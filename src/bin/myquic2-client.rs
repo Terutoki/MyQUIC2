@@ -3,8 +3,12 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use myquic2::*;
+use quinn::Runtime;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::RwLock};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{watch, RwLock},
+};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -15,12 +19,45 @@ struct Args {
 
 type SharedConn = Arc<RwLock<Option<quinn::Connection>>>;
 
+/// Bump the connection-generation counter. Split across two statements on
+/// purpose: the borrow's read guard must drop before `send_replace` takes
+/// the write lock, otherwise this self-deadlocks inside one statement.
+fn bump_gen(tx: &watch::Sender<u64>) {
+    let next = tx.borrow().wrapping_add(1);
+    tx.send_replace(next);
+}
+
 /// Routes inbound QUIC DATAGRAMs to their UDP ASSOCIATE by sess_id.
 /// One dispatcher serves the whole process across reconnects; subscriptions
 /// die with their association, so no immortal task can steal another's packets.
 struct UdpHub {
-    subs: std::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
+    subs: tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
     next: std::sync::atomic::AtomicU32,
+}
+
+impl UdpHub {
+    async fn alloc_sess(
+        &self,
+    ) -> (
+        u32,
+        tokio::sync::mpsc::Sender<Bytes>,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        loop {
+            let s = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // 0 is reserved; skip it and avoid reusing a live id after wraparound.
+            if s == 0 || s == u32::MAX {
+                continue;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
+            let mut m = self.subs.lock().await;
+            if m.contains_key(&s) {
+                continue;
+            }
+            m.insert(s, tx.clone());
+            return (s, tx, rx);
+        }
+    }
 }
 
 #[tokio::main]
@@ -33,38 +70,60 @@ async fn main() -> Result<()> {
     let mut ccfg = quinn::ClientConfig::new(Arc::new(quic_client));
     ccfg.transport_config(build_transport(&c.congestion, c.keep_alive_secs));
     let ccfg = Arc::new(ccfg);
-    let server: SocketAddr = c.server_addr.parse().context("bad server_addr")?;
+    let server: SocketAddr = resolve_server_addr(&c.server_addr)
+        .await
+        .context("bad server_addr")?;
 
     // Single Endpoint for the process lifetime: one UDP socket, shared session-ticket
     // cache (0-RTT resumption) and CID routing for every dial. Never recreate per dial.
-    // Bound dual-stack so servers reachable over IPv4-mapped or native IPv6 both work.
-    let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
+    // Tuned socket buffers so bursts do not drop before quinn sees them.
+    let rt = Arc::new(quinn::TokioRuntime);
+    let std_sock = udp_socket_dual("[::]:0")?;
+    let mut ep = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        rt.wrap_udp_socket(std_sock)?,
+        rt,
+    )?;
     ep.set_default_client_config((*ccfg).clone());
 
     let shared: SharedConn = Arc::new(RwLock::new(None));
+    // Generation counter: bumped on every `shared` swap so waiters sleep
+    // without polling and the datagram dispatcher drops a stale connection
+    // without a per-packet timer.
+    let (gen_tx, gen_rx) = watch::channel(0u64);
     let hub: Arc<UdpHub> = Arc::new(UdpHub {
-        subs: std::sync::Mutex::new(HashMap::new()),
+        subs: tokio::sync::Mutex::new(HashMap::new()),
         next: std::sync::atomic::AtomicU32::new(1),
     });
     // Sole DATAGRAM reader for the process: routes by sess_id to the live association.
     {
         let shared = shared.clone();
         let hub = hub.clone();
+        let mut gen = gen_rx.clone();
         tokio::spawn(async move {
             loop {
-                let conn = match wait_conn(&shared, Duration::from_secs(10)).await {
-                    Ok(c) => c, Err(_) => continue,
+                let conn = match wait_conn(&shared, &mut gen, Duration::from_secs(10)).await {
+                    Ok(c) => c,
+                    Err(_) => continue,
                 };
                 loop {
-                    let d: Bytes = match conn.read_datagram().await {
-                        Ok(d) => d, Err(_) => break,
-                    };
-                    let sess = match decode_datagram(&d) {
-                        Ok((s, _, _)) => s, Err(_) => continue,
-                    };
-                    let tx = hub.subs.lock().unwrap().get(&sess).cloned();
-                    if let Some(tx) = tx {
-                        let _ = tx.try_send(d);
+                    tokio::select! {
+                        d = conn.read_datagram() => {
+                            let d: Bytes = match d {
+                                Ok(d) => d, Err(_) => break,
+                            };
+                            let sess = match decode_datagram(&d) {
+                                Ok((s, _, _)) => s, Err(_) => continue,
+                            };
+                            let tx = hub.subs.lock().await.get(&sess).cloned();
+                            if let Some(tx) = tx {
+                                let _ = tx.try_send(d);
+                            }
+                        }
+                        // Every `shared` swap bumps the generation, so any
+                        // notification means this connection is stale.
+                        _ = gen.changed() => break,
                     }
                 }
             }
@@ -75,26 +134,59 @@ async fn main() -> Result<()> {
         let shared = shared.clone();
         let sname = c.server_name.clone();
         let ep = ep.clone();
+        let gen_tx = gen_tx.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(200);
             loop {
                 match dial_once(&ep, server, &sname).await {
                     Ok(conn) => {
                         info!("QUIC connected to {server}");
-                        *shared.write().await = Some(conn);
+                        *shared.write().await = Some(conn.clone());
+                        bump_gen(&gen_tx);
                         backoff = Duration::from_millis(200);
-                        // wait until connection dies
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            let dead = shared.read().await.as_ref().map(|c| c.close_reason().is_some()).unwrap_or(true);
-                            if dead { break; }
+                        // Watchdog backs up `closed()`: a blackholed path may
+                        // never deliver anything, so a healthy connection must
+                        // keep showing inbound traffic (keepalive ACKs every
+                        // few seconds). 20s of utter silence means dead.
+                        let watchdog = async {
+                            let mut last_rx = conn.stats().udp_rx.datagrams;
+                            let mut quiet_since = std::time::Instant::now();
+                            info!("watchdog armed rx={last_rx}");
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                if conn.close_reason().is_some() {
+                                    break;
+                                }
+                                let rx = conn.stats().udp_rx.datagrams;
+                                if rx != last_rx {
+                                    last_rx = rx;
+                                    quiet_since = std::time::Instant::now();
+                                } else if quiet_since.elapsed() >= Duration::from_secs(20) {
+                                    warn!("QUIC path silent 20s, force-closing {server}");
+                                    conn.close(0u32.into(), b"watchdog");
+                                    break;
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            _ = conn.closed() => {}
+                            _ = watchdog => {}
                         }
                         warn!("QUIC connection lost, reconnecting...");
-                        *shared.write().await = None;
+                        // Only clear if nobody already installed a newer connection.
+                        {
+                            let mut w = shared.write().await;
+                            if let Some(cur) = w.as_ref() {
+                                if cur.stable_id() == conn.stable_id() {
+                                    *w = None;
+                                    bump_gen(&gen_tx);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("dial {server} failed: {e:#}; retry in {backoff:?}");
-                        tokio::time::sleep(backoff + Duration::from_millis(fastrand_jitter())).await;
+                        tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
                         backoff = (backoff * 2).min(Duration::from_secs(5));
                     }
                 }
@@ -110,27 +202,48 @@ async fn main() -> Result<()> {
         let (sock, peer) = li.accept().await?;
         let shared = shared.clone();
         let hub = hub.clone();
+        let gen_rx = gen_rx.clone();
+        let gen_tx = gen_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks(sock, shared, hub, timeout).await {
+            if let Err(e) = handle_socks(sock, shared, hub, gen_rx, gen_tx, timeout).await {
                 warn!("socks {peer} end: {e:#}");
             }
         });
     }
 }
 
-fn fastrand_jitter() -> u64 {
-    // tiny xorshift jitter, no extra dep
+fn jitter_ms() -> u64 {
     use std::cell::Cell;
-    thread_local! { static S: Cell<u64> = Cell::new(0x9e3779b97f4a7c15); }
+    thread_local! { static S: Cell<u64> = const { Cell::new(0) }; }
     S.with(|s| {
         let mut x = s.get();
-        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        if x == 0 {
+            // Seed per-thread from time + thread id so concurrent clients
+            // do not share one backoff sequence and thundering-herd.
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9e3779b97f4a7c15);
+            let tid = format!("{:?}", std::thread::current().id());
+            let mut h = t.wrapping_add(0x9e3779b97f4a7c15);
+            for b in tid.bytes() {
+                h = h.wrapping_mul(0x100000001b3).wrapping_add(b as u64);
+            }
+            x = h | 1;
+        }
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
         s.set(x);
         (x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) % 200
     })
 }
 
-async fn dial_once(ep: &quinn::Endpoint, server: SocketAddr, name: &str) -> Result<quinn::Connection> {
+async fn dial_once(
+    ep: &quinn::Endpoint,
+    server: SocketAddr,
+    name: &str,
+) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
     let connecting = ep.connect(server, name)?;
     // 0-RTT fast path: on resumption the connection is usable immediately, saving 1 RTT.
@@ -149,25 +262,54 @@ async fn dial_once(ep: &quinn::Endpoint, server: SocketAddr, name: &str) -> Resu
     }
 }
 
-async fn wait_conn(shared: &SharedConn, timeout: Duration) -> Result<quinn::Connection> {
-    let t0 = tokio::time::Instant::now();
+async fn wait_conn(
+    shared: &SharedConn,
+    gen_rx: &mut watch::Receiver<u64>,
+    timeout: Duration,
+) -> Result<quinn::Connection> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(c) = shared.read().await.clone() {
-            if c.close_reason().is_none() { return Ok(c); }
+            if c.close_reason().is_none() {
+                return Ok(c);
+            }
         }
-        if t0.elapsed() > timeout { anyhow::bail!("quic unavailable (server restarting?)"); }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("quic unavailable (server restarting?)");
+        }
+        tokio::select! {
+            _ = gen_rx.changed() => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
     }
 }
 
 // ---- SOCKS5 (RFC1928, no-auth only) ----
-async fn handle_socks(mut s: tokio::net::TcpStream, shared: SharedConn, hub: Arc<UdpHub>, timeout: Duration) -> Result<()> {
+async fn handle_socks(
+    mut s: tokio::net::TcpStream,
+    shared: SharedConn,
+    hub: Arc<UdpHub>,
+    mut gen_rx: watch::Receiver<u64>,
+    gen_tx: watch::Sender<u64>,
+    timeout: Duration,
+) -> Result<()> {
+    async fn read_exact_timeout(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
+            .await
+            .context("socks read timed out")??;
+        Ok(())
+    }
     // handshake: VER NMETHODS METHODS; we only support 0x00
     let mut h = [0u8; 2];
-    s.read_exact(&mut h).await?;
-    if h[0] != 0x05 { anyhow::bail!("bad ver"); }
+    read_exact_timeout(&mut s, &mut h).await?;
+    if h[0] != 0x05 {
+        anyhow::bail!("bad ver");
+    }
+    if h[1] == 0 {
+        anyhow::bail!("no methods offered");
+    }
     let mut m = vec![0u8; h[1] as usize];
-    s.read_exact(&mut m).await?;
+    read_exact_timeout(&mut s, &mut m).await?;
     if !m.contains(&0x00) {
         s.write_all(&[0x05, 0xFF]).await?;
         anyhow::bail!("no acceptable auth (client must offer 0x00)");
@@ -175,16 +317,20 @@ async fn handle_socks(mut s: tokio::net::TcpStream, shared: SharedConn, hub: Arc
     s.write_all(&[0x05, 0x00]).await?;
 
     let mut r = [0u8; 3];
-    s.read_exact(&mut r).await?;
-    if r[0] != 0x05 { anyhow::bail!("bad req ver"); }
+    read_exact_timeout(&mut s, &mut r).await?;
+    if r[0] != 0x05 {
+        anyhow::bail!("bad req ver");
+    }
     let target = match r[1] {
-        0x01 => read_socks_addr(&mut s).await?,   // CONNECT
-        0x03 => { // UDP ASSOCIATE
+        0x01 => read_socks_addr(&mut s).await?, // CONNECT
+        0x03 => {
+            // UDP ASSOCIATE
             let _ = read_socks_addr(&mut s).await?;
             return handle_udp_associate(s, shared, hub).await;
         }
         _ => {
-            s.write_all(&[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            s.write_all(&[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
             anyhow::bail!("unsupported cmd");
         }
     };
@@ -194,16 +340,31 @@ async fn handle_socks(mut s: tokio::net::TcpStream, shared: SharedConn, hub: Arc
     let bnd: SocketAddr = {
         let local = s.local_addr()?;
         let ip = unmap(local.ip());
-        let ip = if ip.is_unspecified() { unmap(s.peer_addr()?.ip()) } else { ip };
+        let ip = if ip.is_unspecified() {
+            unmap(s.peer_addr()?.ip())
+        } else {
+            ip
+        };
         SocketAddr::new(ip, local.port())
     };
     write_socks_reply(&mut s, 0x00, bnd).await?;
 
-    let conn = wait_conn(&shared, timeout).await?;
+    let conn = wait_conn(&shared, &mut gen_rx, timeout).await?;
     let (send, recv) = match tokio::time::timeout(Duration::from_secs(3), conn.open_bi()).await {
         Ok(Ok(x)) => x,
         _ => {
-            *shared.write().await = None;
+            // Only invalidate if the failing connection is still current;
+            // otherwise a concurrent reconnect already installed a fresh one.
+            let stale = shared
+                .read()
+                .await
+                .as_ref()
+                .map(|cur| cur.stable_id() == conn.stable_id())
+                .unwrap_or(false);
+            if stale {
+                *shared.write().await = None;
+                bump_gen(&gen_tx);
+            }
             anyhow::bail!("quic stream open failed (server restarting?), retry");
         }
     };
@@ -216,28 +377,34 @@ async fn handle_socks(mut s: tokio::net::TcpStream, shared: SharedConn, hub: Arc
 }
 
 async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
+    async fn rd(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
+            .await
+            .context("socks addr read timed out")??;
+        Ok(())
+    }
     let mut t = [0u8; 1];
-    s.read_exact(&mut t).await?;
+    rd(s, &mut t).await?;
     match t[0] {
         0x01 => {
             let mut b = [0u8; 6];
-            s.read_exact(&mut b).await?;
+            rd(s, &mut b).await?;
             let mut v = vec![0x01];
             v.extend_from_slice(&b);
             Ok(TargetAddr::decode(&v)?.0)
         }
         0x04 => {
             let mut b = [0u8; 18];
-            s.read_exact(&mut b).await?;
+            rd(s, &mut b).await?;
             let mut v = vec![0x04];
             v.extend_from_slice(&b);
             Ok(TargetAddr::decode(&v)?.0)
         }
         0x03 => {
             let mut n = [0u8; 1];
-            s.read_exact(&mut n).await?;
+            rd(s, &mut n).await?;
             let mut b = vec![0u8; n[0] as usize + 2];
-            s.read_exact(&mut b).await?;
+            rd(s, &mut b).await?;
             let mut v = vec![0x03, n[0]];
             v.extend_from_slice(&b);
             Ok(TargetAddr::decode(&v)?.0)
@@ -270,9 +437,7 @@ async fn handle_udp_associate(
     shared: SharedConn,
     hub: Arc<UdpHub>,
 ) -> Result<()> {
-    let sess = hub.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
-    hub.subs.lock().unwrap().insert(sess, tx);
+    let (sess, _tx, mut rx) = hub.alloc_sess().await;
     let relay = tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0")?)?;
     let relay_port = relay.local_addr()?.port();
     let relay_reply = SocketAddr::new(unmap(tcp.peer_addr()?.ip()), relay_port);
@@ -287,18 +452,23 @@ async fn handle_udp_associate(
         tokio::spawn(async move {
             while let Some(d) = rx.recv().await {
                 let (_, addr, payload) = match decode_datagram(&d) {
-                    Ok(x) => x, Err(_) => continue,
+                    Ok(x) => x,
+                    Err(_) => continue,
                 };
                 let dst = match addr {
                     TargetAddr::Ip(s) => s,
-                    TargetAddr::Domain(h, p) => match resolve_server_side(&h, p).await {
-                        Ok(s) => s,
+                    TargetAddr::Domain(h, p) => match resolve_all_cached(&h, p).await {
+                        Ok(v) => match v.into_iter().next() {
+                            Some(s) => s,
+                            None => continue,
+                        },
                         Err(_) => continue,
                     },
                 };
                 if let Some(app) = *last_app.read().await {
-                    let mut pkt = vec![0, 0, 0];
-                    let mut ah = Vec::new();
+                    let mut pkt = Vec::with_capacity(3 + 19 + payload.len());
+                    pkt.extend_from_slice(&[0, 0, 0]);
+                    let mut ah = Vec::with_capacity(19);
                     TargetAddr::Ip(dst).encode(&mut ah);
                     pkt.extend_from_slice(&ah);
                     pkt.extend_from_slice(payload);
@@ -314,32 +484,43 @@ async fn handle_udp_associate(
                     let (n, app) = r?;
                     *last_app_w.write().await = Some(app);
                     if n < 4 || buf[2] != 0x00 { continue; }
-                    let addr = match TargetAddr::decode(&buf[3..n]) {
-                        Ok((a, _)) => a,
+                    // Single decode: reuse header length for the payload offset.
+                    let (addr, hdr_len) = match TargetAddr::decode(&buf[3..n]) {
+                        Ok((a, n)) => (a, n),
                         Err(_) => continue,
                     };
-                    let payload_off = 3 + TargetAddr::decode(&buf[3..n])?.1;
+                    let payload_off = 3 + hdr_len;
+                    if payload_off > n { continue; }
                     let payload = &buf[payload_off..n];
                     let d = match encode_datagram(sess, &addr, payload) {
                         Some(d) => d, None => continue,
                     };
-                    if let Ok(conn) = wait_conn(&shared, Duration::from_millis(500)).await {
+                    // Fast path: never stall the relay loop behind a reconnect
+                    // wait; drop this packet if no live connection exists.
+                    let conn = {
+                        let g = shared.read().await;
+                        g.clone().filter(|c| c.close_reason().is_none())
+                    };
+                    if let Some(conn) = conn {
                         let _ = conn.send_datagram(d);
                     }
                 }
                 _ = tcp.readable() => {
-                    let mut b = [0u8; 1];
+                    let mut b = [0u8; 32];
                     match tcp.try_read(&mut b) {
                         Ok(0) => break,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
-                        _ => break,
+                        // Data on the control connection is not a close; only
+                        // FIN tears the association down. Drain and continue.
+                        Ok(_) => continue,
+                        Err(_) => break,
                     }
                 }
             }
         }
     }
-    hub.subs.lock().unwrap().remove(&sess);
+    hub.subs.lock().await.remove(&sess);
     Ok(())
 }

@@ -37,7 +37,10 @@ async fn main() -> anyhow::Result<()> {
             let mut buf = vec![0u8; 13];
             recv.read_exact(&mut buf).await?;
             println!("conn2: 0-RTT echo ok: {:?}", String::from_utf8_lossy(&buf));
-            println!("conn2: server accepted 0-RTT early data = {}", accepted.await);
+            println!(
+                "conn2: server accepted 0-RTT early data = {}",
+                accepted.await
+            );
             c2.close(0u32.into(), b"probe-done");
             c1.close(0u32.into(), b"probe-done");
         }

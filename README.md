@@ -42,14 +42,14 @@ QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption).
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets, no-auth |
 | **Transport** | QUIC (quinn), TLS 1.3 only, single long-lived connection shared by all flows |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
-| **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB socket buffers; 32 MB DATAGRAM buffers |
+| **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB socket buffers; 8 MB DATAGRAM buffers |
 | **Custom protocol** | MQP-1 binary framing: TCP costs **0 extra bytes** after the first header; UDP costs **≤ 24 B**/packet |
 | **0-RTT** | Session resumption with early data, verified end-to-end (`accepted=true`) |
 | **Reconnect** | Survives server restarts: backoff redial (200 ms → 5 s), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Crypto identity** | Ed25519 self-signed cert, 500-year validity backdated 7 days (routers without RTC), client pins exact cert |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost) |
-| **High-RTT tuned** | 8 MB stream window / 32 MB send window sized for ~140 ms trans-Pacific BDP |
+| **High-RTT tuned** | 4 MB stream window / 8 MB send window sized for ~140 ms trans-Pacific BDP |
 | **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.7 MB each |
 
 ---
@@ -111,7 +111,8 @@ so the client dispatcher can route without any per-target state lookup.
   never reimplement reliability on top).
 - UDP gets DATAGRAMs (loss is semantic, not a bug).
 - No serde/JSON/protobuf on the hot path: hand-rolled codec, `bytes::Bytes`
-  zero-copy forwarding, no per-packet allocation.
+  forwarding (one small allocation per UDP datagram for the framed buffer;
+  TCP uses 64 KB pump buffers per direction), DNS results cached 60 s.
 
 ---
 
@@ -296,20 +297,22 @@ Against RFC 1928 / RFC 1929:
 
 ## Reconnect & High-RTT Behavior
 
-- **Idle**: 5 s keepalive vs 30 s idle timeout — the connection lives indefinitely
+- **Idle**: 5 s keepalive vs 15 s idle timeout — the connection lives indefinitely
   while both processes run (verified: 45 s idle, zero new handshakes, traffic flows
   instantly after).
-- **Dirty network (< 30 s outage)**: QUIC retransmission + BBR absorb it; streams
+- **Dirty network (< 15 s outage)**: QUIC retransmission + BBR absorb it; streams
   stall then resume, **no new handshake**.
 - **IP change (NAT rebinding, WiFi→cellular)**: QUIC connection migration keeps the
   *same* connection alive without a handshake.
-- **Long outage / server restart**: 1 s detection → 200 ms…5 s backoff redial →
-  new connection (0-RTT when resuming against the same server process; verified
-  `accepted=true` end-to-end with `examples/zero_rtt_probe.rs`).
+- **Long outage / server restart**: ~15–20 s silent-path detection (15 s QUIC idle
+  timeout plus a 20 s no-inbound-traffic watchdog that force-closes a blackholed
+  path) → 200 ms…5 s backoff redial → new connection (0-RTT when resuming
+  against the same server process; verified `accepted=true` end-to-end with
+  `examples/zero_rtt_probe.rs`).
 - **After reconnect**: UDP sessions self-heal (server recreates `sess_id` state on
   next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for trans-Pacific BDP — 8 MB stream window (~457 Mb/s per
-  stream), 32 MB connection send window, BBR; SOCKS replies before remote dial
+- **140 ms links**: tuned for trans-Pacific BDP — 4 MB stream window (~239 Mb/s per
+  stream), 8 MB connection send window, BBR; SOCKS replies before remote dial
   (saves a full RTT per connection); server-side DNS avoids geo-misresolved IPs.
 
 ---
