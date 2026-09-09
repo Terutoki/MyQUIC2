@@ -1,0 +1,9 @@
+# MyQUIC2 server config
+listen = "[::]:8443"
+cert_file = "server-cert.pem"
+key_file = "server-key.pem"
+server_name = "test.com"
+congestion = "bbr"
+gso = true
+keep_alive_secs = 5
+allow_private = true

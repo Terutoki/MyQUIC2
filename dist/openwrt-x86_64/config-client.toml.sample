@@ -1,0 +1,9 @@
+# MyQUIC2 client config
+socks_listen = "[::]:1080"
+server_addr = "127.0.0.1:8443"
+server_name = "test.com"
+server_cert_file = "server-cert.pem"
+congestion = "bbr"
+gso = true
+keep_alive_secs = 5
+reconnect_timeout_secs = 5

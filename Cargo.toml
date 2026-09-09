@@ -1,0 +1,34 @@
+[package]
+name = "myquic2"
+version = "0.1.0"
+edition = "2021"
+description = "MyQUIC2 ultra-high-performance QUIC SOCKS5 proxy"
+license = "MIT"
+
+[lib]
+name = "myquic2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myquic2-server"
+path = "src/bin/myquic2-server.rs"
+
+[[bin]]
+name = "myquic2-client"
+path = "src/bin/myquic2-client.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+quinn = { version = "0.11" }
+rustls = { version = "0.23", features = ["ring", "std", "logging"] }
+rcgen = "0.14"
+time = "0.3"
+rustls-pemfile = "2"
+bytes = "1"
+socket2 = "0.6"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+toml = "1"
+serde = { version = "1", features = ["derive"] }
