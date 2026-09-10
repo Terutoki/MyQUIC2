@@ -312,11 +312,14 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     t.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
     t.send_window(8 * 1024 * 1024);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs.max(1))));
-    // 15s idle timeout bounds silent-blackhole detection: with 5s keepalives a
-    // healthy connection always shows inbound traffic, so 15s of nothing means
-    // the path is dead. Short enough to redial promptly, long enough to ride
-    // out transient stalls on high-RTT links.
-    t.max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
+    // Idle timeout derives from keepalive so custom keep_alive_secs can never
+    // self-kill a healthy connection: idle must stay well above the keepalive
+    // interval (QUIC requires inbound traffic before idle fires). 15s floor
+    // preserves the old silent-blackhole bound; larger keepalives scale up.
+    let idle_secs = (keep_alive_secs.max(1).saturating_mul(3)).max(15);
+    t.max_idle_timeout(Some(
+        Duration::from_secs(idle_secs).try_into().unwrap(),
+    ));
     // NOTE: quinn-udp auto-probes GSO/GRO (UDP_SEGMENT) + PMTU discovery;
     // no explicit max_udp_payload flag in 0.11 API — 1350B datagram cap enforced in encode_datagram.
     Arc::new(t)
@@ -366,15 +369,22 @@ fn dns_neg_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, Instant>> 
     NEG.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-fn dns_inflight(
-) -> &'static tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>>>>
-{
+struct DnsInflightEntry {
+    cell: tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>,
+    notify: tokio::sync::Notify,
+}
+
+fn dns_inflight() -> &'static tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>> {
     static INF: std::sync::OnceLock<
-        tokio::sync::Mutex<
-            HashMap<DnsCacheKey, Arc<tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>>>,
-        >,
+        tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>,
     > = std::sync::OnceLock::new();
     INF.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)))
 }
 
 pub fn mono_millis() -> u64 {
@@ -425,16 +435,21 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
 }
 
 fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
-    if m.len() <= 4096 {
+    if m.len() <= 4096 + 256 {
         return;
     }
     m.retain(|_, (t, _)| t.elapsed() < DNS_CACHE_TTL);
     if m.len() <= 4096 {
         return;
     }
-    // Evict the single oldest entry so hot entries survive (P6).
-    if let Some(oldest) = m.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
-        m.remove(&oldest);
+    let excess = m.len() - 4096;
+    let mut oldest: Vec<(Instant, DnsCacheKey)> = Vec::with_capacity(m.len());
+    for (k, (t, _)) in m.iter() {
+        oldest.push((*t, k.clone()));
+    }
+    oldest.sort_by_key(|(t, _)| *t);
+    for (_, k) in oldest.into_iter().take(excess) {
+        m.remove(&k);
     }
 }
 
@@ -457,33 +472,40 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
         }
     }
     // Singleflight: concurrent lookups for the same key share one upstream query.
-    let cell = {
+    let entry = {
         let mut inf = dns_inflight().lock().await;
         if let Some(c) = inf.get(&key) {
             c.clone()
         } else {
-            let c = Arc::new(tokio::sync::OnceCell::new());
+            let c = Arc::new(DnsInflightEntry {
+                cell: tokio::sync::OnceCell::new(),
+                notify: tokio::sync::Notify::new(),
+            });
             inf.insert(key.clone(), c.clone());
             c
         }
     };
-    let is_owner = !cell.initialized();
+    let is_owner = !entry.cell.initialized();
     let res: Result<Vec<SocketAddr>, String> = if is_owner {
         match resolve_all_timeout(host, port, Duration::from_secs(5)).await {
             Ok(v) => {
-                let _ = cell.set(Ok(v.clone()));
+                let _ = entry.cell.set(Ok(v.clone()));
+                entry.notify.notify_waiters();
                 Ok(v)
             }
             Err(e) => {
-                let _ = cell.set(Err(format!("{e:#}")));
+                let _ = entry.cell.set(Err(format!("{e:#}")));
+                entry.notify.notify_waiters();
                 Err(format!("{e:#}"))
             }
         }
     } else {
-        while !cell.initialized() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        loop {
+            if let Some(v) = entry.cell.get() {
+                break v.clone();
+            }
+            entry.notify.notified().await;
         }
-        cell.get().cloned().unwrap_or(Err("dns inflight lost".to_string()))
     };
     if is_owner {
         let mut inf = dns_inflight().lock().await;
@@ -503,7 +525,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
         Err(msg) => {
             if let Ok(mut n) = dns_neg_cache().write() {
                 n.insert(key, Instant::now());
-                if n.len() > 1024 {
+                if n.len() > 1024 + 256 {
                     n.retain(|_, t| t.elapsed() < DNS_NEG_TTL);
                 }
             }
@@ -805,6 +827,11 @@ pub async fn copy_tcp_quic_idle(
             chunks += 1;
             if chunks % 8 == 0 {
                 touch(&l2, &b2);
+            } else {
+                let now = b2.elapsed().as_millis() as u64;
+                if now.saturating_sub(l2.load(Ordering::Relaxed)) >= 500 {
+                    l2.store(now, Ordering::Relaxed);
+                }
             }
         }
         tw.shutdown().await.ok();

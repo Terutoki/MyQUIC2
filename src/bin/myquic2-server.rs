@@ -170,10 +170,15 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         };
                         let _ = sock.send_to(payload, map_for_dual(dst)).await;
                     } else {
+                        let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
                         let ss = ss.clone();
                         let cd = cd.clone();
                         let payload = Bytes::copy_from_slice(payload);
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let dst = match resolve_all_cached(&h, p).await {
                                 Ok(v) => match v.into_iter().next() {
                                     Some(v) => v,
@@ -352,7 +357,7 @@ async fn dial_happy_eyeballs(
                     }
                 }
                 _ = async {
-                    while !won.load(std::sync::atomic::Ordering::Relaxed) {
+                    while !won.load(std::sync::atomic::Ordering::Relaxed) && !tx.is_closed() {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 } => {}
@@ -360,10 +365,12 @@ async fn dial_happy_eyeballs(
         });
     }
     drop(tx);
-    tokio::select! {
+    let res = tokio::select! {
         r = rx.recv() => r,
         _ = &mut budget => None,
-    }
+    };
+    won.store(true, std::sync::atomic::Ordering::Relaxed);
+    res
 }
 
 async fn get_or_create_sess(
@@ -388,14 +395,17 @@ async fn get_or_create_sess(
         t.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
         return Some(sock2.clone());
     }
-    if w.len() >= 4096 {
-        // Evict the least-recently-used entry so hot sessions survive.
-        if let Some(k) = w
-            .iter()
-            .filter(|(k, _)| **k != s)
-            .min_by_key(|(_, (_, _, t))| t.load(std::sync::atomic::Ordering::Relaxed))
-            .map(|(k, _)| *k)
-        {
+    if w.len() >= 4096 + 64 {
+        let mut oldest: Vec<(u64, u32)> = Vec::with_capacity(w.len());
+        for (k, (_, _, t)) in w.iter() {
+            if *k == s {
+                continue;
+            }
+            oldest.push((t.load(std::sync::atomic::Ordering::Relaxed), *k));
+        }
+        oldest.sort_unstable_by_key(|(t, _)| *t);
+        let excess = w.len().saturating_sub(4096);
+        for (_, k) in oldest.into_iter().take(excess.max(1)) {
             if let Some((_, hh, _)) = w.remove(&k) {
                 hh.abort();
             }
@@ -429,7 +439,10 @@ async fn get_or_create_sess(
                 None => continue,
             };
             if c2.send_datagram(d).is_err() {
-                break;
+                if c2.close_reason().is_some() {
+                    break;
+                }
+                continue;
             }
         }
         // Self-reap: task exit removes the zombie entry instead of waiting 180s.

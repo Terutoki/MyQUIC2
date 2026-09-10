@@ -128,7 +128,15 @@ async fn main() -> Result<()> {
                             let sess = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
                             let tx = hub.subs.read().await.get(&sess).cloned();
                             if let Some(tx) = tx {
-                                let _ = tx.try_send(d);
+                                if tx.try_send(d).is_err() {
+                                    static DROPS: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n =
+                                        DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n % 1000 == 0 {
+                                        tracing::warn!("udphub sess={sess} dispatcher drops={n}");
+                                    }
+                                }
                             }
                         }
                         // Every `shared` swap bumps the generation, so any
@@ -544,8 +552,8 @@ async fn handle_udp_associate(
     let relay = Arc::new(relay);
     {
         let r2 = relay.clone();
-        let last_app: Arc<std::sync::RwLock<Option<SocketAddr>>> =
-            Arc::new(std::sync::RwLock::new(None));
+        let last_app: Arc<tokio::sync::RwLock<Option<SocketAddr>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
         let last_app_w = last_app.clone();
         let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
         let last_activity_rx = last_activity.clone();
@@ -556,26 +564,53 @@ async fn handle_udp_associate(
                     Ok(x) => x,
                     Err(_) => continue,
                 };
-                let dst = match addr {
-                    TargetAddr::Ip(s) => s,
+                let dst_opt = match addr {
+                    TargetAddr::Ip(s) => Some(s),
                     TargetAddr::Domain(h, p) => {
                         if let Some(v) = lookup_cached_sync(&h, p) {
-                            match v.into_iter().next() {
-                                Some(s) => s,
-                                None => continue,
-                            }
+                            v.into_iter().next()
                         } else {
-                            match resolve_all_cached(&h, p).await {
-                                Ok(v) => match v.into_iter().next() {
-                                    Some(s) => s,
-                                    None => continue,
-                                },
-                                Err(_) => continue,
-                            }
+                            let r2 = r2.clone();
+                            let last_app = last_app.clone();
+                            let payload = Bytes::copy_from_slice(payload);
+                            let h2 = h.clone();
+                            tokio::spawn(async move {
+                                let permit =
+                                    match dns_slow_path_limiter().clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => return,
+                                    };
+                                let _permit = permit;
+                                let dst = match resolve_all_cached(&h2, p).await {
+                                    Ok(v) => match v.into_iter().next() {
+                                        Some(s) => s,
+                                        None => return,
+                                    },
+                                    Err(_) => return,
+                                };
+                                let app = last_app.read().await.as_ref().copied();
+                                if let Some(app) = app {
+                                    let mut pkt =
+                                        Vec::with_capacity(3 + 19 + payload.len());
+                                    pkt.extend_from_slice(&[0, 0, 0]);
+                                    let mut ah = Vec::with_capacity(19);
+                                    if TargetAddr::Ip(dst).encode(&mut ah).is_err() {
+                                        return;
+                                    }
+                                    pkt.extend_from_slice(&ah);
+                                    pkt.extend_from_slice(&payload);
+                                    let _ = r2.send_to(&pkt, map_for_dual(app)).await;
+                                }
+                            });
+                            continue;
                         }
                     }
                 };
-                let app = last_app.read().ok().and_then(|g| *g);
+                let dst = match dst_opt {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let app = last_app.read().await.as_ref().copied();
                 if let Some(app) = app {
                     let mut pkt = Vec::with_capacity(3 + 19 + payload.len());
                     pkt.extend_from_slice(&[0, 0, 0]);
@@ -602,9 +637,7 @@ async fn handle_udp_associate(
                         continue;
                     }
                     last_activity.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(mut g) = last_app_w.write() {
-                        *g = Some(app);
-                    }
+                    *last_app_w.write().await = Some(app);
                     if n < 4 || buf[2] != 0x00 { continue; }
                     // Single decode: reuse header length for the payload offset.
                     let (addr, hdr_len) = match TargetAddr::decode(&buf[3..n]) {
@@ -619,16 +652,9 @@ async fn handle_udp_associate(
                     };
                     // Fast path: never stall the relay loop behind a reconnect
                     // wait; drop this packet if no live connection exists.
-                    // Small grace: one 20ms wait covers reconnect races.
                     let conn = {
                         let g = shared.read().await;
                         g.clone().filter(|c| c.close_reason().is_none())
-                    };
-                    let conn = if conn.is_none() {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        shared.read().await.clone().filter(|c| c.close_reason().is_none())
-                    } else {
-                        conn
                     };
                     if let Some(conn) = conn {
                         let _ = conn.send_datagram(d);
