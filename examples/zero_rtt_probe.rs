@@ -6,6 +6,9 @@ use myquic2::*;
 use std::net::SocketAddr;
 
 async fn authenticate(conn: &quinn::Connection, token: &str) -> anyhow::Result<()> {
+    if token.is_empty() {
+        return Ok(());
+    }
     // `write_all` is inherent on quinn's SendStream (no AsyncWriteExt needed).
     let mut uni = conn.open_uni().await?;
     uni.write_all(token.as_bytes()).await?;

@@ -19,7 +19,7 @@ type SessEntry = (
     Arc<std::sync::atomic::AtomicU64>,
     tokio::sync::OwnedSemaphorePermit,
 );
-type SessTable = Arc<tokio::sync::RwLock<HashMap<u32, SessEntry>>>;
+type SessTable = Arc<std::sync::RwLock<HashMap<u32, SessEntry>>>;
 
 /// Hard process-wide bounds: new QUIC connections are refused past this count
 /// and new UDP sessions borrow from a shared permit pool, so a single peer
@@ -29,10 +29,24 @@ const MAX_SESSIONS_GLOBAL: usize = 16_384;
 const LOCAL_SESS_MAX: usize = 4096;
 const LOCAL_SESS_TARGET: usize = LOCAL_SESS_MAX - 64;
 const SESS_IDLE_MS: u64 = 180_000;
+/// Process-wide cap on concurrent TCP dials. Per-connection caps alone cannot
+/// bound fd usage when an unauthenticated peer can open many connections.
+const MAX_DIALS_GLOBAL: usize = 4096;
+/// How long a dial may wait for a global dial permit before giving up.
+const DIAL_PERMIT_WAIT: Duration = Duration::from_secs(2);
+/// Total wall-clock budget for client token authentication (accept the uni
+/// stream and read the token). Kept as one deadline so an unauthenticated peer
+/// cannot hold a connection permit for the old accept+read 5s + 5s window.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn session_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS_GLOBAL)))
+}
+
+fn dial_limiter() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_DIALS_GLOBAL)))
 }
 
 /// One-way token authentication: the client opens a uni stream and writes the
@@ -43,12 +57,12 @@ async fn authenticate(conn: &quinn::Connection, expected: &[u8]) -> Result<()> {
     if expected.is_empty() {
         return Ok(());
     }
-    let mut uni = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
-        .await
-        .context("auth stream timeout")??;
-    let got = tokio::time::timeout(Duration::from_secs(5), uni.read_to_end(AUTH_MAX_BYTES))
-        .await
-        .context("auth read timeout")??;
+    let got = tokio::time::timeout(AUTH_TIMEOUT, async {
+        let mut uni = conn.accept_uni().await?;
+        uni.read_to_end(AUTH_MAX_BYTES).await.map_err(anyhow::Error::from)
+    })
+    .await
+    .context("auth timeout")??;
     if !ct_eq(&got, expected) {
         anyhow::bail!("auth token mismatch");
     }
@@ -174,7 +188,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     info!("new QUIC conn from {}", conn.remote_address());
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
-    let sess: SessTable = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let sess: SessTable = Arc::new(std::sync::RwLock::new(HashMap::new()));
     {
         let sess = sess.clone();
         let conn = conn.clone();
@@ -183,7 +197,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = mono_millis();
-                        let mut m = sess.write().await;
+                        let mut m = lock_write(&sess);
                         let expired: Vec<u32> = m
                             .iter()
                             .filter(|(_, (_, _, t, _))| {
@@ -199,7 +213,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         }
                     }
                     _ = conn.closed() => {
-                        let mut m = sess.write().await;
+                        let mut m = lock_write(&sess);
                         for (_, (_, h, _, _)) in m.drain() {
                             h.abort();
                         }
@@ -282,24 +296,17 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     });
 
     // TCP: one QUIC bidi stream per connection. First bytes = MQP addr header.
-    // Bound concurrent dials so fast open/close cannot exhaust FDs/DNS.
-    let dial_sem = Arc::new(tokio::sync::Semaphore::new(1024));
+    // Concurrent streams are already capped by the transport; dials are bounded
+    // process-wide (not per connection) so many connections cannot exhaust fds
+    // together.
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(x) => x,
             Err(_) => break,
         };
-        let permit = match dial_sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                send.reset(0x04u32.into()).ok();
-                continue;
-            }
-        };
         tokio::spawn(async move {
-            let _permit = permit;
             let target: TargetAddr = match tokio::time::timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(5),
                 read_mqp_target(&mut recv),
             )
             .await
@@ -333,6 +340,20 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     v
                 }
             };
+            // Hold the global dial permit only for the connect phase; the copy
+            // phase is bounded by the transport's stream limit instead.
+            let _dial_permit = match tokio::time::timeout(
+                DIAL_PERMIT_WAIT,
+                dial_limiter().clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => {
+                    send.reset(0x04u32.into()).ok();
+                    return;
+                }
+            };
             let tcp = match dial_happy_eyeballs(cands, allow_private).await {
                 Some(t) => t,
                 None => {
@@ -340,6 +361,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     return;
                 }
             };
+            drop(_dial_permit);
             let _ = tcp.set_nodelay(true);
             if send.write_all(&[MQP_TCP_ACK]).await.is_err() {
                 return;
@@ -407,7 +429,7 @@ async fn dial_happy_eyeballs(
     if cands.is_empty() {
         return None;
     }
-    // Total budget 4s so the client-side 7s ACK wait always covers us.
+    // Total budget 4s; the client-side ACK wait is sized to cover it.
     let budget = tokio::time::sleep(Duration::from_secs(4));
     tokio::pin!(budget);
     if cands.len() == 1 {
@@ -420,45 +442,33 @@ async fn dial_happy_eyeballs(
             _ = &mut budget => return None,
         }
     }
-    let won = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Event-driven cancellation: losers are woken by a watch value instead of
+    // polling a flag every 50ms (which cost extra wakeups on hot dial paths).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut tasks = tokio::task::JoinSet::new();
     for (i, a) in cands.into_iter().enumerate() {
         let tx = tx.clone();
-        let won = won.clone();
-        tokio::spawn(async move {
+        let mut cancel = cancel_rx.clone();
+        tasks.spawn(async move {
             if i > 0 {
-                let mut waited = 0u64;
-                let delay = 250 * i.min(4) as u64;
-                while waited < delay {
-                    if won.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed() {
-                        return;
-                    }
-                    let step = 50.min(delay - waited);
-                    tokio::time::sleep(Duration::from_millis(step)).await;
-                    waited += step;
+                let delay = Duration::from_millis(250 * i.min(4) as u64);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.wait_for(|v| *v) => return,
                 }
             }
-            if won.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed() {
+            if *cancel.borrow() || tx.is_closed() {
                 return;
             }
-            tokio::select! {
-                r = tokio::net::TcpStream::connect(a) => {
-                    if let Ok(s) = r {
-                        let _ = s.set_nodelay(true);
-                        if won.compare_exchange(
-                            false, true,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Relaxed,
-                        ).is_ok() {
-                            let _ = tx.try_send(s);
-                        }
-                    }
-                }
-                _ = async {
-                    while !won.load(std::sync::atomic::Ordering::Relaxed) && !tx.is_closed() {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                } => {}
+            let connected = tokio::select! {
+                r = tokio::net::TcpStream::connect(a) => r.ok(),
+                _ = cancel.wait_for(|v| *v) => None,
+            };
+            if let Some(s) = connected {
+                let _ = s.set_nodelay(true);
+                // Capacity 1: the first winner wins, the rest drop their socket.
+                let _ = tx.try_send(s);
             }
         });
     }
@@ -467,7 +477,8 @@ async fn dial_happy_eyeballs(
         r = rx.recv() => r,
         _ = &mut budget => None,
     };
-    won.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = cancel_tx.send(true);
+    tasks.shutdown().await;
     res
 }
 
@@ -484,11 +495,23 @@ fn touch_session(t: &std::sync::atomic::AtomicU64) {
 /// Evict expired sessions first, then arbitrary ones, with O(n) work and a
 /// bounded number of removals: never clone+sort the whole table under the
 /// write lock while the packet fast path is waiting for the read lock.
+/// Expired entries must be aborted, not just dropped: a dropped JoinHandle
+/// leaves the reply reader (and its socket fd / kernel buffer) alive until its
+/// own 180s timeout, which transiently doubled the session/fd budget.
 fn sweep_local(w: &mut HashMap<u32, SessEntry>) {
     let now = mono_millis();
-    w.retain(|_, (_, _, t, _)| {
-        now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed)) < SESS_IDLE_MS
-    });
+    let expired: Vec<u32> = w
+        .iter()
+        .filter(|(_, (_, _, t, _))| {
+            now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    for k in expired {
+        if let Some((_, hh, _, _)) = w.remove(&k) {
+            hh.abort();
+        }
+    }
     let over = w.len().saturating_sub(LOCAL_SESS_TARGET);
     if over == 0 {
         return;
@@ -509,16 +532,21 @@ async fn get_or_create_sess(
     // Fast path: single read lock + lock-free timestamp bump. No write lock
     // per packet, so concurrent sessions never serialize on a global lock.
     {
-        let r = ss.read().await;
+        let r = lock_read(ss);
         if let Some((sock, _, t, _)) = r.get(&s) {
             let sock = sock.clone();
             touch_session(t);
             return Some(sock);
         }
     }
+    // Create the socket BEFORE taking the write lock: socket()/setsockopt()/
+    // bind() are syscalls and must not stall the datagram reader for every
+    // other session. A concurrent creator makes this one redundant, not wrong.
+    let raw = udp_socket_dual_small("[::]:0").ok()?;
+    let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
     // Slow path holds the write lock across check+insert so concurrent
     // packets for the same sess cannot create duplicate sockets (B8).
-    let mut w = ss.write().await;
+    let mut w = lock_write(ss);
     if let Some((sock2, _, t, _)) = w.get(&s) {
         touch_session(t);
         return Some(sock2.clone());
@@ -537,8 +565,6 @@ async fn get_or_create_sess(
             }
         }
     };
-    let raw = udp_socket_dual_small("[::]:0").ok()?;
-    let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
     let c2 = cd.clone();
     let rs = sock.clone();
     let ss2 = ss.clone();
@@ -548,13 +574,25 @@ async fn get_or_create_sess(
         let mut buf = vec![0u8; 2048];
         loop {
             let (n, src) = match tokio::time::timeout(
-                Duration::from_secs(180),
+                Duration::from_secs(60),
                 rs.recv_from(&mut buf),
             )
             .await
             {
                 Ok(Ok(x)) => x,
-                _ => break,
+                Ok(Err(_)) => break,
+                // No inbound reply for 60s: only reap when the whole session
+                // (including outbound traffic) is idle. A one-way flow used to
+                // be recreated every 180s, changing its source port/NAT mapping.
+                Err(_) => {
+                    if mono_millis()
+                        .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
+                        >= SESS_IDLE_MS
+                    {
+                        break;
+                    }
+                    continue;
+                }
             };
             // Inbound replies are liveness too: a long one-way download must
             // not be reaped while it is actively streaming.
@@ -582,7 +620,7 @@ async fn get_or_create_sess(
             }
         }
         // Self-reap: task exit removes the zombie entry instead of waiting 180s.
-        let mut w = ss2.write().await;
+        let mut w = lock_write(&ss2);
         if let Some((cur, _, _, _)) = w.get(&s) {
             if Arc::ptr_eq(cur, &rs) {
                 if let Some((_, hh, _, _)) = w.remove(&s) {

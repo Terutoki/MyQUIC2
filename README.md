@@ -184,13 +184,16 @@ UDP datagram (no traffic amplification). TCP application bytes are never sent un
 the server's dial ACK, so replay cannot duplicate an application request.
 
 **Denial-of-service bounds.** See [Resource Limits & Tuning](#resource-limits--tuning):
-connection/session caps, per-connection stream and dial limits, DNS slow-path
-limiter, bounded detached UDP sends, and a 5 s unauthenticated-connection window.
+connection/session caps, process-wide TCP dial and per-connection stream limits, DNS
+slow-path limiter, bounded detached UDP sends, and a single 5 s deadline for
+unauthenticated connections (auth stream accept + token read share one budget).
 
 **What is *not* protected.** SOCKS5 ingress is no-auth (RFC 1929 is intentionally not
-implemented); the UDP relay learns the app's address from the first packet (run it
-on a trusted host/bind it to localhost). UDP replies are not source-validated
-beyond that (roadmap item).
+implemented). The UDP relay accepts datagrams only from the SOCKS control
+connection's source IP, but not its port (RFC 1928 clients legitimately use a
+different socket), so a process on the same host can still race for the relay —
+run it on a trusted host / bind `socks_listen` to localhost when exposing UDP.
+UDP replies are not further source-validated (roadmap item).
 
 ---
 
@@ -449,8 +452,10 @@ All limits are constants in the sources; the table shows where to change them.
 | Concurrent QUIC connections (server) | 4096 (new `Incoming` refused) | `MAX_CONNECTIONS` |
 | UDP sessions, process-wide | 16384 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
 | UDP sessions per connection | 4096 (O(n) sweep above) | `LOCAL_SESS_MAX` |
-| Concurrent TCP dials per connection | 1024 | `dial_sem` |
+| Concurrent TCP dials, process-wide | 4096, 2 s permit wait (released after connect) | `dial_limiter` |
 | Concurrent bidi streams per connection | 1024 | `build_transport` |
+| Client SOCKS connections | 8192 (excess connections dropped) | `socks_conn_limiter` |
+| Client UDP associations | 4096 (excess replies REP=0x01) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
 | Receive window (aggregate) | 32 MB/connection | `build_transport` |
@@ -458,15 +463,15 @@ All limits are constants in the sources; the table shows where to change them.
 | Send window | 8 MB/connection | `build_transport` |
 | DATAGRAM buffers | 4 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
-| Server auth wait | 5 s per connection | `authenticate()` |
+| Server auth wait | 5 s per connection (one deadline for accept+read) | `authenticate()` |
 | TCP stream idle reap | 300 s | `copy_tcp_quic_idle` call sites |
-| UDP association idle reap | 180 s (both sides; inbound replies count as activity) | server sweeper / client select |
-| DNS cache | 60 s positive, 10 s negative, 4096 entries +512 slack | `DNS_CACHE_*` |
-| Client TCP dial ACK budget | 15 s (covers 3 s permit + 5 s DNS + 4 s connect) | `TCP_DIAL_ACK_TIMEOUT` |
+| UDP association idle reap | 180 s (both directions; TCP control activity counts) | server sweeper / client interval |
+| DNS cache | 60 s positive (4096+512 slack), 10 s negative (4096) | `DNS_CACHE_*`, `DNS_NEG_MAX` |
+| Client TCP dial ACK budget | 20 s (5 s header + 3 s DNS permit + 5 s DNS + 2 s dial permit + 4 s connect + margin) | `TCP_DIAL_ACK_TIMEOUT` |
 
 Kernel-side tuning: raise `net.core.wmem_max` / `net.core.rmem_max` so the 4 MB /
-1 MB socket buffers are not silently clamped; the binaries now log a warning with the
-actual values when clamping is detected.
+1 MB socket buffers are not silently clamped; the first clamp logs one warning per
+process (per-socket warnings were removed because session churn flooded the log).
 
 ---
 

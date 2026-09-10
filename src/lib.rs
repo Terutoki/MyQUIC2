@@ -409,8 +409,42 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
     Ok(addrs)
 }
 
-type DnsCacheKey = (String, u16);
+/// Cache key encoding: `host` bytes + NUL separator + decimal port. This is
+/// injective (the decimal port never contains NUL, so splitting at the last
+/// NUL recovers the exact host/port), so it is safe to build on the stack and
+/// look up with the borrowed `&str` form of `HashMap<String, _>` — no `String`
+/// allocation on the per-datagram hot path.
+type DnsCacheKey = String;
 type DnsCacheVal = (Instant, Vec<SocketAddr>);
+const DNS_KEY_BUF: usize = 255 + 1 + 5;
+
+/// Build the cache key into `buf`, returning a borrowed `&str`.
+/// Returns `None` only when `host` is longer than the wire-format limit.
+fn dns_key<'a>(host: &str, port: u16, buf: &'a mut [u8; DNS_KEY_BUF]) -> Option<&'a str> {
+    let hb = host.as_bytes();
+    if hb.len() + 1 + 5 > DNS_KEY_BUF {
+        return None;
+    }
+    buf[..hb.len()].copy_from_slice(hb);
+    let mut pos = hb.len();
+    buf[pos] = 0;
+    pos += 1;
+    let mut digits = [0u8; 5];
+    let mut p = port;
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (p % 10) as u8;
+        p /= 10;
+        if p == 0 {
+            break;
+        }
+    }
+    buf[pos..pos + (5 - i)].copy_from_slice(&digits[i..]);
+    pos += 5 - i;
+    std::str::from_utf8(&buf[..pos]).ok()
+}
+
 fn dns_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> {
     static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>>> =
         std::sync::OnceLock::new();
@@ -419,6 +453,9 @@ fn dns_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> 
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 const DNS_NEG_TTL: Duration = Duration::from_secs(10);
+/// Soft cap for the negative cache; past this the table is reaped instead of
+/// growing without bound under a failing-domain flood.
+const DNS_NEG_MAX: usize = 4096;
 /// Wall-clock budget for a single upstream DNS lookup. Client-side dial
 /// timeouts are sized to cover this plus the TCP connect budget.
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -429,35 +466,85 @@ fn dns_neg_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, Instant>> 
     NEG.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
+/// Poison-safe lock helpers. The previous `if let Ok(..)` handling silently
+/// disabled all DNS caching forever after any panic while a lock was held;
+/// recovering the guard keeps the cache functional (a HashMap cannot be left
+/// in a half-formed state by such a panic).
+fn warn_poisoned() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| tracing::warn!("a cache lock was poisoned; recovering"));
+}
+
+pub fn lock_read<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| {
+        warn_poisoned();
+        e.into_inner()
+    })
+}
+
+pub fn lock_write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| {
+        warn_poisoned();
+        e.into_inner()
+    })
+}
+
+pub fn lock_mutex<T>(l: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    l.lock().unwrap_or_else(|e| {
+        warn_poisoned();
+        e.into_inner()
+    })
+}
+
 struct DnsInflightEntry {
+    /// Own copy of the key so the cleanup guard can remove the entry even when
+    /// the owner is a takeover task that did not insert it.
+    key: DnsCacheKey,
     cell: tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>,
     notify: tokio::sync::Notify,
     owner: std::sync::atomic::AtomicBool,
 }
 
-/// Releases singleflight ownership if the resolving task is dropped before it
-/// stores a result, so waiters can take over instead of sleeping forever.
+/// Releases singleflight ownership when the resolving task exits for any
+/// reason (completion, cancellation, panic), so waiters can take over instead
+/// of sleeping forever.
 struct OwnerReset<'a> {
     entry: &'a DnsInflightEntry,
-    completed: bool,
 }
 
 impl Drop for OwnerReset<'_> {
     fn drop(&mut self) {
-        if !self.completed {
-            self.entry
-                .owner
-                .store(false, std::sync::atomic::Ordering::Release);
-            self.entry.notify.notify_waiters();
+        self.entry
+            .owner
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.entry.notify.notify_waiters();
+    }
+}
+
+/// Removes the inflight entry when the owner's future is dropped for any
+/// reason. Without this, cancellation between `cell.set()` and the explicit
+/// removal left a permanently stale entry behind: every later lookup returned
+/// the old result without ever re-resolving the name.
+struct InflightCleanup<'a> {
+    entry: &'a Arc<DnsInflightEntry>,
+}
+
+impl Drop for InflightCleanup<'_> {
+    fn drop(&mut self) {
+        let mut inf = lock_mutex(dns_inflight());
+        if let Some(cur) = inf.get(&self.entry.key) {
+            if Arc::ptr_eq(cur, self.entry) {
+                inf.remove(&self.entry.key);
+            }
         }
     }
 }
 
-fn dns_inflight() -> &'static tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>> {
+fn dns_inflight() -> &'static std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>> {
     static INF: std::sync::OnceLock<
-        tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>,
+        std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>,
     > = std::sync::OnceLock::new();
-    INF.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+    INF.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
@@ -481,10 +568,11 @@ fn dns_key_hash(host: &str, port: u16) -> u64 {
 
 /// Cached variant used on hot paths (UDP per-packet, TCP per-connection).
 /// Returns only the IPv4-preferred first address: hot callers never need the
-/// full list, and copying a single `SocketAddr` keeps cache hits allocation-free.
+/// full list, and a hit is allocation-free (stack-built key + per-thread memo).
 pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
     use std::cell::RefCell;
     thread_local! {
+        // (key hash, address, absolute expiry of the global cache entry)
         static LAST: RefCell<(u64, Option<SocketAddr>, Instant)> = RefCell::new((
             0,
             None,
@@ -492,23 +580,29 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
         ));
     }
     let h = dns_key_hash(host, port);
+    let now = Instant::now();
     let hit = LAST.with(|c| {
         let c = c.borrow();
-        c.0 == h && c.2.elapsed() < DNS_CACHE_TTL && c.1.is_some()
+        c.0 == h && now < c.2 && c.1.is_some()
     });
     if hit {
         return LAST.with(|c| c.borrow().1);
     }
-    let key: DnsCacheKey = (host.to_string(), port);
-    let addr = {
-        let m = dns_cache().read().ok()?;
-        let (t, v) = m.get(&key)?;
-        if t.elapsed() >= DNS_CACHE_TTL {
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let key = dns_key(host, port, &mut kbuf)?;
+    let (addr, expires) = {
+        let m = lock_read(dns_cache());
+        let (t, v) = m.get(key)?;
+        // Expiry is anchored to the global entry's insertion time, so the
+        // thread-local memo can never outlive the cache TTL (previously it
+        // could serve an address for up to ~2x the TTL).
+        let expires = *t + DNS_CACHE_TTL;
+        if now >= expires {
             return None;
         }
-        v.first().copied()?
+        (v.first().copied()?, expires)
     };
-    LAST.with(|c| *c.borrow_mut() = (h, Some(addr), Instant::now()));
+    LAST.with(|c| *c.borrow_mut() = (h, Some(addr), expires));
     Some(addr)
 }
 
@@ -535,84 +629,112 @@ fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
 }
 
 pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    let key: DnsCacheKey = (host.to_string(), port);
+    // Stack-built key: no allocation on the positive-cache fast path. The
+    // fallback only triggers for hosts longer than the 255-byte wire limit.
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = format!("{host}\0{port}");
+            &owned
+        }
+    };
+    // 1. Positive cache.
     {
-        if let Ok(m) = dns_cache().read() {
-            if let Some((t, v)) = m.get(&key) {
-                if t.elapsed() < DNS_CACHE_TTL {
-                    return Ok(v.clone());
-                }
-            }
-        }
-        if let Ok(n) = dns_neg_cache().read() {
-            if let Some(t) = n.get(&key) {
-                if t.elapsed() < DNS_NEG_TTL {
-                    anyhow::bail!("dns negative cached");
-                }
+        let m = lock_read(dns_cache());
+        if let Some((t, v)) = m.get(key) {
+            if t.elapsed() < DNS_CACHE_TTL {
+                return Ok(v.clone());
             }
         }
     }
-    // Singleflight: exactly one owner resolves; everyone else waits on the
-    // cell. Ownership is claimed atomically, so two racing callers can never
-    // both hit upstream, and a cancelled owner releases the claim for takeover.
+    // 2. Negative cache.
+    {
+        let n = lock_read(dns_neg_cache());
+        if let Some(t) = n.get(key) {
+            if t.elapsed() < DNS_NEG_TTL {
+                anyhow::bail!("dns negative cached");
+            }
+        }
+    }
+    // 3. Singleflight: exactly one owner resolves; everyone else waits on the
+    //    cell. Ownership is claimed atomically, so two racing callers can never
+    //    both hit upstream, and a cancelled owner releases the claim.
     let entry = {
-        let mut inf = dns_inflight().lock().await;
-        if let Some(c) = inf.get(&key) {
-            c.clone()
-        } else {
-            let c = Arc::new(DnsInflightEntry {
-                cell: tokio::sync::OnceCell::new(),
-                notify: tokio::sync::Notify::new(),
-                owner: std::sync::atomic::AtomicBool::new(false),
-            });
-            inf.insert(key.clone(), c.clone());
-            c
+        let mut inf = lock_mutex(dns_inflight());
+        match inf.get(key) {
+            Some(c) => c.clone(),
+            None => {
+                let c = Arc::new(DnsInflightEntry {
+                    key: key.to_owned(),
+                    cell: tokio::sync::OnceCell::new(),
+                    notify: tokio::sync::Notify::new(),
+                    owner: std::sync::atomic::AtomicBool::new(false),
+                });
+                inf.insert(c.key.clone(), c.clone());
+                c
+            }
         }
     };
-    let mut resolved_as_owner = false;
-    let res: Result<Vec<SocketAddr>, String> = loop {
-        if let Some(v) = entry.cell.get() {
-            break v.clone();
+    let mut owner_won = false;
+    // Always removes the inflight entry when this function returns (normal,
+    // cancelled or panic). Created before the await so the `cell.set` ->
+    // explicit-remove window cannot leak a stale entry.
+    let mut cleanup: Option<InflightCleanup<'_>> = None;
+    let res: Result<Vec<SocketAddr>, String> = if let Some(v) = entry.cell.get() {
+        v.clone()
+    } else if !entry.owner.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        owner_won = true;
+        let _reset = OwnerReset { entry: &entry };
+        cleanup = Some(InflightCleanup { entry: &entry });
+        let r = match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
+            Ok(v) => Ok(v),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        let _ = entry.cell.set(r.clone());
+        entry.notify.notify_waiters();
+        r
+    } else {
+        // Register before re-checking the cell: `notify_waiters` stores no
+        // permit, so an unregistered waiter could otherwise miss completion.
+        loop {
+            let notified = entry.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(v) = entry.cell.get() {
+                break v.clone();
+            }
+            notified.await;
         }
-        if !entry.owner.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            resolved_as_owner = true;
-            let mut guard = OwnerReset {
-                entry: &entry,
-                completed: false,
-            };
-            let r = match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
-                Ok(v) => Ok(v),
-                Err(e) => Err(format!("{e:#}")),
-            };
-            let _ = entry.cell.set(r.clone());
-            guard.completed = true;
-            entry.notify.notify_waiters();
-            break r;
-        }
-        entry.notify.notified().await;
     };
-    if resolved_as_owner {
-        let mut inf = dns_inflight().lock().await;
-        inf.remove(&key);
-    }
     match res {
         Ok(v) => {
-            if let Ok(mut m) = dns_cache().write() {
-                m.insert(key.clone(), (Instant::now(), v.clone()));
+            {
+                let mut m = lock_write(dns_cache());
+                m.insert(key.to_owned(), (Instant::now(), v.clone()));
                 evict_if_needed(&mut m);
             }
-            if let Ok(mut n) = dns_neg_cache().write() {
-                n.remove(&key);
-            }
+            lock_write(dns_neg_cache()).remove(key);
+            // Remove only after the caches are warm, so a caller arriving in
+            // this window still hits the inflight result instead of issuing a
+            // duplicate upstream lookup.
+            drop(cleanup);
             Ok(v)
         }
         Err(msg) => {
-            if let Ok(mut n) = dns_neg_cache().write() {
-                n.insert(key, Instant::now());
-                if n.len() > 1024 + 256 {
+            // Only the owner records the failure: when every waiter inserted,
+            // one failed lookup became N inserts + N full-map sweeps.
+            if owner_won {
+                let mut n = lock_write(dns_neg_cache());
+                if n.len() >= DNS_NEG_MAX {
                     n.retain(|_, t| t.elapsed() < DNS_NEG_TTL);
                 }
+                if n.len() < DNS_NEG_MAX {
+                    n.insert(key.to_owned(), Instant::now());
+                }
             }
+            drop(cleanup);
             anyhow::bail!("{msg}")
         }
     }
@@ -656,6 +778,8 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || (v.octets()[0] == 203 && v.octets()[1] == 0 && v.octets()[2] == 113)
                 // 192.88.99.0/24 6to4 relay (deprecated, never a dial target)
                 || (v.octets()[0] == 192 && v.octets()[1] == 88 && v.octets()[2] == 99)
+                // 192.175.48.0/24 AS112 direct-delegation anycast
+                || (v.octets()[0] == 192 && v.octets()[1] == 175 && v.octets()[2] == 48)
                 // 240.0.0.0/4 reserved (240-255)
                 || (v.octets()[0] >= 240))
         }
@@ -700,8 +824,9 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || (s[0] == 0x2001 && s[1] == 0x0002)
                 // 3fff::/20 documentation (RFC 9637)
                 || ((s[0] & 0xfff0) == 0x3ff0)
-                // 2001:10::/28 ORCHIDv2 (RFC7343, non-routable)
-                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010)
+                // 2001:10::/28 ORCHIDv1 and 2001:20::/28 ORCHIDv2 (RFC 7343)
+                || (s[0] == 0x2001
+                    && (((s[1] & 0xfff0) == 0x0010) || ((s[1] & 0xfff0) == 0x0020)))
                 || ((s[0] & 0xffc0) == 0xfec0))
         }
     }
@@ -784,24 +909,37 @@ pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::Udp
     // a second instance bind the same port and silently steal packets.
     s.set_nonblocking(true)?;
     if s.set_send_buffer_size(buf).is_err() {
-        tracing::warn!("udp send buffer {} unavailable (raise net.core.wmem_max)", buf);
+        tracing::debug!("udp send buffer {buf} unavailable (raise net.core.wmem_max)");
     }
     if s.set_recv_buffer_size(buf).is_err() {
-        tracing::warn!("udp recv buffer {} unavailable (raise net.core.rmem_max)", buf);
+        tracing::debug!("udp recv buffer {buf} unavailable (raise net.core.rmem_max)");
     }
-    // Linux/macOS silently clamp to net.core.{w,r}mem_max; surface the real value.
+    // Linux/macOS silently clamp to net.core.{w,r}mem_max; surface the real
+    // value once per process — these calls run for every UDP session socket,
+    // so warning per socket would flood the log on routers with default
+    // (small) rmem_max/wmem_max.
     if let Ok(actual) = s.send_buffer_size() {
         if actual < buf {
-            tracing::warn!("udp send buffer clamped to {actual} (< {buf}); raise net.core.wmem_max");
+            warn_buf_clamped("send", actual, buf);
         }
     }
     if let Ok(actual) = s.recv_buffer_size() {
         if actual < buf {
-            tracing::warn!("udp recv buffer clamped to {actual} (< {buf}); raise net.core.rmem_max");
+            warn_buf_clamped("recv", actual, buf);
         }
     }
     s.bind(&addr.into())?;
     Ok(s.into())
+}
+
+fn warn_buf_clamped(which: &str, actual: usize, want: usize) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let sysctl = if which == "send" { "wmem_max" } else { "rmem_max" };
+        tracing::warn!(
+            "udp {which} buffer clamped to {actual} (< {want}); raise net.core.{sysctl}; further buffer warnings suppressed"
+        );
+    }
 }
 
 /// Dual-stack TCP listener (V6ONLY=0 when bound to ::).
@@ -896,7 +1034,7 @@ pub async fn copy_tcp_quic_idle(
             }
             total += n as u64;
             chunks += 1;
-            if chunks % 8 == 0 {
+            if chunks.is_multiple_of(8) {
                 touch(&l1, &b1);
             } else {
                 let now = b1.elapsed().as_millis() as u64;
@@ -936,7 +1074,7 @@ pub async fn copy_tcp_quic_idle(
             }
             total += n as u64;
             chunks += 1;
-            if chunks % 8 == 0 {
+            if chunks.is_multiple_of(8) {
                 touch(&l2, &b2);
             } else {
                 let now = b2.elapsed().as_millis() as u64;
@@ -1020,5 +1158,25 @@ mod tests {
         // Newly covered documentation/benchmark prefixes.
         assert!(!is_global_ip("2001:2::1".parse().unwrap()));
         assert!(!is_global_ip("3fff::1".parse().unwrap()));
+        // ORCHIDv1/v2 + AS112.
+        assert!(!is_global_ip("2001:10::1".parse().unwrap()));
+        assert!(!is_global_ip("2001:20::1".parse().unwrap()));
+        assert!(!is_global_ip("192.175.48.1".parse().unwrap()));
+        assert!(is_global_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn dns_key_is_injective() {
+        let mut a = [0u8; DNS_KEY_BUF];
+        let mut b = [0u8; DNS_KEY_BUF];
+        let k1 = dns_key("example.com", 443, &mut a).unwrap();
+        let k2 = dns_key("example.com", 80, &mut b).unwrap();
+        assert_ne!(k1, k2);
+        // A host containing the separator is still unambiguous: the split is
+        // always at the last NUL, which the decimal port can never contain.
+        let mut c = [0u8; DNS_KEY_BUF];
+        let k3 = dns_key("a\0b", 1, &mut c).unwrap();
+        assert_eq!(k3, "a\u{0}b\u{0}1");
+        assert_eq!(dns_key("same", 1, &mut a).unwrap(), "same\u{0}1");
     }
 }
