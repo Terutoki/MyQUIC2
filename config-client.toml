@@ -7,3 +7,5 @@ congestion = "bbr"
 gso = true
 keep_alive_secs = 5
 reconnect_timeout_secs = 5
+# Must match the server's auth_token (empty on both sides = no auth).
+auth_token = "change-me-6b1f0c2d47a9"

@@ -1,7 +1,17 @@
 //! 0-RTT end-to-end probe: connect twice to the SAME server process.
 //! First connection fetches resumption tickets; second must offer 0-RTT early data.
+//! Usage: zero_rtt_probe [server_addr] [sni] [auth_token]
+//! (auth_token also read from MYQUIC2_AUTH_TOKEN; must match the server config)
 use myquic2::*;
 use std::net::SocketAddr;
+
+async fn authenticate(conn: &quinn::Connection, token: &str) -> anyhow::Result<()> {
+    // `write_all` is inherent on quinn's SendStream (no AsyncWriteExt needed).
+    let mut uni = conn.open_uni().await?;
+    uni.write_all(token.as_bytes()).await?;
+    uni.finish().ok();
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -21,8 +31,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:8443".into())
         .parse()?;
     let sni: String = std::env::args().nth(2).unwrap_or_else(|| "test.com".into());
+    let token: String = std::env::args()
+        .nth(3)
+        .or_else(|| std::env::var("MYQUIC2_AUTH_TOKEN").ok())
+        .unwrap_or_default();
 
     let c1 = ep.connect(server, &sni)?.await?;
+    authenticate(&c1, &token).await?;
     println!("conn1: full handshake ok");
     // Keep conn1 OPEN while conn2 is attempted: mirrors quinn's own zero_rtt test,
     // which exchanges 1-RTT data first so NewSessionTickets are guaranteed delivered.
@@ -31,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let connecting = ep.connect(server, &sni)?;
     match connecting.into_0rtt() {
         Ok((c2, accepted)) => {
+            authenticate(&c2, &token).await?;
             println!("conn2: client HAD resumption tickets, 0-RTT offered");
             // Send application data immediately, before handshake completes.
             let (mut send, mut recv) = c2.open_bi().await?;

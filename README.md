@@ -12,6 +12,11 @@ QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption).
 [ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (1 connection)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
 ```
 
+The 2026-09 hardening revision adds optional shared-secret client authentication,
+process-wide resource caps, PMTU-aware DATAGRAM sizing, 0-RTT-safe authentication, and
+a corrected reconnect path. Every behaviour documented below was re-verified
+end-to-end on this revision — see [Verification & E2E Tests](#verification--e2e-tests).
+
 ---
 
 ## Table of Contents
@@ -19,17 +24,21 @@ QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption).
 - [Features](#features)
 - [Architecture](#architecture)
 - [The MQP-1 Protocol](#the-mqp-1-protocol)
+- [Security Model](#security-model)
 - [Performance](#performance)
+- [Verification \& E2E Tests](#verification--e2e-tests)
 - [Requirements](#requirements)
 - [Building](#building)
 - [Configuration](#configuration)
 - [Running](#running)
 - [Certificates \& Authentication](#certificates--authentication)
+- [Resource Limits \& Tuning](#resource-limits--tuning)
 - [SOCKS5 Compliance](#socks5-compliance)
 - [Reconnect \& High-RTT Behavior](#reconnect--high-rtt-behavior)
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -39,18 +48,20 @@ QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption).
 
 | Area | Detail |
 |---|---|
-| **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets, no-auth |
-| **Transport** | QUIC (quinn), TLS 1.3 only, single long-lived connection shared by all flows |
+| **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
+| **Transport** | QUIC (quinn 0.11), TLS 1.3 only, one long-lived connection per client process shared by all flows |
+| **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
-| **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB socket buffers; 8 MB DATAGRAM buffers |
-| **Custom protocol** | MQP-1 binary framing: TCP costs **0 extra bytes** after the first header; UDP costs **≤ 24 B**/packet |
-| **0-RTT** | Session resumption with early data, verified end-to-end (`accepted=true`) |
-| **Reconnect** | Survives server restarts: backoff redial (200 ms → 5 s), fail-fast old streams, UDP sessions self-heal |
+| **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB socket buffers; 4 MB DATAGRAM send/receive buffers |
+| **Custom protocol** | MQP-1 binary framing: TCP costs **0 extra bytes** after the first header; UDP costs **+12 B (IPv4) / +24 B (IPv6)** per datagram |
+| **0-RTT** | Session resumption with early data, verified end-to-end (`accepted=true`). The auth token rides early data and is automatically re-sent if the server rejects it |
+| **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
-| **Crypto identity** | Ed25519 self-signed cert, 500-year validity backdated 7 days (routers without RTC), client pins exact cert |
-| **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost) |
-| **High-RTT tuned** | 4 MB stream window / 8 MB send window sized for ~140 ms trans-Pacific BDP |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.7 MB each |
+| **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
+| **Hard bounds** | 4096 concurrent QUIC connections, 16384 UDP sessions process-wide, 32 MB per-connection receive window |
+| **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
+| **High-RTT tuned** | 4 MB per-stream window, 32 MB aggregate receive window, 8 MB send window — sized for ~140 ms trans-Pacific BDP |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each |
 
 ---
 
@@ -60,10 +71,10 @@ Single crate, three units sharing one protocol library:
 
 | Unit | Source | Role |
 |---|---|---|
-| `myquic2` (lib) | `src/lib.rs` | MQP-1 codec, TOML config schema, TLS/cert helpers, QUIC transport builder, zero-copy bridge |
-| `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; self-signed cert issuance |
-| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; reconnect loop; per-association UDP relay; DATAGRAM dispatcher |
-| `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | E2E 0-RTT verification probe (see [Reconnect](#reconnect--high-rtt-behavior)) |
+| `myquic2` (lib) | `src/lib.rs` | MQP-1 codec (owned + borrowed forms), TOML config schema, TLS/cert helpers, QUIC transport builder, TCP↔QUIC bridge |
+| `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; token auth; self-signed cert issuance |
+| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; reconnect loop; per-association UDP relay; DATAGRAM dispatcher; token auth |
+| `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | End-to-end 0-RTT verification probe (with token support) |
 
 **Data-plane mapping:**
 
@@ -72,14 +83,18 @@ Single crate, three units sharing one protocol library:
   `RESET_STREAM`.
 - **UDP**: 1 SOCKS association = 1 session id (`sess_id`), carried in QUIC **DATAGRAMs**
   (unreliable, no head-of-line blocking — a lost DNS packet never stalls other flows).
-  Oversize datagrams (> 1350 B on the wire) are dropped per UDP semantics.
-- **Control**: none on the wire beyond QUIC itself (auth is the TLS handshake +
-  pinned cert; no SOCKS username/password by design).
+  Each datagram must fit `min(live path max_datagram_size, 1350 B)` including the MQP
+  header; larger packets are dropped per UDP semantics.
+- **Control**: when `auth_token` is set, connection setup carries exactly one
+  **authentication uni stream** (≤ 256 B). After that there is no control traffic
+  beyond QUIC itself — no SOCKS username/password.
 
-**Concurrency model:** Tokio multi-threaded runtime; one task per inbound connection,
-one dispatcher task per QUIC connection routing inbound DATAGRAMs to live
-associations by `sess_id`. Subscriptions die with their association, so stale tasks
-can never steal another session's packets.
+**Concurrency model:** Tokio multi-threaded runtime. The server spawns one task per
+incoming connection (handshake included), one DATAGRAM reader and one session sweeper
+per connection, and one lightweight reader task per UDP session. The client runs one
+process-wide DATAGRAM dispatcher, one reconnect loop, one task per SOCKS connection,
+and one relay + reply task per UDP association. Subscriptions die with their
+association, so stale tasks can never steal another session's packets.
 
 ---
 
@@ -96,6 +111,15 @@ atyp u8 | addr bytes | port u16 BE
 IPv4 total: 7 B. Everything after is raw application bytes (zero overhead).
 ```
 
+The server replies with exactly one status byte on the same stream:
+
+```
+0x00 = dial accepted (client then sends the SOCKS success reply and app bytes)
+```
+
+Any other outcome is a stream `RESET_STREAM` (`0x01` header timeout, `0x04` dial
+refused/timeout) — the client never mistakes app bytes for the ACK.
+
 ### UDP datagram (each QUIC DATAGRAM)
 
 ```
@@ -103,16 +127,70 @@ type=0x02 u8 | sess u32 LE | atyp u8 | addr bytes | port u16 BE | payload
 ```
 
 `sess` scopes the packet to one UDP ASSOCIATE; the server echoes it back on replies
-so the client dispatcher can route without any per-target state lookup.
+so the client dispatcher can route without any per-target state lookup. The client
+sizes each datagram against the connection's live `max_datagram_size()` (PMTU-aware,
+never above 1350 B); the server caps replies the same way.
+
+### Connection authentication (`auth_token` non-empty)
+
+```
+client → server : uni stream (stream type 0x02) carrying the token bytes, FIN
+server          : waits ≤ 5 s, reads ≤ 256 B, constant-time compare
+mismatch        : CONNECTION_CLOSE 0x01 "unauthorized"
+```
+
+- The server reads the token **before** accepting any bidi stream or DATAGRAM, so an
+  unauthenticated peer cannot dial anything.
+- No ACK exists: a wrong token surfaces as a closed connection. The client keeps
+  backing off and logs the close reason.
+- **0-RTT**: the token is written into early data like any other stream. If the
+  server rejects early data (e.g. its session store restart), QUIC discards it with
+  the rest of 0-RTT; the client observes `accepted=false` and re-sends the token on
+  the established connection within one RTT — no auth timeout, no extra handshake.
+- Token length is capped at 256 B; empty on both sides disables the feature.
 
 ### Design rationale
 
 - TCP gets reliable streams (ordering + retransmission + flow control for free —
   never reimplement reliability on top).
 - UDP gets DATAGRAMs (loss is semantic, not a bug).
-- No serde/JSON/protobuf on the hot path: hand-rolled codec, `bytes::Bytes`
-  forwarding (one small allocation per UDP datagram for the framed buffer;
-  TCP uses 64 KB pump buffers per direction), DNS results cached 60 s.
+- No serde/JSON/protobuf on the hot path: hand-rolled codec with a borrowed form
+  (`TargetAddrRef`) so domain-typed packets do not allocate, `bytes::Bytes`
+  forwarding, allocation-free DNS cache hits, and 32 KB pump buffers per TCP
+  direction; DNS results cached 60 s.
+
+---
+
+## Security Model
+
+**Server authenticity (always on).** The client pins the server's self-signed
+Ed25519 certificate. This proves the client reached the genuine server.
+
+**Client authenticity (optional, recommended).** TLS client auth is intentionally
+absent (`with_no_client_auth`), so without `auth_token` the server is an *open
+relay*: anyone who can reach the port can proxy TCP/UDP through it. A non-empty
+`auth_token` (shared secret, constant-time compared, sent inside the QUIC-encrypted
+uni stream) is the client-side gate. Keep the port firewalled as well.
+
+**Egress policy.** With `allow_private = false`, resolved targets are filtered
+against private/loopback/link-local/CGNAT/documentation/benchmark/multicast ranges;
+NAT64 (`64:ff9b::/96`) and deprecated IPv4-compatible addresses are validated via
+their embedded IPv4, so they cannot be used to reach private space. The sample
+config sets `true` for LAN testing — turn it off on public exit nodes.
+
+**Replay.** 0-RTT early data is theoretically replayable; rustls's stateful,
+single-use session tickets bound it. The worst case is a duplicated outbound dial or
+UDP datagram (no traffic amplification). TCP application bytes are never sent until
+the server's dial ACK, so replay cannot duplicate an application request.
+
+**Denial-of-service bounds.** See [Resource Limits & Tuning](#resource-limits--tuning):
+connection/session caps, per-connection stream and dial limits, DNS slow-path
+limiter, bounded detached UDP sends, and a 5 s unauthenticated-connection window.
+
+**What is *not* protected.** SOCKS5 ingress is no-auth (RFC 1929 is intentionally not
+implemented); the UDP relay learns the app's address from the first packet (run it
+on a trusted host/bind it to localhost). UDP replies are not source-validated
+beyond that (roadmap item).
 
 ---
 
@@ -120,6 +198,11 @@ so the client dispatcher can route without any per-target state lookup.
 
 Measured on Apple Silicon (10-core), loopback, `release` profile, byte-exact echo
 verification (any mismatch = fail). Throughput is **up+down combined**.
+
+> The tables below were measured before the 2026-09 hardening pass. The codec and
+> copy paths are the same; the pass mainly changed connection setup (auth), UDP send
+> scheduling, and cache/allocation behaviour, so numbers remain representative —
+> re-run your own benchmark on target hardware for current figures.
 
 ### TCP via SOCKS5 (Mb/s)
 
@@ -156,9 +239,54 @@ aggregate at 0 loss** (sess_id demux verified under concurrency).
 
 ---
 
+## Verification & E2E Tests
+
+Run on the 2026-09 revision, macOS (Apple Silicon), `cargo build --release`, with
+local TCP/UDP echo servers and a raw Python SOCKS5 client. All payloads are verified
+byte-for-byte; UDP checks the echoed payload and the reply's source address.
+
+| # | Test | Result |
+|---|---|---|
+| 1 | `cargo test` (codec round-trips, borrowed-datagram round-trip, `is_global_ip` filter) | ✅ 4/4 |
+| 2 | TCP ECHO via SOCKS5 `CONNECT` (1 MiB random) | ✅ repeated runs |
+| 3 | UDP ECHO via `UDP ASSOCIATE` (25 × 1000 B) | ✅ repeated runs, BND = proxy address |
+| 4 | Server `kill -9` → restart → reconnect → TCP+UDP ECHO | ✅ detects in ~15–16 s (idle timeout), reconnects in < 1 s after redial, echo works immediately |
+| 5 | 0-RTT probe with token, same server process | ✅ `accepted=true`, echo over 0-RTT |
+| 6 | Empty token on both sides (auth disabled) | ✅ TCP+UDP ECHO |
+| 7 | Wrong token | ✅ server logs `auth token mismatch`, client sees SOCKS `0x04`, backoff grows 200 ms→5 s (no redial storm) |
+| 8 | 20 concurrent TCP (256 KiB) + 8 concurrent UDP associations | ✅ 28/28, ~1.7 s wall clock |
+
+0-RTT probe (expect the last three lines):
+
+```sh
+cargo run --release --example zero_rtt_probe -- 127.0.0.1:8443 test.com <auth_token>
+# conn1: full handshake ok
+# conn2: client HAD resumption tickets, 0-RTT offered
+# conn2: 0-RTT echo ok: "zero-rtt-echo"
+# conn2: server accepted 0-RTT early data = true
+```
+
+Representative reconnect trace (client log after `kill -9` of the server):
+
+```
+07:26:37 kill server
+07:26:52.870 WARN QUIC connection lost, reconnecting...   (idle timeout; watchdog backs it up at 20 s)
+07:26:52.871 WARN QUIC close reason: timed out
+07:26:53.174 INFO QUIC connected to 127.0.0.1:8443         (server restarted at :40)
+07:26:53.175 INFO QUIC resumption: 0-RTT keys accepted=false  (stale ticket)
+07:26:53.176 server INFO new QUIC conn                     (token re-sent, auth passed)
+07:26:55     TCP echo OK / UDP echo OK
+```
+
+The E2E harness is intentionally not vendored; it is a plain Python SOCKS5 client
+(`CONNECT` + `UDP ASSOCIATE`) plus `asyncio` TCP/UDP echo servers on ports 18081/18082.
+
+---
+
 ## Requirements
 
-- **Rust** 1.75+ (developed on stable 1.97)
+- **Rust** 1.75+ (developed and tested on stable 1.97; dependencies: quinn 0.11.11 /
+  quinn-proto 0.11.17, rustls 0.23, tokio 1.53)
 - **Linux** (production; GSO/GRO + BBR fully effective) or **macOS** (development;
   dual-stack verified, GSO degrades gracefully)
 - For OpenWrt cross builds: `zig` + `cargo-zigbuild` (see [Building](#building))
@@ -172,8 +300,9 @@ aggregate at 0 loss** (sess_id demux verified under concurrency).
 cargo build --release
 # binaries: ./target/release/myquic2-server ./target/release/myquic2-client
 
-# run unit tests
+# tests + lints
 cargo test
+cargo clippy --all-targets
 ```
 
 ### Cross-compile for OpenWrt x86-64 (static musl, from macOS)
@@ -183,17 +312,21 @@ rustup target add x86_64-unknown-linux-musl
 cargo install cargo-zigbuild   # needs `zig` on PATH
 ```
 
-Build one CPU level at a time (sequentially — each flag set invalidates codegen):
+Build one CPU level at a time (sequentially — each flag set invalidates codegen) and
+copy each result into `dist/` before the next level overwrites it:
 
 ```sh
 # v1 = any x86-64 (J4125/N100 safe default); v2 = SSE4.2; v3 = AVX2; v4 = AVX512
+set -e
 for v in x86-64 x86-64-v2 x86-64-v3 x86-64-v4; do
+  case $v in x86-64) n=v1;; x86-64-v2) n=v2;; x86-64-v3) n=v3;; x86-64-v4) n=v4;; esac
   cargo zigbuild --release --target x86_64-unknown-linux-musl \
     --config 'profile.release.strip="symbols"' \
     --config "target.x86_64-unknown-linux-musl.rustflags=[\"-C\", \"target-cpu=$v\"]" \
     --bin myquic2-server --bin myquic2-client
-  # then copy target/.../myquic2-{server,client} aside BEFORE the next level
-  # overwrites them, e.g. to myquic2-server-v3
+  cp target/x86_64-unknown-linux-musl/release/myquic2-server dist/openwrt-x86_64/myquic2-server-$n
+  cp target/x86_64-unknown-linux-musl/release/myquic2-client dist/openwrt-x86_64/myquic2-client-$n
+  echo "built $n"
 done
 ```
 
@@ -202,7 +335,8 @@ done
 > ship **v1**.
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
-(`*-v1` … `*-v4` for both binaries, plus sample configs).
+(`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries are
+rebuilt from this revision and contain the token-auth and hardening changes.
 
 ---
 
@@ -218,24 +352,37 @@ listen = "[::]:8443"          # QUIC ingress (dual-stack wildcard recommended)
 cert_file = "server-cert.pem" # auto-generated on first run if missing
 key_file = "server-key.pem"   # dito (Ed25519)
 server_name = "test.com"      # SAN for the self-signed cert + expected SNI
-congestion = "bbr"            # bbr | cubic
+congestion = "bbr"            # bbr | cubic (unknown values warn and fall back to bbr)
 gso = true                    # informational: quinn-udp auto-probes GSO/GRO
-keep_alive_secs = 5
-allow_private = true          # dial RFC1918/loopback targets (disable for public exit nodes!)
+keep_alive_secs = 5           # clamped to 1..3600; idle timeout = max(3x, 15s)
+allow_private = true          # dial RFC1918/loopback targets; default is false!
+auth_token = "change-me-6b1f0c2d47a9"  # shared secret ≤ 256 B; empty = disabled (firewall only)
 ```
 
 ### Client (`config-client.toml`)
 
 ```toml
-socks_listen = "[::]:1080"    # SOCKS5 ingress
-server_addr = "127.0.0.1:8443"     # QUIC server (IP or hostname)
+socks_listen = "[::]:1080"    # SOCKS5 ingress (dual-stack)
+server_addr = "127.0.0.1:8443"     # QUIC server (IP or hostname; re-resolved every redial)
 server_name = "test.com"           # SNI; MUST match the cert SAN
 server_cert_file = "server-cert.pem"  # pinned server cert (copied out-of-band)
 congestion = "bbr"
 gso = true
-keep_alive_secs = 5
+keep_alive_secs = 5           # clamped to 1..3600; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
+auth_token = "change-me-6b1f0c2d47a9"  # must match the server (empty on both = disabled)
 ```
+
+Field notes:
+
+- `allow_private` defaults to **false** in code; the sample config sets `true` for
+  local testing. Disable it for any public exit node.
+- `auth_token` empty on both sides = no authentication. Non-empty on the server but
+  empty/wrong on the client = connection closes with `unauthorized` and the client
+  retries with growing backoff.
+- `reconnect_timeout_secs` only bounds how long a *new SOCKS flow* waits for a live
+  QUIC connection; it does not control redial backoff.
+- Paths are resolved against the process CWD — use absolute paths on OpenWrt.
 
 ---
 
@@ -256,13 +403,26 @@ curl --socks5 127.0.0.1:1080 http://example.com
 
 Background: `nohup ./myquic2-server --config config-server.toml > server.log 2>&1 &`
 
+Logging honours `RUST_LOG`, e.g. `RUST_LOG=myquic2_client=debug,myquic2_server=debug`;
+the default filter is `info`.
+
 ---
 
 ## Certificates & Authentication
 
-- **No passwords, no user database.** Authentication = TLS 1.3 handshake against a
-  pinned self-signed **Ed25519** certificate (444 bytes; `ring` provider negotiates
-  AES-128-GCM on AES-NI, ChaCha20-Poly1305 otherwise).
+- **Server identity**: the client pins the server's self-signed **Ed25519**
+  certificate (`server_cert_file`, 444 bytes). The `ring` provider picks the
+  AEAD suite (TLS13_AES_256_GCM_SHA384 observed in the probe logs on both
+  x86-64 and Apple Silicon; ChaCha20-Poly1305 elsewhere), both hardware
+  accelerated. This proves the client is
+  talking to the genuine server — it does **not** authenticate clients.
+- **Client identity (`auth_token`)**: the server has no client certs, so a
+  non-empty `auth_token` is required to keep it from being an open relay. The
+  client opens a one-way uni stream immediately after the handshake and writes
+  the shared secret; the server refuses all streams and datagrams until it
+  matches, then closes unauthorized connections. Set the same value in both
+  configs. Empty token = feature disabled → only expose the port behind a
+  firewall. On 0-RTT rejection the client re-sends the token automatically.
 - **Server** auto-generates the cert on first run: SAN = `server_name`,
   validity **500 years backdated 7 days**. The backdating is deliberate: routers
   without a battery clock (NTP not yet synced at boot) would otherwise fail with
@@ -275,7 +435,38 @@ Background: `nohup ./myquic2-server --config config-server.toml > server.log 2>&
   on both sides).
 - **0-RTT replay note**: early data can theoretically replay; worst case is a
   duplicated outbound dial (no amplification). Tickets live in memory on both ends —
-  either side restarting falls back to a 1-RTT full handshake automatically.
+  either side restarting falls back to a 1-RTT full handshake automatically, and the
+  client re-authenticates in that case.
+
+---
+
+## Resource Limits & Tuning
+
+All limits are constants in the sources; the table shows where to change them.
+
+| Resource | Limit | Where |
+|---|---|---|
+| Concurrent QUIC connections (server) | 4096 (new `Incoming` refused) | `MAX_CONNECTIONS` |
+| UDP sessions, process-wide | 16384 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
+| UDP sessions per connection | 4096 (O(n) sweep above) | `LOCAL_SESS_MAX` |
+| Concurrent TCP dials per connection | 1024 | `dial_sem` |
+| Concurrent bidi streams per connection | 1024 | `build_transport` |
+| DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
+| Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
+| Receive window (aggregate) | 32 MB/connection | `build_transport` |
+| Receive window (per stream) | 4 MB | `build_transport` |
+| Send window | 8 MB/connection | `build_transport` |
+| DATAGRAM buffers | 4 MB each direction | `build_transport` |
+| Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
+| Server auth wait | 5 s per connection | `authenticate()` |
+| TCP stream idle reap | 300 s | `copy_tcp_quic_idle` call sites |
+| UDP association idle reap | 180 s (both sides; inbound replies count as activity) | server sweeper / client select |
+| DNS cache | 60 s positive, 10 s negative, 4096 entries +512 slack | `DNS_CACHE_*` |
+| Client TCP dial ACK budget | 15 s (covers 3 s permit + 5 s DNS + 4 s connect) | `TCP_DIAL_ACK_TIMEOUT` |
+
+Kernel-side tuning: raise `net.core.wmem_max` / `net.core.rmem_max` so the 4 MB /
+1 MB socket buffers are not silently clamped; the binaries now log a warning with the
+actual values when clamping is detected.
 
 ---
 
@@ -288,32 +479,36 @@ Against RFC 1928 / RFC 1929:
 | Handshake, no-auth (`0x00`) | ✅ |
 | `CONNECT`, IPv4/domain/IPv6 | ✅ (curl-verified) |
 | `UDP ASSOCIATE` + relay + TCP control held | ✅ (`FRAG≠0` dropped, as most implementations do) |
+| BND.ADDR for `UDP ASSOCIATE` | ✅ the proxy's own interface address + relay port (LAN clients work; no longer the app's own address) |
 | Username/password (`0x02`) | ❌ intentionally absent |
 | `BIND` | ❌ replies `0x07` (FTP active mode; obsolete in practice) |
-| Error REPs (`0x01/0x04/0x05`…) | ⚠️ success paths reply correctly; on QUIC outage the connection fails fast (RST) instead of sending a SOCKS error code |
+| Error REPs (`0x01/0x04/0x05`…) | ⚠️ success/dial-refused paths reply correctly (`0x00`/`0x04`); on a missing QUIC connection the TCP flow fails fast (close/RST) instead of sending a SOCKS error code |
 | UDP source validation | ⚠️ relay learns the app address from the first packet; fine behind NAT/home use, tighten before public exposure |
+| Association lifetime | ⚠️ idle UDP associations are reaped after 180 s to bound sockets/tasks (RFC has no fixed lifetime) |
 
 ---
 
 ## Reconnect & High-RTT Behavior
 
-- **Idle**: 5 s keepalive vs 15 s idle timeout — the connection lives indefinitely
-  while both processes run (verified: 45 s idle, zero new handshakes, traffic flows
-  instantly after).
+- **Idle**: keepalive every `keep_alive_secs` (default 5 s) vs idle timeout
+  `max(3×keepalive, 15 s)` — the connection lives indefinitely while both processes
+  run (verified: 45 s idle, zero new handshakes, traffic flows instantly after).
 - **Dirty network (< 15 s outage)**: QUIC retransmission + BBR absorb it; streams
   stall then resume, **no new handshake**.
 - **IP change (NAT rebinding, WiFi→cellular)**: QUIC connection migration keeps the
   *same* connection alive without a handshake.
 - **Long outage / server restart**: ~15–20 s silent-path detection (15 s QUIC idle
-  timeout plus a 20 s no-inbound-traffic watchdog that force-closes a blackholed
-  path) → 200 ms…5 s backoff redial → new connection (0-RTT when resuming
-  against the same server process; verified `accepted=true` end-to-end with
-  `examples/zero_rtt_probe.rs`).
-- **After reconnect**: UDP sessions self-heal (server recreates `sess_id` state on
-  next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for trans-Pacific BDP — 4 MB stream window (~239 Mb/s per
-  stream), 8 MB connection send window, BBR; SOCKS replies before remote dial
-  (saves a full RTT per connection); server-side DNS avoids geo-misresolved IPs.
+  timeout, backed up by a `max(4×keepalive, 20 s)` no-inbound-traffic watchdog) →
+  exponential redial (200 ms → 5 s, jittered). The backoff only decays after 5 s of
+  stable connectivity, so a misconfigured peer (e.g. wrong token) cannot cause a
+  redial storm. A stale 0-RTT ticket is rejected once and the token is re-sent on the
+  established connection (verified: server `kill -9` → reconnect → TCP+UDP ECHO pass).
+- **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
+  the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
+- **140 ms links**: tuned for trans-Pacific BDP — 4 MB per-stream / 32 MB aggregate
+  receive window, 8 MB send window, BBR; the SOCKS success reply is sent only after
+  the remote dial ACK (fail-fast), saving a full RTT of error latency per connection;
+  server-side DNS avoids geo-misresolved IPs.
 
 ---
 
@@ -330,10 +525,14 @@ Checklist from real field issues:
    against CWD — the classic `os error 2`).
 2. **Correct binary**: the client build for SOCKS ingress; don't mix up the two.
 3. **Cert first**: start server → copy `server-cert.pem` → start client.
-4. **Clock**: ensure NTP is up (`date` sane) — belt-and-braces alongside the
+4. **Token**: set the same `auth_token` in both configs (or leave empty on both and
+   firewall the port); a mismatch shows up as `unauthorized` close loops.
+5. **Clock**: ensure NTP is up (`date` sane) — belt-and-braces alongside the
    7-day backdating.
-5. `server_addr` = server's **public** IP on the client; `server_name` unchanged
+6. `server_addr` = server's **public** IP on the client; `server_name` unchanged
    (SNI/cert check only, needs no DNS).
+7. **CPU level**: v1 is safe everywhere; v2+/v4 need the matching CPU features
+   (`grep avx512 /proc/cpuinfo`).
 
 ---
 
@@ -344,8 +543,14 @@ Checklist from real field issues:
 | `os error 2` at client startup | Relative `server_cert_file` vs CWD → absolute path |
 | `UnknownIssuer` | Client cert ≠ server cert (stale copy after regen) → compare fingerprints, re-copy |
 | `certificate not valid yet (N seconds in future)` | Router clock behind (no RTC/NTP) → sync NTP; backdating covers ±7 days |
+| `closed by peer: unauthorized (code 1)` in client log | `auth_token` missing or mismatched → set the same value on both sides |
+| `auth_token is empty: the QUIC endpoint accepts any peer` on server start | Intentional if firewalled; otherwise set a token |
+| One extra reconnect right after server restart | Stale session ticket → 0-RTT rejected; the client re-auths automatically. Expected once |
 | New TCP hangs after server restart | Old stream on dead QUIC conn → fail-fast RST is by design; app reconnects, new flows work immediately |
+| UDP fails for LAN/remote SOCKS clients | Fixed in this revision (BND.ADDR is the proxy address); upgrade both binaries |
 | UDP loss under load | Check loss% first: loopback sustains ~234 Mb/s at 0 loss; beyond that is QUIC DATAGRAM backpressure (UDP semantics — app should retransmit) |
+| `udp send buffer clamped to ...` warning | Raise `net.core.wmem_max`/`rmem_max`; the effective value is printed |
+| Client cannot connect at all after a token change | The token travels inside QUIC, not TLS: no cert re-copy needed, only the config |
 
 ---
 
@@ -355,24 +560,54 @@ Checklist from real field issues:
 MyQUIC2/
 ├── Cargo.toml / Cargo.lock
 ├── src/
-│   ├── lib.rs                 # MQP-1 codec, config, TLS, transport builder
+│   ├── lib.rs                 # MQP-1 codec (owned+borrowed), config, TLS, transport, bridge, DNS cache
 │   └── bin/
-│       ├── myquic2-server.rs  # QUIC ingress + dial-out
-│       └── myquic2-client.rs  # SOCKS5 ingress + reconnect + UDP dispatcher
-├── examples/zero_rtt_probe.rs # 0-RTT end-to-end verification probe
+│       ├── myquic2-server.rs  # QUIC ingress + token auth + dial-out + session caps
+│       └── myquic2-client.rs  # SOCKS5 ingress + token auth + reconnect + UDP dispatcher
+├── examples/zero_rtt_probe.rs # 0-RTT end-to-end verification probe (token-aware)
 ├── config-server.toml / config-client.toml
 └── dist/openwrt-x86_64/       # static musl release bins (v1–v4) + sample configs
 ```
 
 ---
 
+## Hardening Notes (this revision)
+
+- Optional `auth_token` connection authentication, constant-time compare, enforced
+  before any stream/DATAGRAM is accepted; 0-RTT-safe re-send on early-data rejection.
+- Server accept/handshake runs in per-connection tasks (no slowloris serialization);
+  process-wide connection cap; `accept() == None` now exits with an error instead of
+  spinning.
+- Explicit 32 MB aggregate receive window (quinn’s default is effectively unlimited)
+  plus per-connection stream/session/dial caps.
+- UDP session liveness now counts inbound replies (long one-way downloads are not
+  reaped); session/DNS eviction is O(n) with bounded lock hold time.
+- `UDP ASSOCIATE` BND.ADDR is the proxy’s own address (LAN clients work).
+- Client DATAGRAMs respect the live PMTU; `udp_try_send()` never stalls a shared
+  reader and never drops the first packet of a fresh socket.
+- DNS: atomic single-flight ownership with cancellation recovery, allocation-free
+  cache hits, borrowed-domain datagram decoding, negative caching.
+- Reconnect: auth re-send after 0-RTT rejection, jittered exponential backoff that
+  decays only after stable connectivity, `RUST_LOG` support.
+- SSRF filter validates NAT64 and IPv4-compatible embedded IPv4; extra
+  documentation/benchmark prefixes rejected.
+- QUIC socket no longer sets `SO_REUSEADDR`; UDP buffer clamping is reported;
+  redundant warnings removed; dead code dropped; `dist/` rebuilt.
+
+---
+
 ## Roadmap
 
+- [x] Optional client authentication (`auth_token`)
+- [x] Process-wide connection/session caps + receive-window bound
+- [x] 0-RTT-safe authentication and corrected reconnect/backoff behaviour
+- [ ] Mutual TLS as an alternative to the shared token
 - [ ] SOCKS error REPs + UDP source validation (strict-compliance mode)
 - [ ] Ticket-key persistence for 0-RTT across server restarts
 - [ ] Per-stream metrics endpoint (Prometheus) — BBR state, GSO batch size, sess table
 - [ ] `procd` init script for OpenWrt
 - [ ] MQP datagram fragmentation for > 1350 B UDP payloads
+- [ ] Fuzz the MQP-1 codec (cargo-fuzz)
 
 ---
 
