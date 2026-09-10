@@ -204,7 +204,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
 
     // TCP: one QUIC bidi stream per connection. First bytes = MQP addr header.
     // Bound concurrent dials so fast open/close cannot exhaust FDs/DNS.
-    let dial_sem = Arc::new(tokio::sync::Semaphore::new(512));
+    let dial_sem = Arc::new(tokio::sync::Semaphore::new(1024));
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(x) => x,

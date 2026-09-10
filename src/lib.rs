@@ -302,9 +302,9 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // halving per-connection memory vs 8MB (100 server-side conns ≈ 800MB→400MB).
     t.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
     t.datagram_send_buffer_size(4 * 1024 * 1024);
-    // 512 concurrent streams cover the 500-flow test with margin while bounding
+    // 1024 concurrent streams cover high-concurrency tests with margin while bounding
     // worst-case flow-control memory (4MB window each).
-    t.max_concurrent_bidi_streams(512u32.into());
+    t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
     // 140ms trans-Pacific at 200Mb/s needs ~3.5MB BDP; 4MB per-stream window
     // covers it, and the 8MB connection window still allows two fast streams
@@ -384,7 +384,7 @@ fn dns_inflight() -> &'static tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInf
 pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
-    LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)))
+    LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1024)))
 }
 
 pub fn mono_millis() -> u64 {
