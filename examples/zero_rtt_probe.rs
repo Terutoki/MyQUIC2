@@ -16,24 +16,31 @@ async fn main() -> anyhow::Result<()> {
     ccfg.transport_config(build_transport("bbr", 5));
     let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
     ep.set_default_client_config(ccfg);
-    let server: SocketAddr = "127.0.0.1:8443".parse()?;
+    let server: SocketAddr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:8443".into())
+        .parse()?;
+    let sni: String = std::env::args().nth(2).unwrap_or_else(|| "test.com".into());
 
-    let c1 = ep.connect(server, "myquic2")?.await?;
+    let c1 = ep.connect(server, &sni)?.await?;
     println!("conn1: full handshake ok");
     // Keep conn1 OPEN while conn2 is attempted: mirrors quinn's own zero_rtt test,
     // which exchanges 1-RTT data first so NewSessionTickets are guaranteed delivered.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let connecting = ep.connect(server, "myquic2")?;
+    let connecting = ep.connect(server, &sni)?;
     match connecting.into_0rtt() {
         Ok((c2, accepted)) => {
             println!("conn2: client HAD resumption tickets, 0-RTT offered");
             // Send application data immediately, before handshake completes.
             let (mut send, mut recv) = c2.open_bi().await?;
             let mut hdr = Vec::new();
-            TargetAddr::Ip("127.0.0.1:18081".parse()?).encode(&mut hdr);
+            TargetAddr::Ip("127.0.0.1:18081".parse()?).encode(&mut hdr)?;
             send.write_all(&hdr).await?;
             send.write_all(b"zero-rtt-echo").await?;
+            let mut ack = [0u8; 1];
+            recv.read_exact(&mut ack).await?;
+            assert_eq!(ack[0], 0x00, "server dial refused");
             let mut buf = vec![0u8; 13];
             recv.read_exact(&mut buf).await?;
             println!("conn2: 0-RTT echo ok: {:?}", String::from_utf8_lossy(&buf));

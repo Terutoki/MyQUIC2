@@ -18,7 +18,7 @@ pub enum TargetAddr {
 }
 
 impl TargetAddr {
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
             TargetAddr::Ip(SocketAddr::V4(a)) => {
                 out.push(0x01);
@@ -26,20 +26,32 @@ impl TargetAddr {
                 out.extend_from_slice(&a.port().to_be_bytes());
             }
             TargetAddr::Ip(SocketAddr::V6(a)) => {
+                if a.ip().is_unspecified() {
+                    anyhow::bail!("refuse unspecified v6");
+                }
+                if a.scope_id() != 0 {
+                    anyhow::bail!("v6 scope_id dropped on wire, refuse scoped addr");
+                }
                 out.push(0x04);
                 out.extend_from_slice(&a.ip().octets());
                 out.extend_from_slice(&a.port().to_be_bytes());
             }
             TargetAddr::Domain(d, p) => {
-                // Domain length is a single byte on the wire; clamp to 255.
                 let bytes = d.as_bytes();
-                let n = bytes.len().min(255);
+                if bytes.is_empty() {
+                    anyhow::bail!("empty domain");
+                }
+                if bytes.len() > 255 {
+                    anyhow::bail!("domain too long");
+                }
+                let n = bytes.len();
                 out.push(0x03);
                 out.push(n as u8);
                 out.extend_from_slice(&bytes[..n]);
                 out.extend_from_slice(&p.to_be_bytes());
             }
         }
+        Ok(())
     }
 
     pub fn decode(b: &[u8]) -> Result<(Self, usize)> {
@@ -71,10 +83,15 @@ impl TargetAddr {
                     anyhow::bail!("short domain");
                 }
                 let n = b[1] as usize;
+                if n == 0 || n > 255 {
+                    anyhow::bail!("bad domain len");
+                }
                 if b.len() < 2 + n + 2 {
                     anyhow::bail!("short domain body");
                 }
-                let d = String::from_utf8(b[2..2 + n].to_vec()).context("bad domain utf8")?;
+                let d = std::str::from_utf8(&b[2..2 + n])
+                    .context("bad domain utf8")?
+                    .to_owned();
                 let port = u16::from_be_bytes([b[2 + n], b[3 + n]]);
                 Ok((TargetAddr::Domain(d, port), 4 + n))
             }
@@ -97,7 +114,9 @@ pub fn encode_datagram(sess: u32, addr: &TargetAddr, payload: &[u8]) -> Option<B
     let mut v = Vec::with_capacity(40 + payload.len());
     v.push(0x02);
     v.extend_from_slice(&sess.to_le_bytes());
-    addr.encode(&mut v);
+    if addr.encode(&mut v).is_err() {
+        return None;
+    }
     if v.len() + payload.len() > 1350 {
         return None;
     }
@@ -295,10 +314,10 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
 
 type DnsCacheKey = (String, u16);
 type DnsCacheVal = (Instant, Vec<SocketAddr>);
-fn dns_cache() -> &'static tokio::sync::Mutex<HashMap<DnsCacheKey, DnsCacheVal>> {
-    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<DnsCacheKey, DnsCacheVal>>> =
+fn dns_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>>> =
         std::sync::OnceLock::new();
-    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+    CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -307,25 +326,25 @@ const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let key: DnsCacheKey = (host.to_string(), port);
     {
-        let m = dns_cache().lock().await;
-        if let Some((t, v)) = m.get(&key) {
-            if t.elapsed() < DNS_CACHE_TTL {
-                return Ok(v.clone());
+        if let Ok(m) = dns_cache().read() {
+            if let Some((t, v)) = m.get(&key) {
+                if t.elapsed() < DNS_CACHE_TTL {
+                    return Ok(v.clone());
+                }
             }
         }
     }
     let v = resolve_all_timeout(host, port, Duration::from_secs(5)).await?;
     {
-        let mut m = dns_cache().lock().await;
-        m.insert(key, (Instant::now(), v.clone()));
-        if m.len() > 4096 {
-            // Evict an arbitrary expired-or-oldest entry to bound memory.
-            let evict = m
-                .iter()
-                .min_by_key(|(_, (t, _))| *t)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = evict {
-                m.remove(&k);
+        if let Ok(mut m) = dns_cache().write() {
+            m.insert(key, (Instant::now(), v.clone()));
+            if m.len() > 4096 {
+                m.retain(|_, (t, _)| t.elapsed() < DNS_CACHE_TTL);
+                if m.len() > 4096 {
+                    if let Some(k) = m.keys().next().cloned() {
+                        m.remove(&k);
+                    }
+                }
             }
         }
     }
@@ -362,9 +381,14 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || (v.octets()[0] == 100 && (v.octets()[1] & 0b1100_0000) == 64)
                 || (v.octets()[0] == 192 && v.octets()[1] == 0 && v.octets()[2] == 0)
                 || (v.octets()[0] == 192 && v.octets()[1] == 0 && v.octets()[2] == 2)
-                || (v.octets()[0] == 198 && (v.octets()[1] == 51 || v.octets()[1] == 18))
+                // 198.18.0.0/15 benchmarking (198.18.x + 198.19.x), TEST-NET-2 198.51.100.0/24
+                || (v.octets()[0] == 198 && (v.octets()[1] & 0xFE) == 18)
+                || (v.octets()[0] == 198
+                    && v.octets()[1] == 51
+                    && v.octets()[2] == 100)
                 || (v.octets()[0] == 203 && v.octets()[1] == 0 && v.octets()[2] == 113)
-                || (v.octets()[0] == 240))
+                // 240.0.0.0/4 reserved (240-255)
+                || (v.octets()[0] >= 240))
         }
         IpAddr::V6(v) => {
             if let Some(mapped) = v.to_ipv4_mapped() {
@@ -469,12 +493,17 @@ pub async fn copy_tcp_quic(
     }
     let c2s = async {
         let r = pump64(&mut tr, &mut send).await;
-        send.finish().ok();
+        match &r {
+            Ok(_) => send.finish().ok(),
+            Err(_) => send.reset(0x04u32.into()).ok(),
+        };
         r
     };
     let s2c = async {
         let r = pump64(&mut recv, &mut tw).await;
-        tw.shutdown().await.ok();
+        if r.is_ok() {
+            tw.shutdown().await.ok();
+        }
         r
     };
     let (a, b) = tokio::join!(c2s, s2c);
@@ -483,7 +512,10 @@ pub async fn copy_tcp_quic(
             tw.shutdown().await.ok();
         }
         (Ok(_), Err(_)) => {
-            send.finish().ok();
+            send.reset(0x04u32.into()).ok();
+        }
+        (Err(_), Err(_)) => {
+            send.reset(0x04u32.into()).ok();
         }
         _ => {}
     }
@@ -506,7 +538,7 @@ mod tests {
             TargetAddr::Domain("example.com".into(), 80),
         ] {
             let mut v = Vec::new();
-            a.encode(&mut v);
+            a.encode(&mut v).unwrap();
             let (b, n) = TargetAddr::decode(&v).unwrap();
             assert_eq!(n, v.len());
             assert_eq!(a, b);

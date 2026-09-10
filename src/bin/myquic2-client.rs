@@ -31,7 +31,7 @@ fn bump_gen(tx: &watch::Sender<u64>) {
 /// One dispatcher serves the whole process across reconnects; subscriptions
 /// die with their association, so no immortal task can steal another's packets.
 struct UdpHub {
-    subs: tokio::sync::Mutex<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
+    subs: std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
     next: std::sync::atomic::AtomicU32,
 }
 
@@ -50,12 +50,13 @@ impl UdpHub {
                 continue;
             }
             let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
-            let mut m = self.subs.lock().await;
-            if m.contains_key(&s) {
-                continue;
+            if let Ok(mut m) = self.subs.write() {
+                if m.contains_key(&s) {
+                    continue;
+                }
+                m.insert(s, tx.clone());
+                return (s, tx, rx);
             }
-            m.insert(s, tx.clone());
-            return (s, tx, rx);
         }
     }
 }
@@ -93,7 +94,7 @@ async fn main() -> Result<()> {
     // without a per-packet timer.
     let (gen_tx, gen_rx) = watch::channel(0u64);
     let hub: Arc<UdpHub> = Arc::new(UdpHub {
-        subs: tokio::sync::Mutex::new(HashMap::new()),
+        subs: std::sync::RwLock::new(HashMap::new()),
         next: std::sync::atomic::AtomicU32::new(1),
     });
     // Sole DATAGRAM reader for the process: routes by sess_id to the live association.
@@ -116,7 +117,11 @@ async fn main() -> Result<()> {
                             let sess = match decode_datagram(&d) {
                                 Ok((s, _, _)) => s, Err(_) => continue,
                             };
-                            let tx = hub.subs.lock().await.get(&sess).cloned();
+                            let tx = hub
+                                .subs
+                                .read()
+                                .ok()
+                                .and_then(|m| m.get(&sess).cloned());
                             if let Some(tx) = tx {
                                 let _ = tx.try_send(d);
                             }
@@ -334,9 +339,6 @@ async fn handle_socks(
             anyhow::bail!("unsupported cmd");
         }
     };
-    // Server-side DNS: domain is forwarded as-is for the server to resolve.
-    // Min-RTT: reply success BEFORE remote dial completes. BND must be dialable:
-    // unmap v4-mapped addrs, and never report wildcard (substitute the peer's IP).
     let bnd: SocketAddr = {
         let local = s.local_addr()?;
         let ip = unmap(local.ip());
@@ -347,31 +349,46 @@ async fn handle_socks(
         };
         SocketAddr::new(ip, local.port())
     };
-    write_socks_reply(&mut s, 0x00, bnd).await?;
 
     let conn = wait_conn(&shared, &mut gen_rx, timeout).await?;
-    let (send, recv) = match tokio::time::timeout(Duration::from_secs(3), conn.open_bi()).await {
-        Ok(Ok(x)) => x,
-        _ => {
-            // Only invalidate if the failing connection is still current;
-            // otherwise a concurrent reconnect already installed a fresh one.
-            let stale = shared
-                .read()
-                .await
-                .as_ref()
-                .map(|cur| cur.stable_id() == conn.stable_id())
-                .unwrap_or(false);
-            if stale {
-                *shared.write().await = None;
-                bump_gen(&gen_tx);
+    let (mut send, mut recv) =
+        match tokio::time::timeout(Duration::from_secs(3), conn.open_bi()).await {
+            Ok(Ok(x)) => x,
+            _ => {
+                if conn.close_reason().is_some() {
+                    let stale = shared
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|cur| cur.stable_id() == conn.stable_id())
+                        .unwrap_or(false);
+                    if stale {
+                        *shared.write().await = None;
+                        bump_gen(&gen_tx);
+                    }
+                    anyhow::bail!("quic connection dead, retry");
+                }
+                anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
             }
-            anyhow::bail!("quic stream open failed (server restarting?), retry");
-        }
-    };
-    let mut hdr = Vec::with_capacity(20);
-    target.encode(&mut hdr);
-    let mut send = send;
+        };
+    let mut hdr = Vec::with_capacity(273);
+    target.encode(&mut hdr)?;
     send.write_all(&hdr).await?;
+    match tokio::time::timeout(Duration::from_secs(5), recv.read(&mut [0u8; 1])).await {
+        Ok(Ok(Some(1))) => {}
+        Ok(Ok(_)) => {
+            write_socks_reply(&mut s, 0x05, bnd).await.ok();
+            anyhow::bail!("remote dial refused");
+        }
+        Ok(Err(_)) => {
+            write_socks_reply(&mut s, 0x05, bnd).await.ok();
+            anyhow::bail!("remote dial refused");
+        }
+        Err(_) => {
+            // Old server never sends ack; compatible fast path.
+        }
+    }
+    write_socks_reply(&mut s, 0x00, bnd).await?;
     let _ = copy_tcp_quic(s, send, recv).await;
     Ok(())
 }
@@ -444,10 +461,10 @@ async fn handle_udp_associate(
     let mut tcp = tcp;
     write_socks_reply(&mut tcp, 0x00, relay_reply).await?;
     let relay = Arc::new(relay);
-    // hub -> app: ends when this association is torn down (sender removed).
     {
         let r2 = relay.clone();
-        let last_app: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
+        let last_app: Arc<std::sync::RwLock<Option<SocketAddr>>> =
+            Arc::new(std::sync::RwLock::new(None));
         let last_app_w = last_app.clone();
         tokio::spawn(async move {
             while let Some(d) = rx.recv().await {
@@ -465,11 +482,14 @@ async fn handle_udp_associate(
                         Err(_) => continue,
                     },
                 };
-                if let Some(app) = *last_app.read().await {
+                let app = last_app.read().ok().and_then(|g| *g);
+                if let Some(app) = app {
                     let mut pkt = Vec::with_capacity(3 + 19 + payload.len());
                     pkt.extend_from_slice(&[0, 0, 0]);
                     let mut ah = Vec::with_capacity(19);
-                    TargetAddr::Ip(dst).encode(&mut ah);
+                    if TargetAddr::Ip(dst).encode(&mut ah).is_err() {
+                        continue;
+                    }
                     pkt.extend_from_slice(&ah);
                     pkt.extend_from_slice(payload);
                     let _ = r2.send_to(&pkt, map_for_dual(app)).await;
@@ -482,7 +502,9 @@ async fn handle_udp_associate(
             tokio::select! {
                 r = relay.recv_from(&mut buf) => {
                     let (n, app) = r?;
-                    *last_app_w.write().await = Some(app);
+                    if let Ok(mut g) = last_app_w.write() {
+                        *g = Some(app);
+                    }
                     if n < 4 || buf[2] != 0x00 { continue; }
                     // Single decode: reuse header length for the payload offset.
                     let (addr, hdr_len) = match TargetAddr::decode(&buf[3..n]) {
@@ -497,30 +519,41 @@ async fn handle_udp_associate(
                     };
                     // Fast path: never stall the relay loop behind a reconnect
                     // wait; drop this packet if no live connection exists.
+                    // Small grace: one 20ms wait covers reconnect races.
                     let conn = {
                         let g = shared.read().await;
                         g.clone().filter(|c| c.close_reason().is_none())
+                    };
+                    let conn = if conn.is_none() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        shared.read().await.clone().filter(|c| c.close_reason().is_none())
+                    } else {
+                        conn
                     };
                     if let Some(conn) = conn {
                         let _ = conn.send_datagram(d);
                     }
                 }
                 _ = tcp.readable() => {
-                    let mut b = [0u8; 32];
-                    match tcp.try_read(&mut b) {
-                        Ok(0) => break,
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                    let mut closed = false;
+                    loop {
+                        let mut b = [0u8; 512];
+                        match tcp.try_read(&mut b) {
+                            Ok(0) => { closed = true; break; }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Ok(_) => continue,
+                            Err(_) => { closed = true; break; }
                         }
-                        // Data on the control connection is not a close; only
-                        // FIN tears the association down. Drain and continue.
-                        Ok(_) => continue,
-                        Err(_) => break,
+                    }
+                    if closed {
+                        break;
                     }
                 }
             }
         }
     }
-    hub.subs.lock().await.remove(&sess);
+    if let Ok(mut m) = hub.subs.write() {
+        m.remove(&sess);
+    }
     Ok(())
 }
