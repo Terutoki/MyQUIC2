@@ -454,6 +454,7 @@ All limits are constants in the sources; the table shows where to change them.
 | UDP sessions per connection | 4096 (O(n) sweep above) | `LOCAL_SESS_MAX` |
 | Concurrent TCP dials, process-wide | 4096, 2 s permit wait (released after connect) | `dial_limiter` |
 | Concurrent bidi streams per connection | 1024 | `build_transport` |
+| Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset) | `MAX_STREAM_TASKS` |
 | Client SOCKS connections | 8192 (excess connections dropped) | `socks_conn_limiter` |
 | Client UDP associations | 4096 (excess replies REP=0x01) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
@@ -598,6 +599,35 @@ MyQUIC2/
   documentation/benchmark prefixes rejected.
 - QUIC socket no longer sets `SO_REUSEADDR`; UDP buffer clamping is reported;
   redundant warnings removed; dead code dropped; `dist/` rebuilt.
+
+### 2026-09 hardening pass 2
+
+- DNS single-flight waiters now reclaim ownership when the owner is cancelled, so
+  `resolve_all_cached` can no longer hang forever; only the owner warms the
+  positive/negative cache (ending N-writer stampedes), and a duplicate-lookup race
+  window is closed by re-checking the cache before claiming ownership.
+- 0-RTT is only exposed to application flows after the server accepts early data:
+  quinn discards streams/DATAGRAMs sent in rejected early data, so the client now
+  waits for the accept/reject decision (the token still rides early data) and
+  re-sends auth on 1-RTT rejection. This removes lost SOCKS flows and stale stream
+  handles after a server restart.
+- `copy_tcp_quic_idle` cancels the peer direction as soon as one side fails, so a
+  dead QUIC connection releases target TCP fds immediately instead of waiting out
+  the 300 s idle window; the old `join!` could pin a silent stream for minutes.
+- `allow_private` also validates the RFC 2765 IPv4-translated prefix
+  (`::ffff:0:a.b.c.d`) and additional IANA non-global ranges (AS112, AMT, PCP/TURN
+  anycast, DRIP, SRv6, `2001:4:112::/48`, `2620:4f:8000::/48`).
+- Client UDP dispatcher table is sharded (32 locks) with an exact process-wide cap;
+  the DNS hot-path memo compares full keys instead of a 64-bit hash, and negative
+  entries short-circuit the per-packet resolver spawn.
+- Server: extra uni streams are drained/stopped (no unbounded receive buffering), a
+  global stream-task cap bounds header/DNS/dial queueing, the handshake has its own
+  timeout, and session creation checks the global permit before creating a socket
+  and never inserts a dead reply reader.
+- SOCKS control writes are bounded by a 10 s timeout; the UDP-associate control drain
+  is bounded per readiness event so a flooding local app cannot starve the relay.
+- `dist/openwrt-x86_64/` rebuilt from this revision for all four CPU levels
+  (v1–v4, static musl, stripped).
 
 ---
 

@@ -46,12 +46,32 @@ fn bump_gen(tx: &watch::Sender<u64>) {
 /// Routes inbound QUIC DATAGRAMs to their UDP ASSOCIATE by sess_id.
 /// One dispatcher serves the whole process across reconnects; subscriptions
 /// die with their association, so no immortal task can steal another's packets.
+/// The table is sharded because the dispatcher reads it for every inbound
+/// DATAGRAM: a single RwLock there is a cross-core cache-line bottleneck.
+const HUB_SHARDS: usize = 32;
+
 struct UdpHub {
-    subs: std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
+    subs: Vec<std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>>,
     next: std::sync::atomic::AtomicU32,
+    /// Exact process-wide association count across all shards.
+    len: std::sync::atomic::AtomicUsize,
 }
 
 impl UdpHub {
+    fn new() -> Self {
+        Self {
+            subs: (0..HUB_SHARDS)
+                .map(|_| std::sync::RwLock::new(HashMap::new()))
+                .collect(),
+            next: std::sync::atomic::AtomicU32::new(1),
+            len: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn shard(&self, s: u32) -> &std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>> {
+        &self.subs[(s as usize) % HUB_SHARDS]
+    }
+
     /// Allocates a session id + reply channel. `None` when the process-wide
     /// association cap is reached (caller replies SOCKS5 REP=0x01).
     fn alloc_sess(
@@ -61,16 +81,29 @@ impl UdpHub {
         tokio::sync::mpsc::Sender<Bytes>,
         tokio::sync::mpsc::Receiver<Bytes>,
     )> {
-        let mut m = myquic2::lock_write(&self.subs);
-        if m.len() >= MAX_UDP_ASSOCS {
-            return None;
+        use std::sync::atomic::Ordering;
+        // Reserve a global slot first so the cap stays exact across shards.
+        loop {
+            let cur = self.len.load(Ordering::Relaxed);
+            if cur >= MAX_UDP_ASSOCS {
+                return None;
+            }
+            if self
+                .len
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
         loop {
-            let s = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let s = self.next.fetch_add(1, Ordering::Relaxed);
             // 0 is reserved; skip it and avoid reusing a live id after wraparound.
             if s == 0 || s == u32::MAX {
                 continue;
             }
+            let shard = self.shard(s);
+            let mut m = myquic2::lock_write(shard);
             if m.contains_key(&s) {
                 continue;
             }
@@ -78,6 +111,17 @@ impl UdpHub {
             m.insert(s, tx.clone());
             return Some((s, tx, rx));
         }
+    }
+
+    fn remove(&self, s: u32) {
+        let shard = self.shard(s);
+        if myquic2::lock_write(shard).remove(&s).is_some() {
+            self.len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    fn sender(&self, s: u32) -> Option<tokio::sync::mpsc::Sender<Bytes>> {
+        myquic2::lock_read(self.shard(s)).get(&s).cloned()
     }
 }
 
@@ -123,10 +167,7 @@ async fn main() -> Result<()> {
     // without polling and the datagram dispatcher drops a stale connection
     // without a per-packet timer.
     let (gen_tx, gen_rx) = watch::channel(0u64);
-    let hub: Arc<UdpHub> = Arc::new(UdpHub {
-        subs: std::sync::RwLock::new(HashMap::new()),
-        next: std::sync::atomic::AtomicU32::new(1),
-    });
+    let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
     // Sole DATAGRAM reader for the process: routes by sess_id to the live association.
     {
         let shared = shared.clone();
@@ -150,7 +191,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let sess = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
-                            let tx = myquic2::lock_read(&hub.subs).get(&sess).cloned();
+                            let tx = hub.sender(sess);
                             if let Some(tx) = tx {
                                 if tx.try_send(d).is_err() {
                                     static DROPS: std::sync::atomic::AtomicU64 =
@@ -337,32 +378,36 @@ async fn dial_once(
 ) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
     let connecting = ep.connect(server, name)?;
-    // 0-RTT fast path: on resumption the connection is usable immediately, saving 1 RTT.
+    // 0-RTT: send the auth token in early data, then WAIT for the server's
+    // accept/reject decision before handing the connection to application
+    // flows. quinn discards every stream and DATAGRAM sent in rejected early
+    // data (and resets stream ids), so using the connection before `accepted`
+    // resolves would silently lose SOCKS requests and could make a stale
+    // stream handle alias a newly opened stream. The token still rides early
+    // data, which is the part that actually saves a round trip on resumption.
     let conn = match connecting.into_0rtt() {
         Ok((conn, accepted)) => {
             let token = auth_token.to_owned();
             let needs_auth = !token.is_empty();
             // A failed early-data write must not fail the whole dial: the
-            // handshake may still complete at 1-RTT. Record the failure and
-            // fall back to re-sending once `accepted` reports the outcome.
+            // handshake may still complete at 1-RTT.
             let early_send_failed = if needs_auth {
                 send_auth(&conn, &token).await.is_err()
             } else {
                 false
             };
-            // If the server rejected our early data, the auth stream was
-            // discarded with it; re-send on the now-established connection so
-            // the server does not sit out its auth timeout and close us.
-            let conn2 = conn.clone();
-            tokio::spawn(async move {
-                let ok = accepted.await;
-                info!("QUIC resumption: 0-RTT keys accepted={ok}");
-                if needs_auth && (!ok || early_send_failed) {
-                    if let Err(e) = send_auth(&conn2, &token).await {
-                        warn!("auth resend after 0-RTT rejection failed: {e:#}");
-                    }
-                }
-            });
+            // The handshake is bounded by the QUIC idle timeout; cap it
+            // explicitly so a dead path can never wedge the reconnect loop.
+            let accepted_ok = tokio::time::timeout(Duration::from_secs(20), accepted)
+                .await
+                .unwrap_or(false);
+            info!("QUIC resumption: 0-RTT keys accepted={accepted_ok}");
+            if needs_auth && (!accepted_ok || early_send_failed) {
+                // Rejected early data discarded the auth stream; re-send it on
+                // the now-established connection so the server does not sit
+                // out its auth timeout and close us.
+                send_auth(&conn, &token).await?;
+            }
             conn
         }
         Err(connecting) => {
@@ -437,10 +482,10 @@ async fn handle_socks(
     let mut m = vec![0u8; h[1] as usize];
     read_exact_timeout(&mut s, &mut m).await?;
     if !m.contains(&0x00) {
-        s.write_all(&[0x05, 0xFF]).await?;
+        write_socks(&mut s, &[0x05, 0xFF]).await?;
         anyhow::bail!("no acceptable auth (client must offer 0x00)");
     }
-    s.write_all(&[0x05, 0x00]).await?;
+    write_socks(&mut s, &[0x05, 0x00]).await?;
 
     let mut r = [0u8; 3];
     read_exact_timeout(&mut s, &mut r).await?;
@@ -470,8 +515,7 @@ async fn handle_socks(
             return handle_udp_associate(s, shared, hub).await;
         }
         _ => {
-            s.write_all(&[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0])
-                .await?;
+            write_socks(&mut s, &[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             anyhow::bail!("unsupported cmd");
         }
     };
@@ -608,6 +652,15 @@ async fn read_socks_addr_lenient(s: &mut tokio::net::TcpStream) -> Result<()> {
     }
 }
 
+/// SOCKS control writes are tiny; a stalled local reader must not pin this
+/// task (and its connection permit) indefinitely.
+async fn write_socks(s: &mut tokio::net::TcpStream, buf: &[u8]) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), s.write_all(buf))
+        .await
+        .context("socks write timed out")??;
+    Ok(())
+}
+
 fn bnd_for(s: &tokio::net::TcpStream) -> Result<SocketAddr> {
     let local = s.local_addr()?;
     let ip = unmap(local.ip());
@@ -632,7 +685,7 @@ async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAd
             v.extend_from_slice(&a.port().to_be_bytes());
         }
     }
-    s.write_all(&v).await?;
+    write_socks(s, &v).await?;
     Ok(())
 }
 
@@ -655,7 +708,7 @@ async fn handle_udp_associate(
     // Wrapper guarantees the subscription is torn down on every exit path,
     // including early setup errors that used to leak the hub entry forever.
     let res = udp_associate_inner(tcp, shared, sess, rx).await;
-    myquic2::lock_write(&hub.subs).remove(&sess);
+    hub.remove(sess);
     res
 }
 
@@ -711,30 +764,38 @@ async fn udp_associate_inner(
                 match addr {
                     TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, payload, &mut pkt),
                     TargetAddrRef::Domain(h, p) => {
-                        if let Some(dst) = lookup_cached_sync(h, p) {
-                            send_reply(&r2, &last_app, dst, payload, &mut pkt);
-                        } else {
-                            let permit =
-                                match dns_slow_path_limiter().clone().try_acquire_owned() {
-                                    Ok(p) => p,
-                                    Err(_) => continue,
-                                };
-                            let r2 = r2.clone();
-                            let last_app = last_app.clone();
-                            let host = h.to_string();
-                            let payload = Bytes::copy_from_slice(payload);
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let dst = match resolve_all_cached(&host, p).await {
-                                    Ok(v) => match v.into_iter().next() {
-                                        Some(s) => s,
-                                        None => return,
-                                    },
-                                    Err(_) => return,
-                                };
-                                let mut pkt = Vec::with_capacity(64);
-                                send_reply(&r2, &last_app, dst, &payload, &mut pkt);
-                            });
+                        // The server always echoes replies with an IP-form source
+                        // address, so this branch is defensive; the negative
+                        // cache is still consulted synchronously so a known-bad
+                        // name never spawns a resolver task.
+                        match lookup_cached_fast(h, p) {
+                            CachedLookup::Negative => continue,
+                            CachedLookup::Addr(dst) => {
+                                send_reply(&r2, &last_app, dst, payload, &mut pkt)
+                            }
+                            CachedLookup::Unknown => {
+                                let permit =
+                                    match dns_slow_path_limiter().clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                let r2 = r2.clone();
+                                let last_app = last_app.clone();
+                                let host = h.to_string();
+                                let payload = Bytes::copy_from_slice(payload);
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let dst = match resolve_all_cached(&host, p).await {
+                                        Ok(v) => match v.into_iter().next() {
+                                            Some(s) => s,
+                                            None => return,
+                                        },
+                                        Err(_) => return,
+                                    };
+                                    let mut pkt = Vec::with_capacity(64);
+                                    send_reply(&r2, &last_app, dst, &payload, &mut pkt);
+                                });
+                            }
                         }
                     }
                 }
@@ -813,11 +874,15 @@ async fn udp_associate_inner(
             _ = tcp.readable() => {
                 let mut closed = false;
                 let mut got = false;
-                loop {
+                // Bounded drain (8 KiB per readiness event): an unbounded loop
+                // inside one select branch lets a flooding local app starve the
+                // relay and idle branches. Tokio keeps readiness set until a
+                // `WouldBlock`, so the remainder is picked up on the next poll.
+                for _ in 0..16 {
                     let mut b = [0u8; 512];
                     match tcp.try_read(&mut b) {
                         Ok(0) => { closed = true; break; }
-                        Ok(_) => { got = true; continue; }
+                        Ok(_) => { got = true; }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => { closed = true; break; }
                     }

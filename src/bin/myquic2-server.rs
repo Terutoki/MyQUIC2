@@ -34,10 +34,14 @@ const SESS_IDLE_MS: u64 = 180_000;
 const MAX_DIALS_GLOBAL: usize = 4096;
 /// How long a dial may wait for a global dial permit before giving up.
 const DIAL_PERMIT_WAIT: Duration = Duration::from_secs(2);
-/// Total wall-clock budget for client token authentication (accept the uni
-/// stream and read the token). Kept as one deadline so an unauthenticated peer
-/// cannot hold a connection permit for the old accept+read 5s + 5s window.
+/// Wall-clock budget for the post-handshake token exchange (accept the uni
+/// stream and read the token). `Incoming::accept()` is synchronous, so the
+/// handshake itself is bounded separately by [`HANDSHAKE_TIMEOUT`]; together
+/// they cap how long an unauthenticated peer can hold a connection permit.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for completing the QUIC handshake after `Incoming::accept()` before
+/// the connection permit is reclaimed (0-RTT connections skip this wait).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn session_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
@@ -47,6 +51,17 @@ fn session_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 fn dial_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_DIALS_GLOBAL)))
+}
+
+/// Process-wide cap on concurrently handled QUIC bidi streams. The transport's
+/// per-connection stream limit alone allows 1024 x 4096 = ~4M live stream tasks,
+/// each holding a 5s header timer while queued on the DNS/dial limiters; this
+/// bounds the worst case to a fixed number of tasks.
+const MAX_STREAM_TASKS: usize = 16_384;
+
+fn stream_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_STREAM_TASKS)))
 }
 
 /// One-way token authentication: the client opens a uni stream and writes the
@@ -157,14 +172,34 @@ async fn main() -> Result<()> {
             // 0.5-RTT accept: streams usable before handshake completes on resumption.
             let conn = match incoming.accept() {
                 Ok(connecting) => match connecting.into_0rtt() {
-                    Ok((c, _)) => c,
-                    Err(connecting) => match connecting.await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("accept err: {e:#}");
-                            return;
+                    Ok((c, accepted)) => {
+                        // A server-side `into_0rtt` always succeeds (0.5-RTT), but
+                        // an unfinished handshake must not hold the connection
+                        // permit; wait (bounded) for the handshake before
+                        // consuming the token. The client already waits for the
+                        // 0-RTT decision, so this costs it no latency.
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepted).await {
+                            Ok(_) => c,
+                            Err(_) => {
+                                warn!("handshake timed out after {HANDSHAKE_TIMEOUT:?}");
+                                return;
+                            }
                         }
-                    },
+                    }
+                    Err(connecting) => {
+                        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+                        match tokio::time::timeout_at(deadline, connecting).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
+                                warn!("accept err: {e:#}");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("handshake timed out after {HANDSHAKE_TIMEOUT:?}");
+                                return;
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
                     warn!("accept err: {e:#}");
@@ -223,6 +258,17 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             }
         });
     }
+    // Uni streams carry only the auth token, which `authenticate` already
+    // consumed. Without a reader quinn would buffer up to the whole connection
+    // receive window for extra uni streams, so drain and refuse them explicitly.
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(mut uni) = conn.accept_uni().await {
+                let _ = uni.stop(0u32.into());
+            }
+        });
+    }
     // QUIC DATAGRAMs -> per-sess UDP sockets
     let cd = conn.clone();
     let ss = sess.clone();
@@ -251,43 +297,50 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     udp_try_send(&sock, map_for_dual(dst), payload);
                 }
                 TargetAddrRef::Domain(h, p) => {
-                    // Fast path: cached DNS avoids per-packet spawn (P1).
-                    if let Some(dst) = lookup_cached_sync(h, p) {
-                        if !allow_private && !is_global_ip(dst.ip()) {
-                            continue;
-                        }
-                        let sock = match get_or_create_sess(&ss, &cd, s).await {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        udp_try_send(&sock, map_for_dual(dst), payload);
-                    } else {
-                        let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        let ss = ss.clone();
-                        let cd = cd.clone();
-                        let payload = Bytes::copy_from_slice(payload);
-                        let host = h.to_string();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let dst = match resolve_all_cached(&host, p).await {
-                                Ok(v) => match v.into_iter().next() {
-                                    Some(v) => v,
-                                    None => return,
-                                },
-                                Err(_) => return,
-                            };
+                    // Fast path: cached DNS avoids a per-packet spawn; a fresh
+                    // negative entry avoids even that (the old fast path only
+                    // consulted the positive cache, so every packet for a bad
+                    // domain spawned a resolver task just to fail).
+                    match lookup_cached_fast(h, p) {
+                        CachedLookup::Negative => continue,
+                        CachedLookup::Addr(dst) => {
                             if !allow_private && !is_global_ip(dst.ip()) {
-                                return;
+                                continue;
                             }
                             let sock = match get_or_create_sess(&ss, &cd, s).await {
                                 Some(v) => v,
-                                None => return,
+                                None => continue,
                             };
-                            udp_try_send(&sock, map_for_dual(dst), &payload);
-                        });
+                            udp_try_send(&sock, map_for_dual(dst), payload);
+                        }
+                        CachedLookup::Unknown => {
+                            let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            let ss = ss.clone();
+                            let cd = cd.clone();
+                            let payload = Bytes::copy_from_slice(payload);
+                            let host = h.to_string();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let dst = match resolve_all_cached(&host, p).await {
+                                    Ok(v) => match v.into_iter().next() {
+                                        Some(v) => v,
+                                        None => return,
+                                    },
+                                    Err(_) => return,
+                                };
+                                if !allow_private && !is_global_ip(dst.ip()) {
+                                    return;
+                                }
+                                let sock = match get_or_create_sess(&ss, &cd, s).await {
+                                    Some(v) => v,
+                                    None => return,
+                                };
+                                udp_try_send(&sock, map_for_dual(dst), &payload);
+                            });
+                        }
                     }
                 }
             }
@@ -304,7 +357,16 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             Ok(x) => x,
             Err(_) => break,
         };
+        let stream_permit = match stream_task_limiter().clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // Fail the stream immediately instead of queueing unbounded work.
+                send.reset(0x05u32.into()).ok();
+                continue;
+            }
+        };
         tokio::spawn(async move {
+            let _stream_permit = stream_permit;
             let target: TargetAddr = match tokio::time::timeout(
                 Duration::from_secs(5),
                 read_mqp_target(&mut recv),
@@ -531,40 +593,51 @@ async fn get_or_create_sess(
 ) -> Option<Arc<tokio::net::UdpSocket>> {
     // Fast path: single read lock + lock-free timestamp bump. No write lock
     // per packet, so concurrent sessions never serialize on a global lock.
+    // A session whose reply reader has already exited is treated as absent so
+    // its next packet recreates it instead of black-holing replies.
     {
         let r = lock_read(ss);
-        if let Some((sock, _, t, _)) = r.get(&s) {
-            let sock = sock.clone();
-            touch_session(t);
-            return Some(sock);
+        if let Some((sock, h, t, _)) = r.get(&s) {
+            if !h.is_finished() {
+                let sock = sock.clone();
+                touch_session(t);
+                return Some(sock);
+            }
         }
     }
-    // Create the socket BEFORE taking the write lock: socket()/setsockopt()/
-    // bind() are syscalls and must not stall the datagram reader for every
-    // other session. A concurrent creator makes this one redundant, not wrong.
-    let raw = udp_socket_dual_small("[::]:0").ok()?;
-    let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
-    // Slow path holds the write lock across check+insert so concurrent
-    // packets for the same sess cannot create duplicate sockets (B8).
-    let mut w = lock_write(ss);
-    if let Some((sock2, _, t, _)) = w.get(&s) {
-        touch_session(t);
-        return Some(sock2.clone());
-    }
-    if w.len() >= LOCAL_SESS_MAX {
-        sweep_local(&mut w);
-    }
-    // Process-wide pool: fail closed once every session slot is held.
+    // Check the global pool BEFORE creating the socket: once every session slot
+    // is held there is no point paying socket()+setsockopt()+bind() per packet.
     let permit = match session_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            sweep_local(&mut w);
+            // Reap expired/over-cap sessions, then retry once.
+            sweep_local(&mut lock_write(ss));
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => return None,
             }
         }
     };
+    // Create the socket outside the write lock: socket()/setsockopt()/bind()
+    // are syscalls and must not stall the datagram reader for every session.
+    let raw = udp_socket_dual_small("[::]:0").ok()?;
+    let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
+    // Slow path holds the write lock across check+insert so concurrent
+    // packets for the same sess cannot create duplicate sockets (B8).
+    let mut w = lock_write(ss);
+    if let Some((sock2, h2, t, _)) = w.get(&s) {
+        if !h2.is_finished() {
+            touch_session(t);
+            return Some(sock2.clone());
+        }
+        // Dead reader: replace it (dropping the stale entry releases its permit).
+        if let Some((_, hh, _, _)) = w.remove(&s) {
+            hh.abort();
+        }
+    }
+    if w.len() >= LOCAL_SESS_MAX {
+        sweep_local(&mut w);
+    }
     let c2 = cd.clone();
     let rs = sock.clone();
     let ss2 = ss.clone();
@@ -581,13 +654,15 @@ async fn get_or_create_sess(
             {
                 Ok(Ok(x)) => x,
                 Ok(Err(_)) => break,
-                // No inbound reply for 60s: only reap when the whole session
-                // (including outbound traffic) is idle. A one-way flow used to
-                // be recreated every 180s, changing its source port/NAT mapping.
+                // No inbound reply for 60s: stop if the connection is gone or
+                // only reap when the whole session (including outbound traffic)
+                // is idle. A one-way flow used to be recreated every 180s,
+                // changing its source port/NAT mapping.
                 Err(_) => {
-                    if mono_millis()
-                        .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
-                        >= SESS_IDLE_MS
+                    if c2.close_reason().is_some()
+                        || mono_millis()
+                            .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
+                            >= SESS_IDLE_MS
                     {
                         break;
                     }
@@ -630,5 +705,16 @@ async fn get_or_create_sess(
         }
     });
     w.insert(s, (sock.clone(), h, last, permit));
+    // The reader may have exited before the insert (e.g. immediate socket
+    // error); its self-reap ran too early, so remove the dead entry here
+    // instead of leaving it to hold a permit until the 180s sweep.
+    if w.get(&s)
+        .map(|(_, hh, _, _)| hh.is_finished())
+        .unwrap_or(false)
+    {
+        if let Some((_, hh, _, _)) = w.remove(&s) {
+            hh.abort();
+        }
+    }
     Some(sock)
 }

@@ -418,14 +418,37 @@ type DnsCacheKey = String;
 type DnsCacheVal = (Instant, Vec<SocketAddr>);
 const DNS_KEY_BUF: usize = 255 + 1 + 5;
 
+/// Normalize a DNS name for cache keys: DNS is case-insensitive and an
+/// absolute (trailing-dot) name is equivalent to its relative form.
+fn dns_name_bytes(host: &str) -> &[u8] {
+    let mut hb = host.as_bytes();
+    while hb.len() > 1 && hb.last() == Some(&b'.') {
+        hb = &hb[..hb.len() - 1];
+    }
+    hb
+}
+
+/// Owned fallback for hosts above the wire-format limit; MUST normalize the
+/// same way as [`dns_key`] so both forms address the same cache entry.
+fn dns_key_owned(host: &str, port: u16) -> String {
+    let hb = dns_name_bytes(host);
+    let mut bytes = Vec::with_capacity(hb.len() + 6);
+    bytes.extend(hb.iter().map(|b| b.to_ascii_lowercase()));
+    bytes.push(0);
+    bytes.extend_from_slice(port.to_string().as_bytes());
+    String::from_utf8(bytes).expect("ascii lowercasing preserves UTF-8")
+}
+
 /// Build the cache key into `buf`, returning a borrowed `&str`.
 /// Returns `None` only when `host` is longer than the wire-format limit.
 fn dns_key<'a>(host: &str, port: u16, buf: &'a mut [u8; DNS_KEY_BUF]) -> Option<&'a str> {
-    let hb = host.as_bytes();
+    let hb = dns_name_bytes(host);
     if hb.len() + 1 + 5 > DNS_KEY_BUF {
         return None;
     }
-    buf[..hb.len()].copy_from_slice(hb);
+    for (dst, b) in buf.iter_mut().zip(hb) {
+        *dst = b.to_ascii_lowercase();
+    }
     let mut pos = hb.len();
     buf[pos] = 0;
     pos += 1;
@@ -558,52 +581,116 @@ pub fn mono_millis() -> u64 {
     BASE.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-fn dns_key_hash(host: &str, port: u16) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    host.hash(&mut h);
-    port.hash(&mut h);
-    h.finish()
+/// Thread-local memo of the most recent lookup, keyed by the *full* normalized
+/// key. A 64-bit hash here would let two different `(host, port)` pairs collide
+/// and serve each other's address for the whole TTL, so the key is compared
+/// byte-for-byte. Storing it inline keeps fast-path hits allocation-free.
+struct DnsMemo {
+    key: [u8; DNS_KEY_BUF],
+    len: usize,
+    /// `None` = negatively cached (NXDOMAIN / lookup failure).
+    addr: Option<SocketAddr>,
+    expires: Instant,
+}
+
+thread_local! {
+    static DNS_MEMO: std::cell::RefCell<Option<DnsMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+fn memo_get(key: &str) -> Option<CachedLookup> {
+    let now = Instant::now();
+    DNS_MEMO.with(|c| {
+        let c = c.borrow();
+        match c.as_ref() {
+            Some(m) if now < m.expires && &m.key[..m.len] == key.as_bytes() => Some(match m.addr {
+                Some(a) => CachedLookup::Addr(a),
+                None => CachedLookup::Negative,
+            }),
+            _ => None,
+        }
+    })
+}
+
+fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
+    let kb = key.as_bytes();
+    if kb.len() > DNS_KEY_BUF {
+        return; // only reachable through the owned fallback for >255-byte names
+    }
+    DNS_MEMO.with(|c| {
+        let mut m = DnsMemo {
+            key: [0u8; DNS_KEY_BUF],
+            len: kb.len(),
+            addr,
+            expires,
+        };
+        m.key[..kb.len()].copy_from_slice(kb);
+        *c.borrow_mut() = Some(m);
+    });
+}
+
+/// Result of a synchronous cache lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedLookup {
+    /// A fresh address is cached.
+    Addr(SocketAddr),
+    /// A fresh negative entry says the name will not resolve; do not spawn a
+    /// resolver task for this packet.
+    Negative,
+    /// Not cached; the caller must use the async resolver.
+    Unknown,
 }
 
 /// Cached variant used on hot paths (UDP per-packet, TCP per-connection).
-/// Returns only the IPv4-preferred first address: hot callers never need the
-/// full list, and a hit is allocation-free (stack-built key + per-thread memo).
-pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
-    use std::cell::RefCell;
-    thread_local! {
-        // (key hash, address, absolute expiry of the global cache entry)
-        static LAST: RefCell<(u64, Option<SocketAddr>, Instant)> = RefCell::new((
-            0,
-            None,
-            Instant::now() - DNS_CACHE_TTL - Duration::from_secs(1),
-        ));
-    }
-    let h = dns_key_hash(host, port);
-    let now = Instant::now();
-    let hit = LAST.with(|c| {
-        let c = c.borrow();
-        c.0 == h && now < c.2 && c.1.is_some()
-    });
-    if hit {
-        return LAST.with(|c| c.borrow().1);
-    }
+/// Consults the thread-local memo, then the positive cache, then the negative
+/// cache, so a known-bad name never costs a task spawn. A hit performs no heap
+/// allocation (stack-built key + full-key compare against the memo).
+pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     let mut kbuf = [0u8; DNS_KEY_BUF];
-    let key = dns_key(host, port, &mut kbuf)?;
-    let (addr, expires) = {
-        let m = lock_read(dns_cache());
-        let (t, v) = m.get(key)?;
-        // Expiry is anchored to the global entry's insertion time, so the
-        // thread-local memo can never outlive the cache TTL (previously it
-        // could serve an address for up to ~2x the TTL).
-        let expires = *t + DNS_CACHE_TTL;
-        if now >= expires {
-            return None;
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = dns_key_owned(host, port);
+            &owned
         }
-        (v.first().copied()?, expires)
     };
-    LAST.with(|c| *c.borrow_mut() = (h, Some(addr), expires));
-    Some(addr)
+    if let Some(hit) = memo_get(key) {
+        return hit;
+    }
+    let now = Instant::now();
+    {
+        let m = lock_read(dns_cache());
+        if let Some((t, v)) = m.get(key) {
+            // Expiry is anchored to the global entry's insertion time, so the
+            // memo can never outlive the cache TTL.
+            let expires = *t + DNS_CACHE_TTL;
+            if now < expires {
+                if let Some(a) = v.first().copied() {
+                    memo_put(key, Some(a), expires);
+                    return CachedLookup::Addr(a);
+                }
+            }
+        }
+    }
+    {
+        let n = lock_read(dns_neg_cache());
+        if let Some(t) = n.get(key) {
+            let expires = *t + DNS_NEG_TTL;
+            if now < expires {
+                memo_put(key, None, expires);
+                return CachedLookup::Negative;
+            }
+        }
+    }
+    CachedLookup::Unknown
+}
+
+/// Back-compat helper returning only the positive form.
+pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
+    match lookup_cached_fast(host, port) {
+        CachedLookup::Addr(a) => Some(a),
+        _ => None,
+    }
 }
 
 const DNS_CACHE_MAX: usize = 4096;
@@ -622,7 +709,25 @@ fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
     if over == 0 {
         return;
     }
-    let victims: Vec<DnsCacheKey> = m.keys().take(over).cloned().collect();
+    // Evict oldest-first so a burst of inserts can never immediately throw away
+    // the entries that were just refreshed (the previous arbitrary `take` could).
+    // The common case (over == 1) stays a single O(n) scan with one clone.
+    let victims: Vec<DnsCacheKey> = if over == 1 {
+        m.iter()
+            .min_by_key(|(_, (t, _))| *t)
+            .map(|(k, _)| k.clone())
+            .into_iter()
+            .collect()
+    } else {
+        let mut entries: Vec<(&DnsCacheKey, Instant)> =
+            m.iter().map(|(k, (t, _))| (k, *t)).collect();
+        entries.sort_unstable_by_key(|(_, t)| *t);
+        entries
+            .into_iter()
+            .take(over)
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
     for k in victims {
         m.remove(&k);
     }
@@ -636,7 +741,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
     let key: &str = match dns_key(host, port, &mut kbuf) {
         Some(k) => k,
         None => {
-            owned = format!("{host}\0{port}");
+            owned = dns_key_owned(host, port);
             &owned
         }
     };
@@ -659,8 +764,10 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
         }
     }
     // 3. Singleflight: exactly one owner resolves; everyone else waits on the
-    //    cell. Ownership is claimed atomically, so two racing callers can never
-    //    both hit upstream, and a cancelled owner releases the claim.
+    //    cell. Ownership is claimed atomically. If the owner is cancelled or
+    //    panics, `OwnerReset` clears the claim and wakes the waiters; the next
+    //    waiter re-claims it, so no waiter can sleep forever on a cell that
+    //    nobody will ever fill.
     let entry = {
         let mut inf = lock_mutex(dns_inflight());
         match inf.get(key) {
@@ -677,66 +784,93 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
             }
         }
     };
-    let mut owner_won = false;
-    // Always removes the inflight entry when this function returns (normal,
-    // cancelled or panic). Created before the await so the `cell.set` ->
-    // explicit-remove window cannot leak a stale entry.
-    let mut cleanup: Option<InflightCleanup<'_>> = None;
-    let res: Result<Vec<SocketAddr>, String> = if let Some(v) = entry.cell.get() {
-        v.clone()
-    } else if !entry.owner.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        owner_won = true;
-        let _reset = OwnerReset { entry: &entry };
-        cleanup = Some(InflightCleanup { entry: &entry });
-        let r = match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
+    loop {
+        if let Some(v) = entry.cell.get() {
+            return match v {
+                Ok(v) => Ok(v.clone()),
+                Err(msg) => anyhow::bail!("{msg}"),
+            };
+        }
+        if !entry.owner.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            break; // this caller is the owner
+        }
+        // Waiter: register before re-checking the cell (`notify_waiters` stores
+        // no permit, so an unregistered waiter could otherwise miss completion).
+        let notified = entry.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(v) = entry.cell.get() {
+            return match v {
+                Ok(v) => Ok(v.clone()),
+                Err(msg) => anyhow::bail!("{msg}"),
+            };
+        }
+        if !entry.owner.load(std::sync::atomic::Ordering::Acquire) {
+            // The owner died without publishing; re-enter and try to take over.
+            continue;
+        }
+        notified.await;
+    }
+
+    // Owner path. Both guards live across the await: `_reset` releases the
+    // claim and wakes waiters on any exit path, `cleanup` removes the inflight
+    // entry once the caches are warm.
+    let _reset = OwnerReset { entry: &entry };
+    let cleanup = InflightCleanup { entry: &entry };
+
+    // A racing caller may have completed and removed the inflight entry between
+    // the initial cache checks and the registration above; re-check before
+    // issuing a duplicate upstream lookup.
+    {
+        let m = lock_read(dns_cache());
+        if let Some((t, v)) = m.get(key) {
+            if t.elapsed() < DNS_CACHE_TTL {
+                return Ok(v.clone());
+            }
+        }
+    }
+
+    let r: Result<Vec<SocketAddr>, String> =
+        match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
             Ok(v) => Ok(v),
             Err(e) => Err(format!("{e:#}")),
         };
-        let _ = entry.cell.set(r.clone());
-        entry.notify.notify_waiters();
-        r
-    } else {
-        // Register before re-checking the cell: `notify_waiters` stores no
-        // permit, so an unregistered waiter could otherwise miss completion.
-        loop {
-            let notified = entry.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(v) = entry.cell.get() {
-                break v.clone();
-            }
-            notified.await;
-        }
-    };
-    match res {
+    let now = Instant::now();
+    // Warm the caches and the thread memo BEFORE publishing the result, so a
+    // caller that observes the cell also observes a cache hit, and only the
+    // owner ever pays for the insert + eviction sweep (previously every waiter
+    // re-inserted and re-swept the whole map).
+    match &r {
         Ok(v) => {
             {
                 let mut m = lock_write(dns_cache());
-                m.insert(key.to_owned(), (Instant::now(), v.clone()));
+                m.insert(key.to_owned(), (now, v.clone()));
                 evict_if_needed(&mut m);
             }
             lock_write(dns_neg_cache()).remove(key);
-            // Remove only after the caches are warm, so a caller arriving in
-            // this window still hits the inflight result instead of issuing a
-            // duplicate upstream lookup.
-            drop(cleanup);
-            Ok(v)
+            if let Some(a) = v.first().copied() {
+                memo_put(key, Some(a), now + DNS_CACHE_TTL);
+            }
         }
-        Err(msg) => {
-            // Only the owner records the failure: when every waiter inserted,
-            // one failed lookup became N inserts + N full-map sweeps.
-            if owner_won {
+        Err(_) => {
+            {
                 let mut n = lock_write(dns_neg_cache());
                 if n.len() >= DNS_NEG_MAX {
                     n.retain(|_, t| t.elapsed() < DNS_NEG_TTL);
                 }
                 if n.len() < DNS_NEG_MAX {
-                    n.insert(key.to_owned(), Instant::now());
+                    n.insert(key.to_owned(), now);
                 }
             }
-            drop(cleanup);
-            anyhow::bail!("{msg}")
+            memo_put(key, None, now + DNS_NEG_TTL);
         }
+    }
+    let _ = entry.cell.set(r.clone());
+    entry.notify.notify_waiters();
+    drop(cleanup);
+    match r {
+        Ok(v) => Ok(v),
+        Err(msg) => anyhow::bail!("{msg}"),
     }
 }
 
@@ -780,6 +914,9 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || (v.octets()[0] == 192 && v.octets()[1] == 88 && v.octets()[2] == 99)
                 // 192.175.48.0/24 AS112 direct-delegation anycast
                 || (v.octets()[0] == 192 && v.octets()[1] == 175 && v.octets()[2] == 48)
+                // 192.31.196.0/24 AS112-v4 and 192.52.193.0/24 AMT (RFC 7450)
+                || (v.octets()[0] == 192 && v.octets()[1] == 31 && v.octets()[2] == 196)
+                || (v.octets()[0] == 192 && v.octets()[1] == 52 && v.octets()[2] == 193)
                 // 240.0.0.0/4 reserved (240-255)
                 || (v.octets()[0] >= 240))
         }
@@ -788,6 +925,18 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 return is_global_ip(IpAddr::V4(mapped));
             }
             let s = v.segments();
+            // RFC 2765 IPv4-translated (SIIT) `::ffff:0:a.b.c.d` is a distinct
+            // prefix from IPv4-mapped; on stacks that translate it, the
+            // embedded IPv4 decides reachability, so validate it recursively.
+            if s[0..4].iter().all(|x| *x == 0) && s[4] == 0xffff && s[5] == 0 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                );
+                return is_global_ip(IpAddr::V4(v4));
+            }
             // 64:ff9b::/96 (well-known NAT64 prefix): validate the embedded
             // IPv4 so private/loopback targets cannot slip through via NAT64.
             if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|x| *x == 0) {
@@ -827,6 +976,21 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 // 2001:10::/28 ORCHIDv1 and 2001:20::/28 ORCHIDv2 (RFC 7343)
                 || (s[0] == 0x2001
                     && (((s[1] & 0xfff0) == 0x0010) || ((s[1] & 0xfff0) == 0x0020)))
+                // 2001:1::1/128 PCP Anycast, ::2/128 TURN Anycast, ::3/128 DNS-SD SRP
+                || (s[0] == 0x2001
+                    && s[1] == 0x0001
+                    && s[2..7].iter().all(|x| *x == 0)
+                    && s[7] <= 3)
+                // 2001:3::/32 AMT (RFC 7450)
+                || (s[0] == 0x2001 && s[1] == 0x0003)
+                // 2001:4:112::/48 AS112-v6
+                || (s[0] == 0x2001 && s[1] == 0x0004 && s[2] == 0x0112)
+                // 2001:30::/28 Drone Remote ID (RFC 9374)
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0030)
+                // 5f00::/16 SRv6 SIDs (RFC 9602)
+                || s[0] == 0x5f00
+                // 2620:4f:8000::/48 Direct Delegation AS112
+                || (s[0] == 0x2620 && s[1] == 0x004f && s[2] == 0x8000)
                 || ((s[0] & 0xffc0) == 0xfec0))
         }
     }
@@ -1006,29 +1170,20 @@ pub async fn copy_tcp_quic_idle(
     let l2 = last_ms.clone();
     let b1 = base;
     let b2 = base;
-    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let f1 = failed.clone();
-    let f2 = failed.clone();
     let c2s = async move {
         let mut buf = vec![0u8; 32 * 1024];
         let mut total = 0u64;
         let mut chunks = 0u64;
         loop {
-            if f1.load(Ordering::Relaxed) {
-                send.reset(0x04u32.into()).ok();
-                anyhow::bail!("peer direction failed");
-            }
             let n = match tr.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    f1.store(true, Ordering::Relaxed);
                     send.reset(0x04u32.into()).ok();
                     return Err::<u64, anyhow::Error>(e.into());
                 }
             };
             if let Err(e) = send.write_all(&buf[..n]).await {
-                f1.store(true, Ordering::Relaxed);
                 send.reset(0x04u32.into()).ok();
                 return Err::<u64, anyhow::Error>(e.into());
             }
@@ -1051,15 +1206,10 @@ pub async fn copy_tcp_quic_idle(
         let mut total = 0u64;
         let mut chunks = 0u64;
         loop {
-            if f2.load(Ordering::Relaxed) {
-                tw.shutdown().await.ok();
-                anyhow::bail!("peer direction failed");
-            }
             let n = match recv.read(&mut buf).await {
                 Ok(Some(0)) | Ok(None) => break,
                 Ok(Some(n)) => n,
                 Err(e) => {
-                    f2.store(true, Ordering::Relaxed);
                     tw.shutdown().await.ok();
                     return Err::<u64, anyhow::Error>(e.into());
                 }
@@ -1068,7 +1218,6 @@ pub async fn copy_tcp_quic_idle(
                 break;
             }
             if let Err(e) = tw.write_all(&buf[..n]).await {
-                f2.store(true, Ordering::Relaxed);
                 tw.shutdown().await.ok();
                 return Err::<u64, anyhow::Error>(e.into());
             }
@@ -1086,15 +1235,26 @@ pub async fn copy_tcp_quic_idle(
         tw.shutdown().await.ok();
         Ok::<u64, anyhow::Error>(total)
     };
-    let copy_fut = async move {
-        let (a, b) = tokio::join!(c2s, s2c);
-        Ok::<(u64, u64), anyhow::Error>((a?, b?))
-    };
-    tokio::pin!(copy_fut);
+    // Drive both directions manually instead of `join!`: when one direction
+    // fails, returning from this function drops the other future immediately,
+    // which closes its TCP half and resets/stops its QUIC stream. `join!` left
+    // the other side blocked in `read()` until the 300 s idle deadline, so a
+    // dead QUIC connection could pin the target fd and buffers for minutes.
+    tokio::pin!(c2s);
+    tokio::pin!(s2c);
+    let mut c2s_total: Option<u64> = None;
+    let mut s2c_total: Option<u64> = None;
     loop {
         let step = Duration::from_secs(5).min(idle);
         tokio::select! {
-            r = &mut copy_fut => return r,
+            r = &mut c2s, if c2s_total.is_none() => match r {
+                Ok(v) => c2s_total = Some(v),
+                Err(e) => return Err(e),
+            },
+            r = &mut s2c, if s2c_total.is_none() => match r {
+                Ok(v) => s2c_total = Some(v),
+                Err(e) => return Err(e),
+            },
             _ = tokio::time::sleep(step) => {
                 let elapsed_ms = base.elapsed().as_millis() as u64;
                 let last = last_ms.load(Ordering::Relaxed);
@@ -1102,6 +1262,9 @@ pub async fn copy_tcp_quic_idle(
                     anyhow::bail!("tcp stream idle>{idle:?}");
                 }
             }
+        }
+        if let (Some(a), Some(b)) = (c2s_total, s2c_total) {
+            return Ok((a, b));
         }
     }
 }
@@ -1123,6 +1286,47 @@ mod tests {
             assert_eq!(a, b);
         }
     }
+    #[test]
+    fn global_ip_filter_extended() {
+        // RFC 2765 IPv4-translated addresses are judged by their embedded IPv4.
+        assert!(!is_global_ip("::ffff:0:127.0.0.1".parse().unwrap()));
+        assert!(!is_global_ip("::ffff:0:10.0.0.1".parse().unwrap()));
+        assert!(!is_global_ip("::ffff:0:192.168.1.1".parse().unwrap()));
+        assert!(is_global_ip("::ffff:0:8.8.8.8".parse().unwrap()));
+        // IPv4-mapped must not be affected by the translated-prefix check.
+        assert!(is_global_ip("::ffff:8.8.8.8".parse().unwrap()));
+        // Newly added IANA "not globally reachable" ranges.
+        assert!(!is_global_ip("192.31.196.1".parse().unwrap()));
+        assert!(!is_global_ip("192.52.193.1".parse().unwrap()));
+        assert!(!is_global_ip("2001:1::1".parse().unwrap()));
+        assert!(!is_global_ip("2001:3::1".parse().unwrap()));
+        assert!(!is_global_ip("2001:4:112::1".parse().unwrap()));
+        assert!(!is_global_ip("2001:30::1".parse().unwrap()));
+        assert!(!is_global_ip("5f00::1".parse().unwrap()));
+        assert!(!is_global_ip("2620:4f:8000::1".parse().unwrap()));
+        // Still globally routable.
+        assert!(is_global_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[test]
+    fn dns_key_normalizes_case_and_trailing_dot() {
+        let mut a = [0u8; DNS_KEY_BUF];
+        let mut b = [0u8; DNS_KEY_BUF];
+        assert_eq!(
+            dns_key("Example.COM.", 443, &mut a).unwrap(),
+            dns_key("example.com", 443, &mut b).unwrap()
+        );
+        assert_eq!(
+            dns_key("example.com", 80, &mut a).unwrap(),
+            "example.com\u{0}80"
+        );
+        // The owned fallback must normalize identically to the stack form.
+        assert_eq!(
+            dns_key_owned("Example.COM.", 443),
+            dns_key("example.com", 443, &mut b).unwrap()
+        );
+    }
+
     #[test]
     fn dgram_roundtrip() {
         let a = TargetAddr::Ip("8.8.8.8:53".parse().unwrap());
