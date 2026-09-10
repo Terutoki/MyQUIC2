@@ -21,6 +21,9 @@ impl TargetAddr {
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
             TargetAddr::Ip(SocketAddr::V4(a)) => {
+                if a.ip().is_unspecified() {
+                    anyhow::bail!("refuse unspecified v4");
+                }
                 out.push(0x01);
                 out.extend_from_slice(&a.ip().octets());
                 out.extend_from_slice(&a.port().to_be_bytes());
@@ -65,6 +68,9 @@ impl TargetAddr {
                     anyhow::bail!("short v4");
                 }
                 let ip = IpAddr::from([b[1], b[2], b[3], b[4]]);
+                if ip.is_unspecified() {
+                    anyhow::bail!("refuse unspecified v4 target");
+                }
                 let port = u16::from_be_bytes([b[5], b[6]]);
                 Ok((TargetAddr::Ip(SocketAddr::new(ip, port)), 7))
             }
@@ -75,6 +81,9 @@ impl TargetAddr {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(&b[1..17]);
                 let ip = IpAddr::from(o);
+                if ip.is_unspecified() {
+                    anyhow::bail!("refuse unspecified v6 target");
+                }
                 let port = u16::from_be_bytes([b[17], b[18]]);
                 Ok((TargetAddr::Ip(SocketAddr::new(ip, port)), 19))
             }
@@ -83,7 +92,7 @@ impl TargetAddr {
                     anyhow::bail!("short domain");
                 }
                 let n = b[1] as usize;
-                if n == 0 || n > 255 {
+                if n == 0 {
                     anyhow::bail!("bad domain len");
                 }
                 if b.len() < 2 + n + 2 {
@@ -106,6 +115,13 @@ impl TargetAddr {
         }
     }
 }
+
+/// MQP-1 TCP open acknowledgement (server -> client, 1 byte).
+/// Both sides must run the same version: the client MUST wait for exactly
+/// this byte and fail the flow otherwise. There is intentionally NO silent
+/// fallback for old peers — falling back would let the first application
+/// byte be mistaken for (or polluted by) the ACK (see B1).
+pub const MQP_TCP_ACK: u8 = 0x00;
 
 /// Build a UDP DATAGRAM body: type + sess + addr header + payload.
 /// sess scopes the packet to one UDP ASSOCIATE so concurrent associations sharing
@@ -252,12 +268,27 @@ pub fn client_tls_config(
 }
 
 // ---------------- QUIC transport: BBR + DATAGRAM + keepalive ----------------
+pub fn parse_congestion(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("cubic") || name.eq_ignore_ascii_case("bbr") {
+        return true;
+    }
+    tracing::warn!(
+        "unknown congestion={name:?}, falling back to bbr (want bbr|cubic)"
+    );
+    false
+}
+
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
-    // BBR default; cubic only as escape hatch
+    // BBR default; cubic only as escape hatch. Unknown values warn (B9) and use BBR.
     if congestion.eq_ignore_ascii_case("cubic") {
         t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
     } else {
+        if !congestion.eq_ignore_ascii_case("bbr") {
+            tracing::warn!(
+                "unknown congestion={congestion:?}, using bbr (want bbr|cubic)"
+            );
+        }
         t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     }
     // GSO/GRO: no flag in quinn API — quinn-udp auto-probes UDP_SEGMENT/UDP_GRO.
@@ -323,6 +354,34 @@ fn dns_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Cached variant used on hot paths (UDP per-packet, TCP per-connection).
+/// Sync fast path for the UDP hot loop: returns a clone only on cache hit,
+/// never performs I/O. Lets callers avoid `tokio::spawn` per packet (P1).
+pub fn lookup_cached_sync(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let key: DnsCacheKey = (host.to_string(), port);
+    if let Ok(m) = dns_cache().read() {
+        if let Some((t, v)) = m.get(&key) {
+            if t.elapsed() < DNS_CACHE_TTL {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
+    if m.len() <= 4096 {
+        return;
+    }
+    m.retain(|_, (t, _)| t.elapsed() < DNS_CACHE_TTL);
+    if m.len() <= 4096 {
+        return;
+    }
+    // Evict the single oldest entry so hot entries survive (P6).
+    if let Some(oldest) = m.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
+        m.remove(&oldest);
+    }
+}
+
 pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let key: DnsCacheKey = (host.to_string(), port);
     {
@@ -338,14 +397,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
     {
         if let Ok(mut m) = dns_cache().write() {
             m.insert(key, (Instant::now(), v.clone()));
-            if m.len() > 4096 {
-                m.retain(|_, (t, _)| t.elapsed() < DNS_CACHE_TTL);
-                if m.len() > 4096 {
-                    if let Some(k) = m.keys().next().cloned() {
-                        m.remove(&k);
-                    }
-                }
-            }
+            evict_if_needed(&mut m);
         }
     }
     Ok(v)
@@ -394,12 +446,18 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
             if let Some(mapped) = v.to_ipv4_mapped() {
                 return is_global_ip(IpAddr::V4(mapped));
             }
+            let s = v.segments();
             !(v.is_loopback()
                 || v.is_multicast()
                 || v.is_unspecified()
-                || ((v.segments()[0] & 0xfe00) == 0xfc00)
-                || ((v.segments()[0] & 0xffc0) == 0xfe80)
-                || (v.segments()[0] == 0x2001 && v.segments()[1] == 0x0db8))
+                || ((s[0] & 0xfe00) == 0xfc00)
+                || ((s[0] & 0xffc0) == 0xfe80)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x0064 && s[1] == 0xff9b)
+                || s[0] == 0x2002
+                || (s[0] == 0x2001 && s[1] == 0x0000)
+                || s[0] == 0x0100
+                || ((s[0] & 0xffc0) == 0xfec0))
         }
     }
 }
@@ -422,7 +480,19 @@ pub fn map_for_dual(addr: SocketAddr) -> SocketAddr {
 }
 
 /// Dual-stack UDP socket (V6ONLY=0 when bound to ::). Buffer enlarged for GSO bursts.
+/// `sess` sockets (per UDP association) should use the small variant to avoid
+/// OOM on routers: 4MB x N sessions of kernel memory adds up fast (P3).
 pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
+    udp_socket_dual_with_size(bind, 4 * 1024 * 1024)
+}
+
+/// Per-session / relay sockets: 1MB is plenty for a single association's
+/// DATAGRAM flow and keeps 100 sessions near ~200MB instead of ~800MB.
+pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
+    udp_socket_dual_with_size(bind, 1024 * 1024)
+}
+
+pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::UdpSocket> {
     let addr: SocketAddr = bind.parse()?;
     let domain = if addr.is_ipv6() {
         socket2::Domain::IPV6
@@ -435,11 +505,11 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
     }
     s.set_reuse_address(true)?;
     s.set_nonblocking(true)?;
-    if s.set_send_buffer_size(4 * 1024 * 1024).is_err() {
-        tracing::warn!("udp send buffer 4MB unavailable (raise net.core.wmem_max)");
+    if s.set_send_buffer_size(buf).is_err() {
+        tracing::warn!("udp send buffer {} unavailable (raise net.core.wmem_max)", buf);
     }
-    if s.set_recv_buffer_size(4 * 1024 * 1024).is_err() {
-        tracing::warn!("udp recv buffer 4MB unavailable (raise net.core.rmem_max)");
+    if s.set_recv_buffer_size(buf).is_err() {
+        tracing::warn!("udp recv buffer {} unavailable (raise net.core.rmem_max)", buf);
     }
     s.bind(&addr.into())?;
     Ok(s.into())
@@ -479,7 +549,7 @@ pub async fn copy_tcp_quic(
         R: AsyncReadExt + Unpin,
         W: AsyncWriteExt + Unpin,
     {
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; 32 * 1024];
         let mut total = 0u64;
         loop {
             let n = r.read(&mut buf).await?;
@@ -520,6 +590,90 @@ pub async fn copy_tcp_quic(
         _ => {}
     }
     Ok((a?, b?))
+}
+
+/// Same as [`copy_tcp_quic`] but bounds idle keep-alive streams: if no bytes
+/// flow in either direction for `idle`, both halves are shut down and an
+/// error is returned so the per-connection task can exit (B7).
+pub async fn copy_tcp_quic_idle(
+    tcp: tokio::net::TcpStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    idle: Duration,
+) -> Result<(u64, u64)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let last_ms = Arc::new(AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    ));
+    let touch = |last: &Arc<AtomicU64>| {
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            last.store(d.as_millis() as u64, Ordering::Relaxed);
+        }
+    };
+    let (mut tr, mut tw) = tcp.into_split();
+    let mut send = send;
+    let mut recv = recv;
+    let l1 = last_ms.clone();
+    let l2 = last_ms.clone();
+    let c2s = async move {
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = tr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            send.write_all(&buf[..n]).await?;
+            total += n as u64;
+            touch(&l1);
+        }
+        send.finish().ok();
+        Ok::<u64, anyhow::Error>(total)
+    };
+    let s2c = async move {
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = recv.read(&mut buf).await?.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            tw.write_all(&buf[..n]).await?;
+            total += n as u64;
+            touch(&l2);
+        }
+        tw.shutdown().await.ok();
+        Ok::<u64, anyhow::Error>(total)
+    };
+    let copy_fut = async move {
+        let (a, b) = tokio::join!(c2s, s2c);
+        match (&a, &b) {
+            (Ok(_), Err(_)) | (Err(_), Err(_)) => {}
+            _ => {}
+        }
+        Ok::<(u64, u64), anyhow::Error>((a?, b?))
+    };
+    tokio::pin!(copy_fut);
+    loop {
+        let step = Duration::from_secs(5).min(idle);
+        tokio::select! {
+            r = &mut copy_fut => return r,
+            _ = tokio::time::sleep(step) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let last = last_ms.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= idle.as_millis() as u64 {
+                    anyhow::bail!("tcp stream idle>{idle:?}");
+                }
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]

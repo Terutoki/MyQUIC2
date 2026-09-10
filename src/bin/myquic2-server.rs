@@ -18,13 +18,14 @@ type SessEntry = (
     tokio::task::JoinHandle<()>,
     std::time::Instant,
 );
-type SessTable = Arc<std::sync::RwLock<HashMap<u32, SessEntry>>>;
+type SessTable = Arc<tokio::sync::RwLock<HashMap<u32, SessEntry>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let a = Args::parse();
     let c: ServerConf = load_toml(&a.config)?;
+    parse_congestion(&c.congestion);
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
 
     // Self-signed cert: auto-generate on first run (fast path, no external CA RTT).
@@ -90,7 +91,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     info!("new QUIC conn from {}", conn.remote_address());
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
-    let sess: SessTable = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let sess: SessTable = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     {
         let sess = sess.clone();
         let conn = conn.clone();
@@ -98,27 +99,25 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                        if let Ok(mut m) = sess.write() {
-                            let now = std::time::Instant::now();
-                            let expired: Vec<u32> = m
-                                .iter()
-                                .filter(|(_, (_, _, t))| {
-                                    now.duration_since(*t) >= Duration::from_secs(180)
-                                })
-                                .map(|(k, _)| *k)
-                                .collect();
-                            for k in expired {
-                                if let Some((_, h, _)) = m.remove(&k) {
-                                    h.abort();
-                                }
+                        let now = std::time::Instant::now();
+                        let mut m = sess.write().await;
+                        let expired: Vec<u32> = m
+                            .iter()
+                            .filter(|(_, (_, _, t))| {
+                                now.duration_since(*t) >= Duration::from_secs(180)
+                            })
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for k in expired {
+                            if let Some((_, h, _)) = m.remove(&k) {
+                                h.abort();
                             }
                         }
                     }
                     _ = conn.closed() => {
-                        if let Ok(mut m) = sess.write() {
-                            for (_, (_, h, _)) in m.drain() {
-                                h.abort();
-                            }
+                        let mut m = sess.write().await;
+                        for (_, (_, h, _)) in m.drain() {
+                            h.abort();
                         }
                         break;
                     }
@@ -139,7 +138,6 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 Ok(x) => x,
                 Err(_) => continue,
             };
-            let payload = Bytes::copy_from_slice(payload);
             match addr {
                 TargetAddr::Ip(dst) => {
                     if !allow_private && !is_global_ip(dst.ip()) {
@@ -149,28 +147,45 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         Some(v) => v,
                         None => continue,
                     };
-                    let _ = sock.send_to(&payload, map_for_dual(dst)).await;
+                    let _ = sock.send_to(payload, map_for_dual(dst)).await;
                 }
                 TargetAddr::Domain(h, p) => {
-                    let ss = ss.clone();
-                    let cd = cd.clone();
-                    tokio::spawn(async move {
-                        let dst = match resolve_all_cached(&h, p).await {
-                            Ok(v) => match v.into_iter().next() {
-                                Some(v) => v,
-                                None => return,
-                            },
-                            Err(_) => return,
+                    // Fast path: cached DNS avoids per-packet spawn (P1).
+                    if let Some(v) = lookup_cached_sync(&h, p) {
+                        let dst = match v.into_iter().next() {
+                            Some(v) => v,
+                            None => continue,
                         };
                         if !allow_private && !is_global_ip(dst.ip()) {
-                            return;
+                            continue;
                         }
                         let sock = match get_or_create_sess(&ss, &cd, s).await {
                             Some(v) => v,
-                            None => return,
+                            None => continue,
                         };
-                        let _ = sock.send_to(&payload, map_for_dual(dst)).await;
-                    });
+                        let _ = sock.send_to(payload, map_for_dual(dst)).await;
+                    } else {
+                        let ss = ss.clone();
+                        let cd = cd.clone();
+                        let payload = Bytes::copy_from_slice(payload);
+                        tokio::spawn(async move {
+                            let dst = match resolve_all_cached(&h, p).await {
+                                Ok(v) => match v.into_iter().next() {
+                                    Some(v) => v,
+                                    None => return,
+                                },
+                                Err(_) => return,
+                            };
+                            if !allow_private && !is_global_ip(dst.ip()) {
+                                return;
+                            }
+                            let sock = match get_or_create_sess(&ss, &cd, s).await {
+                                Some(v) => v,
+                                None => return,
+                            };
+                            let _ = sock.send_to(&payload, map_for_dual(dst)).await;
+                        });
+                    }
                 }
             }
         }
@@ -207,12 +222,11 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     return;
                 }
             };
-            // Dial 成功后回 1 字节确认，client 在回 SOCKS 成功前等待它。
-            // 老 client 不等确认也能跑（直接进 copy），新 client 用它做 fail-fast。
-            if send.write_all(&[0x00]).await.is_err() {
+            let _ = tcp.set_nodelay(true);
+            if send.write_all(&[MQP_TCP_ACK]).await.is_err() {
                 return;
             }
-            let _ = copy_tcp_quic(tcp, send, recv).await;
+            let _ = copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await;
         });
     }
     Ok(())
@@ -276,22 +290,32 @@ async fn dial_happy_eyeballs(
         return None;
     }
     if cands.len() == 1 {
-        return tokio::time::timeout(
+        let s = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::net::TcpStream::connect(cands[0]),
         )
         .await
         .ok()?
-        .ok();
+        .ok()?;
+        let _ = s.set_nodelay(true);
+        return Some(s);
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
-    for a in cands {
+    for (i, a) in cands.into_iter().enumerate() {
         let tx = tx.clone();
         tokio::spawn(async move {
+            // RFC8305-style stagger: avoid SYN burst, first families win (P5).
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(250 * i.min(4) as u64)).await;
+            }
+            if tx.is_closed() {
+                return;
+            }
             if let Ok(Ok(s)) =
                 tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(a))
                     .await
             {
+                let _ = s.set_nodelay(true);
                 let _ = tx.try_send(s);
             }
         });
@@ -305,24 +329,40 @@ async fn get_or_create_sess(
     cd: &quinn::Connection,
     s: u32,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
-    if let Ok(m) = ss.read() {
-        if let Some((sock, _, _)) = m.get(&s) {
+    // Fast path under read lock; timestamp refresh without blocking writers
+    // longer than necessary (P0: single write per packet was the hotspot).
+    {
+        let r = ss.read().await;
+        if let Some((sock, _, _)) = r.get(&s) {
             let sock = sock.clone();
-            drop(m);
-            if let Ok(mut w) = ss.write() {
-                if let Some((_, _, t)) = w.get_mut(&s) {
-                    *t = std::time::Instant::now();
-                }
+            drop(r);
+            let mut w = ss.write().await;
+            if let Some((_, _, t)) = w.get_mut(&s) {
+                *t = std::time::Instant::now();
             }
             return Some(sock);
         }
     }
-    let raw = udp_socket_dual("[::]:0").ok()?;
+    // Slow path holds the write lock across check+insert so concurrent
+    // packets for the same sess cannot create duplicate sockets (B8).
+    let mut w = ss.write().await;
+    if let Some((sock2, _, t)) = w.get_mut(&s) {
+        *t = std::time::Instant::now();
+        return Some(sock2.clone());
+    }
+    if w.len() >= 4096 {
+        if let Some(k) = w.keys().find(|k| **k != s).cloned() {
+            if let Some((_, hh, _)) = w.remove(&k) {
+                hh.abort();
+            }
+        }
+    }
+    let raw = udp_socket_dual_small("[::]:0").ok()?;
     let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
     let c2 = cd.clone();
     let rs = sock.clone();
     let h = tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 4096];
         loop {
             let (n, src) = match tokio::time::timeout(
                 Duration::from_secs(180),
@@ -333,6 +373,9 @@ async fn get_or_create_sess(
                 Ok(Ok(x)) => x,
                 _ => break,
             };
+            if n == buf.len() {
+                continue;
+            }
             let src = SocketAddr::new(unmap(src.ip()), src.port());
             let d = match encode_datagram(s, &TargetAddr::Ip(src), &buf[..n]) {
                 Some(d) => d,
@@ -343,25 +386,6 @@ async fn get_or_create_sess(
             }
         }
     });
-    if let Ok(mut m) = ss.write() {
-        if let Some((sock2, _, t)) = m.get_mut(&s) {
-            *t = std::time::Instant::now();
-            let sock2 = sock2.clone();
-            drop(m);
-            h.abort();
-            return Some(sock2);
-        }
-        m.insert(s, (sock.clone(), h, std::time::Instant::now()));
-        if m.len() > 4096 {
-            if let Some(k) = m.keys().find(|k| **k != s).cloned() {
-                if let Some((_, hh, _)) = m.remove(&k) {
-                    hh.abort();
-                }
-            }
-        }
-        Some(sock)
-    } else {
-        h.abort();
-        None
-    }
+    w.insert(s, (sock.clone(), h, std::time::Instant::now()));
+    Some(sock)
 }

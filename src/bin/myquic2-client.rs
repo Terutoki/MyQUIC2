@@ -31,7 +31,7 @@ fn bump_gen(tx: &watch::Sender<u64>) {
 /// One dispatcher serves the whole process across reconnects; subscriptions
 /// die with their association, so no immortal task can steal another's packets.
 struct UdpHub {
-    subs: std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
+    subs: tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>,
     next: std::sync::atomic::AtomicU32,
 }
 
@@ -50,7 +50,8 @@ impl UdpHub {
                 continue;
             }
             let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
-            if let Ok(mut m) = self.subs.write() {
+            {
+                let mut m = self.subs.write().await;
                 if m.contains_key(&s) {
                     continue;
                 }
@@ -66,14 +67,14 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
+    parse_congestion(&c.congestion);
     let tls = client_tls_config(load_cert_der(&c.server_cert_file)?)?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(Arc::new(quic_client));
     ccfg.transport_config(build_transport(&c.congestion, c.keep_alive_secs));
     let ccfg = Arc::new(ccfg);
-    let server: SocketAddr = resolve_server_addr(&c.server_addr)
-        .await
-        .context("bad server_addr")?;
+    let server_str = c.server_addr.clone();
+    let server_str_log = server_str.clone();
 
     // Single Endpoint for the process lifetime: one UDP socket, shared session-ticket
     // cache (0-RTT resumption) and CID routing for every dial. Never recreate per dial.
@@ -94,7 +95,7 @@ async fn main() -> Result<()> {
     // without a per-packet timer.
     let (gen_tx, gen_rx) = watch::channel(0u64);
     let hub: Arc<UdpHub> = Arc::new(UdpHub {
-        subs: std::sync::RwLock::new(HashMap::new()),
+        subs: tokio::sync::RwLock::new(HashMap::new()),
         next: std::sync::atomic::AtomicU32::new(1),
     });
     // Sole DATAGRAM reader for the process: routes by sess_id to the live association.
@@ -117,11 +118,7 @@ async fn main() -> Result<()> {
                             let sess = match decode_datagram(&d) {
                                 Ok((s, _, _)) => s, Err(_) => continue,
                             };
-                            let tx = hub
-                                .subs
-                                .read()
-                                .ok()
-                                .and_then(|m| m.get(&sess).cloned());
+                            let tx = hub.subs.read().await.get(&sess).cloned();
                             if let Some(tx) = tx {
                                 let _ = tx.try_send(d);
                             }
@@ -135,6 +132,7 @@ async fn main() -> Result<()> {
         });
     }
     // Reconnect loop: survives server restart. Backoff 200ms..5s + jitter.
+    // server_addr is re-resolved every dial so DDNS/IP changes are picked up (B3).
     {
         let shared = shared.clone();
         let sname = c.server_name.clone();
@@ -143,6 +141,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(200);
             loop {
+                let server: SocketAddr = match resolve_server_addr(&server_str).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("resolve {server_str} failed: {e:#}; retry in {backoff:?}");
+                        tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                        continue;
+                    }
+                };
                 match dial_once(&ep, server, &sname).await {
                     Ok(conn) => {
                         info!("QUIC connected to {server}");
@@ -188,6 +195,8 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        // Small pause avoids tight redial spin on flapping links.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                     Err(e) => {
                         warn!("dial {server} failed: {e:#}; retry in {backoff:?}");
@@ -201,10 +210,11 @@ async fn main() -> Result<()> {
 
     let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
     let li = tokio::net::TcpListener::from_std(tcp_listener_dual(&c.socks_listen)?)?;
-    info!("socks5 listening on {listen} -> QUIC {server} (dns=server-side, auth=none, tls13-pinned, 0rtt)");
+    info!("socks5 listening on {listen} -> QUIC {server_str_log} (dns=server-side, auth=none, tls13-pinned, 0rtt)");
     let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
     loop {
         let (sock, peer) = li.accept().await?;
+        let _ = sock.set_nodelay(true);
         let shared = shared.clone();
         let hub = hub.clone();
         let gen_rx = gen_rx.clone();
@@ -327,10 +337,25 @@ async fn handle_socks(
         anyhow::bail!("bad req ver");
     }
     let target = match r[1] {
-        0x01 => read_socks_addr(&mut s).await?, // CONNECT
+        0x01 => match read_socks_addr(&mut s).await {
+            Ok(t) => t,
+            Err(_) => {
+                if let Ok(b) = bnd_for(&s) {
+                    write_socks_reply(&mut s, 0x08, b).await.ok();
+                }
+                anyhow::bail!("bad connect target");
+            }
+        },
         0x03 => {
-            // UDP ASSOCIATE
-            let _ = read_socks_addr(&mut s).await?;
+            // UDP ASSOCIATE: outer addr is a hint only (often 0.0.0.0:0) and
+            // is always ignored, so read it leniently without TargetAddr
+            // validation. Real packet targets inside DATAGRAMs stay strict.
+            if read_socks_addr_lenient(&mut s).await.is_err() {
+                if let Ok(b) = bnd_for(&s) {
+                    write_socks_reply(&mut s, 0x08, b).await.ok();
+                }
+                anyhow::bail!("bad associate target");
+            }
             return handle_udp_associate(s, shared, hub).await;
         }
         _ => {
@@ -339,16 +364,11 @@ async fn handle_socks(
             anyhow::bail!("unsupported cmd");
         }
     };
-    let bnd: SocketAddr = {
-        let local = s.local_addr()?;
-        let ip = unmap(local.ip());
-        let ip = if ip.is_unspecified() {
-            unmap(s.peer_addr()?.ip())
-        } else {
-            ip
-        };
-        SocketAddr::new(ip, local.port())
-    };
+    let bnd: SocketAddr = bnd_for(&s).unwrap_or_else(|_| {
+        s.peer_addr()
+            .map(|p| SocketAddr::new(unmap(p.ip()), 0))
+            .unwrap_or_else(|_| SocketAddr::new(unmap("127.0.0.1".parse().unwrap()), 0))
+    });
 
     let conn = wait_conn(&shared, &mut gen_rx, timeout).await?;
     let (mut send, mut recv) =
@@ -374,22 +394,24 @@ async fn handle_socks(
     let mut hdr = Vec::with_capacity(273);
     target.encode(&mut hdr)?;
     send.write_all(&hdr).await?;
-    match tokio::time::timeout(Duration::from_secs(5), recv.read(&mut [0u8; 1])).await {
-        Ok(Ok(Some(1))) => {}
-        Ok(Ok(_)) => {
-            write_socks_reply(&mut s, 0x05, bnd).await.ok();
-            anyhow::bail!("remote dial refused");
-        }
-        Ok(Err(_)) => {
-            write_socks_reply(&mut s, 0x05, bnd).await.ok();
-            anyhow::bail!("remote dial refused");
-        }
-        Err(_) => {
-            // Old server never sends ack; compatible fast path.
+    // Strict MQP-1 ACK: server must reply exactly MQP_TCP_ACK. No silent
+    // fallback — an old peer's first app byte must never be eaten as an ACK,
+    // and our ACK must never leak into an old peer's app stream (B1).
+    {
+        let mut ack = [0u8; 1];
+        let got = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut ack)).await;
+        let ok = match got {
+            Ok(Ok(Some(1))) => ack[0] == MQP_TCP_ACK,
+            _ => false,
+        };
+        if !ok {
+            write_socks_reply(&mut s, 0x04, bnd).await.ok();
+            send.reset(0x04u32.into()).ok();
+            anyhow::bail!("remote dial refused/timeout/version mismatch");
         }
     }
     write_socks_reply(&mut s, 0x00, bnd).await?;
-    let _ = copy_tcp_quic(s, send, recv).await;
+    let _ = copy_tcp_quic_idle(s, send, recv, Duration::from_secs(300)).await;
     Ok(())
 }
 
@@ -430,8 +452,52 @@ async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
     }
 }
 
-async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {
-    let mut v = vec![0x05, rep, 0x00];
+async fn read_socks_addr_lenient(s: &mut tokio::net::TcpStream) -> Result<()> {
+    async fn rd(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
+            .await
+            .context("socks addr read timed out")??;
+        Ok(())
+    }
+    let mut t = [0u8; 1];
+    rd(s, &mut t).await?;
+    match t[0] {
+        0x01 => {
+            let mut b = [0u8; 6];
+            rd(s, &mut b).await?;
+            Ok(())
+        }
+        0x04 => {
+            let mut b = [0u8; 18];
+            rd(s, &mut b).await?;
+            Ok(())
+        }
+        0x03 => {
+            let mut n = [0u8; 1];
+            rd(s, &mut n).await?;
+            if n[0] == 0 {
+                anyhow::bail!("empty domain");
+            }
+            let mut b = vec![0u8; n[0] as usize + 2];
+            rd(s, &mut b).await?;
+            Ok(())
+        }
+        x => anyhow::bail!("bad atyp {x}"),
+    }
+}
+
+fn bnd_for(s: &tokio::net::TcpStream) -> Result<SocketAddr> {
+    let local = s.local_addr()?;
+    let ip = unmap(local.ip());
+    let ip = if ip.is_unspecified() {
+        unmap(s.peer_addr()?.ip())
+    } else {
+        ip
+    };
+    Ok(SocketAddr::new(ip, local.port()))
+}
+
+async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {    let mut v = vec![0x05, rep, 0x00];
     match bnd {
         SocketAddr::V4(a) => {
             v.push(0x01);
@@ -455,7 +521,7 @@ async fn handle_udp_associate(
     hub: Arc<UdpHub>,
 ) -> Result<()> {
     let (sess, _tx, mut rx) = hub.alloc_sess().await;
-    let relay = tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0")?)?;
+    let relay = tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0")?)?;
     let relay_port = relay.local_addr()?.port();
     let relay_reply = SocketAddr::new(unmap(tcp.peer_addr()?.ip()), relay_port);
     let mut tcp = tcp;
@@ -474,13 +540,22 @@ async fn handle_udp_associate(
                 };
                 let dst = match addr {
                     TargetAddr::Ip(s) => s,
-                    TargetAddr::Domain(h, p) => match resolve_all_cached(&h, p).await {
-                        Ok(v) => match v.into_iter().next() {
-                            Some(s) => s,
-                            None => continue,
-                        },
-                        Err(_) => continue,
-                    },
+                    TargetAddr::Domain(h, p) => {
+                        if let Some(v) = lookup_cached_sync(&h, p) {
+                            match v.into_iter().next() {
+                                Some(s) => s,
+                                None => continue,
+                            }
+                        } else {
+                            match resolve_all_cached(&h, p).await {
+                                Ok(v) => match v.into_iter().next() {
+                                    Some(s) => s,
+                                    None => continue,
+                                },
+                                Err(_) => continue,
+                            }
+                        }
+                    }
                 };
                 let app = last_app.read().ok().and_then(|g| *g);
                 if let Some(app) = app {
@@ -496,12 +571,20 @@ async fn handle_udp_associate(
                 }
             }
         });
-        // app -> QUIC with this association's sess.
-        let mut buf = vec![0u8; 2048];
+        // app -> QUIC with this association's sess. Idle assoc (no packets
+        // either way for 180s) is reaped so leaked TCP controls cannot hold
+        // relay sockets forever (B6).
+        let mut buf = vec![0u8; 4096];
+        let mut last_activity = tokio::time::Instant::now();
+        let idle_limit = Duration::from_secs(180);
         loop {
             tokio::select! {
                 r = relay.recv_from(&mut buf) => {
                     let (n, app) = r?;
+                    if n == buf.len() {
+                        continue;
+                    }
+                    last_activity = tokio::time::Instant::now();
                     if let Ok(mut g) = last_app_w.write() {
                         *g = Some(app);
                     }
@@ -535,6 +618,7 @@ async fn handle_udp_associate(
                     }
                 }
                 _ = tcp.readable() => {
+                    last_activity = tokio::time::Instant::now();
                     let mut closed = false;
                     loop {
                         let mut b = [0u8; 512];
@@ -549,11 +633,14 @@ async fn handle_udp_associate(
                         break;
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    if last_activity.elapsed() >= idle_limit {
+                        break;
+                    }
+                }
             }
         }
     }
-    if let Ok(mut m) = hub.subs.write() {
-        m.remove(&sess);
-    }
+    hub.subs.write().await.remove(&sess);
     Ok(())
 }
