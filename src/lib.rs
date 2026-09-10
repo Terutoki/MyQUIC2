@@ -127,13 +127,22 @@ pub const MQP_TCP_ACK: u8 = 0x00;
 /// sess scopes the packet to one UDP ASSOCIATE so concurrent associations sharing
 /// a QUIC connection never steal each other's replies. Returns None if exceeds limit.
 pub fn encode_datagram(sess: u32, addr: &TargetAddr, payload: &[u8]) -> Option<Bytes> {
+    encode_datagram_with_limit(sess, addr, payload, 1350)
+}
+
+pub fn encode_datagram_with_limit(
+    sess: u32,
+    addr: &TargetAddr,
+    payload: &[u8],
+    limit: usize,
+) -> Option<Bytes> {
     let mut v = Vec::with_capacity(40 + payload.len());
     v.push(0x02);
     v.extend_from_slice(&sess.to_le_bytes());
     if addr.encode(&mut v).is_err() {
         return None;
     }
-    if v.len() + payload.len() > 1350 {
+    if v.len() + payload.len() > limit {
         return None;
     }
     v.extend_from_slice(payload);
@@ -247,6 +256,9 @@ pub fn server_tls_config(
     // Accept QUIC 0-RTT early data on resumption. quinn requires exactly 0 or u32::MAX here.
     // Replay caveat: tickets are single-use and short-lived; worst case is a duplicated
     // outbound dial, no amplification.
+    // quinn-0.11 hard-requires 0 or u32::MAX here (panics otherwise), so the
+    // bound cannot be lowered at this layer; replay exposure is limited by
+    // single-use short-lived tickets instead.
     cfg.max_early_data_size = u32::MAX;
     Ok(Arc::new(cfg))
 }
@@ -269,13 +281,7 @@ pub fn client_tls_config(
 
 // ---------------- QUIC transport: BBR + DATAGRAM + keepalive ----------------
 pub fn parse_congestion(name: &str) -> bool {
-    if name.eq_ignore_ascii_case("cubic") || name.eq_ignore_ascii_case("bbr") {
-        return true;
-    }
-    tracing::warn!(
-        "unknown congestion={name:?}, falling back to bbr (want bbr|cubic)"
-    );
-    false
+    name.eq_ignore_ascii_case("cubic") || name.eq_ignore_ascii_case("bbr")
 }
 
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
@@ -292,10 +298,10 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
         t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     }
     // GSO/GRO: no flag in quinn API — quinn-udp auto-probes UDP_SEGMENT/UDP_GRO.
-    // Bounded buffers: large per-connection buffers risk OOM on small routers,
-    // so use 8MB datagram buffers which still cover high-RTT BDP with headroom.
-    t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    t.datagram_send_buffer_size(8 * 1024 * 1024);
+    // Bounded buffers: 4MB datagram buffers cover high-RTT BDP (~3.5MB) while
+    // halving per-connection memory vs 8MB (100 server-side conns ≈ 800MB→400MB).
+    t.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+    t.datagram_send_buffer_size(4 * 1024 * 1024);
     // 512 concurrent streams cover the 500-flow test with margin while bounding
     // worst-case flow-control memory (4MB window each).
     t.max_concurrent_bidi_streams(512u32.into());
@@ -352,16 +358,66 @@ fn dns_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> 
 }
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const DNS_NEG_TTL: Duration = Duration::from_secs(10);
+
+fn dns_neg_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, Instant>> {
+    static NEG: std::sync::OnceLock<std::sync::RwLock<HashMap<DnsCacheKey, Instant>>> =
+        std::sync::OnceLock::new();
+    NEG.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+fn dns_inflight(
+) -> &'static tokio::sync::Mutex<HashMap<DnsCacheKey, Arc<tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>>>>
+{
+    static INF: std::sync::OnceLock<
+        tokio::sync::Mutex<
+            HashMap<DnsCacheKey, Arc<tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INF.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn mono_millis() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+fn dns_key_hash(host: &str, port: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    host.hash(&mut h);
+    port.hash(&mut h);
+    h.finish()
+}
 
 /// Cached variant used on hot paths (UDP per-packet, TCP per-connection).
 /// Sync fast path for the UDP hot loop: returns a clone only on cache hit,
 /// never performs I/O. Lets callers avoid `tokio::spawn` per packet (P1).
+/// Allocation-free hit path: thread-local single-entry cache keyed by hash
+/// avoids the per-packet `String` allocation when the same domain repeats.
 pub fn lookup_cached_sync(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    use std::cell::RefCell;
+    thread_local! {
+        static LAST: RefCell<(u64, Vec<SocketAddr>, Instant)> =
+            RefCell::new((0, Vec::new(), Instant::now() - DNS_CACHE_TTL - Duration::from_secs(1)));
+    }
+    let h = dns_key_hash(host, port);
+    let hit = LAST.with(|c| {
+        let c = c.borrow();
+        c.0 == h && c.2.elapsed() < DNS_CACHE_TTL && !c.1.is_empty()
+    });
+    if hit {
+        return LAST.with(|c| Some(c.borrow().1.clone()));
+    }
     let key: DnsCacheKey = (host.to_string(), port);
     if let Ok(m) = dns_cache().read() {
         if let Some((t, v)) = m.get(&key) {
             if t.elapsed() < DNS_CACHE_TTL {
-                return Some(v.clone());
+                let v = v.clone();
+                LAST.with(|c| {
+                    *c.borrow_mut() = (h, v.clone(), Instant::now());
+                });
+                return Some(v);
             }
         }
     }
@@ -392,15 +448,68 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
                 }
             }
         }
-    }
-    let v = resolve_all_timeout(host, port, Duration::from_secs(5)).await?;
-    {
-        if let Ok(mut m) = dns_cache().write() {
-            m.insert(key, (Instant::now(), v.clone()));
-            evict_if_needed(&mut m);
+        if let Ok(n) = dns_neg_cache().read() {
+            if let Some(t) = n.get(&key) {
+                if t.elapsed() < DNS_NEG_TTL {
+                    anyhow::bail!("dns negative cached");
+                }
+            }
         }
     }
-    Ok(v)
+    // Singleflight: concurrent lookups for the same key share one upstream query.
+    let cell = {
+        let mut inf = dns_inflight().lock().await;
+        if let Some(c) = inf.get(&key) {
+            c.clone()
+        } else {
+            let c = Arc::new(tokio::sync::OnceCell::new());
+            inf.insert(key.clone(), c.clone());
+            c
+        }
+    };
+    let is_owner = !cell.initialized();
+    let res: Result<Vec<SocketAddr>, String> = if is_owner {
+        match resolve_all_timeout(host, port, Duration::from_secs(5)).await {
+            Ok(v) => {
+                let _ = cell.set(Ok(v.clone()));
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = cell.set(Err(format!("{e:#}")));
+                Err(format!("{e:#}"))
+            }
+        }
+    } else {
+        while !cell.initialized() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cell.get().cloned().unwrap_or(Err("dns inflight lost".to_string()))
+    };
+    if is_owner {
+        let mut inf = dns_inflight().lock().await;
+        inf.remove(&key);
+    }
+    match res {
+        Ok(v) => {
+            if let Ok(mut m) = dns_cache().write() {
+                m.insert(key.clone(), (Instant::now(), v.clone()));
+                evict_if_needed(&mut m);
+            }
+            if let Ok(mut n) = dns_neg_cache().write() {
+                n.remove(&key);
+            }
+            Ok(v)
+        }
+        Err(msg) => {
+            if let Ok(mut n) = dns_neg_cache().write() {
+                n.insert(key, Instant::now());
+                if n.len() > 1024 {
+                    n.retain(|_, t| t.elapsed() < DNS_NEG_TTL);
+                }
+            }
+            anyhow::bail!("{msg}")
+        }
+    }
 }
 
 /// Accept `IP:port` or `hostname:port` for the QUIC server address.
@@ -439,6 +548,8 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                     && v.octets()[1] == 51
                     && v.octets()[2] == 100)
                 || (v.octets()[0] == 203 && v.octets()[1] == 0 && v.octets()[2] == 113)
+                // 192.88.99.0/24 6to4 relay (deprecated, never a dial target)
+                || (v.octets()[0] == 192 && v.octets()[1] == 88 && v.octets()[2] == 99)
                 // 240.0.0.0/4 reserved (240-255)
                 || (v.octets()[0] >= 240))
         }
@@ -457,6 +568,8 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || s[0] == 0x2002
                 || (s[0] == 0x2001 && s[1] == 0x0000)
                 || s[0] == 0x0100
+                // 2001:10::/28 ORCHIDv2 (RFC7343, non-routable)
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010)
                 || ((s[0] & 0xffc0) == 0xfec0))
         }
     }
@@ -595,41 +708,69 @@ pub async fn copy_tcp_quic(
 /// Same as [`copy_tcp_quic`] but bounds idle keep-alive streams: if no bytes
 /// flow in either direction for `idle`, both halves are shut down and an
 /// error is returned so the per-connection task can exit (B7).
+/// Uses monotonic `Instant` (never wall-clock) and resets the QUIC stream
+/// on any directional failure so the peer never hangs.
 pub async fn copy_tcp_quic_idle(
     tcp: tokio::net::TcpStream,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
     idle: Duration,
 ) -> Result<(u64, u64)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let last_ms = Arc::new(AtomicU64::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-    ));
-    let touch = |last: &Arc<AtomicU64>| {
-        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            last.store(d.as_millis() as u64, Ordering::Relaxed);
+    // Monotonic base: all timestamps are ms since here, immune to NTP/wall jumps.
+    let base = tokio::time::Instant::now();
+    let last_ms = Arc::new(AtomicU64::new(0));
+    // Throttled touch: at most one atomic store per 100ms per direction.
+    // High-throughput (400Mb/s ≈ 1500 chunks/s) must not pay a clock+store per chunk.
+    let touch = |last: &AtomicU64, base: &tokio::time::Instant| {
+        let now = base.elapsed().as_millis() as u64;
+        let prev = last.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 100 {
+            last.store(now, Ordering::Relaxed);
         }
     };
     let (mut tr, mut tw) = tcp.into_split();
-    let mut send = send;
-    let mut recv = recv;
     let l1 = last_ms.clone();
     let l2 = last_ms.clone();
+    let b1 = base;
+    let b2 = base;
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f1 = failed.clone();
+    let f2 = failed.clone();
     let c2s = async move {
         let mut buf = vec![0u8; 32 * 1024];
         let mut total = 0u64;
+        let mut chunks = 0u64;
         loop {
-            let n = tr.read(&mut buf).await?;
-            if n == 0 {
-                break;
+            if f1.load(Ordering::Relaxed) {
+                send.reset(0x04u32.into()).ok();
+                anyhow::bail!("peer direction failed");
             }
-            send.write_all(&buf[..n]).await?;
+            let n = match tr.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    f1.store(true, Ordering::Relaxed);
+                    send.reset(0x04u32.into()).ok();
+                    return Err::<u64, anyhow::Error>(e.into());
+                }
+            };
+            if let Err(e) = send.write_all(&buf[..n]).await {
+                f1.store(true, Ordering::Relaxed);
+                send.reset(0x04u32.into()).ok();
+                return Err::<u64, anyhow::Error>(e.into());
+            }
             total += n as u64;
-            touch(&l1);
+            chunks += 1;
+            if chunks % 8 == 0 {
+                touch(&l1, &b1);
+            } else {
+                let now = b1.elapsed().as_millis() as u64;
+                if now.saturating_sub(l1.load(Ordering::Relaxed)) >= 500 {
+                    l1.store(now, Ordering::Relaxed);
+                }
+            }
         }
         send.finish().ok();
         Ok::<u64, anyhow::Error>(total)
@@ -637,24 +778,40 @@ pub async fn copy_tcp_quic_idle(
     let s2c = async move {
         let mut buf = vec![0u8; 32 * 1024];
         let mut total = 0u64;
+        let mut chunks = 0u64;
         loop {
-            let n = recv.read(&mut buf).await?.unwrap_or(0);
+            if f2.load(Ordering::Relaxed) {
+                tw.shutdown().await.ok();
+                anyhow::bail!("peer direction failed");
+            }
+            let n = match recv.read(&mut buf).await {
+                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(n)) => n,
+                Err(e) => {
+                    f2.store(true, Ordering::Relaxed);
+                    tw.shutdown().await.ok();
+                    return Err::<u64, anyhow::Error>(e.into());
+                }
+            };
             if n == 0 {
                 break;
             }
-            tw.write_all(&buf[..n]).await?;
+            if let Err(e) = tw.write_all(&buf[..n]).await {
+                f2.store(true, Ordering::Relaxed);
+                tw.shutdown().await.ok();
+                return Err::<u64, anyhow::Error>(e.into());
+            }
             total += n as u64;
-            touch(&l2);
+            chunks += 1;
+            if chunks % 8 == 0 {
+                touch(&l2, &b2);
+            }
         }
         tw.shutdown().await.ok();
         Ok::<u64, anyhow::Error>(total)
     };
     let copy_fut = async move {
         let (a, b) = tokio::join!(c2s, s2c);
-        match (&a, &b) {
-            (Ok(_), Err(_)) | (Err(_), Err(_)) => {}
-            _ => {}
-        }
         Ok::<(u64, u64), anyhow::Error>((a?, b?))
     };
     tokio::pin!(copy_fut);
@@ -663,12 +820,9 @@ pub async fn copy_tcp_quic_idle(
         tokio::select! {
             r = &mut copy_fut => return r,
             _ = tokio::time::sleep(step) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let elapsed_ms = base.elapsed().as_millis() as u64;
                 let last = last_ms.load(Ordering::Relaxed);
-                if now.saturating_sub(last) >= idle.as_millis() as u64 {
+                if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
                     anyhow::bail!("tcp stream idle>{idle:?}");
                 }
             }

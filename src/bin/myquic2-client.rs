@@ -67,7 +67,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
-    parse_congestion(&c.congestion);
+    if !parse_congestion(&c.congestion) {
+        warn!(
+            "unknown congestion={:?}, falling back to bbr (want bbr|cubic)",
+            c.congestion
+        );
+    }
     let tls = client_tls_config(load_cert_der(&c.server_cert_file)?)?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(Arc::new(quic_client));
@@ -115,9 +120,12 @@ async fn main() -> Result<()> {
                             let d: Bytes = match d {
                                 Ok(d) => d, Err(_) => break,
                             };
-                            let sess = match decode_datagram(&d) {
-                                Ok((s, _, _)) => s, Err(_) => continue,
-                            };
+                            // Lightweight sess extraction: no full TargetAddr decode
+                            // here, the association task decodes once.
+                            if d.len() < 6 || d[0] != 0x02 {
+                                continue;
+                            }
+                            let sess = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
                             let tx = hub.subs.read().await.get(&sess).cloned();
                             if let Some(tx) = tx {
                                 let _ = tx.try_send(d);
@@ -133,6 +141,9 @@ async fn main() -> Result<()> {
     }
     // Reconnect loop: survives server restart. Backoff 200ms..5s + jitter.
     // server_addr is re-resolved every dial so DDNS/IP changes are picked up (B3).
+    // Watchdog silence limit derives from keepalive so custom keep_alive_secs
+    // never causes spurious reconnects.
+    let watchdog_silence = Duration::from_secs((c.keep_alive_secs.max(1) * 4).max(20));
     {
         let shared = shared.clone();
         let sname = c.server_name.clone();
@@ -159,11 +170,12 @@ async fn main() -> Result<()> {
                         // Watchdog backs up `closed()`: a blackholed path may
                         // never deliver anything, so a healthy connection must
                         // keep showing inbound traffic (keepalive ACKs every
-                        // few seconds). 20s of utter silence means dead.
+                        // few seconds). Silence beyond 4x keepalive (min 20s)
+                        // means dead.
                         let watchdog = async {
                             let mut last_rx = conn.stats().udp_rx.datagrams;
                             let mut quiet_since = std::time::Instant::now();
-                            info!("watchdog armed rx={last_rx}");
+                            info!("watchdog armed rx={last_rx} silence_limit={watchdog_silence:?}");
                             loop {
                                 tokio::time::sleep(Duration::from_secs(5)).await;
                                 if conn.close_reason().is_some() {
@@ -173,8 +185,8 @@ async fn main() -> Result<()> {
                                 if rx != last_rx {
                                     last_rx = rx;
                                     quiet_since = std::time::Instant::now();
-                                } else if quiet_since.elapsed() >= Duration::from_secs(20) {
-                                    warn!("QUIC path silent 20s, force-closing {server}");
+                                } else if quiet_since.elapsed() >= watchdog_silence {
+                                    warn!("QUIC path silent {watchdog_silence:?}, force-closing {server}");
                                     conn.close(0u32.into(), b"watchdog");
                                     break;
                                 }
@@ -372,7 +384,7 @@ async fn handle_socks(
 
     let conn = wait_conn(&shared, &mut gen_rx, timeout).await?;
     let (mut send, mut recv) =
-        match tokio::time::timeout(Duration::from_secs(3), conn.open_bi()).await {
+        match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await {
             Ok(Ok(x)) => x,
             _ => {
                 if conn.close_reason().is_some() {
@@ -386,8 +398,10 @@ async fn handle_socks(
                         *shared.write().await = None;
                         bump_gen(&gen_tx);
                     }
+                    write_socks_reply(&mut s, 0x04, bnd).await.ok();
                     anyhow::bail!("quic connection dead, retry");
                 }
+                write_socks_reply(&mut s, 0x01, bnd).await.ok();
                 anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
             }
         };
@@ -397,9 +411,10 @@ async fn handle_socks(
     // Strict MQP-1 ACK: server must reply exactly MQP_TCP_ACK. No silent
     // fallback — an old peer's first app byte must never be eaten as an ACK,
     // and our ACK must never leak into an old peer's app stream (B1).
+    // 7s covers the server-side 4s dial budget plus handshake jitter.
     {
         let mut ack = [0u8; 1];
-        let got = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut ack)).await;
+        let got = tokio::time::timeout(Duration::from_secs(7), recv.read(&mut ack)).await;
         let ok = match got {
             Ok(Ok(Some(1))) => ack[0] == MQP_TCP_ACK,
             _ => false,
@@ -532,8 +547,11 @@ async fn handle_udp_associate(
         let last_app: Arc<std::sync::RwLock<Option<SocketAddr>>> =
             Arc::new(std::sync::RwLock::new(None));
         let last_app_w = last_app.clone();
+        let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
+        let last_activity_rx = last_activity.clone();
         tokio::spawn(async move {
             while let Some(d) = rx.recv().await {
+                last_activity_rx.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
                 let (_, addr, payload) = match decode_datagram(&d) {
                     Ok(x) => x,
                     Err(_) => continue,
@@ -574,9 +592,8 @@ async fn handle_udp_associate(
         // app -> QUIC with this association's sess. Idle assoc (no packets
         // either way for 180s) is reaped so leaked TCP controls cannot hold
         // relay sockets forever (B6).
-        let mut buf = vec![0u8; 4096];
-        let mut last_activity = tokio::time::Instant::now();
-        let idle_limit = Duration::from_secs(180);
+        let mut buf = vec![0u8; 2048];
+        let idle_limit_ms = 180_000u64;
         loop {
             tokio::select! {
                 r = relay.recv_from(&mut buf) => {
@@ -584,7 +601,7 @@ async fn handle_udp_associate(
                     if n == buf.len() {
                         continue;
                     }
-                    last_activity = tokio::time::Instant::now();
+                    last_activity.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
                     if let Ok(mut g) = last_app_w.write() {
                         *g = Some(app);
                     }
@@ -618,7 +635,6 @@ async fn handle_udp_associate(
                     }
                 }
                 _ = tcp.readable() => {
-                    last_activity = tokio::time::Instant::now();
                     let mut closed = false;
                     loop {
                         let mut b = [0u8; 512];
@@ -634,7 +650,7 @@ async fn handle_udp_associate(
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                    if last_activity.elapsed() >= idle_limit {
+                    if mono_millis().saturating_sub(last_activity.load(std::sync::atomic::Ordering::Relaxed)) >= idle_limit_ms {
                         break;
                     }
                 }

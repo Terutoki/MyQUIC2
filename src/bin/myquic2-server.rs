@@ -16,7 +16,7 @@ struct Args {
 type SessEntry = (
     Arc<tokio::net::UdpSocket>,
     tokio::task::JoinHandle<()>,
-    std::time::Instant,
+    Arc<std::sync::atomic::AtomicU64>,
 );
 type SessTable = Arc<tokio::sync::RwLock<HashMap<u32, SessEntry>>>;
 
@@ -25,7 +25,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let a = Args::parse();
     let c: ServerConf = load_toml(&a.config)?;
-    parse_congestion(&c.congestion);
+    if !parse_congestion(&c.congestion) {
+        warn!(
+            "unknown congestion={:?}, falling back to bbr (want bbr|cubic)",
+            c.congestion
+        );
+    }
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
 
     // Self-signed cert: auto-generate on first run (fast path, no external CA RTT).
@@ -99,12 +104,12 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                        let now = std::time::Instant::now();
+                        let now = mono_millis();
                         let mut m = sess.write().await;
                         let expired: Vec<u32> = m
                             .iter()
                             .filter(|(_, (_, _, t))| {
-                                now.duration_since(*t) >= Duration::from_secs(180)
+                                now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed)) >= 180_000
                             })
                             .map(|(k, _)| *k)
                             .collect();
@@ -193,12 +198,22 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     });
 
     // TCP: one QUIC bidi stream per connection. First bytes = MQP addr header.
+    // Bound concurrent dials so fast open/close cannot exhaust FDs/DNS.
+    let dial_sem = Arc::new(tokio::sync::Semaphore::new(512));
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(x) => x,
             Err(_) => break,
         };
+        let permit = match dial_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                send.reset(0x04u32.into()).ok();
+                continue;
+            }
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             let target: TargetAddr = match tokio::time::timeout(
                 Duration::from_secs(10),
                 read_mqp_target(&mut recv),
@@ -289,39 +304,66 @@ async fn dial_happy_eyeballs(
     if cands.is_empty() {
         return None;
     }
+    // Total budget 4s so the client-side 7s ACK wait always covers us.
+    let budget = tokio::time::sleep(Duration::from_secs(4));
+    tokio::pin!(budget);
     if cands.len() == 1 {
-        let s = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(cands[0]),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        let _ = s.set_nodelay(true);
-        return Some(s);
+        tokio::select! {
+            r = tokio::net::TcpStream::connect(cands[0]) => {
+                let s = r.ok()?;
+                let _ = s.set_nodelay(true);
+                return Some(s);
+            }
+            _ = &mut budget => return None,
+        }
     }
+    let won = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
     for (i, a) in cands.into_iter().enumerate() {
         let tx = tx.clone();
+        let won = won.clone();
         tokio::spawn(async move {
-            // RFC8305-style stagger: avoid SYN burst, first families win (P5).
             if i > 0 {
-                tokio::time::sleep(Duration::from_millis(250 * i.min(4) as u64)).await;
+                let mut waited = 0u64;
+                let delay = 250 * i.min(4) as u64;
+                while waited < delay {
+                    if won.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed() {
+                        return;
+                    }
+                    let step = 50.min(delay - waited);
+                    tokio::time::sleep(Duration::from_millis(step)).await;
+                    waited += step;
+                }
             }
-            if tx.is_closed() {
+            if won.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed() {
                 return;
             }
-            if let Ok(Ok(s)) =
-                tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(a))
-                    .await
-            {
-                let _ = s.set_nodelay(true);
-                let _ = tx.try_send(s);
+            tokio::select! {
+                r = tokio::net::TcpStream::connect(a) => {
+                    if let Ok(s) = r {
+                        let _ = s.set_nodelay(true);
+                        if won.compare_exchange(
+                            false, true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ).is_ok() {
+                            let _ = tx.try_send(s);
+                        }
+                    }
+                }
+                _ = async {
+                    while !won.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                } => {}
             }
         });
     }
     drop(tx);
-    rx.recv().await
+    tokio::select! {
+        r = rx.recv() => r,
+        _ = &mut budget => None,
+    }
 }
 
 async fn get_or_create_sess(
@@ -329,29 +371,31 @@ async fn get_or_create_sess(
     cd: &quinn::Connection,
     s: u32,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
-    // Fast path under read lock; timestamp refresh without blocking writers
-    // longer than necessary (P0: single write per packet was the hotspot).
+    // Fast path: single read lock + lock-free timestamp bump. No write lock
+    // per packet, so concurrent sessions never serialize on a global lock.
     {
         let r = ss.read().await;
-        if let Some((sock, _, _)) = r.get(&s) {
+        if let Some((sock, _, t)) = r.get(&s) {
             let sock = sock.clone();
-            drop(r);
-            let mut w = ss.write().await;
-            if let Some((_, _, t)) = w.get_mut(&s) {
-                *t = std::time::Instant::now();
-            }
+            t.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
             return Some(sock);
         }
     }
     // Slow path holds the write lock across check+insert so concurrent
     // packets for the same sess cannot create duplicate sockets (B8).
     let mut w = ss.write().await;
-    if let Some((sock2, _, t)) = w.get_mut(&s) {
-        *t = std::time::Instant::now();
+    if let Some((sock2, _, t)) = w.get(&s) {
+        t.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
         return Some(sock2.clone());
     }
     if w.len() >= 4096 {
-        if let Some(k) = w.keys().find(|k| **k != s).cloned() {
+        // Evict the least-recently-used entry so hot sessions survive.
+        if let Some(k) = w
+            .iter()
+            .filter(|(k, _)| **k != s)
+            .min_by_key(|(_, (_, _, t))| t.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|(k, _)| *k)
+        {
             if let Some((_, hh, _)) = w.remove(&k) {
                 hh.abort();
             }
@@ -361,8 +405,9 @@ async fn get_or_create_sess(
     let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
     let c2 = cd.clone();
     let rs = sock.clone();
+    let ss2 = ss.clone();
     let h = tokio::spawn(async move {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 2048];
         loop {
             let (n, src) = match tokio::time::timeout(
                 Duration::from_secs(180),
@@ -377,7 +422,9 @@ async fn get_or_create_sess(
                 continue;
             }
             let src = SocketAddr::new(unmap(src.ip()), src.port());
-            let d = match encode_datagram(s, &TargetAddr::Ip(src), &buf[..n]) {
+            // Cap by the connection's live max datagram size when known.
+            let limit = c2.max_datagram_size().unwrap_or(1350);
+            let d = match encode_datagram_with_limit(s, &TargetAddr::Ip(src), &buf[..n], limit.min(1350)) {
                 Some(d) => d,
                 None => continue,
             };
@@ -385,7 +432,23 @@ async fn get_or_create_sess(
                 break;
             }
         }
+        // Self-reap: task exit removes the zombie entry instead of waiting 180s.
+        let mut w = ss2.write().await;
+        if let Some((cur, _, _)) = w.get(&s) {
+            if Arc::ptr_eq(cur, &rs) {
+                if let Some((_, hh, _)) = w.remove(&s) {
+                    hh.abort();
+                }
+            }
+        }
     });
-    w.insert(s, (sock.clone(), h, std::time::Instant::now()));
+    w.insert(
+        s,
+        (
+            sock.clone(),
+            h,
+            Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
+        ),
+    );
     Some(sock)
 }
