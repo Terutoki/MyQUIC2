@@ -15,8 +15,13 @@ ALPN `myquic2/2` so version-skewed peers fail closed at the handshake).
 
 The 2026-09 hardening revision adds optional shared-secret client authentication,
 process-wide resource caps, PMTU-aware DATAGRAM sizing, 0-RTT-safe authentication, and
-a corrected reconnect path. Every behaviour documented below was re-verified
-end-to-end on this revision — see [Verification & E2E Tests](#verification--e2e-tests).
+a corrected reconnect path. The latest pass removes a **process-abort** reachable from
+normal network conditions (an MTU reduction could trip an accounting bug inside
+quinn-proto's drop-oldest DATAGRAM path) and strips the remaining per-flow allocations
+from the TCP-open path — see
+[Hardening notes](#2026-09-hardening-pass-5). Every behaviour documented below was
+re-verified end-to-end on this revision — see
+[Verification & E2E Tests](#verification--e2e-tests).
 
 ---
 
@@ -38,7 +43,7 @@ end-to-end on this revision — see [Verification & E2E Tests](#verification--e2
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -61,7 +66,7 @@ end-to-end on this revision — see [Verification & E2E Tests](#verification--e2
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
 | **High-RTT tuned** | 4 MB per-stream window, 8 MB aggregate receive window, 8 MB send window — sized for ~140 ms trans-Pacific BDP |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each (rebuilt from this revision) |
 
 ---
 
@@ -176,6 +181,10 @@ together**. The UDP DATAGRAM layout and the auth uni stream are unchanged from M
   (`TargetAddrRef`) so domain-typed packets do not allocate, `bytes::Bytes`
   forwarding, allocation-free DNS cache hits, and 32 KB pump buffers per TCP
   direction; DNS results cached 60 s.
+- Per-flow work allocates once, not four times: the MQP-2 header is decoded out of a
+  259-byte stack buffer, the IP-literal dial path borrows the decoded address instead
+  of building a one-element `Vec`, and the DATAGRAM send wrapper drops on a full send
+  buffer rather than using quinn's drop-oldest path (see pass 5 below).
 
 ---
 
@@ -218,13 +227,14 @@ UDP replies are not further source-validated (roadmap item).
 
 ## Verification & E2E Tests
 
-Run on the 2026-09 revision, macOS (Apple Silicon), `cargo build --release`, with
-local TCP/UDP echo servers and a raw Python SOCKS5 client. All payloads are verified
-byte-for-byte; UDP checks the echoed payload and the reply's source address.
+Run on the 2026-09 revision (latest pass), macOS (Apple Silicon), `cargo build
+--release`, with local TCP/UDP echo servers and a raw Python SOCKS5 client. All
+payloads are verified byte-for-byte; UDP checks the echoed payload and the reply's
+source address.
 
 | # | Test | Result |
 |---|---|---|
-| 1 | `cargo test` (codec round-trips, borrowed-datagram round-trip, DNS key normalization/injectivity, `is_global_ip` filter) | ✅ 7/7 |
+| 1 | `cargo test` (codec round-trips, borrowed-datagram round-trip, DNS key normalization/injectivity, `is_global_ip` filter, DATAGRAM send-buffer saturation, MQP/SOCKS header length + framing) | ✅ 16/16 |
 | 2 | TCP ECHO via SOCKS5 `CONNECT` (1 MiB random) | ✅ repeated runs |
 | 3 | UDP ECHO via `UDP ASSOCIATE` (25 × 1000 B) | ✅ repeated runs, BND = relay address |
 | 4 | Server `kill -9` → restart → reconnect → TCP+UDP ECHO | ✅ detects in ~15 s (idle timeout; 20 s watchdog backstop), redial < 0.4 s, kill→usable 17.5 s; a UDP association opened *before* the kill and one opened *during* the outage both self-heal |
@@ -233,6 +243,17 @@ byte-for-byte; UDP checks the echoed payload and the reply's source address.
 | 7 | Empty token on both sides (auth disabled) | ✅ TCP+UDP ECHO |
 | 8 | Wrong token | ✅ server logs `auth token mismatch`, client sees SOCKS `0x04`, backoff grows 200 ms→5 s (no redial storm) |
 | 9 | 20 concurrent TCP (256 KiB) + 8 concurrent UDP associations | ✅ 28/28, ~1.7 s wall clock |
+
+Additional checks run on the pass-5 revision (macOS, loopback):
+
+| # | Test | Result |
+|---|---|---|
+| 10 | DATAGRAM send-buffer saturation (`try_send_datagram_saturates_without_panicking`) | ✅ passes; the same test **aborts** when the send path is switched back to `Connection::send_datagram` (verified) |
+| 11 | `read_mqp_target` framing: IPv4 / IPv6 / domain byte accounting, empty-domain and unknown-atyp rejection | ✅ 3/3 |
+| 12 | SOCKS5 address reader: IPv4 / IPv6 / domain decode, bad-atyp, lenient variant | ✅ 3/3 |
+| 13 | Domain-target `CONNECT` end-to-end (server-side DNS, `localhost`) | ✅ 5/5 transfers, no `bad connect target` |
+| 14 | UDP at 20–25k datagrams/s, windowed round trip | ✅ 0.00% loss, RTT p50 0.11–0.13 ms |
+| 15 | 128-datagram bursts ×300 | ✅ 100% replied, burst completion p50 1.8 ms |
 
 0-RTT probe (expect the last four lines):
 
@@ -315,8 +336,10 @@ done
 > ship **v1**.
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
-(`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries are
-rebuilt from this revision and contain the token-auth and hardening changes.
+(`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
+rebuilt from the pass-5 revision: static musl, x86-64, stripped, ~4.1–4.2 MB each.
+They contain the DATAGRAM process-abort fix, so binaries built before pass 5 must be
+replaced on **both** sides of a deployment.
 
 ---
 
@@ -492,6 +515,22 @@ Against RFC 1928 / RFC 1929:
   stable connectivity, so a misconfigured peer (e.g. wrong token) cannot cause a
   redial storm. A stale 0-RTT ticket is rejected once and the token is re-sent on the
   established connection (verified: server `kill -9` → reconnect → TCP+UDP ECHO pass).
+- **A dial is not accepted until the connection is proven alive** (pass 7). quinn's
+  `Connecting` future resolves `Ok` even for a connection that terminated instead of
+  handshaking: the `on_connected` oneshot it awaits carries the 0-RTT accept flag, but
+  `Connecting::poll` discards that flag and always yields `Ok(Connection)`, while
+  `ConnectionInner::terminate` fires the same oneshot (with `false`) for *every*
+  connection that ends — including one that never established. The reconnect loop used
+  to publish that dead handle to `shared` and log `QUIC connected` for it, so every new
+  SOCKS flow in the meantime was handed a dead connection until quinn's idle timeout
+  fired (~15 s). `dial_once` now treats a refused/short 0-RTT handshake as a failed
+  dial, verifies `close_reason()` after one yield, and bounds each attempt with
+  `DIAL_ATTEMPT_TIMEOUT` (5 s) instead of QUIC's ~15 s Initial-retransmission budget —
+  so the first attempt after a restart succeeds instead of waiting out the previous
+  one's timeout. Measured: server `kill -9` → detection ≈ 20 s → reconnect ≈ 0.3–0.4 s
+  after the server is back (before: a false `connected` every ~15 s plus 15.6 s
+  recovery).
+
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
 - **140 ms links**: tuned for trans-Pacific BDP — 4 MB per-stream / 8 MB aggregate
@@ -556,7 +595,9 @@ MyQUIC2/
 │   └── bin/
 │       ├── myquic2-server.rs  # QUIC ingress + token auth + dial-out + session caps
 │       └── myquic2-client.rs  # SOCKS5 ingress + token auth + reconnect + UDP dispatcher
-├── examples/zero_rtt_probe.rs # 0-RTT end-to-end verification probe (token-aware)
+├── examples/
+│   ├── zero_rtt_probe.rs      # 0-RTT end-to-end verification probe (token-aware)
+│   └── hotpath_bench.rs       # hot-path benchmark harness (owns its own targets)
 ├── config-server.toml / config-client.toml
 └── dist/openwrt-x86_64/       # static musl release bins (v1–v4) + sample configs
 ```
@@ -657,6 +698,171 @@ MyQUIC2/
   budget). A failed dial now closes the TCP flow; BND.ADDR for `CONNECT` is
   `0.0.0.0:0` because the reply precedes the dial result.
 
+### 2026-09 hardening pass 5
+
+- **Removed a process-abort reachable from normal network conditions.** quinn-proto
+  0.11.17 corrupts its own DATAGRAM bookkeeping: when the path MTU shrinks,
+  `Connection::drop_oversized` decrements `datagrams.outgoing.payload_bytes` for
+  datagrams that `DatagramState::write` had already accounted for via `pop_front`, so
+  a payload re-queued by the packet builder is subtracted twice. The counter underflows
+  to `usize::MAX`, `memory_used()` then looks astronomical while the queue is empty,
+  and the next `Connection::send_datagram` panics on
+  `.expect("datagrams.outgoing.payload_bytes desynchronized")` — *while holding quinn's
+  connection-state mutex*, which poisons it and aborts the whole process. Because both
+  UDP paths used `send_datagram`, an MTU reduction on either side could kill the proxy.
+  The new `try_send_datagram()` helper polls `send_datagram_wait` once with a no-op
+  waker instead (non-blocking, drop-on-full, and it never touches the drop-oldest
+  path; the pending future is dropped immediately, so nothing can leak) and reports
+  `Sent` / `Blocked` / `TooLarge` / `Unsupported` / `ConnectionLost` explicitly, so the
+  server refreshes its cached PMTU on `TooLarge` and the client invalidates its cached
+  egress handle exactly as before. Its correctness also depends on the send buffer
+  holding at least one maximum-size datagram, which `build_transport` now asserts at
+  compile time. Reproduced on loopback (1200 B payload, peer `max_datagram_size` shrunk
+  to 1162 B) and now covered by a live saturation test that aborts on the old path and
+  passes on the new one.
+- **Per-flow allocation removed from the TCP-open path.** `read_mqp_target` decodes the
+  header out of one 259-byte stack buffer instead of three `Vec`s plus the owned
+  domain `String` (a domain target went from four heap allocations to one); the dial's
+  candidate list is filtered into a fixed array, so an IP-literal target — the dominant
+  case — allocates nothing, and the domain case resolves into a stack array rather than
+  a `Vec`. `dial_happy_eyeballs` now takes `&[SocketAddr]`, keeping its single-candidate
+  fast path and its abort-on-cancel semantics (a plain handle list replaces `JoinSet`).
+  The MQP-2 header length is a pure function (`mqp_hdr_len`) with unit tests for every
+  wire form; the SOCKS5 reader keeps its proven shape and gained framing tests instead
+  (see the next bullet).
+- **Measured and rejected: batching the DATAGRAM readers.** A drain loop that polled
+  `read_datagram` up to 32 times per wakeup was implemented, instrumented and reverted.
+  Instrumentation showed an average batch of **1.06** datagrams (the reader is faster
+  than the inbound queue, so batching never triggers), and an A/B run showed no
+  difference in CPU, latency or throughput — the per-datagram cost is inside quinn's
+  packet processing, not in our lock or waker handling. It is not shipped.
+- **Measured and rejected: a client-side stack-buffer rewrite of the SOCKS5 reader.**
+  It reproducibly lost the last byte of a domain target on macOS (`bad connect target`
+  on every domain `CONNECT`, 0/5 transfers, twice, versus 5/5 with the original
+  two-`read_exact` shape), so the reader keeps its proven shape with a note explaining
+  why. The per-flow `Vec`s it would have saved never appeared in a profile.
+- **Where the time actually goes.** On loopback a single QUIC connection saturates at
+  roughly 2 Gbit/s and adding connections does not raise it; `/usr/bin/sample` shows
+  10–45% of non-idle CPU in quinn's per-operation connection-state mutex (every
+  `read`/`write`/`send_datagram` takes it, and the protocol driver needs it too).
+  Application codec work measures 1.9 ns per address decode and ~49 ns per datagram
+  encode, i.e. noise. Copy-buffer size (16 KB–256 KB) made no measurable difference
+  because quinn's `read` already fills a whole buffer under one lock acquisition.
+  Treat ~2 Gbit/s per connection as the library ceiling of this revision, not a
+  tuning failure — a 1 Gbit/s WAN link is well inside it.
+- **Rebuilt release binaries.** `dist/openwrt-x86_64/` was rebuilt from this revision
+  for all four CPU levels (v1–v4: static musl, x86-64, stripped, ~4.1–4.2 MB each).
+  The previous binaries predate the DATAGRAM abort fix, so **re-copy them to the
+  router**; the fix is server- and client-side.
+
+### 2026-09 hardening pass 6 — per-packet work audit
+
+A line-by-line audit of the packet paths, followed by A/B measurement against the
+previous revision on the same loopback host.
+
+**Removed from the per-packet / per-flow path**
+
+- **One allocation per DATAGRAM, built in one pass.** `encode_datagram*` validated the
+  address *while* appending it, so the buffer could not be sized first: it started at
+  40 bytes and grew once the payload was appended, copying the payload a second time.
+  A new `TargetAddrRef::header()` validates and measures the address up front (still the
+  same rules, still one definition of the wire format), so the buffer is `with_capacity`ed
+  to the exact final size and filled in a single pass. A test pins the encoder's output
+  byte-for-byte against the old two-step form for every address type.
+- **The UDP reply path no longer copies the payload twice.** `send_reply` took a
+  `&[u8]` and `udp_try_send` took a borrowed slice, so every reply that hit the socket's
+  slow path did `payload.to_vec()` — a fresh allocation *and* a copy of data that already
+  sat in an owned, refcounted `Bytes`. `udp_try_send` now takes `Bytes` and *moves* it
+  into the queued write (unwrapping to its `Vec` first when it is unshared, so the common
+  case is zero-copy); the reply path passes a `Bytes::slice` of the received datagram,
+  which is a refcount bump. The per-reply `Vec` scratch buffer became a persistent
+  `BytesMut` sized to the datagram.
+- **A lock-free session lookup on the server's datagram path.** Every inbound datagram
+  took the connection's session-table read lock and did a hash lookup — but a UDP flow
+  sends long runs of packets to *one* session. A thread-local single-slot memo now
+  answers the common case with one atomic load and no lock, and the reply reader clears
+  its liveness flag as it exits so a dead session still falls through and is recreated.
+- **The session sweeper no longer aborts readers while holding the write lock.** Removed
+  entries are returned to the caller and aborted after the guard drops, and the key
+  vectors it allocated under the lock are gone.
+- **DNS: a lock-free hit, no per-packet clock, cheaper eviction.** The thread-local memo
+  grew from one slot to two (positive and negative), so an interleaved stream of good and
+  bad names no longer evicts the other class on every packet. A memo lookup no longer
+  reads the clock before it knows the key matches, and the positive+negative cache probe
+  now shares a single clock read. Eviction (`evict_if_needed`) no longer runs an O(n)
+  `min_by_key` scan — or a full collect+sort — *under the write lock* on every insert past
+  the cap: it evicts the whole overflow in one batch using `select_nth_unstable`.
+- **One receive future per connection, not per datagram.** `read_datagram()` was rebuilt
+  inside the loop on both sides, re-registering its `Notify` and re-taking the connection
+  lock for every packet. It is now constructed once per connection and pinned
+  (`read_datagram` is cancel-safe: a buffered datagram is returned before the first await
+  point). The client's dispatcher additionally caches the last session's `Sender`, so a
+  burst to one association skips the shard lock and the refcount bump.
+- **Per-chunk work in the TCP↔QUIC pump.** The two 32 KB buffers were heap-allocated (and
+  freed) per stream direction; they now come from a small per-thread pool with a
+  bounded depth, so a steady stream of flows reuses the same memory. The throttled
+  liveness stamp no longer did what it claimed — the non-multiple-of-8 branch still read
+  the clock *and* reloaded the atomic on every chunk — and is now one local comparison
+  plus (at most) one shared store per 100 ms.
+- **Smaller fixed costs.** The UDP replies-to-app loop dropped a per-packet atomic reload
+  (local shadow of the liveness stamp); the server's per-stream `Vec` for the 20-byte
+  MQP-2 ACK became a stack buffer (`encode_bnd_addr_into`); per-session/relay socket
+  buffers went from 512 KiB to 256 KiB per direction (they are caps, not reservations, and
+  one association only ever carries one DATAGRAM flow), halving the worst-case kernel
+  memory at the configured session caps; and the "buffer clamped" warning is now
+  per-direction instead of a single flag in which whichever direction was probed first
+  permanently silenced the other.
+
+**Measured — and the honest headline: the proxy is not the bottleneck.**
+
+Two full A/B runs against the previous revision on the same host, loopback, each doing
+512 MiB of bulk download (8 concurrent), 4 000 SOCKS flows (16 concurrent) and 30 000
+UDP datagrams through one association; CPU read from `ps -o time=` on both processes.
+
+| Revision | server CPU | client CPU | bulk | flows/s | UDP recv pps | conn latency (median) |
+|---|---|---|---|---|---|---|
+| previous | 5.38 s | 7.52 s | 209 MB/s | 11 430 | 43 430 | 476 µs |
+| this pass | 5.41 s | 7.41 s | 208 MB/s | 11 282 | 44 015 | 495 µs |
+
+**Everything is within run-to-run noise.** The per-packet work this pass removed is on
+the order of a few hundred nanoseconds, while the same packet costs microseconds inside
+quinn: quinn takes its connection-state mutex once per DATAGRAM, runs through the
+congestion controller and packet builder, and performs its own allocation per received
+datagram. Against that, deleting one application-side `Vec` and one `RwLock::read` is not
+visible in a loopback benchmark — which is the same conclusion the earlier DATAGRAM-reader
+batching experiment reached (average batch 1.06, no measurable difference).
+
+Where they do matter is the reason they were removed anyway: they are **per-packet,
+per-flow costs that multiply with concurrency and core count**. A per-packet allocation
+and a shared read lock are the kinds of things that turn into allocator contention and
+cache-line ping-pong when hundreds of thousands of packets per second cross several
+worker threads, even though they vanish into the noise of a single-flow loopback run.
+Treat these changes as removing application-side tax, not as a throughput increase: if a
+future profile shows the proxy's own per-packet code above noise, the microbenchmark
+harness in `examples/hotpath_bench.rs` is what should measure the next change.
+
+Correctness was verified after every step: `cargo test` (19 tests), `cargo clippy
+--all-targets` and `cargo fmt --check` clean, and end-to-end runs of TCP `CONNECT` (IP and
+domain targets), UDP `ASSOCIATE` (8 B and 1200 B payloads), 0-RTT resumption with early
+data, and the token-auth accept/reject paths — all identical to the previous revision.
+A harder mixed load (12 000 flows, 120 000 datagrams, 1 GiB bulk) kept both processes
+within ~23 MB / ~13 MB RSS with no descriptor growth.
+
+**Already optimal, left alone.** The DATAGRAM **encode** was never the problem: it
+measures ~49 ns, i.e. noise next to the QUIC work around it. A drain loop that polled
+`read_datagram` up to 32x per wakeup was tried and rejected — instrumentation showed an
+average batch of 1.06 datagrams — and this pass did not re-litigate it.
+
+**Outside this codebase's control.** The single biggest cost on the UDP path is that
+quinn takes the connection-state mutex once per DATAGRAM, on both `read_datagram()` and
+`send_datagram_wait()` (whose `poll` also calls `state.wake()`), and quinn 0.11 exposes no
+batched receive or a wake/transmit-only entry point to avoid it. Reading one datagram per
+lock acquisition is therefore a floor this revision cannot go below without patching
+quinn; the changes above remove everything the application was adding *on top* of it. The
+same applies to the second allocation quinn itself performs per received datagram when it
+copies the frame out of its packet buffer.
+
+
 ---
 
 ## Roadmap
@@ -671,6 +877,12 @@ MyQUIC2/
 - [ ] `procd` init script for OpenWrt
 - [ ] MQP datagram fragmentation for > 1350 B UDP payloads
 - [ ] Fuzz the MQP-2 codec (cargo-fuzz)
+- [x] Remove the quinn-proto DATAGRAM drop-oldest process abort (`try_send_datagram`)
+- [x] Per-flow allocation on the TCP-open path (stack-buffer header, borrowed dial candidates)
+- [x] Per-packet allocation / lock / clock-read audit of the UDP and stream paths (pass 6)
+- [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
+      (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
+- [ ] Pin the quinn-proto patch release once the upstream DATAGRAM accounting fix lands
 
 ---
 

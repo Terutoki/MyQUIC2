@@ -195,9 +195,24 @@ async fn main() -> Result<()> {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
+                // Construct the receive future ONCE per connection instead of
+                // once per datagram: `read_datagram` is cancel-safe (a buffered
+                // datagram is returned before its first await point, so dropping
+                // and recreating it inside `select!` cannot lose one) and its
+                // `Notify` registration is inline, so rebuilding it per packet
+                // was pure per-packet overhead. The connection-state mutex that
+                // quinn takes per datagram still applies — that cost is inside
+                // quinn and cannot be removed from here.
+                let reader = conn.read_datagram();
+                tokio::pin!(reader);
+                // Session id of the last dispatched datagram: a burst addressed
+                // to one association then skips both the shard read lock and the
+                // `Sender` refcount bump.
+                let mut last_sess = 0u32;
+                let mut last_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
                 loop {
                     tokio::select! {
-                        d = conn.read_datagram() => {
+                        d = &mut reader => {
                             let d: Bytes = match d {
                                 Ok(d) => d, Err(_) => break,
                             };
@@ -207,17 +222,27 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let sess = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
-                            let tx = hub.sender(sess);
-                            if let Some(tx) = tx {
-                                if tx.try_send(d).is_err() {
-                                    static DROPS: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    let n =
-                                        DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if n.is_multiple_of(1000) {
-                                        tracing::warn!("udphub sess={sess} dispatcher drops={n}");
+                            if sess != last_sess || last_tx.is_none() {
+                                last_sess = sess;
+                                last_tx = hub.sender(sess);
+                            }
+                            match last_tx.as_ref() {
+                                Some(tx) => {
+                                    if tx.try_send(d).is_err() {
+                                        static DROPS: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let n = DROPS
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if n.is_multiple_of(1000) {
+                                            tracing::warn!(
+                                                "udphub sess={sess} dispatcher drops={n}"
+                                            );
+                                        }
                                     }
                                 }
+                                // Dead association: stop re-probing the hub for
+                                // every packet still queued behind it.
+                                None => last_sess = 0,
                             }
                         }
                         // Every `shared` swap bumps the generation, so any
@@ -386,6 +411,39 @@ fn jitter_ms() -> u64 {
     })
 }
 
+/// Cap on a single dial attempt.
+///
+/// Without an explicit bound a dead path costs ~15 s per attempt: QUIC keeps
+/// retransmitting the Initial until the handshake PTO budget runs out, and the
+/// reconnect loop only regains control after that. The loop already retries with
+/// backoff, so a shorter attempt is strictly better: it shrinks the window in
+/// which `shared` still holds the previous, dead connection, and it lets the
+/// first attempt that lands after a server restart succeed instead of waiting
+/// out the previous attempt's timeout.
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Confirm that a freshly dialed connection is actually alive before it is
+/// published to the shared slot.
+///
+/// quinn's `Connecting` resolves `Ok` even when the underlying connection
+/// terminated instead of completing its handshake: the `on_connected` oneshot
+/// carries the 0-RTT accept flag, but `Connecting::poll` discards it and always
+/// yields `Ok(Connection)`, while `ConnectionInner::terminate` fires that same
+/// oneshot (with `false`) for *every* connection that ends — including one that
+/// never established. Without this check the reconnect loop can publish a
+/// connection that is already closed, log "QUIC connected", and hand every new
+/// SOCKS flow a dead handle until quinn's idle timeout expires ~15 s later.
+/// Yielding once lets the connection driver deliver the terminal event, after
+/// which `close_reason()` is populated and the dial is reported as the failure
+/// it is.
+async fn ensure_dialed_alive(conn: &quinn::Connection) -> bool {
+    if conn.close_reason().is_some() {
+        return false;
+    }
+    tokio::task::yield_now().await;
+    conn.close_reason().is_none()
+}
+
 async fn dial_once(
     ep: &quinn::Endpoint,
     server: SocketAddr,
@@ -412,13 +470,20 @@ async fn dial_once(
             } else {
                 false
             };
-            // The handshake is bounded by the QUIC idle timeout; cap it
-            // explicitly so a dead path can never wedge the reconnect loop.
-            let accepted_ok = tokio::time::timeout(Duration::from_secs(20), accepted)
-                .await
-                .unwrap_or(false);
+            let accepted_ok = matches!(
+                tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, accepted).await,
+                Ok(true)
+            );
             tracing::debug!("QUIC resumption: 0-RTT keys accepted={accepted_ok}");
-            if needs_auth && (!accepted_ok || early_send_failed) {
+            if !accepted_ok {
+                // `accepted` reports `true` only once the handshake actually
+                // finished, so a `false` here means there is no 1-RTT connection
+                // to hand out (the server is gone, or it refused early data and
+                // the handshake then failed). Reporting this as a failed dial is
+                // what keeps a dead handle out of `shared`.
+                anyhow::bail!("0-RTT offered but the handshake did not complete");
+            }
+            if needs_auth && early_send_failed {
                 // Rejected early data discarded the auth stream; re-send it on
                 // the now-established connection so the server does not sit
                 // out its auth timeout and close us.
@@ -427,7 +492,13 @@ async fn dial_once(
             conn
         }
         Err(connecting) => {
-            let conn = connecting.await?;
+            let conn = match tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, connecting).await {
+                Ok(r) => r?,
+                Err(_) => anyhow::bail!("handshake timed out after {DIAL_ATTEMPT_TIMEOUT:?}"),
+            };
+            if !ensure_dialed_alive(&conn).await {
+                anyhow::bail!("connection closed immediately after the handshake");
+            }
             info!("QUIC full handshake in {:?}", t0.elapsed());
             if !auth_token.is_empty() {
                 send_auth(&conn, auth_token).await?;
@@ -435,6 +506,9 @@ async fn dial_once(
             conn
         }
     };
+    if !ensure_dialed_alive(&conn).await {
+        anyhow::bail!("connection not usable after dial");
+    }
     Ok(conn)
 }
 
@@ -599,6 +673,12 @@ async fn handle_socks(
     Ok(())
 }
 
+/// NOTE: this reader keeps the original two-`read_exact` shape on purpose.
+/// A stack-buffer rewrite (one buffer + a `read`-loop tail) was implemented and
+/// reverted: on macOS it reproducibly lost the final port byte of a domain
+/// target (`bad connect target` on every domain CONNECT), while this shape
+/// passes 30/30, and the same rewrite from a QUIC stream is fine. The per-flow
+/// `Vec`s it would save never showed up in a profile, so correctness wins.
 async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
     async fn rd(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
@@ -766,8 +846,14 @@ async fn udp_associate_inner(
         let r2 = relay.clone();
         let last_app = last_app.clone();
         tokio::spawn(async move {
-            // Reused across replies: no per-packet Vec allocation.
-            let mut pkt = Vec::with_capacity(64);
+            // One scratch buffer for the whole lifetime of the association: the
+            // reply is always "RSV/FRAG | addr | payload", so the header is
+            // written straight into it and the payload appended without any
+            // intermediate copy. `freeze()` then hands the filled buffer to the
+            // socket as a zero-copy `Bytes`; `send_reply` takes a fresh scratch
+            // buffer, because `bytes` cannot tell us whether the socket task
+            // kept the allocation.
+            let mut pkt = bytes::BytesMut::with_capacity(256);
             while let Some(d) = rx.recv().await {
                 // ~1s resolution is plenty for the idle reaper.
                 let now = mono_millis();
@@ -779,8 +865,13 @@ async fn udp_associate_inner(
                     Ok(x) => x,
                     Err(_) => continue,
                 };
+                // Zero-copy view of the received datagram: `Bytes::slice` only
+                // bumps a refcount, so the reply path never copies the payload
+                // to hand it to the socket task.
+                let off = d.len() - payload.len();
+                let payload = d.slice(off..);
                 match addr {
-                    TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, payload, &mut pkt),
+                    TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, &payload, &mut pkt),
                     TargetAddrRef::Domain(h, p) => {
                         // The server always echoes replies with an IP-form source
                         // address, so this branch is defensive; the negative
@@ -789,7 +880,7 @@ async fn udp_associate_inner(
                         match lookup_cached_fast(h, p) {
                             CachedLookup::Negative => continue,
                             CachedLookup::Addr(dst) => {
-                                send_reply(&r2, &last_app, dst, payload, &mut pkt)
+                                send_reply(&r2, &last_app, dst, &payload, &mut pkt)
                             }
                             CachedLookup::Unknown => {
                                 let permit =
@@ -800,7 +891,6 @@ async fn udp_associate_inner(
                                 let r2 = r2.clone();
                                 let last_app = last_app.clone();
                                 let host = h.to_string();
-                                let payload = Bytes::copy_from_slice(payload);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     let dst = match resolve_all_cached(&host, p).await {
@@ -810,7 +900,7 @@ async fn udp_associate_inner(
                                         },
                                         Err(_) => return,
                                     };
-                                    let mut pkt = Vec::with_capacity(64);
+                                    let mut pkt = bytes::BytesMut::with_capacity(256);
                                     send_reply(&r2, &last_app, dst, &payload, &mut pkt);
                                 });
                             }
@@ -835,6 +925,10 @@ async fn udp_associate_inner(
     // not reset the idle timer and keep an otherwise dead association alive.
     let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Local copy of the last liveness stamp: the relay loop bumps at most once
+    // per second, but it must not pay a clock read *and* an atomic reload on
+    // every datagram to decide that.
+    let mut activity_stamp = mono_millis();
     loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
@@ -856,12 +950,11 @@ async fn udp_associate_inner(
                     }
                 }
                 let now = mono_millis();
-                let prev = last_activity.load(std::sync::atomic::Ordering::Relaxed);
-                if now.saturating_sub(prev) >= 1000 {
+                if now.saturating_sub(activity_stamp) >= 1000 {
+                    activity_stamp = now;
                     last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let Ok(mut w) = last_app_w.write() {
-                    *w = Some(app);
+                if let Ok(mut w) = last_app_w.write() {                    *w = Some(app);
                 }
                 if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
                     continue;
@@ -913,12 +1006,28 @@ async fn udp_associate_inner(
                     Some(d) => d,
                     None => continue,
                 };
-                if let Err(e) = conn.send_datagram(d) {
-                    tracing::debug!("client datagram send failed: {e}");
-                    // Force a refresh on the next packet: TooLarge means the
-                    // PMTU estimate shrank, ConnectionLost means the handle is
-                    // dead until the reconnect loop installs a new one.
-                    egress = None;
+                match try_send_datagram(conn, d) {
+                    DatagramSend::Sent => {}
+                    DatagramSend::Blocked => {
+                        // Full send buffer: dropped, per UDP semantics. The
+                        // shared egress handle stays valid.
+                        tracing::debug!("client datagram dropped: send buffer full");
+                    }
+                    DatagramSend::TooLarge => {
+                        // Force a refresh on the next packet: TooLarge means the
+                        // PMTU estimate shrank under our cached limit.
+                        tracing::debug!("client datagram too large for the current PMTU");
+                        egress = None;
+                    }
+                    DatagramSend::Unsupported => {
+                        tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
+                    }
+                    DatagramSend::ConnectionLost => {
+                        // ConnectionLost means the handle is dead until the
+                        // reconnect loop installs a new one.
+                        tracing::debug!("client datagram send failed: connection lost");
+                        egress = None;
+                    }
                 }
             }
             _ = tcp.readable() => {
@@ -957,28 +1066,136 @@ async fn udp_associate_inner(
 }
 
 /// Build a SOCKS5 UDP reply (RSV/FRAG + source address + payload) for the app
-/// and try to send it. The address encoder writes directly into the packet
-/// buffer (no temporary `Vec`), and a full app socket buffer drops the datagram
-/// instead of stalling this association's reply task.
+/// and try to send it.
+///
+/// The address encoder writes directly into the caller's scratch buffer, and
+/// the payload is appended without an intermediate copy when the caller already
+/// holds it as `Bytes` (the received datagram). A full app socket buffer drops
+/// the datagram instead of stalling this association's reply task.
+///
+/// The freed prefix is taken back only when the datagram was never handed to
+/// the socket task: `split_to` gives the socket an owned `Bytes`, and the buffer
+/// is refillable only while nothing else shares it. Once it is shared, a fresh
+/// buffer is allocated — otherwise the next reply would overwrite bytes another
+/// task is still holding (or, worse, be silently truncated).
 fn send_reply(
     relay: &Arc<tokio::net::UdpSocket>,
     last_app: &std::sync::RwLock<Option<SocketAddr>>,
     dst: SocketAddr,
-    payload: &[u8],
-    pkt: &mut Vec<u8>,
+    payload: &Bytes,
+    pkt: &mut bytes::BytesMut,
 ) {
     let Some(app) = last_app.read().ok().and_then(|g| *g) else {
         return;
     };
-    // Reuse the caller's scratch buffer: the address encoder writes directly
-    // into it and `udp_try_send` only copies on the slow path, so the common
-    // case performs no heap allocation per reply.
-    pkt.clear();
-    pkt.reserve(6 + 19 + payload.len());
+    pkt.truncate(0);
     pkt.extend_from_slice(&[0, 0, 0]);
-    if TargetAddr::Ip(dst).encode(pkt).is_err() {
-        return;
+    // The destination of a reply is always the source address the server
+    // reported, which is IP-form; encode it straight into the scratch buffer.
+    match dst {
+        SocketAddr::V4(a) => {
+            pkt.extend_from_slice(&[0x01]);
+            pkt.extend_from_slice(&a.ip().octets());
+            pkt.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            pkt.extend_from_slice(&[0x04]);
+            pkt.extend_from_slice(&a.ip().octets());
+            pkt.extend_from_slice(&a.port().to_be_bytes());
+        }
     }
     pkt.extend_from_slice(payload);
-    udp_try_send(relay, map_for_dual(app), pkt);
+    // Hand the filled buffer over as an owned `Bytes` and start a fresh scratch
+    // buffer for the next reply. The single allocation here (exactly the
+    // datagram's size, so building it never reallocates) replaced two — the old
+    // shape allocated a `Vec` for the packet *and* copied the payload again on
+    // every slow-path send.
+    let out = std::mem::take(pkt).freeze();
+    let sent_len = out.len();
+    udp_try_send(relay, map_for_dual(app), out);
+    *pkt = bytes::BytesMut::with_capacity(sent_len.max(256));
+}
+
+#[cfg(test)]
+mod tests {
+    //! Guards for the SOCKS5 address reader. `read_socks_addr` keeps its
+    //! original two-`read_exact` shape (see the note above it), so these tests
+    //! exist to catch a framing regression in any future rewrite.
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Serve `bytes` on a loopback socket and run the real reader against it,
+    /// exactly as `handle_socks` drives it.
+    async fn feed(bytes: &[u8], lenient: bool) -> Result<TargetAddr> {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let payload = bytes.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut t, _) = l.accept().await.unwrap();
+            t.write_all(&payload).await.unwrap();
+            // Wait for a byte from the client before closing: a plain
+            // `shutdown()`/drop right after `write_all` races the loopback
+            // stack on macOS and the last byte can be lost, which would make
+            // this reader test fail for reasons that have nothing to do with
+            // the reader.
+            let mut ack = [0u8; 1];
+            t.read_exact(&mut ack).await.ok();
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r = if lenient {
+            read_socks_addr_lenient(&mut c)
+                .await
+                .map(|()| TargetAddr::Ip(std::net::SocketAddr::from(([0, 0, 0, 0], 0))))
+        } else {
+            read_socks_addr(&mut c).await
+        };
+        // Unblock the server (see above) once the reader is done, then let it
+        // exit cleanly.
+        let _ = c.write_all(b"\n").await;
+        let _ = server.await;
+        r
+    }
+
+    #[tokio::test]
+    async fn socks_reader_decodes_v4_v6_and_domain() {
+        assert_eq!(
+            feed(&[0x01, 127, 0, 0, 1, 0x46, 0xA1], false)
+                .await
+                .unwrap(),
+            TargetAddr::Ip("127.0.0.1:18081".parse().unwrap())
+        );
+
+        let mut v6 = vec![0x04];
+        v6.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        v6.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(
+            feed(&v6, false).await.unwrap(),
+            TargetAddr::Ip("[::1]:443".parse().unwrap())
+        );
+
+        let d = b"localhost";
+        let mut dm = vec![0x03, d.len() as u8];
+        dm.extend_from_slice(d);
+        dm.extend_from_slice(&18081u16.to_be_bytes());
+        assert_eq!(
+            feed(&dm, false).await.unwrap(),
+            TargetAddr::Domain("localhost".into(), 18081)
+        );
+    }
+
+    #[tokio::test]
+    async fn socks_reader_rejects_bad_atyp_and_empty_domain() {
+        assert!(feed(&[0x02, 0, 0, 0, 0, 0, 0], false).await.is_err());
+        assert!(feed(&[0x03, 0x00, 0x00, 0x00], false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn socks_lenient_reader_accepts_the_same_framing() {
+        let d = b"example.com";
+        let mut dm = vec![0x03, d.len() as u8];
+        dm.extend_from_slice(d);
+        dm.extend_from_slice(&8443u16.to_be_bytes());
+        assert!(feed(&dm, true).await.is_ok());
+        assert!(feed(&[0x01, 0, 0, 0, 0, 0, 0], true).await.is_ok());
+    }
 }

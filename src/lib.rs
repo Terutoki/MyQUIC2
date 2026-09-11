@@ -4,8 +4,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -47,6 +49,36 @@ impl TargetAddr {
             TargetAddr::Ip(s) => Some(*s),
             _ => None,
         }
+    }
+}
+
+/// A [`TargetAddrRef`] that has already been validated and measured, so the
+/// caller can size its output buffer exactly once instead of encoding twice.
+///
+/// Both operations are pure, so splitting them out of [`TargetAddrRef::encode`]
+/// never changes which addresses are accepted — `encode` remains the single
+/// definition of the wire format and the validation rules.
+#[derive(Debug, Clone, Copy)]
+pub struct AddrHeader<'a> {
+    addr: TargetAddrRef<'a>,
+    len: usize,
+}
+
+impl<'a> AddrHeader<'a> {
+    /// Wire length of `addr` (`atyp | addr | port`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Append the header to `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.addr.encode(out)
     }
 }
 
@@ -94,6 +126,40 @@ impl<'a> TargetAddrRef<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Validate and measure this address once, so a hot-path encoder can
+    /// `with_capacity` the exact size (no growth reallocation) and skip the
+    /// second validation pass that a separate `encode` call would repeat.
+    pub fn header(&self) -> Result<AddrHeader<'a>> {
+        let len = match *self {
+            TargetAddrRef::Ip(SocketAddr::V4(a)) => {
+                if a.ip().is_unspecified() {
+                    anyhow::bail!("refuse unspecified v4");
+                }
+                1 + 4 + 2
+            }
+            TargetAddrRef::Ip(SocketAddr::V6(a)) => {
+                if a.ip().is_unspecified() {
+                    anyhow::bail!("refuse unspecified v6");
+                }
+                if a.scope_id() != 0 {
+                    anyhow::bail!("v6 scope_id dropped on wire, refuse scoped addr");
+                }
+                1 + 16 + 2
+            }
+            TargetAddrRef::Domain(d, _) => {
+                let n = d.len();
+                if n == 0 {
+                    anyhow::bail!("empty domain");
+                }
+                if n > 255 {
+                    anyhow::bail!("domain too long");
+                }
+                1 + 1 + n + 2
+            }
+        };
+        Ok(AddrHeader { addr: *self, len })
     }
 
     pub fn decode(b: &'a [u8]) -> Result<(Self, usize)> {
@@ -167,16 +233,36 @@ pub const MQP_TCP_ACK: u8 = 0x00;
 /// target encoding rejects unspecified addresses; BND may legitimately be
 /// `0.0.0.0:0`, so this is a dedicated encoder that is never used to dial.
 pub fn encode_bnd_addr(addr: SocketAddr, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.resize(start + MAX_BND_LEN, 0);
+    let n = encode_bnd_addr_into(addr, &mut out[start..]);
+    out.truncate(start + n);
+}
+
+/// Number of bytes [`encode_bnd_addr_into`] can write: `atyp | addr | port`
+/// for the largest address form.
+pub const MAX_BND_LEN: usize = 1 + 16 + 2;
+
+/// Allocation-free form of [`encode_bnd_addr`] for hot paths that already own a
+/// fixed buffer (the MQP-2 ACK is at most [`MAX_BND_LEN`] bytes). `out` must be
+/// at least that long. Returns the number of bytes written.
+///
+/// # Panics
+/// Panics if `out` is shorter than [`MAX_BND_LEN`].
+pub fn encode_bnd_addr_into(addr: SocketAddr, out: &mut [u8]) -> usize {
+    assert!(out.len() >= MAX_BND_LEN, "bnd buffer too small");
     match addr {
         SocketAddr::V4(a) => {
-            out.push(0x01);
-            out.extend_from_slice(&a.ip().octets());
-            out.extend_from_slice(&a.port().to_be_bytes());
+            out[0] = 0x01;
+            out[1..5].copy_from_slice(&a.ip().octets());
+            out[5..7].copy_from_slice(&a.port().to_be_bytes());
+            7
         }
         SocketAddr::V6(a) => {
-            out.push(0x04);
-            out.extend_from_slice(&a.ip().octets());
-            out.extend_from_slice(&a.port().to_be_bytes());
+            out[0] = 0x04;
+            out[1..17].copy_from_slice(&a.ip().octets());
+            out[17..19].copy_from_slice(&a.port().to_be_bytes());
+            19
         }
     }
 }
@@ -209,6 +295,14 @@ pub fn decode_bnd_addr(b: &[u8]) -> Result<(SocketAddr, usize)> {
     }
 }
 
+/// MQP-2 datagram frame type: the first byte of every DATAGRAM body (TCP-open
+/// streams start with the address `atyp` instead, so the two cannot be confused).
+pub const MQP_DGRAM_TYPE: u8 = 0x02;
+
+/// `type u8 | sess u32 LE` — the fixed prefix every MQP-2 datagram carries
+/// before its address header.
+pub const DGRAM_PREFIX_LEN: usize = 1 + 4;
+
 /// Build a UDP DATAGRAM body: type + sess + addr header + payload.
 /// sess scopes the packet to one UDP ASSOCIATE so concurrent associations sharing
 /// a QUIC connection never steal each other's replies. Returns None if exceeds limit.
@@ -227,24 +321,31 @@ pub fn encode_datagram_with_limit(
 
 /// Same as [`encode_datagram_with_limit`] but takes the borrowed address form,
 /// keeping the per-packet path free of domain `String` allocations.
+///
+/// quinn's `send_datagram` takes an owned `Bytes`, so one allocation per
+/// outbound datagram is inherent to the API — and it cannot be pooled: the
+/// driver frees that allocation on its own task once the datagram is
+/// transmitted, where no reservation could ever hand it back. What this
+/// function does avoid is *reallocation*: the address header is validated and
+/// measured up front so the buffer is `with_capacity`ed to the exact final
+/// size and then filled in a single pass, instead of starting at 40 bytes and
+/// growing (copying the payload) on the way.
 pub fn encode_datagram_ref_with_limit(
     sess: u32,
     addr: &TargetAddrRef<'_>,
     payload: &[u8],
     limit: usize,
 ) -> Option<Bytes> {
-    // quinn's `send_datagram` takes an owned `Bytes`, so one allocation per
-    // outbound datagram is inherent to the API (the payload copy is the
-    // minimum work); only a buffer pool could remove it.
-    let mut v = Vec::with_capacity(40 + payload.len());
-    v.push(0x02);
+    let header = addr.header().ok()?;
+    let total = DGRAM_PREFIX_LEN + header.len() + payload.len();
+    if total > limit {
+        return None;
+    }
+    let mut v = Vec::with_capacity(total);
+    v.push(MQP_DGRAM_TYPE);
     v.extend_from_slice(&sess.to_le_bytes());
-    if addr.encode(&mut v).is_err() {
-        return None;
-    }
-    if v.len() + payload.len() > limit {
-        return None;
-    }
+    header.encode(&mut v).ok()?;
+    debug_assert_eq!(v.len(), DGRAM_PREFIX_LEN + header.len());
     v.extend_from_slice(payload);
     Some(Bytes::from(v))
 }
@@ -256,12 +357,12 @@ pub fn decode_datagram(b: &[u8]) -> Result<(u32, TargetAddr, &[u8])> {
 
 /// Allocation-free variant of [`decode_datagram`] for the UDP fast paths.
 pub fn decode_datagram_ref(b: &[u8]) -> Result<(u32, TargetAddrRef<'_>, &[u8])> {
-    if b.len() < 6 || b[0] != 0x02 {
+    if b.len() < DGRAM_PREFIX_LEN + 1 || b[0] != MQP_DGRAM_TYPE {
         anyhow::bail!("bad dgram");
     }
     let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
-    let (a, n) = TargetAddrRef::decode(&b[5..])?;
-    Ok((sess, a, &b[5 + n..]))
+    let (a, n) = TargetAddrRef::decode(&b[DGRAM_PREFIX_LEN..])?;
+    Ok((sess, a, &b[DGRAM_PREFIX_LEN + n..]))
 }
 
 // ---------------- Config files ----------------
@@ -424,8 +525,15 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // Datagrams are a lossy best-effort path drained by a dedicated reader, so
     // 1MB (~740 x 1350B datagrams) absorbs bursts without the per-connection
     // 4MB x 4096-connection worst case (16GB of queueable user memory).
-    t.datagram_receive_buffer_size(Some(1024 * 1024));
-    t.datagram_send_buffer_size(1024 * 1024);
+    t.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
+    t.datagram_send_buffer_size(DATAGRAM_BUFFER);
+    // Invariant required by `try_send_datagram`: quinn's `datagram_send_buffer_size`
+    // must be large enough to hold a datagram of the maximum size we can encode.
+    // A buffer smaller than one datagram makes `send_datagram_wait` report
+    // `Blocked` forever (nothing could ever be queued), and it is also what made
+    // the old drop-oldest path reachable with an empty queue. `build_transport`
+    // is the only place these two numbers meet, so enforce it here.
+    const _: () = assert!(DATAGRAM_BUFFER >= MQP_DGRAM_MAX);
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
@@ -664,7 +772,7 @@ pub fn mono_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Thread-local memo of the most recent lookup, keyed by the *full* normalized
+/// Thread-local memo of the most recent lookups, keyed by the *full* normalized
 /// key. A 64-bit hash here would let two different `(host, port)` pairs collide
 /// and serve each other's address for the whole TTL, so the key is compared
 /// byte-for-byte. Storing it inline keeps fast-path hits allocation-free.
@@ -676,18 +784,40 @@ struct DnsMemo {
     expires: Instant,
 }
 
+/// Positive and negative memos are kept in separate slots on purpose: an
+/// interleaved stream of good and bad names on the same worker thread would
+/// otherwise evict the other class on every single packet, and a negative hit
+/// that falls through costs a global `RwLock` read per packet — precisely the
+/// flood the negative cache exists to absorb.
+const MEMO_SLOTS: usize = 2;
+
 thread_local! {
-    static DNS_MEMO: std::cell::RefCell<Option<DnsMemo>> = const { std::cell::RefCell::new(None) };
+    static DNS_MEMO: std::cell::RefCell<[Option<DnsMemo>; MEMO_SLOTS]> =
+        const { std::cell::RefCell::new([None, None]) };
 }
 
-fn memo_get(key: &str) -> Option<CachedLookup> {
-    let now = Instant::now();
+/// A matching memo slot, copied out so the borrow of the thread-local ends with
+/// the call.
+#[derive(Clone, Copy)]
+struct MemoHit {
+    addr: Option<SocketAddr>,
+    expires: Instant,
+}
+
+/// Peek the memo slot that caches positive (`neg == false`) or negative
+/// results, but only if it holds our key. Deliberately does *not* read the
+/// clock: the caller reads it once, and only after a key match, so a memo miss
+/// is never charged a `clock_gettime` — the whole point of the memo is that a
+/// hit is cheaper than the global cache lookup, and a miss must not cost more
+/// than one.
+fn memo_peek(key: &str, neg: bool) -> Option<MemoHit> {
+    let slot = usize::from(neg);
     DNS_MEMO.with(|c| {
         let c = c.borrow();
-        match c.as_ref() {
-            Some(m) if now < m.expires && &m.key[..m.len] == key.as_bytes() => Some(match m.addr {
-                Some(a) => CachedLookup::Addr(a),
-                None => CachedLookup::Negative,
+        match c[slot].as_ref() {
+            Some(m) if &m.key[..m.len] == key.as_bytes() => Some(MemoHit {
+                addr: m.addr,
+                expires: m.expires,
             }),
             _ => None,
         }
@@ -700,6 +830,7 @@ fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
         return; // only reachable through the owned fallback for >255-byte names
     }
     DNS_MEMO.with(|c| {
+        let slot = usize::from(addr.is_none());
         let mut m = DnsMemo {
             key: [0u8; DNS_KEY_BUF],
             len: kb.len(),
@@ -707,7 +838,7 @@ fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
             expires,
         };
         m.key[..kb.len()].copy_from_slice(kb);
-        *c.borrow_mut() = Some(m);
+        c.borrow_mut()[slot] = Some(m);
     });
 }
 
@@ -726,7 +857,8 @@ pub enum CachedLookup {
 /// Cached variant used on hot paths (UDP per-packet, TCP per-connection).
 /// Consults the thread-local memo, then the positive cache, then the negative
 /// cache, so a known-bad name never costs a task spawn. A hit performs no heap
-/// allocation (stack-built key + full-key compare against the memo).
+/// allocation (stack-built key + full-key compare against the memo) and, on the
+/// memo hit path, exactly one clock read — it never touches a lock at all.
 pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
@@ -737,9 +869,28 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
             &owned
         }
     };
-    if let Some(hit) = memo_get(key) {
-        return hit;
+    // Memo first, and only then the clock: a memo hit costs one `Instant::now()`
+    // and a byte compare instead of two global read locks.
+    let pos = memo_peek(key, false);
+    let neg = memo_peek(key, true);
+    if pos.is_some() || neg.is_some() {
+        let now = Instant::now();
+        if let Some(m) = pos {
+            if now < m.expires {
+                return match m.addr {
+                    Some(a) => CachedLookup::Addr(a),
+                    None => CachedLookup::Unknown,
+                };
+            }
+        }
+        if let Some(m) = neg {
+            if now < m.expires {
+                return CachedLookup::Negative;
+            }
+        }
     }
+    // One clock read for both global caches: they are checked back to back and
+    // only their TTLs differ.
     let now = Instant::now();
     {
         let m = lock_read(dns_cache());
@@ -778,38 +929,36 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 
 const DNS_CACHE_MAX: usize = 4096;
 
+/// Batch eviction: once the table crosses the cap, drop enough entries in one
+/// pass to cover the whole overflow, then leave the next few hundred inserts
+/// alone. Evicting exactly one entry per insert forced a full O(n) scan — plus
+/// for the multi-victim case a collect + sort of the entire table — *while
+/// holding the write lock*, i.e. stalling every DNS reader on the packet fast
+/// path. Work is now proportional to how far past the cap the table actually
+/// is, amortized over the batch.
 fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
-    // Soft cap with a slack window so the O(n) sweep is amortized. Eviction is
-    // arbitrary (DNS caching needs no LRU ordering); this keeps the global
-    // write-lock hold time bounded instead of cloning+sorting the whole map on
-    // every insert, which used to stall the packet fast path.
     const SLACK: usize = 512;
     if m.len() <= DNS_CACHE_MAX + SLACK {
         return;
     }
+    // Cheap first pass: force-expired entries cost one retain and nothing else.
     m.retain(|_, (t, _)| t.elapsed() < DNS_CACHE_TTL);
     let over = m.len().saturating_sub(DNS_CACHE_MAX);
     if over == 0 {
         return;
     }
-    // Evict oldest-first so a burst of inserts can never immediately throw away
-    // the entries that were just refreshed (the previous arbitrary `take` could).
-    // The common case (over == 1) stays a single O(n) scan with one clone.
-    let victims: Vec<DnsCacheKey> = if over == 1 {
-        m.iter()
-            .min_by_key(|(_, (t, _))| *t)
-            .map(|(k, _)| k.clone())
-            .into_iter()
-            .collect()
+    // Evict oldest-first so a burst of inserts cannot immediately discard the
+    // entries that were just refreshed. `select_nth_unstable` partitions the
+    // victims to the front in O(n) instead of sorting the whole table just to
+    // keep the oldest `over` — with `over` bounded by the batch above this is
+    // the only unbounded part left, and it is now O(n) with no key clones
+    // until after the partition.
+    let mut entries: Vec<(&DnsCacheKey, Instant)> = m.iter().map(|(k, (t, _))| (k, *t)).collect();
+    let victims: Vec<DnsCacheKey> = if over >= entries.len() {
+        entries.drain(..).map(|(k, _)| k.clone()).collect()
     } else {
-        let mut entries: Vec<(&DnsCacheKey, Instant)> =
-            m.iter().map(|(k, (t, _))| (k, *t)).collect();
-        entries.sort_unstable_by_key(|(_, t)| *t);
-        entries
-            .into_iter()
-            .take(over)
-            .map(|(k, _)| k.clone())
-            .collect()
+        entries.select_nth_unstable_by_key(over, |(_, t)| *t);
+        entries[..over].iter().map(|(k, _)| (*k).clone()).collect()
     };
     for k in victims {
         m.remove(&k);
@@ -1096,6 +1245,88 @@ pub fn map_for_dual(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+// ---------------- QUIC DATAGRAM send (never the drop-oldest path) ----------------
+/// DATAGRAM send/receive buffer per connection (see [`build_transport`]).
+const DATAGRAM_BUFFER: usize = 1024 * 1024;
+
+/// Upper bound for one MQP-2 datagram on the wire: the largest address form
+/// (1 + 1 + 255 + 2) plus the type/session header. Kept as a named constant so
+/// the tests below can prove the send-buffer invariant rather than assert it.
+const MQP_DGRAM_MAX: usize = 5 + 1 + 1 + 255 + 2;
+
+/// Outcome of [`try_send_datagram`]. Mirrors quinn's error surface, but a full
+/// send buffer is a plain `Blocked` (the datagram was dropped) instead of an
+/// await point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramSend {
+    /// Queued for transmission.
+    Sent,
+    /// The send buffer is full; the datagram was dropped (UDP semantics).
+    Blocked,
+    /// Larger than the current path allows; the caller should refresh its
+    /// cached `max_datagram_size()` and drop this packet.
+    TooLarge,
+    /// The peer never negotiated DATAGRAM support.
+    Unsupported,
+    /// The connection is gone; the caller should tear the flow down.
+    ConnectionLost,
+}
+
+/// Poll a future exactly once with a no-op waker.
+///
+/// Sound for futures that are polled to completion elsewhere or dropped right
+/// after: a `Pending` result may leave a waker registered, but the no-op waker
+/// is a valid `RawWaker` and the future is dropped immediately, so nothing is
+/// ever woken on a dangling task.
+///
+/// Primitive behind [`try_send_datagram`]: `send_datagram_wait` takes quinn's
+/// connection-state mutex on every poll, so the non-blocking variant has to be
+/// able to ask once without parking a task.
+fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let waker = Waker::noop();
+    let mut cx = TaskContext::from_waker(waker);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+/// Non-blocking DATAGRAM send that MUST be used instead of quinn's
+/// `Connection::send_datagram`.
+///
+/// `send_datagram` is documented as "drop the oldest queued datagram when the
+/// buffer is full", but that path is broken in quinn-proto 0.11.17:
+/// `Connection::drop_oversized` (called whenever the path MTU shrinks) removes
+/// datagrams from the outgoing queue and decrements `payload_bytes` for each,
+/// yet a datagram re-queued by `DatagramState::write` was already decremented by
+/// `pop_front` — so the byte counter is decremented twice. It underflows to
+/// `usize::MAX`, `memory_used()` then looks astronomically large while the
+/// queue is empty, and the next `send_datagram` panics on
+/// `.expect("datagrams.outgoing.payload_bytes desynchronized")` inside quinn's
+/// connection-state mutex, poisoning it and aborting the whole process.
+///
+/// Reproduced on loopback with a 1200-byte payload against a peer whose
+/// `max_datagram_size()` had shrunk to 1162 bytes, so this is reachable by any
+/// PMTU reduction — i.e. by normal network conditions, not just a hostile peer.
+///
+/// `send_datagram_wait` takes the bounded (`Blocked`) path instead, which never
+/// touches that bookkeeping, so polling it once gives drop-on-full semantics
+/// without the crash. Bytes are copied per datagram regardless (quinn assembles
+/// each datagram frame with `extend_from_slice`), so this costs nothing extra.
+pub fn try_send_datagram(conn: &quinn::Connection, d: Bytes) -> DatagramSend {
+    match poll_once(conn.send_datagram_wait(d)) {
+        Some(Ok(())) => DatagramSend::Sent,
+        Some(Err(quinn::SendDatagramError::TooLarge)) => DatagramSend::TooLarge,
+        Some(Err(quinn::SendDatagramError::UnsupportedByPeer)) => DatagramSend::Unsupported,
+        Some(Err(quinn::SendDatagramError::ConnectionLost(_))) => DatagramSend::ConnectionLost,
+        Some(Err(quinn::SendDatagramError::Disabled)) => DatagramSend::ConnectionLost,
+        // Full send buffer: `send_datagram_wait` parks the datagram in its own
+        // future, which `poll_once` drops here, so nothing leaks.
+        None => DatagramSend::Blocked,
+    }
+}
+
 fn udp_send_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4096)))
@@ -1110,28 +1341,16 @@ fn udp_send_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 /// session. A genuinely full socket buffer is real backpressure too. In both
 /// cases the packet is handed to a bounded detached task so the caller never
 /// stalls on one destination; past the permit limit it is dropped (UDP
-/// semantics). The payload is only copied on the slow path.
-pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: &[u8]) {
-    match sock.try_send_to(payload, dst) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            if let Ok(permit) = udp_send_limiter().clone().try_acquire_owned() {
-                let sock = sock.clone();
-                let payload = payload.to_vec();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = sock.send_to(&payload, dst).await;
-                });
-            }
-        }
-        Err(e) => tracing::debug!("udp send to {dst} failed: {e}"),
-    }
-}
-
-/// Same contract as [`udp_try_send`], but the slow path moves an owned
-/// [`Bytes`] into the detached task instead of copying. Callers that already
-/// hold a `Bytes` should pass a cheap `Bytes::slice` of it.
-pub fn udp_try_send_owned(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
+/// semantics).
+///
+/// Takes `Bytes` so the slow path *moves* the payload into the task. The
+/// borrowed form would force a fresh `to_vec()` allocation plus a copy on a
+/// path that already holds an owned, refcounted buffer, and that copy is pure
+/// overhead. A `Bytes` that is *not* shared with other consumers (e.g. one just
+/// built by `encode_datagram*`) is unwrapped back to its `Vec` first, so the
+/// common case runs zero-copy and reuses the caller's allocation for the
+/// queued write.
+pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
     match sock.try_send_to(&payload, dst) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1139,7 +1358,14 @@ pub fn udp_try_send_owned(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
                 let sock = sock.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = sock.send_to(&payload, dst).await;
+                    match payload.try_into_mut() {
+                        Ok(v) => {
+                            let _ = sock.send_to(&v, dst).await;
+                        }
+                        Err(b) => {
+                            let _ = sock.send_to(&b, dst).await;
+                        }
+                    }
                 });
             }
         }
@@ -1154,13 +1380,20 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
     udp_socket_dual_with_size(bind, 4 * 1024 * 1024)
 }
 
-/// Per-session / relay sockets: 512KB per direction is plenty for a single
-/// association's DATAGRAM flow and keeps 100 sessions near ~100MB.
+/// Per-session / relay socket buffer, per direction.
+///
+/// These are *caps*, not reservations: the kernel only accounts for what is
+/// actually queued, but the cap is what a burst can pin. One association moves
+/// a single DATAGRAM flow whose data is already rate-limited by the QUIC
+/// congestion window, so a few hundred milliseconds of headroom is plenty;
+/// 256 KiB keeps the worst case for the configured session caps well below the
+/// kernel-memory budget (8192 server sessions x 512 KiB ≈ 4 GiB) while still
+/// absorbing a scheduling hiccup on a busy host.
+pub const SESS_SOCKET_BUF: usize = 256 * 1024;
+
+/// Per-session / relay sockets: see [`SESS_SOCKET_BUF`].
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
-    // 512KB per direction: burst headroom for a single association while
-    // keeping the global product sane (16384 sessions x ~1MB kernel = 16GB at
-    // the old 1MB/direction; the global session cap is lowered accordingly).
-    udp_socket_dual_with_size(bind, 512 * 1024)
+    udp_socket_dual_with_size(bind, SESS_SOCKET_BUF)
 }
 
 pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::UdpSocket> {
@@ -1202,13 +1435,17 @@ pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::Udp
 }
 
 fn warn_buf_clamped(which: &str, actual: usize, want: usize) {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let sysctl = if which == "send" {
-            "wmem_max"
-        } else {
-            "rmem_max"
-        };
+    // One flag per direction: a shared flag let whichever direction was probed
+    // first permanently silence the other, so a host with a small `wmem_max`
+    // but a large `rmem_max` never reported the send-side clamp at all.
+    static WARNED_SEND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static WARNED_RECV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (flag, sysctl) = if which == "send" {
+        (&WARNED_SEND, "wmem_max")
+    } else {
+        (&WARNED_RECV, "rmem_max")
+    };
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
             "udp {which} buffer clamped to {actual} (< {want}); raise net.core.{sysctl}; further buffer warnings suppressed"
         );
@@ -1301,6 +1538,86 @@ pub async fn copy_tcp_quic_acked(
     copy_tcp_quic_inner(tcp, send, recv, idle, Some(ack_timeout)).await
 }
 
+/// One direction's read buffer for [`copy_tcp_quic`] and friends.
+///
+/// Every stream used to allocate (and free) its own 32 KiB `Vec`, so a proxy
+/// carrying thousands of concurrent short flows paid an allocator round trip
+/// per flow per direction for a buffer whose lifetime is one connection. The
+/// buffers are checked out of a per-thread free list and returned on drop, so a
+/// steady stream of flows on a worker thread reuses the same memory. Overflow
+/// beyond [`COPY_POOL_MAX`] is freed instead of cached, which keeps a burst of
+/// spawned tasks from leaving idle memory behind on every worker thread.
+struct CopyBuf(&'static mut [u8]);
+
+/// Copy chunk: large enough that a high-BDP stream is not syscall-bound, small
+/// enough that thousands of them do not dominate the RSS.
+const COPY_CHUNK: usize = 32 * 1024;
+/// Per-thread pool depth. Two directions per flow are active at a time, so a
+/// handful of slots covers the common case without hoarding memory.
+const COPY_POOL_MAX: usize = 8;
+
+thread_local! {
+    static COPY_POOL: std::cell::RefCell<Vec<Box<[u8]>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl CopyBuf {
+    fn take() -> Self {
+        let pooled = COPY_POOL.with(|p| p.borrow_mut().pop());
+        match pooled {
+            Some(b) => Self(Box::leak(b)),
+            None => Self(Box::leak(vec![0u8; COPY_CHUNK].into_boxed_slice())),
+        }
+    }
+}
+
+impl std::ops::Deref for CopyBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for CopyBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.0
+    }
+}
+
+impl Drop for CopyBuf {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from `Box::leak` of a boxed slice in `take` and
+        // has not been freed or aliased since; reconstructing the `Box` returns
+        // exclusive ownership of exactly that allocation.
+        let b: Box<[u8]> = unsafe { Box::from_raw(self.0) };
+        COPY_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < COPY_POOL_MAX {
+                p.push(b);
+            }
+        });
+    }
+}
+
+/// Throttled liveness stamp shared by the two copy directions.
+///
+/// `since_ms` is the caller's last observed elapsed time, kept in a local so the
+/// hot loop never reloads the atomic; only an actual write goes to the shared
+/// counter. Each direction still stamps at least once per `throttle`, so the
+/// idle check in the select loop keeps its resolution.
+#[inline]
+fn touch_stamp(
+    last: &std::sync::atomic::AtomicU64,
+    since_ms: &mut u64,
+    now_ms: u64,
+    throttle: u64,
+) {
+    if now_ms.saturating_sub(*since_ms) >= throttle {
+        *since_ms = now_ms;
+        last.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn copy_tcp_quic_inner(
     tcp: tokio::net::TcpStream,
     mut send: quinn::SendStream,
@@ -1313,24 +1630,16 @@ async fn copy_tcp_quic_inner(
     // Monotonic base: all timestamps are ms since here, immune to NTP/wall jumps.
     let base = tokio::time::Instant::now();
     let last_ms = Arc::new(AtomicU64::new(0));
-    // Throttled touch: at most one atomic store per 100ms per direction.
-    // High-throughput (400Mb/s ≈ 1500 chunks/s) must not pay a clock+store per chunk.
-    let touch = |last: &AtomicU64, base: &tokio::time::Instant| {
-        let now = base.elapsed().as_millis() as u64;
-        let prev = last.load(Ordering::Relaxed);
-        if now.saturating_sub(prev) >= 100 {
-            last.store(now, Ordering::Relaxed);
-        }
-    };
     let (mut tr, mut tw) = tcp.into_split();
     let l1 = last_ms.clone();
     let l2 = last_ms.clone();
     let b1 = base;
     let b2 = base;
     let c2s = async move {
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = CopyBuf::take();
         let mut total = 0u64;
         let mut chunks = 0u64;
+        let mut stamped = 0u64;
         loop {
             let n = match tr.read(&mut buf).await {
                 Ok(0) => break,
@@ -1346,22 +1655,21 @@ async fn copy_tcp_quic_inner(
             }
             total += n as u64;
             chunks += 1;
-            if chunks.is_multiple_of(8) {
-                touch(&l1, &b1);
-            } else {
-                let now = b1.elapsed().as_millis() as u64;
-                if now.saturating_sub(l1.load(Ordering::Relaxed)) >= 500 {
-                    l1.store(now, Ordering::Relaxed);
-                }
-            }
+            // One clock read per chunk, one shared store per 100ms: the atomic
+            // comparison the old code ran on every non-multiple-of-8 chunk was
+            // itself the per-chunk cost it was trying to avoid.
+            let now = b1.elapsed().as_millis() as u64;
+            let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
+            touch_stamp(&l1, &mut stamped, now, throttle);
         }
         send.finish().ok();
         Ok::<u64, anyhow::Error>(total)
     };
     let s2c = async move {
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = CopyBuf::take();
         let mut total = 0u64;
         let mut chunks = 0u64;
+        let mut stamped = 0u64;
         // Optimistic SOCKS replies have already told the application the
         // connection is up, so the MQP-2 dial ACK only gates the reply
         // direction here. A failure means the remote dial failed (or the
@@ -1396,14 +1704,9 @@ async fn copy_tcp_quic_inner(
             }
             total += n as u64;
             chunks += 1;
-            if chunks.is_multiple_of(8) {
-                touch(&l2, &b2);
-            } else {
-                let now = b2.elapsed().as_millis() as u64;
-                if now.saturating_sub(l2.load(Ordering::Relaxed)) >= 500 {
-                    l2.store(now, Ordering::Relaxed);
-                }
-            }
+            let now = b2.elapsed().as_millis() as u64;
+            let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
+            touch_stamp(&l2, &mut stamped, now, throttle);
         }
         tw.shutdown().await.ok();
         Ok::<u64, anyhow::Error>(total)
@@ -1417,8 +1720,17 @@ async fn copy_tcp_quic_inner(
     tokio::pin!(s2c);
     let mut c2s_total: Option<u64> = None;
     let mut s2c_total: Option<u64> = None;
+    // Idle watchdog on a *fixed* cadence. The previous shape created a fresh
+    // `sleep(step)` on every loop iteration, and any progress in either
+    // direction re-entered the loop — so a busy stream registered and cancelled
+    // a timer per data chunk (thousands per second). One pinned sleep that is
+    // never re-created fixes the cadence: it is polled again after each transfer
+    // event, and only the elapsed-time comparison decides when the deadline has
+    // passed.
+    let idle_step = Duration::from_secs(5).min(idle);
+    let idle_tick = tokio::time::sleep(idle_step);
+    tokio::pin!(idle_tick);
     loop {
-        let step = Duration::from_secs(5).min(idle);
         tokio::select! {
             r = &mut c2s, if c2s_total.is_none() => match r {
                 Ok(v) => c2s_total = Some(v),
@@ -1428,12 +1740,18 @@ async fn copy_tcp_quic_inner(
                 Ok(v) => s2c_total = Some(v),
                 Err(e) => return Err(e),
             },
-            _ = tokio::time::sleep(step) => {
+            _ = &mut idle_tick => {
                 let elapsed_ms = base.elapsed().as_millis() as u64;
                 let last = last_ms.load(Ordering::Relaxed);
                 if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
                     anyhow::bail!("tcp stream idle>{idle:?}");
                 }
+                // Re-arm towards the same fixed cadence rather than from "now":
+                // a chunk arriving just before the deadline must not push the
+                // check another full step into the future.
+                idle_tick
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + idle_step);
             }
         }
         if let (Some(a), Some(b)) = (c2s_total, s2c_total) {
@@ -1501,6 +1819,113 @@ mod tests {
     }
 
     #[test]
+    fn dgram_send_buffer_always_fits_one_wire_datagram() {
+        // `try_send_datagram` (and any use of `send_datagram_wait`) can only work
+        // if the configured send buffer holds at least one maximum-size MQP-2
+        // datagram; a smaller buffer would report Blocked forever. Checked at
+        // compile time so editing the DATAGRAM cap fails the build loudly instead
+        // of under load; `build_transport` asserts the same bound.
+        const { assert!(MQP_DGRAM_MAX == 264, "MQP-2 datagram bound changed") };
+        const {
+            assert!(
+                MQP_DGRAM_MAX <= 1350,
+                "MQP_DGRAM_MAX must fit the 1350 B cap"
+            )
+        };
+        const { assert!(DATAGRAM_BUFFER >= MQP_DGRAM_MAX) };
+    }
+
+    #[test]
+    fn dgram_encoder_never_exceeds_the_wire_bound() {
+        // The longest encodable datagram: a 255-byte domain, vs the constant
+        // used for the send-buffer invariant.
+        let longest = TargetAddr::Domain("a".repeat(255), u16::MAX);
+        let d = encode_datagram_with_limit(0, &longest, &[0u8; 1350], 4096).unwrap();
+        assert_eq!(d.len(), MQP_DGRAM_MAX + 1350);
+    }
+
+    /// The single-allocation encoder must produce byte-identical output to the
+    /// straightforward `header()` + `encode()` pair for every address form, and
+    /// must reject exactly the same addresses.
+    #[test]
+    fn dgram_encoder_matches_the_reference_encoding() {
+        let addrs = [
+            TargetAddr::Ip("1.2.3.4:80".parse().unwrap()),
+            TargetAddr::Ip("[2001:4860:4860::8888]:443".parse().unwrap()),
+            TargetAddr::Domain("example.com".into(), 8443),
+            TargetAddr::Domain("a".repeat(255), 1),
+        ];
+        for a in &addrs {
+            let got = encode_datagram_ref_with_limit(7, &a.as_ref(), b"payload", 4096).unwrap();
+            // Reference: build the same body by hand from `header()`.
+            let mut want = Vec::new();
+            want.push(MQP_DGRAM_TYPE);
+            want.extend_from_slice(&7u32.to_le_bytes());
+            let h = a.as_ref().header().unwrap();
+            h.encode(&mut want).unwrap();
+            assert_eq!(h.len(), want.len() - DGRAM_PREFIX_LEN);
+            want.extend_from_slice(b"payload");
+            assert_eq!(&got[..], &want[..], "wire form changed for {a:?}");
+        }
+        // Rejections must match too: a scoped v6 address (scope_id != 0) is
+        // refused by the header validation exactly as `encode` refuses it.
+        let scoped = TargetAddrRef::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            1,
+            0,
+            3, // scope_id
+        )));
+        assert!(scoped.header().is_err());
+        assert!(scoped.encode(&mut Vec::new()).is_err());
+        assert!(encode_datagram_ref_with_limit(0, &scoped, b"x", 4096).is_none());
+    }
+
+    /// The ACK's bound-address encoder must agree with the `Vec` form it
+    /// replaces, for both address families.
+    #[test]
+    fn bnd_addr_into_matches_the_vec_encoder() {
+        for a in [
+            "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
+            "192.0.2.7:65535".parse().unwrap(),
+            "[::]:0".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ] {
+            let mut v = Vec::new();
+            encode_bnd_addr(a, &mut v);
+            let mut buf = [0u8; MAX_BND_LEN];
+            let n = encode_bnd_addr_into(a, &mut buf);
+            assert_eq!(n, v.len(), "length mismatch for {a}");
+            assert_eq!(&buf[..n], &v[..], "encoding mismatch for {a}");
+        }
+    }
+
+    /// The copy buffer pool must hand out independent, correctly sized buffers
+    /// and recycle them instead of reallocating.
+    #[test]
+    fn copy_buf_pool_reuses_buffers() {
+        assert_eq!(CopyBuf::take().len(), COPY_CHUNK);
+        // Check one out, write to it, and drop it: the same allocation must come
+        // back out of the pool with its contents intact (no zeroing, no realloc).
+        let addr = {
+            let mut b = CopyBuf::take();
+            b[0] = 0xAB;
+            b[COPY_CHUNK - 1] = 0xCD;
+            b.0.as_ptr() as usize
+        };
+        let again = CopyBuf::take();
+        assert_eq!(again.0.as_ptr() as usize, addr, "buffer was not pooled");
+        assert_eq!(again[0], 0xAB);
+        assert_eq!(again[COPY_CHUNK - 1], 0xCD);
+        // Overflow past the pool depth is freed rather than cached, so a burst
+        // cannot leave unbounded memory behind on a worker thread.
+        let held: Vec<CopyBuf> = (0..COPY_POOL_MAX + 4).map(|_| CopyBuf::take()).collect();
+        assert_eq!(held.len(), COPY_POOL_MAX + 4);
+        drop(held);
+        let depth = COPY_POOL.with(|p| p.borrow().len());
+        assert!(depth <= COPY_POOL_MAX, "pool overfilled: {depth}");
+    }
+
+    #[test]
     fn dgram_roundtrip() {
         let a = TargetAddr::Ip("8.8.8.8:53".parse().unwrap());
         let d = encode_datagram(7, &a, b"hello").unwrap();
@@ -1555,5 +1980,90 @@ mod tests {
         let k3 = dns_key("a\0b", 1, &mut c).unwrap();
         assert_eq!(k3, "a\u{0}b\u{0}1");
         assert_eq!(dns_key("same", 1, &mut a).unwrap(), "same\u{0}1");
+    }
+
+    /// Live regression test for the quinn-proto drop-oldest panic.
+    ///
+    /// Saturation runs the send path that used to reach quinn's broken
+    /// `datagrams.outgoing.payload_bytes` bookkeeping. With `try_send_datagram`
+    /// a full buffer must surface as `Blocked` (the datagram is dropped) and
+    /// must never panic; before the fix this test aborted the whole process
+    /// with `datagrams.outgoing.payload_bytes desynchronized`.
+    #[tokio::test]
+    async fn try_send_datagram_saturates_without_panicking() {
+        async fn endpoint_pair() -> (quinn::Endpoint, quinn::Endpoint) {
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let params = rcgen::CertificateParams::new(vec!["test.com".to_string()]).unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut scfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+                )
+                .unwrap();
+            scfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+            let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
+            let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+            server_cfg.transport_config(build_transport("bbr", 5));
+            let server =
+                quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+            let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates({
+                    let mut r = rustls::RootCertStore::empty();
+                    r.add(cert.der().clone()).unwrap();
+                    r
+                })
+                .with_no_client_auth();
+            ccfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+            let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
+            let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
+            ccfg.transport_config(build_transport("bbr", 5));
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            client.set_default_client_config(ccfg);
+            (client, server)
+        }
+
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        // The peer must complete the handshake; its datagram queue is never read,
+        // which is what eventually fills our send buffer.
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            incoming.accept().unwrap().await.unwrap()
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let _server_conn = accept.await.unwrap();
+        assert!(
+            conn.max_datagram_size().unwrap() >= 1024,
+            "loopback must allow ~1 KiB datagrams"
+        );
+
+        let payload: Bytes = Bytes::from(vec![0u8; 1024]);
+        let mut sent = 0usize;
+        let mut blocked = 0usize;
+        // Far more than the 1 MiB send buffer can hold.
+        for _ in 0..64 * 1024 {
+            match try_send_datagram(&conn, payload.clone()) {
+                DatagramSend::Sent => sent += 1,
+                DatagramSend::Blocked => blocked += 1,
+                other => panic!("unexpected datagram send result: {other:?}"),
+            }
+        }
+        assert!(sent > 0, "at least some datagrams must be queued");
+        assert!(
+            blocked > 0,
+            "the send buffer must saturate within 64k x 1 KiB sends"
+        );
     }
 }

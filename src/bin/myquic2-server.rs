@@ -352,8 +352,15 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     let cd = conn.clone();
     let ss = sess.clone();
     tokio::spawn(async move {
+        // One receive future per connection instead of one per datagram:
+        // `read_datagram` is cancel-safe (a buffered datagram is returned before
+        // its first await point), and its `Notify` is inline, so rebuilding it
+        // per packet was pure overhead. The connection-state mutex that quinn
+        // takes per datagram still applies — that part is inside quinn.
+        let reader = cd.read_datagram();
+        tokio::pin!(reader);
         loop {
-            let d: Bytes = match cd.read_datagram().await {
+            let d: Bytes = match reader.as_mut().await {
                 Ok(d) => d,
                 Err(_) => break,
             };
@@ -378,7 +385,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     // Non-blocking send with bounded detached fallback: a full
                     // target buffer must never stall the single per-connection
                     // datagram reader (UDP loss is acceptable).
-                    udp_try_send_owned(&sock, map_for_dual(dst), owned.slice(payload_off..));
+                    udp_try_send(&sock, map_for_dual(dst), owned.slice(payload_off..));
                 }
                 TargetAddrRef::Domain(h, p) => {
                     // Fast path: cached DNS avoids a per-packet spawn; a fresh
@@ -395,11 +402,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 Some(v) => v,
                                 None => continue,
                             };
-                            udp_try_send_owned(
-                                &sock,
-                                map_for_dual(dst),
-                                owned.slice(payload_off..),
-                            );
+                            udp_try_send(&sock, map_for_dual(dst), owned.slice(payload_off..));
                         }
                         CachedLookup::Unknown => {
                             let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
@@ -427,7 +430,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                     Some(v) => v,
                                     None => return,
                                 };
-                                udp_try_send_owned(&sock, map_for_dual(dst), payload);
+                                udp_try_send(&sock, map_for_dual(dst), payload);
                             });
                         }
                     }
@@ -468,8 +471,18 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     return;
                 }
             };
-            let cands = match &target {
-                TargetAddr::Ip(s) => vec![*s],
+            // Candidate addresses for the dial. Both branches produce a plain
+            // `&[SocketAddr]`: the IP-literal path (the dominant case) borrows
+            // the decoded target and allocates nothing, while the domain path
+            // resolves into a local buffer whose scope covers the dial.
+            let ip_cand;
+            let mut dns_cand = [SocketAddr::from(([0, 0, 0, 0], 0)); 8];
+            let dns_n;
+            let cands: &[SocketAddr] = match &target {
+                TargetAddr::Ip(s) => {
+                    ip_cand = *s;
+                    std::slice::from_ref(&ip_cand)
+                }
                 TargetAddr::Domain(h, p) => {
                     // TCP dials share the same global slow-path budget as UDP:
                     // without it a flood of unique domains would spawn
@@ -486,12 +499,16 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             return;
                         }
                     };
-                    let v = match resolve_all_cached(h, *p).await {
-                        Ok(v) => v.iter().copied().collect::<Vec<_>>(),
-                        Err(_) => Vec::new(),
+                    dns_n = match resolve_all_cached(h, *p).await {
+                        Ok(v) => {
+                            let k = v.len().min(dns_cand.len());
+                            dns_cand[..k].copy_from_slice(&v[..k]);
+                            k
+                        }
+                        Err(_) => 0,
                     };
                     drop(permit);
-                    v
+                    &dns_cand[..dns_n]
                 }
             };
             // Hold the global dial permit only for the connect phase; the copy
@@ -523,10 +540,13 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             let bnd = tcp
                 .local_addr()
                 .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            let mut ack = Vec::with_capacity(20);
-            ack.push(MQP_TCP_ACK);
-            encode_bnd_addr(bnd, &mut ack);
-            if send.write_all(&ack).await.is_err() {
+            // Fixed-size stack buffer: the ACK is at most 1 + 1 + 16 + 2 bytes
+            // (v6 form), so the per-stream `Vec` this used to allocate bought
+            // nothing.
+            let mut ack = [0u8; 20];
+            ack[0] = MQP_TCP_ACK;
+            let n = 1 + encode_bnd_addr_into(bnd, &mut ack[1..]);
+            if send.write_all(&ack[..n]).await.is_err() {
                 return;
             }
             let _ = copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await;
@@ -535,69 +555,83 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     Ok(())
 }
 
+/// Byte length of the complete MQP-2 TCP header for a given `atyp`: how much
+/// the header reader must collect before it can decode. The domain form needs
+/// its length byte first, which is why this is two-staged. Pure so the lengths
+/// are unit-testable without a live QUIC stream.
+fn mqp_hdr_len(atyp: u8, domain_len: u8) -> Result<usize> {
+    Ok(match atyp {
+        0x01 => 1 + 6,
+        0x04 => 1 + 18,
+        0x03 => {
+            if domain_len == 0 {
+                anyhow::bail!("empty domain");
+            }
+            1 + 1 + domain_len as usize + 2
+        }
+        a => anyhow::bail!("bad atyp {a}"),
+    })
+}
+
 async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<TargetAddr> {
     // No per-read timeout here: the caller wraps the whole header read in a
     // single 5s budget, and an inner timeout just registered extra timers.
-    async fn rd(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
-        recv.read_exact(buf).await.context("hdr read")?;
-        Ok(())
-    }
-    let mut atyp = [0u8; 1];
-    rd(recv, &mut atyp).await?;
-    let full: Vec<u8> = match atyp[0] {
-        0x01 => {
-            let mut b = [0u8; 6];
-            rd(recv, &mut b).await?;
-            let mut full = Vec::with_capacity(7);
-            full.push(0x01);
-            full.extend_from_slice(&b);
-            full
-        }
-        0x04 => {
-            let mut b = [0u8; 18];
-            rd(recv, &mut b).await?;
-            let mut full = Vec::with_capacity(19);
-            full.push(0x04);
-            full.extend_from_slice(&b);
-            full
-        }
+    //
+    // The header is decoded from one stack buffer instead of assembling a
+    // temporary `Vec` per field and then decoding that: a domain target used to
+    // cost four heap allocations (three `Vec`s plus the owned `String`) before
+    // the dial even started. Now only the final `TargetAddr` allocates.
+    const HDR_MAX: usize = 1 + 1 + 255 + 2;
+    let mut buf = [0u8; HDR_MAX];
+    recv.read_exact(&mut buf[..1]).await.context("hdr read")?;
+    let (len, rest_at) = match buf[0] {
         0x03 => {
-            let mut n = [0u8; 1];
-            rd(recv, &mut n).await?;
-            if n[0] == 0 {
-                anyhow::bail!("empty domain");
-            }
-            let mut rest = vec![0u8; n[0] as usize + 2];
-            rd(recv, &mut rest).await?;
-            let mut full = Vec::with_capacity(2 + n[0] as usize + 2);
-            full.push(0x03);
-            full.push(n[0]);
-            full.extend_from_slice(&rest);
-            full
+            recv.read_exact(&mut buf[1..2])
+                .await
+                .context("hdr domain len")?;
+            (mqp_hdr_len(0x03, buf[1])?, 2)
         }
-        a => anyhow::bail!("bad atyp {a}"),
+        atyp => (mqp_hdr_len(atyp, 0)?, 1),
     };
-    Ok(TargetAddr::decode(&full)?.0)
+    recv.read_exact(&mut buf[rest_at..len])
+        .await
+        .context("hdr read")?;
+    Ok(TargetAddr::decode(&buf[..len])?.0)
 }
 
+/// Connect to the first candidate that succeeds.
+///
+/// `cands` is borrowed so the IP-literal path allocates nothing. The filtered
+/// candidate list and the task set live in fixed arrays: the old `Vec::collect`
+/// plus `JoinSet` allocated two or three times per flow just to set up a dial
+/// that, in the single-candidate case, needs one `connect`.
 async fn dial_happy_eyeballs(
-    cands: Vec<SocketAddr>,
+    cands: &[SocketAddr],
     allow_private: bool,
 ) -> Option<tokio::net::TcpStream> {
-    let cands: Vec<SocketAddr> = cands
-        .into_iter()
+    const DIAL_CAND_MAX: usize = 8;
+    let mut accept = [SocketAddr::from(([0, 0, 0, 0], 0)); DIAL_CAND_MAX];
+    let mut n = 0;
+    for a in cands
+        .iter()
         .filter(|a| allow_private || is_global_ip(a.ip()))
-        .take(8)
-        .collect();
+    {
+        accept[n] = *a;
+        n += 1;
+        if n == DIAL_CAND_MAX {
+            break;
+        }
+    }
+    let cands = &accept[..n];
     if cands.is_empty() {
         return None;
     }
     // Total budget 4s; the client-side ACK wait is sized to cover it.
     let budget = tokio::time::sleep(Duration::from_secs(4));
     tokio::pin!(budget);
-    if cands.len() == 1 {
+    if let [only] = cands {
         tokio::select! {
-            r = tokio::net::TcpStream::connect(cands[0]) => {
+            r = tokio::net::TcpStream::connect(*only) => {
                 let s = r.ok()?;
                 let _ = s.set_nodelay(true);
                 return Some(s);
@@ -609,11 +643,12 @@ async fn dial_happy_eyeballs(
     // polling a flag every 50ms (which cost extra wakeups on hot dial paths).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let mut tasks = tokio::task::JoinSet::new();
-    for (i, a) in cands.into_iter().enumerate() {
+    let mut tasks = Vec::with_capacity(cands.len());
+    for (i, a) in cands.iter().enumerate() {
         let tx = tx.clone();
         let mut cancel = cancel_rx.clone();
-        tasks.spawn(async move {
+        let a = *a;
+        tasks.push(tokio::spawn(async move {
             if i > 0 {
                 let delay = Duration::from_millis(250 * i.min(4) as u64);
                 tokio::select! {
@@ -633,7 +668,7 @@ async fn dial_happy_eyeballs(
                 // Capacity 1: the first winner wins, the rest drop their socket.
                 let _ = tx.try_send(s);
             }
-        });
+        }));
     }
     drop(tx);
     let res = tokio::select! {
@@ -641,7 +676,9 @@ async fn dial_happy_eyeballs(
         _ = &mut budget => None,
     };
     let _ = cancel_tx.send(true);
-    tasks.shutdown().await;
+    for t in tasks {
+        t.abort();
+    }
     res
 }
 
@@ -655,35 +692,148 @@ fn touch_session(t: &std::sync::atomic::AtomicU64) {
     }
 }
 
-/// Evict expired sessions first, then arbitrary ones, with O(n) work and a
-/// bounded number of removals: never clone+sort the whole table under the
-/// write lock while the packet fast path is waiting for the read lock.
-/// Expired entries must be aborted, not just dropped: a dropped JoinHandle
+/// Evict sessions that are past their idle deadline, then arbitrary ones if the
+/// table is still over its target, and hand the removed entries back so the
+/// caller can abort their readers *after* releasing the table lock.
+///
+/// Expired entries must be aborted, not merely dropped: a dropped `JoinHandle`
 /// leaves the reply reader (and its socket fd / kernel buffer) alive until its
-/// own 180s timeout, which transiently doubled the session/fd budget.
-fn sweep_local(w: &mut HashMap<u32, SessEntry>) {
+/// own 180s timeout, which transiently doubles the session/fd budget.
+///
+/// Returning a `Vec` instead of aborting inline keeps `abort()` — which touches
+/// the task's vtable and may wake a worker thread — off the write-lock hold,
+/// and removes the key-collection allocations from that critical section.
+fn sweep_local(w: &mut HashMap<u32, SessEntry>) -> Vec<SessEntry> {
     let now = mono_millis();
-    let expired: Vec<u32> = w
-        .iter()
-        .filter(|(_, (_, _, t, _))| {
-            now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
-        })
-        .map(|(k, _)| *k)
-        .collect();
+    let mut expired: Vec<u32> = Vec::new();
+    for (k, (_, _, t, _)) in w.iter() {
+        if now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS {
+            expired.push(*k);
+        }
+    }
+    let mut evicted: Vec<SessEntry> = Vec::with_capacity(expired.len());
     for k in expired {
-        if let Some((_, hh, _, _)) = w.remove(&k) {
-            hh.abort();
+        if let Some(e) = w.remove(&k) {
+            evicted.push(e);
         }
     }
     let over = w.len().saturating_sub(LOCAL_SESS_TARGET);
-    if over == 0 {
-        return;
-    }
-    let victims: Vec<u32> = w.keys().take(over).cloned().collect();
-    for k in victims {
-        if let Some((_, hh, _, _)) = w.remove(&k) {
-            hh.abort();
+    if over > 0 {
+        let victims: Vec<u32> = w.keys().take(over).copied().collect();
+        for k in victims {
+            if let Some(e) = w.remove(&k) {
+                evicted.push(e);
+            }
         }
+    }
+    evicted
+}
+
+fn abort_evicted(evicted: Vec<SessEntry>) {
+    for (_, h, _, _) in evicted {
+        h.abort();
+    }
+}
+
+/// Per-connection memo of the most recently used session socket.
+///
+/// A datagram-heavy flow sends a long run of packets to the *same* session, so
+/// the connection-level `RwLock` read plus hash lookup in `get_or_create_sess`
+/// is pure per-packet overhead for all but the first packet of the run. The
+/// memo is a single slot on purpose: a miss simply falls through to the table,
+/// and a stale hit can only ever send one reply to a socket whose reader has
+/// already exited (never to the wrong target), because entries are keyed by
+/// session id and the reader holds its own `Arc` to keep the fd alive.
+struct SessMemo {
+    sess: u32,
+    sock: Arc<tokio::net::UdpSocket>,
+    /// The session table's liveness stamp, kept so a memo hit can refresh it
+    /// without re-taking the table lock.
+    last: Arc<std::sync::atomic::AtomicU64>,
+    /// Cleared by the reply reader as it exits, which turns this slot back into
+    /// a miss for the next packet addressed to `sess`.
+    alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+thread_local! {
+    static SESS_MEMO: std::cell::RefCell<Option<SessMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Remember `sock` as the memoized session, unless a newer session already is.
+fn sess_memo_put(
+    sess: u32,
+    sock: Arc<tokio::net::UdpSocket>,
+    last: Arc<std::sync::atomic::AtomicU64>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+) {
+    SESS_MEMO.with(|c| {
+        *c.borrow_mut() = Some(SessMemo {
+            sess,
+            sock,
+            last,
+            alive,
+        })
+    });
+}
+
+/// Drop the memo when it still points at `sess`. Called by a reply reader as it
+/// exits, so the next inbound packet for that session recreates it instead of
+/// sending into a socket nobody reads.
+fn sess_memo_forget(sess: u32) {
+    SESS_MEMO.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.as_ref().is_some_and(|e| e.sess == sess) {
+            *m = None;
+        }
+    });
+}
+
+/// Per-thread view of the last liveness refresh, so the throttling decision
+/// costs no clock read. A `(session, ms)` pair is enough: it is only ever
+/// compared against the session it belongs to.
+struct TouchMemo {
+    sess: u32,
+    ms: u64,
+}
+
+thread_local! {
+    static TOUCH_MEMO: std::cell::RefCell<Option<TouchMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Refresh `last` at most once per [`TOUCH_INTERVAL_MS`], using a thread-local
+/// copy of the last refresh time and session id.
+///
+/// The memo hit path used to keep a session alive implicitly (it re-took the
+/// table lock and called `touch_session` on every packet). Skipping the table
+/// must not change that: an outbound-only flow would be reaped by the sweeper at
+/// its idle deadline and immediately recreated, churning a socket per flow every
+/// 180 s. The clock read stays on the hot path only in the sense that it decides
+/// whether to store — a `clock_gettime` is an order of magnitude cheaper than the
+/// hash lookup and hash-map read lock this replaced.
+fn touch_session_throttled(sess: u32, last: &std::sync::atomic::AtomicU64) {
+    const TOUCH_INTERVAL_MS: u64 = 1000;
+    let now = mono_millis();
+    let due = TOUCH_MEMO.with(|c| {
+        let mut c = c.borrow_mut();
+        match c.as_ref() {
+            Some(m) if m.sess == sess => {
+                if now.saturating_sub(m.ms) >= TOUCH_INTERVAL_MS {
+                    *c = Some(TouchMemo { sess, ms: now });
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                *c = Some(TouchMemo { sess, ms: now });
+                true
+            }
+        }
+    });
+    if due {
+        last.store(now, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -692,10 +842,47 @@ async fn get_or_create_sess(
     cd: &quinn::Connection,
     s: u32,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
+    // Zero-lock fast path: the common case (a burst of packets for one session)
+    // allocates nothing and never touches the table. `alive` is the same signal
+    // the old table lookup used (`JoinHandle::is_finished`) — an atomic load —
+    // so a session whose reader has exited still falls through and is recreated.
+    use std::sync::atomic::Ordering;
+    enum Hit {
+        Miss,
+        Fresh(Arc<tokio::net::UdpSocket>),
+        /// The memo's reader has exited: the table (not the memo) must decide,
+        /// so this falls through and lets the table path recreate the session.
+        Stale,
+    }
+    let hit = SESS_MEMO.with(|c| {
+        let m = c.borrow();
+        match m.as_ref().filter(|e| e.sess == s) {
+            Some(e) if e.alive.load(Ordering::Relaxed) => Hit::Fresh(e.sock.clone()),
+            Some(_) => Hit::Stale,
+            None => Hit::Miss,
+        }
+    });
+    match hit {
+        Hit::Fresh(sock) => {
+            // Refresh liveness without the table lock; a session captured here is
+            // scheduled by its reader and may be exiting, in which case one reply
+            // is dropped and the next packet recreates it.
+            SESS_MEMO.with(|c| {
+                if let Some(e) = c.borrow().as_ref().filter(|e| e.sess == s) {
+                    touch_session_throttled(s, &e.last);
+                }
+            });
+            return Some(sock);
+        }
+        Hit::Stale | Hit::Miss => {}
+    }
     // Fast path: single read lock + lock-free timestamp bump. No write lock
     // per packet, so concurrent sessions never serialize on a global lock.
     // A session whose reply reader has already exited is treated as absent so
-    // its next packet recreates it instead of black-holing replies.
+    // its next packet recreates it instead of black-holing replies. This path
+    // deliberately does not populate the memo: the memo's liveness flag belongs
+    // to the reader that this path did not create, and a second flag set by
+    // nobody would pin a dead session forever.
     {
         let r = lock_read(ss);
         if let Some((sock, h, t, _)) = r.get(&s) {
@@ -711,8 +898,11 @@ async fn get_or_create_sess(
     let permit = match session_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            // Reap expired/over-cap sessions, then retry once.
-            sweep_local(&mut lock_write(ss));
+            // Reap expired/over-cap sessions, then retry once. Aborts happen
+            // after the lock is dropped (the guard is a temporary in this
+            // statement, and `abort_evicted` runs once it is gone).
+            let evicted = sweep_local(&mut lock_write(ss));
+            abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => return None,
@@ -723,104 +913,218 @@ async fn get_or_create_sess(
     // are syscalls and must not stall the datagram reader for every session.
     let raw = udp_socket_dual_small("[::]:0").ok()?;
     let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
+    // Shared with the memo so a reader exit invalidates it without touching the
+    // table.
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let alive_reader = alive.clone();
+    let evicted;
     // Slow path holds the write lock across check+insert so concurrent
     // packets for the same sess cannot create duplicate sockets (B8).
-    let mut w = lock_write(ss);
-    if let Some((sock2, h2, t, _)) = w.get(&s) {
-        if !h2.is_finished() {
-            touch_session(t);
-            return Some(sock2.clone());
+    {
+        let mut w = lock_write(ss);
+        if let Some((sock2, h2, t, _)) = w.get(&s) {
+            if !h2.is_finished() {
+                touch_session(t);
+                let sock2 = sock2.clone();
+                drop(w);
+                return Some(sock2);
+            }
+            // Dead reader: replace it (dropping the stale entry releases its
+            // permit).
+            if let Some((_, hh, _, _)) = w.remove(&s) {
+                hh.abort();
+            }
         }
-        // Dead reader: replace it (dropping the stale entry releases its permit).
-        if let Some((_, hh, _, _)) = w.remove(&s) {
-            hh.abort();
+        if w.len() >= LOCAL_SESS_MAX {
+            evicted = sweep_local(&mut w);
+        } else {
+            evicted = Vec::new();
         }
-    }
-    if w.len() >= LOCAL_SESS_MAX {
-        sweep_local(&mut w);
-    }
-    let c2 = cd.clone();
-    let rs = sock.clone();
-    let ss2 = ss.clone();
-    let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
-    let last2 = last.clone();
-    let h = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut buf = vec![0u8; 2048];
-        // quinn's `max_datagram_size()` takes the connection-state mutex that
-        // the protocol driver also uses; never call it per datagram. 0 means
-        // the peer does not support QUIC DATAGRAM (replies are then dropped).
-        let mut limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
-        loop {
-            let (n, src) = tokio::select! {
-                r = rs.recv_from(&mut buf) => match r {
-                    Ok(x) => x,
-                    // Socket error: exit; the entry is reaped below and the
-                    // next packet for this session recreates it.
-                    Err(_) => break,
-                },
-                // One fixed 60s tick instead of a fresh 60s timeout per
-                // recv_from (which re-registered a timer for every inbound
-                // packet). The reap decision uses the shared last-activity
-                // stamp, so coarse granularity is sufficient.
-                _ = tick.tick() => {
-                    if c2.close_reason().is_some()
-                        || mono_millis()
-                            .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
-                            >= SESS_IDLE_MS
-                    {
-                        break;
+        let c2 = cd.clone();
+        let rs = sock.clone();
+        let ss2 = ss.clone();
+        let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
+        let last2 = last.clone();
+        let h = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut buf = vec![0u8; 2048];
+            // quinn's `max_datagram_size()` takes the connection-state mutex that
+            // the protocol driver also uses; never call it per datagram. 0 means
+            // the peer does not support QUIC DATAGRAM (replies are then dropped).
+            let mut limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+            // Monotonic ms of the last liveness bump. The atomic is the cross-task
+            // view; this copy is what the per-packet comparison uses, so the fast
+            // path below never reads a clock.
+            let mut last_touch = 0u64;
+            loop {
+                let (n, src) = tokio::select! {
+                    r = rs.recv_from(&mut buf) => match r {
+                        Ok(x) => x,
+                        // Socket error: exit; the entry is reaped below and the
+                        // next packet for this session recreates it.
+                        Err(_) => break,
+                    },
+                    // One fixed 60s tick instead of a fresh 60s timeout per
+                    // recv_from (which re-registered a timer for every inbound
+                    // packet). The reap decision uses the shared last-activity
+                    // stamp, so coarse granularity is sufficient.
+                    _ = tick.tick() => {
+                        if c2.close_reason().is_some()
+                            || mono_millis()
+                                .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
+                                >= SESS_IDLE_MS
+                        {
+                            break;
+                        }
+                        limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+                        continue;
                     }
-                    limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+                };
+                // Inbound replies are liveness too: a long one-way download must
+                // not be reaped while it is actively streaming. The sweeper only
+                // needs ~1s resolution, so the clock is read at most once per
+                // second instead of once per reply.
+                let now = mono_millis();
+                if now.saturating_sub(last_touch) >= 1000 {
+                    last_touch = now;
+                    last2.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+                if n == buf.len() || limit == 0 {
                     continue;
                 }
-            };
-            // Inbound replies are liveness too: a long one-way download must
-            // not be reaped while it is actively streaming.
-            last2.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
-            if n == buf.len() || limit == 0 {
-                continue;
-            }
-            let src = SocketAddr::new(unmap(src.ip()), src.port());
-            let d = match encode_datagram_with_limit(s, &TargetAddr::Ip(src), &buf[..n], limit) {
-                Some(d) => d,
-                None => continue,
-            };
-            // quinn's `send_datagram` does NOT return Blocked when its buffer
-            // is full: it silently drops the oldest queued datagram instead.
-            // Any Err therefore means the connection/datagram path is dead.
-            match c2.send_datagram(d) {
-                Ok(()) => {}
-                Err(quinn::SendDatagramError::TooLarge) => {
-                    // Path MTU shrank: refresh once, drop this packet.
-                    limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+                let src = SocketAddr::new(unmap(src.ip()), src.port());
+                let d = match encode_datagram_with_limit(s, &TargetAddr::Ip(src), &buf[..n], limit)
+                {
+                    Some(d) => d,
+                    None => continue,
+                };
+                // `try_send_datagram` (never quinn's `send_datagram`): a full send
+                // buffer drops the datagram instead of triggering quinn-proto's
+                // broken drop-oldest path, which underflows its byte accounting and
+                // aborts the process (see the helper's docs).
+                match try_send_datagram(&c2, d) {
+                    DatagramSend::Sent => {}
+                    DatagramSend::Blocked => {
+                        // Buffer full: UDP semantics, drop this reply.
+                    }
+                    DatagramSend::TooLarge => {
+                        // Path MTU shrank: refresh once, drop this packet.
+                        limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+                    }
+                    DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
                 }
-                Err(quinn::SendDatagramError::ConnectionLost(_))
-                | Err(quinn::SendDatagramError::UnsupportedByPeer)
-                | Err(quinn::SendDatagramError::Disabled) => break,
             }
-        }
-        // Self-reap: task exit removes the zombie entry (and releases its
-        // permit) instead of waiting for the 60s sweeper. Do NOT abort our own
-        // JoinHandle: this task is already exiting and abort() has no effect
-        // until an await point that no longer exists.
-        let mut w = lock_write(&ss2);
-        if let Some((cur, _, _, _)) = w.get(&s) {
-            if Arc::ptr_eq(cur, &rs) {
-                w.remove(&s);
+            // Reader is gone: invalidate the memo slot so the next packet for
+            // this session takes the table path and recreates it, rather than
+            // sending a reply into a socket nobody is reading.
+            alive_reader.store(false, std::sync::atomic::Ordering::Relaxed);
+            sess_memo_forget(s);
+            // Self-reap: task exit removes the zombie entry (and releases its
+            // permit) instead of waiting for the 60s sweeper. Do NOT abort our own
+            // JoinHandle: this task is already exiting and abort() has no effect
+            // until an await point that no longer exists.
+            let mut w = lock_write(&ss2);
+            if let Some((cur, _, _, _)) = w.get(&s) {
+                if Arc::ptr_eq(cur, &rs) {
+                    w.remove(&s);
+                }
             }
+        });
+        let dead = !alive.load(std::sync::atomic::Ordering::Relaxed);
+        w.insert(s, (sock.clone(), h, last.clone(), permit));
+        // The reader may have exited before the insert (e.g. immediate socket
+        // error); its self-reap ran too early, so remove the dead entry here
+        // instead of leaving it to hold a permit until the 180s sweep.
+        if dead
+            || w.get(&s)
+                .map(|(_, hh, _, _)| hh.is_finished())
+                .unwrap_or(false)
+        {
+            w.remove(&s);
+        } else {
+            // Memoize only a session that is actually alive; a memo hit then
+            // costs one atomic load instead of a table lock per packet.
+            sess_memo_put(s, sock.clone(), last.clone(), alive);
         }
-    });
-    w.insert(s, (sock.clone(), h, last, permit));
-    // The reader may have exited before the insert (e.g. immediate socket
-    // error); its self-reap ran too early, so remove the dead entry here
-    // instead of leaving it to hold a permit until the 180s sweep.
-    if w.get(&s)
-        .map(|(_, hh, _, _)| hh.is_finished())
-        .unwrap_or(false)
-    {
-        w.remove(&s);
     }
+    abort_evicted(evicted);
     Some(sock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(atyp: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![atyp];
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn mqp_hdr_len_matches_each_wire_form() {
+        assert_eq!(mqp_hdr_len(0x01, 0).unwrap(), 7);
+        assert_eq!(mqp_hdr_len(0x04, 0).unwrap(), 19);
+        assert_eq!(mqp_hdr_len(0x03, 1).unwrap(), 5);
+        assert_eq!(mqp_hdr_len(0x03, 255).unwrap(), 259);
+        assert!(
+            mqp_hdr_len(0x03, 0).is_err(),
+            "empty domain must be refused"
+        );
+        assert!(
+            mqp_hdr_len(0x02, 0).is_err(),
+            "unknown atyp must be refused"
+        );
+    }
+
+    /// The stack-buffer reader must consume exactly the bytes the framed header
+    /// names, so the caller's stream position equals the pre-refactor one.
+    #[test]
+    fn mqp_header_roundtrip_v4_v6_and_domain() {
+        for (hdr_bytes, want) in [
+            (
+                hdr(0x01, &[8, 8, 8, 8, 0, 53]),
+                TargetAddr::Ip("8.8.8.8:53".parse().unwrap()),
+            ),
+            (
+                hdr(0x04, &{
+                    let mut b = [0u8; 18];
+                    b[..16].copy_from_slice(
+                        &"2001:4860:4860::8888"
+                            .parse::<std::net::Ipv6Addr>()
+                            .unwrap()
+                            .octets(),
+                    );
+                    b[16..].copy_from_slice(&443u16.to_be_bytes());
+                    b
+                }),
+                TargetAddr::Ip("[2001:4860:4860::8888]:443".parse().unwrap()),
+            ),
+            (
+                hdr(0x03, &{
+                    let d = b"example.com";
+                    let mut b = vec![d.len() as u8];
+                    b.extend_from_slice(d);
+                    b.extend_from_slice(&8443u16.to_be_bytes());
+                    b
+                }),
+                TargetAddr::Domain("example.com".into(), 8443),
+            ),
+        ] {
+            let len = mqp_hdr_len(hdr_bytes[0], *hdr_bytes.get(1).unwrap_or(&0)).unwrap();
+            assert_eq!(len, hdr_bytes.len(), "declared length must match the frame");
+            let (got, used) = TargetAddr::decode(&hdr_bytes).unwrap();
+            assert_eq!(used, hdr_bytes.len());
+            assert_eq!(got, want);
+        }
+    }
+
+    /// A domain header longer than the 255-byte wire limit must be refused by
+    /// the length helper, never sliced into the fixed stack buffer.
+    #[test]
+    fn domain_wire_limit_is_enforced() {
+        assert_eq!(mqp_hdr_len(0x03, 255).unwrap(), 259);
+        assert!(mqp_hdr_len(0x03, 0).is_err());
+    }
 }
