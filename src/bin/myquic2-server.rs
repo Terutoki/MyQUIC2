@@ -4,7 +4,13 @@ use bytes::Bytes;
 use clap::Parser;
 use myquic2::*;
 use quinn::Runtime;
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -25,7 +31,17 @@ type SessTable = Arc<std::sync::RwLock<HashMap<u32, SessEntry>>>;
 /// and new UDP sessions borrow from a shared permit pool, so a single peer
 /// cannot exhaust fds/kernel memory (the server is unauthenticated by default).
 const MAX_CONNECTIONS: usize = 4096;
-const MAX_SESSIONS_GLOBAL: usize = 16_384;
+/// Concurrent connections that have not completed token authentication.
+/// Bounds the receive-window memory an unauthenticated peer can pin while the
+/// process-wide cap still allows 4096 *authenticated* connections. With an
+/// empty `auth_token` every peer is implicitly authenticated, so this cap is a
+/// no-op and the operator must rely on the firewall + the lowered transport
+/// windows.
+const MAX_UNAUTH_CONNECTIONS: usize = 256;
+/// Process-wide UDP session cap. Each session owns a kernel socket with a
+/// 512KB send + 512KB receive buffer (see `udp_socket_dual_small`), so 8192
+/// sessions bound the kernel side to ~8GB worst case instead of ~32GB.
+const MAX_SESSIONS_GLOBAL: usize = 8192;
 const LOCAL_SESS_MAX: usize = 4096;
 const LOCAL_SESS_TARGET: usize = LOCAL_SESS_MAX - 64;
 const SESS_IDLE_MS: u64 = 180_000;
@@ -74,7 +90,9 @@ async fn authenticate(conn: &quinn::Connection, expected: &[u8]) -> Result<()> {
     }
     let got = tokio::time::timeout(AUTH_TIMEOUT, async {
         let mut uni = conn.accept_uni().await?;
-        uni.read_to_end(AUTH_MAX_BYTES).await.map_err(anyhow::Error::from)
+        uni.read_to_end(AUTH_MAX_BYTES)
+            .await
+            .map_err(anyhow::Error::from)
     })
     .await
     .context("auth timeout")??;
@@ -84,15 +102,34 @@ async fn authenticate(conn: &quinn::Connection, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Constant-time token compare that never short-circuits on the first
+/// mismatching byte: mismatched lengths contribute a single flag and the loop
+/// runs over `max(len)` bytes with zero padding.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    // Length inequality is folded in as a 0/1 flag: casting `(len_a ^ len_b)`
+    // to u8 could wrap to 0 for lengths 256 apart (e.g. 256 vs 0) and compare
+    // equal if every common byte matched. Only *whether* the lengths differ
+    // is revealed, never the token bytes.
+    let mut diff = if a.len() == b.len() { 0u8 } else { 1u8 };
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Rate limit for "refusing new connection" logs under a flood.
+fn warn_once_per_sec() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = mono_millis();
+    let prev = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000 {
+        return false;
+    }
+    LAST.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 #[tokio::main]
@@ -113,10 +150,26 @@ async fn main() -> Result<()> {
     }
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
 
+    if is_placeholder_token(&c.auth_token) {
+        warn!("auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)");
+    }
     // Self-signed cert: auto-generate on first run (fast path, no external CA RTT).
-    if !Path::new(&c.cert_file).exists() || !Path::new(&c.key_file).exists() {
-        info!("generating self-signed cert for {}", c.server_name);
-        gen_self_signed_files(&c.server_name, &c.cert_file, &c.key_file)?;
+    // Regenerate only when BOTH files are absent: silently recreating one over
+    // an existing counterpart would invalidate every client's pinned cert.
+    let cert_exists = Path::new(&c.cert_file).exists();
+    let key_exists = Path::new(&c.key_file).exists();
+    match (cert_exists, key_exists) {
+        (true, true) => {}
+        (false, false) => {
+            info!("generating self-signed cert for {}", c.server_name);
+            gen_self_signed_files(&c.server_name, &c.cert_file, &c.key_file)?;
+        }
+        _ => anyhow::bail!(
+            "cert/key pair incomplete: cert_file {} and key_file {}; refusing to overwrite \
+             the surviving file (restore the missing one, or delete both to regenerate)",
+            if cert_exists { "exists" } else { "is missing" },
+            if key_exists { "exists" } else { "is missing" }
+        ),
     }
     let cert = load_cert_der(&c.cert_file)?;
     let key = load_key_der(&c.key_file)?;
@@ -146,7 +199,9 @@ async fn main() -> Result<()> {
         warn!("auth_token is empty: the QUIC endpoint accepts any peer (rely on firewall/network isolation)");
     }
     let auth_token = Arc::new(c.auth_token.clone().into_bytes());
+    let auth_enabled = !auth_token.is_empty();
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS));
     loop {
         let incoming = match ep.accept().await {
             Some(i) => i,
@@ -158,10 +213,31 @@ async fn main() -> Result<()> {
         let permit = match conn_limit.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                warn!("connection limit {MAX_CONNECTIONS} reached; refusing new connection");
+                if warn_once_per_sec() {
+                    warn!("connection limit {MAX_CONNECTIONS} reached; refusing new connection");
+                }
                 drop(incoming); // implicit refuse
                 continue;
             }
+        };
+        // Bound pre-auth receive-window memory: a peer that never sends a
+        // token must not pin the whole MAX_CONNECTIONS budget. Released as
+        // soon as `authenticate` returns.
+        let pending = if auth_enabled {
+            match pending_limit.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    if warn_once_per_sec() {
+                        warn!(
+                            "pre-auth connection limit {MAX_UNAUTH_CONNECTIONS} reached; refusing"
+                        );
+                    }
+                    drop(incoming);
+                    continue;
+                }
+            }
+        } else {
+            None
         };
         let allow_private = c.allow_private;
         let auth_token = auth_token.clone();
@@ -211,6 +287,9 @@ async fn main() -> Result<()> {
                 conn.close(0x01u32.into(), b"unauthorized");
                 return;
             }
+            // Authentication done: free the pre-auth slot so other new peers
+            // can handshake while this connection lives on.
+            drop(pending);
             if let Err(e) = handle_conn(conn, allow_private).await {
                 warn!("conn end: {e:#}");
             }
@@ -278,10 +357,15 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 Ok(d) => d,
                 Err(_) => break,
             };
+            // Keep an owned handle so the payload can be handed to the send
+            // path as a zero-copy `Bytes::slice` (instead of a per-packet
+            // copy) even after `decode_datagram_ref` borrowed `d`.
+            let owned = d.clone();
             let (s, addr, payload) = match decode_datagram_ref(&d) {
                 Ok(x) => x,
                 Err(_) => continue,
             };
+            let payload_off = owned.len() - payload.len();
             match addr {
                 TargetAddrRef::Ip(dst) => {
                     if !allow_private && !is_global_ip(dst.ip()) {
@@ -294,7 +378,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     // Non-blocking send with bounded detached fallback: a full
                     // target buffer must never stall the single per-connection
                     // datagram reader (UDP loss is acceptable).
-                    udp_try_send(&sock, map_for_dual(dst), payload);
+                    udp_try_send_owned(&sock, map_for_dual(dst), owned.slice(payload_off..));
                 }
                 TargetAddrRef::Domain(h, p) => {
                     // Fast path: cached DNS avoids a per-packet spawn; a fresh
@@ -311,7 +395,11 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 Some(v) => v,
                                 None => continue,
                             };
-                            udp_try_send(&sock, map_for_dual(dst), payload);
+                            udp_try_send_owned(
+                                &sock,
+                                map_for_dual(dst),
+                                owned.slice(payload_off..),
+                            );
                         }
                         CachedLookup::Unknown => {
                             let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
@@ -320,25 +408,26 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             };
                             let ss = ss.clone();
                             let cd = cd.clone();
-                            let payload = Bytes::copy_from_slice(payload);
+                            let payload = owned.slice(payload_off..);
                             let host = h.to_string();
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 let dst = match resolve_all_cached(&host, p).await {
-                                    Ok(v) => match v.into_iter().next() {
+                                    Ok(v) => match v
+                                        .iter()
+                                        .copied()
+                                        .find(|a| allow_private || is_global_ip(a.ip()))
+                                    {
                                         Some(v) => v,
                                         None => return,
                                     },
                                     Err(_) => return,
                                 };
-                                if !allow_private && !is_global_ip(dst.ip()) {
-                                    return;
-                                }
                                 let sock = match get_or_create_sess(&ss, &cd, s).await {
                                     Some(v) => v,
                                     None => return,
                                 };
-                                udp_try_send(&sock, map_for_dual(dst), &payload);
+                                udp_try_send_owned(&sock, map_for_dual(dst), payload);
                             });
                         }
                     }
@@ -397,7 +486,10 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             return;
                         }
                     };
-                    let v = resolve_all_cached(h, *p).await.unwrap_or_default();
+                    let v = match resolve_all_cached(h, *p).await {
+                        Ok(v) => v.iter().copied().collect::<Vec<_>>(),
+                        Err(_) => Vec::new(),
+                    };
                     drop(permit);
                     v
                 }
@@ -425,7 +517,16 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             };
             drop(_dial_permit);
             let _ = tcp.set_nodelay(true);
-            if send.write_all(&[MQP_TCP_ACK]).await.is_err() {
+            // MQP-2: report the bound address of the dialed socket so the
+            // client can answer SOCKS with the real BND.ADDR/PORT (RFC 1928)
+            // instead of a placeholder.
+            let bnd = tcp
+                .local_addr()
+                .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+            let mut ack = Vec::with_capacity(20);
+            ack.push(MQP_TCP_ACK);
+            encode_bnd_addr(bnd, &mut ack);
+            if send.write_all(&ack).await.is_err() {
                 return;
             }
             let _ = copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await;
@@ -435,10 +536,10 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
 }
 
 async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<TargetAddr> {
+    // No per-read timeout here: the caller wraps the whole header read in a
+    // single 5s budget, and an inner timeout just registered extra timers.
     async fn rd(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(buf))
-            .await
-            .context("hdr timeout")??;
+        recv.read_exact(buf).await.context("hdr read")?;
         Ok(())
     }
     let mut atyp = [0u8; 1];
@@ -644,21 +745,26 @@ async fn get_or_create_sess(
     let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let last2 = last.clone();
     let h = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut buf = vec![0u8; 2048];
+        // quinn's `max_datagram_size()` takes the connection-state mutex that
+        // the protocol driver also uses; never call it per datagram. 0 means
+        // the peer does not support QUIC DATAGRAM (replies are then dropped).
+        let mut limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
         loop {
-            let (n, src) = match tokio::time::timeout(
-                Duration::from_secs(60),
-                rs.recv_from(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok(x)) => x,
-                Ok(Err(_)) => break,
-                // No inbound reply for 60s: stop if the connection is gone or
-                // only reap when the whole session (including outbound traffic)
-                // is idle. A one-way flow used to be recreated every 180s,
-                // changing its source port/NAT mapping.
-                Err(_) => {
+            let (n, src) = tokio::select! {
+                r = rs.recv_from(&mut buf) => match r {
+                    Ok(x) => x,
+                    // Socket error: exit; the entry is reaped below and the
+                    // next packet for this session recreates it.
+                    Err(_) => break,
+                },
+                // One fixed 60s tick instead of a fresh 60s timeout per
+                // recv_from (which re-registered a timer for every inbound
+                // packet). The reap decision uses the shared last-activity
+                // stamp, so coarse granularity is sufficient.
+                _ = tick.tick() => {
                     if c2.close_reason().is_some()
                         || mono_millis()
                             .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
@@ -666,41 +772,43 @@ async fn get_or_create_sess(
                     {
                         break;
                     }
+                    limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
                     continue;
                 }
             };
             // Inbound replies are liveness too: a long one-way download must
             // not be reaped while it is actively streaming.
             last2.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
-            if n == buf.len() {
+            if n == buf.len() || limit == 0 {
                 continue;
             }
             let src = SocketAddr::new(unmap(src.ip()), src.port());
-            // Cap by the connection's live max datagram size when known.
-            let limit = c2.max_datagram_size().unwrap_or(1350);
-            let d = match encode_datagram_with_limit(
-                s,
-                &TargetAddr::Ip(src),
-                &buf[..n],
-                limit.min(1350),
-            ) {
+            let d = match encode_datagram_with_limit(s, &TargetAddr::Ip(src), &buf[..n], limit) {
                 Some(d) => d,
                 None => continue,
             };
-            if c2.send_datagram(d).is_err() {
-                if c2.close_reason().is_some() {
-                    break;
+            // quinn's `send_datagram` does NOT return Blocked when its buffer
+            // is full: it silently drops the oldest queued datagram instead.
+            // Any Err therefore means the connection/datagram path is dead.
+            match c2.send_datagram(d) {
+                Ok(()) => {}
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    // Path MTU shrank: refresh once, drop this packet.
+                    limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
                 }
-                continue;
+                Err(quinn::SendDatagramError::ConnectionLost(_))
+                | Err(quinn::SendDatagramError::UnsupportedByPeer)
+                | Err(quinn::SendDatagramError::Disabled) => break,
             }
         }
-        // Self-reap: task exit removes the zombie entry instead of waiting 180s.
+        // Self-reap: task exit removes the zombie entry (and releases its
+        // permit) instead of waiting for the 60s sweeper. Do NOT abort our own
+        // JoinHandle: this task is already exiting and abort() has no effect
+        // until an await point that no longer exists.
         let mut w = lock_write(&ss2);
         if let Some((cur, _, _, _)) = w.get(&s) {
             if Arc::ptr_eq(cur, &rs) {
-                if let Some((_, hh, _, _)) = w.remove(&s) {
-                    hh.abort();
-                }
+                w.remove(&s);
             }
         }
     });
@@ -712,9 +820,7 @@ async fn get_or_create_sess(
         .map(|(_, hh, _, _)| hh.is_finished())
         .unwrap_or(false)
     {
-        if let Some((_, hh, _, _)) = w.remove(&s) {
-            hh.abort();
-        }
+        w.remove(&s);
     }
     Some(sock)
 }

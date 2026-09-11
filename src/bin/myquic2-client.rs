@@ -24,8 +24,13 @@ type SharedConn = Arc<RwLock<Option<quinn::Connection>>>;
 /// 4s TCP connect + scheduling jitter.
 const TCP_DIAL_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the UDP relay may reuse a cached `(connection, PMTU limit)` pair
+/// before re-reading it. Both `close_reason()` and `max_datagram_size()` take
+/// quinn's connection-state mutex, so they must not run per datagram.
+const EGRESS_REFRESH: Duration = Duration::from_secs(1);
+
 /// Process-wide caps on client-side resources. Without these a local or LAN
-/// peer can spawn unbounded tasks / relay sockets (each with 1 MB kernel
+/// peer can spawn unbounded tasks / relay sockets (each with 512 KB kernel
 /// buffers) and exhaust fds and memory on the proxy host.
 const MAX_SOCKS_CONNS: usize = 8192;
 const MAX_UDP_ASSOCS: usize = 4096;
@@ -107,7 +112,10 @@ impl UdpHub {
             if m.contains_key(&s) {
                 continue;
             }
-            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
+            // 256 queued datagrams (~350KB worst case) per association: the
+            // reply task never blocks (udp_try_send), so a deeper queue only
+            // multiplies the worst-case memory across MAX_UDP_ASSOCS.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(256);
             m.insert(s, tx.clone());
             return Some((s, tx, rx));
         }
@@ -135,6 +143,9 @@ async fn main() -> Result<()> {
         .init();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
+    if is_placeholder_token(&c.auth_token) {
+        warn!("auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)");
+    }
     if !parse_congestion(&c.congestion) {
         warn!(
             "unknown congestion={:?}, falling back to bbr (want bbr|cubic)",
@@ -401,7 +412,7 @@ async fn dial_once(
             let accepted_ok = tokio::time::timeout(Duration::from_secs(20), accepted)
                 .await
                 .unwrap_or(false);
-            info!("QUIC resumption: 0-RTT keys accepted={accepted_ok}");
+            tracing::debug!("QUIC resumption: 0-RTT keys accepted={accepted_ok}");
             if needs_auth && (!accepted_ok || early_send_failed) {
                 // Rejected early data discarded the auth stream; re-send it on
                 // the now-established connection so the server does not sit
@@ -456,6 +467,28 @@ async fn wait_conn(
 }
 
 // ---- SOCKS5 (RFC1928, no-auth only) ----
+
+/// Read the MQP-2 TCP-open ACK (status byte + bound address). The server
+/// reports the address its dialed socket was bound to, so the SOCKS success
+/// reply carries the real BND.ADDR/PORT instead of a placeholder.
+async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<SocketAddr> {
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status).await.context("ack read")?;
+    if status[0] != MQP_TCP_ACK {
+        anyhow::bail!("bad mqp ack {:#x}", status[0]);
+    }
+    let mut buf = [0u8; 19];
+    recv.read_exact(&mut buf[..1]).await.context("bnd atyp")?;
+    let n = match buf[0] {
+        0x01 => 7,
+        0x04 => 19,
+        a => anyhow::bail!("bad bnd atyp {a}"),
+    };
+    recv.read_exact(&mut buf[1..n]).await.context("bnd addr")?;
+    let (addr, _) = decode_bnd_addr(&buf[..n])?;
+    Ok(addr)
+}
+
 async fn handle_socks(
     mut s: tokio::net::TcpStream,
     shared: SharedConn,
@@ -491,6 +524,9 @@ async fn handle_socks(
     read_exact_timeout(&mut s, &mut r).await?;
     if r[0] != 0x05 {
         anyhow::bail!("bad req ver");
+    }
+    if r[2] != 0x00 {
+        anyhow::bail!("bad req rsv {:#x}", r[2]);
     }
     let target = match r[1] {
         0x01 => match read_socks_addr(&mut s).await {
@@ -559,24 +595,21 @@ async fn handle_socks(
     let mut hdr = Vec::with_capacity(273);
     target.encode(&mut hdr)?;
     send.write_all(&hdr).await?;
-    // Strict MQP-1 ACK: server must reply exactly MQP_TCP_ACK. No silent
-    // fallback — an old peer's first app byte must never be eaten as an ACK,
-    // and our ACK must never leak into an old peer's app stream (B1).
-    // 7s covers the server-side 4s dial budget plus handshake jitter.
+    // Strict MQP-2 ACK: one status byte (0x00) followed by the server's bound
+    // address for this dial. No silent fallback — an old peer's first app byte
+    // must never be eaten as an ACK, and our ACK must never leak into an old
+    // peer's app stream (B1). TCP_DIAL_ACK_TIMEOUT covers the server-side
+    // header + DNS + dial budget.
+    let server_bnd = match tokio::time::timeout(TCP_DIAL_ACK_TIMEOUT, read_mqp_ack(&mut recv)).await
     {
-        let mut ack = [0u8; 1];
-        let got = tokio::time::timeout(TCP_DIAL_ACK_TIMEOUT, recv.read(&mut ack)).await;
-        let ok = match got {
-            Ok(Ok(Some(1))) => ack[0] == MQP_TCP_ACK,
-            _ => false,
-        };
-        if !ok {
+        Ok(Ok(b)) => b,
+        _ => {
             write_socks_reply(&mut s, 0x04, bnd).await.ok();
             send.reset(0x04u32.into()).ok();
             anyhow::bail!("remote dial refused/timeout/version mismatch");
         }
-    }
-    write_socks_reply(&mut s, 0x00, bnd).await?;
+    };
+    write_socks_reply(&mut s, 0x00, server_bnd).await?;
     let _ = copy_tcp_quic_idle(s, send, recv, Duration::from_secs(300)).await;
     Ok(())
 }
@@ -672,7 +705,8 @@ fn bnd_for(s: &tokio::net::TcpStream) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, local.port()))
 }
 
-async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {    let mut v = vec![0x05, rep, 0x00];
+async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {
+    let mut v = vec![0x05, rep, 0x00];
     match bnd {
         SocketAddr::V4(a) => {
             v.push(0x01);
@@ -698,9 +732,8 @@ async fn handle_udp_associate(
     let (sess, _tx, rx) = match hub.alloc_sess() {
         Some(x) => x,
         None => {
-            let bnd = bnd_for(&tcp).unwrap_or_else(|_| {
-                SocketAddr::new(unmap("127.0.0.1".parse().unwrap()), 0)
-            });
+            let bnd = bnd_for(&tcp)
+                .unwrap_or_else(|_| SocketAddr::new(unmap("127.0.0.1".parse().unwrap()), 0));
             write_socks_reply(&mut tcp, 0x01, bnd).await.ok();
             anyhow::bail!("udp association limit {MAX_UDP_ASSOCS} reached");
         }
@@ -786,7 +819,7 @@ async fn udp_associate_inner(
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     let dst = match resolve_all_cached(&host, p).await {
-                                        Ok(v) => match v.into_iter().next() {
+                                        Ok(v) => match v.first().copied() {
                                             Some(s) => s,
                                             None => return,
                                         },
@@ -807,6 +840,12 @@ async fn udp_associate_inner(
     // relay sockets forever (B6).
     let mut buf = vec![0u8; 2048];
     let idle_limit_ms = 180_000u64;
+    // Cached egress connection + PMTU limit. Re-read from `shared` at most
+    // once per EGRESS_REFRESH (or after a failed send), so the per-packet path
+    // never touches quinn's connection-state mutex for close_reason()/
+    // max_datagram_size().
+    let mut egress: Option<(quinn::Connection, usize, tokio::time::Instant)> = None;
+    let mut warned_no_datagram = false;
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
     // not reset the idle timer and keep an otherwise dead association alive.
     let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
@@ -839,7 +878,9 @@ async fn udp_associate_inner(
                 if let Ok(mut w) = last_app_w.write() {
                     *w = Some(app);
                 }
-                if n < 4 || buf[2] != 0x00 { continue; }
+                if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
+                    continue;
+                }
                 // Single decode: reuse header length for the payload offset.
                 let (addr, hdr_len) = match TargetAddrRef::decode(&buf[3..n]) {
                     Ok((a, n)) => (a, n),
@@ -849,26 +890,50 @@ async fn udp_associate_inner(
                 if payload_off > n { continue; }
                 let payload = &buf[payload_off..n];
                 // Fast path: never stall the relay loop behind a reconnect
-                // wait; drop this packet if no live connection exists.
-                // `try_read` keeps the per-packet path lock-syscall free in
-                // the common case; only a concurrent swap pays the async wait.
-                let conn = match shared.try_read() {
-                    Ok(g) => g.clone().filter(|c| c.close_reason().is_none()),
-                    Err(_) => {
-                        let g = shared.read().await;
-                        g.clone().filter(|c| c.close_reason().is_none())
-                    }
+                // wait; drop this packet if no live egress exists. Both
+                // `close_reason()` and `max_datagram_size()` lock the same
+                // connection state as the protocol driver, so they are
+                // refreshed at most once per second (or on send failure).
+                let now_c = tokio::time::Instant::now();
+                let stale = egress
+                    .as_ref()
+                    .map(|(_, _, t)| now_c.duration_since(*t) >= EGRESS_REFRESH)
+                    .unwrap_or(true);
+                if stale {
+                    let g = match shared.try_read() {
+                        Ok(g) => g,
+                        Err(_) => shared.read().await,
+                    };
+                    egress = match g.as_ref() {
+                        Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
+                            Some(m) => Some((c.clone(), m.min(1350), now_c)),
+                            None => {
+                                if !warned_no_datagram {
+                                    warned_no_datagram = true;
+                                    warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
+                                }
+                                None
+                            }
+                        },
+                        _ => None,
+                    };
+                }
+                let Some((conn, limit, _)) = egress.as_ref() else {
+                    continue;
                 };
-                let Some(conn) = conn else { continue };
                 // Respect live PMTU: quinn starts at a 1200-byte MTU, so the
                 // old fixed 1350 limit silently dropped datagrams that were
                 // still too large for the current path.
-                let limit = conn.max_datagram_size().unwrap_or(1350).min(1350);
-                let d = match encode_datagram_ref_with_limit(sess, &addr, payload, limit) {
-                    Some(d) => d, None => continue,
+                let d = match encode_datagram_ref_with_limit(sess, &addr, payload, *limit) {
+                    Some(d) => d,
+                    None => continue,
                 };
                 if let Err(e) = conn.send_datagram(d) {
                     tracing::debug!("client datagram send failed: {e}");
+                    // Force a refresh on the next packet: TooLarge means the
+                    // PMTU estimate shrank, ConnectionLost means the handle is
+                    // dead until the reconnect loop installs a new one.
+                    egress = None;
                 }
             }
             _ = tcp.readable() => {

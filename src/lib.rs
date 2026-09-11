@@ -1,4 +1,4 @@
-//! MyQUIC2 common: MQP-1 codec + config + TLS13-fast cert + QUIC transport (BBR/GSO).
+//! MyQUIC2 common: MQP-2 codec + config + TLS13-fast cert + QUIC transport (BBR/GSO).
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-// ---------------- Address codec (MQP-1) ----------------
+// ---------------- Address codec (MQP-2) ----------------
 // wire: atyp u8 | addr | port u16 BE ; atyp: 0x01 v4, 0x04 v6, 0x03 domain
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetAddr {
@@ -146,12 +146,68 @@ impl<'a> TargetAddrRef<'a> {
     }
 }
 
-/// MQP-1 TCP open acknowledgement (server -> client, 1 byte).
+/// ALPN identifier. Bumped to `/2` together with the MQP-2 TCP-open ACK
+/// (status byte + bound address); a version-skewed peer now fails the TLS
+/// handshake with a clear error instead of misparsing the ACK as app data.
+pub const MQP_ALPN: &[u8] = b"myquic2/2";
+
+/// MQP-2 TCP open acknowledgement (server -> client).
+///
+/// `status u8 (0x00) | atyp u8 | addr | port u16 BE` — the bound address is
+/// the server-side socket it dialed the target from, so the client can put the
+/// real BND.ADDR/BND.PORT into its SOCKS5 success reply (RFC 1928).
+///
 /// Both sides must run the same version: the client MUST wait for exactly
 /// this byte and fail the flow otherwise. There is intentionally NO silent
 /// fallback for old peers — falling back would let the first application
 /// byte be mistaken for (or polluted by) the ACK (see B1).
 pub const MQP_TCP_ACK: u8 = 0x00;
+
+/// Encode a bound address for the ACK (no status byte). Datagram/stream
+/// target encoding rejects unspecified addresses; BND may legitimately be
+/// `0.0.0.0:0`, so this is a dedicated encoder that is never used to dial.
+pub fn encode_bnd_addr(addr: SocketAddr, out: &mut Vec<u8>) {
+    match addr {
+        SocketAddr::V4(a) => {
+            out.push(0x01);
+            out.extend_from_slice(&a.ip().octets());
+            out.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            out.push(0x04);
+            out.extend_from_slice(&a.ip().octets());
+            out.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+}
+
+/// Decode the address portion of an ACK (`atyp | addr | port`).
+/// Returns the address and the number of bytes consumed.
+pub fn decode_bnd_addr(b: &[u8]) -> Result<(SocketAddr, usize)> {
+    if b.is_empty() {
+        anyhow::bail!("empty bnd");
+    }
+    match b[0] {
+        0x01 => {
+            if b.len() < 7 {
+                anyhow::bail!("short bnd v4");
+            }
+            let ip = IpAddr::from([b[1], b[2], b[3], b[4]]);
+            let port = u16::from_be_bytes([b[5], b[6]]);
+            Ok((SocketAddr::new(ip, port), 7))
+        }
+        0x04 => {
+            if b.len() < 19 {
+                anyhow::bail!("short bnd v6");
+            }
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b[1..17]);
+            let port = u16::from_be_bytes([b[17], b[18]]);
+            Ok((SocketAddr::new(IpAddr::from(o), port), 19))
+        }
+        a => anyhow::bail!("bad bnd atyp {a}"),
+    }
+}
 
 /// Build a UDP DATAGRAM body: type + sess + addr header + payload.
 /// sess scopes the packet to one UDP ASSOCIATE so concurrent associations sharing
@@ -177,6 +233,9 @@ pub fn encode_datagram_ref_with_limit(
     payload: &[u8],
     limit: usize,
 ) -> Option<Bytes> {
+    // quinn's `send_datagram` takes an owned `Bytes`, so one allocation per
+    // outbound datagram is inherent to the API (the payload copy is the
+    // minimum work); only a buffer pool could remove it.
     let mut v = Vec::with_capacity(40 + payload.len());
     v.push(0x02);
     v.extend_from_slice(&sess.to_le_bytes());
@@ -304,7 +363,13 @@ pub fn server_tls_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
-    cfg.alpn_protocols = vec![b"myquic2/1".to_vec()];
+    cfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+    // rustls' default stateful store holds only 256 sessions; with the 4096
+    // connection cap and 2 tickets per handshake that thrashes, so 0-RTT and
+    // (1-RTT) resumption would silently degrade to full handshakes. Size the
+    // store for the connection cap instead.
+    const TLS_SESSION_CACHE: usize = 8192;
+    cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(TLS_SESSION_CACHE);
     // KEEP rustls' default ticketer (NeverProducesTickets): that selects STATEFUL
     // resumption via the in-memory session store, which is the only mode where
     // rustls accepts 0-RTT early data (RFC8446 8.1 anti-replay rule).
@@ -329,7 +394,7 @@ pub fn client_tls_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"myquic2/1".to_vec()];
+    cfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
     cfg.enable_early_data = true; // allow QUIC 0-RTT on resumption
     Ok(Arc::new(cfg))
 }
@@ -337,6 +402,13 @@ pub fn client_tls_config(
 // ---------------- QUIC transport: BBR + DATAGRAM + keepalive ----------------
 pub fn parse_congestion(name: &str) -> bool {
     name.eq_ignore_ascii_case("cubic") || name.eq_ignore_ascii_case("bbr")
+}
+
+/// Placeholder secrets shipped in the sample configs. Deploying one is
+/// equivalent to an open proxy with a false sense of security, so both
+/// binaries warn when they see it.
+pub fn is_placeholder_token(token: &str) -> bool {
+    matches!(token, "change-me" | "change-me-6b1f0c2d47a9")
 }
 
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
@@ -349,20 +421,28 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
         t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     }
     // GSO/GRO: no flag in quinn API — quinn-udp auto-probes UDP_SEGMENT/UDP_GRO.
-    // Bounded buffers: 4MB datagram buffers cover high-RTT BDP (~3.5MB) while
-    // halving per-connection memory vs 8MB (100 server-side conns ≈ 800MB→400MB).
-    t.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    t.datagram_send_buffer_size(4 * 1024 * 1024);
+    // Datagrams are a lossy best-effort path drained by a dedicated reader, so
+    // 1MB (~740 x 1350B datagrams) absorbs bursts without the per-connection
+    // 4MB x 4096-connection worst case (16GB of queueable user memory).
+    t.datagram_receive_buffer_size(Some(1024 * 1024));
+    t.datagram_send_buffer_size(1024 * 1024);
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
     // 140ms trans-Pacific at 200Mb/s needs ~3.5MB BDP; 4MB per-stream window
     // covers it. The aggregate connection window MUST be set explicitly:
     // quinn's default is VarInt::MAX, which would otherwise allow up to
-    // 1024 streams * 4MB ≈ 4GB of receive buffering per connection (unauthenticated
-    // peers can exploit this). 32MB still covers many parallel fast streams.
+    // 1024 streams * 4MB ≈ 4GB of receive buffering per connection.
+    // 8MB still covers two full-BDP streams (~457Mb/s aggregate at 140ms)
+    // while cutting the per-connection bound: 4096 conns x 8MB = 32GB worst
+    // case for *authenticated* peers, and the server additionally caps
+    // unauthenticated peers at 256 concurrent connections (≈2GB).
     t.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
-    t.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
+    t.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+    // Send side is driven by what *we* read from the target, but a malicious
+    // client can still pin it (dial a fast local service, never read QUIC).
+    // 8MB is required for the 140ms/200Mb/s single-connection case; the
+    // per-connection product is documented in the README limits table.
     t.send_window(8 * 1024 * 1024);
     // Clamp so absurd config values cannot overflow the QUIC VarInt timeout.
     let keep_alive_secs = keep_alive_secs.clamp(1, 3600);
@@ -388,8 +468,8 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
 pub async fn resolve_server_side(host: &str, port: u16) -> Result<SocketAddr> {
     resolve_all_cached(host, port)
         .await?
-        .into_iter()
-        .next()
+        .first()
+        .copied()
         .context("dns empty")
 }
 
@@ -415,7 +495,9 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
 /// look up with the borrowed `&str` form of `HashMap<String, _>` — no `String`
 /// allocation on the per-datagram hot path.
 type DnsCacheKey = String;
-type DnsCacheVal = (Instant, Vec<SocketAddr>);
+/// `Arc<[SocketAddr]>` so cache hits and single-flight waiters clone a
+/// refcount instead of duplicating the address vector.
+type DnsCacheVal = (Instant, Arc<[SocketAddr]>);
 const DNS_KEY_BUF: usize = 255 + 1 + 5;
 
 /// Normalize a DNS name for cache keys: DNS is case-insensitive and an
@@ -523,7 +605,7 @@ struct DnsInflightEntry {
     /// Own copy of the key so the cleanup guard can remove the entry even when
     /// the owner is a takeover task that did not insert it.
     key: DnsCacheKey,
-    cell: tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>,
+    cell: tokio::sync::OnceCell<Result<Arc<[SocketAddr]>, String>>,
     notify: tokio::sync::Notify,
     owner: std::sync::atomic::AtomicBool,
 }
@@ -564,9 +646,8 @@ impl Drop for InflightCleanup<'_> {
 }
 
 fn dns_inflight() -> &'static std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>> {
-    static INF: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>,
-    > = std::sync::OnceLock::new();
+    static INF: std::sync::OnceLock<std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>> =
+        std::sync::OnceLock::new();
     INF.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -578,7 +659,9 @@ pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore
 
 pub fn mono_millis() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    BASE.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Thread-local memo of the most recent lookup, keyed by the *full* normalized
@@ -733,7 +816,7 @@ fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
     }
 }
 
-pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
     // Stack-built key: no allocation on the positive-cache fast path. The
     // fallback only triggers for hosts longer than the 255-byte wire limit.
     let mut kbuf = [0u8; DNS_KEY_BUF];
@@ -830,9 +913,9 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Vec<SocketAddr>
         }
     }
 
-    let r: Result<Vec<SocketAddr>, String> =
+    let r: Result<Arc<[SocketAddr]>, String> =
         match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok(Arc::from(v)),
             Err(e) => Err(format!("{e:#}")),
         };
     let now = Instant::now();
@@ -1045,6 +1128,25 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
     }
 }
 
+/// Same contract as [`udp_try_send`], but the slow path moves an owned
+/// [`Bytes`] into the detached task instead of copying. Callers that already
+/// hold a `Bytes` should pass a cheap `Bytes::slice` of it.
+pub fn udp_try_send_owned(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
+    match sock.try_send_to(&payload, dst) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Ok(permit) = udp_send_limiter().clone().try_acquire_owned() {
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = sock.send_to(&payload, dst).await;
+                });
+            }
+        }
+        Err(e) => tracing::debug!("udp send to {dst} failed: {e}"),
+    }
+}
+
 /// Dual-stack UDP socket (V6ONLY=0 when bound to ::). Buffer enlarged for GSO bursts.
 /// `sess` sockets (per UDP association) should use the small variant to avoid
 /// OOM on routers: 4MB x N sessions of kernel memory adds up fast (P3).
@@ -1052,10 +1154,13 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
     udp_socket_dual_with_size(bind, 4 * 1024 * 1024)
 }
 
-/// Per-session / relay sockets: 1MB is plenty for a single association's
-/// DATAGRAM flow and keeps 100 sessions near ~200MB instead of ~800MB.
+/// Per-session / relay sockets: 512KB per direction is plenty for a single
+/// association's DATAGRAM flow and keeps 100 sessions near ~100MB.
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
-    udp_socket_dual_with_size(bind, 1024 * 1024)
+    // 512KB per direction: burst headroom for a single association while
+    // keeping the global product sane (16384 sessions x ~1MB kernel = 16GB at
+    // the old 1MB/direction; the global session cap is lowered accordingly).
+    udp_socket_dual_with_size(bind, 512 * 1024)
 }
 
 pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::UdpSocket> {
@@ -1099,7 +1204,11 @@ pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::Udp
 fn warn_buf_clamped(which: &str, actual: usize, want: usize) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let sysctl = if which == "send" { "wmem_max" } else { "rmem_max" };
+        let sysctl = if which == "send" {
+            "wmem_max"
+        } else {
+            "rmem_max"
+        };
         tracing::warn!(
             "udp {which} buffer clamped to {actual} (< {want}); raise net.core.{sysctl}; further buffer warnings suppressed"
         );

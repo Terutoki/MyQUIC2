@@ -60,6 +60,21 @@ async fn main() -> anyhow::Result<()> {
             let mut ack = [0u8; 1];
             recv.read_exact(&mut ack).await?;
             assert_eq!(ack[0], 0x00, "server dial refused");
+            // MQP-2: the ACK carries the server's bound address for this dial.
+            let mut atyp = [0u8; 1];
+            recv.read_exact(&mut atyp).await?;
+            let n = match atyp[0] {
+                0x01 => 6,
+                0x04 => 18,
+                a => panic!("bad bnd atyp {a}"),
+            };
+            let mut bnd = Vec::with_capacity(19);
+            bnd.push(atyp[0]);
+            let mut rest = vec![0u8; n];
+            recv.read_exact(&mut rest).await?;
+            bnd.extend_from_slice(&rest);
+            let (bnd, _) = decode_bnd_addr(&bnd)?;
+            println!("conn2: server bound address {bnd}");
             let mut buf = vec![0u8; 13];
             recv.read_exact(&mut buf).await?;
             println!("conn2: 0-RTT echo ok: {:?}", String::from_utf8_lossy(&buf));

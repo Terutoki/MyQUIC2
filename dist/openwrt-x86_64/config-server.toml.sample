@@ -9,4 +9,4 @@ keep_alive_secs = 5
 allow_private = true
 # Shared secret clients must present (set on both sides).
 # Leave empty to disable auth (then rely on firewall/network isolation).
-auth_token = "change-me-6b1f0c2d47a9"
+auth_token = ""
