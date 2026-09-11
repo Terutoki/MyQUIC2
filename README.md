@@ -79,9 +79,10 @@ Single crate, three units sharing one protocol library:
 **Data-plane mapping:**
 
 - **TCP**: 1 TCP connection = 1 QUIC bidirectional stream. First bytes carry the MQP
-  target header; the rest is a raw byte stream. The server answers with the MQP-2
-  dial ACK (status + its bound address) before any application byte flows.
-  `FIN` ↔ QUIC `finish()`, errors ↔ `RESET_STREAM`.
+  target header; the rest is a raw byte stream. The client answers SOCKS success
+  optimistically and the server's MQP-2 dial ACK is validated on the reply path, so
+  application bytes never wait for the remote dial. `FIN` ↔ QUIC `finish()`,
+  dial failure ↔ closed/reset flow.
 - **UDP**: 1 SOCKS association = 1 session id (`sess_id`), carried in QUIC **DATAGRAMs**
   (unreliable, no head-of-line blocking — a lost DNS packet never stalls other flows).
   Each datagram must fit `min(live path max_datagram_size, 1350 B)` including the MQP
@@ -113,18 +114,22 @@ IPv4 total: 7 B. Everything after is raw application bytes (zero overhead).
 ```
 
 The server replies with a status byte plus the address its dialed socket was
-bound to (so the client can answer SOCKS with the real BND.ADDR/BND.PORT):
+bound to:
 
 ```
 0x00 | atyp u8 | addr bytes | port u16 BE
 ```
 
-`0x00` = dial accepted; the client then sends the SOCKS success reply and app
-bytes. Any other outcome is a stream `RESET_STREAM` (`0x01` header timeout, `0x04`
-dial refused/timeout) — the client never mistakes app bytes for the ACK, and the
-ALPN bump means an old peer cannot reach this parse at all. The address is always
-`0x01` IPv4 or `0x04` IPv6 (the server's dialed local socket, never a domain), so
-the ACK is 8 B (IPv4) or 20 B (IPv6) in total.
+`0x00` = dial accepted. The client answers SOCKS success **immediately after writing
+the target header**, before the ACK: waiting for the ACK would serialize the
+application's first bytes behind the remote dial and costs one full client↔server
+RTT on every connection (juicity/Hysteria-class clients answer immediately for the
+same reason). The ACK is consumed by the reply direction; a reset or non-zero status
+(dial refused/timeout) tears the TCP flow down, so a failed dial surfaces as a closed
+connection rather than a SOCKS error code. BND.ADDR/PORT in the SOCKS reply is
+therefore `0.0.0.0:0` (unknown) — the ACK still carries the real bound address and is
+validated. The address is always `0x01` IPv4 or `0x04` IPv6 (the server's dialed
+local socket, never a domain), so the ACK is 8 B (IPv4) or 20 B (IPv6) in total.
 
 ### UDP datagram (each QUIC DATAGRAM)
 
@@ -193,8 +198,9 @@ config sets `true` for LAN testing — turn it off on public exit nodes.
 
 **Replay.** 0-RTT early data is theoretically replayable; rustls's stateful,
 single-use session tickets bound it. The worst case is a duplicated outbound dial or
-UDP datagram (no traffic amplification). TCP application bytes are never sent until
-the server's dial ACK, so replay cannot duplicate an application request.
+UDP datagram (no traffic amplification). TCP application bytes ride the 1-RTT keys
+established by the handshake, so replay cannot duplicate an application request;
+only the auth token in early data is exposed to the theoretical replay window.
 
 **Denial-of-service bounds.** See [Resource Limits & Tuning](#resource-limits--tuning):
 connection/session caps, process-wide TCP dial and per-connection stream limits, DNS
@@ -222,7 +228,7 @@ byte-for-byte; UDP checks the echoed payload and the reply's source address.
 | 2 | TCP ECHO via SOCKS5 `CONNECT` (1 MiB random) | ✅ repeated runs |
 | 3 | UDP ECHO via `UDP ASSOCIATE` (25 × 1000 B) | ✅ repeated runs, BND = relay address |
 | 4 | Server `kill -9` → restart → reconnect → TCP+UDP ECHO | ✅ detects in ~15 s (idle timeout; 20 s watchdog backstop), redial < 0.4 s, kill→usable 17.5 s; a UDP association opened *before* the kill and one opened *during* the outage both self-heal |
-| 5 | MQP-2 ACK: `CONNECT` reply BND.ADDR/PORT = the server's dialed socket address | ✅ e.g. `127.0.0.1:<ephemeral>` (the dialer's local port, not the SOCKS port) |
+| 5 | Optimistic CONNECT: SOCKS success returns without waiting for the remote dial | ✅ blackhole target → reply in 0.1 ms (was ~4 s waiting for the dial ACK); a failed dial closes the flow |
 | 6 | 0-RTT probe with token, same server process | ✅ `accepted=true`, bound address parsed, echo over 0-RTT |
 | 7 | Empty token on both sides (auth disabled) | ✅ TCP+UDP ECHO |
 | 8 | Wrong token | ✅ server logs `auth token mismatch`, client sees SOCKS `0x04`, backoff grows 200 ms→5 s (no redial storm) |
@@ -460,12 +466,12 @@ Against RFC 1928 / RFC 1929:
 |---|---|
 | Handshake, no-auth (`0x00`) | ✅ |
 | `CONNECT`, IPv4/domain/IPv6 | ✅ (curl-verified) |
-| BND.ADDR/BND.PORT for `CONNECT` | ✅ the server's dialed socket address, carried in the MQP-2 ACK |
+| BND.ADDR/BND.PORT for `CONNECT` | ⚠️ `0.0.0.0:0` (unknown): the success reply is sent before the remote dial completes to avoid an extra RTT; the MQP-2 ACK still carries the real bound address and is validated |
 | `UDP ASSOCIATE` + relay + TCP control held | ✅ (`FRAG≠0` dropped, as most implementations do) |
 | BND.ADDR for `UDP ASSOCIATE` | ✅ the proxy's own interface address + relay port (LAN clients work; no longer the app's own address) |
 | Username/password (`0x02`) | ❌ intentionally absent |
 | `BIND` | ❌ replies `0x07` (FTP active mode; obsolete in practice) |
-| Error REPs (`0x01/0x04/0x05`…) | ⚠️ success/dial-refused paths reply correctly (`0x00`/`0x04`); on a missing QUIC connection the TCP flow fails fast (close/RST) instead of sending a SOCKS error code |
+| Error REPs (`0x01/0x04/0x05`…) | ⚠️ success is replied optimistically; a failed remote dial closes the TCP flow (the app reconnects) instead of returning `0x04`. A missing QUIC connection still fails the flow fast |
 | UDP source validation | ⚠️ relay learns the app address from the first packet; fine behind NAT/home use, tighten before public exposure |
 | Association lifetime | ⚠️ idle UDP associations are reaped after 180 s to bound sockets/tasks (RFC has no fixed lifetime) |
 
@@ -489,9 +495,9 @@ Against RFC 1928 / RFC 1929:
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
 - **140 ms links**: tuned for trans-Pacific BDP — 4 MB per-stream / 8 MB aggregate
-  receive window, 8 MB send window, BBR; the SOCKS success reply is sent only after
-  the remote dial ACK (fail-fast), saving a full RTT of error latency per connection;
-  server-side DNS avoids geo-misresolved IPs.
+  receive window, 8 MB send window, BBR; the SOCKS success reply is sent
+  optimistically (no 1-RTT wait for the remote dial), so the application's TLS
+  handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
 
 ---
 
@@ -630,15 +636,26 @@ MyQUIC2/
   datagram when its buffer is full (it never returns `Blocked`), so error
   handling now keys on `TooLarge` / `ConnectionLost` / `UnsupportedByPeer` /
   `Disabled` and comments match reality.
-- **MQP-2.** The TCP-open ACK carries the server's dialed bound address, so
-  `CONNECT` replies expose the real BND.ADDR/PORT; ALPN is bumped to `myquic2/2`
-  so version-skewed peers fail closed at the handshake instead of misparsing.
+- **MQP-2.** The TCP-open ACK carries the server's dialed bound address and ALPN is
+  bumped to `myquic2/2`, so version-skewed peers fail closed at the handshake instead
+  of misparsing the ACK. *(Superseded in pass 4: the SOCKS reply is now optimistic and
+  BND.ADDR for `CONNECT` is `0.0.0.0:0`.)*
 - **Misc.** SOCKS5 RSV fields validated on requests and UDP headers; token
   comparison no longer leaks length; DNS cache values are `Arc<[SocketAddr]>`
   (O(1) cache-hit clones); the server header reader no longer stacks a second
   timeout per field; cert/key pairs are never partially regenerated (a missing
   half is a hard error); samples ship an empty token with a startup warning for
   placeholder secrets; `cargo fmt` clean.
+
+### 2026-09 hardening pass 4
+
+- **Latency parity with juicity/Hysteria-class clients.** The SOCKS success reply
+  is no longer gated on the MQP-2 dial ACK: the client answers immediately after
+  writing the target header and consumes the ACK on the reply direction. That
+  removes one client↔server RTT from every TCP connection (verified: a blackhole
+  target gets its SOCKS success in 0.1 ms instead of waiting out the ~4 s dial
+  budget). A failed dial now closes the TCP flow; BND.ADDR for `CONNECT` is
+  `0.0.0.0:0` because the reply precedes the dial result.
 
 ---
 

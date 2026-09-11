@@ -1234,6 +1234,28 @@ pub fn tcp_listener_dual(bind: &str) -> Result<std::net::TcpListener> {
     Ok(s.into())
 }
 
+/// Consume the MQP-2 TCP-open ACK (`0x00 | atyp | addr | port`). A non-zero
+/// status, a malformed address, or a stream reset (dial refused/timeout) is an
+/// error. Used by the optimistic client reply path, which has already answered
+/// SOCKS before this runs.
+async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status).await.context("ack read")?;
+    if status[0] != MQP_TCP_ACK {
+        anyhow::bail!("bad mqp ack {:#x}", status[0]);
+    }
+    let mut buf = [0u8; 19];
+    recv.read_exact(&mut buf[..1]).await.context("bnd atyp")?;
+    let n = match buf[0] {
+        0x01 => 7,
+        0x04 => 19,
+        a => anyhow::bail!("bad bnd atyp {a}"),
+    };
+    recv.read_exact(&mut buf[1..n]).await.context("bnd addr")?;
+    decode_bnd_addr(&buf[..n])?;
+    Ok(())
+}
+
 /// Bidirectional copy between TCP and QUIC stream halves.
 /// Half-closes propagate in both directions so neither side hangs waiting
 /// for EOF after the peer already finished.
@@ -1246,7 +1268,7 @@ pub async fn copy_tcp_quic(
     send: quinn::SendStream,
     recv: quinn::RecvStream,
 ) -> Result<(u64, u64)> {
-    copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(u32::MAX as u64)).await
+    copy_tcp_quic_inner(tcp, send, recv, Duration::from_secs(u32::MAX as u64), None).await
 }
 
 /// Same as [`copy_tcp_quic`] but bounds idle keep-alive streams: if no bytes
@@ -1256,9 +1278,35 @@ pub async fn copy_tcp_quic(
 /// on any directional failure so the peer never hangs.
 pub async fn copy_tcp_quic_idle(
     tcp: tokio::net::TcpStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    idle: Duration,
+) -> Result<(u64, u64)> {
+    copy_tcp_quic_inner(tcp, send, recv, idle, None).await
+}
+
+/// Like [`copy_tcp_quic_idle`], but the QUIC→TCP direction first consumes the
+/// MQP-2 dial acknowledgement (status + bound address). The caller is expected
+/// to have already answered SOCKS optimistically: a failed or timed-out ACK
+/// tears the TCP flow down so the application sees the failure instead of
+/// hanging. The TCP→QUIC direction is NOT gated on the ACK, which saves one
+/// client↔server RTT on every connection.
+pub async fn copy_tcp_quic_acked(
+    tcp: tokio::net::TcpStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    idle: Duration,
+    ack_timeout: Duration,
+) -> Result<(u64, u64)> {
+    copy_tcp_quic_inner(tcp, send, recv, idle, Some(ack_timeout)).await
+}
+
+async fn copy_tcp_quic_inner(
+    tcp: tokio::net::TcpStream,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     idle: Duration,
+    ack: Option<Duration>,
 ) -> Result<(u64, u64)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1314,6 +1362,22 @@ pub async fn copy_tcp_quic_idle(
         let mut buf = vec![0u8; 32 * 1024];
         let mut total = 0u64;
         let mut chunks = 0u64;
+        // Optimistic SOCKS replies have already told the application the
+        // connection is up, so the MQP-2 dial ACK only gates the reply
+        // direction here. A failure means the remote dial failed (or the
+        // server never acked); tear the TCP flow down so the app fails fast.
+        if let Some(t) = ack {
+            let ok = matches!(
+                tokio::time::timeout(t, read_mqp_ack(&mut recv)).await,
+                Ok(Ok(()))
+            );
+            if !ok {
+                tw.shutdown().await.ok();
+                return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                    "remote dial failed or MQP ack timed out"
+                ));
+            }
+        }
         loop {
             let n = match recv.read(&mut buf).await {
                 Ok(Some(0)) | Ok(None) => break,

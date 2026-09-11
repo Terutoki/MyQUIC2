@@ -4,7 +4,12 @@ use bytes::Bytes;
 use clap::Parser;
 use myquic2::*;
 use quinn::Runtime;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{watch, RwLock},
@@ -468,27 +473,6 @@ async fn wait_conn(
 
 // ---- SOCKS5 (RFC1928, no-auth only) ----
 
-/// Read the MQP-2 TCP-open ACK (status byte + bound address). The server
-/// reports the address its dialed socket was bound to, so the SOCKS success
-/// reply carries the real BND.ADDR/PORT instead of a placeholder.
-async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<SocketAddr> {
-    let mut status = [0u8; 1];
-    recv.read_exact(&mut status).await.context("ack read")?;
-    if status[0] != MQP_TCP_ACK {
-        anyhow::bail!("bad mqp ack {:#x}", status[0]);
-    }
-    let mut buf = [0u8; 19];
-    recv.read_exact(&mut buf[..1]).await.context("bnd atyp")?;
-    let n = match buf[0] {
-        0x01 => 7,
-        0x04 => 19,
-        a => anyhow::bail!("bad bnd atyp {a}"),
-    };
-    recv.read_exact(&mut buf[1..n]).await.context("bnd addr")?;
-    let (addr, _) = decode_bnd_addr(&buf[..n])?;
-    Ok(addr)
-}
-
 async fn handle_socks(
     mut s: tokio::net::TcpStream,
     shared: SharedConn,
@@ -570,47 +554,48 @@ async fn handle_socks(
             return Err(e);
         }
     };
-    let (mut send, mut recv) =
-        match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await {
-            Ok(Ok(x)) => x,
-            _ => {
-                if conn.close_reason().is_some() {
-                    let stale = shared
-                        .read()
-                        .await
-                        .as_ref()
-                        .map(|cur| cur.stable_id() == conn.stable_id())
-                        .unwrap_or(false);
-                    if stale {
-                        *shared.write().await = None;
-                        bump_gen(&gen_tx);
-                    }
-                    write_socks_reply(&mut s, 0x04, bnd).await.ok();
-                    anyhow::bail!("quic connection dead, retry");
+    let (mut send, recv) = match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await
+    {
+        Ok(Ok(x)) => x,
+        _ => {
+            if conn.close_reason().is_some() {
+                let stale = shared
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|cur| cur.stable_id() == conn.stable_id())
+                    .unwrap_or(false);
+                if stale {
+                    *shared.write().await = None;
+                    bump_gen(&gen_tx);
                 }
-                write_socks_reply(&mut s, 0x01, bnd).await.ok();
-                anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
+                write_socks_reply(&mut s, 0x04, bnd).await.ok();
+                anyhow::bail!("quic connection dead, retry");
             }
-        };
+            write_socks_reply(&mut s, 0x01, bnd).await.ok();
+            anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
+        }
+    };
     let mut hdr = Vec::with_capacity(273);
     target.encode(&mut hdr)?;
     send.write_all(&hdr).await?;
-    // Strict MQP-2 ACK: one status byte (0x00) followed by the server's bound
-    // address for this dial. No silent fallback — an old peer's first app byte
-    // must never be eaten as an ACK, and our ACK must never leak into an old
-    // peer's app stream (B1). TCP_DIAL_ACK_TIMEOUT covers the server-side
-    // header + DNS + dial budget.
-    let server_bnd = match tokio::time::timeout(TCP_DIAL_ACK_TIMEOUT, read_mqp_ack(&mut recv)).await
-    {
-        Ok(Ok(b)) => b,
-        _ => {
-            write_socks_reply(&mut s, 0x04, bnd).await.ok();
-            send.reset(0x04u32.into()).ok();
-            anyhow::bail!("remote dial refused/timeout/version mismatch");
-        }
-    };
-    write_socks_reply(&mut s, 0x00, server_bnd).await?;
-    let _ = copy_tcp_quic_idle(s, send, recv, Duration::from_secs(300)).await;
+    // Optimistic SOCKS success: the application's first bytes must not be
+    // serialized behind the server-side dial. Waiting for the MQP-2 ACK here
+    // costs one full client<->server RTT on every connection (Hysteria/
+    // juicity-class clients answer immediately for exactly this reason).
+    // BND.ADDR is unknown at this point, so report 0.0.0.0:0 (the conventional
+    // "not available" value); the ACK is consumed by the reply direction and a
+    // failed dial tears the TCP flow down instead of returning a SOCKS error.
+    let unknown = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    write_socks_reply(&mut s, 0x00, unknown).await?;
+    let _ = copy_tcp_quic_acked(
+        s,
+        send,
+        recv,
+        Duration::from_secs(300),
+        TCP_DIAL_ACK_TIMEOUT,
+    )
+    .await;
     Ok(())
 }
 
