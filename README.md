@@ -862,6 +862,33 @@ quinn; the changes above remove everything the application was adding *on top* o
 same applies to the second allocation quinn itself performs per received datagram when it
 copies the frame out of its packet buffer.
 
+### 2026-09 hardening pass 7 — reconnect race + DNS overload paths
+
+- **Client `shared` TOCTOU.** The `open_bi` failure path did read-then-write
+  (`read` the `stable_id`, drop, `write` `None`): a reconnect installing a fresh
+  connection in between was unconditionally cleared, blackholing new flows until
+  that connection died. It now takes a single write lock and re-checks
+  `stable_id` inside, matching the reconnect loop's own clear path.
+- **DNS eviction no longer scans under the write lock.** `evict_if_needed` did a
+  full O(n) collect + `select_nth_unstable` plus per-victim key clones, and the
+  negative cache did an O(n) `retain`, both while holding the global write lock —
+  stalling every packet-path reader during a miss storm. Both now evict
+  arbitrary entries in O(over)/O(1) with no clock reads; expired entries are
+  still treated as misses by the TTL check on read, so correctness is unchanged.
+- **TCP domain dials fail fast when the DNS budget is gone.** They waited up to
+  3 s for `dns_slow_path_limiter` while holding a `stream_task_limiter` permit,
+  so a unique-domain flood parked up to `MAX_STREAM_TASKS` permits and starved
+  IP-literal flows. They now use `try_acquire` like the UDP path; the client
+  retries a reset stream.
+
+Verified: `cargo test` (19 tests), `cargo clippy --all-targets` and `cargo fmt
+--check` clean; end-to-end TCP `CONNECT` (IP + `localhost` domain targets) and
+UDP `ASSOCIATE`, plus `kill -9` → restart reconnect (~20 s silent-path
+detection, stale-ticket redials, then TCP+UDP self-heal).
+
+- **Rebuilt release binaries.** `dist/openwrt-x86_64/` was rebuilt from this
+  revision for all four CPU levels (v1–v4: static musl, x86-64, stripped).
+  Re-copy them to the router; the fix is server- and client-side.
 
 ---
 
@@ -880,6 +907,7 @@ copies the frame out of its packet buffer.
 - [x] Remove the quinn-proto DATAGRAM drop-oldest process abort (`try_send_datagram`)
 - [x] Per-flow allocation on the TCP-open path (stack-buffer header, borrowed dial candidates)
 - [x] Per-packet allocation / lock / clock-read audit of the UDP and stream paths (pass 6)
+- [x] Reconnect `shared` TOCTOU + DNS overload-path write-lock stalls (pass 7)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [ ] Pin the quinn-proto patch release once the upstream DATAGRAM accounting fix lands

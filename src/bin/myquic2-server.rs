@@ -484,17 +484,15 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     std::slice::from_ref(&ip_cand)
                 }
                 TargetAddr::Domain(h, p) => {
-                    // TCP dials share the same global slow-path budget as UDP:
-                    // without it a flood of unique domains would spawn
-                    // unbounded blocking DNS lookups.
-                    let permit = match tokio::time::timeout(
-                        Duration::from_secs(3),
-                        dns_slow_path_limiter().clone().acquire_owned(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(p)) => p,
-                        _ => {
+                    // Fail fast when the global slow-path budget is exhausted
+                    // instead of parking this stream task (and its
+                    // stream-task permit) in a 3s queue: a unique-domain
+                    // flood would otherwise hold up to MAX_STREAM_TASKS
+                    // permits while IP-literal flows starve behind them.
+                    // Matches the UDP path's try_acquire; the client retries.
+                    let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
                             send.reset(0x04u32.into()).ok();
                             return;
                         }

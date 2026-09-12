@@ -633,15 +633,19 @@ async fn handle_socks(
         Ok(Ok(x)) => x,
         _ => {
             if conn.close_reason().is_some() {
-                let stale = shared
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|cur| cur.stable_id() == conn.stable_id())
-                    .unwrap_or(false);
-                if stale {
-                    *shared.write().await = None;
-                    bump_gen(&gen_tx);
+                // Single write lock with re-check (no read-then-write split):
+                // a reconnect may install a fresh connection between a read
+                // and a later write, and clearing unconditionally would
+                // blackhole the new connection until it dies. Matches the
+                // reconnect loop's own clear path.
+                {
+                    let mut w = shared.write().await;
+                    if let Some(cur) = w.as_ref() {
+                        if cur.stable_id() == conn.stable_id() {
+                            *w = None;
+                            bump_gen(&gen_tx);
+                        }
+                    }
                 }
                 write_socks_reply(&mut s, 0x04, bnd).await.ok();
                 anyhow::bail!("quic connection dead, retry");

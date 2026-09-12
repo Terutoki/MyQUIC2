@@ -929,37 +929,25 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 
 const DNS_CACHE_MAX: usize = 4096;
 
-/// Batch eviction: once the table crosses the cap, drop enough entries in one
-/// pass to cover the whole overflow, then leave the next few hundred inserts
-/// alone. Evicting exactly one entry per insert forced a full O(n) scan — plus
-/// for the multi-victim case a collect + sort of the entire table — *while
-/// holding the write lock*, i.e. stalling every DNS reader on the packet fast
-/// path. Work is now proportional to how far past the cap the table actually
-/// is, amortized over the batch.
+/// Batch eviction with a bounded write-lock hold: once the table crosses the
+/// cap, drop enough entries in one pass to cover the whole overflow, then
+/// leave the next few hundred inserts alone. Eviction is arbitrary (hash
+/// order) rather than oldest-first on purpose: oldest-first needed a full
+/// O(n) collect + `select_nth_unstable` plus per-victim key clones *while
+/// holding the write lock*, stalling every DNS reader on the packet fast
+/// path during a miss storm. Expired entries need no eager `retain` either:
+/// reads already treat them as misses via the TTL check, so they just wait
+/// for arbitrary eviction. Work per call is O(over) clones + removes.
 fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
     const SLACK: usize = 512;
     if m.len() <= DNS_CACHE_MAX + SLACK {
         return;
     }
-    // Cheap first pass: force-expired entries cost one retain and nothing else.
-    m.retain(|_, (t, _)| t.elapsed() < DNS_CACHE_TTL);
     let over = m.len().saturating_sub(DNS_CACHE_MAX);
     if over == 0 {
         return;
     }
-    // Evict oldest-first so a burst of inserts cannot immediately discard the
-    // entries that were just refreshed. `select_nth_unstable` partitions the
-    // victims to the front in O(n) instead of sorting the whole table just to
-    // keep the oldest `over` — with `over` bounded by the batch above this is
-    // the only unbounded part left, and it is now O(n) with no key clones
-    // until after the partition.
-    let mut entries: Vec<(&DnsCacheKey, Instant)> = m.iter().map(|(k, (t, _))| (k, *t)).collect();
-    let victims: Vec<DnsCacheKey> = if over >= entries.len() {
-        entries.drain(..).map(|(k, _)| k.clone()).collect()
-    } else {
-        entries.select_nth_unstable_by_key(over, |(_, t)| *t);
-        entries[..over].iter().map(|(k, _)| (*k).clone()).collect()
-    };
+    let victims: Vec<DnsCacheKey> = m.keys().take(over).cloned().collect();
     for k in victims {
         m.remove(&k);
     }
@@ -1087,8 +1075,15 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         Err(_) => {
             {
                 let mut n = lock_write(dns_neg_cache());
+                // Bounded hold: evict one arbitrary entry instead of a full
+                // O(n) `retain` scan under the write lock. Expired entries
+                // are already treated as misses by the TTL check on read,
+                // so eager reaping buys nothing while stalling every packet
+                // path reader during a failing-domain flood.
                 if n.len() >= DNS_NEG_MAX {
-                    n.retain(|_, t| t.elapsed() < DNS_NEG_TTL);
+                    if let Some(k) = n.keys().next().cloned() {
+                        n.remove(&k);
+                    }
                 }
                 if n.len() < DNS_NEG_MAX {
                     n.insert(key.to_owned(), now);
