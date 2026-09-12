@@ -65,7 +65,7 @@ re-verified end-to-end on this revision — see
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
-| **High-RTT tuned** | 4 MB per-stream window, 8 MB aggregate receive window, 8 MB send window — sized for ~140 ms trans-Pacific BDP |
+| **High-RTT tuned** | 2 MB per-stream window, 8 MB aggregate receive window, 4 MB send window — halved in the gaps-death hardening pass (bounds in-flight bytes so burst loss can't flood the receiver's reassembly); covers ~114 Mb/s single-stream at ~140 ms |
 | **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each (rebuilt from this revision) |
 
 ---
@@ -464,8 +464,8 @@ All limits are constants in the sources; the table shows where to change them.
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
 | Receive window (aggregate) | 8 MB/connection | `build_transport` |
-| Receive window (per stream) | 4 MB | `build_transport` |
-| Send window | 8 MB/connection | `build_transport` |
+| Receive window (per stream) | 2 MB | `build_transport` |
+| Send window | 4 MB/connection | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
 | Server auth wait | 5 s per connection (one deadline for accept+read) | `authenticate()` |
@@ -533,8 +533,8 @@ Against RFC 1928 / RFC 1929:
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for trans-Pacific BDP — 4 MB per-stream / 8 MB aggregate
-  receive window, 8 MB send window, BBR; the SOCKS success reply is sent
+- **140 ms links**: tuned for trans-Pacific BDP — 2 MB per-stream / 8 MB aggregate
+  receive window, 4 MB send window, BBR; the SOCKS success reply is sent
   optimistically (no 1-RTT wait for the remote dial), so the application's TLS
   handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
 

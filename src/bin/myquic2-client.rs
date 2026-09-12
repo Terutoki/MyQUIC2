@@ -666,14 +666,31 @@ async fn handle_socks(
     // failed dial tears the TCP flow down instead of returning a SOCKS error.
     let unknown = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     write_socks_reply(&mut s, 0x00, unknown).await?;
-    let _ = copy_tcp_quic_acked(
+    match copy_tcp_quic_acked(
         s,
         send,
         recv,
         Duration::from_secs(300),
         TCP_DIAL_ACK_TIMEOUT,
     )
-    .await;
+    .await
+    {
+        Ok((up, down)) => {
+            tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
+        }
+        Err(e) => {
+            // Abnormal ends already RST the TCP flow inside the pump; log the
+            // path snapshot so loss-driven kills are diagnosable in one line.
+            let st = conn.stats();
+            tracing::warn!(
+                "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
+                st.path.rtt,
+                st.path.cwnd,
+                st.path.lost_packets,
+                st.path.sent_packets,
+            );
+        }
+    }
     Ok(())
 }
 

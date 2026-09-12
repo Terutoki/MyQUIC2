@@ -537,21 +537,30 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
-    // 140ms trans-Pacific at 200Mb/s needs ~3.5MB BDP; 4MB per-stream window
-    // covers it. The aggregate connection window MUST be set explicitly:
+    // Window sizing (2026-09 gaps-death hardening): per-stream and send
+    // windows sit deliberately BELOW the trans-Pacific BDP optimum.
+    // Rationale, measured on a 250ms/2%-loss WAN: quinn kills the whole
+    // connection once a single stream's reassembly passes 1024 gaps, and the
+    // fuel for that is in-flight bytes (burst loss -> ghost retransmits ->
+    // duplicate entries; ordered mode never dedups). Halving both windows
+    // took retransmission amplification from 9x to ~1x and deaths from 3/3
+    // runs to 0, with loopback throughput unchanged. 2MB still covers
+    // ~114Mb/s single-stream at 140ms and 4MB send covers ~228Mb/s;
+    // multi-stream aggregate is unaffected (8MB connection window).
+    // The aggregate connection window MUST be set explicitly:
     // quinn's default is VarInt::MAX, which would otherwise allow up to
-    // 1024 streams * 4MB ≈ 4GB of receive buffering per connection.
-    // 8MB still covers two full-BDP streams (~457Mb/s aggregate at 140ms)
-    // while cutting the per-connection bound: 4096 conns x 8MB = 32GB worst
-    // case for *authenticated* peers, and the server additionally caps
+    // 1024 streams * 2MB ≈ 2GB of receive buffering per connection.
+    // 8MB still covers ~457Mb/s aggregate at 140ms while cutting the
+    // per-connection bound: 4096 conns x 8MB = 32GB worst case for
+    // *authenticated* peers, and the server additionally caps
     // unauthenticated peers at 256 concurrent connections (≈2GB).
-    t.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
+    t.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
     t.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
     // Send side is driven by what *we* read from the target, but a malicious
     // client can still pin it (dial a fast local service, never read QUIC).
-    // 8MB is required for the 140ms/200Mb/s single-connection case; the
-    // per-connection product is documented in the README limits table.
-    t.send_window(8 * 1024 * 1024);
+    // Capped at 4MB (see window rationale above); the per-connection product
+    // is documented in the README limits table.
+    t.send_window(4 * 1024 * 1024);
     // Clamp so absurd config values cannot overflow the QUIC VarInt timeout.
     let keep_alive_secs = keep_alive_secs.clamp(1, 3600);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs)));
@@ -1492,6 +1501,11 @@ async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
 /// Half-closes propagate in both directions so neither side hangs waiting
 /// for EOF after the peer already finished.
 ///
+/// Contract: `Ok` means both halves reached clean EOF (TCP closed with FIN);
+/// `Err` means at least one direction failed, in which case the TCP socket
+/// was aborted with RST so the application sees an explicit failure instead
+/// of a truncated-but-clean transfer.
+///
 /// Delegates to [`copy_tcp_quic_idle`] with an effectively unbounded idle
 /// window; the direct `join!` implementation this used to have could hang
 /// forever when one direction failed while the other stayed blocked.
@@ -1508,6 +1522,7 @@ pub async fn copy_tcp_quic(
 /// error is returned so the per-connection task can exit (B7).
 /// Uses monotonic `Instant` (never wall-clock) and resets the QUIC stream
 /// on any directional failure so the peer never hangs.
+/// The TCP socket is RST (not FIN) on the idle timeout, like any abnormal end.
 pub async fn copy_tcp_quic_idle(
     tcp: tokio::net::TcpStream,
     send: quinn::SendStream,
@@ -1521,7 +1536,7 @@ pub async fn copy_tcp_quic_idle(
 /// MQP-2 dial acknowledgement (status + bound address). The caller is expected
 /// to have already answered SOCKS optimistically: a failed or timed-out ACK
 /// tears the TCP flow down so the application sees the failure instead of
-/// hanging. The TCP→QUIC direction is NOT gated on the ACK, which saves one
+/// hanging (aborted with RST, never a FIN posing as an empty reply). The TCP→QUIC direction is NOT gated on the ACK, which saves one
 /// client↔server RTT on every connection.
 pub async fn copy_tcp_quic_acked(
     tcp: tokio::net::TcpStream,
@@ -1614,7 +1629,7 @@ fn touch_stamp(
 }
 
 async fn copy_tcp_quic_inner(
-    tcp: tokio::net::TcpStream,
+    mut tcp: tokio::net::TcpStream,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     idle: Duration,
@@ -1625,133 +1640,190 @@ async fn copy_tcp_quic_inner(
     // Monotonic base: all timestamps are ms since here, immune to NTP/wall jumps.
     let base = tokio::time::Instant::now();
     let last_ms = Arc::new(AtomicU64::new(0));
-    let (mut tr, mut tw) = tcp.into_split();
+    // Borrowed halves: `tcp` itself stays owned here so the final disposition
+    // (graceful FIN on clean EOF, RST on any abnormal end) is decided in one
+    // place after both directions settle, instead of each direction racing to
+    // shut the socket down on its own.
+    let (mut tr, mut tw) = tcp.split();
     let l1 = last_ms.clone();
     let l2 = last_ms.clone();
     let b1 = base;
     let b2 = base;
-    let c2s = async move {
-        let mut buf = CopyBuf::take();
-        let mut total = 0u64;
-        let mut chunks = 0u64;
-        let mut stamped = 0u64;
-        loop {
-            let n = match tr.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
+    // Scope the pump futures: everything borrowing `tcp` ends at the block
+    // end, so the final disposition below owns it outright.
+    let outcome: Result<(u64, u64)> = {
+        let c2s = async move {
+            let mut buf = CopyBuf::take();
+            let mut total = 0u64;
+            let mut chunks = 0u64;
+            let mut stamped = 0u64;
+            loop {
+                let n = match tr.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        send.reset(0x04u32.into()).ok();
+                        return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                            "tcp>quic tcp read failed after {total}B up: {e:#}"
+                        ));
+                    }
+                };
+                if let Err(e) = send.write_all(&buf[..n]).await {
                     send.reset(0x04u32.into()).ok();
-                    return Err::<u64, anyhow::Error>(e.into());
+                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                        "tcp>quic quic write failed after {total}B up: {e:#}"
+                    ));
                 }
-            };
-            if let Err(e) = send.write_all(&buf[..n]).await {
-                send.reset(0x04u32.into()).ok();
-                return Err::<u64, anyhow::Error>(e.into());
+                total += n as u64;
+                chunks += 1;
+                // One clock read per chunk, one shared store per 100ms: the atomic
+                // comparison the old code ran on every non-multiple-of-8 chunk was
+                // itself the per-chunk cost it was trying to avoid.
+                let now = b1.elapsed().as_millis() as u64;
+                let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
+                touch_stamp(&l1, &mut stamped, now, throttle);
             }
-            total += n as u64;
-            chunks += 1;
-            // One clock read per chunk, one shared store per 100ms: the atomic
-            // comparison the old code ran on every non-multiple-of-8 chunk was
-            // itself the per-chunk cost it was trying to avoid.
-            let now = b1.elapsed().as_millis() as u64;
-            let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
-            touch_stamp(&l1, &mut stamped, now, throttle);
-        }
-        send.finish().ok();
-        Ok::<u64, anyhow::Error>(total)
-    };
-    let s2c = async move {
-        let mut buf = CopyBuf::take();
-        let mut total = 0u64;
-        let mut chunks = 0u64;
-        let mut stamped = 0u64;
-        // Optimistic SOCKS replies have already told the application the
-        // connection is up, so the MQP-2 dial ACK only gates the reply
-        // direction here. A failure means the remote dial failed (or the
-        // server never acked); tear the TCP flow down so the app fails fast.
-        if let Some(t) = ack {
-            let ok = matches!(
-                tokio::time::timeout(t, read_mqp_ack(&mut recv)).await,
-                Ok(Ok(()))
-            );
-            if !ok {
-                tw.shutdown().await.ok();
-                return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                    "remote dial failed or MQP ack timed out"
-                ));
+            send.finish().ok();
+            Ok::<u64, anyhow::Error>(total)
+        };
+        let s2c = async move {
+            let mut buf = CopyBuf::take();
+            let mut total = 0u64;
+            let mut chunks = 0u64;
+            let mut stamped = 0u64;
+            // Optimistic SOCKS replies have already told the application the
+            // connection is up, so the MQP-2 dial ACK only gates the reply
+            // direction here. A failure means the remote dial failed (or the
+            // server never acked); tear the TCP flow down so the app fails fast.
+            if let Some(t) = ack {
+                let ok = matches!(
+                    tokio::time::timeout(t, read_mqp_ack(&mut recv)).await,
+                    Ok(Ok(()))
+                );
+                if !ok {
+                    // No FIN here: the final disposition aborts the TCP flow with
+                    // RST so the application retries instead of accepting an
+                    // empty reply as success.
+                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                        "remote dial failed or MQP ack timed out"
+                    ));
+                }
             }
-        }
+            loop {
+                let n = match recv.read(&mut buf).await {
+                    Ok(Some(0)) | Ok(None) => break,
+                    Ok(Some(n)) => n,
+                    Err(e) => {
+                        // Classify for the log line: a peer reset (e.g. refused
+                        // dial) and a dead connection need different follow-ups.
+                        let kind = match &e {
+                            quinn::ReadError::Reset(code) => format!("peer reset {code:?}"),
+                            quinn::ReadError::ConnectionLost(_) => "connection lost".to_string(),
+                            _ => "quic read failed".to_string(),
+                        };
+                        return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                            "quic>tcp {kind} after {total}B down: {e:#}"
+                        ));
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                if let Err(e) = tw.write_all(&buf[..n]).await {
+                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                        "quic>tcp tcp write failed after {total}B down: {e:#}"
+                    ));
+                }
+                total += n as u64;
+                chunks += 1;
+                let now = b2.elapsed().as_millis() as u64;
+                let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
+                touch_stamp(&l2, &mut stamped, now, throttle);
+            }
+            // No FIN here either: the final disposition below closes the socket
+            // once both directions are clean.
+            Ok::<u64, anyhow::Error>(total)
+        };
+        // Drive both directions manually instead of `join!`: when one direction
+        // fails, returning from this function drops the other future immediately,
+        // which closes its TCP half and resets/stops its QUIC stream. `join!` left
+        // the other side blocked in `read()` until the 300 s idle deadline, so a
+        // dead QUIC connection could pin the target fd and buffers for minutes.
+        tokio::pin!(c2s);
+        tokio::pin!(s2c);
+        let mut c2s_total: Option<u64> = None;
+        let mut s2c_total: Option<u64> = None;
+        // Idle watchdog on a *fixed* cadence. The previous shape created a fresh
+        // `sleep(step)` on every loop iteration, and any progress in either
+        // direction re-entered the loop — so a busy stream registered and cancelled
+        // a timer per data chunk (thousands per second). One pinned sleep that is
+        // never re-created fixes the cadence: it is polled again after each transfer
+        // event, and only the elapsed-time comparison decides when the deadline has
+        // passed.
+        let idle_step = Duration::from_secs(5).min(idle);
+        let idle_tick = tokio::time::sleep(idle_step);
+        tokio::pin!(idle_tick);
         loop {
-            let n = match recv.read(&mut buf).await {
-                Ok(Some(0)) | Ok(None) => break,
-                Ok(Some(n)) => n,
-                Err(e) => {
-                    tw.shutdown().await.ok();
-                    return Err::<u64, anyhow::Error>(e.into());
+            tokio::select! {
+                r = &mut c2s, if c2s_total.is_none() => match r {
+                    Ok(v) => c2s_total = Some(v),
+                    Err(e) => break Err(e),
+                },
+                r = &mut s2c, if s2c_total.is_none() => match r {
+                    Ok(v) => s2c_total = Some(v),
+                    Err(e) => break Err(e),
+                },
+                _ = &mut idle_tick => {
+                    let elapsed_ms = base.elapsed().as_millis() as u64;
+                    let last = last_ms.load(Ordering::Relaxed);
+                    if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
+                        break Err(anyhow::anyhow!(
+                            "tcp stream idle>{idle:?} after {}B up/{}B down",
+                            c2s_total.unwrap_or(0),
+                            s2c_total.unwrap_or(0),
+                        ));
+                    }
+                    // Re-arm towards the same fixed cadence rather than from "now":
+                    // a chunk arriving just before the deadline must not push the
+                    // check another full step into the future.
+                    idle_tick
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_step);
                 }
-            };
-            if n == 0 {
-                break;
             }
-            if let Err(e) = tw.write_all(&buf[..n]).await {
-                tw.shutdown().await.ok();
-                return Err::<u64, anyhow::Error>(e.into());
-            }
-            total += n as u64;
-            chunks += 1;
-            let now = b2.elapsed().as_millis() as u64;
-            let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
-            touch_stamp(&l2, &mut stamped, now, throttle);
-        }
-        tw.shutdown().await.ok();
-        Ok::<u64, anyhow::Error>(total)
-    };
-    // Drive both directions manually instead of `join!`: when one direction
-    // fails, returning from this function drops the other future immediately,
-    // which closes its TCP half and resets/stops its QUIC stream. `join!` left
-    // the other side blocked in `read()` until the 300 s idle deadline, so a
-    // dead QUIC connection could pin the target fd and buffers for minutes.
-    tokio::pin!(c2s);
-    tokio::pin!(s2c);
-    let mut c2s_total: Option<u64> = None;
-    let mut s2c_total: Option<u64> = None;
-    // Idle watchdog on a *fixed* cadence. The previous shape created a fresh
-    // `sleep(step)` on every loop iteration, and any progress in either
-    // direction re-entered the loop — so a busy stream registered and cancelled
-    // a timer per data chunk (thousands per second). One pinned sleep that is
-    // never re-created fixes the cadence: it is polled again after each transfer
-    // event, and only the elapsed-time comparison decides when the deadline has
-    // passed.
-    let idle_step = Duration::from_secs(5).min(idle);
-    let idle_tick = tokio::time::sleep(idle_step);
-    tokio::pin!(idle_tick);
-    loop {
-        tokio::select! {
-            r = &mut c2s, if c2s_total.is_none() => match r {
-                Ok(v) => c2s_total = Some(v),
-                Err(e) => return Err(e),
-            },
-            r = &mut s2c, if s2c_total.is_none() => match r {
-                Ok(v) => s2c_total = Some(v),
-                Err(e) => return Err(e),
-            },
-            _ = &mut idle_tick => {
-                let elapsed_ms = base.elapsed().as_millis() as u64;
-                let last = last_ms.load(Ordering::Relaxed);
-                if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
-                    anyhow::bail!("tcp stream idle>{idle:?}");
-                }
-                // Re-arm towards the same fixed cadence rather than from "now":
-                // a chunk arriving just before the deadline must not push the
-                // check another full step into the future.
-                idle_tick
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + idle_step);
+            if let (Some(a), Some(b)) = (c2s_total, s2c_total) {
+                break Ok((a, b));
             }
         }
-        if let (Some(a), Some(b)) = (c2s_total, s2c_total) {
-            return Ok((a, b));
+    }; // pump futures (and their borrows of `tcp`) end here
+    match outcome {
+        Ok((a, b)) => {
+            // Both halves reached clean EOF: graceful FIN close.
+            tcp.shutdown().await.ok();
+            Ok((a, b))
         }
+        Err(e) => {
+            // Any abnormal end aborts with RST (see `abort_tcp`): a FIN here
+            // would pose as a complete transfer and silently corrupt downloads.
+            abort_tcp(tcp);
+            Err(e)
+        }
+    }
+}
+
+/// Abort a TCP socket with RST instead of FIN.
+///
+/// Used exclusively for abnormal pump ends (see `copy_tcp_quic_inner`): a
+/// graceful FIN would tell the application the transfer completed, turning a
+/// truncated download into silent corruption (curl exits 0 on a short file).
+/// SO_LINGER=0 makes the close emit RST, so the application sees an explicit
+/// failure and can retry or resume (e.g. HTTP Range).
+fn abort_tcp(tcp: tokio::net::TcpStream) {
+    // `into_std` failure is not actionable here; worst case the socket closes
+    // gracefully while the caller still reports the error.
+    if let Ok(std) = tcp.into_std() {
+        let _ = socket2::SockRef::from(&std).set_linger(Some(Duration::ZERO));
+        // `std` drops here: linger 0 => RST.
     }
 }
 

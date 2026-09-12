@@ -457,6 +457,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 continue;
             }
         };
+        let stat_conn = conn.clone();
         tokio::spawn(async move {
             let _stream_permit = stream_permit;
             let target: TargetAddr = match tokio::time::timeout(
@@ -547,7 +548,21 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             if send.write_all(&ack[..n]).await.is_err() {
                 return;
             }
-            let _ = copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await;
+            match copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await {
+                Ok((up, down)) => {
+                    tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
+                }
+                Err(e) => {
+                    let st = stat_conn.stats();
+                    tracing::warn!(
+                        "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
+                        st.path.rtt,
+                        st.path.cwnd,
+                        st.path.lost_packets,
+                        st.path.sent_packets,
+                    );
+                }
+            }
         });
     }
     Ok(())
