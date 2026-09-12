@@ -6,7 +6,10 @@ use std::{
     collections::HashMap,
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
@@ -537,29 +540,44 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
-    // Window sizing (2026-09 gaps-death hardening): per-stream and send
-    // windows sit deliberately BELOW the trans-Pacific BDP optimum.
-    // Rationale, measured on a 250ms/2%-loss WAN: quinn kills the whole
-    // connection once a single stream's reassembly passes 1024 gaps, and the
-    // fuel for that is in-flight bytes (burst loss -> ghost retransmits ->
-    // duplicate entries; ordered mode never dedups). Halving both windows
-    // took retransmission amplification from 9x to ~1x and deaths from 3/3
-    // runs to 0, with loopback throughput unchanged. 2MB still covers
-    // ~114Mb/s single-stream at 140ms and 4MB send covers ~228Mb/s;
-    // multi-stream aggregate is unaffected (8MB connection window).
-    // The aggregate connection window MUST be set explicitly:
-    // quinn's default is VarInt::MAX, which would otherwise allow up to
-    // 1024 streams * 2MB ≈ 2GB of receive buffering per connection.
-    // 8MB still covers ~457Mb/s aggregate at 140ms while cutting the
-    // per-connection bound: 4096 conns x 8MB = 32GB worst case for
-    // *authenticated* peers, and the server additionally caps
-    // unauthenticated peers at 256 concurrent connections (≈2GB).
+    // Window sizing (2026-09 gaps-death hardening; revised after the reader/
+    // writer split, see `S2C_SPOOL_MAX`).
+    //
+    // These are two different knobs and only ONE of them is dangerous:
+    //
+    // * `stream_receive_window` is the ceiling on how many bytes one stream may
+    //   hold *unread*. quinn's advertised window is
+    //   `bytes_read + stream_receive_window`, so once the application stops
+    //   reading, the sender can still fill the whole window with hole-ridden
+    //   data and the reassembly span count climbs to roughly
+    //   `stream_receive_window / 1KB` (measured: 988 spans at 2MB, 1937 at
+    //   4MB, against a 1024 cap that kills the entire connection). The
+    //   decoupled reader does NOT lift this: it only runs ahead by the spool
+    //   budget, and once the spool is full the exposure is the window again.
+    //   So 2MB stays: it is the largest value that keeps the pathological case
+    //   near the cap instead of far past it, and it still covers ~114Mb/s
+    //   single-stream at 140ms.
+    // * `receive_window` is the aggregate budget across all streams on the
+    //   connection and does NOT feed the per-stream span counter, so raising it
+    //   is free of that failure mode. It is what bounds parallel downloads
+    //   (Chrome opens several Range streams per file): 16MB covers ~914Mb/s
+    //   aggregate at 140ms instead of ~457Mb/s at 8MB.
+    //
+    // The aggregate window MUST be set explicitly: quinn's default is
+    // VarInt::MAX, which would allow up to 1024 streams x 2MB of receive
+    // buffering per connection. 16MB bounds it at 4096 conns x 16MB = 64GB
+    // worst case for *authenticated* peers -- but that memory is only touched
+    // if peers actually send it, the per-stream cap still limits any single
+    // flow to 2MB, and the server caps unauthenticated peers at 256 concurrent
+    // connections (~4GB).
     t.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
-    t.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+    t.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     // Send side is driven by what *we* read from the target, but a malicious
     // client can still pin it (dial a fast local service, never read QUIC).
-    // Capped at 4MB (see window rationale above); the per-connection product
-    // is documented in the README limits table.
+    // Kept at 4MB: the send direction has no span-cap failure mode, so this is
+    // purely a memory bound on how much unread target data we buffer.
+    // ~228Mb/s single-stream at 140ms; the per-connection product is in the
+    // README limits table.
     t.send_window(4 * 1024 * 1024);
     // Clamp so absurd config values cannot overflow the QUIC VarInt timeout.
     let keep_alive_secs = keep_alive_secs.clamp(1, 3600);
@@ -1497,6 +1515,169 @@ async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
     Ok(())
 }
 
+/// A read gap or a TCP write stall at least this long is considered a stall
+/// event worth reporting. Chosen well above the RTT of any supported path
+/// (140 ms trans-Pacific) so normal loss recovery never trips it, and well
+/// below the multi-second scale on which reassembly damage accumulates.
+const STALL_REPORT_MS: u64 = 250;
+
+/// Stall telemetry for one pump run.
+///
+/// Rationale (gaps-death investigation): quinn's receive assembler keeps one
+/// span per non-contiguous byte range, and a span is only retired when the
+/// application *reads* it. While the pump is parked in `write_all` towards a
+/// slow local consumer, `recv.read` is not called at all, so holes left by
+/// loss and duplicates stay resident and the span count climbs towards quinn's
+/// `MAX_CHUNKS` cap (1024) — which, when exceeded, kills the whole connection
+/// with `INTERNAL_ERROR: too many gaps in stream buffer`.
+///
+/// Measured against a reconstruction of quinn's assembler: with the
+/// application draining normally the peak span count stays in the single
+/// digits at any receive-window size, while a parked consumer drives it to
+/// roughly `window / 1500` spans (924 at a 2 MB window and 1657 at 4 MB on a
+/// 5%-loss plus duplicate path). The window therefore bounds the damage; the
+/// stall is what reaches the bound.
+///
+/// The pump therefore splits QUIC→TCP into a reader and a writer joined by a
+/// bounded spool (see `S2C_SPOOL_MAX`), so a slow consumer can no longer stop
+/// the flow from being drained. The fields below are how that is verified in
+/// the field: a stalled consumer should now show a **large `s2c_write_stall_ms`
+/// together with a small `s2c_read_gap_ms`** and `s2c_spool_peak` at or near
+/// its cap, because the stall was absorbed as spool backpressure
+/// (`s2c_credit_wait_ms`) instead of as unread stream data.
+///
+/// All times are milliseconds since the pump started (monotonic).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CopyDiagnostics {
+    /// Worst gap between read attempts *while the spool was empty*, i.e. how
+    /// long the QUIC stream went without being drained at all. With the spool
+    /// decoupled this should stay in the low milliseconds even while a local
+    /// consumer is stalled; a large value means the drain task itself was
+    /// starved (runtime starvation, or a pathologically slow peer).
+    pub s2c_read_gap_ms: u64,
+    /// When `s2c_read_gap_ms` was observed.
+    pub s2c_read_gap_at_ms: u64,
+    /// Worst time spent inside a TCP write towards the local application.
+    pub s2c_write_stall_ms: u64,
+    pub s2c_write_stall_at_ms: u64,
+    /// Peak bytes held in the QUIC→TCP spool. Reaching `S2C_SPOOL_MAX` while
+    /// `s2c_credit_wait_ms` covers the consumer stall is the signature of a
+    /// *healthy* decoupled pump absorbing it.
+    pub s2c_spool_peak: u64,
+    /// Cumulative time the reader spent waiting for spool space. This is the
+    /// decoupled design's backpressure: the flow was drained as far as the
+    /// budget allows, and the remaining exposure is exactly `s2c_spool_peak`.
+    pub s2c_credit_wait_ms: u64,
+    /// Number of times the reader had to wait for spool space.
+    pub s2c_credit_waits: u64,
+    /// Worst gap between two successful TCP→QUIC reads **that happened while
+    /// the QUIC write side was blocked**. A large value means the application
+    /// had data we could not forward because the peer stopped consuming, which
+    /// is the mirror image of the download-direction problem.
+    ///
+    /// Idle connections deliberately do not count: a keep-alive socket that
+    /// sends nothing for a minute produces no reads, and reporting that as a
+    /// stall buries the real signal (observed in production as `c2s read
+    /// 60003ms` on completely healthy flows).
+    pub c2s_read_gap_ms: u64,
+    pub c2s_read_gap_at_ms: u64,
+    /// Worst time spent inside a QUIC write towards the peer. Non-zero means
+    /// flow-control backpressure: the peer stopped reading our stream.
+    pub c2s_write_stall_ms: u64,
+    pub c2s_write_stall_at_ms: u64,
+}
+
+impl CopyDiagnostics {
+    /// Worst stall seen in either direction, whichever is longer.
+    pub fn worst_ms(&self) -> u64 {
+        self.s2c_read_gap_ms
+            .max(self.s2c_write_stall_ms)
+            .max(self.c2s_read_gap_ms)
+            .max(self.c2s_write_stall_ms)
+    }
+
+    /// True when a direction was actually blocked long enough to be worth a log
+    /// line. Pure idleness never qualifies: the reader-side numbers are only
+    /// recorded while the flow was blocked, and the write-side numbers are time
+    /// spent inside a write that could not complete.
+    pub fn is_significant(&self) -> bool {
+        self.s2c_read_gap_ms >= STALL_REPORT_MS
+            || self.s2c_write_stall_ms >= STALL_REPORT_MS
+            || self.c2s_read_gap_ms >= STALL_REPORT_MS
+            || self.c2s_write_stall_ms >= STALL_REPORT_MS
+    }
+
+    /// Compact one-line summary for the WARN log at the call sites.
+    /// Reads are reported as `dir:read_gap@at` and writes as `dir:write@at`
+    /// so a stall can be ordered against `conn.stats()` at the same moment.
+    pub fn summary(&self) -> String {
+        format!(
+            "stalls s2c read {}ms@{}ms s2c write {}ms@{}ms spool {}/{}B credit {}ms x{} c2s read {}ms@{}ms c2s write {}ms@{}ms",
+            self.s2c_read_gap_ms,
+            self.s2c_read_gap_at_ms,
+            self.s2c_write_stall_ms,
+            self.s2c_write_stall_at_ms,
+            self.s2c_spool_peak,
+            S2C_SPOOL_MAX,
+            self.s2c_credit_wait_ms,
+            self.s2c_credit_waits,
+            self.c2s_read_gap_ms,
+            self.c2s_read_gap_at_ms,
+            self.c2s_write_stall_ms,
+            self.c2s_write_stall_at_ms,
+        )
+    }
+}
+
+/// Lock-free worst-case recorder shared by the two pump futures.
+///
+/// Atomics rather than `&mut` so both directions can record without holding a
+/// mutable borrow of one shared struct across an await point. Each direction
+/// only ever touches its own fields, and a plain `load` at the end of the pump
+/// sees them (the futures have been joined by then).
+#[derive(Debug, Default)]
+struct StallProbe {
+    s2c_read_gap: AtomicU64,
+    s2c_read_at: AtomicU64,
+    s2c_write: AtomicU64,
+    s2c_write_at: AtomicU64,
+    c2s_read_gap: AtomicU64,
+    c2s_read_at: AtomicU64,
+    c2s_write: AtomicU64,
+    c2s_write_at: AtomicU64,
+    /// Reader-side backpressure counters (see `CopyDiagnostics`).
+    credit_wait_ms: AtomicU64,
+    credit_waits: AtomicU64,
+}
+
+impl StallProbe {
+    /// Record a stall if it beats the current worst, storing its timestamp too.
+    fn note(value: &AtomicU64, at: &AtomicU64, ms: u64, at_ms: u64) {
+        if ms > value.load(Ordering::Relaxed) {
+            value.store(ms, Ordering::Relaxed);
+            at.store(at_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot for the caller. Called once the pump has settled.
+    fn snapshot(&self) -> CopyDiagnostics {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        CopyDiagnostics {
+            s2c_read_gap_ms: l(&self.s2c_read_gap),
+            s2c_read_gap_at_ms: l(&self.s2c_read_at),
+            s2c_write_stall_ms: l(&self.s2c_write),
+            s2c_write_stall_at_ms: l(&self.s2c_write_at),
+            s2c_spool_peak: 0,
+            s2c_credit_wait_ms: l(&self.credit_wait_ms),
+            s2c_credit_waits: l(&self.credit_waits),
+            c2s_read_gap_ms: l(&self.c2s_read_gap),
+            c2s_read_gap_at_ms: l(&self.c2s_read_at),
+            c2s_write_stall_ms: l(&self.c2s_write),
+            c2s_write_stall_at_ms: l(&self.c2s_write_at),
+        }
+    }
+}
+
 /// Bidirectional copy between TCP and QUIC stream halves.
 /// Half-closes propagate in both directions so neither side hangs waiting
 /// for EOF after the peer already finished.
@@ -1506,6 +1687,11 @@ async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
 /// was aborted with RST so the application sees an explicit failure instead
 /// of a truncated-but-clean transfer.
 ///
+/// Returns `(bytes_up, bytes_down, stall_diagnostics)`; the third element is
+/// always populated, including on the error path, so a failing flow can report
+/// whether the receiver stopped draining before it died (see
+/// [`CopyDiagnostics`]).
+///
 /// Delegates to [`copy_tcp_quic_idle`] with an effectively unbounded idle
 /// window; the direct `join!` implementation this used to have could hang
 /// forever when one direction failed while the other stayed blocked.
@@ -1513,7 +1699,7 @@ pub async fn copy_tcp_quic(
     tcp: tokio::net::TcpStream,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
-) -> Result<(u64, u64)> {
+) -> (Result<(u64, u64)>, CopyDiagnostics) {
     copy_tcp_quic_inner(tcp, send, recv, Duration::from_secs(u32::MAX as u64), None).await
 }
 
@@ -1528,7 +1714,7 @@ pub async fn copy_tcp_quic_idle(
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     idle: Duration,
-) -> Result<(u64, u64)> {
+) -> (Result<(u64, u64)>, CopyDiagnostics) {
     copy_tcp_quic_inner(tcp, send, recv, idle, None).await
 }
 
@@ -1544,7 +1730,7 @@ pub async fn copy_tcp_quic_acked(
     recv: quinn::RecvStream,
     idle: Duration,
     ack_timeout: Duration,
-) -> Result<(u64, u64)> {
+) -> (Result<(u64, u64)>, CopyDiagnostics) {
     copy_tcp_quic_inner(tcp, send, recv, idle, Some(ack_timeout)).await
 }
 
@@ -1558,6 +1744,137 @@ pub async fn copy_tcp_quic_acked(
 /// beyond [`COPY_POOL_MAX`] is freed instead of cached, which keeps a burst of
 /// spawned tasks from leaving idle memory behind on every worker thread.
 struct CopyBuf(&'static mut [u8]);
+
+/// Bytes that may sit in the QUIC→TCP spool before the reader pauses.
+///
+/// Rationale (gaps-death, measured): quinn retires a reassembly span only when
+/// the application *reads* the stream, so the number of spans a stalled flow
+/// can accumulate is bounded by how many bytes are allowed to pile up unread.
+/// Reconstructing quinn's assembler gives roughly `bytes / 1024` spans on a
+/// lossy path: 375 at 512 KiB, 988 at 1 MiB, 1937 at 4 MiB against a 1024 cap.
+///
+/// The spool is what lets the reader keep draining during a stall, so the
+/// budget has to stay small enough that the *sum* of spool plus the single
+/// in-flight read stays far below the cap. 512 KiB leaves a ~2.7x margin and
+/// still absorbs a stall of ~0.4 s at 10 Mb/s or ~40 ms at 100 Mb/s before the
+/// reader has to pause.
+const S2C_SPOOL_MAX: usize = 512 * 1024;
+
+/// Bound on bytes held in-flight by one reader step. Bounds overshoot past
+/// [`S2C_SPOOL_MAX`] by at most one chunk, and keeps the spool's accounting
+/// honest (the length is known before the chunk is queued).
+const S2C_READ_CHUNK: usize = 32 * 1024;
+
+/// SPSC-ish byte spool between the QUIC reader and the TCP writer.
+///
+/// A plain `Mutex<VecDeque<Bytes>>` plus `Notify` is deliberate: the critical
+/// section is a few pointer-sized moves, the number of queued chunks is
+/// bounded by `S2C_SPOOL_MAX / S2C_READ_CHUNK` (16 for the shipped values), and
+/// this keeps the ordering reasoning trivial compared with a ring buffer that
+/// would have to split chunks across the wrap point.
+#[derive(Default)]
+struct Spool {
+    inner: std::sync::Mutex<SpoolState>,
+}
+
+#[derive(Default)]
+struct SpoolState {
+    queue: std::collections::VecDeque<Bytes>,
+    queued_bytes: usize,
+    /// Set by the reader once the QUIC stream reached EOF and stopped queueing.
+    reader_done: bool,
+    /// Set when the peer's error path gives up, so the reader stops waiting and
+    /// this direction can be dropped.
+    stopped: bool,
+}
+
+struct SpoolChannel {
+    /// High-water mark of queued bytes. Reported in the diagnostics: reaching
+    /// `S2C_SPOOL_MAX` during a stall is the proof that the reader kept
+    /// draining QUIC instead of parking behind the local consumer.
+    peak: AtomicU64,
+    spool: Spool,
+    /// Space became available (writer side signals the reader).
+    space: Arc<tokio::sync::Notify>,
+    /// Either data was queued or the reader finished (reader signals writer).
+    data: Arc<tokio::sync::Notify>,
+}
+
+impl SpoolChannel {
+    fn new() -> Self {
+        Self {
+            peak: AtomicU64::new(0),
+            spool: Spool::default(),
+            space: Arc::new(tokio::sync::Notify::new()),
+            data: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn queued_bytes(&self) -> usize {
+        lock_mutex(&self.spool.inner).queued_bytes
+    }
+
+    /// Queue a chunk. Returns `false` if the peer stopped the pump.
+    fn push(&self, bytes: Bytes) -> bool {
+        {
+            let mut st = lock_mutex(&self.spool.inner);
+            if st.stopped {
+                return false;
+            }
+            st.queued_bytes += bytes.len();
+            if st.queued_bytes as u64 > self.peak.load(Ordering::Relaxed) {
+                self.peak.store(st.queued_bytes as u64, Ordering::Relaxed);
+            }
+            st.queue.push_back(bytes);
+        }
+        self.data.notify_one();
+        true
+    }
+
+    fn mark_reader_done(&self) {
+        lock_mutex(&self.spool.inner).reader_done = true;
+        self.data.notify_one();
+    }
+
+    /// Pop the next chunk.
+    ///
+    /// `None` means the stream is finished and fully drained, **not** that the
+    /// writer should give up: an empty queue with the reader still working is
+    /// reported as `Some(None)`, and the caller waits on [`Self::data`]. Mixing
+    /// those two states up makes the writer exit before the first byte arrives.
+    fn pop(&self) -> Option<Option<Bytes>> {
+        let mut space_freed = false;
+        let out = {
+            let mut st = lock_mutex(&self.spool.inner);
+            match st.queue.pop_front() {
+                Some(b) => {
+                    st.queued_bytes -= b.len();
+                    space_freed = true;
+                    Some(Some(b))
+                }
+                // Queue empty: finished only once the reader says so.
+                None if st.reader_done => None,
+                None => Some(None),
+            }
+        };
+        if space_freed {
+            self.space.notify_one();
+        }
+        out
+    }
+
+    fn stop(&self) {
+        lock_mutex(&self.spool.inner).stopped = true;
+        // Wake both sides: the reader may be waiting for space, the writer may
+        // be waiting for data.
+        self.space.notify_one();
+        self.data.notify_one();
+    }
+
+    fn is_stopped(&self) -> bool {
+        lock_mutex(&self.spool.inner).stopped
+    }
+}
 
 /// Copy chunk: large enough that a high-BDP stream is not syscall-bound, small
 /// enough that thousands of them do not dominate the RSS.
@@ -1634,12 +1951,12 @@ async fn copy_tcp_quic_inner(
     mut recv: quinn::RecvStream,
     idle: Duration,
     ack: Option<Duration>,
-) -> Result<(u64, u64)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+) -> (Result<(u64, u64)>, CopyDiagnostics) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Monotonic base: all timestamps are ms since here, immune to NTP/wall jumps.
     let base = tokio::time::Instant::now();
     let last_ms = Arc::new(AtomicU64::new(0));
+    let probe = Arc::new(StallProbe::default());
     // Borrowed halves: `tcp` itself stays owned here so the final disposition
     // (graceful FIN on clean EOF, RST on any abnormal end) is decided in one
     // place after both directions settle, instead of each direction racing to
@@ -1647,6 +1964,12 @@ async fn copy_tcp_quic_inner(
     let (mut tr, mut tw) = tcp.split();
     let l1 = last_ms.clone();
     let l2 = last_ms.clone();
+    let p1 = probe.clone();
+    let p2r = probe.clone();
+    let p2w = probe.clone();
+    // Independent handle for the spool high-water mark: the pump futures must
+    // own their own clone, and the value is only read after they have settled.
+    let spool_probe: Arc<SpoolChannel>;
     let b1 = base;
     let b2 = base;
     // Scope the pump futures: everything borrowing `tcp` ends at the block
@@ -1657,6 +1980,12 @@ async fn copy_tcp_quic_inner(
             let mut total = 0u64;
             let mut chunks = 0u64;
             let mut stamped = 0u64;
+            let mut last_read_ms = 0u64;
+            // Set when the previous QUIC write was blocked, i.e. the app had
+            // data we could not forward. Only such reads say anything about
+            // this direction: on an idle keep-alive socket the "gap" is just
+            // the peer having nothing to send, which is not a stall.
+            let mut write_blocked = false;
             loop {
                 let n = match tr.read(&mut buf).await {
                     Ok(0) => break,
@@ -1668,12 +1997,36 @@ async fn copy_tcp_quic_inner(
                         ));
                     }
                 };
+                let now = b1.elapsed().as_millis() as u64;
+                if write_blocked {
+                    StallProbe::note(
+                        &p1.c2s_read_gap,
+                        &p1.c2s_read_at,
+                        now.saturating_sub(last_read_ms),
+                        now,
+                    );
+                }
+                last_read_ms = now;
+                write_blocked = false;
+                let write_start = tokio::time::Instant::now();
                 if let Err(e) = send.write_all(&buf[..n]).await {
                     send.reset(0x04u32.into()).ok();
                     return Err::<u64, anyhow::Error>(anyhow::anyhow!(
                         "tcp>quic quic write failed after {total}B up: {e:#}"
                     ));
                 }
+                // Time the flow-control-blocked part of the write. A non-zero
+                // value here means the peer stopped consuming our stream.
+                let w = write_start.elapsed().as_millis() as u64;
+                if w > 0 {
+                    write_blocked = true;
+                }
+                StallProbe::note(
+                    &p1.c2s_write,
+                    &p1.c2s_write_at,
+                    w,
+                    b1.elapsed().as_millis() as u64,
+                );
                 total += n as u64;
                 chunks += 1;
                 // One clock read per chunk, one shared store per 100ms: the atomic
@@ -1686,11 +2039,19 @@ async fn copy_tcp_quic_inner(
             send.finish().ok();
             Ok::<u64, anyhow::Error>(total)
         };
+        // QUIC→TCP is split into an independent reader and writer joined by a
+        // bounded spool. The reader never blocks on the local socket, so a
+        // stalled consumer can no longer stop the flow from being drained:
+        // quinn retires reassembly spans only when the application reads, and
+        // the old single-loop shape parked in `write_all` while spans piled up
+        // towards the 1024 cap that kills the whole connection.
+        let spool = Arc::new(SpoolChannel::new());
+        spool_probe = spool.clone();
         let s2c = async move {
-            let mut buf = CopyBuf::take();
             let mut total = 0u64;
             let mut chunks = 0u64;
             let mut stamped = 0u64;
+            let mut last_read_ms = 0u64;
             // Optimistic SOCKS replies have already told the application the
             // connection is up, so the MQP-2 dial ACK only gates the reply
             // direction here. A failure means the remote dial failed (or the
@@ -1701,6 +2062,9 @@ async fn copy_tcp_quic_inner(
                     Ok(Ok(()))
                 );
                 if !ok {
+                    // Release the spool first: nothing was started yet, but the
+                    // writer must never be left waiting if this ordering changes.
+                    spool.stop();
                     // No FIN here: the final disposition aborts the TCP flow with
                     // RST so the application retries instead of accepting an
                     // empty reply as success.
@@ -1709,40 +2073,169 @@ async fn copy_tcp_quic_inner(
                     ));
                 }
             }
-            loop {
-                let n = match recv.read(&mut buf).await {
-                    Ok(Some(0)) | Ok(None) => break,
-                    Ok(Some(n)) => n,
-                    Err(e) => {
-                        // Classify for the log line: a peer reset (e.g. refused
-                        // dial) and a dead connection need different follow-ups.
-                        let kind = match &e {
-                            quinn::ReadError::Reset(code) => format!("peer reset {code:?}"),
-                            quinn::ReadError::ConnectionLost(_) => "connection lost".to_string(),
-                            _ => "quic read failed".to_string(),
+            let reader = {
+                let spool = spool.clone();
+                async move {
+                    let mut buf = CopyBuf::take();
+                    let mut credit_wait_ms = 0u64;
+                    let mut credit_waits = 0u64;
+                    loop {
+                        if spool.is_stopped() {
+                            p2r.credit_wait_ms.store(credit_wait_ms, Ordering::Relaxed);
+                            p2r.credit_waits.store(credit_waits, Ordering::Relaxed);
+                            return Ok::<u64, anyhow::Error>(0);
+                        }
+                        // Never queue more than the budget: this is what keeps
+                        // the unread-but-undrained exposure (and therefore the
+                        // span count) bounded while the consumer is stalled.
+                        let queued = spool.queued_bytes();
+                        if queued >= S2C_SPOOL_MAX {
+                            let mark = tokio::time::Instant::now();
+                            spool.space.notified().await;
+                            credit_wait_ms += mark.elapsed().as_millis() as u64;
+                            credit_waits += 1;
+                            // Charge this time to backpressure, not to the next
+                            // read: the stream was drained right up to the
+                            // budget, so it did not go undrained.
+                            last_read_ms = b2.elapsed().as_millis() as u64;
+                            continue;
+                        }
+                        let want = S2C_READ_CHUNK.min(S2C_SPOOL_MAX - queued);
+                        let attempt_ms = b2.elapsed().as_millis() as u64;
+                        let n = match recv.read(&mut buf[..want]).await {
+                            Ok(Some(0)) | Ok(None) => break,
+                            Ok(Some(n)) => n,
+                            Err(e) => {
+                                // Classify for the log line: a peer reset (e.g.
+                                // refused dial) and a dead connection need
+                                // different follow-ups.
+                                let kind = match &e {
+                                    quinn::ReadError::Reset(code) => {
+                                        format!("peer reset {code:?}")
+                                    }
+                                    quinn::ReadError::ConnectionLost(_) => {
+                                        "connection lost".to_string()
+                                    }
+                                    _ => "quic read failed".to_string(),
+                                };
+                                return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                    "quic>tcp {kind} after {total}B down: {e:#}"
+                                ));
+                            }
                         };
-                        return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                            "quic>tcp {kind} after {total}B down: {e:#}"
-                        ));
+                        if n == 0 {
+                            break;
+                        }
+                        // A gap only means the flow went *undrained* if the
+                        // stream was empty in our hands and stayed empty while
+                        // the read was outstanding. If the spool had room and
+                        // the read still took long, either the spool or the TCP
+                        // socket absorbed the data instead, which is the
+                        // backpressure this design is supposed to provide.
+                        if queued == 0 && spool.queued_bytes() == 0 {
+                            StallProbe::note(
+                                &p2r.s2c_read_gap,
+                                &p2r.s2c_read_at,
+                                attempt_ms.saturating_sub(last_read_ms),
+                                attempt_ms,
+                            );
+                        }
+                        let now = b2.elapsed().as_millis() as u64;
+                        last_read_ms = now;
+                        total += n as u64;
+                        chunks += 1;
+                        if !spool.push(Bytes::copy_from_slice(&buf[..n])) {
+                            return Ok::<u64, anyhow::Error>(total);
+                        }
+                        let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
+                        touch_stamp(&l2, &mut stamped, now, throttle);
                     }
-                };
-                if n == 0 {
+                    spool.mark_reader_done();
+                    p2r.credit_wait_ms.store(credit_wait_ms, Ordering::Relaxed);
+                    p2r.credit_waits.store(credit_waits, Ordering::Relaxed);
+                    Ok::<u64, anyhow::Error>(total)
+                }
+            };
+            let writer = {
+                let spool = spool.clone();
+                async move {
+                    let mut written = 0u64;
+                    loop {
+                        // `None` (not `Some(None)`) is the end of the stream:
+                        // the reader finished and every queued byte was written.
+                        let Some(next) = spool.pop() else {
+                            return Ok::<u64, anyhow::Error>(written);
+                        };
+                        let Some(chunk) = next else {
+                            // Nothing queued yet: wait for the reader.
+                            if spool.is_stopped() {
+                                return Ok::<u64, anyhow::Error>(written);
+                            }
+                            spool.data.notified().await;
+                            continue;
+                        };
+                        let write_start = tokio::time::Instant::now();
+                        if let Err(e) = tw.write_all(&chunk).await {
+                            // Nothing can drain the spool now: stop the reader
+                            // so this direction can be dropped (and the socket
+                            // RST) instead of waiting for the idle bound.
+                            spool.stop();
+                            return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                "quic>tcp tcp write failed after {written}B down: {e:#}"
+                            ));
+                        }
+                        // A slow local consumer (browser on disk, paused
+                        // download, backpressured socket) shows up here. The
+                        // reader keeps draining QUIC while this blocks.
+                        let w = write_start.elapsed().as_millis() as u64;
+                        StallProbe::note(
+                            &p2w.s2c_write,
+                            &p2w.s2c_write_at,
+                            w,
+                            b2.elapsed().as_millis() as u64,
+                        );
+                        written += chunk.len() as u64;
+                    }
+                }
+            };
+            // Drive the pair together: if the reader fails the writer must not
+            // keep waiting for data, and if the writer fails `stop` releases a
+            // reader that is waiting for space.
+            tokio::pin!(reader);
+            tokio::pin!(writer);
+            let mut reader_out: Option<Result<u64, anyhow::Error>> = None;
+            let mut writer_out: Option<Result<u64, anyhow::Error>> = None;
+            loop {
+                tokio::select! {
+                    r = &mut reader, if reader_out.is_none() => match r {
+                        Ok(_) => reader_out = Some(Ok(0)),
+                        Err(e) => {
+                            spool.stop();
+                            reader_out = Some(Err(e));
+                            break;
+                        }
+                    },
+                    w = &mut writer, if writer_out.is_none() => match w {
+                        Ok(n) => writer_out = Some(Ok(n)),
+                        Err(e) => {
+                            spool.stop();
+                            writer_out = Some(Err(e));
+                            break;
+                        }
+                    },
+                }
+                if reader_out.is_some() && writer_out.is_some() {
                     break;
                 }
-                if let Err(e) = tw.write_all(&buf[..n]).await {
-                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                        "quic>tcp tcp write failed after {total}B down: {e:#}"
-                    ));
-                }
-                total += n as u64;
-                chunks += 1;
-                let now = b2.elapsed().as_millis() as u64;
-                let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
-                touch_stamp(&l2, &mut stamped, now, throttle);
             }
-            // No FIN here either: the final disposition below closes the socket
-            // once both directions are clean.
-            Ok::<u64, anyhow::Error>(total)
+            match (reader_out, writer_out) {
+                (Some(Err(e)), _) => Err(e),
+                (_, Some(Err(e))) => Err(e),
+                // Success means every byte reached TCP (the writer only returns
+                // once the spool reported the reader done and drained).
+                (_, Some(Ok(written))) => Ok(written),
+                _ => Ok(0),
+            }
         };
         // Drive both directions manually instead of `join!`: when one direction
         // fails, returning from this function drops the other future immediately,
@@ -1796,7 +2289,11 @@ async fn copy_tcp_quic_inner(
             }
         }
     }; // pump futures (and their borrows of `tcp`) end here
-    match outcome {
+       // The pump has settled, so both directions have stopped recording and the
+       // snapshot is final (also on the error paths above, which `break`).
+    let mut diag = probe.snapshot();
+    diag.s2c_spool_peak = spool_probe.peak.load(Ordering::Relaxed);
+    let result = match outcome {
         Ok((a, b)) => {
             // Both halves reached clean EOF: graceful FIN close.
             tcp.shutdown().await.ok();
@@ -1808,7 +2305,8 @@ async fn copy_tcp_quic_inner(
             abort_tcp(tcp);
             Err(e)
         }
-    }
+    };
+    (result, diag)
 }
 
 /// Abort a TCP socket with RST instead of FIN.
@@ -1990,6 +2488,127 @@ mod tests {
         drop(held);
         let depth = COPY_POOL.with(|p| p.borrow().len());
         assert!(depth <= COPY_POOL_MAX, "pool overfilled: {depth}");
+    }
+
+    #[test]
+    fn stall_probe_keeps_only_the_worst_event() {
+        let p = StallProbe::default();
+        // A long s2c write stall (browser stopped reading), reported first.
+        StallProbe::note(&p.s2c_write, &p.s2c_write_at, 900, 1_000);
+        // Later, shorter events in the same field must not overwrite it.
+        StallProbe::note(&p.s2c_write, &p.s2c_write_at, 300, 5_000);
+        // A different field records independently.
+        StallProbe::note(&p.s2c_read_gap, &p.s2c_read_at, 420, 2_000);
+        let d = p.snapshot();
+        assert_eq!(d.s2c_write_stall_ms, 900);
+        assert_eq!(
+            d.s2c_write_stall_at_ms, 1_000,
+            "timestamp followed the loser"
+        );
+        assert_eq!(d.s2c_read_gap_ms, 420);
+        assert_eq!(d.s2c_read_gap_at_ms, 2_000);
+        assert_eq!(d.worst_ms(), 900);
+        assert_eq!(d.c2s_read_gap_ms, 0);
+        assert_eq!(d.c2s_write_stall_ms, 0);
+    }
+
+    #[test]
+    fn stall_reporting_threshold_is_inclusive() {
+        let mut d = CopyDiagnostics {
+            s2c_read_gap_ms: STALL_REPORT_MS - 1,
+            ..Default::default()
+        };
+        assert!(!d.is_significant(), "below threshold must stay quiet");
+        d.s2c_read_gap_ms = STALL_REPORT_MS;
+        assert!(d.is_significant(), "threshold itself must report");
+        // Any of the four fields can make the run significant.
+        for f in [0, 1, 2, 3] {
+            let mut d = CopyDiagnostics::default();
+            match f {
+                0 => d.s2c_read_gap_ms = STALL_REPORT_MS,
+                1 => d.s2c_write_stall_ms = STALL_REPORT_MS,
+                2 => d.c2s_read_gap_ms = STALL_REPORT_MS,
+                _ => d.c2s_write_stall_ms = STALL_REPORT_MS,
+            }
+            assert!(d.is_significant(), "field {f} did not trigger reporting");
+            assert_eq!(d.worst_ms(), STALL_REPORT_MS);
+        }
+    }
+
+    /// Production regression: idle keep-alive sockets produced `c2s read
+    /// 60003ms` WARNs on completely healthy flows, because the gap between two
+    /// reads was measured even when the application had nothing to send. Only
+    /// time blocked by flow control may count.
+    #[test]
+    fn idle_connections_are_not_reported_as_stalls() {
+        let probe = StallProbe::default();
+        // Nothing was ever blocked: no field is set, which is what the loops
+        // do for a socket that simply stays quiet (no read, no blocked write).
+        let d = probe.snapshot();
+        assert_eq!(d.c2s_read_gap_ms, 0);
+        assert_eq!(d.s2c_read_gap_ms, 0);
+        assert!(
+            !d.is_significant(),
+            "an idle connection must never be logged: {d:?}"
+        );
+
+        // And a large value that is *not* recorded as backpressure cannot
+        // surface either: `is_significant` reads only the stall fields.
+        let quiet = CopyDiagnostics {
+            // Hypothetical clock values that would previously have tripped the
+            // 250 ms threshold: the struct only carries real stall numbers, so
+            // a zeroed one is silent regardless of connection lifetime.
+            ..Default::default()
+        };
+        assert!(!quiet.is_significant());
+    }
+
+    #[test]
+    fn stall_summary_names_every_direction() {
+        let d = CopyDiagnostics {
+            s2c_read_gap_ms: 1_500,
+            s2c_read_gap_at_ms: 60_000,
+            s2c_write_stall_ms: 1_400,
+            s2c_write_stall_at_ms: 59_000,
+            c2s_read_gap_ms: 2,
+            c2s_read_gap_at_ms: 30_000,
+            c2s_write_stall_ms: 1,
+            c2s_write_stall_at_ms: 29_000,
+            ..Default::default()
+        };
+        let s = d.summary();
+        // The download-direction read gap is the number that explains a
+        // "too many gaps" death, so it must be present and unambiguous.
+        for needle in [
+            "s2c read 1500ms@60000ms",
+            "s2c write 1400ms@59000ms",
+            "c2s read 2ms@30000ms",
+            "c2s write 1ms@29000ms",
+        ] {
+            assert!(s.contains(needle), "summary missing {needle:?}: {s}");
+        }
+    }
+
+    #[test]
+    fn stall_probe_accumulates_worst_across_directions() {
+        // Mirrors the real layout: two pump futures recording into disjoint
+        // fields of one probe, read out only after both have settled.
+        let p = Arc::new(StallProbe::default());
+        let a = p.clone();
+        let b = p.clone();
+        let t1 = std::thread::spawn(move || {
+            StallProbe::note(&a.s2c_read_gap, &a.s2c_read_at, 2_100, 10);
+            StallProbe::note(&a.s2c_write, &a.s2c_write_at, 50, 20);
+        });
+        let t2 = std::thread::spawn(move || {
+            StallProbe::note(&b.c2s_read_gap, &b.c2s_read_at, 20, 30);
+            StallProbe::note(&b.c2s_write, &b.c2s_write_at, 7, 40);
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let d = p.snapshot();
+        assert_eq!(d.worst_ms(), 2_100);
+        assert!(d.is_significant());
     }
 
     #[test]

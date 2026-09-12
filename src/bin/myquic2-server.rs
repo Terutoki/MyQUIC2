@@ -548,7 +548,14 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             if send.write_all(&ack[..n]).await.is_err() {
                 return;
             }
-            match copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await {
+            let (pump, diag) = copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await;
+            // Reported on both outcomes: a long s2c read gap (the app not
+            // draining the stream) is what lets quinn's reassembly spans pile
+            // up towards the MAX_CHUNKS cap that kills the connection.
+            if diag.is_significant() {
+                tracing::warn!("tcp {target:?} {}", diag.summary());
+            }
+            match pump {
                 Ok((up, down)) => {
                     tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
                 }

@@ -63,9 +63,9 @@ re-verified end-to-end on this revision — see
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
-| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window |
+| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 16 MB per-connection receive window (2 MB per stream) |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
-| **High-RTT tuned** | 2 MB per-stream window, 8 MB aggregate receive window, 4 MB send window — halved in the gaps-death hardening pass (bounds in-flight bytes so burst loss can't flood the receiver's reassembly); covers ~114 Mb/s single-stream at ~140 ms |
+| **High-RTT tuned** | 2 MB per-stream window, 16 MB aggregate receive window, 4 MB send window — the per-stream cap is what bounds a stalled flow's reassembly risk (~114 Mb/s single-stream at ~140 ms), while the aggregate covers ~914 Mb/s of parallel Range streams |
 | **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each (rebuilt from this revision) |
 
 ---
@@ -281,6 +281,71 @@ Representative reconnect trace (client log after `kill -9` of the server):
 The E2E harness is intentionally not vendored; it is a plain Python SOCKS5 client
 (`CONNECT` + `UDP ASSOCIATE`) plus `asyncio` TCP/UDP echo servers on ports 18081/18082.
 
+### Pump stall telemetry (`too many gaps in stream buffer`)
+
+The pump reports worst-case stalls per direction, logged as a WARN whenever any
+of them reaches 250 ms (`CopyDiagnostics` in `src/lib.rs`). A long **s2c read
+gap** is the field signature of the receiver having stopped draining QUIC —
+quinn only retires reassembly spans when the application reads, so a parked
+consumer lets spans climb towards the 1024 cap that kills the connection.
+
+`tests/pump_stall.rs` proves the mechanism end to end over a real quinn
+connection: a consumer that parks for 600 ms makes the writer block for ~590 ms,
+the reader keeps draining QUIC (spool fills to its 512 KiB cap, `s2c read` gap
+stays at 0 ms), and all 4 MiB arrive intact. Before the reader/writer split the
+same scenario stopped draining entirely — the read gap and the write stall were
+the same ~584 ms number, which is exactly the shape that let spans pile up
+towards quinn's cap.
+
+`examples/pump_probe.rs` runs the same comparison as a standalone process, which
+is the useful form when checking a live link, and `examples/pump_bench.rs`
+measures the same pump's loopback throughput for A/B against another revision.
+
+### UDP segmentation offload on routers
+
+quinn-udp decides GSO support when the endpoint is created by *setting*
+`UDP_SEGMENT` on a throwaway socket and never sending anything. "Option accepted"
+is therefore not "offload works": the kernel can accept the option and still fail
+the first real segmented send, and its EIO arm then pins `max_gso_segments = 1`
+for the rest of the process, so every later send is one datagram per syscall.
+The startup warning for that case is:
+
+```text
+libc::sendmsg failed with I/O error (os error 5); halting segmentation offload
+sendmsg error: Os { code: 5, ... }, Transmit: { len: 1595, segment_size: Some(1420) }
+```
+
+Whether it can happen to you is a property of the egress interface, and `ethtool`
+answers it directly — a `[fixed]` capability cannot be enabled by any
+configuration:
+
+```sh
+ethtool -k pppoe-wan | grep tx-udp-segmentation
+# tx-udp-segmentation: off [fixed]      <- UDP GSO unavailable on this path
+```
+
+Observed on both tested OpenWrt routers (PPPoE WAN, different kernels), so treat
+`off [fixed]` as the normal case rather than a misconfiguration. `[fixed]` means
+the driver does not advertise `NETIF_F_GSO_UDP_L4`; the kernel-level option still
+succeeds, which is exactly what misleads quinn-udp.
+
+**The cost is small and bounded.** Only the segmented send shape fails; batched
+and single sends keep working, and the batch that hit EIO is retried by the
+connection driver, so nothing is lost. What remains is per-syscall overhead:
+roughly 1.7% of one core at 100 Mb/s and 3.3% at 200 Mb/s. It is not a throughput
+ceiling and it cannot explain a slow download — check the router's CPU (`top`,
+`si` in particular) before blaming the send path.
+
+--- parked consumer (browser stalled on disk) ---
+# [parked] ok: 0B up / 4194304B down, consumer got 4194304B
+# [parked] stalls: s2c read 0ms@0ms s2c write 590ms@597ms spool 524288B credit 585ms x10 | c2s read 0ms@0ms c2s write 0ms@0ms
+# [parked] significant=true (threshold 250ms) — would log: stalls s2c read 0ms@0ms s2c write 590ms ...
+# --- healthy consumer ---
+# [healthy] ok: 0B up / 4194304B down, consumer got 4194304B
+# [healthy] stalls: s2c read 0ms@0ms s2c write 0ms@0ms spool 28497B credit 0ms x0 | c2s read 0ms@0ms c2s write 0ms@0ms
+# [healthy] significant=false (threshold 250ms) — would log: (nothing)
+```
+
 ---
 
 ## Requirements
@@ -337,9 +402,11 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-5 revision: static musl, x86-64, stripped, ~4.1–4.2 MB each.
-They contain the DATAGRAM process-abort fix, so binaries built before pass 5 must be
-replaced on **both** sides of a deployment.
+rebuilt from the pass-8 revision: static musl, x86-64, stripped, ~4.18–4.24 MB each.
+They contain the **pump reader/writer split** (the `too many gaps in stream buffer`
+fix) and the restart-safe RST disposition, so installs older than pass 8 must be
+replaced on **both** sides of a deployment — the download path is protected by the
+client binary and the upload path by the server one.
 
 ---
 
@@ -463,7 +530,7 @@ All limits are constants in the sources; the table shows where to change them.
 | Client UDP associations | 4096 (excess replies REP=0x01, 256-datagram queue each) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
-| Receive window (aggregate) | 8 MB/connection | `build_transport` |
+| Receive window (aggregate) | 16 MB/connection | `build_transport` |
 | Receive window (per stream) | 2 MB | `build_transport` |
 | Send window | 4 MB/connection | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
@@ -533,7 +600,7 @@ Against RFC 1928 / RFC 1929:
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for trans-Pacific BDP — 2 MB per-stream / 8 MB aggregate
+- **140 ms links**: tuned for trans-Pacific BDP — 2 MB per-stream / 16 MB aggregate
   receive window, 4 MB send window, BBR; the SOCKS success reply is sent
   optimistically (no 1-RTT wait for the remote dial), so the application's TLS
   handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
@@ -580,6 +647,12 @@ Checklist from real field issues:
 | New TCP hangs after server restart | Old stream on dead QUIC conn → fail-fast RST is by design; app reconnects, new flows work immediately |
 | UDP fails for LAN/remote SOCKS clients | Fixed in this revision (BND.ADDR is the proxy address); upgrade both binaries |
 | UDP loss under load | Check loss% first: sustained overload is QUIC DATAGRAM backpressure (UDP semantics — app should retransmit) |
+| `too many gaps in stream buffer` in the client log | quinn's per-stream reassembly cap (1024 spans) was exceeded and killed the connection. The pump now drains QUIC through a bounded spool precisely so a slow local consumer cannot cause this; a death here means the stream was drained `s2c_spool_peak` bytes ahead and still lost the race — check the WARN line's `spool`/`credit` numbers against `S2C_SPOOL_MAX` |
+| `… stalls s2c write …ms` with `spool` at cap and a small `s2c read` | Healthy backpressure: the browser/application stalled, the pump absorbed it in the spool (`credit` = how long the reader waited for space) and kept draining QUIC. Nothing to fix |
+| `… stalls s2c read …ms` large (and `spool` near zero) | The stream itself went undrained: the read path (not the local consumer) is the problem. Repro with `cargo run --release --example pump_probe parked` |
+| `… c2s read …ms` on an otherwise idle connection | Not a stall. Read gaps are recorded **only** when the preceding QUIC write was flow-control blocked, so a quiet keep-alive socket produces no WARN at all. A large `c2s read` therefore means the application had data that could not be forwarded — look at `c2s write` for how long the peer stalled us |
+| `tx-udp-segmentation: off [fixed]` in `ethtool -k <wan-iface>` | The egress interface cannot do UDP segmentation offload, so the first segmented send fails and quinn-udp disables GSO for the process. `[fixed]` cannot be changed by configuration — this is a driver/kernel capability, not a misconfiguration. Cost is a few percent of one core (see "UDP segmentation offload on routers") |
+| `quinn_udp: sendmsg error: Os { code: 5 ... }` mid-transfer | Same limitation as above, seen the moment quinn-udp notices (its own EIO arm, hence code 5). The batch that hit EIO is retried by the connection driver. The fallback costs only batch coalescing, so it is not a throughput ceiling |
 | `udp send buffer clamped to ...` warning | Raise `net.core.wmem_max`/`rmem_max`; the effective value is printed |
 | Client cannot connect at all after a token change | The token travels inside QUIC, not TLS: no cert re-copy needed, only the config |
 
@@ -889,6 +962,75 @@ detection, stale-ticket redials, then TCP+UDP self-heal).
 - **Rebuilt release binaries.** `dist/openwrt-x86_64/` was rebuilt from this
   revision for all four CPU levels (v1–v4: static musl, x86-64, stripped).
   Re-copy them to the router; the fix is server- and client-side.
+
+---
+
+### 2026-09 hardening pass 8 — the pump stops parking behind the local consumer
+
+- **QUIC→TCP reader/writer split with a bounded spool.** The download direction
+  used one loop: `recv.read()` then `write_all()`. A slow local consumer parked
+  that loop inside `write_all`, so the flow stopped being drained entirely — and
+  because quinn retires reassembly spans only when the application reads, the
+  span count climbed into the 1024 cap that kills the whole connection
+  (`INTERNAL_ERROR: too many gaps in stream buffer`), taking every other stream
+  on that connection with it. The two halves are now independent, joined by a
+  `S2C_SPOOL_MAX` (512 KiB) byte budget: the reader keeps draining QUIC while
+  the writer waits on the socket, and only pauses once the budget is spent.
+- **Why 512 KiB.** Reconstructing quinn's assembler puts a stalled flow at
+  roughly `bytes / 1024` spans (375 at 512 KiB, 988 at 1 MiB, 1937 at 4 MiB, cap
+  1024), so the budget is what keeps the unread exposure — and therefore the
+  span count — bounded no matter how long the consumer stalls.
+- **The spool also caps the whole flow, not just the stream.** Because the
+  reader stops at the budget, sibling stalled streams share the connection
+  window instead of each holding a full per-stream window of unread data, which
+  is how several concurrent Chrome downloads previously added up past the cap.
+- **Diagnostics updated to match.** `s2c_read_gap_ms` now means "the stream went
+  undrained" (time waited on QUIC while the spool was empty), and `s2c_write_stall_ms`,
+  `s2c_spool_peak` and `s2c_credit_wait_ms` are reported separately so a stalled
+  consumer reads as backpressure rather than as a drain failure.
+- **False-positive fix found in production.** The first deployment logged
+  `c2s read 45088ms` / `60003ms` on entirely healthy flows: a read *gap* was being
+  measured even when the application simply had nothing to send, so every idle
+  keep-alive socket eventually tripped the 250 ms threshold. `c2s_read_gap_ms` is
+  now recorded only when the preceding QUIC write was actually flow-control
+  blocked, and `is_significant()` no longer considers a bare elapsed time. In that
+  same deployment the download side read clean throughout (`s2c read 0ms`,
+  `spool` a few KiB, `credit 0ms x0`) and **no connection died with `too many gaps
+  in stream buffer`**, which is what the split was for.
+
+**Performance.** The extra work per 32 KiB chunk is one pooled allocation, one
+memcpy out of quinn's buffer, an uncontended mutex and one atomic — and the
+`Notify` permit stays set while the writer keeps up, so the steady-state fast path
+takes no scheduler hop. A/B against the pre-split revision
+(`cargo run --release --example pump_bench`, 256 MiB × 4 reps, six alternating
+rounds, loopback) gives baseline median 249–259 MB/s versus 248–256 MB/s
+decoupled: below this harness's run-to-run noise. The spool also stays shallow
+(tens of KiB peak) while the consumer keeps up, so the copy is not on the
+steady-state critical path. The real throughput change is on bad paths, where
+avoiding the death removes both the retransmit amplification and the restarted
+download.
+
+Verified: `cargo test` (25 tests, including two live quinn round trips in
+`tests/pump_stall.rs`), `make`-free `cargo clippy --all-targets` and
+`cargo fmt --check` clean; `examples/pump_probe.rs` shows a parked consumer at
+`s2c read 0ms / s2c write 590ms / spool 524288B / credit 585ms` versus
+`s2c read 0ms / s2c write 0ms / spool 28497B` for a healthy one, with all 4 MiB
+delivered intact in both cases.
+
+- **Aggregate window raised, per-stream window deliberately not.** Follow-up after
+  the split landed: `receive_window` 8 MB -> 16 MB (~457 -> ~914 Mb/s of parallel
+  Range streams at 140 ms), while `stream_receive_window` stays at 2 MB. The
+  advertised per-stream window is `bytes_read + stream_receive_window`, so once a
+  consumer stalls the sender can still fill the whole window with hole-ridden data
+  and the span count reaches roughly `window / 1KB` — measured 988 spans at 2 MB
+  and 1937 at 4 MB against the 1024 cap. The reader split does not lift that
+  ceiling: it only runs ahead by the spool budget, and a full spool puts the
+  exposure back at the window. The aggregate window feeds no per-stream counter,
+  so raising it is free of that failure mode.
+
+- **Rebuilt release binaries.** `dist/openwrt-x86_64/` must be rebuilt from this
+  revision (same four CPU levels) before deployment; the change is client-side
+  for downloads and server-side for uploads.
 
 ---
 

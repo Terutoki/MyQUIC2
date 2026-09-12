@@ -666,15 +666,22 @@ async fn handle_socks(
     // failed dial tears the TCP flow down instead of returning a SOCKS error.
     let unknown = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     write_socks_reply(&mut s, 0x00, unknown).await?;
-    match copy_tcp_quic_acked(
+    let (pump, diag) = copy_tcp_quic_acked(
         s,
         send,
         recv,
         Duration::from_secs(300),
         TCP_DIAL_ACK_TIMEOUT,
     )
-    .await
-    {
+    .await;
+    // Stall evidence is reported in both outcomes: the whole point is to see
+    // whether the receiver stopped draining *before* quinn killed the flow
+    // with "too many gaps in stream buffer". A long s2c read gap means the
+    // local consumer (browser/disk), not the WAN, stalled the assembler.
+    if diag.is_significant() {
+        tracing::warn!("tcp {target:?} {}", diag.summary());
+    }
+    match pump {
         Ok((up, down)) => {
             tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
         }

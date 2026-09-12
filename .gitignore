@@ -8,6 +8,12 @@
 # client must receive server-cert.pem out-of-band. NEVER commit keys.
 *.pem
 
+# Deployment staging name: the router installs the chosen level as `myquic2`
+# (`/usr/bin/myquic2`), so a local copy under this name is a working artifact,
+# not a release. The versioned `myquic2-{client,server}-v[1-4]` binaries in the
+# same directory ARE tracked - keep this rule narrow.
+/dist/openwrt-x86_64/myquic2
+
 # macOS / editors
 .DS_Store
 *.swp
