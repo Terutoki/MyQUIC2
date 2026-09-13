@@ -63,9 +63,9 @@ re-verified end-to-end on this revision — see
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
-| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 16 MB per-connection receive window (2 MB per stream) |
+| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 16 MB per-connection receive window (8 MB per stream), 64 MB process-wide QUIC→TCP spool budget |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
-| **High-RTT tuned** | 2 MB per-stream window, 16 MB aggregate receive window, 4 MB send window — the per-stream cap is what bounds a stalled flow's reassembly risk (~114 Mb/s single-stream at ~140 ms), while the aggregate covers ~914 Mb/s of parallel Range streams |
+| **High-RTT tuned** | 8 MB per-stream window, 16 MB aggregate receive window, 4 MB send window — ~190–215 Mb/s single-stream measured at ~140 ms RTT with a 4 MB window (vs ~145 at 2 MB; 8 MB lifts the ceiling to ~480 Mb/s), while the aggregate covers ~914 Mb/s of parallel Range streams |
 | **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each (rebuilt from this revision) |
 
 ---
@@ -255,6 +255,16 @@ Additional checks run on the pass-5 revision (macOS, loopback):
 | 14 | UDP at 20–25k datagrams/s, windowed round trip | ✅ 0.00% loss, RTT p50 0.11–0.13 ms |
 | 15 | 128-datagram bursts ×300 | ✅ 100% replied, burst completion p50 1.8 ms |
 
+Additional checks run on the window/spool retune revision:
+
+| # | Test | Result |
+|---|---|---|
+| 16 | `cargo test` against the pinned quinn-proto rev | ✅ 26/26 (18 lib + 3 server + 3 client + 2 live round trips in `tests/pump_stall.rs`) |
+| 17 | Single-stream download, emulated 140 ms RTT, alternating builds from the same source | ✅ 4 MiB window: 184.0 / 190.3 / 203.5 / 215.8 Mbit/s; 2 MiB window: 141.3 / 147.6 / 149.4 / 152.4 (medians 196.9 vs 148.5, **+33%**) |
+| 18 | Same measurement unshaped (window cannot bind on a ~0 ms path) | ✅ 566 vs 565 Mbit/s — neutral |
+| 19 | Upload direction at 140 ms | ✅ ~144 Mbit/s unchanged (the receiver there is the server's `send_window`) |
+| 20 | OpenWrt musl cross-build with the git-pinned dependency | ✅ both binaries build and remain static stripped x86-64 ELF |
+
 0-RTT probe (expect the last four lines):
 
 ```sh
@@ -350,6 +360,21 @@ ceiling and it cannot explain a slow download — check the router's CPU (`top`,
 
 ## Requirements
 
+- **quinn-proto is pinned to a git revision.** `Cargo.toml` carries a
+  `[patch.crates-io]` entry pointing at the quinn `0.11.x` maintenance branch
+  (rev `d2cf48f`), because two fixes the proxy depends on have no crates.io
+  release yet: the DATAGRAM `payload_bytes` double subtraction that could abort
+  the process ([quinn#2805](https://github.com/quinn-rs/quinn/issues/2805),
+  [PR #2806](https://github.com/quinn-rs/quinn/pull/2806)) and the assembler
+  span ceiling that this revision's 4 MB per-stream window relies on
+  ([PR #2814](https://github.com/quinn-rs/quinn/pull/2814)). Consequences: the
+  first build needs network access to `github.com` (and `~/.cargo/git` is a
+  build cache, not a substitute for the registry), and the exact revision is
+  what the tests and E2E results in this README were produced against.
+  **To unpin:** once a crates.io `quinn-proto` release contains both commits,
+  delete the `[patch.crates-io]` block, run `cargo update -p quinn-proto`, then
+  re-run `cargo test` — `try_send_datagram_saturates_without_panicking` aborts
+  on the unfixed path, so it is the gate rather than the version number.
 - **Rust** 1.88+ (MSRV driven by `time 0.3.55` / `rcgen 0.14.10`; developed and
   tested on stable 1.97.1; deps: quinn 0.11.11 / quinn-proto 0.11.17, rustls
   0.23.44, tokio 1.53.1)
@@ -530,8 +555,8 @@ All limits are constants in the sources; the table shows where to change them.
 | Client UDP associations | 4096 (excess replies REP=0x01, 256-datagram queue each) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
-| Receive window (aggregate) | 16 MB/connection | `build_transport` |
-| Receive window (per stream) | 2 MB | `build_transport` |
+| Receive window (aggregate) | 16 MB/connection (`RECV_WINDOW`; must stay >= the per-stream window) | `build_transport` |
+| Receive window (per stream) | 8 MB (`STREAM_RECV_WINDOW`, must stay <= the aggregate) | `build_transport` |
 | Send window | 4 MB/connection | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
@@ -600,7 +625,7 @@ Against RFC 1928 / RFC 1929:
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for trans-Pacific BDP — 2 MB per-stream / 16 MB aggregate
+- **140 ms links**: tuned for trans-Pacific BDP — 8 MB per-stream / 16 MB aggregate
   receive window, 4 MB send window, BBR; the SOCKS success reply is sent
   optimistically (no 1-RTT wait for the remote dial), so the application's TLS
   handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
@@ -647,7 +672,7 @@ Checklist from real field issues:
 | New TCP hangs after server restart | Old stream on dead QUIC conn → fail-fast RST is by design; app reconnects, new flows work immediately |
 | UDP fails for LAN/remote SOCKS clients | Fixed in this revision (BND.ADDR is the proxy address); upgrade both binaries |
 | UDP loss under load | Check loss% first: sustained overload is QUIC DATAGRAM backpressure (UDP semantics — app should retransmit) |
-| `too many gaps in stream buffer` in the client log | quinn's per-stream reassembly cap (1024 spans) was exceeded and killed the connection. The pump now drains QUIC through a bounded spool precisely so a slow local consumer cannot cause this; a death here means the stream was drained `s2c_spool_peak` bytes ahead and still lost the race — check the WARN line's `spool`/`credit` numbers against `S2C_SPOOL_MAX` |
+| `too many gaps in stream buffer` in the client log | quinn's per-stream reassembly cap (1024 spans) was exceeded. The pinned quinn-proto makes that cap structural (defragment coalesces any chunk below `buffered / MAX_CHUNKS`, so the count cannot exceed 1024 for any input), and the pump additionally drains QUIC through a bounded spool so a slow local consumer cannot pile spans up; seeing this at all now means the spool itself stalled — check `s2c_spool_peak` / `credit` against `S2C_SPOOL_MAX` and `S2C_SPOOL_BUDGET` |
 | `… stalls s2c write …ms` with `spool` at cap and a small `s2c read` | Healthy backpressure: the browser/application stalled, the pump absorbed it in the spool (`credit` = how long the reader waited for space) and kept draining QUIC. Nothing to fix |
 | `… stalls s2c read …ms` large (and `spool` near zero) | The stream itself went undrained: the read path (not the local consumer) is the problem. Repro with `cargo run --release --example pump_probe parked` |
 | `… c2s read …ms` on an otherwise idle connection | Not a stall. Read gaps are recorded **only** when the preceding QUIC write was flow-control blocked, so a quiet keep-alive socket produces no WARN at all. A large `c2s read` therefore means the application had data that could not be forwarded — look at `c2s write` for how long the peer stalled us |
@@ -973,13 +998,26 @@ detection, stale-ticket redials, then TCP+UDP self-heal).
   because quinn retires reassembly spans only when the application reads, the
   span count climbed into the 1024 cap that kills the whole connection
   (`INTERNAL_ERROR: too many gaps in stream buffer`), taking every other stream
-  on that connection with it. The two halves are now independent, joined by a
-  `S2C_SPOOL_MAX` (512 KiB) byte budget: the reader keeps draining QUIC while
-  the writer waits on the socket, and only pauses once the budget is spent.
-- **Why 512 KiB.** Reconstructing quinn's assembler puts a stalled flow at
-  roughly `bytes / 1024` spans (375 at 512 KiB, 988 at 1 MiB, 1937 at 4 MiB, cap
-  1024), so the budget is what keeps the unread exposure — and therefore the
-  span count — bounded no matter how long the consumer stalls.
+  on that connection with it. The two halves are independent, joined by a
+  `S2C_SPOOL_MAX` (2 MiB) budget: the reader keeps draining QUIC while the
+  writer waits on the socket, and only pauses once the budget is spent.
+- **Why 2 MiB, and why it is no longer a safety limit.** The spool size used to
+  be a *safety* figure: spans scaled as `bytes / ~1KB` (375 at 512 KiB, 988 at
+  2 MiB, 1937 at 4 MiB, against the 1024 cap), so 512 KiB plus a 32 KiB read in
+  flight had to stay far below the cap. The pinned quinn-proto removed that cap
+  structurally — `defragment()` now coalesces any chunk smaller than
+  `buffered / MAX_CHUNKS`, which bounds the span count at 1024 for *any* input —
+  so the spool is now sized for what it is for: absorbing a consumer stall.
+  2 MiB rides out ~160 ms at 100 Mb/s (~1.6 s at 10 Mb/s), which covers the
+  local stalls we see (browser rendering, SD-card writes, app decode), and at
+  2 MiB + 64 KiB in flight it is ~52% of the 4 MiB stream window, so the spool
+  stays the binding limit rather than flow control (~1.9x headroom).
+- **Process-wide spool budget.** Per-stream budgets multiply: at 1024 streams
+  and the 4096-connection cap, 2 MiB per stream would be an ~8 TiB theoretical
+  ceiling. `S2C_SPOOL_BUDGET` (64 MB) caps the sum across the process. Budget is
+  acquired for the bytes a chunk actually carries — not reserved per stream — and
+  released as the writer drains, so the cap binds only on genuinely concurrent
+  spool occupancy and idle streams cost nothing.
 - **The spool also caps the whole flow, not just the stream.** Because the
   reader stops at the budget, sibling stalled streams share the connection
   window instead of each holding a full per-stream window of unread data, which
@@ -1017,16 +1055,33 @@ Verified: `cargo test` (25 tests, including two live quinn round trips in
 `s2c read 0ms / s2c write 0ms / spool 28497B` for a healthy one, with all 4 MiB
 delivered intact in both cases.
 
-- **Aggregate window raised, per-stream window deliberately not.** Follow-up after
-  the split landed: `receive_window` 8 MB -> 16 MB (~457 -> ~914 Mb/s of parallel
-  Range streams at 140 ms), while `stream_receive_window` stays at 2 MB. The
-  advertised per-stream window is `bytes_read + stream_receive_window`, so once a
-  consumer stalls the sender can still fill the whole window with hole-ridden data
-  and the span count reaches roughly `window / 1KB` — measured 988 spans at 2 MB
-  and 1937 at 4 MB against the 1024 cap. The reader split does not lift that
-  ceiling: it only runs ahead by the spool budget, and a full spool puts the
-  exposure back at the window. The aggregate window feeds no per-stream counter,
-  so raising it is free of that failure mode.
+- **Per-stream window raised to 8 MB, now that the cap behind the old choice is
+  fixed.** `stream_receive_window` had been held at 2 MB purely because of
+  quinn's assembler: the advertised window is `bytes_read +
+  stream_receive_window`, so a stalled consumer let the peer fill the window
+  with hole-ridden data, and the span count grew as `window / ~1KB` — measured
+  988 spans at 2 MB, 1937 at 4 MB, against a 1024 cap that kills the entire
+  connection. That cap was a false ceiling once defragment() coalesces chunks
+  below `buffered / MAX_CHUNKS`, which is what the pinned quinn-proto revision
+  brings in ([quinn#2809](https://github.com/quinn-rs/quinn/issues/2809),
+  [PR #2814](https://github.com/quinn-rs/quinn/pull/2814)); the span count is
+  now bounded by construction for any input, so the window is set by throughput
+  again: `window / RTT` is ~120 Mb/s at 2 MB and ~240 Mb/s at 4 MB on a 140 ms
+  path.
+- **Measured on an emulated 140 ms path.** Because the two knobs only differ on
+  a high-RTT link (on loopback the window can never bind), the comparison was
+  made in a Linux netns with a veth pair and `tc netem delay 70ms` on the
+  server's egress, running the real proxy end to end (SOCKS ingress → QUIC →
+  TCP target) with a 32 MiB single-stream download, alternating builds from the
+  same source: 2 MiB window / 512 KiB spool gave 141.3, 147.6, 149.4, 152.4
+  Mbit/s; 4 MiB window / 2 MiB spool gave 184.0, 190.3, 203.5, 215.8 Mbit/s
+  (medians 148.5 → 196.9, **+33%**, with every 4 MiB run above every 2 MiB run).
+  The window has since been raised again to 8 MiB as a parameter change; the
+  8 MiB figure is analytical (~480 Mb/s ceiling at 140 ms), not re-measured —
+  re-run the same netns comparison before relying on it.
+  Unshaped both sit at ~565 Mbit/s, i.e. the change is neutral when the window
+  is not the bottleneck, and the upload direction is unchanged at ~144 Mbit/s
+  because the receiver there is the server (`send_window`), not the client.
 
 - **Rebuilt release binaries.** `dist/openwrt-x86_64/` must be rebuilt from this
   revision (same four CPU levels) before deployment; the change is client-side

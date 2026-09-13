@@ -39,3 +39,30 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = "symbols"
+
+# quinn-proto is pinned to the `0.11.x` maintenance branch at the revision that
+# carries the fixes we need but that no crates.io release contains yet
+# (0.11.17, published 2026-08-17, predates both):
+#   * f650e0f213  fix payload_bytes double subtraction when evicting outgoing
+#                 datagrams (quinn#2805 / PR #2806) — without it an MTU
+#                 reduction can underflow the datagram byte counter and abort
+#                 the process while holding the connection-state lock;
+#   * b826169972  coalesce contiguous chunks during defragment (PR #2814) — the
+#                 assembler capped the stream receive window at roughly
+#                 frame_len * 2048 (~2.44 MB at a 1200-byte MTU), so a window
+#                 above that could kill the connection with
+#                 INTERNAL_ERROR("too many gaps in stream buffer").
+#
+# Only quinn-proto is patched: quinn 0.11.11 and quinn-udp 0.5.15 on that branch
+# carry the same version numbers as the published crates, so patching them would
+# widen the change surface for no benefit.
+#
+# The revision is pinned rather than tracked by branch, and it is the exact
+# revision this tree was verified against (build, 26 tests, E2E, OpenWrt musl
+# cross-build). WHEN TO REMOVE: once a crates.io quinn-proto release contains
+# both commits above, delete this block, run `cargo update -p quinn-proto`, and
+# re-check `try_send_datagram_saturates_without_panicking` plus the E2E suite —
+# that test aborts on the unfixed path, so it is the gate, not the version
+# number. Bumping the rev later requires the same re-verification.
+[patch.crates-io]
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "d2cf48f12b9cf95de51f317e16ee8976ca3afc2c" }

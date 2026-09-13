@@ -515,6 +515,27 @@ pub fn is_placeholder_token(token: &str) -> bool {
     matches!(token, "change-me" | "change-me-6b1f0c2d47a9")
 }
 
+/// Per-stream receive window (bytes we allow one stream to hold unread).
+///
+/// This is the single-stream throughput ceiling: `window / RTT` caps one flow at
+/// ~120 Mb/s (2 MiB), ~240 Mb/s (4 MiB) or ~480 Mb/s (8 MiB) on a 140 ms path.
+/// 8 MiB is safe now that the pinned quinn-proto bounds assembler spans
+/// structurally (PR #2814) instead of relying on a window small enough to stay
+/// under `MAX_CHUNKS`.
+///
+/// Cost is linear in memory, and the window is a *ceiling*, not a reservation: a
+/// stream only ever holds as much unread data as the peer actually sends, and
+/// `S2C_SPOOL_MAX` is what stops the reader from letting it pile up. The bound
+/// that matters is the aggregate: `RECV_WINDOW` (16 MiB) caps the whole
+/// connection, so N parallel streams share it however they arrive.
+/// Must stay <= `RECV_WINDOW` or a single stream can be starved of credit.
+const STREAM_RECV_WINDOW: u32 = 8 * 1024 * 1024;
+
+/// Aggregate receive window across all streams of one connection. Bounds how
+/// much data a peer may have in flight to us on the whole connection, and is
+/// what parallel Range-download workloads actually hit.
+const RECV_WINDOW: u32 = 16 * 1024 * 1024;
+
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // BBR default; cubic only as escape hatch. Callers validate + log the
@@ -540,44 +561,48 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
-    // Window sizing (2026-09 gaps-death hardening; revised after the reader/
-    // writer split, see `S2C_SPOOL_MAX`).
+    // Window sizing (2026-09; revised for the pinned quinn-proto rev, see
+    // Cargo.toml).
     //
-    // These are two different knobs and only ONE of them is dangerous:
+    // These are two different knobs:
     //
     // * `stream_receive_window` is the ceiling on how many bytes one stream may
-    //   hold *unread*. quinn's advertised window is
-    //   `bytes_read + stream_receive_window`, so once the application stops
-    //   reading, the sender can still fill the whole window with hole-ridden
-    //   data and the reassembly span count climbs to roughly
-    //   `stream_receive_window / 1KB` (measured: 988 spans at 2MB, 1937 at
-    //   4MB, against a 1024 cap that kills the entire connection). The
-    //   decoupled reader does NOT lift this: it only runs ahead by the spool
-    //   budget, and once the spool is full the exposure is the window again.
-    //   So 2MB stays: it is the largest value that keeps the pathological case
-    //   near the cap instead of far past it, and it still covers ~114Mb/s
-    //   single-stream at 140ms.
+    //   hold *unread*, and it is also the knob that caps single-stream
+    //   throughput at `window / RTT` (~120 Mb/s at 2 MiB on a 140 ms path,
+    //   ~480 Mb/s at 8 MiB). It used to be held at 2 MiB because quinn's
+    //   assembler refused a stream once it held more than `MAX_CHUNKS` (1024)
+    //   spans, and a stalled reader accumulated roughly `window / 1KB` spans —
+    //   924 at 2 MiB, 1657 at 4 MiB — so a larger window could kill the whole
+    //   connection with INTERNAL_ERROR("too many gaps in stream buffer").
+    //   That ceiling is gone in the pinned revision: defragment() now coalesces
+    //   any chunk smaller than `buffered / MAX_CHUNKS`, which bounds the span
+    //   count at 1024 for *any* input by construction (PR #2814). The window is
+    //   therefore set by throughput alone now.
     // * `receive_window` is the aggregate budget across all streams on the
-    //   connection and does NOT feed the per-stream span counter, so raising it
-    //   is free of that failure mode. It is what bounds parallel downloads
-    //   (Chrome opens several Range streams per file): 16MB covers ~914Mb/s
-    //   aggregate at 140ms instead of ~457Mb/s at 8MB.
+    //   connection and never fed the per-stream span counter. It is what bounds
+    //   parallel downloads (Chrome opens several Range streams per file): 16 MB
+    //   covers ~914 Mb/s aggregate at 140 ms instead of ~457 Mb/s at 8 MB. It
+    //   must stay >= `stream_receive_window`.
     //
     // The aggregate window MUST be set explicitly: quinn's default is
-    // VarInt::MAX, which would allow up to 1024 streams x 2MB of receive
-    // buffering per connection. 16MB bounds it at 4096 conns x 16MB = 64GB
-    // worst case for *authenticated* peers -- but that memory is only touched
-    // if peers actually send it, the per-stream cap still limits any single
-    // flow to 2MB, and the server caps unauthenticated peers at 256 concurrent
-    // connections (~4GB).
-    t.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
-    t.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    // VarInt::MAX, which would allow up to 1024 streams x 8 MiB of receive
+    // buffering per connection. At 16 MB the aggregate is the binding limit for
+    // more than two concurrent wide-window streams, which is the intended
+    // trade (a per-connection 64 GB worst case for 4096 conns)
+    // worst case for *authenticated* peers -- only touched if peers actually
+    // send it, the per-stream cap still limits any single flow, and the server
+    // caps unauthenticated peers at 256 concurrent connections (~4 GB).
+    t.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECV_WINDOW));
+    t.receive_window(quinn::VarInt::from_u32(RECV_WINDOW));
     // Send side is driven by what *we* read from the target, but a malicious
     // client can still pin it (dial a fast local service, never read QUIC).
-    // Kept at 4MB: the send direction has no span-cap failure mode, so this is
-    // purely a memory bound on how much unread target data we buffer.
+    // Kept at 4MB: the send direction has no assembler/span failure mode, so
+    // this is purely a memory bound on how much unread target data we buffer.
     // ~228Mb/s single-stream at 140ms; the per-connection product is in the
-    // README limits table.
+    // README limits table. It stays at 4MB while the receive side moved to 8MB
+    // so that a download-shaped flow is not throttled by *our* send window on
+    // the return path (ACKs and requests are tiny; this is headroom, not a
+    // throughput setting).
     t.send_window(4 * 1024 * 1024);
     // Clamp so absurd config values cannot overflow the QUIC VarInt timeout.
     let keep_alive_secs = keep_alive_secs.clamp(1, 3600);
@@ -1745,25 +1770,69 @@ pub async fn copy_tcp_quic_acked(
 /// spawned tasks from leaving idle memory behind on every worker thread.
 struct CopyBuf(&'static mut [u8]);
 
+/// Process-wide spool budget. Bytes are acquired before queueing and released
+/// as the writer drains, so this bounds the *sum* of every live spool without
+/// penalising streams that are not actually holding data.
+fn s2c_budget() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(S2C_SPOOL_BUDGET)))
+}
+
 /// Bytes that may sit in the QUIC→TCP spool before the reader pauses.
 ///
-/// Rationale (gaps-death, measured): quinn retires a reassembly span only when
-/// the application *reads* the stream, so the number of spans a stalled flow
-/// can accumulate is bounded by how many bytes are allowed to pile up unread.
-/// Reconstructing quinn's assembler gives roughly `bytes / 1024` spans on a
-/// lossy path: 375 at 512 KiB, 988 at 1 MiB, 1937 at 4 MiB against a 1024 cap.
+/// The spool decouples the QUIC drain from the local consumer: quinn retires a
+/// reassembly span only when the application *reads* the stream, so keeping the
+/// reader running while the local socket is blocked is what keeps the span
+/// count in the single digits and the connection out of a stall.
 ///
-/// The spool is what lets the reader keep draining during a stall, so the
-/// budget has to stay small enough that the *sum* of spool plus the single
-/// in-flight read stays far below the cap. 512 KiB leaves a ~2.7x margin and
-/// still absorbs a stall of ~0.4 s at 10 Mb/s or ~40 ms at 100 Mb/s before the
-/// reader has to pause.
-const S2C_SPOOL_MAX: usize = 512 * 1024;
+/// Sizing rationale (revised for the pinned quinn-proto rev):
+/// * It used to be a *safety* limit — spans scaled as `bytes / ~1KB`, so
+///   512 KiB + 32 KiB in flight (~531 spans) had to stay far below the 1024
+///   cap. The pinned revision removed that cap structurally, so this is now a
+///   pure "how long a consumer stall do we absorb" knob.
+/// * Sized for stall absorption, not as a fraction of the receive window: the
+///   arrival rate times the stall we want to ride out. 2 MiB absorbs ~160 ms at
+///   100 Mb/s (and ~1.6 s at 10 Mb/s), which covers the local-consumer stalls we
+///   actually see (browser rendering, SD-card writes, app decode).
+/// * It must stay well below `STREAM_RECV_WINDOW` so the *spool* is the binding
+///   limit rather than the flow-control window. It deliberately does not scale
+///   with the window: the spool is sized for the stall it must absorb, and the
+///   shipped 2 MiB (plus 64 KiB in flight) is about 25% of the 8 MiB stream
+///   window, leaving ~3.9x headroom. Widening the window therefore cannot make
+///   flow control the binding limit first.
+/// * Bound the product, not just the per-stream figure: `S2C_SPOOL_BUDGET` caps
+///   the sum across every stream in the process.
+const S2C_SPOOL_MAX: usize = 2 * 1024 * 1024;
 
-/// Bound on bytes held in-flight by one reader step. Bounds overshoot past
-/// [`S2C_SPOOL_MAX`] by at most one chunk, and keeps the spool's accounting
+/// Process-wide cap on bytes queued across *all* QUIC→TCP spools.
+///
+/// Per-stream budgets multiply: at `max_concurrent_bidi_streams` (1024) and the
+/// 4096-connection cap the shipped 512 KiB figure was already a ~2 TiB
+/// theoretical ceiling, and 2 MiB would make it ~8 TiB. The product is only
+/// reachable if peers actually fill every stream at once, but it should still
+/// have a gate. Streams acquire budget for the bytes they queue and release it
+/// as the writer drains, so the cap binds only on genuinely concurrent spool
+/// occupancy; a stream that cannot get budget inside
+/// [`S2C_BUDGET_WAIT`] proceeds with whatever it holds.
+const S2C_SPOOL_BUDGET: usize = 64 * 1024 * 1024;
+
+/// How long a reader waits for spool budget before proceeding with less.
+///
+/// Not a failure path: the wait exists so a burst of streams cannot starve one
+/// reader indefinitely. Timing out simply means this stream keeps draining into
+/// its own (smaller) allowance, and progress still comes from the writer
+/// releasing budget as it writes to the local socket.
+const S2C_BUDGET_WAIT: Duration = Duration::from_millis(250);
+
+/// Bound on bytes held in-flight by one reader step. Bounds overshoot past the
+/// per-stream budget by at most one chunk, and keeps the spool's accounting
 /// honest (the length is known before the chunk is queued).
-const S2C_READ_CHUNK: usize = 32 * 1024;
+///
+/// 64 KiB rather than 32 KiB so a 4 MiB stream window can be refilled in fewer
+/// steps (`recv.read` copies into this buffer under a single connection-state
+/// lock acquisition, so a larger step also means fewer lock acquisitions at the
+/// rates the wider window now allows).
+const S2C_READ_CHUNK: usize = 64 * 1024;
 
 /// SPSC-ish byte spool between the QUIC reader and the TCP writer.
 ///
@@ -1779,7 +1848,9 @@ struct Spool {
 
 #[derive(Default)]
 struct SpoolState {
-    queue: std::collections::VecDeque<Bytes>,
+    /// Each entry carries the process-wide budget permit that was acquired for
+    /// it, so writing (and dropping) the chunk returns the budget to the pool.
+    queue: std::collections::VecDeque<(Bytes, tokio::sync::OwnedSemaphorePermit)>,
     queued_bytes: usize,
     /// Set by the reader once the QUIC stream reached EOF and stopped queueing.
     reader_done: bool,
@@ -1814,8 +1885,9 @@ impl SpoolChannel {
         lock_mutex(&self.spool.inner).queued_bytes
     }
 
-    /// Queue a chunk. Returns `false` if the peer stopped the pump.
-    fn push(&self, bytes: Bytes) -> bool {
+    /// Queue a chunk together with the budget permit acquired for it. Returns
+    /// `false` if the peer stopped the pump (the permit is then dropped here).
+    fn push(&self, bytes: Bytes, permit: tokio::sync::OwnedSemaphorePermit) -> bool {
         {
             let mut st = lock_mutex(&self.spool.inner);
             if st.stopped {
@@ -1825,7 +1897,7 @@ impl SpoolChannel {
             if st.queued_bytes as u64 > self.peak.load(Ordering::Relaxed) {
                 self.peak.store(st.queued_bytes as u64, Ordering::Relaxed);
             }
-            st.queue.push_back(bytes);
+            st.queue.push_back((bytes, permit));
         }
         self.data.notify_one();
         true
@@ -1847,9 +1919,11 @@ impl SpoolChannel {
         let out = {
             let mut st = lock_mutex(&self.spool.inner);
             match st.queue.pop_front() {
-                Some(b) => {
+                Some((b, permit)) => {
                     st.queued_bytes -= b.len();
                     space_freed = true;
+                    // Budget returns to the process-wide pool as this drops.
+                    drop(permit);
                     Some(Some(b))
                 }
                 // Queue empty: finished only once the reader says so.
@@ -1878,7 +1952,12 @@ impl SpoolChannel {
 
 /// Copy chunk: large enough that a high-BDP stream is not syscall-bound, small
 /// enough that thousands of them do not dominate the RSS.
-const COPY_CHUNK: usize = 32 * 1024;
+const COPY_CHUNK: usize = 64 * 1024;
+
+// A reader step may not exceed the pooled copy buffer it reads into, or the
+// slice index would panic (this is exactly what a `S2C_READ_CHUNK` bump without
+// a matching `COPY_CHUNK` bump does).
+const _: () = assert!(S2C_READ_CHUNK <= COPY_CHUNK);
 /// Per-thread pool depth. Two directions per flow are active at a time, so a
 /// handful of slots covers the common case without hoarding memory.
 const COPY_POOL_MAX: usize = 8;
@@ -2100,7 +2179,10 @@ async fn copy_tcp_quic_inner(
                             last_read_ms = b2.elapsed().as_millis() as u64;
                             continue;
                         }
-                        let want = S2C_READ_CHUNK.min(S2C_SPOOL_MAX - queued);
+                        // Budget is reserved for the bytes actually arriving, not
+                        // for the whole per-stream allowance: reserving upfront
+                        // would charge idle streams against every other stream.
+                        let want = S2C_READ_CHUNK.min(S2C_SPOOL_MAX.saturating_sub(queued));
                         let attempt_ms = b2.elapsed().as_millis() as u64;
                         let n = match recv.read(&mut buf[..want]).await {
                             Ok(Some(0)) | Ok(None) => break,
@@ -2144,7 +2226,32 @@ async fn copy_tcp_quic_inner(
                         last_read_ms = now;
                         total += n as u64;
                         chunks += 1;
-                        if !spool.push(Bytes::copy_from_slice(&buf[..n])) {
+                        // Reserve process-wide budget for this chunk. The wait is
+                        // not a failure path, and it must not drop the bytes just
+                        // read (that would corrupt the stream), so it retries:
+                        // the writer releases budget for every chunk it drains, so
+                        // a waiter always makes progress once the consumer moves.
+                        let permit = loop {
+                            let mark = tokio::time::Instant::now();
+                            match tokio::time::timeout(
+                                S2C_BUDGET_WAIT,
+                                s2c_budget().clone().acquire_many_owned(n as u32),
+                            )
+                            .await
+                            {
+                                Ok(Ok(p)) => break p,
+                                Ok(Err(_)) => return Ok::<u64, anyhow::Error>(total),
+                                Err(_) => {
+                                    // Counted as backpressure, like the per-stream
+                                    // budget: the reader is waiting on the consumer,
+                                    // not on the network.
+                                    credit_wait_ms += mark.elapsed().as_millis() as u64;
+                                    credit_waits += 1;
+                                    last_read_ms = b2.elapsed().as_millis() as u64;
+                                }
+                            }
+                        };
+                        if !spool.push(Bytes::copy_from_slice(&buf[..n]), permit) {
                             return Ok::<u64, anyhow::Error>(total);
                         }
                         let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
