@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
     // Tuned socket buffers so bursts do not drop before quinn sees them.
     let rt = Arc::new(quinn::TokioRuntime);
     let std_sock = udp_socket_dual("[::]:0")?;
-    let mut ep = quinn::Endpoint::new_with_abstract_socket(
+    let ep = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
         rt.wrap_udp_socket(std_sock)?,
@@ -425,15 +425,13 @@ const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Confirm that a freshly dialed connection is actually alive before it is
 /// published to the shared slot.
 ///
-/// quinn's `Connecting` resolves `Ok` even when the underlying connection
-/// terminated instead of completing its handshake: the `on_connected` oneshot
-/// carries the 0-RTT accept flag, but `Connecting::poll` discards it and always
-/// yields `Ok(Connection)`, while `ConnectionInner::terminate` fires that same
-/// oneshot (with `false`) for *every* connection that ends — including one that
-/// never established. Without this check the reconnect loop can publish a
-/// connection that is already closed, log "QUIC connected", and hand every new
-/// SOCKS flow a dead handle until quinn's idle timeout expires ~15 s later.
-/// Yielding once lets the connection driver deliver the terminal event, after
+/// quinn-0.11's `Connecting` resolved `Ok` even when the underlying connection
+/// terminated instead of completing its handshake, which let the reconnect loop
+/// publish a connection that was already closed, log "QUIC connected", and hand
+/// every new SOCKS flow a dead handle until quinn's idle timeout expired ~15 s
+/// later. quinn 0.12 reports the terminal error from `Connecting` itself, so
+/// this is now a cheap belt-and-braces guard rather than the only defence:
+/// yielding once lets the connection driver deliver any terminal event, after
 /// which `close_reason()` is populated and the dial is reported as the failure
 /// it is.
 async fn ensure_dialed_alive(conn: &quinn::Connection) -> bool {
@@ -452,41 +450,61 @@ async fn dial_once(
 ) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
     let connecting = ep.connect(server, name)?;
-    // 0-RTT: send the auth token in early data, then WAIT for the server's
-    // accept/reject decision before handing the connection to application
-    // flows. quinn discards every stream and DATAGRAM sent in rejected early
-    // data (and resets stream ids), so using the connection before `accepted`
-    // resolves would silently lose SOCKS requests and could make a stale
-    // stream handle alias a newly opened stream. The token still rides early
-    // data, which is the part that actually saves a round trip on resumption.
+    // 0-RTT: send the auth token in early data, then WAIT for the handshake to
+    // complete before handing the connection to application flows. quinn
+    // discards every stream and DATAGRAM sent in rejected early data (and
+    // resets stream ids), so using the connection before the handshake is known
+    // to have completed would silently lose SOCKS requests and could make a
+    // stale stream handle alias a newly opened stream. The token still rides
+    // early data, which is the part that actually saves a round trip on
+    // resumption.
+    //
+    // quinn 0.12 removed the `ZeroRttAccepted` future that reported the
+    // server's early-data decision; the supported signal is now
+    // `SendStream::stopped()` on the finished early stream, which yields
+    // `ZeroRttRejected` exactly when the server discarded it.
     let conn = match connecting.into_0rtt() {
-        Ok((conn, accepted)) => {
+        Ok(conn) => {
             let token = auth_token.to_owned();
             let needs_auth = !token.is_empty();
             // A failed early-data write must not fail the whole dial: the
-            // handshake may still complete at 1-RTT.
-            let early_send_failed = if needs_auth {
-                send_auth(&conn, &token).await.is_err()
+            // handshake may still complete at 1-RTT, in which case the token is
+            // re-sent below.
+            let early_auth = if needs_auth {
+                match send_auth_stream(&conn, &token).await {
+                    Ok(uni) => Some(uni),
+                    Err(e) => {
+                        tracing::debug!("0-RTT auth write failed ({e:#}); will re-send at 1-RTT");
+                        None
+                    }
+                }
             } else {
-                false
+                None
             };
-            let accepted_ok = matches!(
-                tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, accepted).await,
-                Ok(true)
+            // `authenticated` resolves `Err` when the connection was lost before
+            // the handshake finished, so a dead dial can never be published here.
+            let handshake_ok = matches!(
+                tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, conn.authenticated()).await,
+                Ok(Ok(()))
             );
-            tracing::debug!("QUIC resumption: 0-RTT keys accepted={accepted_ok}");
-            if !accepted_ok {
-                // `accepted` reports `true` only once the handshake actually
-                // finished, so a `false` here means there is no 1-RTT connection
-                // to hand out (the server is gone, or it refused early data and
-                // the handshake then failed). Reporting this as a failed dial is
-                // what keeps a dead handle out of `shared`.
+            tracing::debug!("QUIC resumption: 1-RTT handshake complete={handshake_ok}");
+            if !handshake_ok {
                 anyhow::bail!("0-RTT offered but the handshake did not complete");
             }
-            if needs_auth && early_send_failed {
-                // Rejected early data discarded the auth stream; re-send it on
-                // the now-established connection so the server does not sit
-                // out its auth timeout and close us.
+            // Rejected early data discarded the auth stream; re-send it on the
+            // now-established connection so the server does not sit out its auth
+            // timeout and close us. An absent handle means the early write
+            // itself failed, which needs the same recovery.
+            if needs_auth
+                && match &early_auth {
+                    Some(uni) => matches!(
+                        tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, uni.stopped()).await,
+                        Ok(Err(quinn::StoppedError::ZeroRttRejected))
+                    ),
+                    None => true,
+                }
+            {
+                tracing::debug!("QUIC 0-RTT rejected: re-sending auth at 1-RTT");
                 send_auth(&conn, &token).await?;
             }
             conn
@@ -512,7 +530,11 @@ async fn dial_once(
     Ok(conn)
 }
 
-async fn send_auth(conn: &quinn::Connection, token: &str) -> Result<()> {
+/// Open a uni stream and write the auth token into it.
+///
+/// Returns the stream so the 0-RTT path can await [`quinn::SendStream::stopped`]
+/// and learn whether the server kept the early data.
+async fn send_auth_stream(conn: &quinn::Connection, token: &str) -> Result<quinn::SendStream> {
     let mut uni = tokio::time::timeout(Duration::from_secs(5), conn.open_uni())
         .await
         .context("auth stream open timed out")??;
@@ -520,7 +542,11 @@ async fn send_auth(conn: &quinn::Connection, token: &str) -> Result<()> {
         .await
         .context("auth write failed")?;
     uni.finish().ok();
-    Ok(())
+    Ok(uni)
+}
+
+async fn send_auth(conn: &quinn::Connection, token: &str) -> Result<()> {
+    send_auth_stream(conn, token).await.map(|_| ())
 }
 
 async fn wait_conn(

@@ -15,11 +15,12 @@ ALPN `myquic2/2` so version-skewed peers fail closed at the handshake).
 
 The 2026-09 hardening revision adds optional shared-secret client authentication,
 process-wide resource caps, PMTU-aware DATAGRAM sizing, 0-RTT-safe authentication, and
-a corrected reconnect path. The latest pass removes a **process-abort** reachable from
+a corrected reconnect path. A previous pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
-quinn-proto's drop-oldest DATAGRAM path) and strips the remaining per-flow allocations
-from the TCP-open path — see
-[Hardening notes](#2026-09-hardening-pass-5). Every behaviour documented below was
+quinn-proto's drop-oldest DATAGRAM path) and stripped the remaining per-flow allocations
+from the TCP-open path; the latest pass moves all three quinn crates off crates.io onto
+upstream `main` (0.12), which is where that DATAGRAM fix lives — see
+[Hardening notes](#2026-09-hardening-pass-8). Every behaviour documented below was
 re-verified end-to-end on this revision — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
@@ -43,7 +44,7 @@ re-verified end-to-end on this revision — see
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5) and [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -54,7 +55,7 @@ re-verified end-to-end on this revision — see
 | Area | Detail |
 |---|---|
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
-| **Transport** | QUIC (quinn 0.11), TLS 1.3 only, one long-lived connection per client process shared by all flows |
+| **Transport** | QUIC (quinn 0.12, pinned to upstream `main`), TLS 1.3 only, one long-lived connection per client process shared by all flows |
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
@@ -234,7 +235,7 @@ source address.
 
 | # | Test | Result |
 |---|---|---|
-| 1 | `cargo test` (codec round-trips, borrowed-datagram round-trip, DNS key normalization/injectivity, `is_global_ip` filter, DATAGRAM send-buffer saturation, MQP/SOCKS header length + framing) | ✅ 16/16 |
+| 1 | `cargo test --all-targets` (codec round-trips, borrowed-datagram round-trip, DNS key normalization/injectivity, `is_global_ip` filter, DATAGRAM send-buffer saturation, MQP/SOCKS header length + framing) | ✅ 19/19 |
 | 2 | TCP ECHO via SOCKS5 `CONNECT` (1 MiB random) | ✅ repeated runs |
 | 3 | UDP ECHO via `UDP ASSOCIATE` (25 × 1000 B) | ✅ repeated runs, BND = relay address |
 | 4 | Server `kill -9` → restart → reconnect → TCP+UDP ECHO | ✅ detects in ~15 s (idle timeout; 20 s watchdog backstop), redial < 0.4 s, kill→usable 17.5 s; a UDP association opened *before* the kill and one opened *during* the outage both self-heal |
@@ -254,6 +255,17 @@ Additional checks run on the pass-5 revision (macOS, loopback):
 | 13 | Domain-target `CONNECT` end-to-end (server-side DNS, `localhost`) | ✅ 5/5 transfers, no `bad connect target` |
 | 14 | UDP at 20–25k datagrams/s, windowed round trip | ✅ 0.00% loss, RTT p50 0.11–0.13 ms |
 | 15 | 128-datagram bursts ×300 | ✅ 100% replied, burst completion p50 1.8 ms |
+
+Additional checks run on the pass-8 revision (quinn 0.12 from upstream `main`,
+macOS, loopback, `cargo build --release`, token auth enabled on both sides):
+
+| # | Test | Result |
+|---|---|---|
+| 16 | TCP ECHO via SOCKS5 `CONNECT` (1 MiB random) over a full handshake | ✅ 1048576 B byte-for-byte |
+| 17 | UDP ECHO via `UDP ASSOCIATE` (25 × 1000 B) | ✅ 25/25, BND = relay address |
+| 18 | Server `kill -9` → restart → reconnect: the client offers a **stale 0-RTT ticket** the restarted server rejects | ✅ `QUIC 0-RTT rejected: re-sending auth at 1-RTT` then TCP (64 KiB) + UDP (25/25) echo pass — the rejection is detected through `SendStream::stopped()`, not a redial |
+| 19 | 0-RTT probe with token, same server process | ✅ `0-RTT offered`, `server accepted 0-RTT early data = true`, echo over early data; acceptance derived from `stopped()` in 3.0 s (the probe's own sleep) |
+| 20 | `cargo clippy --all-targets` + `cargo fmt --check` | ✅ clean |
 
 0-RTT probe (expect the last four lines):
 
@@ -285,9 +297,13 @@ The E2E harness is intentionally not vendored; it is a plain Python SOCKS5 clien
 
 ## Requirements
 
-- **Rust** 1.88+ (MSRV driven by `time 0.3.55` / `rcgen 0.14.10`; developed and
-  tested on stable 1.97.1; deps: quinn 0.11.11 / quinn-proto 0.11.17, rustls
-  0.23.44, tokio 1.53.1)
+- **Rust** 1.88+ (MSRV driven by `time 0.3.55` / `rcgen 0.14.10` and by quinn
+  0.12, which requires 1.88; developed and tested on stable 1.97.1; deps: quinn
+  0.12.0 / quinn-proto 0.12.0 / quinn-udp 0.6.2 from
+  [`quinn-rs/quinn` `main`](https://github.com/quinn-rs/quinn) `621e38ab`, rustls
+  0.23.44, tokio 1.53.1). The quinn crates are a **git dependency**: the first
+  build needs network access to fetch them, and `cargo update -p quinn` advances
+  all three to the then-current `main`.
 - **Linux** (production; GSO/GRO + BBR fully effective) or **macOS** (development;
   dual-stack verified, GSO degrades gracefully)
 - For OpenWrt cross builds: `zig` + `cargo-zigbuild` (see [Building](#building))
@@ -515,16 +531,19 @@ Against RFC 1928 / RFC 1929:
   stable connectivity, so a misconfigured peer (e.g. wrong token) cannot cause a
   redial storm. A stale 0-RTT ticket is rejected once and the token is re-sent on the
   established connection (verified: server `kill -9` → reconnect → TCP+UDP ECHO pass).
-- **A dial is not accepted until the connection is proven alive** (pass 7). quinn's
-  `Connecting` future resolves `Ok` even for a connection that terminated instead of
-  handshaking: the `on_connected` oneshot it awaits carries the 0-RTT accept flag, but
-  `Connecting::poll` discards that flag and always yields `Ok(Connection)`, while
-  `ConnectionInner::terminate` fires the same oneshot (with `false`) for *every*
-  connection that ends — including one that never established. The reconnect loop used
-  to publish that dead handle to `shared` and log `QUIC connected` for it, so every new
-  SOCKS flow in the meantime was handed a dead connection until quinn's idle timeout
-  fired (~15 s). `dial_once` now treats a refused/short 0-RTT handshake as a failed
-  dial, verifies `close_reason()` after one yield, and bounds each attempt with
+- **A dial is not accepted until the connection is proven alive** (pass 7, reworked in
+  pass 8). quinn-0.11's `Connecting` future resolved `Ok` even for a connection that
+  terminated instead of handshaking: the `on_connected` oneshot it awaited carried the
+  0-RTT accept flag, but `Connecting::poll` discarded that flag and always yielded
+  `Ok(Connection)`, while `ConnectionInner::terminate` fired the same oneshot (with
+  `false`) for *every* connection that ends — including one that never established. The
+  reconnect loop used to publish that dead handle to `shared` and log `QUIC connected`
+  for it, so every new SOCKS flow in the meantime was handed a dead connection until
+  quinn's idle timeout fired (~15 s). quinn 0.12 returns the terminal error from
+  `Connecting` instead, and the 0-RTT path now gates on `Connection::authenticated()`
+  (which fails for a connection lost before its handshake), so a dead dial cannot be
+  published; `dial_once` still treats a refused/short 0-RTT handshake as a failed dial,
+  verifies `close_reason()` after one yield, and bounds each attempt with
   `DIAL_ATTEMPT_TIMEOUT` (5 s) instead of QUIC's ~15 s Initial-retransmission budget —
   so the first attempt after a restart succeeds instead of waiting out the previous
   one's timeout. Measured: server `kill -9` → detection ≈ 20 s → reconnect ≈ 0.3–0.4 s
@@ -855,7 +874,7 @@ average batch of 1.06 datagrams — and this pass did not re-litigate it.
 
 **Outside this codebase's control.** The single biggest cost on the UDP path is that
 quinn takes the connection-state mutex once per DATAGRAM, on both `read_datagram()` and
-`send_datagram_wait()` (whose `poll` also calls `state.wake()`), and quinn 0.11 exposes no
+`send_datagram_wait()` (whose `poll` also calls `state.wake()`), and quinn 0.12 exposes no
 batched receive or a wake/transmit-only entry point to avoid it. Reading one datagram per
 lock acquisition is therefore a floor this revision cannot go below without patching
 quinn; the changes above remove everything the application was adding *on top* of it. The
@@ -890,6 +909,49 @@ detection, stale-ticket redials, then TCP+UDP self-heal).
   revision for all four CPU levels (v1–v4: static musl, x86-64, stripped).
   Re-copy them to the router; the fix is server- and client-side.
 
+### 2026-09 hardening pass 8 — quinn crates moved to upstream main
+
+- **Dependency swap.** `quinn`, `quinn-proto` and `quinn-udp` are no longer taken
+  from crates.io (0.11.11 / 0.11.17 / 0.5.15); all three now come from one git
+  source, [`quinn-rs/quinn` `main`](https://github.com/quinn-rs/quinn) at
+  `621e38ab` (0.12.0 / 0.12.0 / 0.6.2). `Cargo.lock` pins the exact commit, so
+  builds stay reproducible; `cargo update -p quinn` moves the three forward
+  together. This is what retires the pass-5 workaround: upstream moved the
+  counter into the datagram buffer itself, so every mutation keeps it in sync
+  (`drop_oversized` now decrements exactly what it removes), and the
+  `.expect("datagrams.outgoing.payload_bytes desynchronized")` abort path no
+  longer exists. `try_send_datagram` is kept — not for safety any more, but
+  because the relay wants `Blocked` reports and drop-*newest* semantics, where
+  `send_datagram` silently evicts the oldest queued datagram.
+- **0-RTT API migration (breaking upstream change).** 0.12 removed the
+  `ZeroRttAccepted` future that `Connecting::into_0rtt()` returned, and
+  `Connection::authenticated()` reports only "handshake finished or connection
+  lost" — it does **not** carry the early-data decision. The client still refuses
+  to publish a connection before the handshake completes (now by awaiting
+  `authenticated()`, which also surfaces a dead dial as `Err`), and detects
+  rejection the way upstream documents: `SendStream::stopped()` on the finished
+  early auth stream yields `ZeroRttRejected`. On rejection the token is re-sent
+  over the established 1-RTT connection instead of failing the dial and
+  redialing, so a server that declines early data no longer costs a dial.
+- **Server handshake gate.** The 0.5-RTT accept path awaits
+  `Connection::authenticated()` in place of the removed `ZeroRttAccepted`, and
+  now also aborts on a failed handshake rather than only on the timeout.
+- **`Connecting` no longer hides a dead dial.** 0.12 returns the terminal error
+  instead of `Ok` for a connection that terminated before its handshake;
+  `ensure_dialed_alive` stays as a cheap guard.
+- **Minor API churn.** `Endpoint::set_default_client_config` takes `&self` (the
+  now-redundant `mut` endpoint bindings are gone); `examples/zero_rtt_probe.rs`
+  derives the "server accepted 0-RTT" line from `stopped()` and falls back to the
+  echoed early data as its own proof when no auth token is configured.
+
+Verified end-to-end on loopback with token auth on both sides (tests 16–20 in
+[Verification & E2E Tests](#verification--e2e-tests)): `cargo test --all-targets`
+19/19, `cargo clippy --all-targets` and `cargo fmt --check` clean, TCP `CONNECT`
+(1 MiB) and UDP `ASSOCIATE` (25 × 1000 B) byte-for-byte, and a `kill -9` →
+restart cycle in which the client's **stale 0-RTT ticket is rejected** and the
+token is re-sent at 1-RTT before the flows recover. `dist/openwrt-x86_64/` was
+rebuilt from this revision for all four CPU levels.
+
 ---
 
 ## Roadmap
@@ -910,7 +972,8 @@ detection, stale-ticket redials, then TCP+UDP self-heal).
 - [x] Reconnect `shared` TOCTOU + DNS overload-path write-lock stalls (pass 7)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
-- [ ] Pin the quinn-proto patch release once the upstream DATAGRAM accounting fix lands
+- [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
+      upstream DATAGRAM accounting fix (pass 8); `Cargo.lock` pins the commit
 
 ---
 

@@ -477,9 +477,9 @@ pub fn server_tls_config(
     // Accept QUIC 0-RTT early data on resumption. quinn requires exactly 0 or u32::MAX here.
     // Replay caveat: tickets are single-use and short-lived; worst case is a duplicated
     // outbound dial, no amplification.
-    // quinn-0.11 hard-requires 0 or u32::MAX here (panics otherwise), so the
-    // bound cannot be lowered at this layer; replay exposure is limited by
-    // single-use short-lived tickets instead.
+    // quinn (and QUIC itself) only permits 0 or u32::MAX here — anything else is
+    // a protocol violation, so the bound cannot be lowered at this layer; replay
+    // exposure is limited by single-use short-lived tickets instead.
     cfg.max_early_data_size = u32::MAX;
     Ok(Arc::new(cfg))
 }
@@ -575,7 +575,8 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
             .expect("idle timeout must fit in a QUIC VarInt"),
     ));
     // NOTE: quinn-udp auto-probes GSO/GRO (UDP_SEGMENT) + PMTU discovery;
-    // no explicit max_udp_payload flag in 0.11 API — 1350B datagram cap enforced in encode_datagram.
+    // no explicit max_udp_payload flag in the quinn API — the 1350B datagram cap
+    // is enforced in encode_datagram.
     Arc::new(t)
 }
 
@@ -1300,24 +1301,29 @@ fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
 /// `Connection::send_datagram`.
 ///
 /// `send_datagram` is documented as "drop the oldest queued datagram when the
-/// buffer is full", but that path is broken in quinn-proto 0.11.17:
-/// `Connection::drop_oversized` (called whenever the path MTU shrinks) removes
-/// datagrams from the outgoing queue and decrements `payload_bytes` for each,
-/// yet a datagram re-queued by `DatagramState::write` was already decremented by
-/// `pop_front` — so the byte counter is decremented twice. It underflows to
-/// `usize::MAX`, `memory_used()` then looks astronomically large while the
-/// queue is empty, and the next `send_datagram` panics on
+/// buffer is full", and that path used to be broken: quinn-proto 0.11.17's
+/// `Connection::drop_oversized` (called whenever the path MTU shrinks) removed
+/// datagrams from the outgoing queue and decremented `payload_bytes` for each,
+/// yet a datagram re-queued by `DatagramState::write` had already been
+/// decremented by `pop_front` — so the byte counter was decremented twice. It
+/// underflowed to `usize::MAX`, `memory_used()` then looked astronomically large
+/// while the queue was empty, and the next `send_datagram` panicked on
 /// `.expect("datagrams.outgoing.payload_bytes desynchronized")` inside quinn's
 /// connection-state mutex, poisoning it and aborting the whole process.
-///
 /// Reproduced on loopback with a 1200-byte payload against a peer whose
-/// `max_datagram_size()` had shrunk to 1162 bytes, so this is reachable by any
+/// `max_datagram_size()` had shrunk to 1162 bytes, so it was reachable by any
 /// PMTU reduction — i.e. by normal network conditions, not just a hostile peer.
 ///
-/// `send_datagram_wait` takes the bounded (`Blocked`) path instead, which never
-/// touches that bookkeeping, so polling it once gives drop-on-full semantics
-/// without the crash. Bytes are copied per datagram regardless (quinn assembles
-/// each datagram frame with `extend_from_slice`), so this costs nothing extra.
+/// Upstream fixed the bookkeeping (the counter now lives inside the datagram
+/// buffer and `drop_oversized` only decrements what it actually removes), so the
+/// crash is gone. This wrapper is kept because the relay still wants its
+/// semantics: `send_datagram_wait` failing with the bounded (`Blocked`) path
+/// reports the drop to the caller and discards the *newest* datagram, whereas
+/// `send_datagram` silently evicts the *oldest* queued one and returns `Ok`. The
+/// callers count and log `Blocked`, so switching would quietly erase the
+/// per-connection drop accounting. Bytes are copied per datagram regardless
+/// (quinn assembles each datagram frame with `extend_from_slice`), so this costs
+/// nothing extra.
 pub fn try_send_datagram(conn: &quinn::Connection, d: Bytes) -> DatagramSend {
     match poll_once(conn.send_datagram_wait(d)) {
         Some(Ok(())) => DatagramSend::Sent,
@@ -2049,13 +2055,15 @@ mod tests {
         assert_eq!(dns_key("same", 1, &mut a).unwrap(), "same\u{0}1");
     }
 
-    /// Live regression test for the quinn-proto drop-oldest panic.
+    /// Live regression test for the quinn-proto datagram accounting.
     ///
     /// Saturation runs the send path that used to reach quinn's broken
     /// `datagrams.outgoing.payload_bytes` bookkeeping. With `try_send_datagram`
     /// a full buffer must surface as `Blocked` (the datagram is dropped) and
-    /// must never panic; before the fix this test aborted the whole process
-    /// with `datagrams.outgoing.payload_bytes desynchronized`.
+    /// must never panic; on quinn-proto 0.11.17 this test aborted the whole
+    /// process with `datagrams.outgoing.payload_bytes desynchronized`. The
+    /// underflow is fixed upstream, so the test now guards against a regression
+    /// in that accounting.
     #[tokio::test]
     async fn try_send_datagram_saturates_without_panicking() {
         async fn endpoint_pair() -> (quinn::Endpoint, quinn::Endpoint) {
@@ -2092,7 +2100,7 @@ mod tests {
             let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
             let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
             ccfg.transport_config(build_transport("bbr", 5));
-            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             client.set_default_client_config(ccfg);
             (client, server)
         }

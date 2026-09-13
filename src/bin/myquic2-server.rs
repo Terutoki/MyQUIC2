@@ -248,14 +248,21 @@ async fn main() -> Result<()> {
             // 0.5-RTT accept: streams usable before handshake completes on resumption.
             let conn = match incoming.accept() {
                 Ok(connecting) => match connecting.into_0rtt() {
-                    Ok((c, accepted)) => {
+                    Ok(c) => {
                         // A server-side `into_0rtt` always succeeds (0.5-RTT), but
                         // an unfinished handshake must not hold the connection
                         // permit; wait (bounded) for the handshake before
-                        // consuming the token. The client already waits for the
-                        // 0-RTT decision, so this costs it no latency.
-                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepted).await {
-                            Ok(_) => c,
+                        // consuming the token. quinn 0.12 signals this with
+                        // `authenticated()` (it replaced the `ZeroRttAccepted`
+                        // future) and reports a lost connection as `Err`. The
+                        // client already waits for the same event, so this costs
+                        // it no latency.
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, c.authenticated()).await {
+                            Ok(Ok(())) => c,
+                            Ok(Err(e)) => {
+                                warn!("handshake failed: {e:#}");
+                                return;
+                            }
                             Err(_) => {
                                 warn!("handshake timed out after {HANDSHAKE_TIMEOUT:?}");
                                 return;

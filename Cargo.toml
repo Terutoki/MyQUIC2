@@ -20,7 +20,14 @@ path = "src/bin/myquic2-client.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
-quinn = { version = "0.11" }
+# quinn + quinn-proto + quinn-udp all come from one git source. The newest
+# published crates are quinn 0.11.11 / quinn-proto 0.11.17 / quinn-udp 0.5.15, and
+# quinn-proto 0.11.17 still carries the DATAGRAM byte-accounting underflow this
+# project guards against (see `try_send_datagram`). Upstream `main` (0.12.0) has
+# that fix, so the workaround is no longer load-bearing. Taking the workspace as a
+# single git source keeps the three crates in lockstep; Cargo.lock pins the exact
+# commit and `cargo update -p quinn` moves it forward.
+quinn = { git = "https://github.com/quinn-rs/quinn", branch = "main" }
 rustls = { version = "0.23", features = ["ring", "std", "logging"] }
 rcgen = "0.14"
 time = "0.3"
