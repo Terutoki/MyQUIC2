@@ -512,6 +512,53 @@ pub fn is_placeholder_token(token: &str) -> bool {
     matches!(token, "change-me" | "change-me-6b1f0c2d47a9")
 }
 
+/// Target bandwidth for the TCP tuning below: 300Mb/s.
+///
+/// The deployment this build is tuned for is a ~140ms RTT WAN link (e.g. a
+/// trans-Pacific hop) where one TCP flow must reach 300Mb/s.
+pub const TARGET_LINK_BYTES_PER_SEC: u64 = 300 * 1000 * 1000 / 8;
+/// The RTT the window sizing is derived from.
+pub const TARGET_LINK_RTT: Duration = Duration::from_millis(140);
+/// Bytes in flight required to fill [`TARGET_LINK_BYTES_PER_SEC`] over
+/// [`TARGET_LINK_RTT`]: 37.5MB/s x 140ms = 5.25MB (~5.0MiB of stream payload;
+/// the QUIC short header plus IPv4/UDP headers put the wire figure slightly
+/// above this, which the 8MB windows cover with room to spare).
+pub const TARGET_BDP_BYTES: u64 = TARGET_LINK_BYTES_PER_SEC * 140 / 1000;
+
+// Flow control, not the congestion controller, is what caps single-stream
+// throughput on a high-RTT link: every window below is a hard ceiling of
+// `window / RTT`, applied before BBR's cwnd is consulted. The 2026-09 gaps-death
+// pass deliberately shrank them (2MB per stream / 8MB aggregate / 4MB send),
+// which capped one stream at ~114Mb/s at 140ms. These values supersede that for
+// the 300Mb/s target.
+//
+// KNOWN COST of the re-widening: quinn kills a connection once a single stream's
+// reassembly holds `MAX_CHUNKS = 1024` distinct spans. A larger window allows
+// more packets in flight per RTT (~6200 at 1350B, ~3700 at the 1472B PMTU
+// ceiling), so a burst-loss or reordering episode has more room than 2MB did to
+// approach that cliff. A clean path is unaffected; on a lossy one, step
+// `SEND_WINDOW` and `STREAM_RECEIVE_WINDOW` back to 4MB (=240Mb/s) rather than
+// reverting the ACK-frequency and PMTU work, which is loss-independent.
+
+/// Per-stream receive window. 8MB rather than the 5.25MB BDP: quinn only
+/// announces a `MAX_STREAM_DATA` once the advertised window is short by
+/// `STREAM_RECEIVE_WINDOW / 8`, so the cushion that must still cover a full BDP
+/// is `8MB - 1MB = 7MB`. At 6MB the cushion would be 5.25MB -- the BDP exactly,
+/// with nothing left for scheduler jitter or a stalled application read.
+pub const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+/// Aggregate connection receive window. MUST be set explicitly: quinn's default
+/// is `VarInt::MAX`, which would otherwise allow 1024 streams x 8MB of receive
+/// buffering per connection. 16MB covers the BDP with margin for a few
+/// concurrent streams; 4096 conns x 16MB is the 64GB worst case documented in
+/// the README limits table (halved to 4GB for the 256 pre-auth connections).
+pub const RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+/// Send-side budget: the upper bound on data this endpoint may keep buffered and
+/// unacknowledged on one connection. quinn blocks a writer once
+/// `min(peer's stream window, SEND_WINDOW) - buffered_data` reaches zero, so on
+/// a high-RTT link this is a throughput ceiling of `SEND_WINDOW / RTT` for the
+/// write direction. See the flow-control note above for the 8MB tradeoff.
+pub const SEND_WINDOW: u64 = 8 * 1024 * 1024;
+
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // BBR default; cubic only as escape hatch. Callers validate + log the
@@ -537,30 +584,44 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
-    // Window sizing (2026-09 gaps-death hardening): per-stream and send
-    // windows sit deliberately BELOW the trans-Pacific BDP optimum.
-    // Rationale, measured on a 250ms/2%-loss WAN: quinn kills the whole
-    // connection once a single stream's reassembly passes 1024 gaps, and the
-    // fuel for that is in-flight bytes (burst loss -> ghost retransmits ->
-    // duplicate entries; ordered mode never dedups). Halving both windows
-    // took retransmission amplification from 9x to ~1x and deaths from 3/3
-    // runs to 0, with loopback throughput unchanged. 2MB still covers
-    // ~114Mb/s single-stream at 140ms and 4MB send covers ~228Mb/s;
-    // multi-stream aggregate is unaffected (8MB connection window).
-    // The aggregate connection window MUST be set explicitly:
-    // quinn's default is VarInt::MAX, which would otherwise allow up to
-    // 1024 streams * 2MB ≈ 2GB of receive buffering per connection.
-    // 8MB still covers ~457Mb/s aggregate at 140ms while cutting the
-    // per-connection bound: 4096 conns x 8MB = 32GB worst case for
-    // *authenticated* peers, and the server additionally caps
-    // unauthenticated peers at 256 concurrent connections (≈2GB).
-    t.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
-    t.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
-    // Send side is driven by what *we* read from the target, but a malicious
-    // client can still pin it (dial a fast local service, never read QUIC).
-    // Capped at 4MB (see window rationale above); the per-connection product
-    // is documented in the README limits table.
-    t.send_window(4 * 1024 * 1024);
+    // Window sizing: every flow-control window must exceed the target BDP, or
+    // it -- not the congestion controller -- becomes the throughput ceiling.
+    // The numbers live in named constants so `tcp_windows_cover_the_300mb_s_bdp`
+    // can prove the invariant instead of restating it.
+    t.stream_receive_window(quinn::VarInt::from_u32(
+        u32::try_from(STREAM_RECEIVE_WINDOW).expect("stream window fits a VarInt"),
+    ));
+    t.receive_window(quinn::VarInt::from_u32(
+        u32::try_from(RECEIVE_WINDOW).expect("connection window fits a VarInt"),
+    ));
+    t.send_window(SEND_WINDOW);
+    // ACK frequency (draft-ietf-quic-ack-frequency): this is what we *request
+    // the peer to use* when we are the receiver, so it bounds the reverse-path
+    // ACK rate. quinn's default (threshold 1) ACKs every other packet: at
+    // 300Mb/s that is ~14k ACK/s for a single stream, all of it paid for by
+    // the one writer thread. 8 cuts that 8x while max_ack_delay = 10ms keeps
+    // BBR's bandwidth estimate and loss detection sharp; >=32 makes the
+    // estimate too coarse and slows the startup ramp. reordering_threshold
+    // stays at quinn's recommended packet_threshold - 1 = 2.
+    let mut ack_freq = quinn::AckFrequencyConfig::default();
+    ack_freq
+        .ack_eliciting_threshold(quinn::VarInt::from_u32(8))
+        .max_ack_delay(Some(Duration::from_millis(10)))
+        .reordering_threshold(quinn::VarInt::from_u32(2));
+    t.ack_frequency_config(Some(ack_freq));
+    // Seed the RTT estimator for the link this build targets. quinn's 333ms
+    // default is a spec-derived placeholder that makes the first PTO and
+    // BBR's initial bandwidth estimate far too pessimistic at 140ms.
+    t.initial_rtt(Duration::from_millis(190));
+    // Raise the PMTU search ceiling from quinn's 1452 to 1472 (the endpoint's
+    // `max_udp_payload_size` default, so this is the hard limit anyway): 20
+    // more bytes per packet is ~1.4% fewer packets for the same payload, which
+    // a single-threaded sender pays directly. The search still starts at the
+    // 1200B QUIC minimum and only climbs on successful probes, so a smaller
+    // path MTU is still discovered correctly.
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    mtud.upper_bound(1472);
+    t.mtu_discovery_config(Some(mtud));
     // Clamp so absurd config values cannot overflow the QUIC VarInt timeout.
     let keep_alive_secs = keep_alive_secs.clamp(1, 3600);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs)));
@@ -2140,5 +2201,42 @@ mod tests {
             blocked > 0,
             "the send buffer must saturate within 64k x 1 KiB sends"
         );
+    }
+
+    /// Window sizing invariant: every flow-control window must clear the BDP of
+    /// the link this build targets, or it -- not BBR's congestion window --
+    /// becomes the single-stream throughput ceiling.
+    ///
+    /// This is a constants check rather than a live measurement on purpose.
+    /// quinn exposes no window getters, and a loopback connection cannot detect
+    /// the regression it guards against: with a 2MB window the cushion is still
+    /// 1MB, which at a ~0.2ms loopback RTT is worth ~40Gb/s. Verified by
+    /// reverting `STREAM_RECEIVE_WINDOW` to 2MB -- the live variant of this test
+    /// passed. Only the constants carry the invariant, so only they are tested.
+    #[test]
+    fn tcp_windows_cover_the_300mb_s_bdp() {
+        // Relations between constants are asserted at compile time, so a future
+        // edit that re-tightens a window fails the build rather than only a WAN
+        // measurement. Panic messages cannot be formatted in const context, so
+        // each relation gets its own const block and the comments carry intent.
+        //
+        // `STREAM_RECEIVE_WINDOW` is the receiver-side advertisement, so it caps
+        // a *download*; `SEND_WINDOW` caps the write side of an *upload*.
+        const _: () = assert!(TARGET_LINK_RTT.as_millis() == 140);
+        const _: () = assert!(TARGET_BDP_BYTES == 5_250_000);
+        const _: () = assert!(STREAM_RECEIVE_WINDOW >= TARGET_BDP_BYTES);
+        const _: () = assert!(SEND_WINDOW >= TARGET_BDP_BYTES);
+        // The stream window is only useful if it still clears the BDP after the
+        // cushion quinn withholds (`window / 8`) before announcing an update.
+        const _: () = assert!(STREAM_RECEIVE_WINDOW - STREAM_RECEIVE_WINDOW / 8 > TARGET_BDP_BYTES);
+        // The aggregate window must cover more than one stream's BDP, or a
+        // single stream would exhaust the connection-level budget.
+        const _: () = assert!(RECEIVE_WINDOW >= 2 * TARGET_BDP_BYTES);
+        // Regression guards: these two are what capped single-stream at ~120Mb/s
+        // (receive) and ~240Mb/s (send) at 140ms before the 2026-09 re-tuning.
+        const _: () = assert!(STREAM_RECEIVE_WINDOW > 2 * 1024 * 1024);
+        const _: () = assert!(SEND_WINDOW > 4 * 1024 * 1024);
+        // Implied single-stream ceiling for the target RTT, in Mb/s.
+        const _: () = assert!(STREAM_RECEIVE_WINDOW * 8 / 140 * 1000 / 1_000_000 >= 300);
     }
 }

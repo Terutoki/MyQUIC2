@@ -44,7 +44,7 @@ re-verified end-to-end on this revision — see
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5) and [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main) and [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -64,10 +64,10 @@ re-verified end-to-end on this revision — see
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
-| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window |
+| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 16 MB per-connection receive window |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
-| **High-RTT tuned** | 2 MB per-stream window, 8 MB aggregate receive window, 4 MB send window — halved in the gaps-death hardening pass (bounds in-flight bytes so burst loss can't flood the receiver's reassembly); covers ~114 Mb/s single-stream at ~140 ms |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1–4.2 MB stripped each (rebuilt from this revision) |
+| **High-RTT tuned** | 8 MB per-stream / 16 MB aggregate receive window, 8 MB send window — every window clears the 5.25 MB BDP of 300 Mb/s at 140 ms — plus a 190 ms `initial_rtt`, ACK-every-8th-packet with 10 ms `max_ack_delay`, and a 1472 B PMTU search ceiling. Covers ~480 Mb/s single-stream at ~140 ms (the previous 2/8/4 MB split capped it at ~114 Mb/s) |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.0–4.1 MB stripped each (rebuilt from this revision) |
 
 ---
 
@@ -353,9 +353,20 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-5 revision: static musl, x86-64, stripped, ~4.1–4.2 MB each.
-They contain the DATAGRAM process-abort fix, so binaries built before pass 5 must be
-replaced on **both** sides of a deployment.
+rebuilt from the pass-9 revision (the 300 Mb/s @ 140 ms window re-tuning): static
+musl, x86-64, stripped, ~4.0–4.1 MB each. A binary built before pass 9 carries the
+old 2/8/4 MB windows and caps a single stream at ~114 Mb/s, so **both** sides of a
+deployment must be replaced together — a mixed pair is limited by whichever end is
+older, since a download is capped by the receiver's advertised window.
+
+Verified by running the v1 pair on an x86-64 CPU reporting **no** `sse4_2`, `avx` or
+`avx2` (QEMU's baseline `qemu64`, which is what the emulated test container
+exposes): the QUIC handshake completed and a 256 KiB SOCKS5 `CONNECT` transfer came
+back byte-for-byte. The AVX2 instructions the v1 binary does contain live in `ring`'s
+VAES/AVX2 AES-GCM path and in `core`'s slice helpers, both behind runtime CPU
+detection — the handshake on that CPU is the proof they were not executed. The same
+CPU makes the **v4** binary die immediately with `Illegal instruction`, which is the
+expected consequence of selecting a level the CPU does not implement.
 
 ---
 
@@ -479,9 +490,10 @@ All limits are constants in the sources; the table shows where to change them.
 | Client UDP associations | 4096 (excess replies REP=0x01, 256-datagram queue each) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
-| Receive window (aggregate) | 8 MB/connection | `build_transport` |
-| Receive window (per stream) | 2 MB | `build_transport` |
-| Send window | 4 MB/connection | `build_transport` |
+| Receive window (aggregate) | 16 MB/connection | `RECEIVE_WINDOW` |
+| Receive window (per stream) | 8 MB | `STREAM_RECEIVE_WINDOW` |
+| Send window | 8 MB/connection | `SEND_WINDOW` |
+| Initial RTT / PMTU ceiling | 190 ms / 1472 B | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
 | Server auth wait | 5 s per connection (one deadline for accept+read) | `authenticate()` |
@@ -491,9 +503,12 @@ All limits are constants in the sources; the table shows where to change them.
 | Client TCP dial ACK budget | 20 s (5 s header + 3 s DNS permit + 5 s DNS + 2 s dial permit + 4 s connect + margin) | `TCP_DIAL_ACK_TIMEOUT` |
 
 Kernel-side tuning: raise `net.core.wmem_max` / `net.core.rmem_max` so the 4 MB
-(QUIC socket) and 512 KB (per-session) socket buffers are not silently clamped; the
+(QUIC socket) and 256 KB (per-session) socket buffers are not silently clamped; the
 first clamp logs one warning per
 process (per-socket warnings were removed because session churn flooded the log).
+For the 300 Mb/s @ 140 ms target, 8 MB is the recommended value for both
+(`sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608`): 4 MB covers
+only ~110 ms of that rate.
 
 ---
 
@@ -552,10 +567,16 @@ Against RFC 1928 / RFC 1929:
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for trans-Pacific BDP — 2 MB per-stream / 8 MB aggregate
-  receive window, 4 MB send window, BBR; the SOCKS success reply is sent
+- **140 ms links**: tuned for the trans-Pacific BDP — 8 MB per-stream / 16 MB
+  aggregate receive window, 8 MB send window, BBR, ACK-every-8th-packet with a
+  10 ms `max_ack_delay`; every window clears the 5.25 MB that 300 Mb/s costs in
+  flight at 140 ms. The SOCKS success reply is sent
   optimistically (no 1-RTT wait for the remote dial), so the application's TLS
   handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
+  A lossy path is the tradeoff: 8 MB allows ~6200 packets in flight per RTT, which
+  is more room than the legacy 2 MB to approach quinn's 1024-chunk reassembly
+  limit, so `too many gaps in stream buffer` on a burst-loss link means stepping
+  `SEND_WINDOW` / `STREAM_RECEIVE_WINDOW` back to 4 MB (~240 Mb/s).
 
 ---
 
@@ -950,7 +971,53 @@ Verified end-to-end on loopback with token auth on both sides (tests 16–20 in
 (1 MiB) and UDP `ASSOCIATE` (25 × 1000 B) byte-for-byte, and a `kill -9` →
 restart cycle in which the client's **stale 0-RTT ticket is rejected** and the
 token is re-sent at 1-RTT before the flows recover. `dist/openwrt-x86_64/` was
-rebuilt from this revision for all four CPU levels.
+rebuilt from the pass-8 revision for all four CPU levels.
+
+### 2026-09 hardening pass 9 — TCP windows re-sized for 300 Mb/s at 140 ms
+
+- **`dist/openwrt-x86_64/` rebuilt again** from this pass for all four CPU levels
+  (v1–v4, static musl, stripped, ~4.0–4.1 MB each) and smoke-tested under x86-64
+  emulation on a CPU without AVX: see
+  [Cross-compile for OpenWrt x86-64](#cross-compile-for-openwrt-x86-64-static-musl-from-macos).
+- **The bottleneck was flow control, not congestion control.** At 140 ms, 300 Mb/s
+  costs ~5.25 MB in flight (37.5 MB/s × 0.14 s, plus the QUIC short header and
+  IPv4/UDP headers). Every flow-control window is a hard ceiling of
+  `window / RTT`, and the previous sizing capped single-stream at **~114 Mb/s
+  receive / ~228 Mb/s send** long before BBR's congestion window mattered:
+  `stream_receive_window` 2→8 MB, `receive_window` 8→16 MB, `send_window` 4→8 MB.
+  Both endpoints build their transport from `build_transport`, and a download is
+  capped by the *receiver's* advertisement while an upload is capped by the
+  *sender's* budget, so both sides had to change for either direction to improve.
+- **8 MB, not the ~5.25 MB BDP.** quinn only emits `MAX_STREAM_DATA` once the
+  advertised window is short by `stream_receive_window / 8`, so the cushion that
+  must still cover a BDP is `8 − 1 = 7 MB`. At 6 MB it would be 5.25 MB — the BDP
+  exactly, with nothing left for scheduler jitter or a slow application read.
+- **Reverse-path ACK rate.** `AckFrequencyConfig` now requests an ACK every 8th
+  ack-eliciting packet with a 10 ms `max_ack_delay` (was quinn's default of every
+  2nd packet, `None` delay): ~14k ACK/s per 300 Mb/s stream is real work for the
+  single writer thread. A threshold of 32+ was rejected — it makes BBR's
+  bandwidth estimate too coarse and slows the startup ramp.
+- **`initial_rtt` 333 → 190 ms** (quinn's default is a spec-derived placeholder
+  that makes the first PTO and the initial bandwidth estimate pessimistic for
+  this link), and the PMTU search ceiling 1452 → 1472 B (`EndpointConfig`'s
+  default `max_udp_payload_size`, so 1452 was leaving 1.4% of the path unused).
+  The search still starts at the 1200 B QUIC minimum and climbs only on
+  successful probes.
+- **Known cost, carried over from pass 2's gaps-death halving.** 8 MB allows
+  ~6200 packets in flight per RTT (1350 B) or ~3700 (1452 B), so a burst-loss or
+  reordering episode has more room than 2 MB did to approach quinn's
+  `MAX_CHUNKS = 1024` reassembly limit, which kills the whole connection with
+  `too many gaps in stream buffer`. A clean path is unaffected. On a lossy one,
+  step `SEND_WINDOW` / `STREAM_RECEIVE_WINDOW` back to 4 MB (~240 Mb/s) rather
+  than reverting the ACK/MTU work, which is independent of loss.
+- **What is not tested here.** The invariant lives in named constants
+  (`STREAM_RECEIVE_WINDOW`, `RECEIVE_WINDOW`, `SEND_WINDOW`) asserted in `const`
+  blocks, so re-tightening a window fails the *build*. A live loopback test was
+  written and rejected: with a 2 MB window the cushion is still 1 MB, which at a
+  ~0.2 ms loopback RTT is worth ~40 Gb/s, so it passed against the very
+  regression it was meant to catch. Confirming the 300 Mb/s figure needs a
+  ~140 ms path and `conn.stats()` (`path.cwnd`, `path.pacing_rate`), as the
+  README's measurement notes describe.
 
 ---
 
