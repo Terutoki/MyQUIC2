@@ -5,20 +5,16 @@
 use myquic2::*;
 use std::net::SocketAddr;
 
-/// Write the auth token on a fresh uni stream. Returns the stream so the caller
-/// can await `stopped()` and learn whether the early data survived the handshake.
-async fn authenticate(
-    conn: &quinn::Connection,
-    token: &str,
-) -> anyhow::Result<Option<quinn::SendStream>> {
+/// Write the auth token on a fresh uni stream (early data on the 0-RTT attempt).
+async fn authenticate(conn: &quinn::Connection, token: &str) -> anyhow::Result<()> {
     if token.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
     // `write_all` is inherent on quinn's SendStream (no AsyncWriteExt needed).
     let mut uni = conn.open_uni().await?;
     uni.write_all(token.as_bytes()).await?;
     uni.finish().ok();
-    Ok(Some(uni))
+    Ok(())
 }
 
 #[tokio::main]
@@ -32,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(std::sync::Arc::new(quic_client));
     ccfg.transport_config(build_transport("bbr", 5));
-    let ep = quinn::Endpoint::client("[::]:0".parse()?)?;
+    let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
     ep.set_default_client_config(ccfg);
     let server: SocketAddr = std::env::args()
         .nth(1)
@@ -45,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
 
     let c1 = ep.connect(server, &sni)?.await?;
-    drop(authenticate(&c1, &token).await?);
+    authenticate(&c1, &token).await?;
     println!("conn1: full handshake ok");
     // Keep conn1 OPEN while conn2 is attempted: mirrors quinn's own zero_rtt test,
     // which exchanges 1-RTT data first so NewSessionTickets are guaranteed delivered.
@@ -53,8 +49,8 @@ async fn main() -> anyhow::Result<()> {
 
     let connecting = ep.connect(server, &sni)?;
     match connecting.into_0rtt() {
-        Ok(c2) => {
-            let early_auth = authenticate(&c2, &token).await?;
+        Ok((c2, accepted_fut)) => {
+            authenticate(&c2, &token).await?;
             println!("conn2: client HAD resumption tickets, 0-RTT offered");
             // Send application data immediately, before handshake completes.
             let (mut send, mut recv) = c2.open_bi().await?;
@@ -83,19 +79,10 @@ async fn main() -> anyhow::Result<()> {
             let mut buf = vec![0u8; 13];
             recv.read_exact(&mut buf).await?;
             println!("conn2: 0-RTT echo ok: {:?}", String::from_utf8_lossy(&buf));
-            // quinn 0.12 dropped the `ZeroRttAccepted` future: the supported
-            // signal for "did the server keep my early data?" is `stopped()` on
-            // a finished early uni stream, which yields `ZeroRttRejected` if the
-            // server discarded it. Without an auth stream there is no early
-            // stream to interrogate, but the echo above is itself the proof,
-            // since a rejected 0-RTT stream cannot echo.
-            let accepted = match early_auth {
-                Some(uni) => match uni.stopped().await {
-                    Err(quinn::StoppedError::ZeroRttRejected) => "false",
-                    _ => "true",
-                },
-                None => "true (no auth token; the echo above is the proof)",
-            };
+            // 0.11 API: `ZeroRttAccepted` resolves when the handshake completes
+            // with true = early data kept. The echo above already proves it
+            // (a rejected 0-RTT stream cannot echo), this names it directly.
+            let accepted = accepted_fut.await;
             println!("conn2: server accepted 0-RTT early data = {accepted}");
             c2.close(0u32.into(), b"probe-done");
             c1.close(0u32.into(), b"probe-done");

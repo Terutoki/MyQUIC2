@@ -18,10 +18,11 @@ process-wide resource caps, PMTU-aware DATAGRAM sizing, 0-RTT-safe authenticatio
 a corrected reconnect path. A previous pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
 quinn-proto's drop-oldest DATAGRAM path) and stripped the remaining per-flow allocations
-from the TCP-open path; the latest pass moves all three quinn crates off crates.io onto
-upstream `main` (0.12), which is where that DATAGRAM fix lives — see
-[Hardening notes](#2026-09-hardening-pass-8). Every behaviour documented below was
-re-verified end-to-end on this revision — see
+from the TCP-open path; an intermediate pass briefly tracked upstream `main` (0.12) for
+that fix, and the latest pass is back on crates.io (quinn 0.11.12 / proto 0.11.18),
+which backports the DATAGRAM fix plus the assembler coalescing and three security
+fixes — see [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
+Every behaviour documented below was re-verified end-to-end on this revision — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
@@ -55,7 +56,7 @@ re-verified end-to-end on this revision — see
 | Area | Detail |
 |---|---|
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
-| **Transport** | QUIC (quinn 0.12, pinned to upstream `main`), TLS 1.3 only, one long-lived connection per client process shared by all flows |
+| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, one long-lived connection per client process shared by all flows |
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
@@ -297,13 +298,10 @@ The E2E harness is intentionally not vendored; it is a plain Python SOCKS5 clien
 
 ## Requirements
 
-- **Rust** 1.88+ (MSRV driven by `time 0.3.55` / `rcgen 0.14.10` and by quinn
-  0.12, which requires 1.88; developed and tested on stable 1.97.1; deps: quinn
-  0.12.0 / quinn-proto 0.12.0 / quinn-udp 0.6.2 from
-  [`quinn-rs/quinn` `main`](https://github.com/quinn-rs/quinn) `621e38ab`, rustls
-  0.23.44, tokio 1.53.1). The quinn crates are a **git dependency**: the first
-  build needs network access to fetch them, and `cargo update -p quinn` advances
-  all three to the then-current `main`.
+- **Rust** 1.88+ (MSRV driven by `time 0.3.55` / `rcgen 0.14.10`; developed and
+  tested on stable 1.97.1; deps: quinn 0.11.12 / quinn-proto 0.11.18 /
+  quinn-udp 0.5.15 from crates.io, rustls 0.23, tokio 1.53.1). The quinn crates
+  are plain crates.io dependencies; `cargo update` moves them within the 0.11 line.
 - **Linux** (production; GSO/GRO + BBR fully effective) or **macOS** (development;
   dual-stack verified, GSO degrades gracefully)
 - For OpenWrt cross builds: `zig` + `cargo-zigbuild` (see [Building](#building))
@@ -547,23 +545,16 @@ Against RFC 1928 / RFC 1929:
   redial storm. A stale 0-RTT ticket is rejected once and the token is re-sent on the
   established connection (verified: server `kill -9` → reconnect → TCP+UDP ECHO pass).
 - **A dial is not accepted until the connection is proven alive** (pass 7, reworked in
-  pass 8). quinn-0.11's `Connecting` future resolved `Ok` even for a connection that
-  terminated instead of handshaking: the `on_connected` oneshot it awaited carried the
-  0-RTT accept flag, but `Connecting::poll` discarded that flag and always yielded
-  `Ok(Connection)`, while `ConnectionInner::terminate` fired the same oneshot (with
-  `false`) for *every* connection that ends — including one that never established. The
-  reconnect loop used to publish that dead handle to `shared` and log `QUIC connected`
-  for it, so every new SOCKS flow in the meantime was handed a dead connection until
-  quinn's idle timeout fired (~15 s). quinn 0.12 returns the terminal error from
-  `Connecting` instead, and the 0-RTT path now gates on `Connection::authenticated()`
-  (which fails for a connection lost before its handshake), so a dead dial cannot be
-  published; `dial_once` still treats a refused/short 0-RTT handshake as a failed dial,
-  verifies `close_reason()` after one yield, and bounds each attempt with
-  `DIAL_ATTEMPT_TIMEOUT` (5 s) instead of QUIC's ~15 s Initial-retransmission budget —
-  so the first attempt after a restart succeeds instead of waiting out the previous
-  one's timeout. Measured: server `kill -9` → detection ≈ 20 s → reconnect ≈ 0.3–0.4 s
-  after the server is back (before: a false `connected` every ~15 s plus 15.6 s
-  recovery).
+  pass 8, ported back to 0.11 in pass 10). quinn-0.11's `Connecting` future resolved `Ok`
+  even for a connection that terminated instead of handshaking, so the 0-RTT path gates
+  on the `ZeroRttAccepted` future (true = early data kept; false = rejected or died)
+  plus `close_reason()`: a timeout or a closed connection fails the dial, a live
+  connection with rejected early data re-sends the token at 1-RTT, so a dead dial cannot
+  be published; `dial_once` bounds each attempt with `DIAL_ATTEMPT_TIMEOUT` (5 s)
+  instead of QUIC's ~15 s Initial-retransmission budget — so the first attempt after a
+  restart succeeds instead of waiting out the previous one's timeout. Measured:
+  server `kill -9` → detection ≈ 20 s → reconnect ≈ 0.3–0.4 s after the server is back
+  (before: a false `connected` every ~15 s plus 15.6 s recovery).
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
@@ -1019,6 +1010,30 @@ rebuilt from the pass-8 revision for all four CPU levels.
   ~140 ms path and `conn.stats()` (`path.cwnd`, `path.pacing_rate`), as the
   README's measurement notes describe.
 
+### 2026-09 hardening pass 10 — back to crates.io quinn 0.11.18
+
+- **Dependency switch.** `quinn`, `quinn-proto` and `quinn-udp` are crates.io
+  dependencies again (quinn 0.11.12 / proto 0.11.18 / udp 0.5.15) instead of the
+  upstream-`main` git pin (pass 8) and the `MAX_CHUNKS = 16384` fork patch built
+  on it. Upstream's 0.11.18 backports everything this project needed from `main`:
+  the DATAGRAM `payload_bytes` accounting fix, the assembler contiguous-chunk
+  coalescing, and three security fixes (unordered-read panic, drop-oldest
+  double-subtraction, ACK_FREQUENCY min-delay panic) — so the fork has no
+  remaining value and its maintenance cost is gone. `cargo update` moves the
+  trio within the 0.11 line.
+- **0-RTT ported back to the 0.11 API.** `Connecting::into_0rtt()` yields
+  `(Connection, ZeroRttAccepted)` again; the client gates publication on that
+  future plus `close_reason()` (false = rejected or died, timeout = dead), and
+  re-sends the token at 1-RTT on rejection; the server awaits the same future
+  (always true incoming-side) bounded by `HANDSHAKE_TIMEOUT` before consuming
+  the auth token. The `stopped()`-based rejection signal and `mut`-less
+  `set_default_client_config` from pass 8 are reverted with it. Transport tuning
+  (`AckFrequencyConfig`, `initial_rtt`, MTU ceiling, windows, `send_datagram_wait`
+  helper) needed no changes — all present in 0.11.
+- **Known regression vs the fork.** `MAX_CHUNKS` is 1024 again, so the 8 MB
+  stream window is gap-kill-prone on lossy links as analyzed in pass 9; the
+  mitigation is unchanged (step back to 4 MB). Single-user deployment accepted.
+
 ---
 
 ## Roadmap
@@ -1040,7 +1055,8 @@ rebuilt from the pass-8 revision for all four CPU levels.
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
-      upstream DATAGRAM accounting fix (pass 8); `Cargo.lock` pins the commit
+      upstream DATAGRAM accounting fix (pass 8; superseded — back on crates.io
+      0.11.18, which backports it, see pass 10)
 
 ---
 

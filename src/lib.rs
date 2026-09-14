@@ -2161,7 +2161,7 @@ mod tests {
             let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
             let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
             ccfg.transport_config(build_transport("bbr", 5));
-            let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             client.set_default_client_config(ccfg);
             (client, server)
         }

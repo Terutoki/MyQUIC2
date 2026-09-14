@@ -248,19 +248,18 @@ async fn main() -> Result<()> {
             // 0.5-RTT accept: streams usable before handshake completes on resumption.
             let conn = match incoming.accept() {
                 Ok(connecting) => match connecting.into_0rtt() {
-                    Ok(c) => {
-                        // A server-side `into_0rtt` always succeeds (0.5-RTT), but
-                        // an unfinished handshake must not hold the connection
-                        // permit; wait (bounded) for the handshake before
-                        // consuming the token. quinn 0.12 signals this with
-                        // `authenticated()` (it replaced the `ZeroRttAccepted`
-                        // future) and reports a lost connection as `Err`. The
-                        // client already waits for the same event, so this costs
-                        // it no latency.
-                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, c.authenticated()).await {
-                            Ok(Ok(())) => c,
-                            Ok(Err(e)) => {
-                                warn!("handshake failed: {e:#}");
+                    Ok((c, accepted_fut)) => {
+                        // Incoming conversion always succeeds and `accepted`
+                        // always resolves true, but an unfinished handshake
+                        // must not hold the connection permit: awaiting it
+                        // (bounded) gates the permit on handshake completion.
+                        // A dead client resolves false via the channel close,
+                        // and the timeout backstops a stall; either way the
+                        // close_reason check keeps a dead handle out.
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepted_fut).await {
+                            Ok(_) if c.close_reason().is_none() => c,
+                            Ok(_) => {
+                                warn!("client handshake failed: {:?}", c.close_reason());
                                 return;
                             }
                             Err(_) => {

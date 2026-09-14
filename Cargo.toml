@@ -20,12 +20,12 @@ path = "src/bin/myquic2-client.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
-# quinn + quinn-proto + quinn-udp all come from one git source: our fork of
-# upstream `main` (0.12.0), branch `myquic2-4k-chunks`, which raises the stream
-# reassembly bound `MAX_CHUNKS` 1024 -> 16384 so an 8MB stream window (~5900
-# packets in flight) cannot hit `too many gaps in stream buffer` with
-# normal-size frames under any loss pattern. Cargo.lock pins the exact commit.
-quinn = { git = "https://github.com/Terutoki/quinn", branch = "myquic2-4k-chunks" }
+# quinn trio from crates.io (0.11 line): quinn 0.11.12 / quinn-proto 0.11.18 /
+# quinn-udp 0.5.x. 0.11.18 backports the DATAGRAM accounting fix and the
+# assembler contiguous-chunk coalescing, so no fork is needed; the custom
+# MAX_CHUNKS=16384 fork patch is intentionally dropped (1024 returns, hence
+# the 0-RTT flow below keys on `ZeroRttAccepted`, the 0.11 API).
+quinn = "0.11.12"
 rustls = { version = "0.23", features = ["ring", "std", "logging"] }
 rcgen = "0.14"
 time = "0.3"
