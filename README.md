@@ -60,7 +60,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
-| **Custom protocol** | MQP-2 binary framing: TCP costs **0 extra bytes** after the first header; UDP costs **+12 B (IPv4) / +24 B (IPv6)** per datagram |
+| **Custom protocol** | MQP-2 binary framing: TCP costs **0 extra bytes** after the first header; UDP costs **+12 B (IPv4) / +24 B (IPv6)** per datagram, plus **+16 B per additional fragment** once a payload exceeds one QUIC DATAGRAM |
 | **0-RTT** | Session resumption with early data, verified end-to-end (`accepted=true`). The auth token rides early data and is automatically re-sent if the server rejects it |
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
@@ -68,7 +68,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 16 MB per-connection receive window |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
 | **High-RTT tuned** | 8 MB per-stream / 16 MB aggregate receive window, 8 MB send window — every window clears the 5.25 MB BDP of 300 Mb/s at 140 ms — plus a 190 ms `initial_rtt`, ACK-every-8th-packet with 10 ms `max_ack_delay`, and a 1472 B PMTU search ceiling. Covers ~480 Mb/s single-stream at ~140 ms (the previous 2/8/4 MB split capped it at ~114 Mb/s) |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.0–4.1 MB stripped each (rebuilt from this revision) |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.2 MB stripped each (rebuilt from this revision) |
 
 ---
 
@@ -92,8 +92,12 @@ Single crate, three units sharing one protocol library:
   dial failure ↔ closed/reset flow.
 - **UDP**: 1 SOCKS association = 1 session id (`sess_id`), carried in QUIC **DATAGRAMs**
   (unreliable, no head-of-line blocking — a lost DNS packet never stalls other flows).
-  Each datagram must fit `min(live path max_datagram_size, 1350 B)` including the MQP
-  header; larger packets are dropped per UDP semantics.
+  A payload that fits one frame (`max_datagram_size() - 12 B` for an IPv4 target,
+  `- 24 B` for IPv6/domain) is sent as a single `type=0x02` datagram; anything larger
+  is split across `type=0x05` fragments and reassembled by the peer, up to
+  `MQP_FRAG_MAX_PAYLOAD` (8 KiB). A datagram missing a fragment is discarded, never
+  delivered short — fragmentation buys size, not reliability. Payloads past the
+  reassembly cap are dropped and counted in `myquic2::dgram_drops`.
 - **Control**: when `auth_token` is set, connection setup carries exactly one
   **authentication uni stream** (≤ 256 B). After that there is no control traffic
   beyond QUIC itself — no SOCKS username/password.
@@ -147,7 +151,43 @@ type=0x02 u8 | sess u32 LE | atyp u8 | addr bytes | port u16 BE | payload
 `sess` scopes the packet to one UDP ASSOCIATE; the server echoes it back on replies
 so the client dispatcher can route without any per-target state lookup. The client
 sizes each datagram against the connection's live `max_datagram_size()` (PMTU-aware,
-never above 1350 B); the server caps replies the same way.
+**unclamped**); the server caps replies the same way.
+
+### UDP fragment (only when one frame is not enough)
+
+```
+type=0x05 u8 | sess u32 LE | id u16 LE | idx u8 | total u8 | atyp | addr | port | chunk
+```
+
+A QUIC DATAGRAM cannot carry a full 1472 B UDP payload — the 12/24 B MQP header plus
+the QUIC packet and DATAGRAM-frame overhead exceed the path MTU — so a proxy built
+only on single-frame datagrams is *strictly worse* than a direct UDP path for the
+packets conferencing stacks actually emit (DTLS handshake flights, non-WebRTC media,
+TURN-wrapped payloads, modest IP fragmentation). `type=0x05` lifts that ceiling to
+`MQP_FRAG_MAX_PAYLOAD` without buying reliability.
+
+- **Address on every fragment.** It costs 7 B (IPv4) / 19 B (IPv6) per fragment and
+  buys a reassembler with no special case for out-of-order arrival and no way for a
+  lost fragment 0 to strand the rest — every fragment is self-describing.
+- **`(sess, id)` is the reassembly key.** `id` is a per-sender `u16` counter (one per
+  SOCKS association on the client, one per UDP session on the server), so a wrapped
+  id reused with a different `total` restarts the partial instead of splicing two
+  unrelated datagrams together.
+- **Bounded.** A partial is at most `MQP_FRAG_MAX_PAYLOAD`; in aggregate a connection
+  holds at most `FRAG_MAX_HELD_BYTES` and evicts the oldest partial past that.
+  Partials whose first fragment is older than `FRAG_TIMEOUT_MS` are swept on insert.
+- **All-or-nothing.** A datagram missing any fragment is dropped, never delivered
+  short. UDP peers do not retransmit, so nothing waits longer than one expiry.
+- Both relays send through `myquic2::DgramFragmenter::send` — the single send path —
+  so every drop is counted, and a payload above the reassembly cap is refused rather
+  than truncated.
+
+The fragment frame is additive: a peer that predates it rejects `type=0x05` in
+`decode_datagram_ref` and drops the datagram (the pre-fragmentation behaviour for
+oversized payloads), so a version-skewed pair loses only large datagrams and can
+never misparse. Both ends must be on this revision to carry them.
+
+### Connection authentication (`auth_token` non-empty)
 
 ### Connection authentication (`auth_token` non-empty)
 
@@ -173,6 +213,12 @@ ALPN is **`myquic2/2`**. It was bumped from `myquic2/1` when the TCP-open ACK ga
 the bound address: a version-skewed pair now fails the TLS handshake with a clear
 error instead of misparsing the ACK as application data, so **upgrade both sides
 together**. The UDP DATAGRAM layout and the auth uni stream are unchanged from MQP-1.
+
+Pass 12 added the `type=0x05` UDP fragment frame *without* a bump, because it is
+purely additive: a peer that predates it rejects the unknown type and drops the
+datagram — its own pre-pass-11 behaviour for oversized payloads — so misparsing is
+impossible. The cost of a skewed pair is that UDP payloads above one frame are lost,
+which is why **both ends should still be upgraded together** if you carry large UDP.
 
 ### Design rationale
 
@@ -351,11 +397,17 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-9 revision (the 300 Mb/s @ 140 ms window re-tuning): static
-musl, x86-64, stripped, ~4.0–4.1 MB each. A binary built before pass 9 carries the
-old 2/8/4 MB windows and caps a single stream at ~114 Mb/s, so **both** sides of a
-deployment must be replaced together — a mixed pair is limited by whichever end is
-older, since a download is capped by the receiver's advertised window.
+rebuilt from the pass-12 revision (MQP-2 UDP fragmentation plus the DATAGRAM
+payload-budget fix): static musl, x86-64, stripped, ~4.2 MB each. Two upgrade
+notes, both requiring **both** sides to be replaced together:
+
+- A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
+  stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
+  download is capped by the receiver's advertised window.
+- A binary built before pass 12 loses every UDP payload above one QUIC DATAGRAM
+  (~1422 B on a 1472 B path) and truncates relay reads at 2048 B. Payloads above
+  one frame are *silently* lost against an older peer, because it rejects the
+  `type=0x05` fragment frame — no misparse, but no error either.
 
 Verified by running the v1 pair on an x86-64 CPU reporting **no** `sse4_2`, `avx` or
 `avx2` (QEMU's baseline `qemu64`, which is what the emulated test container
@@ -967,7 +1019,7 @@ rebuilt from the pass-8 revision for all four CPU levels.
 ### 2026-09 hardening pass 9 — TCP windows re-sized for 300 Mb/s at 140 ms
 
 - **`dist/openwrt-x86_64/` rebuilt again** from this pass for all four CPU levels
-  (v1–v4, static musl, stripped, ~4.0–4.1 MB each) and smoke-tested under x86-64
+  (v1–v4, static musl, stripped, ~4.2 MB each) and smoke-tested under x86-64
   emulation on a CPU without AVX: see
   [Cross-compile for OpenWrt x86-64](#cross-compile-for-openwrt-x86-64-static-musl-from-macos).
 - **The bottleneck was flow control, not congestion control.** At 140 ms, 300 Mb/s
@@ -1034,6 +1086,118 @@ rebuilt from the pass-8 revision for all four CPU levels.
   stream window is gap-kill-prone on lossy links as analyzed in pass 9; the
   mitigation is unchanged (step back to 4 MB). Single-user deployment accepted.
 
+### 2026-09 hardening pass 11 — the DATAGRAM budget was a payload cap
+
+Found while explaining a `speed.cloudflare.com` verdict of *Video chatting: Poor*
+on a China-Mobile → LAX path. The TCP side was not at fault (that verdict is
+driven by TCP-measured jitter); the UDP relay had a real defect of its own.
+
+- **The bug.** Both relays sized outgoing DATAGRAMs against
+  `max_datagram_size().min(1350)`. The `min` looks like a harmless MTU safety
+  margin, but `1350` is compared against the **whole** MQP-2 body
+  (`encode_datagram_ref_with_limit`: `DGRAM_PREFIX_LEN + header + payload`), so
+  it is in fact a *payload* cap of `1350 - 5 - 7 = 1338 B` for an IPv4 target
+  and `1326 B` for IPv6 — no matter how large the discovered path MTU was. Every
+  larger UDP payload was dropped with a `debug!`-level log, i.e. silently at the
+  default log level. Measured on loopback against the previous binary:
+  1338 B → 0 % loss, 1350 B → **100 % loss**. A 1400 B DTLS record or a
+  TURN-wrapped media packet that a direct UDP path delivers fine simply vanished.
+- **Fix.** The relays now pass `max_datagram_size()` unclamped — that value is
+  exactly the largest DATAGRAM body quinn will carry on the current path, with
+  the QUIC packet and DATAGRAM-frame overhead already subtracted, so using it
+  directly is the API contract rather than a policy choice. On a 1472 B path the
+  usable UDP payload is now ~1436 B (IPv4) instead of 1338 B. The dynamic-PMTU
+  behaviour that motivated the `min` is preserved by the existing refresh paths
+  (`TooLarge` → re-read the limit, client also re-reads once per second).
+- **New `dgram_payload_cap()`** states the relationship once, so callers and
+  tests reason about the *payload* budget instead of re-deriving the header
+  arithmetic. `DGRAM_MAX_WIRE = 1472` replaces the old
+  `DATAGRAM_BUFFER >= MQP_DGRAM_MAX` send-buffer invariant, which only ever
+  proved that a 264 B header fits — it never covered a full-size datagram.
+- **Drops are now visible.** `try_send_datagram`'s two drop outcomes were
+  `debug!`-only, which is why a 100 % loss of large datagrams could go unnoticed.
+  `send_udp_datagram()` is now the single encode+send entry point for both
+  relays; it bumps `dgram_drops::TOO_LARGE` / `dgram_drops::BUFFER_FULL`
+  (`snapshot()` reads them) and emits one rate-limited `warn!` per 10 s naming
+  the path limit and the usable payload budget.
+- **Not a fix: `Blocked` under TCP load.** The 1 MB datagram send buffer was
+  suspected of dropping UDP when bulk TCP streams occupy the congestion window.
+  Measured with four saturating TCP flows on the same connection: 1200 B UDP at
+  200 pps lost **0 %** both with and without the TCP load; only a full-rate flood
+  (~190 kpps offered) lost packets, and the rate was essentially unchanged by the
+  TCP load (70.5 % vs 66.5 %). DATAGRAM loss here is driven by the offered UDP
+  rate filling the send buffer, not by TCP competing for cwnd. The counters above
+  make that distinction observable in production.
+
+### 2026-09 hardening pass 12 — MQP-2 UDP fragmentation
+
+Pass 11 removed an artificial clamp, which moved the single-frame ceiling from
+1338 B to ~1422 B. That is still **not enough to be transparent**: a full 1472 B
+UDP payload can never fit a QUIC DATAGRAM, because the 12 B MQP header plus the
+QUIC packet and DATAGRAM-frame overhead exceed a 1472 B path MTU. Video calling
+is exactly the workload that notices — DTLS handshake records, non-WebRTC
+conferencing stacks, TURN-wrapped media and modest IP fragmentation all exceed
+one frame, and every such packet was being dropped 100 %.
+
+- **`type=0x05` fragments.** A payload too large for one frame is split into
+  `total` fragments carrying `(sess, id, idx, total)` plus the address header, and
+  reassembled by the peer. Small packets keep the byte-identical `type=0x02`
+  single-frame path, so nothing pays for this unless it needs it.
+- **Ceiling raised to 8 KiB** (`MQP_FRAG_MAX_PAYLOAD`), 5.5x the largest
+  datagram any real-time medium produces (1472 B on a 1500 B MTU), so it is not
+  a limit the target workload can reach. The per-session read buffer is the same
+  8 KiB, which bounds worst-case relay memory at 8 KiB × `MAX_SESSIONS_GLOBAL`
+  (64 MiB).
+- **Why not the 65507 B UDP maximum.** Reassembly is all-or-nothing, so a
+  payload's delivery probability is `(1-p)^F` while its cost stays `F` fragments.
+  At 1 % loss a 64 KiB payload is 47 fragments: 62 % delivery for 47x the bytes,
+  and at 5 % loss it is 9 % — bandwidth spent on a datagram that will not
+  arrive. 8192 B is 6 fragments, 94 % at the same 1 % loss. Fragmentation still
+  beats dropping outright, which is why the **wire format is sized for the full
+  UDP maximum**: the compile-time assertion next to `MQP_FRAG_MAX_TOTAL` proves a
+  `u8` count reaches 65507 B even at QUIC's minimum 1200 B MTU (58 of 64
+  fragments), so raising the constant is a one-line change and never a
+  wire-format change. `fragment_count_documents_the_loss_amplification_tradeoff`
+  pins the arithmetic.
+- **Buffers were a second, earlier cliff.** Both relays read into a 2048 B socket
+  buffer, so anything past ~2 KiB was truncated *by the kernel* before any counter
+  could see it. Buffers now cover the full protocol cap, plus one byte of slack:
+  `recv_from` reports the same length for "exactly filled" and "truncated", so the
+  slack is what makes the `n == buf.len()` warning mean truncation and nothing
+  else. Truncations now log instead of vanishing.
+- **Bounded and all-or-nothing.** A partial is capped by
+  `MQP_FRAG_MAX_PAYLOAD`, a connection holds at most `FRAG_MAX_HELD_BYTES`
+  (evicting the oldest partial past it), and partials expire after
+  `FRAG_TIMEOUT_MS`. A datagram missing any fragment is dropped rather than
+  delivered short — the failure mode this whole pass exists to remove.
+- **Additive on the wire.** An older peer rejects the new frame type and drops
+  the datagram, which is exactly its pre-pass-11 behaviour for oversized payloads,
+  so no misparse is possible and ALPN stays `myquic2/2`. Both ends must be on this
+  revision to carry large datagrams.
+- **The dispatcher is a second decode site (found by the Meet simulation).** The
+  client's per-connection reader routes each datagram to its association by
+  reading `sess` — and it did so behind a hard-coded `d[0] != 0x02` check, so
+  every `0x05` fragment was discarded before the reassembler could see it. The
+  symptom was precise: a 1438 B DTLS record (the only packet in a Meet call that
+  needs a second frame) was lost 100 % of the time, every run, while everything
+  at or below one frame was perfect. `dgram_sess()` is now the single place that
+  knows which frame types are routable, with
+  `dgram_sess_routes_both_frame_types` pinning it.
+- **Verified end to end, round trip.** The earlier sweep counted only what the
+  echo peer received, i.e. the outbound half — which is why it passed while the
+  reply direction was broken. `udp.mjs` now counts replies at the client too:
+  1200 / 1420 / **1430** / **1472** / 2000 / 4000 / 8000 / **8192** B all at 0 %
+  loss in *both* directions (1422 B and 1430 B were 100 % loss before), and
+  8300 B refused with one warning naming the cap.
+- **Google Meet simulation** (`meet_sim.mjs`): 250 pps of 1200/200/100 B media
+  plus a 1236–1438 B DTLS burst, run through the real binaries. 6/6 handshake
+  and 4680/4680 media packets, 0 % loss, 0 reorder, 0 size mismatch, RTT median
+  0.6 ms / p95 0.8 ms, RFC 3550 jitter 0.17 ms — and unchanged with two
+  saturating bulk TCP downloads sharing the tunnel. Unit tests cover order
+  independence, a lost fragment, duplicate fragments, malformed headers, id
+  reuse with a changed shape, expiry, the memory bound, and a real-connection
+  round trip.
+
 ---
 
 ## Roadmap
@@ -1046,7 +1210,8 @@ rebuilt from the pass-8 revision for all four CPU levels.
 - [ ] Ticket-key persistence for 0-RTT across server restarts
 - [ ] Per-stream metrics endpoint (Prometheus) — BBR state, GSO batch size, sess table
 - [ ] `procd` init script for OpenWrt
-- [ ] MQP datagram fragmentation for > 1350 B UDP payloads
+- [x] MQP datagram fragmentation for UDP payloads above the path budget
+      (`type=0x05`, up to `MQP_FRAG_MAX_PAYLOAD` = 8 KiB; see pass 12)
 - [ ] Fuzz the MQP-2 codec (cargo-fuzz)
 - [x] Remove the quinn-proto DATAGRAM drop-oldest process abort (`try_send_datagram`)
 - [x] Per-flow allocation on the TCP-open path (stack-buffer header, borrowed dial candidates)

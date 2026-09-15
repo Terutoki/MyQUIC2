@@ -239,6 +239,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        spawn_udp_reporter();
         let allow_private = c.allow_private;
         let auth_token = auth_token.clone();
         // Accept + handshake per connection: never await a handshake inline, or
@@ -304,6 +305,53 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// One UDP activity line per minute.
+///
+/// The only way to answer "is my UDP traffic actually going through the tunnel,
+/// and how large does it get?" without a packet capture — which on an encrypted
+/// tunnel can only ever show ciphertext. `high-water payload` is the empirical
+/// check on `MQP_FRAG_MAX_PAYLOAD`: a deployment that never approaches it needs
+/// no larger cap, whatever its workload is.
+fn spawn_udp_reporter() {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick fires immediately; skip it
+        let mut prev = udp_stats::snapshot();
+        let mut prev_w = udp_write::snapshot();
+        let mut prev_r = udp_stats::reassembly_drops();
+        loop {
+            tick.tick().await;
+            let now = udp_stats::snapshot();
+            let now_w = udp_write::snapshot();
+            let d = now.since(&prev);
+            let dw = now_w.since(&prev_w);
+            if !d.is_idle() {
+                info!(
+                    "udp relay (60s): {d}; high-water payload {} B",
+                    now.max_payload
+                );
+            }
+            // The last-hop write outcomes, always logged: a silent drop here is
+            // what a flat relay counter cannot show.
+            if !(dw.sent == 0 && dw.retried == 0) || !dw.clean() {
+                info!("udp write (60s): {dw}");
+            }
+            let now_r = udp_stats::reassembly_drops();
+            if now_r != prev_r {
+                info!(
+                    "udp reassembly (60s): {} expired (missing fragment), {} evicted (memory cap)",
+                    now_r.0.saturating_sub(prev_r.0),
+                    now_r.1.saturating_sub(prev_r.1)
+                );
+                prev_r = now_r;
+            }
+            prev = now;
+            prev_w = now_w;
+        }
+    });
+}
+
 async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()> {
     info!("new QUIC conn from {}", conn.remote_address());
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
@@ -365,6 +413,9 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // takes per datagram still applies — that part is inside quinn.
         let reader = cd.read_datagram();
         tokio::pin!(reader);
+        // Large app datagrams arrive as MQP-2 fragments; reassemble before they
+        // reach a target socket, so the target sees the datagram the app sent.
+        let mut reasm = DgramReassembler::new();
         loop {
             let d: Bytes = match reader.as_mut().await {
                 Ok(d) => d,
@@ -374,12 +425,28 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             // path as a zero-copy `Bytes::slice` (instead of a per-packet
             // copy) even after `decode_datagram_ref` borrowed `d`.
             let owned = d.clone();
-            let (s, addr, payload) = match decode_datagram_ref(&d) {
-                Ok(x) => x,
-                Err(_) => continue,
+            let (s, addr, payload): (u32, TargetAddr, Bytes) = if d.first() == Some(&MQP_DGRAM_FRAG)
+            {
+                let Ok(f) = decode_fragment(&d) else {
+                    continue;
+                };
+                match reasm.push(&f, mono_millis()) {
+                    Some((s, a, whole)) => (s, a, whole),
+                    // Incomplete: the sender is UDP and will not retransmit,
+                    // so the partial simply expires.
+                    None => continue,
+                }
+            } else {
+                let Ok((s, a, p)) = decode_datagram_ref(&d) else {
+                    continue;
+                };
+                let off = owned.len() - p.len();
+                (s, a.into_owned(), owned.slice(off..))
             };
-            let payload_off = owned.len() - payload.len();
-            match addr {
+            // Inbound half of the activity counters (the outbound half is
+            // recorded inside `DgramFragmenter::send`).
+            udp_stats::payload(payload.len());
+            match addr.as_ref() {
                 TargetAddrRef::Ip(dst) => {
                     if !allow_private && !is_global_ip(dst.ip()) {
                         continue;
@@ -391,7 +458,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     // Non-blocking send with bounded detached fallback: a full
                     // target buffer must never stall the single per-connection
                     // datagram reader (UDP loss is acceptable).
-                    udp_try_send(&sock, map_for_dual(dst), owned.slice(payload_off..));
+                    udp_try_send(&sock, map_for_dual(dst), payload);
                 }
                 TargetAddrRef::Domain(h, p) => {
                     // Fast path: cached DNS avoids a per-packet spawn; a fresh
@@ -408,7 +475,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 Some(v) => v,
                                 None => continue,
                             };
-                            udp_try_send(&sock, map_for_dual(dst), owned.slice(payload_off..));
+                            udp_try_send(&sock, map_for_dual(dst), payload);
                         }
                         CachedLookup::Unknown => {
                             let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
@@ -417,7 +484,6 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             };
                             let ss = ss.clone();
                             let cd = cd.clone();
-                            let payload = owned.slice(payload_off..);
                             let host = h.to_string();
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -967,11 +1033,16 @@ async fn get_or_create_sess(
         let h = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut buf = vec![0u8; 2048];
+            // `UDP_RECV_MAX`, not 2048: a target reply larger than the buffer is
+            // truncated by the kernel, and the `n == buf.len()` check below can
+            // only report it, not recover it.
+            let mut buf = vec![0u8; UDP_RECV_MAX + UDP_RECV_SLACK];
+            // One id counter per session: `(sess, id)` is the client's key.
+            let mut frag = DgramFragmenter::new();
             // quinn's `max_datagram_size()` takes the connection-state mutex that
             // the protocol driver also uses; never call it per datagram. 0 means
             // the peer does not support QUIC DATAGRAM (replies are then dropped).
-            let mut limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+            let mut limit = c2.max_datagram_size().unwrap_or(0);
             // Monotonic ms of the last liveness bump. The atomic is the cross-task
             // view; this copy is what the per-packet comparison uses, so the fast
             // path below never reads a clock.
@@ -996,7 +1067,7 @@ async fn get_or_create_sess(
                         {
                             break;
                         }
-                        limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+                        limit = c2.max_datagram_size().unwrap_or(0);
                         continue;
                     }
                 };
@@ -1009,27 +1080,40 @@ async fn get_or_create_sess(
                     last_touch = now;
                     last2.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                if n == buf.len() || limit == 0 {
+                if n == buf.len() {
+                    // The kernel already truncated the excess; say so rather
+                    // than drop it without a trace.
+                    warn!(
+                        "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
+                         raise MQP_FRAG_MAX_PAYLOAD to carry it"
+                    );
+                    continue;
+                }
+                if limit == 0 {
                     continue;
                 }
                 let src = SocketAddr::new(unmap(src.ip()), src.port());
-                let d = match encode_datagram_with_limit(s, &TargetAddr::Ip(src), &buf[..n], limit)
-                {
-                    Some(d) => d,
-                    None => continue,
-                };
-                // `try_send_datagram` (never quinn's `send_datagram`): a full send
-                // buffer drops the datagram instead of triggering quinn-proto's
-                // broken drop-oldest path, which underflows its byte accounting and
-                // aborts the process (see the helper's docs).
-                match try_send_datagram(&c2, d) {
+                // `limit` is the connection's live `max_datagram_size()`; never
+                // clamp it, because clamping the DATAGRAM budget is really
+                // clamping the *payload* budget (see `dgram_payload_cap`).
+                // `DgramFragmenter::send` is the single send path: it uses
+                // `try_send_datagram` internally (never quinn's `send_datagram`,
+                // whose drop-oldest path underflowed its byte accounting and
+                // aborted the process), splits anything too large for one frame,
+                // and accounts for every drop.
+                let ta = TargetAddr::Ip(src);
+                let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
+                if sent.fragmented() {
+                    tracing::debug!("udp session {s}: {} B sent as {} fragments", n, sent.frames);
+                }
+                match sent.outcome() {
                     DatagramSend::Sent => {}
                     DatagramSend::Blocked => {
                         // Buffer full: UDP semantics, drop this reply.
                     }
                     DatagramSend::TooLarge => {
                         // Path MTU shrank: refresh once, drop this packet.
-                        limit = c2.max_datagram_size().map(|m| m.min(1350)).unwrap_or(0);
+                        limit = c2.max_datagram_size().unwrap_or(0);
                     }
                     DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
                 }
@@ -1052,6 +1136,7 @@ async fn get_or_create_sess(
         });
         let dead = !alive.load(std::sync::atomic::Ordering::Relaxed);
         w.insert(s, (sock.clone(), h, last.clone(), permit));
+        udp_stats::session();
         // The reader may have exited before the insert (e.g. immediate socket
         // error); its self-reap ran too early, so remove the dead entry here
         // instead of leaving it to hold a permit until the 180s sweep.

@@ -217,11 +217,13 @@ async fn main() -> Result<()> {
                                 Ok(d) => d, Err(_) => break,
                             };
                             // Lightweight sess extraction: no full TargetAddr decode
-                            // here, the association task decodes once.
-                            if d.len() < 6 || d[0] != 0x02 {
+                            // here, the association task decodes once. Uses the
+                            // shared helper because a *fragment* (0x05) carries the
+                            // same prefix — switching on the type here silently
+                            // dropped every fragmented reply.
+                            let Some(sess) = dgram_sess(&d) else {
                                 continue;
-                            }
-                            let sess = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
+                            };
                             if sess != last_sess || last_tx.is_none() {
                                 last_sess = sess;
                                 last_tx = hub.sender(sess);
@@ -351,6 +353,7 @@ async fn main() -> Result<()> {
     let li = tokio::net::TcpListener::from_std(tcp_listener_dual(&c.socks_listen)?)?;
     info!("socks5 listening on {listen} -> QUIC {server_str_log} (dns=server-side, token={}, tls13-pinned, 0rtt)",
         if c.auth_token.is_empty() { "off" } else { "on" });
+    spawn_udp_reporter();
     let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
     loop {
         let (sock, peer) = match li.accept().await {
@@ -559,6 +562,53 @@ async fn wait_conn(
             _ = tokio::time::sleep_until(deadline) => {}
         }
     }
+}
+
+/// One UDP activity line per minute.
+///
+/// The only way to answer "is my UDP traffic actually going through the tunnel,
+/// and how large does it get?" without a packet capture — which on an encrypted
+/// tunnel can only ever show ciphertext. `high-water payload` is the empirical
+/// check on `MQP_FRAG_MAX_PAYLOAD`: a deployment that never approaches it needs
+/// no larger cap, whatever its workload is.
+fn spawn_udp_reporter() {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick fires immediately; skip it
+        let mut prev = udp_stats::snapshot();
+        let mut prev_w = udp_write::snapshot();
+        let mut prev_r = udp_stats::reassembly_drops();
+        loop {
+            tick.tick().await;
+            let now = udp_stats::snapshot();
+            let now_w = udp_write::snapshot();
+            let d = now.since(&prev);
+            let dw = now_w.since(&prev_w);
+            if !d.is_idle() {
+                info!(
+                    "udp relay (60s): {d}; high-water payload {} B",
+                    now.max_payload
+                );
+            }
+            // The last-hop write outcomes, always logged: a silent drop here is
+            // what a flat relay counter cannot show.
+            if !(dw.sent == 0 && dw.retried == 0) || !dw.clean() {
+                info!("udp write (60s): {dw}");
+            }
+            let now_r = udp_stats::reassembly_drops();
+            if now_r != prev_r {
+                info!(
+                    "udp reassembly (60s): {} expired (missing fragment), {} evicted (memory cap)",
+                    now_r.0.saturating_sub(prev_r.0),
+                    now_r.1.saturating_sub(prev_r.1)
+                );
+                prev_r = now_r;
+            }
+            prev = now;
+            prev_w = now_w;
+        }
+    });
 }
 
 // ---- SOCKS5 (RFC1928, no-auth only) ----
@@ -840,6 +890,7 @@ async fn handle_udp_associate(
             anyhow::bail!("udp association limit {MAX_UDP_ASSOCS} reached");
         }
     };
+    udp_stats::session();
     // Wrapper guarantees the subscription is torn down on every exit path,
     // including early setup errors that used to leak the hub entry forever.
     let res = udp_associate_inner(tcp, shared, sess, rx).await;
@@ -891,6 +942,9 @@ async fn udp_associate_inner(
             // buffer, because `bytes` cannot tell us whether the socket task
             // kept the allocation.
             let mut pkt = bytes::BytesMut::with_capacity(256);
+            // Large replies arrive as MQP-2 fragments; reassemble them here so
+            // the app sees the datagram the server's peer actually sent.
+            let mut reasm = DgramReassembler::new();
             while let Some(d) = rx.recv().await {
                 // ~1s resolution is plenty for the idle reaper.
                 let now = mono_millis();
@@ -898,16 +952,28 @@ async fn udp_associate_inner(
                 if now.saturating_sub(prev) >= 1000 {
                     last_activity_rx.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                let (_, addr, payload) = match decode_datagram_ref(&d) {
-                    Ok(x) => x,
-                    Err(_) => continue,
+                let (addr, payload): (TargetAddr, Bytes) = if d.first() == Some(&MQP_DGRAM_FRAG) {
+                    let Ok(f) = decode_fragment(&d) else { continue };
+                    match reasm.push(&f, now) {
+                        Some((_, a, whole)) => (a, whole),
+                        // Still missing fragments: UDP semantics say wait for
+                        // nothing, the partial expires on its own.
+                        None => continue,
+                    }
+                } else {
+                    let Ok((_, a, p)) = decode_datagram_ref(&d) else {
+                        continue;
+                    };
+                    // Zero-copy view of the received datagram: `Bytes::slice`
+                    // only bumps a refcount, so the reply path never copies the
+                    // payload to hand it to the socket task.
+                    let off = d.len() - p.len();
+                    (a.into_owned(), d.slice(off..))
                 };
-                // Zero-copy view of the received datagram: `Bytes::slice` only
-                // bumps a refcount, so the reply path never copies the payload
-                // to hand it to the socket task.
-                let off = d.len() - payload.len();
-                let payload = d.slice(off..);
-                match addr {
+                // Inbound half of the activity counters (the outbound half is
+                // recorded inside `DgramFragmenter::send`).
+                udp_stats::payload(payload.len());
+                match addr.as_ref() {
                     TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, &payload, &mut pkt),
                     TargetAddrRef::Domain(h, p) => {
                         // The server always echoes replies with an IP-form source
@@ -950,7 +1016,14 @@ async fn udp_associate_inner(
     // app -> QUIC with this association's sess. Idle assoc (no packets
     // either way for 180s) is reaped so leaked TCP controls cannot hold
     // relay sockets forever (B6).
-    let mut buf = vec![0u8; 2048];
+    //
+    // `UDP_RECV_MAX`, not 2048: the socket must be able to hold any datagram
+    // the protocol can carry, or the kernel truncates it before the fragmenter
+    // ever sees it. The SOCKS5 header sits in front of the payload, so the
+    // buffer covers both (`n == buf.len()` below reports a truncation).
+    let mut buf = vec![0u8; UDP_RECV_MAX + SOCKS_UDP_HDR_MAX + UDP_RECV_SLACK];
+    // One id counter per association: `(sess, id)` is the receiver's key.
+    let mut frag = DgramFragmenter::new();
     let idle_limit_ms = 180_000u64;
     // Cached egress connection + PMTU limit. Re-read from `shared` at most
     // once per EGRESS_REFRESH (or after a failed send), so the per-packet path
@@ -976,6 +1049,14 @@ async fn udp_associate_inner(
                     Err(_) => break,
                 };
                 if n == buf.len() {
+                    // The kernel truncates a datagram larger than the buffer and
+                    // reports only the buffer length, so the excess is already
+                    // gone. Say so instead of dropping it without a trace.
+                    warn!(
+                        "udp assoc {sess}: app datagram of >= {} B truncated; raise \
+                         MQP_FRAG_MAX_PAYLOAD to carry it",
+                        buf.len()
+                    );
                     continue;
                 }
                 // Pin the source IP: any host that can reach the relay port
@@ -1021,7 +1102,7 @@ async fn udp_associate_inner(
                     };
                     egress = match g.as_ref() {
                         Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
-                            Some(m) => Some((c.clone(), m.min(1350), now_c)),
+                            Some(m) => Some((c.clone(), m, now_c)),
                             None => {
                                 if !warned_no_datagram {
                                     warned_no_datagram = true;
@@ -1036,14 +1117,22 @@ async fn udp_associate_inner(
                 let Some((conn, limit, _)) = egress.as_ref() else {
                     continue;
                 };
-                // Respect live PMTU: quinn starts at a 1200-byte MTU, so the
-                // old fixed 1350 limit silently dropped datagrams that were
-                // still too large for the current path.
-                let d = match encode_datagram_ref_with_limit(sess, &addr, payload, *limit) {
-                    Some(d) => d,
-                    None => continue,
-                };
-                match try_send_datagram(conn, d) {
+                // `limit` is the connection's live `max_datagram_size()`: the
+                // real DATAGRAM budget for the discovered path MTU, with the
+                // QUIC overhead already subtracted. It is deliberately NOT
+                // clamped — a hard cap here is really a *payload* cap, and the
+                // old `min(1350)` made every UDP payload above 1338 B vanish on
+                // a 1472 B path (see `dgram_payload_cap`). Payloads past a single
+                // frame are split by the fragmenter rather than dropped.
+                let sent = frag.send(conn, sess, &addr, payload, *limit);
+                if sent.fragmented() {
+                    tracing::debug!(
+                        "udp assoc {sess}: {} B sent as {} fragments",
+                        payload.len(),
+                        sent.frames
+                    );
+                }
+                match sent.outcome() {
                     DatagramSend::Sent => {}
                     DatagramSend::Blocked => {
                         // Full send buffer: dropped, per UDP semantics. The
@@ -1123,6 +1212,9 @@ fn send_reply(
     pkt: &mut bytes::BytesMut,
 ) {
     let Some(app) = last_app.read().ok().and_then(|g| *g) else {
+        // A reply before the app's address is known has nowhere to go. Counted:
+        // this used to return silently.
+        udp_write::no_app();
         return;
     };
     pkt.truncate(0);

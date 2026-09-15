@@ -303,11 +303,122 @@ pub const MQP_DGRAM_TYPE: u8 = 0x02;
 /// before its address header.
 pub const DGRAM_PREFIX_LEN: usize = 1 + 4;
 
+/// Standalone default for [`encode_datagram`], used only by callers that have
+/// no live connection to ask (tests, tooling).
+///
+/// Both relays must instead pass `Connection::max_datagram_size()`, which is
+/// the largest DATAGRAM body QUIC will actually carry on the *current* path.
+/// Hard-coding this value in a relay is what made every UDP payload above
+/// 1338 B silently disappear on a 1472 B path (see `dgram_payload_cap`).
+pub const DGRAM_DEFAULT_LIMIT: usize = 1350;
+
+/// MQP-2 fragmented-datagram frame type.
+///
+/// `0x02` is the single-frame datagram and the address atyp values are
+/// `0x01/0x03/0x04`, so `0x05` is free. A peer that predates fragmentation
+/// rejects this type in `decode_datagram_ref` and drops the datagram — the
+/// pre-fix behaviour for oversized payloads, never a misparse.
+pub const MQP_DGRAM_FRAG: u8 = 0x05;
+
+/// Fixed part of a fragment header: `type | sess | id | idx | total`.
+pub const FRAG_PREFIX_LEN: usize = 1 + 4 + 2 + 1 + 1;
+
+/// Largest UDP payload the protocol will carry or reassemble.
+///
+/// # Why 8 KiB rather than the 65507 B UDP maximum
+///
+/// 8192 B is 5.5x the largest datagram any real-time medium produces (1472 B
+/// on a 1500 B MTU), so it is not a limit the target workload can reach. The
+/// reason not to go higher is **loss amplification**: a payload split into `F`
+/// fragments arrives only if all `F` do, so a datagram's delivery probability is
+/// `(1-p)^F` while its cost stays `F` fragments. On a 1 %-loss link a 64 KiB
+/// payload is 47 fragments — 62 % delivery at 47x the bytes, and at 5 % loss it
+/// is 9 %, i.e. bandwidth spent on a datagram that will not arrive.
+///
+/// Fragmentation still beats the alternative (dropping it outright), so the wire
+/// format is sized to reach the full UDP maximum — see
+/// [`MQP_FRAG_MAX_TOTAL`] — and raising this constant is a one-line change if a
+/// deployment needs NFS-over-UDP or outsized EDNS0 responses.
+pub const MQP_FRAG_MAX_PAYLOAD: usize = 8192;
+
+/// Largest number of fragments one payload may be split into.
+///
+/// `u8` on the wire, and deliberately large enough to carry
+/// [`UDP_PAYLOAD_MAX`] at QUIC's *minimum* path MTU, so raising
+/// [`MQP_FRAG_MAX_PAYLOAD`] to the UDP maximum never becomes a wire-format
+/// change. The compile-time assertion below proves that.
+pub const MQP_FRAG_MAX_TOTAL: u8 = 64;
+
+/// Maximum UDP payload for IPv4 (65535 - 20 IP - 8 UDP) or IPv6
+/// (65535 - 40 - 8, ignoring jumbograms): 65507 either way.
+pub const UDP_PAYLOAD_MAX: usize = 65507;
+
+/// quinn's DATAGRAM budget at QUIC's minimum 1200 B path MTU: the smallest
+/// limit any conforming path can produce, and therefore the worst case for
+/// fragment sizing.
+pub const MIN_PATH_DGRAM_BUDGET: usize = 1162;
+
+const _: () = {
+    // Smallest chunk a fragment can carry: the minimum path budget minus the
+    // fragment prefix and the largest (IPv6) address header.
+    let min_chunk = MIN_PATH_DGRAM_BUDGET - FRAG_PREFIX_LEN - (1 + 16 + 2);
+    let needed = (UDP_PAYLOAD_MAX as u64).div_ceil(min_chunk as u64);
+    assert!(
+        needed <= MQP_FRAG_MAX_TOTAL as u64,
+        "u8 fragment count cannot reach the UDP maximum at the minimum MTU"
+    );
+};
+
+/// Read buffer for the UDP relays. On the server this holds a bare payload; on
+/// the client it must additionally cover the SOCKS5 UDP header, so the client
+/// sizes its socket buffer as `UDP_RECV_MAX + SOCKS_UDP_HDR_MAX`. Either way the
+/// buffer must cover everything the protocol can carry, or the kernel truncates
+/// the datagram — a silent loss with no counter behind it.
+pub const UDP_RECV_MAX: usize = MQP_FRAG_MAX_PAYLOAD;
+
+/// Largest SOCKS5 UDP framing in front of a payload:
+/// `RSV(2) | FRAG(1) | atyp(1) | addr(≤16) | port(2)`.
+pub const SOCKS_UDP_HDR_MAX: usize = 3 + 1 + 16 + 2;
+
+/// One byte of slack on every relay read buffer.
+///
+/// `recv_from` reports the buffer length both when a datagram exactly filled it
+/// and when the kernel truncated a larger one, so the two are indistinguishable
+/// at `n == buf.len()`. With a byte to spare, that equality means "truncated"
+/// and nothing else — otherwise every maximum-size datagram would log a false
+/// truncation warning.
+pub const UDP_RECV_SLACK: usize = 1;
+
+/// How long a partial reassembly is held before it is discarded. A datagram
+/// missing a fragment is undeliverable, and UDP gives the peer no reason to
+/// wait longer than a retransmit-free round trip.
+pub const FRAG_TIMEOUT_MS: u64 = 2_000;
+
+/// Reassembly memory bound per connection. A partial is at most
+/// [`MQP_FRAG_MAX_PAYLOAD`], and past this the oldest partial is evicted — so
+/// this is also what caps how many datagrams may be in flight at once.
+pub const FRAG_MAX_HELD_BYTES: usize = 256 * 1024;
+
 /// Build a UDP DATAGRAM body: type + sess + addr header + payload.
 /// sess scopes the packet to one UDP ASSOCIATE so concurrent associations sharing
 /// a QUIC connection never steal each other's replies. Returns None if exceeds limit.
 pub fn encode_datagram(sess: u32, addr: &TargetAddr, payload: &[u8]) -> Option<Bytes> {
-    encode_datagram_with_limit(sess, addr, payload, 1350)
+    encode_datagram_with_limit(sess, addr, payload, DGRAM_DEFAULT_LIMIT)
+}
+
+/// UDP payload bytes that fit in a datagram of `limit` **total** MQP-2 bytes
+/// for `address`, i.e. `limit` minus the fixed prefix and the address header.
+///
+/// `limit` is the value of `Connection::max_datagram_size()`: quinn already
+/// subtracts the QUIC packet overhead and the DATAGRAM frame header, so the
+/// returned number *is* the usable UDP payload budget on the current path —
+/// not a guess and not a policy cap. Saturates to 0 when the address header
+/// alone does not fit, which the encoder then reports as `TooLarge`.
+pub fn dgram_payload_cap(limit: usize, address: &TargetAddrRef<'_>) -> usize {
+    match address.header() {
+        Ok(h) => limit.saturating_sub(DGRAM_PREFIX_LEN + h.len()),
+        Err(_) => 0,
+    }
 }
 
 pub fn encode_datagram_with_limit(
@@ -363,6 +474,100 @@ pub fn decode_datagram_ref(b: &[u8]) -> Result<(u32, TargetAddrRef<'_>, &[u8])> 
     let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
     let (a, n) = TargetAddrRef::decode(&b[DGRAM_PREFIX_LEN..])?;
     Ok((sess, a, &b[DGRAM_PREFIX_LEN + n..]))
+}
+
+// ---------------- QUIC DATAGRAM fragmentation (MQP-2 large UDP) ----------------
+// A QUIC DATAGRAM cannot carry a full 1472 B UDP payload: the 12 B MQP header
+// plus the QUIC packet and DATAGRAM-frame overhead exceed the path MTU, so a
+// proxy built only on single-frame datagrams is strictly worse than a direct
+// UDP path for large media packets (DTLS handshake flights, non-WebRTC
+// conferencing stacks, TURN-wrapped payloads, modest IP fragmentation). These
+// frames lift that ceiling to `MQP_FRAG_MAX_PAYLOAD` without giving up UDP
+// semantics: a datagram missing any fragment is dropped, never retransmitted.
+
+/// One decoded [`MQP_DGRAM_FRAG`] frame.
+///
+/// The address header is repeated on *every* fragment, which costs 7 B (IPv4)
+/// or 19 B (IPv6) per fragment and buys a reassembler that needs no special
+/// case for out-of-order arrival or for a lost fragment 0: every fragment is
+/// self-describing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentRef<'a> {
+    pub sess: u32,
+    pub id: u16,
+    pub idx: u8,
+    pub total: u8,
+    pub address: TargetAddrRef<'a>,
+    pub chunk: &'a [u8],
+}
+
+/// Session id of any relay datagram, single-frame or fragment.
+///
+/// Both forms start `type u8 | sess u32 LE`, so routing reads the same bytes
+/// either way. **A dispatcher must not switch on the type**: doing so silently
+/// drops fragments before the reassembler ever sees them, which looks exactly
+/// like the pre-fragmentation oversize loss. This helper is the single place
+/// that knows which types are routable.
+pub fn dgram_sess(b: &[u8]) -> Option<u32> {
+    match b.first() {
+        Some(&MQP_DGRAM_TYPE) | Some(&MQP_DGRAM_FRAG) if b.len() >= DGRAM_PREFIX_LEN => {
+            Some(u32::from_le_bytes([b[1], b[2], b[3], b[4]]))
+        }
+        _ => None,
+    }
+}
+
+/// Largest chunk one fragment can carry for `address` under `limit`.
+pub fn fragment_chunk_len(limit: usize, address: &TargetAddrRef<'_>) -> usize {
+    match address.header() {
+        Ok(h) => limit.saturating_sub(FRAG_PREFIX_LEN + h.len()),
+        Err(_) => 0,
+    }
+}
+
+/// Encode one fragment. Returns `None` if the chunk does not fit `limit`.
+pub fn encode_fragment(
+    sess: u32,
+    id: u16,
+    idx: u8,
+    total: u8,
+    address: &TargetAddrRef<'_>,
+    chunk: &[u8],
+    limit: usize,
+) -> Option<Bytes> {
+    let header = address.header().ok()?;
+    let total_len = FRAG_PREFIX_LEN + header.len() + chunk.len();
+    if total_len > limit {
+        return None;
+    }
+    let mut v = Vec::with_capacity(total_len);
+    v.push(MQP_DGRAM_FRAG);
+    v.extend_from_slice(&sess.to_le_bytes());
+    v.extend_from_slice(&id.to_le_bytes());
+    v.push(idx);
+    v.push(total);
+    header.encode(&mut v).ok()?;
+    debug_assert_eq!(v.len(), FRAG_PREFIX_LEN + header.len());
+    v.extend_from_slice(chunk);
+    Some(Bytes::from(v))
+}
+
+pub fn decode_fragment(b: &[u8]) -> Result<FragmentRef<'_>> {
+    if b.len() < FRAG_PREFIX_LEN + 1 || b[0] != MQP_DGRAM_FRAG {
+        anyhow::bail!("bad fragment");
+    }
+    let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
+    let id = u16::from_le_bytes([b[5], b[6]]);
+    let (idx, total) = (b[7], b[8]);
+    let (address, n) = TargetAddrRef::decode(&b[FRAG_PREFIX_LEN..])?;
+    Ok(FragmentRef {
+        sess,
+        id,
+        idx,
+        total,
+        address,
+        chunk: &b[FRAG_PREFIX_LEN + n..],
+    })
 }
 
 // ---------------- Config files ----------------
@@ -578,9 +783,15 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // must be large enough to hold a datagram of the maximum size we can encode.
     // A buffer smaller than one datagram makes `send_datagram_wait` report
     // `Blocked` forever (nothing could ever be queued), and it is also what made
-    // the old drop-oldest path reachable with an empty queue. `build_transport`
-    // is the only place these two numbers meet, so enforce it here.
-    const _: () = assert!(DATAGRAM_BUFFER >= MQP_DGRAM_MAX);
+    // the old drop-oldest path reachable with an empty queue. The bound is
+    // `DGRAM_MAX_WIRE`, not the 264 B header bound: since the relays pass the
+    // live `max_datagram_size()` unclamped, the largest body actually queued is
+    // a full-path one. `build_transport` is the only place these meet.
+    const _: () = assert!(DATAGRAM_BUFFER >= DGRAM_MAX_WIRE);
+    // ...and the largest possible body must be able to hold the largest
+    // possible MQP-2 header, or a maximum-length domain target could never be
+    // encoded at any path MTU.
+    const _: () = assert!(DGRAM_MAX_WIRE > MQP_DGRAM_MAX);
     // 1024 concurrent streams cover high-concurrency tests with margin.
     t.max_concurrent_bidi_streams(1024u32.into());
     t.max_concurrent_uni_streams(100u32.into());
@@ -636,8 +847,9 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
             .expect("idle timeout must fit in a QUIC VarInt"),
     ));
     // NOTE: quinn-udp auto-probes GSO/GRO (UDP_SEGMENT) + PMTU discovery;
-    // no explicit max_udp_payload flag in the quinn API — the 1350B datagram cap
-    // is enforced in encode_datagram.
+    // there is no explicit max_udp_payload flag in the quinn API. The outgoing
+    // datagram budget is the live `Connection::max_datagram_size()`, which
+    // quinn derives from the discovered path MTU; see `dgram_payload_cap`.
     Arc::new(t)
 }
 
@@ -1320,6 +1532,15 @@ const DATAGRAM_BUFFER: usize = 1024 * 1024;
 /// the tests below can prove the send-buffer invariant rather than assert it.
 const MQP_DGRAM_MAX: usize = 5 + 1 + 1 + 255 + 2;
 
+/// Largest MQP-2 datagram body that can ever be handed to quinn.
+///
+/// The body is `min(Connection::max_datagram_size(), ...)` and quinn's own
+/// ceiling is the endpoint's `max_udp_payload_size` (1472), so no datagram can
+/// exceed that. This — not [`MQP_DGRAM_MAX`], which is only the header bound —
+/// is what the send buffer has to hold at least one of for
+/// `send_datagram_wait` to ever make progress.
+pub const DGRAM_MAX_WIRE: usize = 1472;
+
 /// Outcome of [`try_send_datagram`]. Mirrors quinn's error surface, but a full
 /// send buffer is a plain `Blocked` (the datagram was dropped) instead of an
 /// await point.
@@ -1398,6 +1619,611 @@ pub fn try_send_datagram(conn: &quinn::Connection, d: Bytes) -> DatagramSend {
     }
 }
 
+/// Process-wide UDP DATAGRAM drop accounting.
+///
+/// Every dropped datagram is a packet the peer's own UDP stack would have
+/// carried, so these counters are the honest measure of how much the tunnel is
+/// degrading UDP. Both drop paths used to be `debug!`-only, which made a
+/// silent 100 % loss of large datagrams invisible at the default log level.
+pub mod dgram_drops {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Payload did not fit the current path's DATAGRAM budget (oversized).
+    pub static TOO_LARGE: AtomicU64 = AtomicU64::new(0);
+    /// Send buffer full: dropped per UDP semantics (quinn `Blocked`).
+    pub static BUFFER_FULL: AtomicU64 = AtomicU64::new(0);
+
+    /// `(too_large, buffer_full)` totals since process start.
+    pub fn snapshot() -> (u64, u64) {
+        (
+            TOO_LARGE.load(Ordering::Relaxed),
+            BUFFER_FULL.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn bump(counter: &AtomicU64) -> u64 {
+        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+}
+
+/// UDP relay activity, so "is my UDP traffic actually going through the tunnel,
+/// and how large does it get?" is answerable from the log rather than a packet
+/// capture — on a QUIC tunnel a capture can only ever show ciphertext.
+///
+/// [`UdpSnapshot::max_payload`] is a **high-water mark, not a limit**: it is the
+/// empirical answer to "is `MQP_FRAG_MAX_PAYLOAD` big enough for this
+/// deployment", measured on real traffic instead of argued from protocol specs.
+/// A deployment whose high-water mark stays under `UDP_RECV_MAX` never needs a
+/// larger cap, whatever its workload is.
+pub mod udp_stats {
+    use crate::UdpSnapshot;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DATAGRAMS: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static FRAGMENTED: AtomicU64 = AtomicU64::new(0);
+    static MAX_PAYLOAD: AtomicU64 = AtomicU64::new(0);
+    static SESSIONS: AtomicU64 = AtomicU64::new(0);
+    static REASSEMBLY_EXPIRED: AtomicU64 = AtomicU64::new(0);
+    static REASSEMBLY_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+    /// One relayed UDP payload of `len` bytes.
+    pub fn payload(len: usize) {
+        DATAGRAMS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        MAX_PAYLOAD.fetch_max(len as u64, Ordering::Relaxed);
+    }
+
+    /// One payload that needed `frames` frames to carry.
+    pub fn fragmented(frames: u8) {
+        if frames > 1 {
+            FRAGMENTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A new UDP session (server) or SOCKS association (client) was established.
+    pub fn session() {
+        SESSIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A partial datagram was discarded because a fragment never arrived.
+    pub fn reassembly_expired() {
+        REASSEMBLY_EXPIRED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A partial datagram was discarded to stay inside [`FRAG_MAX_HELD_BYTES`].
+    pub fn reassembly_evicted() {
+        REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(expired, evicted)` reassembly losses since process start. These are the
+    /// only drops that happen after the wire, so no send-side counter can see
+    /// them: a fragment lost in transit shows up here, not in `udp_write`.
+    pub fn reassembly_drops() -> (u64, u64) {
+        (
+            REASSEMBLY_EXPIRED.load(Ordering::Relaxed),
+            REASSEMBLY_EVICTED.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn snapshot() -> UdpSnapshot {
+        UdpSnapshot {
+            datagrams: DATAGRAMS.load(Ordering::Relaxed),
+            bytes: BYTES.load(Ordering::Relaxed),
+            fragmented: FRAGMENTED.load(Ordering::Relaxed),
+            max_payload: MAX_PAYLOAD.load(Ordering::Relaxed),
+            sessions: SESSIONS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// See [`udp_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UdpSnapshot {
+    pub datagrams: u64,
+    pub bytes: u64,
+    pub fragmented: u64,
+    /// High-water mark over the process lifetime; never differenced, because a
+    /// maximum cannot be subtracted.
+    pub max_payload: u64,
+    pub sessions: u64,
+}
+
+impl UdpSnapshot {
+    /// Counters accumulated since `prev`. `max_payload` stays the cumulative
+    /// high-water mark for the reason above.
+    pub fn since(&self, prev: &Self) -> Self {
+        Self {
+            datagrams: self.datagrams.saturating_sub(prev.datagrams),
+            bytes: self.bytes.saturating_sub(prev.bytes),
+            fragmented: self.fragmented.saturating_sub(prev.fragmented),
+            max_payload: self.max_payload,
+            sessions: self.sessions.saturating_sub(prev.sessions),
+        }
+    }
+
+    /// Nothing happened in this interval; callers use it to stay quiet.
+    pub fn is_idle(&self) -> bool {
+        self.datagrams == 0 && self.sessions == 0
+    }
+}
+
+impl std::fmt::Display for UdpSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} session(s), {} datagram(s) / {:.2} MiB, {} fragmented",
+            self.sessions,
+            self.datagrams,
+            self.bytes as f64 / (1024.0 * 1024.0),
+            self.fragmented
+        )
+    }
+}
+
+/// Terminal outcomes of the last-hop UDP write.
+///
+/// These were the only paths in the relay that could lose a packet with no
+/// counter behind them — `udp_try_send` dropped on a full retry budget, threw
+/// away hard errors at `debug!`, and a reply with no recorded app address
+/// returned silently. That is why a rate-dependent loss could be measured from
+/// the outside while every existing counter stayed flat.
+pub mod udp_write {
+    use crate::UdpWriteSnapshot;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Written to the socket on the first attempt.
+    pub static SENT: AtomicU64 = AtomicU64::new(0);
+    /// `WouldBlock`: handed to a detached task that retries (not a loss).
+    pub static RETRIED: AtomicU64 = AtomicU64::new(0);
+    /// `WouldBlock` and the detached-retry budget was exhausted: dropped.
+    pub static DROPPED_NO_PERMIT: AtomicU64 = AtomicU64::new(0);
+    /// Hard send error. Previously `debug!`-only, i.e. invisible in production.
+    pub static FAILED: AtomicU64 = AtomicU64::new(0);
+    /// A reply arrived before any app address was known: nowhere to send it.
+    pub static NO_APP: AtomicU64 = AtomicU64::new(0);
+    /// A detached retry finished without writing.
+    pub static RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
+
+    fn bump(c: &AtomicU64) -> u64 {
+        c.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+    pub fn sent() {
+        bump(&SENT);
+    }
+    pub fn retried() -> u64 {
+        bump(&RETRIED)
+    }
+    pub fn dropped_no_permit() -> u64 {
+        bump(&DROPPED_NO_PERMIT)
+    }
+    pub fn failed() -> u64 {
+        bump(&FAILED)
+    }
+    pub fn no_app() -> u64 {
+        bump(&NO_APP)
+    }
+    pub fn retry_failed() -> u64 {
+        bump(&RETRY_FAILED)
+    }
+
+    pub fn snapshot() -> UdpWriteSnapshot {
+        UdpWriteSnapshot {
+            sent: SENT.load(Ordering::Relaxed),
+            retried: RETRIED.load(Ordering::Relaxed),
+            dropped_no_permit: DROPPED_NO_PERMIT.load(Ordering::Relaxed),
+            failed: FAILED.load(Ordering::Relaxed),
+            no_app: NO_APP.load(Ordering::Relaxed),
+            retry_failed: RETRY_FAILED.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// See [`udp_write`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UdpWriteSnapshot {
+    pub sent: u64,
+    pub retried: u64,
+    pub dropped_no_permit: u64,
+    pub failed: u64,
+    pub no_app: u64,
+    pub retry_failed: u64,
+}
+
+impl UdpWriteSnapshot {
+    pub fn since(&self, prev: &Self) -> Self {
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        Self {
+            sent: d(self.sent, prev.sent),
+            retried: d(self.retried, prev.retried),
+            dropped_no_permit: d(self.dropped_no_permit, prev.dropped_no_permit),
+            failed: d(self.failed, prev.failed),
+            no_app: d(self.no_app, prev.no_app),
+            retry_failed: d(self.retry_failed, prev.retry_failed),
+        }
+    }
+    /// Nothing was lost in this interval.
+    pub fn clean(&self) -> bool {
+        self.dropped_no_permit == 0
+            && self.failed == 0
+            && self.no_app == 0
+            && self.retry_failed == 0
+    }
+}
+
+impl std::fmt::Display for UdpWriteSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} sent, {} retried, {} dropped(no permit), {} failed, {} no-app, {} retry-failed",
+            self.sent,
+            self.retried,
+            self.dropped_no_permit,
+            self.failed,
+            self.no_app,
+            self.retry_failed
+        )
+    }
+}
+
+/// Monotonic milliseconds since first use. Interval logic deliberately avoids
+/// wall-clock reads, which an NTP step would corrupt.
+fn mono_ms() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Minimum spacing between datagram-drop warnings, per process.
+const DROP_WARN_INTERVAL_MS: u64 = 10_000;
+
+/// Sentinel for "no drop warning has been emitted yet".
+///
+/// Using 0 here swallows the *first* drop: `mono_ms()` establishes its base on
+/// first call, so the elapsed value it returns starts near zero and
+/// `now - 0 < INTERVAL` holds. That is exactly the case a fresh deployment
+/// hits, so the first drop must warn unconditionally.
+const NEVER_WARNED: u64 = u64::MAX;
+
+/// Whether a drop warning is due. Split out from the atomic so the window logic
+/// is testable without a clock or a global.
+fn drop_warn_due(last: u64, now: u64) -> bool {
+    last == NEVER_WARNED || now.saturating_sub(last) >= DROP_WARN_INTERVAL_MS
+}
+
+/// Rate-limited (at most one per [`DROP_WARN_INTERVAL_MS`], process-wide)
+/// warning for a dropped datagram. A per-packet `warn!` would itself become the
+/// bottleneck under the flood that causes drops.
+fn warn_datagram_drop(reason: &str, total: u64, detail: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    let now = mono_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if !drop_warn_due(last, now)
+        || LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        "udp datagram dropped ({reason}): {total} so far{detail} — a packet this size would \
+         have been carried by a direct UDP path, so the tunnel is degrading UDP here"
+    );
+}
+
+/// Path-budget context for a drop warning.
+fn budget_detail(limit: usize, cap: usize) -> String {
+    format!("; path DATAGRAM limit {limit} B, usable UDP payload {cap} B")
+}
+
+/// Encode and send one UDP payload as a single MQP-2 DATAGRAM, accounting for
+/// every drop.
+///
+/// `limit` must be [`quinn::Connection::max_datagram_size`] — see
+/// [`dgram_payload_cap`] for the resulting UDP payload budget. A returned
+/// [`DatagramSend::TooLarge`] means the payload exceeds what the current path
+/// can carry in one frame; [`DgramFragmenter::send`] is the relay entry point
+/// and splits such a payload instead of dropping it.
+pub fn send_udp_datagram(
+    conn: &quinn::Connection,
+    sess: u32,
+    address: &TargetAddrRef<'_>,
+    payload: &[u8],
+    limit: usize,
+) -> DatagramSend {
+    let Some(d) = encode_datagram_ref_with_limit(sess, address, payload, limit) else {
+        let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        warn_datagram_drop(
+            "payload exceeds the path budget",
+            n,
+            &budget_detail(limit, dgram_payload_cap(limit, address)),
+        );
+        return DatagramSend::TooLarge;
+    };
+    send_encoded(conn, d)
+}
+
+/// Queue an already-encoded datagram body, counting a full send buffer.
+fn send_encoded(conn: &quinn::Connection, body: Bytes) -> DatagramSend {
+    let outcome = try_send_datagram(conn, body);
+    if outcome == DatagramSend::Blocked {
+        let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+        warn_datagram_drop("send buffer full", n, "");
+    }
+    outcome
+}
+
+/// Result of [`DgramFragmenter::send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadSend {
+    /// Frames actually queued (1 for the unfragmented fast path).
+    pub frames: u8,
+    /// The failure that stopped the send, if it did not complete. A partially
+    /// sent payload is *not* rolled back: the peer discards it on reassembly
+    /// timeout, which is the UDP answer to a lost fragment.
+    pub failed: Option<DatagramSend>,
+}
+
+impl PayloadSend {
+    pub fn complete(&self) -> bool {
+        self.failed.is_none()
+    }
+    pub fn fragmented(&self) -> bool {
+        self.frames > 1
+    }
+    /// Collapse to the single-frame outcome the relays already match on.
+    pub fn outcome(&self) -> DatagramSend {
+        self.failed.unwrap_or(DatagramSend::Sent)
+    }
+}
+
+/// Splits oversized UDP payloads across [`MQP_DGRAM_FRAG`] frames.
+///
+/// One instance per sending context (a SOCKS association on the client, a UDP
+/// session on the server), so `id` is unique within the `(sess, id)` key the
+/// receiver reassembles on.
+#[derive(Debug, Default)]
+pub struct DgramFragmenter {
+    next_id: u16,
+}
+
+impl DgramFragmenter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Encode and send `payload`, fragmenting only when it does not fit one
+    /// DATAGRAM. The unfragmented path is byte-identical to the pre-fragmentation
+    /// wire format, so small packets pay nothing for this.
+    pub fn send(
+        &mut self,
+        conn: &quinn::Connection,
+        sess: u32,
+        address: &TargetAddrRef<'_>,
+        payload: &[u8],
+        limit: usize,
+    ) -> PayloadSend {
+        let cap = dgram_payload_cap(limit, address);
+        // Every outbound relayed payload passes through here, so this is the one
+        // place the activity counters need (see `udp_stats`).
+        udp_stats::payload(payload.len());
+        if payload.len() <= cap {
+            let failed = match send_udp_datagram(conn, sess, address, payload, limit) {
+                DatagramSend::Sent => None,
+                other => Some(other),
+            };
+            return PayloadSend {
+                frames: u8::from(failed.is_none()),
+                failed,
+            };
+        }
+
+        let chunk = fragment_chunk_len(limit, address);
+        // One fragment must carry something, and the reassembled result must
+        // stay inside both the protocol's payload cap and the u8 fragment count.
+        let total_usize = if chunk == 0 {
+            usize::MAX
+        } else {
+            payload.len().div_ceil(chunk)
+        };
+        if total_usize > MQP_FRAG_MAX_TOTAL as usize || payload.len() > MQP_FRAG_MAX_PAYLOAD {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop(
+                "payload above the MQP-2 fragmentation limit",
+                n,
+                &format!(
+                    "; {} B exceeds the {MQP_FRAG_MAX_PAYLOAD} B reassembly cap",
+                    payload.len()
+                ),
+            );
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        }
+        let total = total_usize as u8;
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+
+        udp_stats::fragmented(total);
+        let mut frames = 0u8;
+        for (i, part) in payload.chunks(chunk).enumerate() {
+            let Some(body) = encode_fragment(sess, id, i as u8, total, address, part, limit) else {
+                // Only reachable if `chunk` and the encoder disagree; report it
+                // rather than send a payload that can never reassemble.
+                let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+                warn_datagram_drop("fragment does not fit the path budget", n, "");
+                return PayloadSend {
+                    frames,
+                    failed: Some(DatagramSend::TooLarge),
+                };
+            };
+            match send_encoded(conn, body) {
+                DatagramSend::Sent => frames += 1,
+                other => {
+                    return PayloadSend {
+                        frames,
+                        failed: Some(other),
+                    }
+                }
+            }
+        }
+        PayloadSend {
+            frames,
+            failed: None,
+        }
+    }
+}
+
+/// A partially reassembled datagram.
+struct Partial {
+    total: u8,
+    address: TargetAddr,
+    chunks: Vec<Option<Bytes>>,
+    got: u8,
+    bytes: usize,
+    first_ms: u64,
+}
+
+impl Partial {
+    fn new(total: u8, address: &TargetAddrRef<'_>, now_ms: u64) -> Self {
+        Self {
+            total,
+            address: address.into_owned(),
+            chunks: vec![None; total as usize],
+            got: 0,
+            bytes: 0,
+            first_ms: now_ms,
+        }
+    }
+
+    fn assemble(self) -> Bytes {
+        let mut out = bytes::BytesMut::with_capacity(self.bytes);
+        for c in self.chunks.into_iter().flatten() {
+            out.extend_from_slice(&c);
+        }
+        out.freeze()
+    }
+}
+
+/// Reassembles [`MQP_DGRAM_FRAG`] frames into whole UDP payloads.
+///
+/// Keyed by `(sess, id)`. Because every fragment carries the address header,
+/// out-of-order arrival needs no special case and a lost fragment 0 does not
+/// strand the rest — the partial simply expires. Memory is bounded twice over:
+/// per partial by [`MQP_FRAG_MAX_PAYLOAD`], and in aggregate by
+/// [`FRAG_MAX_HELD_BYTES`], past which the oldest partial is evicted.
+#[derive(Default)]
+pub struct DgramReassembler {
+    parts: HashMap<(u32, u16), Partial>,
+    held: usize,
+    last_sweep_ms: u64,
+}
+
+impl DgramReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn held_bytes(&self) -> usize {
+        self.held
+    }
+
+    /// Number of datagrams currently waiting for their remaining fragments.
+    pub fn inflight(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Feed one fragment. Returns the payload once the last fragment lands.
+    ///
+    /// A duplicate fragment is ignored, a malformed one is rejected without
+    /// disturbing the partial, and an incomplete datagram is dropped silently —
+    /// the sender is UDP and will not retransmit, so there is nothing to report
+    /// to a peer that never asked for reliability. A *complete* set replayed
+    /// after delivery is delivered again: UDP permits duplicates, the id is
+    /// freed on completion, and suppressing them would cost a window of
+    /// completed ids for no semantic gain.
+    pub fn push(&mut self, f: &FragmentRef<'_>, now_ms: u64) -> Option<(u32, TargetAddr, Bytes)> {
+        if f.total < 2 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total {
+            return None;
+        }
+        self.maybe_sweep(now_ms);
+
+        let key = (f.sess, f.id);
+        let complete = {
+            let entry = self
+                .parts
+                .entry(key)
+                .or_insert_with(|| Partial::new(f.total, &f.address, now_ms));
+            if entry.total != f.total {
+                // A wrapped id reused with a different shape: restart rather
+                // than splice two datagrams together.
+                *entry = Partial::new(f.total, &f.address, now_ms);
+            }
+            let slot = &mut entry.chunks[f.idx as usize];
+            if slot.is_none() {
+                *slot = Some(Bytes::copy_from_slice(f.chunk));
+                entry.got += 1;
+                entry.bytes += f.chunk.len();
+                self.held = self.held.saturating_add(f.chunk.len());
+            }
+            entry.got == entry.total
+        };
+
+        if complete {
+            let p = self.parts.remove(&key)?;
+            self.held = self.held.saturating_sub(p.bytes);
+            return Some((key.0, p.address.clone(), p.assemble()));
+        }
+        while self.held > FRAG_MAX_HELD_BYTES {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Drop partials whose first fragment is older than [`FRAG_TIMEOUT_MS`].
+    fn maybe_sweep(&mut self, now_ms: u64) {
+        if self.last_sweep_ms != 0 && now_ms.saturating_sub(self.last_sweep_ms) < 1_000 {
+            return;
+        }
+        self.last_sweep_ms = now_ms;
+        let mut freed = 0usize;
+        let mut expired = 0u64;
+        self.parts.retain(|_, p| {
+            let live = now_ms.saturating_sub(p.first_ms) < FRAG_TIMEOUT_MS;
+            if !live {
+                freed += p.bytes;
+                expired += 1;
+            }
+            live
+        });
+        for _ in 0..expired {
+            udp_stats::reassembly_expired();
+        }
+        self.held = self.held.saturating_sub(freed);
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(key) = self
+            .parts
+            .iter()
+            .min_by_key(|(_, p)| p.first_ms)
+            .map(|(k, _)| *k)
+        else {
+            return false;
+        };
+        if let Some(p) = self.parts.remove(&key) {
+            self.held = self.held.saturating_sub(p.bytes);
+            udp_stats::reassembly_evicted();
+        }
+        true
+    }
+}
+
 fn udp_send_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4096)))
@@ -1423,25 +2249,51 @@ fn udp_send_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 /// queued write.
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
     match sock.try_send_to(&payload, dst) {
-        Ok(_) => {}
+        Ok(_) => udp_write::sent(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             if let Ok(permit) = udp_send_limiter().clone().try_acquire_owned() {
+                let n = udp_write::retried();
                 let sock = sock.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    match payload.try_into_mut() {
-                        Ok(v) => {
-                            let _ = sock.send_to(&v, dst).await;
-                        }
-                        Err(b) => {
-                            let _ = sock.send_to(&b, dst).await;
-                        }
+                    let r = match payload.try_into_mut() {
+                        Ok(v) => sock.send_to(&v, dst).await,
+                        Err(b) => sock.send_to(&b, dst).await,
+                    };
+                    if let Err(e) = r {
+                        let n = udp_write::retry_failed();
+                        warn_udp_write("detached retry failed", n, &e.to_string());
                     }
                 });
+                let _ = n;
+            } else {
+                // Retry budget exhausted: this packet is gone. Counted now,
+                // because this is exactly the loss that had no counter before.
+                let n = udp_write::dropped_no_permit();
+                warn_udp_write("retry budget exhausted", n, "send buffer full");
             }
         }
-        Err(e) => tracing::debug!("udp send to {dst} failed: {e}"),
+        Err(e) => {
+            let n = udp_write::failed();
+            warn_udp_write("send failed", n, &e.to_string());
+        }
     }
+}
+
+/// Rate-limited warning for a last-hop UDP write failure.
+fn warn_udp_write(reason: &str, total: u64, detail: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    let now = mono_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if !drop_warn_due(last, now)
+        || LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    tracing::warn!("udp write dropped ({reason}): {total} so far; {detail}");
 }
 
 /// Dual-stack UDP socket (V6ONLY=0 when bound to ::). Buffer enlarged for GSO bursts.
@@ -1957,16 +2809,477 @@ mod tests {
         // `try_send_datagram` (and any use of `send_datagram_wait`) can only work
         // if the configured send buffer holds at least one maximum-size MQP-2
         // datagram; a smaller buffer would report Blocked forever. Checked at
-        // compile time so editing the DATAGRAM cap fails the build loudly instead
-        // of under load; `build_transport` asserts the same bound.
+        // compile time so editing the DATAGRAM budget fails the build loudly
+        // instead of under load; `build_transport` asserts the same bound.
         const { assert!(MQP_DGRAM_MAX == 264, "MQP-2 datagram bound changed") };
-        const {
+        // The header bound has to fit QUIC's minimum path MTU (1200 B) so a
+        // maximum-length domain header still leaves room for a payload.
+        const { assert!(MQP_DGRAM_MAX < 1200, "MQP-2 header must fit a 1200 B path") };
+        // The buffer bound is the largest body we can hand quinn, not the
+        // header bound: the relays no longer clamp `max_datagram_size()`.
+        const { assert!(DATAGRAM_BUFFER >= DGRAM_MAX_WIRE) };
+        const { assert!(DGRAM_DEFAULT_LIMIT <= DGRAM_MAX_WIRE) };
+    }
+
+    /// Regression for the silent large-datagram loss: clamping the DATAGRAM
+    /// budget is clamping the *payload* budget. With `max_datagram_size()`
+    /// clamped to 1350 the usable UDP payload was 1338 B (v4) / 1326 B (v6)
+    /// regardless of how much the path could carry, so a 1400 B DTLS record —
+    /// which a direct UDP path delivers fine — vanished with no log line.
+    #[test]
+    fn dgram_payload_cap_tracks_the_live_limit_not_a_hard_cap() {
+        let v4 = TargetAddrRef::Ip("1.2.3.4:443".parse().unwrap());
+        let v6 = TargetAddrRef::Ip("[2001:db8::1]:443".parse().unwrap());
+        let dom = TargetAddrRef::Domain("example.com", 443); // header = 4 + 11
+
+        // Overheads: 5 B MQP prefix, then 7 B (v4) / 19 B (v6) address header.
+        assert_eq!(dgram_payload_cap(1350, &v4), 1338); // the old ceiling
+        assert_eq!(dgram_payload_cap(1448, &v4), 1436); // a 1472 B path now
+        assert_eq!(dgram_payload_cap(1448, &v6), 1424);
+        assert_eq!(dgram_payload_cap(1448, &dom), 1428);
+        assert!(dgram_payload_cap(1448, &v4) > 1338, "the hard cap is gone");
+        // QUIC's minimum path MTU is 1200 B, where `max_datagram_size()` is
+        // ~1162: that must still leave room for a typical 1100 B UDP payload.
+        assert!(dgram_payload_cap(1162, &v4) >= 1100);
+        // Saturates instead of underflowing when even the header cannot fit.
+        assert_eq!(dgram_payload_cap(4, &v4), 0);
+        assert_eq!(dgram_payload_cap(0, &v6), 0);
+    }
+
+    /// The cap must agree with the encoder byte for byte, in both directions:
+    /// a payload of exactly `cap` encodes, one byte more is rejected.
+    #[test]
+    fn dgram_payload_cap_matches_the_encoder() {
+        let addrs = [
+            (
+                TargetAddrRef::Ip("1.2.3.4:443".parse().unwrap()),
+                1350usize,
+                1338usize,
+            ),
+            (
+                TargetAddrRef::Ip("[2001:db8::1]:443".parse().unwrap()),
+                1350,
+                1326,
+            ),
+            (TargetAddrRef::Domain("example.com", 443), 1350, 1330), // header = 4 + 11
+        ];
+        for (addr, limit, expected) in addrs {
+            let cap = dgram_payload_cap(limit, &addr);
+            assert_eq!(cap, expected, "cap for {addr:?}");
             assert!(
-                MQP_DGRAM_MAX <= 1350,
-                "MQP_DGRAM_MAX must fit the 1350 B cap"
-            )
+                encode_datagram_ref_with_limit(1, &addr, &vec![0u8; cap], limit).is_some(),
+                "payload of exactly cap must encode for {addr:?}"
+            );
+            assert!(
+                encode_datagram_ref_with_limit(1, &addr, &vec![0u8; cap + 1], limit).is_none(),
+                "one byte over cap must be rejected for {addr:?}"
+            );
+        }
+    }
+
+    /// Drops are counted, and `bump` is what moves the counters, so a relay
+    /// cannot drop a datagram without it showing up in `snapshot()`.
+    #[test]
+    fn dgram_drop_counters_are_monotonic() {
+        use std::sync::atomic::AtomicU64;
+        let c = AtomicU64::new(0);
+        assert_eq!(dgram_drops::bump(&c), 1);
+        assert_eq!(dgram_drops::bump(&c), 2);
+
+        // The process-wide snapshot must observe a bump on the real counter.
+        // Other tests may bump concurrently, so assert a lower bound only.
+        let (before, _) = dgram_drops::snapshot();
+        dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        let (after, _) = dgram_drops::snapshot();
+        assert!(after > before, "snapshot must observe the bump");
+    }
+
+    /// The first drop must warn, and only then does the interval apply. A rate
+    /// limiter that swallows the first event is useless precisely when a fresh
+    /// deployment first shows the symptom.
+    #[test]
+    fn drop_warning_fires_once_then_rate_limits() {
+        assert!(drop_warn_due(NEVER_WARNED, 0), "first drop always warns");
+        assert!(
+            !drop_warn_due(1_000, 1_000),
+            "immediately after: suppressed"
+        );
+        assert!(!drop_warn_due(1_000, 10_999), "just inside the window");
+        assert!(
+            drop_warn_due(1_000, 11_000),
+            "exactly at the interval: warns"
+        );
+        assert!(drop_warn_due(1_000, 99_999), "well past the interval");
+        assert!(!drop_warn_due(5_000, 4_999), "clock regression: suppressed");
+    }
+
+    /// Encode `payload` the way [`DgramFragmenter`] does, for reassembler tests
+    /// that need no connection. The limit is generous so only `chunk` splits.
+    fn frag_frames(
+        id: u16,
+        sess: u32,
+        addr: &TargetAddrRef<'_>,
+        payload: &[u8],
+        chunk: usize,
+    ) -> Vec<Bytes> {
+        let total = payload.len().div_ceil(chunk) as u8;
+        payload
+            .chunks(chunk)
+            .enumerate()
+            .map(|(i, part)| {
+                encode_fragment(sess, id, i as u8, total, addr, part, 64 * 1024).unwrap()
+            })
+            .collect()
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The `u8` fragment count must reach the UDP maximum even at QUIC's
+    /// minimum path MTU, so raising `MQP_FRAG_MAX_PAYLOAD` later is a one-line
+    /// change and never a wire-format change. (The same bound is asserted at
+    /// compile time next to `MQP_FRAG_MAX_TOTAL`.)
+    #[test]
+    fn the_fragment_count_reaches_the_udp_maximum_at_the_minimum_mtu() {
+        let min_chunk = MIN_PATH_DGRAM_BUDGET - FRAG_PREFIX_LEN - (1 + 16 + 2);
+        assert_eq!(min_chunk, 1134, "1200 B path, IPv6 target");
+        assert_eq!(UDP_PAYLOAD_MAX.div_ceil(min_chunk), 58);
+        assert!(UDP_PAYLOAD_MAX.div_ceil(min_chunk) <= MQP_FRAG_MAX_TOTAL as usize);
+
+        // A full Ethernet path needs fewer, but the worst case is what bounds it.
+        let eth_chunk = 1434 - FRAG_PREFIX_LEN - (1 + 4 + 2);
+        assert_eq!(eth_chunk, 1418);
+        assert_eq!(UDP_PAYLOAD_MAX.div_ceil(eth_chunk), 47);
+    }
+
+    /// Why `MQP_FRAG_MAX_PAYLOAD` is 8 KiB and not the 65507 B UDP maximum:
+    /// reassembly is all-or-nothing, so a payload's survival is `(1-p)^F` while
+    /// its cost stays `F` fragments. Pinning the numbers here forces any future
+    /// change to argue with them rather than re-derive them wrongly.
+    #[test]
+    fn fragment_count_documents_the_loss_amplification_tradeoff() {
+        let chunk = 1434 - FRAG_PREFIX_LEN - (1 + 4 + 2); // IPv4 target, 1472 B path
+        let frags = |payload: usize| payload.div_ceil(chunk);
+        let survives = |f: usize, p: f64| (1.0 - p).powi(f as i32);
+
+        assert_eq!(frags(1472), 2, "a full Ethernet payload");
+        assert_eq!(frags(MQP_FRAG_MAX_PAYLOAD), 6, "the protocol cap");
+        assert_eq!(frags(UDP_PAYLOAD_MAX), 47, "the UDP maximum");
+
+        // At 1 % loss everything up to the cap still lands ~95 %+ of the time...
+        assert!(survives(frags(MQP_FRAG_MAX_PAYLOAD), 0.01) > 0.94);
+        // ...while a 64 KiB payload is a coin flip that costs 47x the bytes.
+        assert!(survives(frags(UDP_PAYLOAD_MAX), 0.01) < 0.63);
+        // At 5 % loss the UDP maximum is effectively undeliverable.
+        assert!(survives(frags(UDP_PAYLOAD_MAX), 0.05) < 0.10);
+    }
+
+    #[test]
+    fn udp_snapshot_differences_counters_but_not_the_high_water_mark() {
+        let a = UdpSnapshot {
+            datagrams: 100,
+            bytes: 9_000,
+            fragmented: 4,
+            max_payload: 1_400,
+            sessions: 2,
         };
-        const { assert!(DATAGRAM_BUFFER >= MQP_DGRAM_MAX) };
+        let b = UdpSnapshot {
+            datagrams: 130,
+            bytes: 12_000,
+            fragmented: 6,
+            max_payload: 1_900,
+            sessions: 3,
+        };
+        let d = b.since(&a);
+        assert_eq!(
+            (d.datagrams, d.bytes, d.fragmented, d.sessions),
+            (30, 3_000, 2, 1)
+        );
+        assert_eq!(d.max_payload, 1_900, "a maximum cannot be differenced");
+        assert!(!d.is_idle());
+        assert!(b.since(&b).is_idle(), "an empty interval stays quiet");
+        // Saturating, so a snapshot taken out of order cannot wrap into an
+        // absurd delta.
+        assert_eq!(a.since(&b).datagrams, 0);
+    }
+
+    /// The dispatcher's rule, in one place. A frame type the router does not
+    /// recognise must be skipped, but *both* relay frames carry `sess` at the
+    /// same offset — switching on the type is what silently dropped every
+    /// fragmented reply before the reassembler could see it.
+    #[test]
+    fn dgram_sess_routes_both_frame_types() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let plain = encode_datagram(7, &addr, b"x").unwrap();
+        let frag = encode_fragment(9, 1, 0, 2, &addr.as_ref(), b"y", 4096).unwrap();
+        assert_eq!(dgram_sess(&plain), Some(7));
+        assert_eq!(dgram_sess(&frag), Some(9));
+        assert_eq!(dgram_sess(&frag), dgram_sess(&plain).map(|_| 9));
+
+        // Not relay frames: an address atyp, an unknown type, a runt.
+        assert_eq!(dgram_sess(&[0x01, 0, 0, 0, 0, 0]), None);
+        assert_eq!(dgram_sess(&[0x7f, 0, 0, 0, 0, 0]), None);
+        assert_eq!(dgram_sess(&[MQP_DGRAM_FRAG, 0, 0]), None);
+        assert_eq!(dgram_sess(&[]), None);
+    }
+
+    /// The counters must actually move, and `max_payload` must be a high-water
+    /// mark rather than the most recent value — that is what makes it the
+    /// empirical answer to "is the 8 KiB cap big enough here?".
+    #[test]
+    fn udp_stats_records_payloads_and_sessions() {
+        // Other tests drive `DgramFragmenter::send` concurrently, so assert
+        // lower bounds rather than exact deltas.
+        let before = udp_stats::snapshot();
+        udp_stats::payload(1_472);
+        udp_stats::fragmented(3);
+        udp_stats::fragmented(1); // unfragmented: must not count
+        udp_stats::session();
+        let after = udp_stats::snapshot();
+        let d = after.since(&before);
+        assert!(d.datagrams >= 1 && d.bytes >= 1_472);
+        assert!(d.fragmented >= 1);
+        assert!(d.sessions >= 1);
+        assert!(after.max_payload >= 1_472);
+
+        // A later *smaller* payload must not lower the mark.
+        udp_stats::payload(64);
+        assert!(udp_stats::snapshot().max_payload >= 1_472);
+    }
+
+    #[test]
+    fn fragment_reassembly_is_order_independent() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let payload = pattern(5000);
+        let frames = frag_frames(7, 3, &addr.as_ref(), &payload, 1400);
+        assert_eq!(frames.len(), 4, "5000 B over 1400 B chunks");
+
+        for order in [[0usize, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
+            let mut r = DgramReassembler::new();
+            let mut done = None;
+            for i in order {
+                if let Some(x) = r.push(&decode_fragment(&frames[i]).unwrap(), 1_000) {
+                    done = Some(x);
+                }
+            }
+            let (sess, got_addr, whole) = done.expect("every fragment arrived");
+            assert_eq!(sess, 3);
+            assert_eq!(got_addr, addr);
+            assert_eq!(&whole[..], &payload[..], "order {order:?} must reassemble");
+            assert_eq!(r.inflight(), 0, "the partial is released on completion");
+            assert_eq!(r.held_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn a_lost_fragment_never_yields_a_short_payload() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let payload = pattern(3000);
+        let frames = frag_frames(1, 1, &addr.as_ref(), &payload, 1400);
+        assert_eq!(frames.len(), 3);
+
+        // UDP semantics: an incomplete datagram is discarded, never delivered
+        // short — a short read is exactly what the old 1338 B cap looked like
+        // to the application.
+        for missing in 0..frames.len() {
+            let mut r = DgramReassembler::new();
+            let mut completed = 0;
+            for (i, fr) in frames.iter().enumerate() {
+                if i == missing {
+                    continue;
+                }
+                if r.push(&decode_fragment(fr).unwrap(), 0).is_some() {
+                    completed += 1;
+                }
+            }
+            assert_eq!(completed, 0, "missing fragment {missing} must not complete");
+        }
+
+        // Duplicates within a partial are idempotent: a replayed fragment must
+        // not advance the count, or three distinct fragments plus one replay
+        // would "complete" a four-fragment datagram.
+        let mut r = DgramReassembler::new();
+        assert!(r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none());
+        assert!(
+            r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none(),
+            "a replayed fragment must not advance the count"
+        );
+        assert!(r.push(&decode_fragment(&frames[1]).unwrap(), 0).is_none());
+        let done = r.push(&decode_fragment(&frames[2]).unwrap(), 0);
+        let (_, _, w) = done.expect("completes once all three distinct fragments arrive");
+        assert_eq!(w.len(), payload.len());
+    }
+
+    #[test]
+    fn malformed_fragments_are_rejected_without_allocating_state() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(3000), 1400);
+        let mut r = DgramReassembler::new();
+
+        let mut f = decode_fragment(&frames[0]).unwrap();
+        f.total = 1; // that is the single-frame form, not a fragment
+        assert!(r.push(&f, 0).is_none());
+        let mut f = decode_fragment(&frames[0]).unwrap();
+        f.idx = 9; // index outside the declared count
+        assert!(r.push(&f, 0).is_none());
+        let mut f = decode_fragment(&frames[0]).unwrap();
+        f.total = MQP_FRAG_MAX_TOTAL + 1;
+        assert!(r.push(&f, 0).is_none());
+        assert_eq!(
+            r.inflight(),
+            0,
+            "a malformed fragment must not allocate state"
+        );
+
+        // A wrapped id reused with a different shape restarts rather than
+        // splicing two unrelated datagrams together: 3000 B is 3 fragments,
+        // 6000 B is 5, and the first two of the new shape must not complete
+        // against the old count.
+        let mut r = DgramReassembler::new();
+        assert!(r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none());
+        let other = frag_frames(1, 1, &addr.as_ref(), &pattern(6000), 1400);
+        assert_eq!(other.len(), 5);
+        for fr in &other[1..4] {
+            assert!(r.push(&decode_fragment(fr).unwrap(), 0).is_none());
+        }
+        assert!(r.push(&decode_fragment(&other[4]).unwrap(), 0).is_none());
+        let done = r.push(&decode_fragment(&other[0]).unwrap(), 0);
+        assert!(done.is_some(), "the restarted partial completes");
+        assert_eq!(done.unwrap().2.len(), 6000);
+    }
+
+    #[test]
+    fn partials_expire_and_reassembly_memory_is_bounded() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        // 6000 B over 4000 B chunks is exactly two fragments; a payload equal to
+        // its chunk would be a one-fragment "fragment", which is malformed.
+        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(6000), 4000);
+        assert_eq!(frames.len(), 2);
+
+        // A fragment arriving after the partial expired starts a new partial
+        // instead of completing the stale one.
+        let mut r = DgramReassembler::new();
+        assert!(r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none());
+        assert_eq!(r.inflight(), 1);
+        assert!(r
+            .push(
+                &decode_fragment(&frames[1]).unwrap(),
+                FRAG_TIMEOUT_MS + 1_500
+            )
+            .is_none());
+        assert_eq!(
+            r.inflight(),
+            1,
+            "the stale partial was swept, a new one began"
+        );
+
+        // A flood of never-completing datagrams cannot grow memory without
+        // bound: past FRAG_MAX_HELD_BYTES the oldest partial is evicted.
+        let mut r = DgramReassembler::new();
+        let (_, ev0) = udp_stats::reassembly_drops();
+        // 7000 B over 4000 B chunks: two fragments, so the first push allocates
+        // a partial (a payload equal to its chunk would be a one-fragment
+        // "fragment", which the reassembler rightly refuses).
+        let big_frames = frag_frames(1, 1, &addr.as_ref(), &pattern(7000), 4000);
+        assert_eq!(big_frames.len(), 2);
+        for id in 0..200u16 {
+            let mut f = decode_fragment(&big_frames[0]).unwrap();
+            f.id = id;
+            assert!(r.push(&f, 0).is_none());
+        }
+        assert!(
+            r.held_bytes() <= FRAG_MAX_HELD_BYTES,
+            "held {} B exceeds the {FRAG_MAX_HELD_BYTES} B cap",
+            r.held_bytes()
+        );
+        assert!(
+            r.inflight() > 0 && r.inflight() < 200,
+            "old partials were evicted"
+        );
+        assert!(
+            udp_stats::reassembly_drops().1 > ev0,
+            "an evicted partial must be counted"
+        );
+    }
+
+    /// End to end over a real connection: every size up to the protocol cap
+    /// arrives whole, and the frame counts prove the split actually happened.
+    #[tokio::test]
+    async fn fragmentation_round_trips_large_udp_payloads() {
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        let target = TargetAddr::Ip("9.9.9.9:53".parse().unwrap());
+        let sizes = [1usize, 1400, 3000, MQP_FRAG_MAX_PAYLOAD];
+        let expected: Vec<Vec<u8>> = sizes.iter().map(|n| pattern(*n)).collect();
+
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.accept().unwrap().await.unwrap();
+            let mut reasm = DgramReassembler::new();
+            let mut out: Vec<(u32, TargetAddr, Bytes)> = Vec::new();
+            while let Ok(d) = conn.read_datagram().await {
+                if d.first() == Some(&MQP_DGRAM_FRAG) {
+                    let Ok(f) = decode_fragment(&d) else { continue };
+                    if let Some(x) = reasm.push(&f, mono_ms()) {
+                        out.push(x);
+                    }
+                } else {
+                    let Ok((s, a, p)) = decode_datagram_ref(&d) else {
+                        continue;
+                    };
+                    out.push((s, a.into_owned(), Bytes::copy_from_slice(p)));
+                }
+            }
+            out
+        });
+
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let limit = conn.max_datagram_size().unwrap();
+        let cap = dgram_payload_cap(limit, &target.as_ref());
+        assert!(cap > 0);
+        let mut frag = DgramFragmenter::new();
+        let mut frames = 0u8;
+        for (i, payload) in expected.iter().enumerate() {
+            let r = frag.send(&conn, i as u32, &target.as_ref(), payload, limit);
+            assert!(
+                r.complete(),
+                "{} B send failed: {:?}",
+                payload.len(),
+                r.failed
+            );
+            assert_eq!(r.fragmented(), payload.len() > cap);
+            frames = frames.saturating_add(r.frames);
+        }
+        assert!(
+            frames > expected.len() as u8,
+            "at least one payload must have been split"
+        );
+
+        // Above the protocol cap the payload is refused outright rather than
+        // silently truncated by the reassembler.
+        let too_big = pattern(MQP_FRAG_MAX_PAYLOAD + 1);
+        let r = frag.send(&conn, 99, &target.as_ref(), &too_big, limit);
+        assert_eq!(r.failed, Some(DatagramSend::TooLarge));
+        assert_eq!(r.frames, 0);
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        conn.close(0u32.into(), b"done");
+        let got = accept.await.unwrap();
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "every payload arrives exactly once"
+        );
+        for (i, (sess, addr, payload)) in got.iter().enumerate() {
+            assert_eq!(*sess, i as u32);
+            assert_eq!(*addr, target);
+            assert_eq!(&payload[..], &expected[i][..], "payload {i} mismatch");
+        }
     }
 
     #[test]
@@ -2125,47 +3438,49 @@ mod tests {
     /// process with `datagrams.outgoing.payload_bytes desynchronized`. The
     /// underflow is fixed upstream, so the test now guards against a regression
     /// in that accounting.
+    /// Loopback QUIC endpoint pair sharing the production transport config.
+    /// Lives at module scope so both the send-buffer and fragmentation
+    /// tests drive a real connection instead of a mock.
+    async fn endpoint_pair() -> (quinn::Endpoint, quinn::Endpoint) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["test.com".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut scfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        scfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        server_cfg.transport_config(build_transport("bbr", 5));
+        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates({
+                let mut r = rustls::RootCertStore::empty();
+                r.add(cert.der().clone()).unwrap();
+                r
+            })
+            .with_no_client_auth();
+        ccfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+        let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
+        let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
+        ccfg.transport_config(build_transport("bbr", 5));
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(ccfg);
+        (client, server)
+    }
+
     #[tokio::test]
     async fn try_send_datagram_saturates_without_panicking() {
-        async fn endpoint_pair() -> (quinn::Endpoint, quinn::Endpoint) {
-            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-            let params = rcgen::CertificateParams::new(vec!["test.com".to_string()]).unwrap();
-            let cert = params.self_signed(&key).unwrap();
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let mut scfg = rustls::ServerConfig::builder_with_provider(provider.clone())
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert.der().clone()],
-                    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
-                )
-                .unwrap();
-            scfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
-            let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
-            let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-            server_cfg.transport_config(build_transport("bbr", 5));
-            let server =
-                quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
-
-            let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_root_certificates({
-                    let mut r = rustls::RootCertStore::empty();
-                    r.add(cert.der().clone()).unwrap();
-                    r
-                })
-                .with_no_client_auth();
-            ccfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
-            let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
-            let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
-            ccfg.transport_config(build_transport("bbr", 5));
-            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client.set_default_client_config(ccfg);
-            (client, server)
-        }
-
         let (client, server) = endpoint_pair().await;
         let server_addr = server.local_addr().unwrap();
         // The peer must complete the handshake; its datagram queue is never read,
