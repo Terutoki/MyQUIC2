@@ -212,10 +212,26 @@ impl<'a> TargetAddrRef<'a> {
     }
 }
 
-/// ALPN identifier. Bumped to `/2` together with the MQP-2 TCP-open ACK
-/// (status byte + bound address); a version-skewed peer now fails the TLS
+/// Versioned ALPN identifier. Bumped to `/2` together with the MQP-2 TCP-open
+/// ACK (status byte + bound address); a version-skewed peer now fails the TLS
 /// handshake with a clear error instead of misparsing the ACK as app data.
+/// The default config ALPN is now `h3` (see `normalize_alpn`); set
+/// `alpn = "myquic2/2"` explicitly to restore this identifier and its
+/// fail-closed skew guard.
 pub const MQP_ALPN: &[u8] = b"myquic2/2";
+
+/// Resolve the configured ALPN: empty/unset keeps the default `h3`
+/// masquerade. `h3` hides only the ALPN label — the self-signed cert and the
+/// MQP framing stay fingerprintable, so this is obfuscation, not a full
+/// HTTP/3 disguise. Explicit `myquic2/2` restores the versioned identifier
+/// (and its fail-closed skew guard against real HTTP/3 peers); either way
+/// both sides must run the same value.
+pub fn normalize_alpn(configured: Option<&str>) -> Vec<u8> {
+    match configured {
+        Some(s) if !s.is_empty() => s.as_bytes().to_vec(),
+        _ => b"h3".to_vec(),
+    }
+}
 
 /// MQP-2 TCP open acknowledgement (server -> client).
 ///
@@ -590,6 +606,25 @@ pub struct ServerConf {
     /// isolation / firewall).
     #[serde(default)]
     pub auth_token: String,
+    // ---- Transport tuning (all optional; None = low-latency default) ----
+    // Larger windows trade loaded latency for peak throughput: 8/16/8 MB
+    // reaches ~300 Mb/s @140 ms with ~2x the queue of the 4/8/4 MB default
+    // (~240 Mb/s). ACK threshold 8 + 10 ms delay saves reverse-path CPU at
+    // the cost of coarser RTT/loss feedback.
+    #[serde(default)]
+    pub stream_receive_window_mb: Option<u64>,
+    #[serde(default)]
+    pub receive_window_mb: Option<u64>,
+    #[serde(default)]
+    pub send_window_mb: Option<u64>,
+    #[serde(default)]
+    pub ack_threshold: Option<u32>,
+    #[serde(default)]
+    pub max_ack_delay_ms: Option<u64>,
+    /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
+    /// Unset/empty = `h3` masquerade.
+    #[serde(default)]
+    pub alpn: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConf {
@@ -608,7 +643,34 @@ pub struct ClientConf {
     /// Must match the server's `auth_token` (both empty = no authentication).
     #[serde(default)]
     pub auth_token: String,
+    // ---- Transport tuning (mirrors ServerConf) ----
+    #[serde(default)]
+    pub stream_receive_window_mb: Option<u64>,
+    #[serde(default)]
+    pub receive_window_mb: Option<u64>,
+    #[serde(default)]
+    pub send_window_mb: Option<u64>,
+    #[serde(default)]
+    pub ack_threshold: Option<u32>,
+    #[serde(default)]
+    pub max_ack_delay_ms: Option<u64>,
+    // ---- Connection isolation ----
+    // 2 = dual connections (default): bulk TCP spreads round-robin across
+    // both while ports in `interactive_ports` (plus all UDP) pin to the
+    // interactive one, so a latency probe never queues behind bulk on the
+    // same cwnd. 1 = legacy single shared connection.
+    // quinn 0.11 exposes no per-stream priority API, so separate cwnds are
+    // the only reliable isolation.
+    #[serde(default)]
+    pub quic_conns: Option<usize>,
+    #[serde(default)]
+    pub interactive_ports: Option<Vec<u16>>,
+    /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
+    /// Unset/empty = `h3` masquerade.
+    #[serde(default)]
+    pub alpn: Option<String>,
 }
+
 fn d_bbr() -> String {
     "bbr".into()
 }
@@ -623,6 +685,80 @@ fn d_keepalive() -> u64 {
 }
 fn d_5() -> u64 {
     5
+}
+
+/// Runtime transport tuning resolved from optional TOML fields.
+/// Defaults are the low-latency preset for ~140 ms links (4/8/4 MB windows,
+/// ACK every 2nd, 5 ms delay): ~half the loaded queue of the 8/16/8 MB
+/// ceiling at ~240 Mb/s @140 ms. Raise the windows back to 8/16/8 MB for
+/// 300 Mb/s peak throughput at the cost of ~2x loaded latency.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportTuning {
+    pub stream_receive_window: u64,
+    pub receive_window: u64,
+    pub send_window: u64,
+    pub ack_threshold: u32,
+    pub max_ack_delay: Duration,
+}
+
+impl Default for TransportTuning {
+    fn default() -> Self {
+        Self {
+            stream_receive_window: 4 * 1024 * 1024,
+            receive_window: 8 * 1024 * 1024,
+            send_window: 4 * 1024 * 1024,
+            ack_threshold: 2,
+            max_ack_delay: Duration::from_millis(5),
+        }
+    }
+}
+
+fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
+    let mb = v.unwrap_or(def_mb).clamp(1, 64);
+    mb * 1024 * 1024
+}
+
+impl ServerConf {
+    pub fn tuning(&self) -> TransportTuning {
+        TransportTuning {
+            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 4),
+            receive_window: clamp_window_mb(self.receive_window_mb, 8),
+            send_window: clamp_window_mb(self.send_window_mb, 4),
+            ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
+            max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
+        }
+    }
+
+    pub fn alpn_bytes(&self) -> Vec<u8> {
+        normalize_alpn(self.alpn.as_deref())
+    }
+}
+
+impl ClientConf {
+    pub fn tuning(&self) -> TransportTuning {
+        TransportTuning {
+            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 4),
+            receive_window: clamp_window_mb(self.receive_window_mb, 8),
+            send_window: clamp_window_mb(self.send_window_mb, 4),
+            ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
+            max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
+        }
+    }
+
+    /// 2 = dual connections (default). 1 restores the legacy single connection.
+    pub fn conn_count(&self) -> usize {
+        self.quic_conns.unwrap_or(2).clamp(1, 2)
+    }
+
+    pub fn interactive_port_list(&self) -> Vec<u16> {
+        self.interactive_ports
+            .clone()
+            .unwrap_or_else(|| vec![53, 123, 3478, 3479, 3480, 3481])
+    }
+
+    pub fn alpn_bytes(&self) -> Vec<u8> {
+        normalize_alpn(self.alpn.as_deref())
+    }
 }
 
 pub fn load_toml<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T> {
@@ -663,13 +799,14 @@ pub fn load_key_der(pem_path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'
 pub fn server_tls_config(
     cert: rustls::pki_types::CertificateDer<'static>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    alpn: &[u8],
 ) -> Result<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
-    cfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     // rustls' default stateful store holds only 256 sessions; with the 4096
     // connection cap and 2 tickets per handshake that thrashes, so 0-RTT and
     // (1-RTT) resumption would silently degrade to full handshakes. Size the
@@ -692,6 +829,7 @@ pub fn server_tls_config(
 /// Client TLS: pin exact self-signed cert, no WebPKI roots (skip chain building => min RTT/CPU).
 pub fn client_tls_config(
     pinned: rustls::pki_types::CertificateDer<'static>,
+    alpn: &[u8],
 ) -> Result<Arc<rustls::ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
@@ -700,7 +838,7 @@ pub fn client_tls_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+    cfg.alpn_protocols = vec![alpn.to_vec()];
     cfg.enable_early_data = true; // allow QUIC 0-RTT on resumption
     Ok(Arc::new(cfg))
 }
@@ -765,6 +903,14 @@ pub const RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
 pub const SEND_WINDOW: u64 = 8 * 1024 * 1024;
 
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
+    build_transport_tuned(congestion, keep_alive_secs, TransportTuning::default())
+}
+
+pub fn build_transport_tuned(
+    congestion: &str,
+    keep_alive_secs: u64,
+    tuning: TransportTuning,
+) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // BBR default; cubic only as escape hatch. Callers validate + log the
     // configured value via `parse_congestion`; unknown values fall back to BBR.
@@ -800,12 +946,12 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // The numbers live in named constants so `tcp_windows_cover_the_300mb_s_bdp`
     // can prove the invariant instead of restating it.
     t.stream_receive_window(quinn::VarInt::from_u32(
-        u32::try_from(STREAM_RECEIVE_WINDOW).expect("stream window fits a VarInt"),
+        u32::try_from(tuning.stream_receive_window).expect("stream window fits a VarInt"),
     ));
     t.receive_window(quinn::VarInt::from_u32(
-        u32::try_from(RECEIVE_WINDOW).expect("connection window fits a VarInt"),
+        u32::try_from(tuning.receive_window).expect("connection window fits a VarInt"),
     ));
-    t.send_window(SEND_WINDOW);
+    t.send_window(tuning.send_window);
     // ACK frequency (draft-ietf-quic-ack-frequency): this is what we *request
     // the peer to use* when we are the receiver, so it bounds the reverse-path
     // ACK rate. quinn's default (threshold 1) ACKs every other packet: at
@@ -814,10 +960,12 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     // BBR's bandwidth estimate and loss detection sharp; >=32 makes the
     // estimate too coarse and slows the startup ramp. reordering_threshold
     // stays at quinn's recommended packet_threshold - 1 = 2.
+    // Tunable: threshold 2 + small delay trades reverse-path CPU for sharper
+    // RTT/loss feedback under interactive load.
     let mut ack_freq = quinn::AckFrequencyConfig::default();
     ack_freq
-        .ack_eliciting_threshold(quinn::VarInt::from_u32(8))
-        .max_ack_delay(Some(Duration::from_millis(10)))
+        .ack_eliciting_threshold(quinn::VarInt::from_u32(tuning.ack_threshold))
+        .max_ack_delay(Some(tuning.max_ack_delay))
         .reordering_threshold(quinn::VarInt::from_u32(2));
     t.ack_frequency_config(Some(ack_freq));
     // Seed the RTT estimator for the link this build targets. quinn's 333ms
@@ -3516,6 +3664,64 @@ mod tests {
             blocked > 0,
             "the send buffer must saturate within 64k x 1 KiB sends"
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_open_header_arrives_without_app_data() {
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let mut recv = conn.accept_bi().await.unwrap().1;
+            let mut hdr = [0u8; 7];
+            recv.read_exact(&mut hdr).await.unwrap();
+            TargetAddr::decode(&hdr).unwrap().0
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let target = TargetAddr::Ip("93.184.216.34:80".parse().unwrap());
+        let mut hdr = Vec::new();
+        target.encode(&mut hdr).unwrap();
+        send.write_all(&hdr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), accept)
+            .await
+            .expect("open header must arrive even when the app never sends")
+            .unwrap();
+        assert_eq!(got, target);
+    }
+
+    #[test]
+    fn alpn_override_parses_and_defaults() {
+        let base = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
+            server_name = 'test.com'\nserver_cert_file = 'x'\n";
+        let c: ClientConf = toml::from_str(base).unwrap();
+        assert_eq!(c.alpn_bytes(), b"h3");
+        let c2: ClientConf = toml::from_str(&format!("{base}alpn = 'myquic2/2'\n")).unwrap();
+        assert_eq!(c2.alpn_bytes(), MQP_ALPN);
+        assert_eq!(normalize_alpn(Some("")), b"h3");
+        assert_eq!(normalize_alpn(None), b"h3");
+        assert_eq!(normalize_alpn(Some("h3")), b"h3");
+    }
+
+    #[test]
+    fn tuning_defaults_are_low_latency_dual() {
+        let base = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
+            server_name = 'test.com'\nserver_cert_file = 'x'\n";
+        let c: ClientConf = toml::from_str(base).unwrap();
+        let t = c.tuning();
+        assert_eq!(t.stream_receive_window, 4 * 1024 * 1024);
+        assert_eq!(t.receive_window, 8 * 1024 * 1024);
+        assert_eq!(t.send_window, 4 * 1024 * 1024);
+        assert_eq!(t.ack_threshold, 2);
+        assert_eq!(t.max_ack_delay, Duration::from_millis(5));
+        assert_eq!(c.conn_count(), 2);
+        let c1: ClientConf = toml::from_str(&format!("{base}quic_conns = 1\n")).unwrap();
+        assert_eq!(c1.conn_count(), 1);
     }
 
     /// Window sizing invariant: every flow-control window must clear the BDP of

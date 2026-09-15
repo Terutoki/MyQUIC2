@@ -53,6 +53,133 @@ fn bump_gen(tx: &watch::Sender<u64>) {
     tx.send_replace(next);
 }
 
+/// One QUIC connection slot: the shared handle plus its generation channel.
+/// Bumped on every swap so waiters sleep without polling and dispatchers drop
+/// a stale connection without a per-packet timer.
+#[derive(Clone, Debug)]
+struct ConnSlot {
+    shared: SharedConn,
+    gen_tx: watch::Sender<u64>,
+    gen_rx: watch::Receiver<u64>,
+}
+
+impl ConnSlot {
+    fn fresh() -> Self {
+        let (gen_tx, gen_rx) = watch::channel(0u64);
+        Self {
+            shared: Arc::new(RwLock::new(None)),
+            gen_tx,
+            gen_rx,
+        }
+    }
+
+    /// Best-effort liveness for routing only: a contended lock reads as live
+    /// and `wait_conn` remains the authority that fails a flow fast.
+    fn is_live(&self) -> bool {
+        match self.shared.try_read() {
+            Ok(g) => g.as_ref().is_some_and(|c| c.close_reason().is_none()),
+            Err(_) => true,
+        }
+    }
+}
+
+/// Pure routing decision for tests: true = use `a`.
+/// A dead preferred slot fails over to the live one; both dead keeps the
+/// preferred slot so `wait_conn` still bounds the stall and fails fast.
+fn select_slot(pinned: bool, rr: usize, a_live: bool, b_live: Option<bool>) -> bool {
+    let Some(b_live) = b_live else {
+        return true;
+    };
+    if pinned || rr.is_multiple_of(2) {
+        a_live || !b_live
+    } else {
+        a_live && !b_live
+    }
+}
+
+/// Dual-connection pool for loaded-latency isolation.
+/// `a` is the interactive connection (all UDP + pinned ports, and the sole
+/// connection when `quic_conns == 1`). `b` exists only in dual mode and
+/// absorbs half the bulk TCP streams so each cwnd holds ~half the queue.
+/// quinn 0.11 has no per-stream priority, so separate congestion windows are
+/// the isolation mechanism.
+#[derive(Clone, Debug)]
+struct ConnPool {
+    a: ConnSlot,
+    b: Option<ConnSlot>,
+    rr: Arc<std::sync::atomic::AtomicUsize>,
+    interactive_ports: Arc<std::collections::HashSet<u16>>,
+}
+
+impl ConnPool {
+    fn target_port(t: &TargetAddr) -> u16 {
+        match t {
+            TargetAddr::Ip(s) => s.port(),
+            TargetAddr::Domain(_, p) => *p,
+        }
+    }
+
+    /// Pick the slot for a new TCP flow. Pinned ports prefer `a` and bulk
+    /// spreads round-robin in dual mode; a dead preferred slot fails over to
+    /// the live one (returning flows stick to their slot for life, so nothing
+    /// oscillates). Both dead keeps the preference and `wait_conn` fails fast.
+    fn pick_tcp(&self, t: &TargetAddr) -> ConnSlot {
+        match &self.b {
+            None => self.a.clone(),
+            Some(b) => {
+                let pinned = self.interactive_ports.contains(&Self::target_port(t));
+                let n = if pinned {
+                    0
+                } else {
+                    self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                };
+                if select_slot(pinned, n, self.a.is_live(), Some(b.is_live())) {
+                    self.a.clone()
+                } else {
+                    b.clone()
+                }
+            }
+        }
+    }
+
+    /// Bulk-slot fallback for UDP while the interactive slot is down
+    /// (see `refresh_udp_egress`). `None` in single-connection mode.
+    fn udp_fallback(&self) -> Option<ConnSlot> {
+        self.b.clone()
+    }
+}
+
+/// Re-read the cached egress connection + PMTU limit, preferring the
+/// interactive slot and failing over to the bulk slot while it is down.
+/// Non-blocking: a contended slot lock skips to the next candidate instead
+/// of stalling the relay loop, and the 1 s refresh cadence bounds the cost
+/// of quinn's connection-state mutex on the per-packet path.
+fn refresh_udp_egress(
+    pool: &ConnPool,
+    now_c: tokio::time::Instant,
+    warned_no_datagram: &mut bool,
+) -> Option<(quinn::Connection, usize, tokio::time::Instant)> {
+    for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
+        let Ok(g) = slot.shared.try_read() else {
+            continue;
+        };
+        match g.as_ref() {
+            Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
+                Some(m) => return Some((c.clone(), m, now_c)),
+                None => {
+                    if !*warned_no_datagram {
+                        *warned_no_datagram = true;
+                        warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
+                    }
+                    return None;
+                }
+            },
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// Routes inbound QUIC DATAGRAMs to their UDP ASSOCIATE by sess_id.
 /// One dispatcher serves the whole process across reconnects; subscriptions
 /// die with their association, so no immortal task can steal another's packets.
@@ -157,10 +284,14 @@ async fn main() -> Result<()> {
             c.congestion
         );
     }
-    let tls = client_tls_config(load_cert_der(&c.server_cert_file)?)?;
+    let tls = client_tls_config(load_cert_der(&c.server_cert_file)?, &c.alpn_bytes())?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(Arc::new(quic_client));
-    ccfg.transport_config(build_transport(&c.congestion, c.keep_alive_secs));
+    ccfg.transport_config(build_transport_tuned(
+        &c.congestion,
+        c.keep_alive_secs,
+        c.tuning(),
+    ));
     let ccfg = Arc::new(ccfg);
     let server_str = c.server_addr.clone();
     let server_str_log = server_str.clone();
@@ -178,175 +309,49 @@ async fn main() -> Result<()> {
     )?;
     ep.set_default_client_config((*ccfg).clone());
 
-    let shared: SharedConn = Arc::new(RwLock::new(None));
-    // Generation counter: bumped on every `shared` swap so waiters sleep
-    // without polling and the datagram dispatcher drops a stale connection
-    // without a per-packet timer.
-    let (gen_tx, gen_rx) = watch::channel(0u64);
+    let dual = c.conn_count() >= 2;
+    let pool = ConnPool {
+        a: ConnSlot::fresh(),
+        b: if dual { Some(ConnSlot::fresh()) } else { None },
+        rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        interactive_ports: Arc::new(c.interactive_port_list().into_iter().collect()),
+    };
+    info!(
+        "quic pool: {} connection(s){}",
+        if dual { 2 } else { 1 },
+        if dual {
+            " (bulk round-robin + interactive pin)"
+        } else {
+            ""
+        }
+    );
     let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
-    // Sole DATAGRAM reader for the process: routes by sess_id to the live association.
-    {
-        let shared = shared.clone();
-        let hub = hub.clone();
-        let mut gen = gen_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                let conn = match wait_conn(&shared, &mut gen, Duration::from_secs(10)).await {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                // Construct the receive future ONCE per connection instead of
-                // once per datagram: `read_datagram` is cancel-safe (a buffered
-                // datagram is returned before its first await point, so dropping
-                // and recreating it inside `select!` cannot lose one) and its
-                // `Notify` registration is inline, so rebuilding it per packet
-                // was pure per-packet overhead. The connection-state mutex that
-                // quinn takes per datagram still applies — that cost is inside
-                // quinn and cannot be removed from here.
-                let reader = conn.read_datagram();
-                tokio::pin!(reader);
-                // Session id of the last dispatched datagram: a burst addressed
-                // to one association then skips both the shard read lock and the
-                // `Sender` refcount bump.
-                let mut last_sess = 0u32;
-                let mut last_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
-                loop {
-                    tokio::select! {
-                        d = &mut reader => {
-                            let d: Bytes = match d {
-                                Ok(d) => d, Err(_) => break,
-                            };
-                            // Lightweight sess extraction: no full TargetAddr decode
-                            // here, the association task decodes once. Uses the
-                            // shared helper because a *fragment* (0x05) carries the
-                            // same prefix — switching on the type here silently
-                            // dropped every fragmented reply.
-                            let Some(sess) = dgram_sess(&d) else {
-                                continue;
-                            };
-                            if sess != last_sess || last_tx.is_none() {
-                                last_sess = sess;
-                                last_tx = hub.sender(sess);
-                            }
-                            match last_tx.as_ref() {
-                                Some(tx) => {
-                                    if tx.try_send(d).is_err() {
-                                        static DROPS: std::sync::atomic::AtomicU64 =
-                                            std::sync::atomic::AtomicU64::new(0);
-                                        let n = DROPS
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if n.is_multiple_of(1000) {
-                                            tracing::warn!(
-                                                "udphub sess={sess} dispatcher drops={n}"
-                                            );
-                                        }
-                                    }
-                                }
-                                // Dead association: stop re-probing the hub for
-                                // every packet still queued behind it.
-                                None => last_sess = 0,
-                            }
-                        }
-                        // Every `shared` swap bumps the generation, so any
-                        // notification means this connection is stale.
-                        _ = gen.changed() => break,
-                    }
-                }
-            }
-        });
+    spawn_dispatcher(pool.a.clone(), hub.clone());
+    if let Some(b) = pool.b.clone() {
+        spawn_dispatcher(b, hub.clone());
     }
-    // Reconnect loop: survives server restart. Backoff 200ms..5s + jitter.
-    // server_addr is re-resolved every dial so DDNS/IP changes are picked up (B3).
-    // Mirror build_transport's clamp before multiplying: using the raw config
-    // value could overflow u64 (release: tiny watchdog -> endless reconnect
-    // loop; debug: panic).
+    // One reconnect loop per pool slot, sharing the same Endpoint (one UDP
+    // socket, one ticket cache). Dual mode doubles idle keepalives; each
+    // connection carries ~half the streams, so each cwnd holds ~half the queue.
     let keep_alive_secs = c.keep_alive_secs.clamp(1, 3600);
     let watchdog_silence = Duration::from_secs(keep_alive_secs.saturating_mul(4).max(20));
-    {
-        let shared = shared.clone();
-        let sname = c.server_name.clone();
-        let auth = c.auth_token.clone();
-        let ep = ep.clone();
-        let gen_tx = gen_tx.clone();
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_millis(200);
-            loop {
-                let server: SocketAddr = match resolve_server_addr(&server_str).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!("resolve {server_str} failed: {e:#}; retry in {backoff:?}");
-                        tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                match dial_once(&ep, server, &sname, &auth).await {
-                    Ok(conn) => {
-                        info!("QUIC connected to {server}");
-                        *shared.write().await = Some(conn.clone());
-                        bump_gen(&gen_tx);
-                        let connected_at = std::time::Instant::now();
-                        // Watchdog backs up `closed()`: a blackholed path may
-                        // never deliver anything, so a healthy connection must
-                        // keep showing inbound traffic (keepalive ACKs every
-                        // few seconds). Silence beyond 4x keepalive (min 20s)
-                        // means dead.
-                        let watchdog = async {
-                            let mut last_rx = conn.stats().udp_rx.datagrams;
-                            let mut quiet_since = std::time::Instant::now();
-                            info!("watchdog armed rx={last_rx} silence_limit={watchdog_silence:?}");
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                if conn.close_reason().is_some() {
-                                    break;
-                                }
-                                let rx = conn.stats().udp_rx.datagrams;
-                                if rx != last_rx {
-                                    last_rx = rx;
-                                    quiet_since = std::time::Instant::now();
-                                } else if quiet_since.elapsed() >= watchdog_silence {
-                                    warn!("QUIC path silent {watchdog_silence:?}, force-closing {server}");
-                                    conn.close(0u32.into(), b"watchdog");
-                                    break;
-                                }
-                            }
-                        };
-                        tokio::select! {
-                            _ = conn.closed() => {}
-                            _ = watchdog => {}
-                        }
-                        warn!("QUIC connection lost, reconnecting...");
-                        if let Some(reason) = conn.close_reason() {
-                            warn!("QUIC close reason: {reason}");
-                        }
-                        // Only clear if nobody already installed a newer connection.
-                        {
-                            let mut w = shared.write().await;
-                            if let Some(cur) = w.as_ref() {
-                                if cur.stable_id() == conn.stable_id() {
-                                    *w = None;
-                                    bump_gen(&gen_tx);
-                                }
-                            }
-                        }
-                        // A stable connection decays the backoff; a peer that
-                        // closes immediately (wrong token, flapping) keeps it
-                        // growing so it cannot cause a redial storm.
-                        if connected_at.elapsed() >= Duration::from_secs(5) {
-                            backoff = Duration::from_millis(200);
-                        }
-                        let wait = backoff + Duration::from_millis(jitter_ms());
-                        tokio::time::sleep(wait).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
-                    }
-                    Err(e) => {
-                        warn!("dial {server} failed: {e:#}; retry in {backoff:?}");
-                        tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(5));
-                    }
-                }
-            }
-        });
+    spawn_conn_loop(
+        ep.clone(),
+        server_str.clone(),
+        c.server_name.clone(),
+        c.auth_token.clone(),
+        pool.a.clone(),
+        watchdog_silence,
+    );
+    if let Some(b) = pool.b.clone() {
+        spawn_conn_loop(
+            ep.clone(),
+            server_str.clone(),
+            c.server_name.clone(),
+            c.auth_token.clone(),
+            b,
+            watchdog_silence,
+        );
     }
 
     let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
@@ -374,13 +379,11 @@ async fn main() -> Result<()> {
                 continue; // socket closes on drop
             }
         };
-        let shared = shared.clone();
+        let pool = pool.clone();
         let hub = hub.clone();
-        let gen_rx = gen_rx.clone();
-        let gen_tx = gen_tx.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_socks(sock, shared, hub, gen_rx, gen_tx, timeout).await {
+            if let Err(e) = handle_socks(sock, pool, hub, timeout).await {
                 warn!("socks {peer} end: {e:#}");
             }
         });
@@ -414,6 +417,136 @@ fn jitter_ms() -> u64 {
     })
 }
 
+fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
+    tokio::spawn(async move {
+        let mut gen = slot.gen_rx.clone();
+        loop {
+            let conn = match wait_conn(&slot.shared, &mut gen, Duration::from_secs(10)).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let reader = conn.read_datagram();
+            tokio::pin!(reader);
+            let mut last_sess = 0u32;
+            let mut last_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
+            loop {
+                tokio::select! {
+                    d = &mut reader => {
+                        let d: Bytes = match d {
+                            Ok(d) => d, Err(_) => break,
+                        };
+                        let Some(sess) = dgram_sess(&d) else {
+                            continue;
+                        };
+                        if sess != last_sess || last_tx.is_none() {
+                            last_sess = sess;
+                            last_tx = hub.sender(sess);
+                        }
+                        match last_tx.as_ref() {
+                            Some(tx) => {
+                                if tx.try_send(d).is_err() {
+                                    static DROPS: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = DROPS
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n.is_multiple_of(1000) {
+                                        tracing::warn!(
+                                            "udphub sess={sess} dispatcher drops={n}"
+                                        );
+                                    }
+                                }
+                            }
+                            None => last_sess = 0,
+                        }
+                    }
+                    _ = gen.changed() => break,
+                }
+            }
+        }
+    });
+}
+
+fn spawn_conn_loop(
+    ep: quinn::Endpoint,
+    server_str: String,
+    sname: String,
+    auth: String,
+    slot: ConnSlot,
+    watchdog_silence: Duration,
+) {
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_millis(200);
+        loop {
+            let server: SocketAddr = match resolve_server_addr(&server_str).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("resolve {server_str} failed: {e:#}; retry in {backoff:?}");
+                    tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+            };
+            match dial_once(&ep, server, &sname, &auth).await {
+                Ok(conn) => {
+                    info!("QUIC connected to {server}");
+                    *slot.shared.write().await = Some(conn.clone());
+                    bump_gen(&slot.gen_tx);
+                    let connected_at = std::time::Instant::now();
+                    let watchdog = async {
+                        let mut last_rx = conn.stats().udp_rx.datagrams;
+                        let mut quiet_since = std::time::Instant::now();
+                        info!("watchdog armed rx={last_rx} silence_limit={watchdog_silence:?}");
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            if conn.close_reason().is_some() {
+                                break;
+                            }
+                            let rx = conn.stats().udp_rx.datagrams;
+                            if rx != last_rx {
+                                last_rx = rx;
+                                quiet_since = std::time::Instant::now();
+                            } else if quiet_since.elapsed() >= watchdog_silence {
+                                warn!(
+                                    "QUIC path silent {watchdog_silence:?}, force-closing {server}"
+                                );
+                                conn.close(0u32.into(), b"watchdog");
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        _ = conn.closed() => {}
+                        _ = watchdog => {}
+                    }
+                    warn!("QUIC connection lost, reconnecting...");
+                    if let Some(reason) = conn.close_reason() {
+                        warn!("QUIC close reason: {reason}");
+                    }
+                    {
+                        let mut w = slot.shared.write().await;
+                        if let Some(cur) = w.as_ref() {
+                            if cur.stable_id() == conn.stable_id() {
+                                *w = None;
+                                bump_gen(&slot.gen_tx);
+                            }
+                        }
+                    }
+                    if connected_at.elapsed() >= Duration::from_secs(5) {
+                        backoff = Duration::from_millis(200);
+                    }
+                    let wait = backoff + Duration::from_millis(jitter_ms());
+                    tokio::time::sleep(wait).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                Err(e) => {
+                    warn!("dial {server} failed: {e:#}; retry in {backoff:?}");
+                    tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+    });
+}
 /// Cap on a single dial attempt.
 ///
 /// Without an explicit bound a dead path costs ~15 s per attempt: QUIC keeps
@@ -615,10 +748,8 @@ fn spawn_udp_reporter() {
 
 async fn handle_socks(
     mut s: tokio::net::TcpStream,
-    shared: SharedConn,
+    pool: ConnPool,
     hub: Arc<UdpHub>,
-    mut gen_rx: watch::Receiver<u64>,
-    gen_tx: watch::Sender<u64>,
     timeout: Duration,
 ) -> Result<()> {
     async fn read_exact_timeout(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
@@ -672,7 +803,7 @@ async fn handle_socks(
                 }
                 anyhow::bail!("bad associate target");
             }
-            return handle_udp_associate(s, shared, hub).await;
+            return handle_udp_associate(s, pool, hub).await;
         }
         _ => {
             write_socks(&mut s, &[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
@@ -685,6 +816,10 @@ async fn handle_socks(
             .unwrap_or_else(|_| SocketAddr::new(unmap("127.0.0.1".parse().unwrap()), 0))
     });
 
+    let slot = pool.pick_tcp(&target);
+    let shared = slot.shared.clone();
+    let mut gen_rx = slot.gen_rx.clone();
+    let gen_tx = slot.gen_tx.clone();
     let conn = match wait_conn(&shared, &mut gen_rx, timeout).await {
         Ok(c) => c,
         Err(e) => {
@@ -720,6 +855,11 @@ async fn handle_socks(
             anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
         }
     };
+    // The open header is deliberately its own write, flushed before any
+    // application byte is read: a peer that waits for its first reply
+    // (game login, banner protocols) must see the header within ~100ms
+    // without the client ever sending payload. Never batch it behind the
+    // first app chunk; `tcp_open_header_arrives_without_app_data` pins this.
     let mut hdr = Vec::with_capacity(273);
     target.encode(&mut hdr)?;
     send.write_all(&hdr).await?;
@@ -878,7 +1018,7 @@ async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAd
 // ---- UDP ASSOCIATE: app <-> local relay <-> QUIC DATAGRAM ----
 async fn handle_udp_associate(
     mut tcp: tokio::net::TcpStream,
-    shared: SharedConn,
+    pool: ConnPool,
     hub: Arc<UdpHub>,
 ) -> Result<()> {
     let (sess, _tx, rx) = match hub.alloc_sess() {
@@ -893,14 +1033,14 @@ async fn handle_udp_associate(
     udp_stats::session();
     // Wrapper guarantees the subscription is torn down on every exit path,
     // including early setup errors that used to leak the hub entry forever.
-    let res = udp_associate_inner(tcp, shared, sess, rx).await;
+    let res = udp_associate_inner(tcp, pool, sess, rx).await;
     hub.remove(sess);
     res
 }
 
 async fn udp_associate_inner(
     mut tcp: tokio::net::TcpStream,
-    shared: SharedConn,
+    pool: ConnPool,
     sess: u32,
     mut rx: tokio::sync::mpsc::Receiver<Bytes>,
 ) -> Result<()> {
@@ -1096,23 +1236,7 @@ async fn udp_associate_inner(
                     .map(|(_, _, t)| now_c.duration_since(*t) >= EGRESS_REFRESH)
                     .unwrap_or(true);
                 if stale {
-                    let g = match shared.try_read() {
-                        Ok(g) => g,
-                        Err(_) => shared.read().await,
-                    };
-                    egress = match g.as_ref() {
-                        Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
-                            Some(m) => Some((c.clone(), m, now_c)),
-                            None => {
-                                if !warned_no_datagram {
-                                    warned_no_datagram = true;
-                                    warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
-                                }
-                                None
-                            }
-                        },
-                        _ => None,
-                    };
+                    egress = refresh_udp_egress(&pool, now_c, &mut warned_no_datagram);
                 }
                 let Some((conn, limit, _)) = egress.as_ref() else {
                     continue;
@@ -1326,5 +1450,28 @@ mod tests {
         dm.extend_from_slice(&8443u16.to_be_bytes());
         assert!(feed(&dm, true).await.is_ok());
         assert!(feed(&[0x01, 0, 0, 0, 0, 0, 0], true).await.is_ok());
+    }
+
+    #[test]
+    fn slot_routing_fails_over_to_the_live_connection() {
+        // Single mode always keeps `a`.
+        assert!(select_slot(false, 0, false, None));
+        assert!(select_slot(true, 1, false, None));
+        // Dual, all live: pinned -> a, bulk round-robins.
+        assert!(select_slot(true, 0, true, Some(true)));
+        assert!(select_slot(false, 0, true, Some(true)));
+        assert!(!select_slot(false, 1, true, Some(true)));
+        // Dual, `a` down: everything fails over to `b`.
+        assert!(!select_slot(true, 0, false, Some(true)));
+        assert!(!select_slot(false, 0, false, Some(true)));
+        assert!(!select_slot(false, 1, false, Some(true)));
+        // Dual, `b` down: bulk falls back to `a`, pinned stays.
+        assert!(select_slot(true, 0, true, Some(false)));
+        assert!(select_slot(false, 0, true, Some(false)));
+        assert!(select_slot(false, 1, true, Some(false)));
+        // Dual, both down: keep the preference for a bounded fail-fast.
+        assert!(select_slot(true, 0, false, Some(false)));
+        assert!(select_slot(false, 0, false, Some(false)));
+        assert!(!select_slot(false, 1, false, Some(false)));
     }
 }

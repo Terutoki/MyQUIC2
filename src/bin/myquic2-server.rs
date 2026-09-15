@@ -173,10 +173,17 @@ async fn main() -> Result<()> {
     }
     let cert = load_cert_der(&c.cert_file)?;
     let key = load_key_der(&c.key_file)?;
-    let tls = server_tls_config(cert, key)?;
+    let tls = server_tls_config(cert, key, &c.alpn_bytes())?;
+    if c.alpn.as_deref().is_some_and(|s| !s.is_empty()) {
+        info!("custom ALPN in use (masquerade: skew guard weakened, upgrade both sides together)");
+    }
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-    scfg.transport_config(build_transport(&c.congestion, c.keep_alive_secs));
+    scfg.transport_config(build_transport_tuned(
+        &c.congestion,
+        c.keep_alive_secs,
+        c.tuning(),
+    ));
     // Dual-stack QUIC socket: explicit V6ONLY=0 so [::] also serves IPv4-mapped clients.
     let rt = Arc::new(quinn::TokioRuntime);
     let std_sock = udp_socket_dual(&c.listen)?;

@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cert = load_cert_der("server-cert.pem")?;
-    let tls = client_tls_config(cert)?;
+    let tls = client_tls_config(cert, &normalize_alpn(None))?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(std::sync::Arc::new(quic_client));
     ccfg.transport_config(build_transport("bbr", 5));

@@ -1,16 +1,16 @@
 # MyQUIC2
 
 **An ultra-high-performance QUIC-based SOCKS5 proxy** — multiplexes TCP and UDP traffic
-over a single QUIC connection, written in Rust.
+over QUIC (dual connections by default for loaded-latency isolation), written in Rust.
 
 MyQUIC2 speaks standard SOCKS5 (RFC 1928) on the ingress side, so browsers, CLIs and
 apps work unchanged (`curl --socks5`, system proxy settings, etc.), while the wire
 between client and server is a purpose-built minimal binary protocol (**MQP-2**) over
 QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption,
-ALPN `myquic2/2` so version-skewed peers fail closed at the handshake).
+ALPN `h3` by default for masquerade, `myquic2/2` opt-in for a versioned fail-closed handshake).
 
 ```
-[ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (1 connection)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
+[ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (2 connections by default)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
 ```
 
 The 2026-09 hardening revision adds optional shared-secret client authentication,
@@ -56,7 +56,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 | Area | Detail |
 |---|---|
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
-| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, one long-lived connection per client process shared by all flows |
+| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, dual QUIC connections per client by default (bulk round-robin, interactive pinning, failover) — `quic_conns = 1` restores a single shared connection |
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
@@ -65,9 +65,9 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
-| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 16 MB per-connection receive window |
+| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window default |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
-| **High-RTT tuned** | 8 MB per-stream / 16 MB aggregate receive window, 8 MB send window — every window clears the 5.25 MB BDP of 300 Mb/s at 140 ms — plus a 190 ms `initial_rtt`, ACK-every-8th-packet with 10 ms `max_ack_delay`, and a 1472 B PMTU search ceiling. Covers ~480 Mb/s single-stream at ~140 ms (the previous 2/8/4 MB split capped it at ~114 Mb/s) |
+| **High-RTT tuned** | 4 MB per-stream / 8 MB aggregate receive window, 4 MB send window by default (~240 Mb/s at 140 ms, ~half the loaded queue) — 8/16/8 MB opt-in for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
 | **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.2 MB stripped each (rebuilt from this revision) |
 
 ---
@@ -80,7 +80,7 @@ Single crate, three units sharing one protocol library:
 |---|---|---|
 | `myquic2` (lib) | `src/lib.rs` | MQP-2 codec (owned + borrowed forms), TOML config schema, TLS/cert helpers, QUIC transport builder, TCP↔QUIC bridge |
 | `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; token auth; self-signed cert issuance |
-| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; reconnect loop; per-association UDP relay; DATAGRAM dispatcher; token auth |
+| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; dual-connection pool with reconnect loop + DATAGRAM dispatcher per slot; per-association UDP relay; token auth |
 | `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | End-to-end 0-RTT verification probe (with token support) |
 
 **Data-plane mapping:**
@@ -104,10 +104,21 @@ Single crate, three units sharing one protocol library:
 
 **Concurrency model:** Tokio multi-threaded runtime. The server spawns one task per
 incoming connection (handshake included), one DATAGRAM reader and one session sweeper
-per connection, and one lightweight reader task per UDP session. The client runs one
-process-wide DATAGRAM dispatcher, one reconnect loop, one task per SOCKS connection,
-and one relay + reply task per UDP association. Subscriptions die with their
+per connection, and one lightweight reader task per UDP session. The client keeps a
+pool of QUIC connections (2 by default, `quic_conns`) sharing one Endpoint/UDP socket,
+each slot with its own reconnect loop and DATAGRAM dispatcher; one task per SOCKS
+connection and one relay + reply task per UDP association. Subscriptions die with their
 association, so stale tasks can never steal another session's packets.
+
+**Connection isolation (client):** quinn 0.11 exposes no per-stream priority, so
+separate congestion windows are the isolation mechanism. Bulk TCP spreads round-robin
+across the pool while ports in `interactive_ports` (default DNS/NTP/STUN) plus **all
+UDP** pin to the interactive connection, so a latency probe never queues behind bulk
+on the same cwnd. Routing is liveness-aware: a dead preferred slot fails over to the
+live one (returning flows stay on their slot; both dead fails the flow fast via the
+normal reconnect timeout). The TCP open header is always its own write, never batched
+behind first application bytes, so server-first peers (game logins, banners) see it
+within ~100 ms.
 
 ---
 
@@ -209,7 +220,11 @@ mismatch        : CONNECTION_CLOSE 0x01 "unauthorized"
 
 ### Versioning
 
-ALPN is **`myquic2/2`**. It was bumped from `myquic2/1` when the TCP-open ACK gained
+ALPN defaults to **`h3`** (masquerade: hides only the ALPN label — the self-signed
+cert and MQP framing stay fingerprintable). Set `alpn = "myquic2/2"` explicitly on
+both sides to restore the versioned identifier below.
+
+`myquic2/2` was bumped from `myquic2/1` when the TCP-open ACK gained
 the bound address: a version-skewed pair now fails the TLS handshake with a clear
 error instead of misparsing the ACK as application data, so **upgrade both sides
 together**. The UDP DATAGRAM layout and the auth uni stream are unchanged from MQP-1.
@@ -438,6 +453,10 @@ keep_alive_secs = 5           # clamped to 1..3600; idle timeout = max(3x, 15s)
 allow_private = true          # dial RFC1918/loopback targets; default is false!
 auth_token = ""                # shared secret ≤ 256 B; empty = disabled (firewall only).
                                # Set a private random value here and on the client.
+# Optional tuning, mirrors the client (download capped by receiver window,
+# upload by sender window — change both sides together):
+# stream_receive_window_mb = 4, receive_window_mb = 8, send_window_mb = 4,
+# ack_threshold = 2, max_ack_delay_ms = 5, alpn = "h3"
 ```
 
 ### Client (`config-client.toml`)
@@ -452,6 +471,9 @@ gso = true
 keep_alive_secs = 5           # clamped to 1..3600; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
 auth_token = ""                     # must match the server (empty on both = disabled)
+# Optional tuning (defaults = 4/8/4 MB windows, ACK 2/5ms, dual connections):
+# stream_receive_window_mb, receive_window_mb, send_window_mb,
+# ack_threshold, max_ack_delay_ms, quic_conns = 1 (single), interactive_ports, alpn
 ```
 
 Field notes:
@@ -463,6 +485,18 @@ Field notes:
   retries with growing backoff.
 - `reconnect_timeout_secs` only bounds how long a *new SOCKS flow* waits for a live
   QUIC connection; it does not control redial backoff.
+- Transport tuning (`stream/receive/send_window_mb`, `ack_threshold`,
+  `max_ack_delay_ms`) defaults to the low-latency preset (4/8/4 MB, ACK 2/5 ms,
+  ~240 Mb/s @140 ms); set 8/16/8 MB + ACK 8/10 ms on **both sides** for 300 Mb/s
+  peak at ~2x loaded latency. Optimal total in flight ≈ link BDP — e.g. a
+  200M/140ms link (BDP 3.5 MB) wants 2/4/2 MB, which halves single-thread speed
+  (~114 Mb/s) while multi-thread still fills the link with minimal loaded latency.
+- `quic_conns = 2` (default) isolates bulk from interactive traffic; `1` restores
+  the legacy single connection. `interactive_ports` pins latency-sensitive TCP
+  ports to the interactive connection (default 53/123/3478–3481); all UDP always
+  rides it. A dead slot fails over automatically.
+- `alpn` defaults to `h3` masquerade (label only); `myquic2/2` restores the
+  versioned fail-closed handshake. Same value required on both sides.
 - Paths are resolved against the process CWD — use absolute paths on OpenWrt.
 
 ---
@@ -540,9 +574,9 @@ All limits are constants in the sources; the table shows where to change them.
 | Client UDP associations | 4096 (excess replies REP=0x01, 256-datagram queue each) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
-| Receive window (aggregate) | 16 MB/connection | `RECEIVE_WINDOW` |
-| Receive window (per stream) | 8 MB | `STREAM_RECEIVE_WINDOW` |
-| Send window | 8 MB/connection | `SEND_WINDOW` |
+| Receive window (aggregate) | 8 MB/connection default (16 MB opt-in) | `TransportTuning` (`RECEIVE_WINDOW`) |
+| Receive window (per stream) | 4 MB default (8 MB opt-in) | `TransportTuning` (`STREAM_RECEIVE_WINDOW`) |
+| Send window | 4 MB/connection default (8 MB opt-in) | `TransportTuning` (`SEND_WINDOW`) |
 | Initial RTT / PMTU ceiling | 190 ms / 1472 B | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
@@ -610,10 +644,10 @@ Against RFC 1928 / RFC 1929:
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for the trans-Pacific BDP — 8 MB per-stream / 16 MB
-  aggregate receive window, 8 MB send window, BBR, ACK-every-8th-packet with a
-  10 ms `max_ack_delay`; every window clears the 5.25 MB that 300 Mb/s costs in
-  flight at 140 ms. The SOCKS success reply is sent
+- **140 ms links**: tuned for the trans-Pacific BDP — 4 MB per-stream / 8 MB
+  aggregate receive window, 4 MB send window, BBR, ACK-every-2nd-packet with a
+  5 ms `max_ack_delay` by default (~240 Mb/s, ~half the loaded queue); opt in to
+  8/16/8 MB for 300 Mb/s. The SOCKS success reply is sent
   optimistically (no 1-RTT wait for the remote dial), so the application's TLS
   handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
   A lossy path is the tradeoff: 8 MB allows ~6200 packets in flight per RTT, which
@@ -658,7 +692,7 @@ Checklist from real field issues:
 | `auth_token is empty: the QUIC endpoint accepts any peer` on server start | Intentional if firewalled; otherwise set a token |
 | `auth_token is a placeholder from the sample config` | Set a private shared secret (or an empty token with firewall isolation) |
 | `cert/key pair incomplete: cert_file … and key_file …` at server start | Only one of the pair exists → restore the missing file, or delete both to regenerate; the surviving file is never overwritten |
-| Handshake fails between two installs (`no application protocol`) | Mixed MQP-1/MQP-2 binaries (ALPN `myquic2/2`) → upgrade both sides together |
+| Handshake fails between two installs (`no application protocol`) | ALPN mismatch: default is `h3` now, pre-h3 binaries use `myquic2/2` → upgrade both sides together / set the same `alpn` on both |
 | One extra reconnect right after server restart | Stale session ticket → 0-RTT rejected; the client re-auths automatically. Expected once |
 | New TCP hangs after server restart | Old stream on dead QUIC conn → fail-fast RST is by design; app reconnects, new flows work immediately |
 | UDP fails for LAN/remote SOCKS clients | Fixed in this revision (BND.ADDR is the proxy address); upgrade both binaries |
