@@ -15,13 +15,16 @@ ALPN `h3` by default for masquerade, `myquic2/2` opt-in for a versioned fail-clo
 
 The 2026-09 hardening revision adds optional shared-secret client authentication,
 process-wide resource caps, PMTU-aware DATAGRAM sizing, 0-RTT-safe authentication, and
-a corrected reconnect path. A previous pass removed a **process-abort** reachable from
+a corrected reconnect path, and the latest pass removes the remaining per-byte copies
+from the TCP↔QUIC pump, makes the per-packet relay counters a compile-time choice
+(`--no-default-features`), and makes the client's TCP-open path allocation-free — see
+[pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs).
+An earlier pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
-quinn-proto's drop-oldest DATAGRAM path) and stripped the remaining per-flow allocations
-from the TCP-open path; an intermediate pass briefly tracked upstream `main` (0.12) for
-that fix, and the latest pass is back on crates.io (quinn 0.11.12 / proto 0.11.18),
-which backports the DATAGRAM fix plus the assembler coalescing and three security
-fixes — see [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
+quinn-proto's drop-oldest DATAGRAM path); the build is back on crates.io
+(quinn 0.11.12 / proto 0.11.18), which backports the DATAGRAM fix plus the assembler
+coalescing and three security fixes — see
+[Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
 Every behaviour documented below was re-verified end-to-end on this revision — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
@@ -45,7 +48,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main) and [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms) and [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -332,6 +335,20 @@ macOS, loopback, `cargo build --release`, token auth enabled on both sides):
 | 19 | 0-RTT probe with token, same server process | ✅ `0-RTT offered`, `server accepted 0-RTT early data = true`, echo over early data; acceptance derived from `stopped()` in 3.0 s (the probe's own sleep) |
 | 20 | `cargo clippy --all-targets` + `cargo fmt --check` | ✅ clean |
 
+Additional checks run on the pass-13 revision (macOS, loopback, `cargo build --release`,
+both feature sets, empty token; the SOCKS listener's owning PID is asserted before every
+run so a stale process can never masquerade as the build under test):
+
+| # | Test | Result |
+|---|---|---|
+| 21 | TCP ECHO via SOCKS5 `CONNECT` (1 MiB random) | ✅ 1048576 B byte-for-byte |
+| 22 | Domain-target `CONNECT` (server-side DNS, `localhost`, 64 KiB) | ✅ byte-for-byte |
+| 23 | UDP ASSOCIATE sweep 8 / 1200 / 1420 / 1430 / 2000 / 8000 B (the last two need `type=0x05` fragments) | ✅ 6/6 echoed, 0 lost, both directions |
+| 24 | Same E2E suite against `--no-default-features` (counters compiled out) | ✅ identical results |
+| 25 | `cargo test` 36/36 (34/34 without `stats`), clippy + `cargo fmt --check` clean on both feature sets | ✅ |
+| 26 | A/B vs the pass-12 binaries: 3 interleaved rounds of 256 MiB bulk + 2 000 CONNECTs + 100 000 datagrams, CPU read from the two live processes | ✅ no regression — and no *gain* either: 10.37 s vs 10.41 s CPU, all throughput figures inside run-to-run noise (see pass 13) |
+| 27 | Reconnect cycle: `kill -9` server while two idle TCP flows and one UDP association are open → restart → recover | ✅ detection 15.1 s (QUIC idle timeout, both connections), redial **0.19 s** after the restarted server bound (both conns), first successful TCP echo 17.2 s after the kill; the idle pre-kill flows fail with `BrokenPipeError` at connection death instead of hanging out the 300 s idle window, and the pre-kill UDP association self-heals on its next datagram (a fresh association also works) |
+
 0-RTT probe (expect the last four lines):
 
 ```sh
@@ -384,6 +401,19 @@ cargo test
 cargo clippy --all-targets
 ```
 
+### The extreme build (`--no-default-features`)
+
+The default build keeps the per-packet relay counters (`stats` feature) because they are
+what the 60-second `udp relay` / `udp write` lines and the drop warnings report. For a
+build that gives up that observability for four fewer atomic RMWs per relayed datagram:
+
+```sh
+cargo build --release --no-default-features
+```
+
+The protocol-level warnings (`udp datagram dropped …`, reassembly expiry/eviction) come
+from `dgram_drops`, which is drop-path-only and stays live either way.
+
 ### Cross-compile for OpenWrt x86-64 (static musl, from macOS)
 
 ```sh
@@ -415,9 +445,10 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-12 revision (MQP-2 UDP fragmentation plus the DATAGRAM
-payload-budget fix): static musl, x86-64, stripped, ~4.2 MB each. Two upgrade
-notes, both requiring **both** sides to be replaced together:
+rebuilt from the pass-13 revision (zero-copy TCP pump, compile-out counters, an
+allocation-free client open path) with the default feature set, so the relay counters
+are **on** in these builds): static musl, x86-64, stripped, ~4.1–4.2 MB each. Three
+upgrade notes, all requiring **both** sides to be replaced together:
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -426,15 +457,20 @@ notes, both requiring **both** sides to be replaced together:
   (~1422 B on a 1472 B path) and truncates relay reads at 2048 B. Payloads above
   one frame are *silently* lost against an older peer, because it rejects the
   `type=0x05` fragment frame — no misparse, but no error either.
+- A binary built before pass 13 still copies every chunk through the TCP↔QUIC pump
+  and allocates per SOCKS flow on the client. Wire-compatible, so a mixed pair works —
+  it just leaves the pass-13 tax removals on the floor.
 
-Verified by running the v1 pair on an x86-64 CPU reporting **no** `sse4_2`, `avx` or
-`avx2` (QEMU's baseline `qemu64`, which is what the emulated test container
-exposes): the QUIC handshake completed and a 256 KiB SOCKS5 `CONNECT` transfer came
-back byte-for-byte. The AVX2 instructions the v1 binary does contain live in `ring`'s
-VAES/AVX2 AES-GCM path and in `core`'s slice helpers, both behind runtime CPU
-detection — the handshake on that CPU is the proof they were not executed. The same
-CPU makes the **v4** binary die immediately with `Illegal instruction`, which is the
-expected consequence of selecting a level the CPU does not implement.
+Verified by running the v1 pair under x86-64 emulation (Podman's amd64 runtime on
+Apple Silicon): both binaries execute, the QUIC handshake completes, and the full E2E
+suite passes — TCP ECHO 1 MiB byte-for-byte, a domain-target `CONNECT`, and the UDP
+sweep of 8 / 1200 / 1420 / 1430 / 2000 / 8000 B (the last two through `type=0x05`
+fragments) at 0 % loss. The AVX2 instructions the v1 binary does contain live in
+`ring`'s VAES/AVX2 AES-GCM path and in `core`'s slice helpers, both behind runtime CPU
+detection. The same emulated CPU runs the **v3** binary but makes the **v4** binary die
+with `Illegal instruction` (exit 132), which is the expected consequence of selecting
+an AVX512 level the CPU does not implement — and the proof that the per-level
+`target-cpu` flags are actually compiled in.
 
 ---
 
@@ -1235,6 +1271,78 @@ one frame, and every such packet was being dropped 100 %.
   reuse with a changed shape, expiry, the memory bound, and a real-connection
   round trip.
 
+### 2026-09 hardening pass 13 — zero-copy TCP pump, optional counters, per-flow Vecs
+
+Three items from the "remove application-side tax" list. All three are real, and
+**none of them is measurable on a loopback host** — the work they remove is
+0.3–0.6 % of the CPU the same traffic costs, so they are insurance for
+concurrency and pps, not a throughput increase.
+
+- **The TCP↔QUIC pump no longer copies in either direction.** quinn's
+  `write_chunk` *moves* the caller's `Bytes` into the stream's send queue
+  (`BytesArray::pop_chunk` retains it, no copy), where `write`/`write_all`
+  copies (`ByteSlice::pop_chunk` → `to_owned()`); quinn's `read_chunk` returns a
+  refcounted view of the receive assembler's own buffer
+  (`assembler.read` → `Bytes::split_to`), where `read` copies out of it. So the
+  upload side now reads with `read_buf` into a `BytesMut` and hands large reads
+  over as `write_chunk`, and the download side drains with `read_chunk`: one
+  32 KiB memcpy per chunk per direction is gone. The per-thread `CopyBuf` pool
+  went with it — the read buffer is reused for small writes and handed to quinn
+  for large ones.
+- **Small writes still copy, deliberately.** A handed-over buffer is a full
+  `COPY_CHUNK` (32 KiB) however few bytes were read, so handing it over for a
+  24-byte request would pin 32 KiB per in-flight small write; below
+  `ZEROCOPY_MIN_WRITE` (8 KiB) the pump calls `write_all` and lets quinn
+  allocate exactly what it needs. The read path's headroom invariant
+  (`BytesMut::chunk_mut` only reserves 64 B once full, which would turn every
+  32 KiB read into a 64-byte one) is pinned by
+  `reserve_copy_chunk_always_leaves_a_full_chunk_of_room`.
+- **Per-packet counters can be compiled out.** The `stats` feature (default on)
+  gates every atomic `udp_stats`/`udp_write` bumps on the relay path — four
+  shared cache-line RMWs per relayed datagram. `cargo build --release
+  --no-default-features` compiles them all out; the modules keep their API and
+  report zeros, and `dgram_drops` (drop paths only, not per packet) stays live
+  so the drop/reassembly warnings still name what happened.
+- **The client's TCP-open path allocates nothing.** `AddrHeader::encode_into`
+  writes the MQP-2 header into a stack buffer (pinned byte-for-byte against the
+  `Vec` encoder by `addr_header_into_matches_the_vec_encoder`), and
+  `read_socks_addr` decodes from one stack buffer instead of assembling four
+  `Vec`s. The reader keeps its `read_exact`-per-field shape on purpose: the
+  earlier "one buffer + a read loop" rewrite lost the final port byte of a domain
+  target on macOS and was already reverted once.
+
+**Measured — and the honest headline is that this pass moves nothing on this
+host.** A/B against the pass-12 binaries, same machine, 3 interleaved rounds
+alternating variants, identical warmups (after the cold-vs-warm 20–30 % swing
+found in pass 13's own round-one measurement, warmups are mandatory before
+believing any number here):
+
+| Workload per round | pass 12 | this pass |
+|---|---|---|
+| 256 MiB bulk download, 4-way | 158 MB/s (median) | 151 MB/s |
+| 2 000 SOCKS `CONNECT`s, 32-way | 10 997 flows/s | 10 411 flows/s |
+| 100 000 UDP datagrams, batch 128 | 34 714 pps | 35 170 pps |
+| **CPU-seconds, client + server** | **10.37 s** | **10.41 s** |
+
+Every figure is inside the host's run-to-run noise (single bulk runs ranged
+136–167 MB/s across both variants). The arithmetic explains it: 512 MiB of
+memcpy is removed per round, which at 8–15 GB/s is 35–65 ms of the 10.4 s
+total — 0.3–0.6 %, below what a single-host benchmark can resolve. Treat these
+as removing application-side tax that multiplies with concurrency (four atomic
+RMWs per packet across cores; one copy per byte per link), which is what a
+future 10× pps load or a saturated weak-CPU link would notice.
+
+Verified on this revision: `cargo test` 36/36 (34/34 with
+`--no-default-features`), `cargo clippy --all-targets` and `cargo fmt --check`
+clean on both feature sets, and — through the real binaries, with the SOCKS
+listener's owning PID checked so a stale process cannot masquerade as the build
+under test — TCP ECHO 1 MiB byte-for-byte, a domain-target `CONNECT`, a UDP
+sweep of 8 / 1200 / 1420 / 1430 / 2000 / 8000 B at 0 % loss in both directions,
+and a full `kill -9` → restart cycle (detection 15.1 s, redial 0.19 s after the
+restarted server bound, first TCP echo 17.2 s after the kill, idle pre-kill
+flows failed at connection death instead of hanging, and the pre-kill UDP
+association self-healed).
+
 ---
 
 ## Roadmap
@@ -1252,6 +1360,9 @@ one frame, and every such packet was being dropped 100 %.
 - [ ] Fuzz the MQP-2 codec (cargo-fuzz)
 - [x] Remove the quinn-proto DATAGRAM drop-oldest process abort (`try_send_datagram`)
 - [x] Per-flow allocation on the TCP-open path (stack-buffer header, borrowed dial candidates)
+- [x] Zero-copy TCP↔QUIC pump (`read_chunk` / `write_chunk`, pass 13)
+- [x] Compile-out per-packet relay counters (`--no-default-features`, pass 13)
+- [x] Client-side per-flow allocations on the SOCKS path (stack header/reply/greeting, pass 13)
 - [x] Per-packet allocation / lock / clock-read audit of the UDP and stream paths (pass 6)
 - [x] Reconnect `shared` TOCTOU + DNS overload-path write-lock stalls (pass 7)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API

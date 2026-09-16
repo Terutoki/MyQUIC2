@@ -791,9 +791,9 @@ async fn handle_socks(
     if h[1] == 0 {
         anyhow::bail!("no methods offered");
     }
-    let mut m = vec![0u8; h[1] as usize];
-    read_exact_timeout(&mut s, &mut m).await?;
-    if !m.contains(&0x00) {
+    let mut m = [0u8; u8::MAX as usize];
+    read_exact_timeout(&mut s, &mut m[..h[1] as usize]).await?;
+    if !m[..h[1] as usize].contains(&0x00) {
         write_socks(&mut s, &[0x05, 0xFF]).await?;
         anyhow::bail!("no acceptable auth (client must offer 0x00)");
     }
@@ -884,9 +884,11 @@ async fn handle_socks(
     // (game login, banner protocols) must see the header within ~100ms
     // without the client ever sending payload. Never batch it behind the
     // first app chunk; `tcp_open_header_arrives_without_app_data` pins this.
-    let mut hdr = Vec::with_capacity(273);
-    target.encode(&mut hdr)?;
-    send.write_all(&hdr).await?;
+    // Stack buffer: the header is at most 259 B, so the per-flow `Vec` this
+    // used to allocate was one heap round trip for bytes that live one write.
+    let mut hdr = [0u8; AddrHeader::MAX_LEN];
+    let hdr_len = target.as_ref().header()?.encode_into(&mut hdr);
+    send.write_all(&hdr[..hdr_len]).await?;
     // Optimistic SOCKS success: the application's first bytes must not be
     // serialized behind the server-side dial. Waiting for the MQP-2 ACK here
     // costs one full client<->server RTT on every connection (Hysteria/
@@ -924,12 +926,13 @@ async fn handle_socks(
     Ok(())
 }
 
-/// NOTE: this reader keeps the original two-`read_exact` shape on purpose.
-/// A stack-buffer rewrite (one buffer + a `read`-loop tail) was implemented and
-/// reverted: on macOS it reproducibly lost the final port byte of a domain
-/// target (`bad connect target` on every domain CONNECT), while this shape
-/// passes 30/30, and the same rewrite from a QUIC stream is fine. The per-flow
-/// `Vec`s it would save never showed up in a profile, so correctness wins.
+/// NOTE: the `read_exact`-per-field read shape is kept on purpose.
+/// An earlier stack-buffer rewrite (one buffer + a `read`-loop tail) was
+/// implemented and reverted: on macOS it reproducibly lost the final port byte
+/// of a domain target (`bad connect target` on every domain CONNECT), while the
+/// `read_exact`-per-field shape passes 30/30. This version changes only *where*
+/// the bytes land (one stack buffer instead of assembled `Vec`s); every read
+/// keeps the proven size and order.
 async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
     async fn rd(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
@@ -937,34 +940,29 @@ async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
             .context("socks addr read timed out")??;
         Ok(())
     }
-    let mut t = [0u8; 1];
-    rd(s, &mut t).await?;
-    match t[0] {
+    let mut buf = [0u8; AddrHeader::MAX_LEN];
+    rd(s, &mut buf[..1]).await?;
+    let len = match buf[0] {
         0x01 => {
-            let mut b = [0u8; 6];
-            rd(s, &mut b).await?;
-            let mut v = vec![0x01];
-            v.extend_from_slice(&b);
-            Ok(TargetAddr::decode(&v)?.0)
+            rd(s, &mut buf[1..7]).await?;
+            7
         }
         0x04 => {
-            let mut b = [0u8; 18];
-            rd(s, &mut b).await?;
-            let mut v = vec![0x04];
-            v.extend_from_slice(&b);
-            Ok(TargetAddr::decode(&v)?.0)
+            rd(s, &mut buf[1..19]).await?;
+            19
         }
         0x03 => {
-            let mut n = [0u8; 1];
-            rd(s, &mut n).await?;
-            let mut b = vec![0u8; n[0] as usize + 2];
-            rd(s, &mut b).await?;
-            let mut v = vec![0x03, n[0]];
-            v.extend_from_slice(&b);
-            Ok(TargetAddr::decode(&v)?.0)
+            rd(s, &mut buf[1..2]).await?;
+            let n = buf[1] as usize;
+            if n == 0 {
+                anyhow::bail!("empty domain");
+            }
+            rd(s, &mut buf[2..4 + n]).await?;
+            4 + n
         }
         x => anyhow::bail!("bad atyp {x}"),
-    }
+    };
+    Ok(TargetAddr::decode(&buf[..len])?.0)
 }
 
 async fn read_socks_addr_lenient(s: &mut tokio::net::TcpStream) -> Result<()> {
@@ -1027,21 +1025,12 @@ fn bnd_for(s: &tokio::net::TcpStream) -> Result<SocketAddr> {
 }
 
 async fn write_socks_reply(s: &mut tokio::net::TcpStream, rep: u8, bnd: SocketAddr) -> Result<()> {
-    let mut v = vec![0x05, rep, 0x00];
-    match bnd {
-        SocketAddr::V4(a) => {
-            v.push(0x01);
-            v.extend_from_slice(&a.ip().octets());
-            v.extend_from_slice(&a.port().to_be_bytes());
-        }
-        SocketAddr::V6(a) => {
-            v.push(0x04);
-            v.extend_from_slice(&a.ip().octets());
-            v.extend_from_slice(&a.port().to_be_bytes());
-        }
-    }
-    write_socks(s, &v).await?;
-    Ok(())
+    let mut v = [0u8; 3 + MAX_BND_LEN];
+    v[0] = 0x05;
+    v[1] = rep;
+    v[2] = 0x00;
+    let n = 3 + encode_bnd_addr_into(bnd, &mut v[3..]);
+    write_socks(s, &v[..n]).await
 }
 
 // ---- UDP ASSOCIATE: app <-> local relay <-> QUIC DATAGRAM ----

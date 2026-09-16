@@ -1,6 +1,6 @@
 //! MyQUIC2 common: MQP-2 codec + config + TLS13-fast cert + QUIC transport (BBR/GSO).
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -10,6 +10,19 @@ use std::{
     task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
+
+/// Compile the wrapped statements only in a statistics-enabled build (the
+/// default). `--no-default-features` removes them entirely: the per-packet
+/// counters are shared atomics, and at a few hundred thousand packets per
+/// second their cache lines are the contention, not the code.
+macro_rules! stats_only {
+    ($($t:tt)*) => {
+        #[cfg(feature = "stats")]
+        {
+            $($t)*
+        }
+    };
+}
 
 // ---------------- Address codec (MQP-2) ----------------
 // wire: atyp u8 | addr | port u16 BE ; atyp: 0x01 v4, 0x04 v6, 0x03 domain
@@ -65,6 +78,9 @@ pub struct AddrHeader<'a> {
 }
 
 impl<'a> AddrHeader<'a> {
+    /// Wire length of the largest address form (`atyp | addr | port`).
+    pub const MAX_LEN: usize = 1 + 1 + 255 + 2;
+
     /// Wire length of `addr` (`atyp | addr | port`).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -74,6 +90,42 @@ impl<'a> AddrHeader<'a> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Append the header to `out`, returning the byte count written.
+    ///
+    /// The allocation-free twin of [`AddrHeader::encode`], for per-connection
+    /// paths that own a fixed buffer ([`AddrHeader::MAX_LEN`] bytes covers every
+    /// form). Validation already happened in [`TargetAddrRef::header`], so this
+    /// only writes bytes; a debug build asserts the two agree on the length.
+    ///
+    /// # Panics
+    /// Panics if `out` is shorter than the encoded header.
+    pub fn encode_into(&self, out: &mut [u8]) -> usize {
+        let n = match self.addr {
+            TargetAddrRef::Ip(SocketAddr::V4(a)) => {
+                out[0] = 0x01;
+                out[1..5].copy_from_slice(&a.ip().octets());
+                out[5..7].copy_from_slice(&a.port().to_be_bytes());
+                7
+            }
+            TargetAddrRef::Ip(SocketAddr::V6(a)) => {
+                out[0] = 0x04;
+                out[1..17].copy_from_slice(&a.ip().octets());
+                out[17..19].copy_from_slice(&a.port().to_be_bytes());
+                19
+            }
+            TargetAddrRef::Domain(d, p) => {
+                let b = d.as_bytes();
+                out[0] = 0x03;
+                out[1] = b.len() as u8;
+                out[2..2 + b.len()].copy_from_slice(b);
+                out[2 + b.len()..4 + b.len()].copy_from_slice(&p.to_be_bytes());
+                4 + b.len()
+            }
+        };
+        debug_assert_eq!(n, self.len, "encoder and header() disagree");
+        n
     }
 
     /// Append the header to `out`.
@@ -1853,31 +1905,43 @@ pub mod udp_stats {
 
     /// One relayed UDP payload of `len` bytes.
     pub fn payload(len: usize) {
-        DATAGRAMS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        MAX_PAYLOAD.fetch_max(len as u64, Ordering::Relaxed);
+        stats_only! {
+            DATAGRAMS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            MAX_PAYLOAD.fetch_max(len as u64, Ordering::Relaxed);
+        }
+        let _ = len;
     }
 
     /// One payload that needed `frames` frames to carry.
     pub fn fragmented(frames: u8) {
-        if frames > 1 {
-            FRAGMENTED.fetch_add(1, Ordering::Relaxed);
+        stats_only! {
+            if frames > 1 {
+                FRAGMENTED.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        let _ = frames;
     }
 
     /// A new UDP session (server) or SOCKS association (client) was established.
     pub fn session() {
-        SESSIONS.fetch_add(1, Ordering::Relaxed);
+        stats_only! {
+            SESSIONS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A partial datagram was discarded because a fragment never arrived.
     pub fn reassembly_expired() {
-        REASSEMBLY_EXPIRED.fetch_add(1, Ordering::Relaxed);
+        stats_only! {
+            REASSEMBLY_EXPIRED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A partial datagram was discarded to stay inside [`FRAG_MAX_HELD_BYTES`].
     pub fn reassembly_evicted() {
-        REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
+        stats_only! {
+            REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// `(expired, evicted)` reassembly losses since process start. These are the
@@ -1969,26 +2033,44 @@ pub mod udp_write {
     /// A detached retry finished without writing.
     pub static RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(feature = "stats")]
     fn bump(c: &AtomicU64) -> u64 {
         c.fetch_add(1, Ordering::Relaxed).saturating_add(1)
     }
     pub fn sent() {
-        bump(&SENT);
+        stats_only! {
+            bump(&SENT);
+        }
     }
     pub fn retried() -> u64 {
-        bump(&RETRIED)
+        #[cfg(feature = "stats")]
+        return bump(&RETRIED);
+        #[cfg(not(feature = "stats"))]
+        return 1;
     }
     pub fn dropped_no_permit() -> u64 {
-        bump(&DROPPED_NO_PERMIT)
+        #[cfg(feature = "stats")]
+        return bump(&DROPPED_NO_PERMIT);
+        #[cfg(not(feature = "stats"))]
+        return 1;
     }
     pub fn failed() -> u64 {
-        bump(&FAILED)
+        #[cfg(feature = "stats")]
+        return bump(&FAILED);
+        #[cfg(not(feature = "stats"))]
+        return 1;
     }
     pub fn no_app() -> u64 {
-        bump(&NO_APP)
+        #[cfg(feature = "stats")]
+        return bump(&NO_APP);
+        #[cfg(not(feature = "stats"))]
+        return 1;
     }
     pub fn retry_failed() -> u64 {
-        bump(&RETRY_FAILED)
+        #[cfg(feature = "stats")]
+        return bump(&RETRY_FAILED);
+        #[cfg(not(feature = "stats"))]
+        return 1;
     }
 
     pub fn snapshot() -> UdpWriteSnapshot {
@@ -2704,64 +2786,28 @@ pub async fn copy_tcp_quic_acked(
     copy_tcp_quic_inner(tcp, send, recv, idle, Some(ack_timeout)).await
 }
 
-/// One direction's read buffer for [`copy_tcp_quic`] and friends.
-///
-/// Every stream used to allocate (and free) its own 32 KiB `Vec`, so a proxy
-/// carrying thousands of concurrent short flows paid an allocator round trip
-/// per flow per direction for a buffer whose lifetime is one connection. The
-/// buffers are checked out of a per-thread free list and returned on drop, so a
-/// steady stream of flows on a worker thread reuses the same memory. Overflow
-/// beyond [`COPY_POOL_MAX`] is freed instead of cached, which keeps a burst of
-/// spawned tasks from leaving idle memory behind on every worker thread.
-struct CopyBuf(&'static mut [u8]);
-
 /// Copy chunk: large enough that a high-BDP stream is not syscall-bound, small
 /// enough that thousands of them do not dominate the RSS.
 const COPY_CHUNK: usize = 32 * 1024;
-/// Per-thread pool depth. Two directions per flow are active at a time, so a
-/// handful of slots covers the common case without hoarding memory.
-const COPY_POOL_MAX: usize = 8;
 
-thread_local! {
-    static COPY_POOL: std::cell::RefCell<Vec<Box<[u8]>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Writes at least this large are handed to quinn as an owned `Bytes`
+/// (`write_chunk`, which moves the buffer straight into the send queue) instead
+/// of being copied into it. Below it the copy is the better trade: the buffer
+/// handed over is a full [`COPY_CHUNK`] however few bytes were read, so a
+/// request/response workload would pin 32 KiB per in-flight small write where
+/// quinn's own `to_owned()` allocates exactly the bytes it needs.
+const ZEROCOPY_MIN_WRITE: usize = 8 * 1024;
 
-impl CopyBuf {
-    fn take() -> Self {
-        let pooled = COPY_POOL.with(|p| p.borrow_mut().pop());
-        match pooled {
-            Some(b) => Self(Box::leak(b)),
-            None => Self(Box::leak(vec![0u8; COPY_CHUNK].into_boxed_slice())),
-        }
-    }
-}
-
-impl std::ops::Deref for CopyBuf {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        self.0
-    }
-}
-
-impl std::ops::DerefMut for CopyBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        self.0
-    }
-}
-
-impl Drop for CopyBuf {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` came from `Box::leak` of a boxed slice in `take` and
-        // has not been freed or aliased since; reconstructing the `Box` returns
-        // exclusive ownership of exactly that allocation.
-        let b: Box<[u8]> = unsafe { Box::from_raw(self.0) };
-        COPY_POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.len() < COPY_POOL_MAX {
-                p.push(b);
-            }
-        });
+/// Make room for a whole copy chunk before a `read_buf`.
+///
+/// `BytesMut::chunk_mut` only reserves 64 B once the buffer is full, so without
+/// this a `read_buf` on a full buffer would perform 64-byte reads — correct,
+/// but hundreds of times more wakeups per chunk than intended. Pure so the
+/// invariant that keeps the pump fast is pinned by a test.
+#[inline]
+fn reserve_copy_chunk(buf: &mut BytesMut) {
+    if buf.capacity() - buf.len() < COPY_CHUNK {
+        buf.reserve(COPY_CHUNK);
     }
 }
 
@@ -2809,12 +2855,13 @@ async fn copy_tcp_quic_inner(
     // end, so the final disposition below owns it outright.
     let outcome: Result<(u64, u64)> = {
         let c2s = async move {
-            let mut buf = CopyBuf::take();
+            let mut buf = BytesMut::with_capacity(COPY_CHUNK);
             let mut total = 0u64;
             let mut chunks = 0u64;
             let mut stamped = 0u64;
             loop {
-                let n = match tr.read(&mut buf).await {
+                reserve_copy_chunk(&mut buf);
+                let n = match tr.read_buf(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
@@ -2824,7 +2871,20 @@ async fn copy_tcp_quic_inner(
                         ));
                     }
                 };
-                if let Err(e) = send.write_all(&buf[..n]).await {
+                // Hand the filled buffer to quinn as an owned `Bytes` so a bulk
+                // chunk crosses no memcpy boundary at all (quinn's `write_chunk`
+                // moves it into `unacked_segments`); the remaining allocation is
+                // the one quinn's `to_owned()` used to perform, minus the copy.
+                let res = if n >= ZEROCOPY_MIN_WRITE {
+                    send.write_chunk(buf.split_to(n).freeze()).await
+                } else {
+                    let r = send.write_all(&buf[..n]).await;
+                    if r.is_ok() {
+                        buf.clear();
+                    }
+                    r
+                };
+                if let Err(e) = res {
                     send.reset(0x04u32.into()).ok();
                     return Err::<u64, anyhow::Error>(anyhow::anyhow!(
                         "tcp>quic quic write failed after {total}B up: {e:#}"
@@ -2843,7 +2903,6 @@ async fn copy_tcp_quic_inner(
             Ok::<u64, anyhow::Error>(total)
         };
         let s2c = async move {
-            let mut buf = CopyBuf::take();
             let mut total = 0u64;
             let mut chunks = 0u64;
             let mut stamped = 0u64;
@@ -2866,9 +2925,15 @@ async fn copy_tcp_quic_inner(
                 }
             }
             loop {
-                let n = match recv.read(&mut buf).await {
-                    Ok(Some(0)) | Ok(None) => break,
-                    Ok(Some(n)) => n,
+                // `read_chunk` hands over a refcounted view of quinn's own
+                // receive buffer instead of copying into ours, so this direction
+                // crosses one userspace boundary (the socket write) instead of
+                // two. `max_length` is unbounded on purpose: the data is already
+                // held by the assembler, so taking the whole contiguous span
+                // only means fewer trips through quinn's connection lock.
+                let chunk = match recv.read_chunk(usize::MAX, true).await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
                     Err(e) => {
                         // Classify for the log line: a peer reset (e.g. refused
                         // dial) and a dead connection need different follow-ups.
@@ -2882,10 +2947,11 @@ async fn copy_tcp_quic_inner(
                         ));
                     }
                 };
+                let n = chunk.bytes.len();
                 if n == 0 {
-                    break;
+                    continue;
                 }
-                if let Err(e) = tw.write_all(&buf[..n]).await {
+                if let Err(e) = tw.write_all(&chunk.bytes).await {
                     return Err::<u64, anyhow::Error>(anyhow::anyhow!(
                         "quic>tcp tcp write failed after {total}B down: {e:#}"
                     ));
@@ -3278,6 +3344,7 @@ mod tests {
     /// The counters must actually move, and `max_payload` must be a high-water
     /// mark rather than the most recent value — that is what makes it the
     /// empirical answer to "is the 8 KiB cap big enough here?".
+    #[cfg(feature = "stats")]
     #[test]
     fn udp_stats_records_payloads_and_sessions() {
         // Other tests drive `DgramFragmenter::send` concurrently, so assert
@@ -3448,10 +3515,13 @@ mod tests {
             r.inflight() > 0 && r.inflight() < 200,
             "old partials were evicted"
         );
+        #[cfg(feature = "stats")]
         assert!(
             udp_stats::reassembly_drops().1 > ev0,
             "an evicted partial must be counted"
         );
+        #[cfg(not(feature = "stats"))]
+        let _ = ev0;
     }
 
     #[test]
@@ -3763,30 +3833,55 @@ mod tests {
         }
     }
 
-    /// The copy buffer pool must hand out independent, correctly sized buffers
-    /// and recycle them instead of reallocating.
+    /// The fixed-buffer header encoder must be byte-identical to the `Vec` one
+    /// for every address form: the client writes the TCP-open header from a
+    /// stack buffer on the hot path, so a divergence here would misparse every
+    /// target.
     #[test]
-    fn copy_buf_pool_reuses_buffers() {
-        assert_eq!(CopyBuf::take().len(), COPY_CHUNK);
-        // Check one out, write to it, and drop it: the same allocation must come
-        // back out of the pool with its contents intact (no zeroing, no realloc).
-        let addr = {
-            let mut b = CopyBuf::take();
-            b[0] = 0xAB;
-            b[COPY_CHUNK - 1] = 0xCD;
-            b.0.as_ptr() as usize
-        };
-        let again = CopyBuf::take();
-        assert_eq!(again.0.as_ptr() as usize, addr, "buffer was not pooled");
-        assert_eq!(again[0], 0xAB);
-        assert_eq!(again[COPY_CHUNK - 1], 0xCD);
-        // Overflow past the pool depth is freed rather than cached, so a burst
-        // cannot leave unbounded memory behind on a worker thread.
-        let held: Vec<CopyBuf> = (0..COPY_POOL_MAX + 4).map(|_| CopyBuf::take()).collect();
-        assert_eq!(held.len(), COPY_POOL_MAX + 4);
-        drop(held);
-        let depth = COPY_POOL.with(|p| p.borrow().len());
-        assert!(depth <= COPY_POOL_MAX, "pool overfilled: {depth}");
+    fn addr_header_into_matches_the_vec_encoder() {
+        for a in [
+            TargetAddr::Ip("1.2.3.4:80".parse().unwrap()),
+            TargetAddr::Ip("[2001:db8::1]:443".parse().unwrap()),
+            TargetAddr::Domain("example.com".into(), 8443),
+            TargetAddr::Domain("a".repeat(255), 65535),
+        ] {
+            let mut v = Vec::new();
+            a.encode(&mut v).unwrap();
+            let header = a.as_ref().header().unwrap();
+            assert_eq!(header.len(), v.len(), "measured length for {a:?}");
+            let mut buf = [0u8; AddrHeader::MAX_LEN];
+            let n = header.encode_into(&mut buf);
+            assert_eq!(n, v.len(), "encoded length for {a:?}");
+            assert_eq!(&buf[..n], &v[..], "encoding mismatch for {a:?}");
+        }
+    }
+
+    /// The pump's read path depends on this invariant: a `read_buf` into a full
+    /// `BytesMut` would only ever read 64 B, so the reserve helper must always
+    /// leave a whole chunk of headroom, including after a zero-copy split that
+    /// hands the buffer's front to quinn.
+    #[test]
+    fn reserve_copy_chunk_always_leaves_a_full_chunk_of_room() {
+        let mut buf = BytesMut::with_capacity(COPY_CHUNK);
+        assert!(buf.capacity() - buf.len() >= COPY_CHUNK);
+
+        buf.extend_from_slice(&[0u8; COPY_CHUNK]);
+        reserve_copy_chunk(&mut buf);
+        assert!(buf.capacity() - buf.len() >= COPY_CHUNK);
+
+        // A zero-copy handover leaves the tail sharing the allocation; the
+        // helper must still find (or make) a whole chunk of room.
+        let taken = buf.split_to(buf.len()).freeze();
+        assert_eq!(taken.len(), COPY_CHUNK);
+        reserve_copy_chunk(&mut buf);
+        assert!(buf.capacity() - buf.len() >= COPY_CHUNK);
+        assert_eq!(buf.len(), 0);
+
+        // And a small whole buffer must grow rather than settle for 64 B.
+        let mut tiny = BytesMut::with_capacity(8);
+        tiny.extend_from_slice(b"12345678");
+        reserve_copy_chunk(&mut tiny);
+        assert!(tiny.capacity() - tiny.len() >= COPY_CHUNK);
     }
 
     #[test]
