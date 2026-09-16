@@ -376,26 +376,36 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = mono_millis();
-                        let mut m = lock_write(&sess);
-                        let expired: Vec<u32> = m
-                            .iter()
-                            .filter(|(_, (_, _, t, _))| {
-                                now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed))
-                                    >= SESS_IDLE_MS
-                            })
-                            .map(|(k, _)| *k)
-                            .collect();
-                        for k in expired {
-                            if let Some((_, h, _, _)) = m.remove(&k) {
-                                h.abort();
+                        // Collect under the lock, abort after it drops: `abort()`
+                        // touches the task vtable and may wake a worker, which must
+                        // not stall the per-connection datagram reader holding
+                        // `lock_read` on the same table (same rule as `sweep_local`).
+                        let evicted: Vec<SessEntry> = {
+                            let mut m = lock_write(&sess);
+                            let expired: Vec<u32> = m
+                                .iter()
+                                .filter(|(_, (_, _, t, _))| {
+                                    now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed))
+                                        >= SESS_IDLE_MS
+                                })
+                                .map(|(k, _)| *k)
+                                .collect();
+                            let mut ev = Vec::with_capacity(expired.len());
+                            for k in expired {
+                                if let Some(e) = m.remove(&k) {
+                                    ev.push(e);
+                                }
                             }
-                        }
+                            ev
+                        };
+                        abort_evicted(evicted);
                     }
                     _ = conn.closed() => {
-                        let mut m = lock_write(&sess);
-                        for (_, (_, h, _, _)) in m.drain() {
-                            h.abort();
-                        }
+                        let drained: Vec<SessEntry> = {
+                            let mut m = lock_write(&sess);
+                            m.drain().map(|(_, v)| v).collect()
+                        };
+                        abort_evicted(drained);
                         break;
                     }
                 }
@@ -959,6 +969,84 @@ fn touch_session_throttled(sess: u32, last: &std::sync::atomic::AtomicU64) {
     }
 }
 
+async fn sess_reader_task(
+    s: u32,
+    rs: Arc<tokio::net::UdpSocket>,
+    ss2: SessTable,
+    c2: quinn::Connection,
+    last2: Arc<std::sync::atomic::AtomicU64>,
+    alive_reader: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut buf = vec![0u8; UDP_RECV_MAX + UDP_RECV_SLACK];
+    let mut frag = DgramFragmenter::new();
+    let mut limit = c2.max_datagram_size().unwrap_or(0);
+    let mut last_touch = 0u64;
+    loop {
+        let (n, src) = tokio::select! {
+            r = rs.recv_from(&mut buf) => match r {
+                Ok(x) => x,
+                Err(_) => break,
+            },
+            _ = tick.tick() => {
+                if c2.close_reason().is_some()
+                    || mono_millis()
+                        .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
+                        >= SESS_IDLE_MS
+                {
+                    break;
+                }
+                limit = match c2.max_datagram_size() {
+                    Some(m) => m,
+                    // DATAGRAM support is negotiated at the handshake; a mid-life
+                    // disable leaves this reader with nothing to deliver, so exit
+                    // and let the entry self-reap instead of holding a socket.
+                    None => break,
+                };
+                continue;
+            }
+        };
+        let now = mono_millis();
+        if now.saturating_sub(last_touch) >= 1000 {
+            last_touch = now;
+            last2.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+        if n == buf.len() {
+            warn!(
+                "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
+                 raise MQP_FRAG_MAX_PAYLOAD to carry it"
+            );
+            continue;
+        }
+        if limit == 0 {
+            continue;
+        }
+        let src = SocketAddr::new(unmap(src.ip()), src.port());
+        let ta = TargetAddr::Ip(src);
+        let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
+        if sent.fragmented() {
+            tracing::debug!("udp session {s}: {} B sent as {} fragments", n, sent.frames);
+        }
+        match sent.outcome() {
+            DatagramSend::Sent => {}
+            DatagramSend::Blocked => {}
+            DatagramSend::TooLarge => {
+                limit = c2.max_datagram_size().unwrap_or(0);
+            }
+            DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
+        }
+    }
+    alive_reader.store(false, std::sync::atomic::Ordering::Relaxed);
+    sess_memo_forget(s);
+    let mut w = lock_write(&ss2);
+    if let Some((cur, _, _, _)) = w.get(&s) {
+        if Arc::ptr_eq(cur, &rs) {
+            w.remove(&s);
+        }
+    }
+}
+
 async fn get_or_create_sess(
     ss: &SessTable,
     cd: &quinn::Connection,
@@ -970,6 +1058,12 @@ async fn get_or_create_sess(
     if s == 0 {
         return None;
     }
+    // No DATAGRAM support on this path: refuse before pinning a global permit,
+    // a kernel socket and a reader task for a session whose replies would all
+    // be dropped (`limit == 0` in the reader). Negotiated at the handshake so
+    // it never flaps mid-connection; the per-miss `max_datagram_size()` cost
+    // stays off the per-packet fast path above.
+    cd.max_datagram_size()?;
     // Zero-lock fast path: the common case (a burst of packets for one session)
     // allocates nothing and never touches the table. `alive` is the same signal
     // the old table lookup used (`JoinHandle::is_finished`) — an atomic load —
@@ -1044,159 +1138,62 @@ async fn get_or_create_sess(
     // Shared with the memo so a reader exit invalidates it without touching the
     // table.
     let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let alive_reader = alive.clone();
-    let evicted;
-    // Slow path holds the write lock across check+insert so concurrent
-    // packets for the same sess cannot create duplicate sockets (B8).
-    {
+    let c2_pre = cd.clone();
+    let rs_pre = sock.clone();
+    let ss_pre = ss.clone();
+    let last_pre = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
+    let h_pre = tokio::spawn(sess_reader_task(
+        s,
+        rs_pre,
+        ss_pre,
+        c2_pre,
+        last_pre.clone(),
+        alive.clone(),
+    ));
+    let mut stale_dead: Vec<SessEntry> = Vec::new();
+    let mut swept: Vec<SessEntry> = Vec::new();
+    let inserted = {
         let mut w = lock_write(ss);
         if let Some((sock2, h2, t, _)) = w.get(&s) {
             if !h2.is_finished() {
                 touch_session(t);
                 let sock2 = sock2.clone();
                 drop(w);
+                h_pre.abort();
+                drop(permit);
                 return Some(sock2);
             }
-            // Dead reader: replace it (dropping the stale entry releases its
-            // permit).
-            if let Some((_, hh, _, _)) = w.remove(&s) {
-                hh.abort();
+            if let Some(e) = w.remove(&s) {
+                stale_dead.push(e);
             }
         }
         if w.len() >= LOCAL_SESS_MAX {
-            evicted = sweep_local(&mut w);
-        } else {
-            evicted = Vec::new();
+            swept = sweep_local(&mut w);
         }
-        let c2 = cd.clone();
-        let rs = sock.clone();
-        let ss2 = ss.clone();
-        let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
-        let last2 = last.clone();
-        let h = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(60));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // `UDP_RECV_MAX`, not 2048: a target reply larger than the buffer is
-            // truncated by the kernel, and the `n == buf.len()` check below can
-            // only report it, not recover it.
-            let mut buf = vec![0u8; UDP_RECV_MAX + UDP_RECV_SLACK];
-            // One id counter per session: `(sess, id)` is the client's key.
-            let mut frag = DgramFragmenter::new();
-            // quinn's `max_datagram_size()` takes the connection-state mutex that
-            // the protocol driver also uses; never call it per datagram. 0 means
-            // the peer does not support QUIC DATAGRAM (replies are then dropped).
-            let mut limit = c2.max_datagram_size().unwrap_or(0);
-            // Monotonic ms of the last liveness bump. The atomic is the cross-task
-            // view; this copy is what the per-packet comparison uses, so the fast
-            // path below never reads a clock.
-            let mut last_touch = 0u64;
-            loop {
-                let (n, src) = tokio::select! {
-                    r = rs.recv_from(&mut buf) => match r {
-                        Ok(x) => x,
-                        // Socket error: exit; the entry is reaped below and the
-                        // next packet for this session recreates it.
-                        Err(_) => break,
-                    },
-                    // One fixed 60s tick instead of a fresh 60s timeout per
-                    // recv_from (which re-registered a timer for every inbound
-                    // packet). The reap decision uses the shared last-activity
-                    // stamp, so coarse granularity is sufficient.
-                    _ = tick.tick() => {
-                        if c2.close_reason().is_some()
-                            || mono_millis()
-                                .saturating_sub(last2.load(std::sync::atomic::Ordering::Relaxed))
-                                >= SESS_IDLE_MS
-                        {
-                            break;
-                        }
-                        limit = c2.max_datagram_size().unwrap_or(0);
-                        continue;
-                    }
-                };
-                // Inbound replies are liveness too: a long one-way download must
-                // not be reaped while it is actively streaming. The sweeper only
-                // needs ~1s resolution, so the clock is read at most once per
-                // second instead of once per reply.
-                let now = mono_millis();
-                if now.saturating_sub(last_touch) >= 1000 {
-                    last_touch = now;
-                    last2.store(now, std::sync::atomic::Ordering::Relaxed);
-                }
-                if n == buf.len() {
-                    // The kernel already truncated the excess; say so rather
-                    // than drop it without a trace.
-                    warn!(
-                        "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
-                         raise MQP_FRAG_MAX_PAYLOAD to carry it"
-                    );
-                    continue;
-                }
-                if limit == 0 {
-                    continue;
-                }
-                let src = SocketAddr::new(unmap(src.ip()), src.port());
-                // `limit` is the connection's live `max_datagram_size()`; never
-                // clamp it, because clamping the DATAGRAM budget is really
-                // clamping the *payload* budget (see `dgram_payload_cap`).
-                // `DgramFragmenter::send` is the single send path: it uses
-                // `try_send_datagram` internally (never quinn's `send_datagram`,
-                // whose drop-oldest path underflowed its byte accounting and
-                // aborted the process), splits anything too large for one frame,
-                // and accounts for every drop.
-                let ta = TargetAddr::Ip(src);
-                let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
-                if sent.fragmented() {
-                    tracing::debug!("udp session {s}: {} B sent as {} fragments", n, sent.frames);
-                }
-                match sent.outcome() {
-                    DatagramSend::Sent => {}
-                    DatagramSend::Blocked => {
-                        // Buffer full: UDP semantics, drop this reply.
-                    }
-                    DatagramSend::TooLarge => {
-                        // Path MTU shrank: refresh once, drop this packet.
-                        limit = c2.max_datagram_size().unwrap_or(0);
-                    }
-                    DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
-                }
-            }
-            // Reader is gone: invalidate the memo slot so the next packet for
-            // this session takes the table path and recreates it, rather than
-            // sending a reply into a socket nobody is reading.
-            alive_reader.store(false, std::sync::atomic::Ordering::Relaxed);
-            sess_memo_forget(s);
-            // Self-reap: task exit removes the zombie entry (and releases its
-            // permit) instead of waiting for the 60s sweeper. Do NOT abort our own
-            // JoinHandle: this task is already exiting and abort() has no effect
-            // until an await point that no longer exists.
-            let mut w = lock_write(&ss2);
-            if let Some((cur, _, _, _)) = w.get(&s) {
-                if Arc::ptr_eq(cur, &rs) {
-                    w.remove(&s);
-                }
-            }
-        });
         let dead = !alive.load(std::sync::atomic::Ordering::Relaxed);
-        w.insert(s, (sock.clone(), h, last.clone(), permit));
+        w.insert(s, (sock.clone(), h_pre, last_pre.clone(), permit));
         udp_stats::session();
-        // The reader may have exited before the insert (e.g. immediate socket
-        // error); its self-reap ran too early, so remove the dead entry here
-        // instead of leaving it to hold a permit until the 180s sweep.
         if dead
             || w.get(&s)
                 .map(|(_, hh, _, _)| hh.is_finished())
                 .unwrap_or(false)
         {
-            w.remove(&s);
+            if let Some((_, hh, _, _)) = w.remove(&s) {
+                hh.abort();
+            }
+            false
         } else {
-            // Memoize only a session that is actually alive; a memo hit then
-            // costs one atomic load instead of a table lock per packet.
-            sess_memo_put(s, sock.clone(), last.clone(), alive);
+            sess_memo_put(s, sock.clone(), last_pre.clone(), alive);
+            true
         }
+    };
+    abort_evicted(stale_dead);
+    abort_evicted(swept);
+    if inserted {
+        Some(sock)
+    } else {
+        None
     }
-    abort_evicted(evicted);
-    Some(sock)
 }
 
 #[cfg(test)]

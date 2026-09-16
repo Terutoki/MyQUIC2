@@ -1104,7 +1104,7 @@ async fn udp_associate_inner(
     let last_app_w = last_app.clone();
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let last_activity_rx = last_activity.clone();
-    {
+    let reply_handle = {
         let r2 = relay.clone();
         let last_app = last_app.clone();
         tokio::spawn(async move {
@@ -1185,8 +1185,8 @@ async fn udp_associate_inner(
                     }
                 }
             }
-        });
-    }
+        })
+    };
     // app -> QUIC with this association's sess. Idle assoc (no packets
     // either way for 180s) is reaped so leaked TCP controls cannot hold
     // relay sockets forever (B6).
@@ -1370,6 +1370,7 @@ async fn udp_associate_inner(
             }
         }
     }
+    reply_handle.abort();
     Ok(())
 }
 
