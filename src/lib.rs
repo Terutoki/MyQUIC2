@@ -473,6 +473,19 @@ pub fn encode_datagram_ref_with_limit(
     limit: usize,
 ) -> Option<Bytes> {
     let header = addr.header().ok()?;
+    encode_datagram_with_header(sess, &header, payload, limit)
+}
+
+/// Encode with a pre-validated [`AddrHeader`]: the single-validation fast path
+/// for [`DgramFragmenter::send`], which already measured the header once to
+/// derive the payload/fragment budgets. Byte-identical to
+/// [`encode_datagram_ref_with_limit`].
+fn encode_datagram_with_header(
+    sess: u32,
+    header: &AddrHeader<'_>,
+    payload: &[u8],
+    limit: usize,
+) -> Option<Bytes> {
     let total = DGRAM_PREFIX_LEN + header.len() + payload.len();
     if total > limit {
         return None;
@@ -561,6 +574,20 @@ pub fn encode_fragment(
     limit: usize,
 ) -> Option<Bytes> {
     let header = address.header().ok()?;
+    encode_fragment_with_header(sess, id, idx, total, &header, chunk, limit)
+}
+
+/// Pre-validated-header variant of [`encode_fragment`]; see
+/// `encode_datagram_with_header` for why it exists.
+fn encode_fragment_with_header(
+    sess: u32,
+    id: u16,
+    idx: u8,
+    total: u8,
+    header: &AddrHeader<'_>,
+    chunk: &[u8],
+    limit: usize,
+) -> Option<Bytes> {
     let total_len = FRAG_PREFIX_LEN + header.len() + chunk.len();
     if total_len > limit {
         return None;
@@ -2090,12 +2117,27 @@ pub fn send_udp_datagram(
     payload: &[u8],
     limit: usize,
 ) -> DatagramSend {
-    let Some(d) = encode_datagram_ref_with_limit(sess, address, payload, limit) else {
+    let Ok(header) = address.header() else {
+        let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        warn_datagram_drop("bad address header", n, "");
+        return DatagramSend::TooLarge;
+    };
+    send_udp_datagram_with_header(conn, sess, &header, payload, limit)
+}
+
+fn send_udp_datagram_with_header(
+    conn: &quinn::Connection,
+    sess: u32,
+    header: &AddrHeader<'_>,
+    payload: &[u8],
+    limit: usize,
+) -> DatagramSend {
+    let Some(d) = encode_datagram_with_header(sess, header, payload, limit) else {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
         warn_datagram_drop(
             "payload exceeds the path budget",
             n,
-            &budget_detail(limit, dgram_payload_cap(limit, address)),
+            &budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len())),
         );
         return DatagramSend::TooLarge;
     };
@@ -2162,12 +2204,20 @@ impl DgramFragmenter {
         payload: &[u8],
         limit: usize,
     ) -> PayloadSend {
-        let cap = dgram_payload_cap(limit, address);
+        let Ok(header) = address.header() else {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop("bad address header", n, "");
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        };
+        let cap = limit.saturating_sub(DGRAM_PREFIX_LEN + header.len());
         // Every outbound relayed payload passes through here, so this is the one
         // place the activity counters need (see `udp_stats`).
         udp_stats::payload(payload.len());
         if payload.len() <= cap {
-            let failed = match send_udp_datagram(conn, sess, address, payload, limit) {
+            let failed = match send_udp_datagram_with_header(conn, sess, &header, payload, limit) {
                 DatagramSend::Sent => None,
                 other => Some(other),
             };
@@ -2177,7 +2227,7 @@ impl DgramFragmenter {
             };
         }
 
-        let chunk = fragment_chunk_len(limit, address);
+        let chunk = limit.saturating_sub(FRAG_PREFIX_LEN + header.len());
         // One fragment must carry something, and the reassembled result must
         // stay inside both the protocol's payload cap and the u8 fragment count.
         let total_usize = if chunk == 0 {
@@ -2207,7 +2257,9 @@ impl DgramFragmenter {
         udp_stats::fragmented(total);
         let mut frames = 0u8;
         for (i, part) in payload.chunks(chunk).enumerate() {
-            let Some(body) = encode_fragment(sess, id, i as u8, total, address, part, limit) else {
+            let Some(body) =
+                encode_fragment_with_header(sess, id, i as u8, total, &header, part, limit)
+            else {
                 // Only reachable if `chunk` and the encoder disagree; report it
                 // rather than send a payload that can never reassemble.
                 let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);

@@ -446,88 +446,23 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             // path as a zero-copy `Bytes::slice` (instead of a per-packet
             // copy) even after `decode_datagram_ref` borrowed `d`.
             let owned = d.clone();
-            let (s, addr, payload): (u32, TargetAddr, Bytes) = if d.first() == Some(&MQP_DGRAM_FRAG)
-            {
+            if d.first() == Some(&MQP_DGRAM_FRAG) {
                 let Ok(f) = decode_fragment(&d) else {
                     continue;
                 };
-                match reasm.push(&f, mono_millis()) {
-                    Some((s, a, whole)) => (s, a, whole),
-                    // Incomplete: the sender is UDP and will not retransmit,
-                    // so the partial simply expires.
-                    None => continue,
-                }
+                let Some((s, a, whole)) = reasm.push(&f, mono_millis()) else {
+                    continue;
+                };
+                udp_stats::payload(whole.len());
+                forward_server_dgram(&ss, &cd, s, a.as_ref(), whole, allow_private).await;
             } else {
                 let Ok((s, a, p)) = decode_datagram_ref(&d) else {
                     continue;
                 };
                 let off = owned.len() - p.len();
-                (s, a.into_owned(), owned.slice(off..))
-            };
-            // Inbound half of the activity counters (the outbound half is
-            // recorded inside `DgramFragmenter::send`).
-            udp_stats::payload(payload.len());
-            match addr.as_ref() {
-                TargetAddrRef::Ip(dst) => {
-                    if !allow_private && !is_global_ip(dst.ip()) {
-                        continue;
-                    }
-                    let sock = match get_or_create_sess(&ss, &cd, s).await {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    // Non-blocking send with bounded detached fallback: a full
-                    // target buffer must never stall the single per-connection
-                    // datagram reader (UDP loss is acceptable).
-                    udp_try_send(&sock, map_for_dual(dst), payload);
-                }
-                TargetAddrRef::Domain(h, p) => {
-                    // Fast path: cached DNS avoids a per-packet spawn; a fresh
-                    // negative entry avoids even that (the old fast path only
-                    // consulted the positive cache, so every packet for a bad
-                    // domain spawned a resolver task just to fail).
-                    match lookup_cached_fast(h, p) {
-                        CachedLookup::Negative => continue,
-                        CachedLookup::Addr(dst) => {
-                            if !allow_private && !is_global_ip(dst.ip()) {
-                                continue;
-                            }
-                            let sock = match get_or_create_sess(&ss, &cd, s).await {
-                                Some(v) => v,
-                                None => continue,
-                            };
-                            udp_try_send(&sock, map_for_dual(dst), payload);
-                        }
-                        CachedLookup::Unknown => {
-                            let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => continue,
-                            };
-                            let ss = ss.clone();
-                            let cd = cd.clone();
-                            let host = h.to_string();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let dst = match resolve_all_cached(&host, p).await {
-                                    Ok(v) => match v
-                                        .iter()
-                                        .copied()
-                                        .find(|a| allow_private || is_global_ip(a.ip()))
-                                    {
-                                        Some(v) => v,
-                                        None => return,
-                                    },
-                                    Err(_) => return,
-                                };
-                                let sock = match get_or_create_sess(&ss, &cd, s).await {
-                                    Some(v) => v,
-                                    None => return,
-                                };
-                                udp_try_send(&sock, map_for_dual(dst), payload);
-                            });
-                        }
-                    }
-                }
+                let payload = owned.slice(off..);
+                udp_stats::payload(payload.len());
+                forward_server_dgram(&ss, &cd, s, a, payload, allow_private).await;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -814,6 +749,75 @@ async fn dial_happy_eyeballs(
     res
 }
 
+/// Forward one decoded datagram to its session socket. Takes the borrowed
+/// address form so the non-fragment fast path never materializes a
+/// `TargetAddr` (a domain packet would otherwise pay a `String` alloc per
+/// packet just to be borrowed again for the DNS lookup below).
+async fn forward_server_dgram(
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    s: u32,
+    addr: TargetAddrRef<'_>,
+    payload: Bytes,
+    allow_private: bool,
+) {
+    match addr {
+        TargetAddrRef::Ip(dst) => {
+            if !allow_private && !is_global_ip(dst.ip()) {
+                return;
+            }
+            let sock = match get_or_create_sess(ss, cd, s).await {
+                Some(v) => v,
+                None => return,
+            };
+            udp_try_send(&sock, map_for_dual(dst), payload);
+        }
+        TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
+            CachedLookup::Negative => {}
+            CachedLookup::Addr(dst) => {
+                if !allow_private && !is_global_ip(dst.ip()) {
+                    return;
+                }
+                let sock = match get_or_create_sess(ss, cd, s).await {
+                    Some(v) => v,
+                    None => return,
+                };
+                udp_try_send(&sock, map_for_dual(dst), payload);
+            }
+            CachedLookup::Unknown => {
+                if dns_slow_path_limiter().available_permits() == 0 {
+                    return;
+                }
+                let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let ss = ss.clone();
+                let cd = cd.clone();
+                let host = h.to_owned();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let dst = match resolve_all_cached(&host, p).await {
+                        Ok(v) => match v
+                            .iter()
+                            .copied()
+                            .find(|a| allow_private || is_global_ip(a.ip()))
+                        {
+                            Some(v) => v,
+                            None => return,
+                        },
+                        Err(_) => return,
+                    };
+                    let sock = match get_or_create_sess(&ss, &cd, s).await {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    udp_try_send(&sock, map_for_dual(dst), payload);
+                });
+            }
+        },
+    }
+}
 /// Throttled liveness bump: readers only need ~1s resolution for the sweeper,
 /// so avoid a store per packet (stores bounce cache lines between cores).
 fn touch_session(t: &std::sync::atomic::AtomicU64) {
@@ -1120,9 +1124,29 @@ async fn get_or_create_sess(
     let permit = match session_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            // Reap expired/over-cap sessions, then retry once. Aborts happen
-            // after the lock is dropped (the guard is a temporary in this
-            // statement, and `abort_evicted` runs once it is gone).
+            // Throttled reap: an O(n) sweep per packet under a new-session
+            // flood would stall the single per-connection reader behind the
+            // table write lock. At most one sweep per second; packets arriving
+            // inside the window drop fast (UDP semantics) instead of
+            // re-scanning the whole table.
+            static LAST_SWEEP_MS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let now = mono_millis();
+            let last = LAST_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) < 1000 {
+                return None;
+            }
+            if LAST_SWEEP_MS
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                return None;
+            }
             let evicted = sweep_local(&mut lock_write(ss));
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {

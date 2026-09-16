@@ -29,10 +29,10 @@ type SharedConn = Arc<RwLock<Option<quinn::Connection>>>;
 /// 4s TCP connect + scheduling jitter, with margin for a loaded host.
 const TCP_DIAL_ACK_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// How long the UDP relay may reuse a cached `(connection, PMTU limit)` pair
-/// before re-reading it. Both `close_reason()` and `max_datagram_size()` take
-/// quinn's connection-state mutex, so they must not run per datagram.
-const EGRESS_REFRESH: Duration = Duration::from_secs(1);
+/// Egress freshness window in ms, mirroring the old 1 s `EGRESS_REFRESH`.
+/// Stored as `mono_millis()` so the relay loop reuses its single per-packet
+/// clock read instead of taking a second `Instant::now()` per datagram.
+const EGRESS_REFRESH_MS: u64 = 1000;
 
 /// Process-wide caps on client-side resources. Without these a local or LAN
 /// peer can spawn unbounded tasks / relay sockets (each with 512 KB kernel
@@ -156,16 +156,16 @@ impl ConnPool {
 /// of quinn's connection-state mutex on the per-packet path.
 fn refresh_udp_egress(
     pool: &ConnPool,
-    now_c: tokio::time::Instant,
+    now_ms: u64,
     warned_no_datagram: &mut bool,
-) -> Option<(quinn::Connection, usize, tokio::time::Instant)> {
+) -> Option<(quinn::Connection, usize, u64)> {
     for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
         let Ok(g) = slot.shared.try_read() else {
             continue;
         };
         match g.as_ref() {
             Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
-                Some(m) => return Some((c.clone(), m, now_c)),
+                Some(m) => return Some((c.clone(), m, now_ms)),
                 None => {
                     if !*warned_no_datagram {
                         *warned_no_datagram = true;
@@ -1126,28 +1126,30 @@ async fn udp_associate_inner(
                 if now.saturating_sub(prev) >= 1000 {
                     last_activity_rx.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                let (addr, payload): (TargetAddr, Bytes) = if d.first() == Some(&MQP_DGRAM_FRAG) {
+                if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else { continue };
-                    match reasm.push(&f, now) {
-                        Some((_, a, whole)) => (a, whole),
-                        // Still missing fragments: UDP semantics say wait for
-                        // nothing, the partial expires on its own.
-                        None => continue,
-                    }
-                } else {
-                    let Ok((_, a, p)) = decode_datagram_ref(&d) else {
+                    let Some((_, a, whole)) = reasm.push(&f, now) else {
                         continue;
                     };
-                    // Zero-copy view of the received datagram: `Bytes::slice`
-                    // only bumps a refcount, so the reply path never copies the
-                    // payload to hand it to the socket task.
-                    let off = d.len() - p.len();
-                    (a.into_owned(), d.slice(off..))
+                    udp_stats::payload(whole.len());
+                    match a.as_ref() {
+                        TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, &whole, &mut pkt),
+                        TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
+                            CachedLookup::Addr(dst) => {
+                                send_reply(&r2, &last_app, dst, &whole, &mut pkt)
+                            }
+                            CachedLookup::Negative | CachedLookup::Unknown => {}
+                        },
+                    }
+                    continue;
+                }
+                let Ok((_, a, p)) = decode_datagram_ref(&d) else {
+                    continue;
                 };
-                // Inbound half of the activity counters (the outbound half is
-                // recorded inside `DgramFragmenter::send`).
+                let off = d.len() - p.len();
+                let payload = d.slice(off..);
                 udp_stats::payload(payload.len());
-                match addr.as_ref() {
+                match a {
                     TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, &payload, &mut pkt),
                     TargetAddrRef::Domain(h, p) => {
                         // The server always echoes replies with an IP-form source
@@ -1160,6 +1162,9 @@ async fn udp_associate_inner(
                                 send_reply(&r2, &last_app, dst, &payload, &mut pkt)
                             }
                             CachedLookup::Unknown => {
+                                if dns_slow_path_limiter().available_permits() == 0 {
+                                    continue;
+                                }
                                 let permit =
                                     match dns_slow_path_limiter().clone().try_acquire_owned() {
                                         Ok(p) => p,
@@ -1205,7 +1210,7 @@ async fn udp_associate_inner(
     // max_datagram_size(). Sticky to the current connection while it lives
     // (see the refresh site); the pool is only re-resolved to pick a new
     // slot after the cached handle dies.
-    let mut egress: Option<(quinn::Connection, usize, tokio::time::Instant)> = None;
+    let mut egress: Option<(quinn::Connection, usize, u64)> = None;
     let mut warned_no_datagram = false;
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
     // not reset the idle timer and keep an otherwise dead association alive.
@@ -1266,10 +1271,11 @@ async fn udp_associate_inner(
                 // `close_reason()` and `max_datagram_size()` lock the same
                 // connection state as the protocol driver, so they are
                 // refreshed at most once per second (or on send failure).
-                let now_c = tokio::time::Instant::now();
+                // `now` doubles as the egress freshness clock, so this path
+                // costs a single clock read per packet.
                 let stale = egress
                     .as_ref()
-                    .map(|(_, _, t)| now_c.duration_since(*t) >= EGRESS_REFRESH)
+                    .map(|(_, _, t)| now.saturating_sub(*t) >= EGRESS_REFRESH_MS)
                     .unwrap_or(true);
                 if stale {
                     // Sticky egress: while the cached connection is still
@@ -1287,13 +1293,13 @@ async fn udp_associate_inner(
                         if c.close_reason().is_none() {
                             if let Some(m) = c.max_datagram_size() {
                                 *limit = m;
-                                *t = now_c;
+                                *t = now;
                                 kept = true;
                             }
                         }
                     }
                     if !kept {
-                        egress = refresh_udp_egress(&pool, now_c, &mut warned_no_datagram);
+                        egress = refresh_udp_egress(&pool, now, &mut warned_no_datagram);
                     }
                 }
                 let Some((conn, limit, _)) = egress.as_ref() else {
