@@ -415,6 +415,15 @@ pub const FRAG_TIMEOUT_MS: u64 = 2_000;
 /// this is also what caps how many datagrams may be in flight at once.
 pub const FRAG_MAX_HELD_BYTES: usize = 256 * 1024;
 
+/// Reassembly partial-count bound per connection.
+///
+/// `held` only accounts payload bytes, but each partial also owns a
+/// `vec![None; total]` slot table (up to 64 `Option<Bytes>` ≈ 2 KiB) plus a
+/// HashMap entry. Without a count cap a peer can force ~128 MiB of slot
+/// tables with 65k single-byte fragments while `held` barely moves. The count
+/// cap also bounds the `min_by_key` eviction scan to 256 entries per eviction.
+pub const FRAG_MAX_PARTIALS: usize = 256;
+
 /// Build a UDP DATAGRAM body: type + sess + addr header + payload.
 /// sess scopes the packet to one UDP ASSOCIATE so concurrent associations sharing
 /// a QUIC connection never steal each other's replies. Returns None if exceeds limit.
@@ -2300,6 +2309,16 @@ impl DgramReassembler {
         self.maybe_sweep(now_ms);
 
         let key = (f.sess, f.id);
+        // Count cap first: `held` misses the per-partial slot-table cost, so a
+        // flood of tiny single-fragment partials would otherwise grow memory
+        // without ever tripping the byte bound. Evict-before-insert keeps the
+        // `min_by_key` scan bounded to FRAG_MAX_PARTIALS entries.
+        if !self.parts.contains_key(&key)
+            && self.parts.len() >= FRAG_MAX_PARTIALS
+            && (!self.evict_oldest() || self.parts.len() >= FRAG_MAX_PARTIALS)
+        {
+            return None;
+        }
         let complete = {
             let entry = self
                 .parts
@@ -2307,7 +2326,25 @@ impl DgramReassembler {
                 .or_insert_with(|| Partial::new(f.total, &f.address, now_ms));
             if entry.total != f.total {
                 // A wrapped id reused with a different shape: restart rather
-                // than splice two datagrams together.
+                // than splice two datagrams together. Release the old bytes
+                // first or `held` overcounts forever.
+                self.held = self.held.saturating_sub(entry.bytes);
+                *entry = Partial::new(f.total, &f.address, now_ms);
+            } else if entry.got > 0
+                && (entry.address.as_ref() != f.address
+                    || entry.chunks[f.idx as usize]
+                        .as_ref()
+                        .is_some_and(|old| old.as_ref() != f.chunk))
+            {
+                // Same shape but a different generation: the address changed,
+                // or this index already holds different bytes. An identical
+                // chunk is a plain replay and stays ignored below; a differing
+                // one is a fast id reuse, so restart rather than splice (a
+                // stale fragment landing on an *empty* slot stays
+                // indistinguishable without a wire generation marker, but that
+                // requires id reuse inside the 2s window plus exact
+                // interleaving, and at most drops or reorders UDP payloads).
+                self.held = self.held.saturating_sub(entry.bytes);
                 *entry = Partial::new(f.total, &f.address, now_ms);
             }
             let slot = &mut entry.chunks[f.idx as usize];
@@ -2807,8 +2844,18 @@ async fn copy_tcp_quic_inner(
                 let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
                 touch_stamp(&l2, &mut stamped, now, throttle);
             }
-            // No FIN here either: the final disposition below closes the socket
-            // once both directions are clean.
+            // QUIC-recv EOF: half-close the TCP write side now. Without
+            // this FIN the peer waits for EOF while our own c2s direction
+            // waits for the peer's FIN — a deadlock in which neither side
+            // ever finishes and every cleanly-closed flow lingers until the
+            // idle reap (or connection death), pinning its task, both
+            // sockets and the stream-task permit. The TCP read side stays
+            // open: c2s may still be forwarding, and its own EOF (after the
+            // peer reacts to this FIN) completes the other half
+            // symmetrically. A shutdown error means the peer is already
+            // gone; the transfer itself is complete, so it is ignored and
+            // the direction still reports Ok.
+            tw.shutdown().await.ok();
             Ok::<u64, anyhow::Error>(total)
         };
         // Drive both directions manually instead of `join!`: when one direction
@@ -2827,6 +2874,10 @@ async fn copy_tcp_quic_inner(
         // never re-created fixes the cadence: it is polled again after each transfer
         // event, and only the elapsed-time comparison decides when the deadline has
         // passed.
+        // The unbounded `copy_tcp_quic` path passes u32::MAX seconds as
+        // "no idle timeout": arming a 5s tick for it wakes every stream
+        // forever for a check that can never fire.
+        let idle_enabled = idle < Duration::from_secs(u32::MAX as u64 / 2);
         let idle_step = Duration::from_secs(5).min(idle);
         let idle_tick = tokio::time::sleep(idle_step);
         tokio::pin!(idle_tick);
@@ -2840,7 +2891,7 @@ async fn copy_tcp_quic_inner(
                     Ok(v) => s2c_total = Some(v),
                     Err(e) => break Err(e),
                 },
-                _ = &mut idle_tick => {
+                _ = &mut idle_tick, if idle_enabled => {
                     let elapsed_ms = base.elapsed().as_millis() as u64;
                     let last = last_ms.load(Ordering::Relaxed);
                     if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
@@ -3349,6 +3400,172 @@ mod tests {
             udp_stats::reassembly_drops().1 > ev0,
             "an evicted partial must be counted"
         );
+    }
+
+    #[test]
+    fn partial_count_cap_bounds_slot_table_memory() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        // Small first-fragment chunks (700 B): 306 of them hold ~214 KiB,
+        // under FRAG_MAX_HELD_BYTES, so only the count cap can bind. (With
+        // 4000 B chunks the byte cap binds first at ~65 partials, which is a
+        // different bound than the one pinned here.)
+        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(7000), 700);
+        assert_eq!(frames.len(), 10);
+        let mut r = DgramReassembler::new();
+        for id in 0..(FRAG_MAX_PARTIALS as u16 + 50) {
+            let mut f = decode_fragment(&frames[0]).unwrap();
+            f.id = id;
+            assert!(r.push(&f, 0).is_none());
+        }
+        assert_eq!(
+            r.inflight(),
+            FRAG_MAX_PARTIALS,
+            "inflight partials must never exceed the count cap"
+        );
+    }
+
+    #[test]
+    fn same_shape_id_reuse_restarts_instead_of_splicing() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let first = pattern(3000);
+        let frames_a = frag_frames(9, 1, &addr.as_ref(), &first, 1400);
+        assert_eq!(frames_a.len(), 3);
+        let mut second = pattern(3000);
+        second[0] ^= 0xff;
+        assert_ne!(second, first);
+        let frames_b = frag_frames(9, 1, &addr.as_ref(), &second, 1400);
+        assert_eq!(frames_b.len(), 3);
+
+        let mut r = DgramReassembler::new();
+        assert!(r.push(&decode_fragment(&frames_a[0]).unwrap(), 0).is_none());
+        assert!(r.push(&decode_fragment(&frames_a[1]).unwrap(), 0).is_none());
+        // Same (sess, id, total, idx) with different bytes: a fast reuse, not
+        // a replay. The old partial must be discarded, so the stale third
+        // fragment of generation A no longer completes anything.
+        assert!(r.push(&decode_fragment(&frames_b[0]).unwrap(), 0).is_none());
+        assert!(r.push(&decode_fragment(&frames_a[2]).unwrap(), 0).is_none());
+        let done = r.push(&decode_fragment(&frames_b[1]).unwrap(), 0);
+        let (_, _, whole) = done.expect("generation B completes with its own fragments");
+        assert_eq!(&whole[..], &second[..], "must not splice A and B together");
+        assert_eq!(r.inflight(), 0);
+    }
+
+    #[test]
+    fn restart_releases_the_old_bytes_from_held() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(3000), 1400);
+        let other = frag_frames(1, 1, &addr.as_ref(), &pattern(6000), 1400);
+        let mut r = DgramReassembler::new();
+        assert!(r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none());
+        let held_before = r.held_bytes();
+        assert!(held_before > 0);
+        // Different shape forces a restart: held must drop the old bytes and
+        // count only the new fragment, never accumulate both.
+        assert!(r.push(&decode_fragment(&other[0]).unwrap(), 0).is_none());
+        let f0 = decode_fragment(&other[0]).unwrap();
+        assert_eq!(r.held_bytes(), f0.chunk.len());
+    }
+
+    /// Half-close propagation between two pumps: when the app shuts down its
+    /// write side, the FIN must travel app -> QUIC -> peer TCP and back,
+    /// instead of each pump waiting for a FIN only the final disposition
+    /// would send. Pre-fix this test hung on every await: both pumps lingered
+    /// until the 300 s idle reap, pinning tasks, sockets and stream-task
+    /// permits per cleanly-closed flow — so the idle budget here is
+    /// deliberately 300 s and every await above it is bounded by a 10 s
+    /// timeout. (A single pump against a far end that unconditionally
+    /// finishes cannot catch this: the deadlock needs a symmetric peer whose
+    /// own TCP never closes first, exactly like a real echo target.)
+    #[tokio::test]
+    async fn half_close_propagates_and_the_pump_finishes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let a = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (b, _) = listener.accept().await.unwrap();
+            (a, b)
+        }
+
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        // The far accept only resolves after the first STREAM frame arrives
+        // (quinn requires a write before accept_bi fires), so pump1 must be
+        // running and the app must send before awaiting the far end.
+        let far_conn = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let (s, r) = conn.accept_bi().await.unwrap();
+            (conn, s, r)
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (send, recv) = conn.open_bi().await.unwrap();
+
+        // App <-> pump1 <-> QUIC <-> pump2 <-> echo socket E1; the test holds
+        // E2 (peer's TCP read side) open until the FIN arrives, mimicking an
+        // echo target that only closes on EOF.
+        let (mut app, pump_tcp) = tcp_pair().await;
+        let (echo_ours, mut echo_theirs) = tcp_pair().await;
+        let pump1 = tokio::spawn(copy_tcp_quic_idle(
+            pump_tcp,
+            send,
+            recv,
+            Duration::from_secs(300),
+        ));
+        app.write_all(b"hello-half-close").await.unwrap();
+        let (_far, far_send, far_recv) = tokio::time::timeout(Duration::from_secs(10), far_conn)
+            .await
+            .expect("far accept fires once the first STREAM frame arrives")
+            .unwrap();
+        let pump2 = tokio::spawn(copy_tcp_quic_idle(
+            echo_ours,
+            far_send,
+            far_recv,
+            Duration::from_secs(300),
+        ));
+        app.shutdown().await.unwrap();
+        // The full 16 B must still arrive before any FIN: shutdown propagation
+        // must not truncate in-flight data.
+        let mut got = vec![0u8; 16];
+        tokio::time::timeout(Duration::from_secs(10), echo_theirs.read_exact(&mut got))
+            .await
+            .expect("echo side must receive the payload")
+            .unwrap();
+        assert_eq!(got, b"hello-half-close");
+        // Far pump's s2c saw QUIC EOF and must have half-closed E1: without
+        // propagation this EOF never arrives.
+        let mut one = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(10), echo_theirs.read(&mut one))
+            .await
+            .expect("echo side must observe EOF promptly");
+        assert_eq!(n.unwrap(), 0, "echo side must observe EOF");
+        drop(echo_theirs);
+        // E2's close EOFs pump2's c2s, which finishes its QUIC send; pump1's
+        // s2c then EOFs and half-closes the app socket.
+        let n = tokio::time::timeout(Duration::from_secs(10), app.read(&mut one))
+            .await
+            .expect("app must observe EOF promptly");
+        assert_eq!(n.unwrap(), 0, "app must observe EOF, not data or reset");
+        // Both pumps must finish on their own rather than at the idle reap.
+        let (up, down) = tokio::time::timeout(Duration::from_secs(10), pump1)
+            .await
+            .expect("pump1 must finish without the idle reap")
+            .unwrap()
+            .expect("pump1 must end clean");
+        assert_eq!((up, down), (16, 0));
+        let (up, down) = tokio::time::timeout(Duration::from_secs(10), pump2)
+            .await
+            .expect("pump2 must finish without the idle reap")
+            .unwrap()
+            .expect("pump2 must end clean");
+        assert_eq!((up, down), (0, 16));
     }
 
     /// End to end over a real connection: every size up to the protocol cap

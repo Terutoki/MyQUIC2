@@ -26,8 +26,8 @@ type SharedConn = Arc<RwLock<Option<quinn::Connection>>>;
 
 /// Must cover the server's worst-case dial path:
 /// 5s header read + 3s DNS permit + 5s DNS lookup + 2s dial permit +
-/// 4s TCP connect + scheduling jitter.
-const TCP_DIAL_ACK_TIMEOUT: Duration = Duration::from_secs(20);
+/// 4s TCP connect + scheduling jitter, with margin for a loaded host.
+const TCP_DIAL_ACK_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// How long the UDP relay may reuse a cached `(connection, PMTU limit)` pair
 /// before re-reading it. Both `close_reason()` and `max_datagram_size()` take
@@ -417,6 +417,14 @@ fn jitter_ms() -> u64 {
     })
 }
 
+fn count_dispatch_drop(sess: u32) {
+    static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n.is_multiple_of(1000) {
+        tracing::warn!("udphub sess={sess} dispatcher drops={n}");
+    }
+}
+
 fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
     tokio::spawn(async move {
         let mut gen = slot.gen_rx.clone();
@@ -444,15 +452,31 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         }
                         match last_tx.as_ref() {
                             Some(tx) => {
-                                if tx.try_send(d).is_err() {
-                                    static DROPS: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    let n = DROPS
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if n.is_multiple_of(1000) {
-                                        tracing::warn!(
-                                            "udphub sess={sess} dispatcher drops={n}"
-                                        );
+                                match tx.try_send(d) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(
+                                        payload,
+                                    )) => {
+                                        // Cached sender is stale (association removed;
+                                        // sess id may since have been reused): refresh
+                                        // once and retry the recovered payload so a
+                                        // reused sess recovers immediately.
+                                        last_tx = hub.sender(sess);
+                                        match last_tx.as_ref() {
+                                            Some(fresh) => {
+                                                if fresh.try_send(payload).is_err() {
+                                                    count_dispatch_drop(sess);
+                                                }
+                                            }
+                                            None => {
+                                                last_sess = 0;
+                                                count_dispatch_drop(sess);
+                                            }
+                                        }
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // Queue full on a live association: UDP drop.
+                                        count_dispatch_drop(sess);
                                     }
                                 }
                             }
@@ -989,8 +1013,13 @@ async fn write_socks(s: &mut tokio::net::TcpStream, buf: &[u8]) -> Result<()> {
 fn bnd_for(s: &tokio::net::TcpStream) -> Result<SocketAddr> {
     let local = s.local_addr()?;
     let ip = unmap(local.ip());
+    // An accepted socket's local address is concrete in practice; the
+    // unspecified branch only fires for an unbound/odd socket. Falling back
+    // to the peer (client) address there misreports BND as the client itself,
+    // so report an unavailable address instead (the error REP is what the app
+    // acts on; BND is informational on failures).
     let ip = if ip.is_unspecified() {
-        unmap(s.peer_addr()?.ip())
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
         ip
     };
@@ -1049,11 +1078,16 @@ async fn udp_associate_inner(
     // BND.ADDR must be THIS proxy's address (the IP the app connected to), not
     // the app's own address: a LAN client sending datagrams to its own
     // IP:port would never reach the relay, breaking UDP off-host entirely.
-    // `bnd_for` mirrors the CONNECT path's unspecified-address handling.
-    let relay_ip = bnd_for(&tcp)
-        .map(|b| b.ip())
-        .or_else(|_| tcp.local_addr().map(|l| unmap(l.ip())))
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    // Computed directly (not via `bnd_for`, whose unknown fallback is
+    // 0.0.0.0): prefer the concrete local interface, else the peer address
+    // (correct for same-host testing), else localhost.
+    let relay_ip = match tcp.local_addr().map(|l| unmap(l.ip())) {
+        Ok(ip) if !ip.is_unspecified() => ip,
+        _ => tcp
+            .peer_addr()
+            .map(|p| unmap(p.ip()))
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+    };
     let relay_reply = SocketAddr::new(relay_ip, relay_port);
     write_socks_reply(&mut tcp, 0x00, relay_reply).await?;
     let relay = Arc::new(relay);
@@ -1165,10 +1199,12 @@ async fn udp_associate_inner(
     // One id counter per association: `(sess, id)` is the receiver's key.
     let mut frag = DgramFragmenter::new();
     let idle_limit_ms = 180_000u64;
-    // Cached egress connection + PMTU limit. Re-read from `shared` at most
-    // once per EGRESS_REFRESH (or after a failed send), so the per-packet path
-    // never touches quinn's connection-state mutex for close_reason()/
-    // max_datagram_size().
+    // Cached egress connection + PMTU limit. Refreshed at most once per
+    // EGRESS_REFRESH (or after a failed send), so the per-packet path never
+    // touches quinn's connection-state mutex for close_reason()/
+    // max_datagram_size(). Sticky to the current connection while it lives
+    // (see the refresh site); the pool is only re-resolved to pick a new
+    // slot after the cached handle dies.
     let mut egress: Option<(quinn::Connection, usize, tokio::time::Instant)> = None;
     let mut warned_no_datagram = false;
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
@@ -1236,7 +1272,29 @@ async fn udp_associate_inner(
                     .map(|(_, _, t)| now_c.duration_since(*t) >= EGRESS_REFRESH)
                     .unwrap_or(true);
                 if stale {
-                    egress = refresh_udp_egress(&pool, now_c, &mut warned_no_datagram);
+                    // Sticky egress: while the cached connection is still
+                    // alive, only refresh its PMTU limit in place (same
+                    // conn-mutex cost as a pool re-resolve, minus the slot
+                    // locks). Re-resolving the pool on every tick flaps UDP
+                    // between slots whenever A recovers: each flip abandons
+                    // a warm server-side session (zombie until its 180s
+                    // sweep) and creates a new one. Associations opened
+                    // during an outage therefore stay on B until B itself
+                    // fails; traffic migrates back to A naturally as
+                    // associations churn.
+                    let mut kept = false;
+                    if let Some((c, limit, t)) = egress.as_mut() {
+                        if c.close_reason().is_none() {
+                            if let Some(m) = c.max_datagram_size() {
+                                *limit = m;
+                                *t = now_c;
+                                kept = true;
+                            }
+                        }
+                    }
+                    if !kept {
+                        egress = refresh_udp_egress(&pool, now_c, &mut warned_no_datagram);
+                    }
                 }
                 let Some((conn, limit, _)) = egress.as_ref() else {
                     continue;

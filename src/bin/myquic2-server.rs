@@ -320,6 +320,10 @@ async fn main() -> Result<()> {
 /// check on `MQP_FRAG_MAX_PAYLOAD`: a deployment that never approaches it needs
 /// no larger cap, whatever its workload is.
 fn spawn_udp_reporter() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_err() {
+        return;
+    }
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -579,9 +583,35 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     };
                     dns_n = match resolve_all_cached(h, *p).await {
                         Ok(v) => {
-                            let k = v.len().min(dns_cand.len());
-                            dns_cand[..k].copy_from_slice(&v[..k]);
-                            k
+                            // `resolve_all_cached` sorts IPv4 first, so a flat
+                            // prefix cut would starve IPv6 whenever upstream
+                            // returns more than 8 v4 records. Alternate
+                            // families instead, keeping v4 preference while
+                            // guaranteeing v6 gets tried.
+                            let mut n = 0;
+                            let mut v4 = v.iter().filter(|a| a.is_ipv4());
+                            let mut v6 = v.iter().filter(|a| !a.is_ipv4());
+                            // Alternate families so v6 is never starved, but
+                            // keep filling from whichever family still has
+                            // records until the 8-slot buffer is full (a
+                            // v4-only answer must still yield up to 8).
+                            let mut want_v4 = true;
+                            while n < dns_cand.len() {
+                                let next = if want_v4 {
+                                    v4.next().or_else(|| v6.next())
+                                } else {
+                                    v6.next().or_else(|| v4.next())
+                                };
+                                match next {
+                                    Some(a) => {
+                                        dns_cand[n] = *a;
+                                        n += 1;
+                                    }
+                                    None => break,
+                                }
+                                want_v4 = !want_v4;
+                            }
+                            n
                         }
                         Err(_) => 0,
                     };
@@ -934,6 +964,12 @@ async fn get_or_create_sess(
     cd: &quinn::Connection,
     s: u32,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
+    // Session 0 is reserved (never allocated by any client hub): a wire
+    // datagram carrying it is malformed or hostile, not a new session.
+    // Refusing here keeps it from pinning a global permit until the sweep.
+    if s == 0 {
+        return None;
+    }
     // Zero-lock fast path: the common case (a burst of packets for one session)
     // allocates nothing and never touches the table. `alive` is the same signal
     // the old table lookup used (`JoinHandle::is_finished`) — an atomic load —

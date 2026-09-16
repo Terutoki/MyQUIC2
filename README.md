@@ -116,7 +116,10 @@ across the pool while ports in `interactive_ports` (default DNS/NTP/STUN) plus *
 UDP** pin to the interactive connection, so a latency probe never queues behind bulk
 on the same cwnd. Routing is liveness-aware: a dead preferred slot fails over to the
 live one (returning flows stay on their slot; both dead fails the flow fast via the
-normal reconnect timeout). The TCP open header is always its own write, never batched
+normal reconnect timeout). Isolation holds while both connections are alive: with a
+single live connection every flow shares one cwnd. UDP egress is sticky to its
+connection while it lives (no flap-back churn when the preferred slot recovers;
+new associations prefer the interactive slot again). The TCP open header is always its own write, never batched
 behind first application bytes, so server-first peers (game logins, banners) see it
 within ~100 ms.
 
@@ -584,7 +587,7 @@ All limits are constants in the sources; the table shows where to change them.
 | TCP stream idle reap | 300 s | `copy_tcp_quic_idle` call sites |
 | UDP association idle reap | 180 s (both directions; TCP control activity counts) | server sweeper / client interval |
 | DNS cache | 60 s positive (4096+512 slack), 10 s negative (4096) | `DNS_CACHE_*`, `DNS_NEG_MAX` |
-| Client TCP dial ACK budget | 20 s (5 s header + 3 s DNS permit + 5 s DNS + 2 s dial permit + 4 s connect + margin) | `TCP_DIAL_ACK_TIMEOUT` |
+| Client TCP dial ACK budget | 25 s (5 s header + 3 s DNS permit + 5 s DNS + 2 s dial permit + 4 s connect + scheduling margin) | `TCP_DIAL_ACK_TIMEOUT` |
 
 Kernel-side tuning: raise `net.core.wmem_max` / `net.core.rmem_max` so the 4 MB
 (QUIC socket) and 256 KB (per-session) socket buffers are not silently clamped; the
