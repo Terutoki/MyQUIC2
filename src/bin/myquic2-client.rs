@@ -159,6 +159,11 @@ impl ConnPool {
 struct SharedEgress {
     cached: std::sync::RwLock<Option<(quinn::Connection, usize, u64)>>,
     warned: std::sync::atomic::AtomicBool,
+    /// Single-flight refresh gate: only one association task pays the two
+    /// quinn locks (`close_reason` + `max_datagram_size`) per refresh window.
+    /// The rest fail fast (UDP drop semantics) instead of herding on the same
+    /// mutexes the moment the 1 s window expires on 4096 associations at once.
+    refreshing: std::sync::atomic::AtomicBool,
 }
 
 impl SharedEgress {
@@ -172,6 +177,21 @@ impl SharedEgress {
     }
 
     fn refresh_global(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize)> {
+        // Single-flight: a loser drops fast (UDP semantics) instead of paying
+        // the quinn locks while a winner is already refreshing.
+        if self
+            .refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return None;
+        }
+        struct RefreshGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for RefreshGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = RefreshGuard(&self.refreshing);
         for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
             let Ok(g) = slot.shared.try_read() else {
                 continue;
@@ -452,6 +472,31 @@ fn count_dispatch_drop(sess: u32) {
     }
 }
 
+fn tcp_abort_log_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    let now = mono_millis();
+    let prev = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000 {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if LAST
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let n = SUPPRESSED.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            tracing::warn!("tcp aborts suppressed in the last window: {n}");
+        }
+        true
+    } else {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
 fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
     tokio::spawn(async move {
         let mut gen = slot.gen_rx.clone();
@@ -462,8 +507,10 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             };
             let reader = conn.read_datagram();
             tokio::pin!(reader);
-            let mut last_sess = 0u32;
-            let mut last_tx: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
+            const DISPATCH_CACHE: usize = 8;
+            let mut cache: [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE] =
+                std::array::from_fn(|_| (u32::MAX, None));
+            let mut rr: usize = 0;
             loop {
                 tokio::select! {
                     d = &mut reader => {
@@ -473,41 +520,71 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         let Some(sess) = dgram_sess(&d) else {
                             continue;
                         };
-                        if sess != last_sess || last_tx.is_none() {
-                            last_sess = sess;
-                            last_tx = hub.sender(sess);
+                        let mut cur: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
+                        for (s, tx) in cache.iter() {
+                            if *s == sess {
+                                cur = tx.clone();
+                                break;
+                            }
                         }
-                        match last_tx.as_ref() {
+                        if cur.is_none() {
+                            // Distinguish "never cached" from "cached as absent":
+                            // only a live sender avoids the shard lock; an
+                            // absent entry is re-probed via the hub below.
+                            let tx = hub.sender(sess);
+                            let mut placed = false;
+                            for e in cache.iter_mut() {
+                                if e.0 == sess || e.1.is_none() {
+                                    *e = (sess, tx.clone());
+                                    placed = true;
+                                    break;
+                                }
+                            }
+                            if !placed {
+                                let i = rr % DISPATCH_CACHE;
+                                rr = rr.wrapping_add(1);
+                                cache[i] = (sess, tx.clone());
+                            }
+                            cur = tx;
+                        }
+                        match cur.as_ref() {
                             Some(tx) => {
                                 match tx.try_send(d) {
                                     Ok(()) => {}
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(
                                         payload,
                                     )) => {
-                                        // Cached sender is stale (association removed;
-                                        // sess id may since have been reused): refresh
-                                        // once and retry the recovered payload so a
-                                        // reused sess recovers immediately.
-                                        last_tx = hub.sender(sess);
-                                        match last_tx.as_ref() {
+                                        let fresh = hub.sender(sess);
+                                        for e in cache.iter_mut() {
+                                            if e.0 == sess {
+                                                e.1 = fresh.clone();
+                                                break;
+                                            }
+                                        }
+                                        match fresh.as_ref() {
                                             Some(fresh) => {
                                                 if fresh.try_send(payload).is_err() {
                                                     count_dispatch_drop(sess);
                                                 }
                                             }
                                             None => {
-                                                last_sess = 0;
                                                 count_dispatch_drop(sess);
                                             }
                                         }
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        // Queue full on a live association: UDP drop.
                                         count_dispatch_drop(sess);
                                     }
                                 }
                             }
-                            None => last_sess = 0,
+                            None => {
+                                for e in cache.iter_mut() {
+                                    if e.0 == sess {
+                                        e.1 = None;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     _ = gen.changed() => break,
@@ -971,14 +1048,18 @@ async fn handle_socks(
         Err(e) => {
             // Abnormal ends already RST the TCP flow inside the pump; log the
             // path snapshot so loss-driven kills are diagnosable in one line.
-            let st = conn.stats();
-            tracing::warn!(
-                "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
-                st.path.rtt,
-                st.path.cwnd,
-                st.path.lost_packets,
-                st.path.sent_packets,
-            );
+            // Sampled: `stats()` takes the quinn lock, so an abort storm must
+            // not pay it per flow.
+            if tcp_abort_log_due() {
+                let st = conn.stats();
+                tracing::warn!(
+                    "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
+                    st.path.rtt,
+                    st.path.cwnd,
+                    st.path.lost_packets,
+                    st.path.sent_packets,
+                );
+            }
         }
     }
     Ok(())
@@ -1257,6 +1338,11 @@ async fn udp_associate_inner(
     // per second, but it must not pay a clock read *and* an atomic reload on
     // every datagram to decide that.
     let mut activity_stamp = mono_millis();
+    // Local copy of the last published app address: the value almost never
+    // changes (one UDP socket per association), so only `try_write` on change
+    // instead of CAS-ing the shared lock per packet where a loaded reply task
+    // would starve the write.
+    let mut published_app: Option<SocketAddr> = None;
     loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
@@ -1290,8 +1376,11 @@ async fn udp_associate_inner(
                     activity_stamp = now;
                     last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let Ok(mut w) = last_app_w.try_write() {
-                    *w = Some(app);
+                if published_app != Some(app) {
+                    if let Ok(mut w) = last_app_w.try_write() {
+                        *w = Some(app);
+                        published_app = Some(app);
+                    }
                 }
                 if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
                     continue;

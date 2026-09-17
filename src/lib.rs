@@ -2647,25 +2647,34 @@ struct UdpRetry {
     payload: Bytes,
 }
 
-fn udp_retry_queue() -> &'static tokio::sync::mpsc::Sender<UdpRetry> {
-    static TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<UdpRetry>> =
+const UDP_RETRY_SHARDS: usize = 4;
+
+fn udp_retry_queues() -> &'static [tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETRY_SHARDS] {
+    static TX: std::sync::OnceLock<[tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETRY_SHARDS]> =
         std::sync::OnceLock::new();
     TX.get_or_init(|| {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(4096);
-        tokio::spawn(async move {
-            while let Some(req) = rx.recv().await {
-                let r = match req.payload.try_into_mut() {
-                    Ok(v) => req.sock.send_to(&v, req.dst).await,
-                    Err(b) => req.sock.send_to(&b, req.dst).await,
-                };
-                if let Err(e) = r {
-                    let n = udp_write::retry_failed();
-                    warn_udp_write("detached retry failed", n, || e.to_string());
+        std::array::from_fn(|_| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(1024);
+            tokio::spawn(async move {
+                while let Some(req) = rx.recv().await {
+                    let r = match req.payload.try_into_mut() {
+                        Ok(v) => req.sock.send_to(&v, req.dst).await,
+                        Err(b) => req.sock.send_to(&b, req.dst).await,
+                    };
+                    if let Err(e) = r {
+                        let n = udp_write::retry_failed();
+                        warn_udp_write("detached retry failed", n, || e.to_string());
+                    }
                 }
-            }
-        });
-        tx
+            });
+            tx
+        })
     })
+}
+
+fn udp_retry_queue_for(dst: &SocketAddr) -> &'static tokio::sync::mpsc::Sender<UdpRetry> {
+    let h = dst.port() as usize;
+    &udp_retry_queues()[h % UDP_RETRY_SHARDS]
 }
 
 /// Best-effort non-blocking UDP send for shared loops (one datagram reader per
@@ -2675,9 +2684,10 @@ fn udp_retry_queue() -> &'static tokio::sync::mpsc::Sender<UdpRetry> {
 /// attempting the syscall while a freshly registered socket has no cached
 /// writable readiness, which would silently drop the first packet of every new
 /// session. A genuinely full socket buffer is real backpressure too. In both
-/// cases the packet is queued to a single global retry worker so the caller
-/// never stalls and no task is spawned per packet; a full queue drops (UDP
-/// semantics).
+/// cases the packet is queued to a sharded global retry pool (one worker per
+/// shard, selected by destination port) so the caller never stalls, no task is
+/// spawned per packet, and one slow destination cannot head-of-line-block every
+/// other session behind a single queue; a full shard drops (UDP semantics).
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
     match sock.try_send_to(&payload, dst) {
         Ok(_) => udp_write::sent(),
@@ -2688,7 +2698,7 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                 dst,
                 payload,
             };
-            if udp_retry_queue().try_send(req).is_err() {
+            if udp_retry_queue_for(&dst).try_send(req).is_err() {
                 let n = udp_write::dropped_no_permit();
                 warn_udp_write("retry budget exhausted", n, || {
                     "send buffer full".to_string()
@@ -2918,6 +2928,40 @@ fn reserve_copy_chunk(buf: &mut BytesMut) {
     }
 }
 
+const COPY_BUF_POOL_DEPTH: usize = 4;
+
+thread_local! {
+    static COPY_BUF_POOL: std::cell::RefCell<Vec<BytesMut>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn copy_buf_acquire() -> BytesMut {
+    COPY_BUF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(mut b) = p.pop() {
+            b.clear();
+            reserve_copy_chunk(&mut b);
+            b
+        } else {
+            BytesMut::with_capacity(COPY_CHUNK)
+        }
+    })
+}
+
+fn copy_buf_release(mut buf: BytesMut) {
+    buf.clear();
+    COPY_BUF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < COPY_BUF_POOL_DEPTH && buf.capacity() >= COPY_CHUNK {
+            // Cap retained memory: a buffer that grew far past one chunk
+            // (read side overshoot) is dropped instead of pooling.
+            if buf.capacity() <= COPY_CHUNK * 2 {
+                p.push(buf);
+            }
+        }
+    });
+}
+
 /// Throttled liveness stamp shared by the two copy directions.
 ///
 /// `since_ms` is the caller's last observed elapsed time, kept in a local so the
@@ -3022,7 +3066,7 @@ async fn copy_tcp_quic_inner(
     // end, so the final disposition below owns it outright.
     let outcome: Result<(u64, u64)> = {
         let c2s = async move {
-            let mut buf = BytesMut::with_capacity(COPY_CHUNK);
+            let mut buf = copy_buf_acquire();
             let mut total = 0u64;
             let mut chunks = 0u64;
             let mut stamped = 0u64;
@@ -3033,8 +3077,11 @@ async fn copy_tcp_quic_inner(
                     Ok(n) => n,
                     Err(e) => {
                         send.reset(0x04u32.into()).ok();
+                        let total_copy = total;
+                        let buf_ret = std::mem::replace(&mut buf, BytesMut::new());
+                        copy_buf_release(buf_ret);
                         return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                            "tcp>quic tcp read failed after {total}B up: {e:#}"
+                            "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
                         ));
                     }
                 };
@@ -3053,18 +3100,22 @@ async fn copy_tcp_quic_inner(
                 };
                 if let Err(e) = res {
                     send.reset(0x04u32.into()).ok();
+                    let total_copy = total;
+                    let buf_ret = std::mem::replace(&mut buf, BytesMut::new());
+                    copy_buf_release(buf_ret);
                     return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                        "tcp>quic quic write failed after {total}B up: {e:#}"
+                        "tcp>quic quic write failed after {total_copy}B up: {e:#}"
                     ));
                 }
                 total += n as u64;
                 chunks += 1;
-                if chunks.is_multiple_of(8) {
+                if chunks & 7 == 0 {
                     let now = b1.elapsed().as_millis() as u64;
                     touch_stamp(&l1, &mut stamped, now, 100);
                 }
             }
             send.finish().ok();
+            copy_buf_release(buf);
             Ok::<u64, anyhow::Error>(total)
         };
         let s2c = async move {

@@ -25,7 +25,61 @@ type SessEntry = (
     Arc<std::sync::atomic::AtomicU64>,
     tokio::sync::OwnedSemaphorePermit,
 );
-type SessTable = Arc<std::sync::RwLock<HashMap<u32, SessEntry>>>;
+type SessTable = Arc<ShardedSessTable>;
+
+const SESS_SHARDS: usize = 8;
+
+struct ShardedSessTable {
+    shards: Vec<std::sync::RwLock<HashMap<u32, SessEntry>>>,
+}
+
+impl ShardedSessTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..SESS_SHARDS)
+                .map(|_| std::sync::RwLock::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard(&self, s: u32) -> &std::sync::RwLock<HashMap<u32, SessEntry>> {
+        &self.shards[(s as usize) % SESS_SHARDS]
+    }
+
+    fn drain_all(&self) -> Vec<SessEntry> {
+        let mut out = Vec::new();
+        for sh in &self.shards {
+            out.extend(lock_write(sh).drain().map(|(_, v)| v));
+        }
+        out
+    }
+
+    fn sweep_all(&self, now: u64) -> Vec<SessEntry> {
+        let mut out = Vec::new();
+        for sh in &self.shards {
+            let expired: Vec<u32> = {
+                let m = lock_read(sh);
+                m.iter()
+                    .filter(|(_, (_, _, t, _))| {
+                        now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed))
+                            >= SESS_IDLE_MS
+                    })
+                    .map(|(k, _)| *k)
+                    .collect()
+            };
+            if expired.is_empty() {
+                continue;
+            }
+            let mut m = lock_write(sh);
+            for k in expired {
+                if let Some(e) = m.remove(&k) {
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
+}
 
 /// Hard process-wide bounds: new QUIC connections are refused past this count
 /// and new UDP sessions borrow from a shared permit pool, so a single peer
@@ -130,6 +184,33 @@ fn warn_once_per_sec() -> bool {
     }
     LAST.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
+}
+
+/// Rate limit for per-flow abort lines: the `conn.stats()` snapshot takes the
+/// quinn connection-state mutex, so an abort storm must not pay it per flow.
+fn tcp_abort_log_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    let now = mono_millis();
+    let prev = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000 {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if LAST
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let n = SUPPRESSED.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            tracing::warn!("tcp aborts suppressed in the last window: {n}");
+        }
+        true
+    } else {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
 }
 
 #[tokio::main]
@@ -368,7 +449,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
-    let sess: SessTable = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let sess: SessTable = Arc::new(ShardedSessTable::new());
     {
         let sess = sess.clone();
         let conn = conn.clone();
@@ -377,35 +458,12 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = mono_millis();
-                        // Collect under the lock, abort after it drops: `abort()`
-                        // touches the task vtable and may wake a worker, which must
-                        // not stall the per-connection datagram reader holding
-                        // `lock_read` on the same table (same rule as `sweep_local`).
-                        let evicted: Vec<SessEntry> = {
-                            let mut m = lock_write(&sess);
-                            let expired: Vec<u32> = m
-                                .iter()
-                                .filter(|(_, (_, _, t, _))| {
-                                    now.saturating_sub(t.load(std::sync::atomic::Ordering::Relaxed))
-                                        >= SESS_IDLE_MS
-                                })
-                                .map(|(k, _)| *k)
-                                .collect();
-                            let mut ev = Vec::with_capacity(expired.len());
-                            for k in expired {
-                                if let Some(e) = m.remove(&k) {
-                                    ev.push(e);
-                                }
-                            }
-                            ev
-                        };
+                        // Shard-by-shard sweep, abort after all locks drop.
+                        let evicted = sess.sweep_all(now);
                         abort_evicted(evicted);
                     }
                     _ = conn.closed() => {
-                        let drained: Vec<SessEntry> = {
-                            let mut m = lock_write(&sess);
-                            m.drain().map(|(_, v)| v).collect()
-                        };
+                        let drained = sess.drain_all();
                         abort_evicted(drained);
                         break;
                     }
@@ -438,6 +496,13 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // Large app datagrams arrive as MQP-2 fragments; reassemble before they
         // reach a target socket, so the target sees the datagram the app sent.
         let mut reasm = DgramReassembler::new();
+        // Per-connection fast path: the thread-local memo is shared by every
+        // connection on this worker, so a burst to one session still pays two
+        // RefCell scans per packet. This slot lives in the reader task itself.
+        let mut fast_sess: u32 = u32::MAX;
+        let mut fast_sock: Option<Arc<tokio::net::UdpSocket>> = None;
+        let mut fast_last: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+        let mut fast_abort: Option<tokio::task::AbortHandle> = None;
         loop {
             let d: Bytes = match reader.as_mut().await {
                 Ok(d) => d,
@@ -455,15 +520,85 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     continue;
                 };
                 udp_stats::payload(whole.len());
+                if let TargetAddrRef::Ip(dst) = a.as_ref() {
+                    let mut fast_hit = false;
+                    if s == fast_sess {
+                        if let (Some(sock), Some(last), Some(ab)) =
+                            (fast_sock.as_ref(), fast_last.as_ref(), fast_abort.as_ref())
+                        {
+                            if !ab.is_finished() && (allow_private || is_global_ip_cached(dst.ip()))
+                            {
+                                touch_session_throttled(conn_id, s, last);
+                                udp_try_send(sock, map_for_dual(dst), whole.clone());
+                                fast_hit = true;
+                            }
+                        }
+                    }
+                    if fast_hit {
+                        continue;
+                    }
+                }
                 forward_server_dgram(&ss, &cd, conn_id, s, a.as_ref(), whole, allow_private).await;
+                if let TargetAddrRef::Ip(_) = a.as_ref() {
+                    match sess_memo_lookup(conn_id, s) {
+                        SessHit::Fresh(sock, last, ab) => {
+                            fast_sess = s;
+                            fast_sock = Some(sock);
+                            fast_last = Some(last);
+                            fast_abort = Some(ab);
+                        }
+                        SessHit::Stale | SessHit::Miss => {
+                            fast_sess = u32::MAX;
+                            fast_sock = None;
+                            fast_last = None;
+                            fast_abort = None;
+                        }
+                    }
+                }
             } else {
                 let Ok((s, a, p)) = decode_datagram_ref(&d) else {
                     continue;
                 };
+                if let TargetAddrRef::Ip(dst) = a {
+                    let mut fast_hit = false;
+                    if s == fast_sess {
+                        if let (Some(sock), Some(last), Some(ab)) =
+                            (fast_sock.as_ref(), fast_last.as_ref(), fast_abort.as_ref())
+                        {
+                            if !ab.is_finished() && (allow_private || is_global_ip_cached(dst.ip()))
+                            {
+                                let off = owned.len() - p.len();
+                                udp_stats::payload(p.len());
+                                touch_session_throttled(conn_id, s, last);
+                                udp_try_send(sock, map_for_dual(dst), owned.slice(off..));
+                                fast_hit = true;
+                            }
+                        }
+                    }
+                    if fast_hit {
+                        continue;
+                    }
+                }
                 let off = owned.len() - p.len();
                 let payload = owned.slice(off..);
                 udp_stats::payload(payload.len());
                 forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
+                if matches!(a, TargetAddrRef::Ip(_)) {
+                    match sess_memo_lookup(conn_id, s) {
+                        SessHit::Fresh(sock, last, ab) => {
+                            fast_sess = s;
+                            fast_sock = Some(sock);
+                            fast_last = Some(last);
+                            fast_abort = Some(ab);
+                        }
+                        SessHit::Stale | SessHit::Miss => {
+                            fast_sess = u32::MAX;
+                            fast_sock = None;
+                            fast_last = None;
+                            fast_abort = None;
+                        }
+                    }
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -608,14 +743,16 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
                 }
                 Err(e) => {
-                    let st = stat_conn.stats();
-                    tracing::warn!(
-                        "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
-                        st.path.rtt,
-                        st.path.cwnd,
-                        st.path.lost_packets,
-                        st.path.sent_packets,
-                    );
+                    if tcp_abort_log_due() {
+                        let st = stat_conn.stats();
+                        tracing::warn!(
+                            "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
+                            st.path.rtt,
+                            st.path.cwnd,
+                            st.path.lost_packets,
+                            st.path.sent_packets,
+                        );
+                    }
                 }
             }
         });
@@ -754,6 +891,47 @@ async fn dial_happy_eyeballs(
 /// address form so the non-fragment fast path never materializes a
 /// `TargetAddr` (a domain packet would otherwise pay a `String` alloc per
 /// packet just to be borrowed again for the DNS lookup below).
+/// Fixed-destination flows pay `is_global_ip` per packet; the predicate is pure
+/// over the IP, so remember the last few verdicts thread-locally. Same security
+/// outcome, no per-packet branch walk on the hot path.
+fn is_global_ip_cached(ip: IpAddr) -> bool {
+    const SLOTS: usize = 8;
+    thread_local! {
+        static CACHE: std::cell::RefCell<[(Option<IpAddr>, bool); SLOTS]> =
+            const { std::cell::RefCell::new([(None, false); SLOTS]) };
+        static RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    CACHE
+        .with(|c| {
+            let c = c.borrow();
+            for (k, v) in c.iter() {
+                if *k == Some(ip) {
+                    return Some(*v);
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| {
+            let v = is_global_ip(ip);
+            CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                for e in c.iter_mut() {
+                    if e.0 == Some(ip) {
+                        e.1 = v;
+                        return;
+                    }
+                }
+                let i = RR.with(|r| {
+                    let i = r.get() % SLOTS;
+                    r.set(i.wrapping_add(1));
+                    i
+                });
+                c[i] = (Some(ip), v);
+            });
+            v
+        })
+}
+
 async fn forward_server_dgram(
     ss: &SessTable,
     cd: &quinn::Connection,
@@ -765,7 +943,7 @@ async fn forward_server_dgram(
 ) {
     match addr {
         TargetAddrRef::Ip(dst) => {
-            if !allow_private && !is_global_ip(dst.ip()) {
+            if !allow_private && !is_global_ip_cached(dst.ip()) {
                 return;
             }
             let sock = match get_or_create_sess(ss, cd, conn_id, s).await {
@@ -777,7 +955,7 @@ async fn forward_server_dgram(
         TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
             CachedLookup::Negative => {}
             CachedLookup::Addr(dst) => {
-                if !allow_private && !is_global_ip(dst.ip()) {
+                if !allow_private && !is_global_ip_cached(dst.ip()) {
                     return;
                 }
                 let sock = match get_or_create_sess(ss, cd, conn_id, s).await {
@@ -975,10 +1153,13 @@ fn sess_memo_forget(conn: usize, sess: u32) {
 /// Outcome of a session-memo probe.
 enum SessHit {
     Miss,
-    /// A live session socket and its liveness stamp.
+    /// A live session socket, its liveness stamp and its reader abort handle
+    /// (the abort handle lets per-connection fast paths validate liveness
+    /// without re-probing the thread-local memo).
     Fresh(
         Arc<tokio::net::UdpSocket>,
         Arc<std::sync::atomic::AtomicU64>,
+        tokio::task::AbortHandle,
     ),
     /// The memo's reader has exited: the table (not the memo) must decide,
     /// so this falls through and lets the table path recreate the session.
@@ -999,7 +1180,7 @@ fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
         for e in m.iter().flatten() {
             if e.conn == conn && e.sess == sess {
                 if !e.abort.is_finished() {
-                    return SessHit::Fresh(e.sock.clone(), e.last.clone());
+                    return SessHit::Fresh(e.sock.clone(), e.last.clone(), e.abort.clone());
                 }
                 found_stale = true;
             }
@@ -1042,6 +1223,27 @@ thread_local! {
 /// hash lookup and hash-map read lock this replaced.
 fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     const TOUCH_INTERVAL_MS: u64 = 1000;
+    // Clock reads are ~20ns vdso each; at 500kpps per core that is 1% CPU for
+    // timestamps alone. Sample the clock at most once per 64 packets: high-rate
+    // flows still refresh far more often than the 1 s interval, and slow flows
+    // stay safely inside the 180 s reap budget (64 packets at 1pps = 64 s).
+    thread_local! {
+        static TOUCH_TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let tick = TOUCH_TICK.with(|t| {
+        let v = t.get().wrapping_add(1);
+        t.set(v);
+        v
+    });
+    if tick & 63 != 0 {
+        let known = TOUCH_MEMO.with(|c| {
+            let c = c.borrow();
+            c.iter().flatten().any(|e| e.conn == conn && e.sess == sess)
+        });
+        if known {
+            return;
+        }
+    }
     let now = mono_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
@@ -1085,6 +1287,7 @@ async fn sess_reader_task(
     let mut frag = DgramFragmenter::new();
     let mut limit = c2.max_datagram_size().unwrap_or(0);
     let mut last_touch = 0u64;
+    let mut last_limit_refresh = mono_millis();
     loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
@@ -1114,6 +1317,16 @@ async fn sess_reader_task(
             last_touch = now;
             last2.store(now, std::sync::atomic::Ordering::Relaxed);
         }
+        // Active sessions track PMTU growth without waiting for the 60 s idle
+        // tick: at most one quinn lock per session per 5 s, and only while the
+        // session is actually receiving replies.
+        if now.saturating_sub(last_limit_refresh) >= 5000 {
+            last_limit_refresh = now;
+            match c2.max_datagram_size() {
+                Some(m) => limit = m,
+                None => break,
+            }
+        }
         if n == buf.len() {
             warn!(
                 "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
@@ -1140,10 +1353,13 @@ async fn sess_reader_task(
         }
     }
     sess_memo_forget(conn_id, s);
-    let mut w = lock_write(&ss2);
-    if let Some((cur, _, _, _)) = w.get(&s) {
-        if Arc::ptr_eq(cur, &rs) {
-            w.remove(&s);
+    {
+        let sh = ss2.shard(s);
+        let mut w = lock_write(sh);
+        if let Some((cur, _, _, _)) = w.get(&s) {
+            if Arc::ptr_eq(cur, &rs) {
+                w.remove(&s);
+            }
         }
     }
 }
@@ -1166,7 +1382,7 @@ async fn get_or_create_sess(
     // atomic load — so a session whose reader has exited, aborted included,
     // still falls through and is recreated.
     match sess_memo_lookup(conn_id, s) {
-        SessHit::Fresh(sock, last) => {
+        SessHit::Fresh(sock, last, _) => {
             // Refresh liveness without the table lock; a session captured here is
             // scheduled by its reader and may be exiting, in which case one reply
             // is dropped and the next packet recreates it.
@@ -1175,12 +1391,13 @@ async fn get_or_create_sess(
         }
         SessHit::Stale | SessHit::Miss => {}
     }
-    // Fast path: single read lock + lock-free timestamp bump. No write lock
-    // per packet, so concurrent sessions never serialize on a global lock.
-    // A session whose reply reader has already exited is treated as absent so
-    // its next packet recreates it instead of black-holing replies.
+    // Fast path: single shard read lock + lock-free timestamp bump. No write
+    // lock per packet, and concurrent sessions on different shards never share
+    // a cache line. A session whose reply reader has already exited is treated
+    // as absent so its next packet recreates it instead of black-holing.
     {
-        let r = lock_read(ss);
+        let sh = ss.shard(s);
+        let r = lock_read(sh);
         if let Some((sock, h, t, _)) = r.get(&s) {
             if !h.is_finished() {
                 let sock = sock.clone();
@@ -1224,7 +1441,7 @@ async fn get_or_create_sess(
             {
                 return None;
             }
-            let evicted = sweep_local(&mut lock_write(ss));
+            let evicted = ss.sweep_all(mono_millis());
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -1252,7 +1469,8 @@ async fn get_or_create_sess(
     let mut stale_dead: Vec<SessEntry> = Vec::new();
     let mut swept: Vec<SessEntry> = Vec::new();
     let inserted = {
-        let mut w = lock_write(ss);
+        let sh = ss.shard(s);
+        let mut w = lock_write(sh);
         if let Some((sock2, h2, t, _)) = w.get(&s) {
             if !h2.is_finished() {
                 touch_session(t);
@@ -1266,7 +1484,9 @@ async fn get_or_create_sess(
                 stale_dead.push(e);
             }
         }
-        if w.len() >= LOCAL_SESS_MAX {
+        // Per-connection cap is enforced on the owning shard; shards share the
+        // cap evenly so no single shard lock ever scans the whole table.
+        if w.len() >= LOCAL_SESS_MAX / SESS_SHARDS {
             swept = sweep_local(&mut w);
         }
         let dead = h_pre.is_finished();
@@ -1402,7 +1622,7 @@ mod tests {
         sess_memo_put(1, 7, a.clone(), last.clone(), live_reader());
         assert!(matches!(sess_memo_lookup(2, 7), SessHit::Miss));
         match sess_memo_lookup(1, 7) {
-            SessHit::Fresh(s, _) => assert!(Arc::ptr_eq(&s, &a)),
+            SessHit::Fresh(s, _, _) => assert!(Arc::ptr_eq(&s, &a)),
             _ => panic!("the owning connection must still hit"),
         }
         assert!(matches!(sess_memo_lookup(1, 8), SessHit::Miss));
@@ -1415,7 +1635,7 @@ mod tests {
         sess_memo_put(2, 7, b.clone(), last, live_reader());
         assert!(matches!(sess_memo_lookup(1, 7), SessHit::Miss));
         match sess_memo_lookup(2, 7) {
-            SessHit::Fresh(s, _) => assert!(Arc::ptr_eq(&s, &b)),
+            SessHit::Fresh(s, _, _) => assert!(Arc::ptr_eq(&s, &b)),
             _ => panic!("connection 2 must see its own socket"),
         }
     }

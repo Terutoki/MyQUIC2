@@ -22,10 +22,14 @@ from the TCP↔QUIC pump, makes the per-packet relay counters a compile-time cho
 The newest pass fixes the session-memo correctness while removing the remaining
 connection-state locks from the per-packet and per-flow paths — see
 [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks).
-The current pass batches the TCP download pump, shards the per-packet counters,
+The previous pass batches the TCP download pump, shards the per-packet counters,
 shares one UDP egress cache process-wide, widens the session/DNS memos, and adds
 stream priorities — see
 [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress).
+The current pass removes the contention the shared paths still had at high
+association counts (single-flight egress refresh, sharded retry pool and session
+table, a per-connection fast path, sampled clocks, pooled pump buffers) — see
+[pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump).
 An earlier pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
 quinn-proto's drop-oldest DATAGRAM path); the build is back on crates.io
@@ -34,7 +38,7 @@ coalescing and three security fixes — see
 [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
 Unit tests, clippy and fmt are re-verified on this revision on both feature sets;
 the full E2E suite was last run green on pass 14 and is not re-run for the
-pass-15 throughput changes (wire-compatible, see pass 15) — see
+pass-15/pass-16 throughput changes (wire-compatible, see passes 15 and 16) — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
@@ -57,7 +61,7 @@ pass-15 throughput changes (wire-compatible, see pass 15) — see
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks) and [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress) and [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -463,8 +467,9 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-15 revision (batched TCP pump, sharded counters, shared UDP
-egress, wider memos, stream priorities) with the default feature set, so the relay
+rebuilt from the pass-16 revision (pass-15 base plus single-flight egress refresh,
+8-slot dispatcher cache, sharded retry pool and session table, per-connection fast
+path, sampled clocks, pooled pump buffers) with the default feature set, so the relay
 counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB each. Three
 upgrade notes, all requiring **both** sides to be replaced together (plus one config
 note that needs no binary change):
@@ -1457,6 +1462,62 @@ musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was la
 run green on pass 14 and is not re-run here — wire and behavior are unchanged, but
 treat throughput deltas as unmeasured until the bench harness runs on a real link.
 
+### 2026-09 hardening pass 16 — single-flight egress, sharded tables, pooled pump
+
+Contention work on top of pass 15, same wire protocol (no ALPN bump, mixed pairs
+stay compatible). Pass 15 shared the egress cache, the retry queue and the memos;
+at high association counts the shared paths themselves became the bottleneck:
+
+- **Single-flight egress refresh.** The 1 s window expired on all 4096 associations
+  at once, so every association paid `close_reason()` + `max_datagram_size()` (two
+  quinn locks) per refresh window. Only one winner still pays them; the rest fail
+  fast under UDP drop semantics instead of herding on the same mutexes.
+- **Dispatcher 8-slot cache.** The per-connection dispatcher kept a single
+  `last_sess` slot, so two interleaved associations re-took the hub shard lock on
+  every packet. Eight slots with round-robin replacement match the server-side
+  memo widths; the stale-sender refresh-and-retry rule is unchanged.
+- **Sharded retry pool.** `WouldBlock` retries went through one 4096-deep global
+  worker, so one slow destination head-of-line-blocked every other session. Four
+  shards (by destination port, 1024 deep each, same total budget) with one worker
+  per shard; a full shard still drops per UDP semantics.
+- **Sharded server session table.** The per-connection table was one `RwLock`, so
+  concurrent sessions serialized on one reader count. Eight shards by sess id;
+  sweep and drain go shard by shard with short lock holds, and the per-shard cap
+  shares `LOCAL_SESS_MAX` evenly.
+- **Per-connection fast path.** The thread-local session memo is shared by every
+  connection on a worker, so a burst still paid two `RefCell` scans per packet.
+  The DATAGRAM reader keeps its own single slot (socket + stamp + abort handle,
+  the same liveness signal as the table path); IP hits skip memo and table
+  entirely, misses fall back and refill. The `is_global_ip` verdict for the
+  packet's own address is still checked on every hit, and `sess 0` can never
+  enter the slot.
+- **Sampled clocks.** `touch_session_throttled` read the clock on every packet
+  (~20 ns vdso each, ~1% CPU per core at 500 kpps). The clock is now sampled at
+  most once per 64 packets: hot flows still refresh far more often than the 1 s
+  interval, and slow flows stay inside the 180 s reap budget. Fixed-destination
+  `is_global_ip` verdicts are memoized thread-locally (8 slots, pure function,
+  same security outcome).
+- **Pooled pump buffers.** Each TCP flow allocated its 32 KiB copy buffer fresh;
+  at 10k short flows/s that is 320 MB/s of allocator traffic. A thread-local pool
+  (depth 4, oversized buffers dropped instead of retained) serves the small-write
+  path and flow startup; the bulk zero-copy path is unchanged.
+- **PMTU tracking on the reply path.** The server session reader refreshed its
+  DATAGRAM limit only on the 60 s tick, so a grown path MTU went unused for up to
+  a minute. Active sessions now refresh at most once per 5 s (one quinn lock);
+  idle sessions pay nothing. `TooLarge` still refreshes immediately.
+- **Small fixes.** `last_app` is only published on change (the value is constant
+  per association, so the per-packet `try_write` starved under a loaded reply
+  task); per-flow abort lines are sampled to one `conn.stats()` snapshot per
+  second with a suppressed count instead of one quinn lock per abort.
+
+Verified on this revision: `cargo test` 48/48 (47/47 without `stats`), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets.
+`dist/openwrt-x86_64/` rebuilt from this revision for all four CPU levels (static
+musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was last
+run green on pass 14 and is not re-run here — wire and behavior are unchanged, but
+treat throughput deltas as unmeasured until the bench harness runs on a real link
+(multi-association concurrency and abort storms, not just single-flow MB/s).
+
 ---
 
 ## Roadmap
@@ -1482,6 +1543,9 @@ treat throughput deltas as unmeasured until the bench harness runs on a real lin
 - [x] Batched TCP download pump (`read_chunks` + vectored write, pass 15)
 - [x] Sharded per-packet counters + shared UDP egress + wider session/DNS memos (pass 15)
 - [x] Stream priorities for interactive vs bulk TCP (pass 15; DATAGRAM isolation still via dual connections)
+- [x] Single-flight egress refresh + 8-slot dispatcher cache + sharded retry pool (pass 16)
+- [x] Sharded server session table + per-connection fast path + sampled clocks (pass 16)
+- [x] Pooled TCP pump buffers + reply-path PMTU tracking + sampled abort logs (pass 16)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
