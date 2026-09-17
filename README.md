@@ -19,6 +19,9 @@ a corrected reconnect path, and the latest pass removes the remaining per-byte c
 from the TCP↔QUIC pump, makes the per-packet relay counters a compile-time choice
 (`--no-default-features`), and makes the client's TCP-open path allocation-free — see
 [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs).
+The newest pass fixes the session-memo correctness while removing the remaining
+connection-state locks from the per-packet and per-flow paths — see
+[pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks).
 An earlier pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
 quinn-proto's drop-oldest DATAGRAM path); the build is back on crates.io
@@ -48,7 +51,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms) and [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs) and [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -349,6 +352,15 @@ run so a stale process can never masquerade as the build under test):
 | 26 | A/B vs the pass-12 binaries: 3 interleaved rounds of 256 MiB bulk + 2 000 CONNECTs + 100 000 datagrams, CPU read from the two live processes | ✅ no regression — and no *gain* either: 10.37 s vs 10.41 s CPU, all throughput figures inside run-to-run noise (see pass 13) |
 | 27 | Reconnect cycle: `kill -9` server while two idle TCP flows and one UDP association are open → restart → recover | ✅ detection 15.1 s (QUIC idle timeout, both connections), redial **0.19 s** after the restarted server bound (both conns), first successful TCP echo 17.2 s after the kill; the idle pre-kill flows fail with `BrokenPipeError` at connection death instead of hanging out the 300 s idle window, and the pre-kill UDP association self-heals on its next datagram (a fresh association also works) |
 
+Additional checks run on the pass-14 revision (macOS, loopback, `cargo build --release`,
+both feature sets, empty token):
+
+| # | Test | Result |
+|---|---|---|
+| 28 | Dual clients sharing sess id 1 on different server connections: 2 × 30000 UDP datagrams + 2 × 304 TCP `CONNECT`s concurrently | ✅ 60000/60000 echoed, 0 lost; 608/608 flows clean |
+| 29 | Reconnect cycle: `kill -9` server → restart → recover | ✅ detection 17.5 s (QUIC idle timeout), reconnect 1.8 s after the restarted server bound, UDP 2000/2000 self-heal |
+| 30 | `cargo test` 48/48 (47/47 without `stats`), clippy + `cargo fmt --check` clean on both feature sets | ✅ |
+
 0-RTT probe (expect the last four lines):
 
 ```sh
@@ -445,8 +457,8 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-13 revision (zero-copy TCP pump, compile-out counters, an
-allocation-free client open path) with the default feature set, so the relay counters
+rebuilt from the pass-14 revision (session-memo correctness, hot-path lock removal,
+lazy drop-warning formatting) with the default feature set, so the relay counters
 are **on** in these builds): static musl, x86-64, stripped, ~4.1–4.2 MB each. Three
 upgrade notes, all requiring **both** sides to be replaced together:
 
@@ -1342,6 +1354,56 @@ and a full `kill -9` → restart cycle (detection 15.1 s, redial 0.19 s after th
 restarted server bound, first TCP echo 17.2 s after the kill, idle pre-kill
 flows failed at connection death instead of hanging, and the pre-kill UDP
 association self-healed).
+
+### 2026-09 hardening pass 14 — session-memo correctness and hot-path locks
+
+Two correctness fixes and four per-packet/per-flow tax removals, all found by
+re-reading the relay paths (the loopback profile still shows the proxy's own
+code as noise next to quinn's connection-state mutex, as in passes 5–6 and 13).
+
+- **Cross-connection session-memo crosstalk.** The server's thread-local
+  `SESS_MEMO`/`TOUCH_MEMO` slots were keyed by `sess` alone, but session ids
+  are allocated per client (every hub counts from 1), so two connections
+  sharing a worker thread served each other's sockets and routed replies onto
+  the wrong QUIC connection. The key is now `(conn, sess)` with a
+  process-wide monotonic id — `Connection::stable_id` is a heap address the
+  allocator reuses after a reconnect, so it cannot serve as the key. Pinned by
+  `session_memo_never_crosses_connections` (verified to fail against the old
+  key).
+- **Stale memo after reader abort.** The `alive` flag was only cleared on a
+  natural reader exit; the sweeper and connection close abort readers without
+  running any cleanup, so the memo kept handing out a dead socket. The memo
+  now stores the reader's `AbortHandle` and treats a finished task as stale —
+  the same signal the table path uses. Pinned by
+  `session_memo_ignores_finished_readers` (verified to fail against the old
+  always-live check).
+- **The DATAGRAM-budget check left the hot path.** `get_or_create_sess` called
+  `max_datagram_size()` — quinn's connection-state mutex — before the
+  memo/table fast paths, on every inbound datagram. It now runs once per
+  session creation, after both hits.
+- **Routing no longer takes quinn's lock.** `ConnSlot::is_live` called
+  `close_reason()` (the same mutex, plus an error clone) twice per TCP flow;
+  the connection loop maintains an atomic liveness bit instead, and
+  `wait_conn` stays the authority that fails a flow fast. Pinned by
+  `slot_liveness_is_the_maintained_atomic`.
+- **One SOCKS negotiation deadline.** Greeting, request and address reads each
+  re-armed a 10 s timeout; `negotiate()` keeps the byte-identical framing
+  (pinned by `negotiate_reads_connect_and_associate`) under a single 10 s
+  deadline.
+- **Drop warnings format lazily.** `budget_detail` / `format!` / `to_string`
+  ran before the rate-limit gate, so logging was the per-drop cost under a
+  flood; the detail closure now runs only for the emitted line (pinned by
+  `warning_slot_is_claimed_once_per_interval`). The duplicate
+  `mono_ms` / `mono_millis` clocks merged, and the UDP reporter left the
+  accept loop.
+
+Verified on this revision: `cargo test` 48/48 (47/47 without `stats`),
+`cargo clippy --all-targets` and `cargo fmt --check` clean on both feature
+sets, and — through the real binaries — two clients sharing sess id 1 on
+different server connections exchanged 2×30000 UDP datagrams at 0 % loss with
+2×304 TCP flows clean, plus a `kill -9` → restart cycle (17.5 s detection,
+1.8 s recovery, UDP self-heal). `dist/openwrt-x86_64/` rebuilt from this
+revision for all four CPU levels.
 
 ---
 
