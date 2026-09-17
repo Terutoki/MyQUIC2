@@ -22,13 +22,19 @@ from the TCP↔QUIC pump, makes the per-packet relay counters a compile-time cho
 The newest pass fixes the session-memo correctness while removing the remaining
 connection-state locks from the per-packet and per-flow paths — see
 [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks).
+The current pass batches the TCP download pump, shards the per-packet counters,
+shares one UDP egress cache process-wide, widens the session/DNS memos, and adds
+stream priorities — see
+[pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress).
 An earlier pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
 quinn-proto's drop-oldest DATAGRAM path); the build is back on crates.io
 (quinn 0.11.12 / proto 0.11.18), which backports the DATAGRAM fix plus the assembler
 coalescing and three security fixes — see
 [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
-Every behaviour documented below was re-verified end-to-end on this revision — see
+Unit tests, clippy and fmt are re-verified on this revision on both feature sets;
+the full E2E suite was last run green on pass 14 and is not re-run for the
+pass-15 throughput changes (wire-compatible, see pass 15) — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
@@ -51,7 +57,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs) and [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks) and [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -74,7 +80,7 @@ Every behaviour documented below was re-verified end-to-end on this revision —
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window default |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
 | **High-RTT tuned** | 4 MB per-stream / 8 MB aggregate receive window, 4 MB send window by default (~240 Mb/s at 140 ms, ~half the loaded queue) — 8/16/8 MB opt-in for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.2 MB stripped each (rebuilt from this revision) |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1 MB stripped each (rebuilt from this revision) |
 
 ---
 
@@ -457,10 +463,11 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-14 revision (session-memo correctness, hot-path lock removal,
-lazy drop-warning formatting) with the default feature set, so the relay counters
-are **on** in these builds): static musl, x86-64, stripped, ~4.1–4.2 MB each. Three
-upgrade notes, all requiring **both** sides to be replaced together:
+rebuilt from the pass-15 revision (batched TCP pump, sharded counters, shared UDP
+egress, wider memos, stream priorities) with the default feature set, so the relay
+counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB each. Three
+upgrade notes, all requiring **both** sides to be replaced together (plus one config
+note that needs no binary change):
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -472,6 +479,10 @@ upgrade notes, all requiring **both** sides to be replaced together:
 - A binary built before pass 13 still copies every chunk through the TCP↔QUIC pump
   and allocates per SOCKS flow on the client. Wire-compatible, so a mixed pair works —
   it just leaves the pass-13 tax removals on the floor.
+- Config note (no binary change): the sample configs no longer pin 2/4/2 MB windows —
+  they omit tuning and use the 4/8/4 MB code defaults (~240 Mb/s @140 ms). A deployment
+  still on the old 2/4/2 samples stays at ~114 Mb/s single-stream until the tuning lines
+  are removed or raised; change both sides together.
 
 Verified by running the v1 pair under x86-64 emulation (Podman's amd64 runtime on
 Apple Silicon): both binaries execute, the QUIC handshake completes, and the full E2E
@@ -539,7 +550,8 @@ Field notes:
 - Transport tuning (`stream/receive/send_window_mb`, `ack_threshold`,
   `max_ack_delay_ms`) defaults to the low-latency preset (4/8/4 MB, ACK 2/5 ms,
   ~240 Mb/s @140 ms); set 8/16/8 MB + ACK 8/10 ms on **both sides** for 300 Mb/s
-  peak at ~2x loaded latency. Optimal total in flight ≈ link BDP — e.g. a
+  peak at ~2x loaded latency. The shipped samples omit tuning entirely and use these
+  defaults. Optimal total in flight ≈ link BDP — e.g. a
   200M/140ms link (BDP 3.5 MB) wants 2/4/2 MB, which halves single-thread speed
   (~114 Mb/s) while multi-thread still fills the link with minimal loaded latency.
 - `quic_conns = 2` (default) isolates bulk from interactive traffic; `1` restores
@@ -1405,6 +1417,46 @@ different server connections exchanged 2×30000 UDP datagrams at 0 % loss with
 1.8 s recovery, UDP self-heal). `dist/openwrt-x86_64/` rebuilt from this
 revision for all four CPU levels.
 
+### 2026-09 hardening pass 15 — batched pump, sharded counters, shared egress
+
+Throughput work on top of pass 14, same wire protocol (no ALPN bump, mixed pairs
+stay compatible):
+
+- **Batched TCP download.** The QUIC→TCP direction used `read_chunk(MAX)` +
+  `write_all`: one connection-lock acquisition and one syscall per ~1.4 KiB STREAM
+  frame. It now drains up to 8 segments per lock with `read_chunks` and pushes them
+  with a single vectored write; the liveness clock is sampled once per batch and the
+  upload direction stamps every 8th chunk.
+- **Sharded relay counters.** `DATAGRAMS`/`BYTES`/`SENT` accumulate thread-locally
+  and flush every 1024 (bytes every 1 MiB); `MAX_PAYLOAD` checks-then-sets so the
+  common case is a shared load, not an RMW. `snapshot()` flushes the caller's
+  thread — cross-thread error is bounded, low-rate reporters should note the delay.
+- **Shared UDP egress.** Each association refreshed its own `(connection, PMTU)`
+  once per second (two quinn locks × 4096 associations). One process-wide cache now
+  serves all associations; only the global refresher pays the locks, and
+  `TooLarge`/`ConnectionLost` invalidates it.
+- **Wider memos.** `SESS`/`TOUCH` go 1→8 slots and DNS 2→8 slots with round-robin
+  replacement, so interleaved sessions and domains no longer evict each other per
+  packet. DNS misses also skip spawning when the key is already inflight, and
+  `WouldBlock` retries go through a single 4096-deep global worker instead of one
+  task per packet.
+- **Stream priorities.** Interactive TCP flows set priority 10, bulk stays 0
+  (`SendStream::set_priority`, quinn 0.11). This orders STREAMs within a connection;
+  DATAGRAM-vs-STREAM scheduling still follows the congestion window, so the dual
+  connections remain the UDP isolation mechanism.
+- **Samples use defaults.** Both sample configs drop the 2/4/2 MB pin and omit tuning
+  (4/8/4 MB code defaults). No wire change.
+- **Small fixes.** Drop warnings are per-reason (large/full/other) instead of one
+  shared slot; a zero-budget session reader exits instead of dropping silently;
+  `last_app` uses non-blocking `try_read`/`try_write`.
+
+Verified on this revision: `cargo test` 48/48 (47/47 without `stats`), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets.
+`dist/openwrt-x86_64/` rebuilt from this revision for all four CPU levels (static
+musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was last
+run green on pass 14 and is not re-run here — wire and behavior are unchanged, but
+treat throughput deltas as unmeasured until the bench harness runs on a real link.
+
 ---
 
 ## Roadmap
@@ -1427,6 +1479,9 @@ revision for all four CPU levels.
 - [x] Client-side per-flow allocations on the SOCKS path (stack header/reply/greeting, pass 13)
 - [x] Per-packet allocation / lock / clock-read audit of the UDP and stream paths (pass 6)
 - [x] Reconnect `shared` TOCTOU + DNS overload-path write-lock stalls (pass 7)
+- [x] Batched TCP download pump (`read_chunks` + vectored write, pass 15)
+- [x] Sharded per-packet counters + shared UDP egress + wider session/DNS memos (pass 15)
+- [x] Stream priorities for interactive vs bulk TCP (pass 15; DATAGRAM isolation still via dual connections)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the

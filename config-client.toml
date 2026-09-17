@@ -11,17 +11,16 @@ reconnect_timeout_secs = 5
 # Set a private random shared secret here and on the server.
 # Empty on BOTH sides disables auth (firewall isolation only).
 auth_token = ""
-# Latency-first preset for a 200M/140ms link (W_total ~= BDP): 2/4/2 MB
-# windows + dual connections. Single-thread caps at ~114M; multi-thread
-# still fills 200M with loaded ping ~= 150-160ms.
-stream_receive_window_mb = 2
-receive_window_mb = 4
-send_window_mb = 2
-ack_threshold = 2
-max_ack_delay_ms = 5
-# Transport tuning (all optional; omit = 4/8/4 MB windows, ACK 2/5ms).
-# For 300 Mb/s peak use 8/16/8 MB at ~2x loaded latency; ack_threshold=8 +
-# max_ack_delay_ms=10 saves reverse-path CPU at coarser RTT feedback.
+# Default 4/8/4 MB matches code defaults (low-latency preset, ~240 Mb/s @140ms).
+# For 300 Mb/s peak use 8/16/8 MB at ~2x loaded latency with ack_threshold=8 +
+# max_ack_delay_ms=10 to save reverse-path CPU. The old 2/4/2 MB preset capped
+# single-stream at ~114 Mb/s, contradicting the BDP target, so it is removed.
+# Omit all five to use defaults.
+# stream_receive_window_mb = 4
+# receive_window_mb = 8
+# send_window_mb = 4
+# ack_threshold = 2
+# max_ack_delay_ms = 5
 # Connection isolation (optional; omit = dual connections).
 # quic_conns=2 spreads bulk TCP round-robin across two cwnds while
 # interactive_ports + all UDP pin to the first, so probes skip bulk queues.

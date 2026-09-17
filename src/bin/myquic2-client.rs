@@ -149,37 +149,60 @@ impl ConnPool {
     fn udp_fallback(&self) -> Option<ConnSlot> {
         self.b.clone()
     }
+
+    fn is_interactive(&self, t: &TargetAddr) -> bool {
+        self.interactive_ports.contains(&Self::target_port(t))
+    }
 }
 
-/// Re-read the cached egress connection + PMTU limit, preferring the
-/// interactive slot and failing over to the bulk slot while it is down.
-/// Non-blocking: a contended slot lock skips to the next candidate instead
-/// of stalling the relay loop, and the 1 s refresh cadence bounds the cost
-/// of quinn's connection-state mutex on the per-packet path.
-fn refresh_udp_egress(
-    pool: &ConnPool,
-    now_ms: u64,
-    warned_no_datagram: &mut bool,
-) -> Option<(quinn::Connection, usize, u64)> {
-    for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
-        let Ok(g) = slot.shared.try_read() else {
-            continue;
-        };
-        match g.as_ref() {
-            Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
-                Some(m) => return Some((c.clone(), m, now_ms)),
-                None => {
-                    if !*warned_no_datagram {
-                        *warned_no_datagram = true;
-                        warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
+#[derive(Debug, Default)]
+struct SharedEgress {
+    cached: std::sync::RwLock<Option<(quinn::Connection, usize, u64)>>,
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl SharedEgress {
+    fn get_fresh(&self, now_ms: u64) -> Option<(quinn::Connection, usize)> {
+        let g = self.cached.try_read().ok()?;
+        let (c, limit, t) = g.as_ref()?;
+        if now_ms.saturating_sub(*t) >= EGRESS_REFRESH_MS {
+            return None;
+        }
+        Some((c.clone(), *limit))
+    }
+
+    fn refresh_global(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize)> {
+        for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
+            let Ok(g) = slot.shared.try_read() else {
+                continue;
+            };
+            match g.as_ref() {
+                Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
+                    Some(m) => {
+                        let out = (c.clone(), m);
+                        if let Ok(mut w) = self.cached.try_write() {
+                            *w = Some((c.clone(), m, now_ms));
+                        }
+                        return Some(out);
                     }
-                    return None;
-                }
-            },
-            _ => continue,
+                    None => {
+                        if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
+                        }
+                        return None;
+                    }
+                },
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    fn invalidate(&self) {
+        if let Ok(mut w) = self.cached.try_write() {
+            *w = None;
         }
     }
-    None
 }
 
 /// Routes inbound QUIC DATAGRAMs to their UDP ASSOCIATE by sess_id.
@@ -328,6 +351,7 @@ async fn main() -> Result<()> {
         }
     );
     let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
+    let egress_shared: Arc<SharedEgress> = Arc::new(SharedEgress::default());
     spawn_dispatcher(pool.a.clone(), hub.clone());
     if let Some(b) = pool.b.clone() {
         spawn_dispatcher(b, hub.clone());
@@ -383,9 +407,10 @@ async fn main() -> Result<()> {
         };
         let pool = pool.clone();
         let hub = hub.clone();
+        let egress_shared = egress_shared.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle_socks(sock, pool, hub, timeout).await {
+            if let Err(e) = handle_socks(sock, pool, hub, egress_shared, timeout).await {
                 warn!("socks {peer} end: {e:#}");
             }
         });
@@ -850,6 +875,7 @@ async fn handle_socks(
     mut s: tokio::net::TcpStream,
     pool: ConnPool,
     hub: Arc<UdpHub>,
+    egress_shared: Arc<SharedEgress>,
     timeout: Duration,
 ) -> Result<()> {
     let request = match tokio::time::timeout(SOCKS_NEGOTIATE_TIMEOUT, negotiate(&mut s)).await {
@@ -858,7 +884,7 @@ async fn handle_socks(
     };
     let target = match request {
         SocksRequest::Connect(t) => t,
-        SocksRequest::Associate => return handle_udp_associate(s, pool, hub).await,
+        SocksRequest::Associate => return handle_udp_associate(s, pool, hub, egress_shared).await,
     };
     let bnd: SocketAddr = bnd_for(&s).unwrap_or_else(|_| {
         s.peer_addr()
@@ -882,7 +908,11 @@ async fn handle_socks(
     };
     let (mut send, recv) = match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await
     {
-        Ok(Ok(x)) => x,
+        Ok(Ok((s, r))) => {
+            let prio = if pool.is_interactive(&target) { 10 } else { 0 };
+            let _ = s.set_priority(prio);
+            (s, r)
+        }
         _ => {
             if conn.close_reason().is_some() {
                 // Single write lock with re-check (no read-then-write split):
@@ -1059,6 +1089,7 @@ async fn handle_udp_associate(
     mut tcp: tokio::net::TcpStream,
     pool: ConnPool,
     hub: Arc<UdpHub>,
+    egress_shared: Arc<SharedEgress>,
 ) -> Result<()> {
     let (sess, _tx, rx) = match hub.alloc_sess() {
         Some(x) => x,
@@ -1072,7 +1103,7 @@ async fn handle_udp_associate(
     udp_stats::session();
     // Wrapper guarantees the subscription is torn down on every exit path,
     // including early setup errors that used to leak the hub entry forever.
-    let res = udp_associate_inner(tcp, pool, sess, rx).await;
+    let res = udp_associate_inner(tcp, pool, egress_shared, sess, rx).await;
     hub.remove(sess);
     res
 }
@@ -1080,6 +1111,7 @@ async fn handle_udp_associate(
 async fn udp_associate_inner(
     mut tcp: tokio::net::TcpStream,
     pool: ConnPool,
+    egress_shared: Arc<SharedEgress>,
     sess: u32,
     mut rx: tokio::sync::mpsc::Receiver<Bytes>,
 ) -> Result<()> {
@@ -1172,6 +1204,9 @@ async fn udp_associate_inner(
                                 send_reply(&r2, &last_app, dst, &payload, &mut pkt)
                             }
                             CachedLookup::Unknown => {
+                                if dns_is_inflight(h, p) {
+                                    continue;
+                                }
                                 if dns_slow_path_limiter().available_permits() == 0 {
                                     continue;
                                 }
@@ -1214,14 +1249,6 @@ async fn udp_associate_inner(
     // One id counter per association: `(sess, id)` is the receiver's key.
     let mut frag = DgramFragmenter::new();
     let idle_limit_ms = 180_000u64;
-    // Cached egress connection + PMTU limit. Refreshed at most once per
-    // EGRESS_REFRESH (or after a failed send), so the per-packet path never
-    // touches quinn's connection-state mutex for close_reason()/
-    // max_datagram_size(). Sticky to the current connection while it lives
-    // (see the refresh site); the pool is only re-resolved to pick a new
-    // slot after the cached handle dies.
-    let mut egress: Option<(quinn::Connection, usize, u64)> = None;
-    let mut warned_no_datagram = false;
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
     // not reset the idle timer and keep an otherwise dead association alive.
     let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
@@ -1263,7 +1290,8 @@ async fn udp_associate_inner(
                     activity_stamp = now;
                     last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let Ok(mut w) = last_app_w.write() {                    *w = Some(app);
+                if let Ok(mut w) = last_app_w.try_write() {
+                    *w = Some(app);
                 }
                 if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
                     continue;
@@ -1276,44 +1304,16 @@ async fn udp_associate_inner(
                 let payload_off = 3 + hdr_len;
                 if payload_off > n { continue; }
                 let payload = &buf[payload_off..n];
-                // Fast path: never stall the relay loop behind a reconnect
-                // wait; drop this packet if no live egress exists. Both
-                // `close_reason()` and `max_datagram_size()` lock the same
-                // connection state as the protocol driver, so they are
-                // refreshed at most once per second (or on send failure).
-                // `now` doubles as the egress freshness clock, so this path
-                // costs a single clock read per packet.
-                let stale = egress
-                    .as_ref()
-                    .map(|(_, _, t)| now.saturating_sub(*t) >= EGRESS_REFRESH_MS)
-                    .unwrap_or(true);
-                if stale {
-                    // Sticky egress: while the cached connection is still
-                    // alive, only refresh its PMTU limit in place (same
-                    // conn-mutex cost as a pool re-resolve, minus the slot
-                    // locks). Re-resolving the pool on every tick flaps UDP
-                    // between slots whenever A recovers: each flip abandons
-                    // a warm server-side session (zombie until its 180s
-                    // sweep) and creates a new one. Associations opened
-                    // during an outage therefore stay on B until B itself
-                    // fails; traffic migrates back to A naturally as
-                    // associations churn.
-                    let mut kept = false;
-                    if let Some((c, limit, t)) = egress.as_mut() {
-                        if c.close_reason().is_none() {
-                            if let Some(m) = c.max_datagram_size() {
-                                *limit = m;
-                                *t = now;
-                                kept = true;
-                            }
-                        }
-                    }
-                    if !kept {
-                        egress = refresh_udp_egress(&pool, now, &mut warned_no_datagram);
-                    }
-                }
-                let Some((conn, limit, _)) = egress.as_ref() else {
-                    continue;
+                // Shared egress: per-packet path is a try_read + timestamp
+                // check, no quinn lock. Only the global refresher (once per
+                // second) pays close_reason/max_datagram_size. A dead handle
+                // surfaces as ConnectionLost and invalidates the cache.
+                let (conn, limit) = match egress_shared.get_fresh(now) {
+                    Some(v) => v,
+                    None => match egress_shared.refresh_global(&pool, now) {
+                        Some(v) => v,
+                        None => continue,
+                    },
                 };
                 // `limit` is the connection's live `max_datagram_size()`: the
                 // real DATAGRAM budget for the discovered path MTU, with the
@@ -1322,7 +1322,7 @@ async fn udp_associate_inner(
                 // old `min(1350)` made every UDP payload above 1338 B vanish on
                 // a 1472 B path (see `dgram_payload_cap`). Payloads past a single
                 // frame are split by the fragmenter rather than dropped.
-                let sent = frag.send(conn, sess, &addr, payload, *limit);
+                let sent = frag.send(&conn, sess, &addr, payload, limit);
                 if sent.fragmented() {
                     tracing::debug!(
                         "udp assoc {sess}: {} B sent as {} fragments",
@@ -1333,24 +1333,14 @@ async fn udp_associate_inner(
                 match sent.outcome() {
                     DatagramSend::Sent => {}
                     DatagramSend::Blocked => {
-                        // Full send buffer: dropped, per UDP semantics. The
-                        // shared egress handle stays valid.
                         tracing::debug!("client datagram dropped: send buffer full");
                     }
-                    DatagramSend::TooLarge => {
-                        // Force a refresh on the next packet: TooLarge means the
-                        // PMTU estimate shrank under our cached limit.
-                        tracing::debug!("client datagram too large for the current PMTU");
-                        egress = None;
+                    DatagramSend::TooLarge | DatagramSend::ConnectionLost => {
+                        tracing::debug!("client egress stale, invalidating shared cache");
+                        egress_shared.invalidate();
                     }
                     DatagramSend::Unsupported => {
                         tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
-                    }
-                    DatagramSend::ConnectionLost => {
-                        // ConnectionLost means the handle is dead until the
-                        // reconnect loop installs a new one.
-                        tracing::debug!("client datagram send failed: connection lost");
-                        egress = None;
                     }
                 }
             }
@@ -1410,9 +1400,7 @@ fn send_reply(
     payload: &Bytes,
     pkt: &mut bytes::BytesMut,
 ) {
-    let Some(app) = last_app.read().ok().and_then(|g| *g) else {
-        // A reply before the app's address is known has nowhere to go. Counted:
-        // this used to return silently.
+    let Some(app) = last_app.try_read().ok().and_then(|g| *g) else {
         udp_write::no_app();
         return;
     };

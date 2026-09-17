@@ -787,6 +787,9 @@ async fn forward_server_dgram(
                 udp_try_send(&sock, map_for_dual(dst), payload);
             }
             CachedLookup::Unknown => {
+                if dns_is_inflight(h, p) {
+                    return;
+                }
                 if dns_slow_path_limiter().available_permits() == 0 {
                     return;
                 }
@@ -911,12 +914,14 @@ struct SessMemo {
     abort: tokio::task::AbortHandle,
 }
 
+const SESS_MEMO_SLOTS: usize = 8;
+
 thread_local! {
-    static SESS_MEMO: std::cell::RefCell<Option<SessMemo>> =
-        const { std::cell::RefCell::new(None) };
+    static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =
+        const { std::cell::RefCell::new([None, None, None, None, None, None, None, None]) };
+    static SESS_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Remember `sock` as the memoized session, unless a newer session already is.
 fn sess_memo_put(
     conn: usize,
     sess: u32,
@@ -925,13 +930,31 @@ fn sess_memo_put(
     abort: tokio::task::AbortHandle,
 ) {
     SESS_MEMO.with(|c| {
-        *c.borrow_mut() = Some(SessMemo {
+        let mut m = c.borrow_mut();
+        for e in m.iter_mut().flatten() {
+            if e.conn == conn && e.sess == sess {
+                *e = SessMemo {
+                    conn,
+                    sess,
+                    sock,
+                    last,
+                    abort,
+                };
+                return;
+            }
+        }
+        let idx = SESS_RR.with(|r| {
+            let i = r.get() % SESS_MEMO_SLOTS;
+            r.set(i.wrapping_add(1));
+            i
+        });
+        m[idx] = Some(SessMemo {
             conn,
             sess,
             sock,
             last,
             abort,
-        })
+        });
     });
 }
 
@@ -941,8 +964,10 @@ fn sess_memo_put(
 fn sess_memo_forget(conn: usize, sess: u32) {
     SESS_MEMO.with(|c| {
         let mut m = c.borrow_mut();
-        if m.as_ref().is_some_and(|e| e.conn == conn && e.sess == sess) {
-            *m = None;
+        for e in m.iter_mut() {
+            if e.as_ref().is_some_and(|x| x.conn == conn && x.sess == sess) {
+                *e = None;
+            }
         }
     });
 }
@@ -970,10 +995,19 @@ enum SessHit {
 fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
     SESS_MEMO.with(|c| {
         let m = c.borrow();
-        match m.as_ref().filter(|e| e.conn == conn && e.sess == sess) {
-            Some(e) if !e.abort.is_finished() => SessHit::Fresh(e.sock.clone(), e.last.clone()),
-            Some(_) => SessHit::Stale,
-            None => SessHit::Miss,
+        let mut found_stale = false;
+        for e in m.iter().flatten() {
+            if e.conn == conn && e.sess == sess {
+                if !e.abort.is_finished() {
+                    return SessHit::Fresh(e.sock.clone(), e.last.clone());
+                }
+                found_stale = true;
+            }
+        }
+        if found_stale {
+            SessHit::Stale
+        } else {
+            SessHit::Miss
         }
     })
 }
@@ -988,9 +1022,12 @@ struct TouchMemo {
     ms: u64,
 }
 
+const TOUCH_SLOTS: usize = 8;
+
 thread_local! {
-    static TOUCH_MEMO: std::cell::RefCell<Option<TouchMemo>> =
-        const { std::cell::RefCell::new(None) };
+    static TOUCH_MEMO: std::cell::RefCell<[Option<TouchMemo>; TOUCH_SLOTS]> =
+        const { std::cell::RefCell::new([None, None, None, None, None, None, None, None]) };
+    static TOUCH_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Refresh `last` at most once per [`TOUCH_INTERVAL_MS`], using a thread-local
@@ -1008,28 +1045,26 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
     let now = mono_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
-        match c.as_ref() {
-            Some(m) if m.conn == conn && m.sess == sess => {
-                if now.saturating_sub(m.ms) >= TOUCH_INTERVAL_MS {
-                    *c = Some(TouchMemo {
-                        conn,
-                        sess,
-                        ms: now,
-                    });
-                    true
-                } else {
-                    false
+        for e in c.iter_mut().flatten() {
+            if e.conn == conn && e.sess == sess {
+                if now.saturating_sub(e.ms) >= TOUCH_INTERVAL_MS {
+                    e.ms = now;
+                    return true;
                 }
-            }
-            _ => {
-                *c = Some(TouchMemo {
-                    conn,
-                    sess,
-                    ms: now,
-                });
-                true
+                return false;
             }
         }
+        let idx = TOUCH_RR.with(|r| {
+            let i = r.get() % TOUCH_SLOTS;
+            r.set(i.wrapping_add(1));
+            i
+        });
+        c[idx] = Some(TouchMemo {
+            conn,
+            sess,
+            ms: now,
+        });
+        true
     });
     if due {
         last.store(now, std::sync::atomic::Ordering::Relaxed);
@@ -1087,7 +1122,7 @@ async fn sess_reader_task(
             continue;
         }
         if limit == 0 {
-            continue;
+            break;
         }
         let src = SocketAddr::new(unmap(src.ip()), src.port());
         let ta = TargetAddr::Ip(src);

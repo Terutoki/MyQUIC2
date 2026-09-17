@@ -1284,6 +1284,19 @@ pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore
     LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1024)))
 }
 
+pub fn dns_is_inflight(host: &str, port: u16) -> bool {
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = dns_key_owned(host, port);
+            &owned
+        }
+    };
+    lock_mutex(dns_inflight()).contains_key(key)
+}
+
 pub fn mono_millis() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     BASE.get_or_init(std::time::Instant::now)
@@ -1303,16 +1316,14 @@ struct DnsMemo {
     expires: Instant,
 }
 
-/// Positive and negative memos are kept in separate slots on purpose: an
-/// interleaved stream of good and bad names on the same worker thread would
-/// otherwise evict the other class on every single packet, and a negative hit
-/// that falls through costs a global `RwLock` read per packet — precisely the
-/// flood the negative cache exists to absorb.
-const MEMO_SLOTS: usize = 2;
+const MEMO_SLOTS: usize = 8;
 
 thread_local! {
     static DNS_MEMO: std::cell::RefCell<[Option<DnsMemo>; MEMO_SLOTS]> =
-        const { std::cell::RefCell::new([None, None]) };
+        const {
+            std::cell::RefCell::new([None, None, None, None, None, None, None, None])
+        };
+    static DNS_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A matching memo slot, copied out so the borrow of the thread-local ends with
@@ -1330,26 +1341,39 @@ struct MemoHit {
 /// hit is cheaper than the global cache lookup, and a miss must not cost more
 /// than one.
 fn memo_peek(key: &str, neg: bool) -> Option<MemoHit> {
-    let slot = usize::from(neg);
     DNS_MEMO.with(|c| {
         let c = c.borrow();
-        match c[slot].as_ref() {
-            Some(m) if &m.key[..m.len] == key.as_bytes() => Some(MemoHit {
-                addr: m.addr,
-                expires: m.expires,
-            }),
-            _ => None,
+        for m in c.iter().flatten() {
+            if (m.addr.is_none() == neg) && &m.key[..m.len] == key.as_bytes() {
+                return Some(MemoHit {
+                    addr: m.addr,
+                    expires: m.expires,
+                });
+            }
         }
+        None
     })
 }
 
 fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
     let kb = key.as_bytes();
     if kb.len() > DNS_KEY_BUF {
-        return; // only reachable through the owned fallback for >255-byte names
+        return;
     }
     DNS_MEMO.with(|c| {
-        let slot = usize::from(addr.is_none());
+        let mut c = c.borrow_mut();
+        for e in c.iter_mut().flatten() {
+            if &e.key[..e.len] == kb {
+                e.addr = addr;
+                e.expires = expires;
+                return;
+            }
+        }
+        let idx = DNS_RR.with(|r| {
+            let i = r.get() % MEMO_SLOTS;
+            r.set(i.wrapping_add(1));
+            i
+        });
         let mut m = DnsMemo {
             key: [0u8; DNS_KEY_BUF],
             len: kb.len(),
@@ -1357,7 +1381,7 @@ fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
             expires,
         };
         m.key[..kb.len()].copy_from_slice(kb);
-        c.borrow_mut()[slot] = Some(m);
+        c[idx] = Some(m);
     });
 }
 
@@ -1903,12 +1927,52 @@ pub mod udp_stats {
     static REASSEMBLY_EXPIRED: AtomicU64 = AtomicU64::new(0);
     static REASSEMBLY_EVICTED: AtomicU64 = AtomicU64::new(0);
 
+    thread_local! {
+        static L_DATAGRAMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(feature = "stats")]
+    fn flush_locals() {
+        L_DATAGRAMS.with(|c| {
+            let v = c.get();
+            if v != 0 {
+                DATAGRAMS.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
+        L_BYTES.with(|c| {
+            let v = c.get();
+            if v != 0 {
+                BYTES.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
+    }
+
     /// One relayed UDP payload of `len` bytes.
     pub fn payload(len: usize) {
         stats_only! {
-            DATAGRAMS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(len as u64, Ordering::Relaxed);
-            MAX_PAYLOAD.fetch_max(len as u64, Ordering::Relaxed);
+            L_DATAGRAMS.with(|c| {
+                let v = c.get().wrapping_add(1);
+                c.set(v);
+                if v >= 1024 {
+                    DATAGRAMS.fetch_add(v, Ordering::Relaxed);
+                    c.set(0);
+                }
+            });
+            L_BYTES.with(|c| {
+                let v = c.get().wrapping_add(len as u64);
+                c.set(v);
+                if v >= 1_048_576 {
+                    BYTES.fetch_add(v, Ordering::Relaxed);
+                    c.set(0);
+                }
+            });
+            let l = len as u64;
+            if l > MAX_PAYLOAD.load(Ordering::Relaxed) {
+                MAX_PAYLOAD.fetch_max(l, Ordering::Relaxed);
+            }
         }
         let _ = len;
     }
@@ -1955,6 +2019,8 @@ pub mod udp_stats {
     }
 
     pub fn snapshot() -> UdpSnapshot {
+        #[cfg(feature = "stats")]
+        flush_locals();
         UdpSnapshot {
             datagrams: DATAGRAMS.load(Ordering::Relaxed),
             bytes: BYTES.load(Ordering::Relaxed),
@@ -2037,9 +2103,31 @@ pub mod udp_write {
     fn bump(c: &AtomicU64) -> u64 {
         c.fetch_add(1, Ordering::Relaxed).saturating_add(1)
     }
+    thread_local! {
+        static L_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(feature = "stats")]
+    fn flush_sent() {
+        L_SENT.with(|c| {
+            let v = c.get();
+            if v != 0 {
+                SENT.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
+    }
     pub fn sent() {
         stats_only! {
-            bump(&SENT);
+            L_SENT.with(|c| {
+                let v = c.get().wrapping_add(1);
+                if v >= 1024 {
+                    SENT.fetch_add(v, Ordering::Relaxed);
+                    c.set(0);
+                } else {
+                    c.set(v);
+                }
+            });
         }
     }
     pub fn retried() -> u64 {
@@ -2074,6 +2162,8 @@ pub mod udp_write {
     }
 
     pub fn snapshot() -> UdpWriteSnapshot {
+        #[cfg(feature = "stats")]
+        flush_sent();
         UdpWriteSnapshot {
             sent: SENT.load(Ordering::Relaxed),
             retried: RETRIED.load(Ordering::Relaxed),
@@ -2170,8 +2260,18 @@ fn claim_drop_warning(last: &std::sync::atomic::AtomicU64) -> bool {
 /// bottleneck under the flood that causes drops.
 fn warn_datagram_drop(reason: &str, total: u64, detail: impl FnOnce() -> String) {
     use std::sync::atomic::AtomicU64;
-    static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    if !claim_drop_warning(&LAST) {
+    static LAST_LARGE: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    static LAST_FULL: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    static LAST_OTHER: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    let slot = if reason.contains("buffer full") {
+        &LAST_FULL
+    } else if reason.contains("budget") || reason.contains("fragment") || reason.contains("header")
+    {
+        &LAST_LARGE
+    } else {
+        &LAST_OTHER
+    };
+    if !claim_drop_warning(slot) {
         return;
     }
     let detail = detail();
@@ -2541,9 +2641,31 @@ impl DgramReassembler {
     }
 }
 
-fn udp_send_limiter() -> &'static Arc<tokio::sync::Semaphore> {
-    static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4096)))
+struct UdpRetry {
+    sock: Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    payload: Bytes,
+}
+
+fn udp_retry_queue() -> &'static tokio::sync::mpsc::Sender<UdpRetry> {
+    static TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<UdpRetry>> =
+        std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(4096);
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let r = match req.payload.try_into_mut() {
+                    Ok(v) => req.sock.send_to(&v, req.dst).await,
+                    Err(b) => req.sock.send_to(&b, req.dst).await,
+                };
+                if let Err(e) = r {
+                    let n = udp_write::retry_failed();
+                    warn_udp_write("detached retry failed", n, || e.to_string());
+                }
+            }
+        });
+        tx
+    })
 }
 
 /// Best-effort non-blocking UDP send for shared loops (one datagram reader per
@@ -2553,39 +2675,20 @@ fn udp_send_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 /// attempting the syscall while a freshly registered socket has no cached
 /// writable readiness, which would silently drop the first packet of every new
 /// session. A genuinely full socket buffer is real backpressure too. In both
-/// cases the packet is handed to a bounded detached task so the caller never
-/// stalls on one destination; past the permit limit it is dropped (UDP
+/// cases the packet is queued to a single global retry worker so the caller
+/// never stalls and no task is spawned per packet; a full queue drops (UDP
 /// semantics).
-///
-/// Takes `Bytes` so the slow path *moves* the payload into the task. The
-/// borrowed form would force a fresh `to_vec()` allocation plus a copy on a
-/// path that already holds an owned, refcounted buffer, and that copy is pure
-/// overhead. A `Bytes` that is *not* shared with other consumers (e.g. one just
-/// built by `encode_datagram*`) is unwrapped back to its `Vec` first, so the
-/// common case runs zero-copy and reuses the caller's allocation for the
-/// queued write.
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
     match sock.try_send_to(&payload, dst) {
         Ok(_) => udp_write::sent(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            if let Ok(permit) = udp_send_limiter().clone().try_acquire_owned() {
-                let n = udp_write::retried();
-                let sock = sock.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let r = match payload.try_into_mut() {
-                        Ok(v) => sock.send_to(&v, dst).await,
-                        Err(b) => sock.send_to(&b, dst).await,
-                    };
-                    if let Err(e) = r {
-                        let n = udp_write::retry_failed();
-                        warn_udp_write("detached retry failed", n, || e.to_string());
-                    }
-                });
-                let _ = n;
-            } else {
-                // Retry budget exhausted: this packet is gone. Counted now,
-                // because this is exactly the loss that had no counter before.
+            let _ = udp_write::retried();
+            let req = UdpRetry {
+                sock: sock.clone(),
+                dst,
+                payload,
+            };
+            if udp_retry_queue().try_send(req).is_err() {
                 let n = udp_write::dropped_no_permit();
                 warn_udp_write("retry budget exhausted", n, || {
                     "send buffer full".to_string()
@@ -2602,8 +2705,17 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
 /// Rate-limited warning for a last-hop UDP write failure.
 fn warn_udp_write(reason: &str, total: u64, detail: impl FnOnce() -> String) {
     use std::sync::atomic::AtomicU64;
-    static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    if !claim_drop_warning(&LAST) {
+    static LAST_FAIL: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    static LAST_NOPERM: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    static LAST_OTHER: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    let slot = if reason.contains("budget") || reason.contains("retry") {
+        &LAST_NOPERM
+    } else if reason.contains("failed") {
+        &LAST_FAIL
+    } else {
+        &LAST_OTHER
+    };
+    if !claim_drop_warning(slot) {
         return;
     }
     let detail = detail();
@@ -2825,6 +2937,66 @@ fn touch_stamp(
     }
 }
 
+async fn write_batch_vectored<W>(tw: &mut W, bufs: &[Bytes]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use std::future::poll_fn;
+    let mut off = 0usize;
+    let mut skip = 0usize;
+    while skip < bufs.len() {
+        while skip < bufs.len() && off >= bufs[skip].len() {
+            skip += 1;
+            off = 0;
+        }
+        if skip >= bufs.len() {
+            break;
+        }
+        let mut ios: [std::io::IoSlice<'_>; 8] = [std::io::IoSlice::new(&[]); 8];
+        let mut nios = 0usize;
+        for (i, b) in bufs[skip..].iter().enumerate() {
+            let s = if i == 0 {
+                &b[off.min(b.len())..]
+            } else {
+                &b[..]
+            };
+            if !s.is_empty() {
+                ios[nios] = std::io::IoSlice::new(s);
+                nios += 1;
+            }
+        }
+        if nios == 0 {
+            break;
+        }
+        let ios = &ios[..nios];
+        let n = poll_fn(|cx| {
+            tokio::io::AsyncWrite::poll_write_vectored(std::pin::Pin::new(&mut *tw), cx, ios)
+        })
+        .await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "tcp vectored write zero",
+            ));
+        }
+        let mut left = n;
+        while skip < bufs.len() {
+            let avail = bufs[skip].len().saturating_sub(off);
+            if left < avail {
+                off += left;
+                break;
+            }
+            left -= avail;
+            skip += 1;
+            off = 0;
+            if left == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn copy_tcp_quic_inner(
     mut tcp: tokio::net::TcpStream,
     mut send: quinn::SendStream,
@@ -2887,19 +3059,16 @@ async fn copy_tcp_quic_inner(
                 }
                 total += n as u64;
                 chunks += 1;
-                // One clock read per chunk, one shared store per 100ms: the atomic
-                // comparison the old code ran on every non-multiple-of-8 chunk was
-                // itself the per-chunk cost it was trying to avoid.
-                let now = b1.elapsed().as_millis() as u64;
-                let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
-                touch_stamp(&l1, &mut stamped, now, throttle);
+                if chunks.is_multiple_of(8) {
+                    let now = b1.elapsed().as_millis() as u64;
+                    touch_stamp(&l1, &mut stamped, now, 100);
+                }
             }
             send.finish().ok();
             Ok::<u64, anyhow::Error>(total)
         };
         let s2c = async move {
             let mut total = 0u64;
-            let mut chunks = 0u64;
             let mut stamped = 0u64;
             // Optimistic SOCKS replies have already told the application the
             // connection is up, so the MQP-2 dial ACK only gates the reply
@@ -2919,15 +3088,16 @@ async fn copy_tcp_quic_inner(
                     ));
                 }
             }
+            let mut batch: [Bytes; 8] = std::array::from_fn(|_| Bytes::new());
             loop {
-                // `read_chunk` hands over a refcounted view of quinn's own
-                // receive buffer instead of copying into ours, so this direction
-                // crosses one userspace boundary (the socket write) instead of
-                // two. `max_length` is unbounded on purpose: the data is already
-                // held by the assembler, so taking the whole contiguous span
-                // only means fewer trips through quinn's connection lock.
-                let chunk = match recv.read_chunk(usize::MAX, true).await {
-                    Ok(Some(c)) => c,
+                // Batched zero-copy receive: `read_chunks` drains up to 8
+                // assembler segments under one connection-lock acquisition,
+                // then a single vectored write pushes them to TCP. The old
+                // `read_chunk(MAX)+write_all` paid one lock + one syscall per
+                // ~1.4 KiB STREAM frame; batching amortizes both. Clock is
+                // sampled once per batch, not per chunk.
+                let n = match recv.read_chunks(&mut batch).await {
+                    Ok(Some(n)) => n,
                     Ok(None) => break,
                     Err(e) => {
                         // Classify for the log line: a peer reset (e.g. refused
@@ -2942,20 +3112,24 @@ async fn copy_tcp_quic_inner(
                         ));
                     }
                 };
-                let n = chunk.bytes.len();
                 if n == 0 {
                     continue;
                 }
-                if let Err(e) = tw.write_all(&chunk.bytes).await {
+                let mut batch_bytes = 0usize;
+                for b in batch.iter().take(n) {
+                    batch_bytes += b.len();
+                }
+                if batch_bytes == 0 {
+                    continue;
+                }
+                if let Err(e) = write_batch_vectored(&mut tw, &batch[..n]).await {
                     return Err::<u64, anyhow::Error>(anyhow::anyhow!(
                         "quic>tcp tcp write failed after {total}B down: {e:#}"
                     ));
                 }
-                total += n as u64;
-                chunks += 1;
+                total += batch_bytes as u64;
                 let now = b2.elapsed().as_millis() as u64;
-                let throttle = if chunks.is_multiple_of(8) { 100 } else { 500 };
-                touch_stamp(&l2, &mut stamped, now, throttle);
+                touch_stamp(&l2, &mut stamped, now, 100);
             }
             // QUIC-recv EOF: half-close the TCP write side now. Without
             // this FIN the peer waits for EOF while our own c2s direction
