@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
     let auth_enabled = !auth_token.is_empty();
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS));
+    spawn_udp_reporter();
     loop {
         let incoming = match ep.accept().await {
             Some(i) => i,
@@ -246,7 +247,6 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        spawn_udp_reporter();
         let allow_private = c.allow_private;
         let auth_token = auth_token.clone();
         // Accept + handshake per connection: never await a handshake inline, or
@@ -365,6 +365,7 @@ fn spawn_udp_reporter() {
 
 async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()> {
     info!("new QUIC conn from {}", conn.remote_address());
+    let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
     let sess: SessTable = Arc::new(std::sync::RwLock::new(HashMap::new()));
@@ -454,7 +455,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     continue;
                 };
                 udp_stats::payload(whole.len());
-                forward_server_dgram(&ss, &cd, s, a.as_ref(), whole, allow_private).await;
+                forward_server_dgram(&ss, &cd, conn_id, s, a.as_ref(), whole, allow_private).await;
             } else {
                 let Ok((s, a, p)) = decode_datagram_ref(&d) else {
                     continue;
@@ -462,7 +463,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 let off = owned.len() - p.len();
                 let payload = owned.slice(off..);
                 udp_stats::payload(payload.len());
-                forward_server_dgram(&ss, &cd, s, a, payload, allow_private).await;
+                forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -756,6 +757,7 @@ async fn dial_happy_eyeballs(
 async fn forward_server_dgram(
     ss: &SessTable,
     cd: &quinn::Connection,
+    conn_id: usize,
     s: u32,
     addr: TargetAddrRef<'_>,
     payload: Bytes,
@@ -766,7 +768,7 @@ async fn forward_server_dgram(
             if !allow_private && !is_global_ip(dst.ip()) {
                 return;
             }
-            let sock = match get_or_create_sess(ss, cd, s).await {
+            let sock = match get_or_create_sess(ss, cd, conn_id, s).await {
                 Some(v) => v,
                 None => return,
             };
@@ -778,7 +780,7 @@ async fn forward_server_dgram(
                 if !allow_private && !is_global_ip(dst.ip()) {
                     return;
                 }
-                let sock = match get_or_create_sess(ss, cd, s).await {
+                let sock = match get_or_create_sess(ss, cd, conn_id, s).await {
                     Some(v) => v,
                     None => return,
                 };
@@ -808,7 +810,7 @@ async fn forward_server_dgram(
                         },
                         Err(_) => return,
                     };
-                    let sock = match get_or_create_sess(&ss, &cd, s).await {
+                    let sock = match get_or_create_sess(&ss, &cd, conn_id, s).await {
                         Some(v) => v,
                         None => return,
                     };
@@ -871,24 +873,42 @@ fn abort_evicted(evicted: Vec<SessEntry>) {
     }
 }
 
-/// Per-connection memo of the most recently used session socket.
+/// Monotonic connection ids for the session memos.
+///
+/// Session ids are allocated per client — every client hub counts from 1 — so
+/// `(conn, sess)` is the identity of a session and the connection half must
+/// never repeat. `Connection::stable_id` is a heap address, and the allocator
+/// hands the same address to the next connection after a reconnect, so a memo
+/// entry left behind by a dead connection could match a different one. A
+/// process-wide counter cannot alias.
+fn next_conn_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per-thread memo of the most recently used session socket.
 ///
 /// A datagram-heavy flow sends a long run of packets to the *same* session, so
 /// the connection-level `RwLock` read plus hash lookup in `get_or_create_sess`
 /// is pure per-packet overhead for all but the first packet of the run. The
-/// memo is a single slot on purpose: a miss simply falls through to the table,
-/// and a stale hit can only ever send one reply to a socket whose reader has
-/// already exited (never to the wrong target), because entries are keyed by
-/// session id and the reader holds its own `Arc` to keep the fd alive.
+/// memo is a single slot on purpose: a miss simply falls through to the table.
+/// The key is `(conn, sess)`, never `sess` alone: session ids are allocated per
+/// client, so two connections sharing this thread would otherwise serve each
+/// other's sockets and route replies onto the wrong QUIC connection.
 struct SessMemo {
+    /// Owning connection id ([`next_conn_id`]): the slot is shared by every
+    /// connection whose DATAGRAM reader runs on this worker thread.
+    conn: usize,
     sess: u32,
     sock: Arc<tokio::net::UdpSocket>,
     /// The session table's liveness stamp, kept so a memo hit can refresh it
     /// without re-taking the table lock.
     last: Arc<std::sync::atomic::AtomicU64>,
-    /// Cleared by the reply reader as it exits, which turns this slot back into
-    /// a miss for the next packet addressed to `sess`.
-    alive: Arc<std::sync::atomic::AtomicBool>,
+    /// The reply reader's abort handle. `is_finished` is the liveness signal,
+    /// the same one the table path uses: a flag the reader cleared on its way
+    /// out would stay set when the sweeper or a connection close aborts the
+    /// reader mid-await, and that path runs no cleanup at all.
+    abort: tokio::task::AbortHandle,
 }
 
 thread_local! {
@@ -898,37 +918,72 @@ thread_local! {
 
 /// Remember `sock` as the memoized session, unless a newer session already is.
 fn sess_memo_put(
+    conn: usize,
     sess: u32,
     sock: Arc<tokio::net::UdpSocket>,
     last: Arc<std::sync::atomic::AtomicU64>,
-    alive: Arc<std::sync::atomic::AtomicBool>,
+    abort: tokio::task::AbortHandle,
 ) {
     SESS_MEMO.with(|c| {
         *c.borrow_mut() = Some(SessMemo {
+            conn,
             sess,
             sock,
             last,
-            alive,
+            abort,
         })
     });
 }
 
-/// Drop the memo when it still points at `sess`. Called by a reply reader as it
-/// exits, so the next inbound packet for that session recreates it instead of
-/// sending into a socket nobody reads.
-fn sess_memo_forget(sess: u32) {
+/// Drop the memo when it still points at `(conn, sess)`. Called by a reply
+/// reader as it exits, so the next inbound packet for that session recreates it
+/// instead of sending into a socket nobody reads.
+fn sess_memo_forget(conn: usize, sess: u32) {
     SESS_MEMO.with(|c| {
         let mut m = c.borrow_mut();
-        if m.as_ref().is_some_and(|e| e.sess == sess) {
+        if m.as_ref().is_some_and(|e| e.conn == conn && e.sess == sess) {
             *m = None;
         }
     });
 }
 
+/// Outcome of a session-memo probe.
+enum SessHit {
+    Miss,
+    /// A live session socket and its liveness stamp.
+    Fresh(
+        Arc<tokio::net::UdpSocket>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ),
+    /// The memo's reader has exited: the table (not the memo) must decide,
+    /// so this falls through and lets the table path recreate the session.
+    Stale,
+}
+
+/// Probe the thread-local session memo for `(conn, sess)`.
+///
+/// The connection is part of the key because a session id is only unique
+/// within one connection (every client hub allocates ids from 1), and this slot
+/// is shared by every connection whose DATAGRAM reader runs on this worker
+/// thread. Matching on `sess` alone served one connection's socket to another,
+/// so that connection's datagrams went out on the wrong session.
+fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
+    SESS_MEMO.with(|c| {
+        let m = c.borrow();
+        match m.as_ref().filter(|e| e.conn == conn && e.sess == sess) {
+            Some(e) if !e.abort.is_finished() => SessHit::Fresh(e.sock.clone(), e.last.clone()),
+            Some(_) => SessHit::Stale,
+            None => SessHit::Miss,
+        }
+    })
+}
+
 /// Per-thread view of the last liveness refresh, so the throttling decision
-/// costs no clock read. A `(session, ms)` pair is enough: it is only ever
-/// compared against the session it belongs to.
+/// costs no clock read. A `(connection, session, ms)` triple: session ids are
+/// only unique within a connection, so `(session, ms)` alone let two
+/// connections share — and thereby defeat — one throttle window.
 struct TouchMemo {
+    conn: usize,
     sess: u32,
     ms: u64,
 }
@@ -948,22 +1003,30 @@ thread_local! {
 /// 180 s. The clock read stays on the hot path only in the sense that it decides
 /// whether to store — a `clock_gettime` is an order of magnitude cheaper than the
 /// hash lookup and hash-map read lock this replaced.
-fn touch_session_throttled(sess: u32, last: &std::sync::atomic::AtomicU64) {
+fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     const TOUCH_INTERVAL_MS: u64 = 1000;
     let now = mono_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
         match c.as_ref() {
-            Some(m) if m.sess == sess => {
+            Some(m) if m.conn == conn && m.sess == sess => {
                 if now.saturating_sub(m.ms) >= TOUCH_INTERVAL_MS {
-                    *c = Some(TouchMemo { sess, ms: now });
+                    *c = Some(TouchMemo {
+                        conn,
+                        sess,
+                        ms: now,
+                    });
                     true
                 } else {
                     false
                 }
             }
             _ => {
-                *c = Some(TouchMemo { sess, ms: now });
+                *c = Some(TouchMemo {
+                    conn,
+                    sess,
+                    ms: now,
+                });
                 true
             }
         }
@@ -974,12 +1037,12 @@ fn touch_session_throttled(sess: u32, last: &std::sync::atomic::AtomicU64) {
 }
 
 async fn sess_reader_task(
+    conn_id: usize,
     s: u32,
     rs: Arc<tokio::net::UdpSocket>,
     ss2: SessTable,
     c2: quinn::Connection,
     last2: Arc<std::sync::atomic::AtomicU64>,
-    alive_reader: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1041,8 +1104,7 @@ async fn sess_reader_task(
             DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
         }
     }
-    alive_reader.store(false, std::sync::atomic::Ordering::Relaxed);
-    sess_memo_forget(s);
+    sess_memo_forget(conn_id, s);
     let mut w = lock_write(&ss2);
     if let Some((cur, _, _, _)) = w.get(&s) {
         if Arc::ptr_eq(cur, &rs) {
@@ -1054,6 +1116,7 @@ async fn sess_reader_task(
 async fn get_or_create_sess(
     ss: &SessTable,
     cd: &quinn::Connection,
+    conn_id: usize,
     s: u32,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
     // Session 0 is reserved (never allocated by any client hub): a wire
@@ -1062,53 +1125,25 @@ async fn get_or_create_sess(
     if s == 0 {
         return None;
     }
-    // No DATAGRAM support on this path: refuse before pinning a global permit,
-    // a kernel socket and a reader task for a session whose replies would all
-    // be dropped (`limit == 0` in the reader). Negotiated at the handshake so
-    // it never flaps mid-connection; the per-miss `max_datagram_size()` cost
-    // stays off the per-packet fast path above.
-    cd.max_datagram_size()?;
     // Zero-lock fast path: the common case (a burst of packets for one session)
-    // allocates nothing and never touches the table. `alive` is the same signal
-    // the old table lookup used (`JoinHandle::is_finished`) — an atomic load —
-    // so a session whose reader has exited still falls through and is recreated.
-    use std::sync::atomic::Ordering;
-    enum Hit {
-        Miss,
-        Fresh(Arc<tokio::net::UdpSocket>),
-        /// The memo's reader has exited: the table (not the memo) must decide,
-        /// so this falls through and lets the table path recreate the session.
-        Stale,
-    }
-    let hit = SESS_MEMO.with(|c| {
-        let m = c.borrow();
-        match m.as_ref().filter(|e| e.sess == s) {
-            Some(e) if e.alive.load(Ordering::Relaxed) => Hit::Fresh(e.sock.clone()),
-            Some(_) => Hit::Stale,
-            None => Hit::Miss,
-        }
-    });
-    match hit {
-        Hit::Fresh(sock) => {
+    // allocates nothing and never touches the table. The memo's liveness check
+    // is the same signal the table path uses (`JoinHandle::is_finished`) — one
+    // atomic load — so a session whose reader has exited, aborted included,
+    // still falls through and is recreated.
+    match sess_memo_lookup(conn_id, s) {
+        SessHit::Fresh(sock, last) => {
             // Refresh liveness without the table lock; a session captured here is
             // scheduled by its reader and may be exiting, in which case one reply
             // is dropped and the next packet recreates it.
-            SESS_MEMO.with(|c| {
-                if let Some(e) = c.borrow().as_ref().filter(|e| e.sess == s) {
-                    touch_session_throttled(s, &e.last);
-                }
-            });
+            touch_session_throttled(conn_id, s, &last);
             return Some(sock);
         }
-        Hit::Stale | Hit::Miss => {}
+        SessHit::Stale | SessHit::Miss => {}
     }
     // Fast path: single read lock + lock-free timestamp bump. No write lock
     // per packet, so concurrent sessions never serialize on a global lock.
     // A session whose reply reader has already exited is treated as absent so
-    // its next packet recreates it instead of black-holing replies. This path
-    // deliberately does not populate the memo: the memo's liveness flag belongs
-    // to the reader that this path did not create, and a second flag set by
-    // nobody would pin a dead session forever.
+    // its next packet recreates it instead of black-holing replies.
     {
         let r = lock_read(ss);
         if let Some((sock, h, t, _)) = r.get(&s) {
@@ -1119,6 +1154,13 @@ async fn get_or_create_sess(
             }
         }
     }
+    // No DATAGRAM support on this path: refuse before pinning a global permit,
+    // a kernel socket and a reader task for a session whose replies would all
+    // be dropped (`limit == 0` in the reader). Negotiated at the handshake, so
+    // it never flaps mid-connection — and since a hit above can only be a
+    // session that passed this check already, it stays off the per-packet path
+    // instead of taking the connection-state lock for every datagram.
+    cd.max_datagram_size()?;
     // Check the global pool BEFORE creating the socket: once every session slot
     // is held there is no point paying socket()+setsockopt()+bind() per packet.
     let permit = match session_limiter().clone().try_acquire_owned() {
@@ -1159,21 +1201,19 @@ async fn get_or_create_sess(
     // are syscalls and must not stall the datagram reader for every session.
     let raw = udp_socket_dual_small("[::]:0").ok()?;
     let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
-    // Shared with the memo so a reader exit invalidates it without touching the
-    // table.
-    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let c2_pre = cd.clone();
     let rs_pre = sock.clone();
     let ss_pre = ss.clone();
     let last_pre = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let h_pre = tokio::spawn(sess_reader_task(
+        conn_id,
         s,
         rs_pre,
         ss_pre,
         c2_pre,
         last_pre.clone(),
-        alive.clone(),
     ));
+    let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();
     let mut swept: Vec<SessEntry> = Vec::new();
     let inserted = {
@@ -1194,7 +1234,7 @@ async fn get_or_create_sess(
         if w.len() >= LOCAL_SESS_MAX {
             swept = sweep_local(&mut w);
         }
-        let dead = !alive.load(std::sync::atomic::Ordering::Relaxed);
+        let dead = h_pre.is_finished();
         w.insert(s, (sock.clone(), h_pre, last_pre.clone(), permit));
         udp_stats::session();
         if dead
@@ -1207,7 +1247,7 @@ async fn get_or_create_sess(
             }
             false
         } else {
-            sess_memo_put(s, sock.clone(), last_pre.clone(), alive);
+            sess_memo_put(conn_id, s, sock.clone(), last_pre.clone(), reader_abort);
             true
         }
     };
@@ -1294,5 +1334,84 @@ mod tests {
     fn domain_wire_limit_is_enforced() {
         assert_eq!(mqp_hdr_len(0x03, 255).unwrap(), 259);
         assert!(mqp_hdr_len(0x03, 0).is_err());
+    }
+
+    fn memo_sock() -> Arc<tokio::net::UdpSocket> {
+        let s = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        s.set_nonblocking(true).unwrap();
+        Arc::new(tokio::net::UdpSocket::from_std(s).unwrap())
+    }
+
+    /// A reader that stays alive (`SessHit::Fresh` requires a running task).
+    fn live_reader() -> tokio::task::AbortHandle {
+        let h = tokio::spawn(std::future::pending::<()>());
+        let abort = h.abort_handle();
+        drop(h);
+        abort
+    }
+
+    /// Session ids are allocated per client and every client hub counts from 1,
+    /// so two connections whose DATAGRAM readers share one worker thread
+    /// routinely carry the same sess id. The memo is a single thread-local
+    /// slot, so matching on `sess` alone served one connection's socket to the
+    /// other — its datagrams then went out on the wrong session and the replies
+    /// came back on the wrong QUIC connection.
+    #[tokio::test]
+    async fn session_memo_never_crosses_connections() {
+        use std::sync::atomic::AtomicU64;
+
+        let a = memo_sock();
+        let b = memo_sock();
+        let last = Arc::new(AtomicU64::new(1));
+
+        sess_memo_put(1, 7, a.clone(), last.clone(), live_reader());
+        assert!(matches!(sess_memo_lookup(2, 7), SessHit::Miss));
+        match sess_memo_lookup(1, 7) {
+            SessHit::Fresh(s, _) => assert!(Arc::ptr_eq(&s, &a)),
+            _ => panic!("the owning connection must still hit"),
+        }
+        assert!(matches!(sess_memo_lookup(1, 8), SessHit::Miss));
+
+        sess_memo_forget(2, 7);
+        assert!(matches!(sess_memo_lookup(1, 7), SessHit::Fresh(..)));
+        sess_memo_forget(1, 7);
+        assert!(matches!(sess_memo_lookup(1, 7), SessHit::Miss));
+
+        sess_memo_put(2, 7, b.clone(), last, live_reader());
+        assert!(matches!(sess_memo_lookup(1, 7), SessHit::Miss));
+        match sess_memo_lookup(2, 7) {
+            SessHit::Fresh(s, _) => assert!(Arc::ptr_eq(&s, &b)),
+            _ => panic!("connection 2 must see its own socket"),
+        }
+    }
+
+    /// The sweeper and a connection close abort a session's reader, which then
+    /// never reaches the cleanup after its loop — so the memo must learn that
+    /// the reader is gone from the task handle itself, or it keeps handing out
+    /// a socket nobody reads.
+    #[tokio::test]
+    async fn session_memo_ignores_finished_readers() {
+        use std::sync::atomic::AtomicU64;
+
+        let last = Arc::new(AtomicU64::new(1));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let h = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        let finished = h.abort_handle();
+        drop(tx);
+        h.await.unwrap();
+        assert!(finished.is_finished());
+        sess_memo_put(3, 1, memo_sock(), last.clone(), finished);
+        assert!(matches!(sess_memo_lookup(3, 1), SessHit::Stale));
+
+        let h = tokio::spawn(std::future::pending::<()>());
+        let aborted = h.abort_handle();
+        h.abort();
+        while !aborted.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        sess_memo_put(4, 1, memo_sock(), last, aborted);
+        assert!(matches!(sess_memo_lookup(4, 1), SessHit::Stale));
     }
 }

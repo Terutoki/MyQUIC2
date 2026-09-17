@@ -2132,22 +2132,13 @@ impl std::fmt::Display for UdpWriteSnapshot {
     }
 }
 
-/// Monotonic milliseconds since first use. Interval logic deliberately avoids
-/// wall-clock reads, which an NTP step would corrupt.
-fn mono_ms() -> u64 {
-    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    BASE.get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-}
-
 /// Minimum spacing between datagram-drop warnings, per process.
 const DROP_WARN_INTERVAL_MS: u64 = 10_000;
 
 /// Sentinel for "no drop warning has been emitted yet".
 ///
-/// Using 0 here swallows the *first* drop: `mono_ms()` establishes its base on
-/// first call, so the elapsed value it returns starts near zero and
+/// Using 0 here swallows the *first* drop: [`mono_millis`] establishes its base
+/// on first call, so the elapsed value it returns starts near zero and
 /// `now - 0 < INTERVAL` holds. That is exactly the case a fresh deployment
 /// hits, so the first drop must warn unconditionally.
 const NEVER_WARNED: u64 = u64::MAX;
@@ -2158,21 +2149,32 @@ fn drop_warn_due(last: u64, now: u64) -> bool {
     last == NEVER_WARNED || now.saturating_sub(last) >= DROP_WARN_INTERVAL_MS
 }
 
+/// Claim this warning slot if one is due (at most one winner per
+/// [`DROP_WARN_INTERVAL_MS`] per counter).
+///
+/// Split from the message so a flood of drops pays for building the detail
+/// string only when the line will actually be emitted: formatting it before the
+/// gate made the *logging* itself the per-drop cost.
+fn claim_drop_warning(last: &std::sync::atomic::AtomicU64) -> bool {
+    use std::sync::atomic::Ordering;
+    let now = mono_millis();
+    let prev = last.load(Ordering::Relaxed);
+    drop_warn_due(prev, now)
+        && last
+            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
 /// Rate-limited (at most one per [`DROP_WARN_INTERVAL_MS`], process-wide)
 /// warning for a dropped datagram. A per-packet `warn!` would itself become the
 /// bottleneck under the flood that causes drops.
-fn warn_datagram_drop(reason: &str, total: u64, detail: &str) {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn warn_datagram_drop(reason: &str, total: u64, detail: impl FnOnce() -> String) {
+    use std::sync::atomic::AtomicU64;
     static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    let now = mono_ms();
-    let last = LAST.load(Ordering::Relaxed);
-    if !drop_warn_due(last, now)
-        || LAST
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-    {
+    if !claim_drop_warning(&LAST) {
         return;
     }
+    let detail = detail();
     tracing::warn!(
         "udp datagram dropped ({reason}): {total} so far{detail} — a packet this size would \
          have been carried by a direct UDP path, so the tunnel is degrading UDP here"
@@ -2201,7 +2203,7 @@ pub fn send_udp_datagram(
 ) -> DatagramSend {
     let Ok(header) = address.header() else {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-        warn_datagram_drop("bad address header", n, "");
+        warn_datagram_drop("bad address header", n, String::new);
         return DatagramSend::TooLarge;
     };
     send_udp_datagram_with_header(conn, sess, &header, payload, limit)
@@ -2216,11 +2218,9 @@ fn send_udp_datagram_with_header(
 ) -> DatagramSend {
     let Some(d) = encode_datagram_with_header(sess, header, payload, limit) else {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-        warn_datagram_drop(
-            "payload exceeds the path budget",
-            n,
-            &budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len())),
-        );
+        warn_datagram_drop("payload exceeds the path budget", n, || {
+            budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len()))
+        });
         return DatagramSend::TooLarge;
     };
     send_encoded(conn, d)
@@ -2231,7 +2231,7 @@ fn send_encoded(conn: &quinn::Connection, body: Bytes) -> DatagramSend {
     let outcome = try_send_datagram(conn, body);
     if outcome == DatagramSend::Blocked {
         let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-        warn_datagram_drop("send buffer full", n, "");
+        warn_datagram_drop("send buffer full", n, String::new);
     }
     outcome
 }
@@ -2288,7 +2288,7 @@ impl DgramFragmenter {
     ) -> PayloadSend {
         let Ok(header) = address.header() else {
             let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            warn_datagram_drop("bad address header", n, "");
+            warn_datagram_drop("bad address header", n, String::new);
             return PayloadSend {
                 frames: 0,
                 failed: Some(DatagramSend::TooLarge),
@@ -2319,14 +2319,12 @@ impl DgramFragmenter {
         };
         if total_usize > MQP_FRAG_MAX_TOTAL as usize || payload.len() > MQP_FRAG_MAX_PAYLOAD {
             let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            warn_datagram_drop(
-                "payload above the MQP-2 fragmentation limit",
-                n,
-                &format!(
+            warn_datagram_drop("payload above the MQP-2 fragmentation limit", n, || {
+                format!(
                     "; {} B exceeds the {MQP_FRAG_MAX_PAYLOAD} B reassembly cap",
                     payload.len()
-                ),
-            );
+                )
+            });
             return PayloadSend {
                 frames: 0,
                 failed: Some(DatagramSend::TooLarge),
@@ -2345,7 +2343,7 @@ impl DgramFragmenter {
                 // Only reachable if `chunk` and the encoder disagree; report it
                 // rather than send a payload that can never reassemble.
                 let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-                warn_datagram_drop("fragment does not fit the path budget", n, "");
+                warn_datagram_drop("fragment does not fit the path budget", n, String::new);
                 return PayloadSend {
                     frames,
                     failed: Some(DatagramSend::TooLarge),
@@ -2581,7 +2579,7 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                     };
                     if let Err(e) = r {
                         let n = udp_write::retry_failed();
-                        warn_udp_write("detached retry failed", n, &e.to_string());
+                        warn_udp_write("detached retry failed", n, || e.to_string());
                     }
                 });
                 let _ = n;
@@ -2589,29 +2587,26 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                 // Retry budget exhausted: this packet is gone. Counted now,
                 // because this is exactly the loss that had no counter before.
                 let n = udp_write::dropped_no_permit();
-                warn_udp_write("retry budget exhausted", n, "send buffer full");
+                warn_udp_write("retry budget exhausted", n, || {
+                    "send buffer full".to_string()
+                });
             }
         }
         Err(e) => {
             let n = udp_write::failed();
-            warn_udp_write("send failed", n, &e.to_string());
+            warn_udp_write("send failed", n, || e.to_string());
         }
     }
 }
 
 /// Rate-limited warning for a last-hop UDP write failure.
-fn warn_udp_write(reason: &str, total: u64, detail: &str) {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn warn_udp_write(reason: &str, total: u64, detail: impl FnOnce() -> String) {
+    use std::sync::atomic::AtomicU64;
     static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    let now = mono_ms();
-    let last = LAST.load(Ordering::Relaxed);
-    if !drop_warn_due(last, now)
-        || LAST
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-    {
+    if !claim_drop_warning(&LAST) {
         return;
     }
+    let detail = detail();
     tracing::warn!("udp write dropped ({reason}): {total} so far; {detail}");
 }
 
@@ -3230,6 +3225,21 @@ mod tests {
         assert!(!drop_warn_due(5_000, 4_999), "clock regression: suppressed");
     }
 
+    /// The slot is claimed exactly once per interval: the message (and its
+    /// detail string) must be built by the winner only, or a drop flood makes
+    /// logging itself the per-drop cost.
+    #[test]
+    fn warning_slot_is_claimed_once_per_interval() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let slot = AtomicU64::new(NEVER_WARNED);
+        assert!(claim_drop_warning(&slot), "a never-warned slot claims");
+        assert!(slot.load(Ordering::Relaxed) != NEVER_WARNED);
+        assert!(
+            !claim_drop_warning(&slot),
+            "a second claim inside the window is refused"
+        );
+    }
+
     /// Encode `payload` the way [`DgramFragmenter`] does, for reassembler tests
     /// that need no connection. The limit is generous so only `chunk` splits.
     fn frag_frames(
@@ -3708,7 +3718,7 @@ mod tests {
             while let Ok(d) = conn.read_datagram().await {
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else { continue };
-                    if let Some(x) = reasm.push(&f, mono_ms()) {
+                    if let Some(x) = reasm.push(&f, mono_millis()) {
                         out.push(x);
                     }
                 } else {

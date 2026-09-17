@@ -61,6 +61,12 @@ struct ConnSlot {
     shared: SharedConn,
     gen_tx: watch::Sender<u64>,
     gen_rx: watch::Receiver<u64>,
+    /// Routing hint, maintained by the connection loop: `shared` holds a
+    /// connection with no close reason. One atomic load where `close_reason()`
+    /// takes quinn's connection-state mutex and clones the error, which
+    /// `pick_tcp` would otherwise pay twice per TCP flow. `wait_conn` remains
+    /// the authority that fails a flow fast.
+    live: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConnSlot {
@@ -70,16 +76,12 @@ impl ConnSlot {
             shared: Arc::new(RwLock::new(None)),
             gen_tx,
             gen_rx,
+            live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Best-effort liveness for routing only: a contended lock reads as live
-    /// and `wait_conn` remains the authority that fails a flow fast.
     fn is_live(&self) -> bool {
-        match self.shared.try_read() {
-            Ok(g) => g.as_ref().is_some_and(|c| c.close_reason().is_none()),
-            Err(_) => true,
-        }
+        self.live.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -514,6 +516,7 @@ fn spawn_conn_loop(
                 Ok(conn) => {
                     info!("QUIC connected to {server}");
                     *slot.shared.write().await = Some(conn.clone());
+                    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
                     bump_gen(&slot.gen_tx);
                     let connected_at = std::time::Instant::now();
                     let watchdog = async {
@@ -546,6 +549,7 @@ fn spawn_conn_loop(
                     if let Some(reason) = conn.close_reason() {
                         warn!("QUIC close reason: {reason}");
                     }
+                    slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
                     {
                         let mut w = slot.shared.write().await;
                         if let Some(cur) = w.as_ref() {
@@ -770,21 +774,25 @@ fn spawn_udp_reporter() {
 
 // ---- SOCKS5 (RFC1928, no-auth only) ----
 
-async fn handle_socks(
-    mut s: tokio::net::TcpStream,
-    pool: ConnPool,
-    hub: Arc<UdpHub>,
-    timeout: Duration,
-) -> Result<()> {
-    async fn read_exact_timeout(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
-            .await
-            .context("socks read timed out")??;
-        Ok(())
-    }
+/// One deadline for a whole SOCKS negotiation (greeting + request + target).
+/// The app is local, so this only has to bound a stuck or hostile peer; the
+/// previous shape re-armed a fresh 10 s timeout per field, making the worst
+/// case a multiple of it and registering several timers per connection at the
+/// connection rate.
+const SOCKS_NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the client asked for, once its whole negotiation has been read.
+enum SocksRequest {
+    Connect(TargetAddr),
+    Associate,
+}
+
+/// Reads the greeting (only the no-auth method is offered) and the request.
+/// Framing only; the caller owns the deadline (see [`SOCKS_NEGOTIATE_TIMEOUT`]).
+async fn negotiate(s: &mut tokio::net::TcpStream) -> Result<SocksRequest> {
     // handshake: VER NMETHODS METHODS; we only support 0x00
     let mut h = [0u8; 2];
-    read_exact_timeout(&mut s, &mut h).await?;
+    s.read_exact(&mut h).await.context("socks greeting")?;
     if h[0] != 0x05 {
         anyhow::bail!("bad ver");
     }
@@ -792,27 +800,29 @@ async fn handle_socks(
         anyhow::bail!("no methods offered");
     }
     let mut m = [0u8; u8::MAX as usize];
-    read_exact_timeout(&mut s, &mut m[..h[1] as usize]).await?;
+    s.read_exact(&mut m[..h[1] as usize])
+        .await
+        .context("socks methods")?;
     if !m[..h[1] as usize].contains(&0x00) {
-        write_socks(&mut s, &[0x05, 0xFF]).await?;
+        write_socks(s, &[0x05, 0xFF]).await?;
         anyhow::bail!("no acceptable auth (client must offer 0x00)");
     }
-    write_socks(&mut s, &[0x05, 0x00]).await?;
+    write_socks(s, &[0x05, 0x00]).await?;
 
     let mut r = [0u8; 3];
-    read_exact_timeout(&mut s, &mut r).await?;
+    s.read_exact(&mut r).await.context("socks request")?;
     if r[0] != 0x05 {
         anyhow::bail!("bad req ver");
     }
     if r[2] != 0x00 {
         anyhow::bail!("bad req rsv {:#x}", r[2]);
     }
-    let target = match r[1] {
-        0x01 => match read_socks_addr(&mut s).await {
-            Ok(t) => t,
+    match r[1] {
+        0x01 => match read_socks_addr(s).await {
+            Ok(t) => Ok(SocksRequest::Connect(t)),
             Err(_) => {
-                if let Ok(b) = bnd_for(&s) {
-                    write_socks_reply(&mut s, 0x08, b).await.ok();
+                if let Ok(b) = bnd_for(s) {
+                    write_socks_reply(s, 0x08, b).await.ok();
                 }
                 anyhow::bail!("bad connect target");
             }
@@ -821,18 +831,34 @@ async fn handle_socks(
             // UDP ASSOCIATE: outer addr is a hint only (often 0.0.0.0:0) and
             // is always ignored, so read it leniently without TargetAddr
             // validation. Real packet targets inside DATAGRAMs stay strict.
-            if read_socks_addr_lenient(&mut s).await.is_err() {
-                if let Ok(b) = bnd_for(&s) {
-                    write_socks_reply(&mut s, 0x08, b).await.ok();
+            if read_socks_addr_lenient(s).await.is_err() {
+                if let Ok(b) = bnd_for(s) {
+                    write_socks_reply(s, 0x08, b).await.ok();
                 }
                 anyhow::bail!("bad associate target");
             }
-            return handle_udp_associate(s, pool, hub).await;
+            Ok(SocksRequest::Associate)
         }
         _ => {
-            write_socks(&mut s, &[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            write_socks(s, &[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             anyhow::bail!("unsupported cmd");
         }
+    }
+}
+
+async fn handle_socks(
+    mut s: tokio::net::TcpStream,
+    pool: ConnPool,
+    hub: Arc<UdpHub>,
+    timeout: Duration,
+) -> Result<()> {
+    let request = match tokio::time::timeout(SOCKS_NEGOTIATE_TIMEOUT, negotiate(&mut s)).await {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!("socks negotiation timed out"),
+    };
+    let target = match request {
+        SocksRequest::Connect(t) => t,
+        SocksRequest::Associate => return handle_udp_associate(s, pool, hub).await,
     };
     let bnd: SocketAddr = bnd_for(&s).unwrap_or_else(|_| {
         s.peer_addr()
@@ -842,6 +868,7 @@ async fn handle_socks(
 
     let slot = pool.pick_tcp(&target);
     let shared = slot.shared.clone();
+    let live = slot.live.clone();
     let mut gen_rx = slot.gen_rx.clone();
     let gen_tx = slot.gen_tx.clone();
     let conn = match wait_conn(&shared, &mut gen_rx, timeout).await {
@@ -868,6 +895,7 @@ async fn handle_socks(
                     if let Some(cur) = w.as_ref() {
                         if cur.stable_id() == conn.stable_id() {
                             *w = None;
+                            live.store(false, std::sync::atomic::Ordering::Relaxed);
                             bump_gen(&gen_tx);
                         }
                     }
@@ -932,32 +960,31 @@ async fn handle_socks(
 /// of a domain target (`bad connect target` on every domain CONNECT), while the
 /// `read_exact`-per-field shape passes 30/30. This version changes only *where*
 /// the bytes land (one stack buffer instead of assembled `Vec`s); every read
-/// keeps the proven size and order.
+/// keeps the proven size and order. No per-field deadline here: `negotiate`'s
+/// caller bounds the whole negotiation with one timeout.
 async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
-    async fn rd(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
-            .await
-            .context("socks addr read timed out")??;
-        Ok(())
-    }
     let mut buf = [0u8; AddrHeader::MAX_LEN];
-    rd(s, &mut buf[..1]).await?;
+    s.read_exact(&mut buf[..1]).await.context("socks atyp")?;
     let len = match buf[0] {
         0x01 => {
-            rd(s, &mut buf[1..7]).await?;
+            s.read_exact(&mut buf[1..7]).await.context("socks v4")?;
             7
         }
         0x04 => {
-            rd(s, &mut buf[1..19]).await?;
+            s.read_exact(&mut buf[1..19]).await.context("socks v6")?;
             19
         }
         0x03 => {
-            rd(s, &mut buf[1..2]).await?;
+            s.read_exact(&mut buf[1..2])
+                .await
+                .context("socks domain len")?;
             let n = buf[1] as usize;
             if n == 0 {
                 anyhow::bail!("empty domain");
             }
-            rd(s, &mut buf[2..4 + n]).await?;
+            s.read_exact(&mut buf[2..4 + n])
+                .await
+                .context("socks domain")?;
             4 + n
         }
         x => anyhow::bail!("bad atyp {x}"),
@@ -966,33 +993,27 @@ async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
 }
 
 async fn read_socks_addr_lenient(s: &mut tokio::net::TcpStream) -> Result<()> {
-    async fn rd(s: &mut tokio::net::TcpStream, buf: &mut [u8]) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), s.read_exact(buf))
-            .await
-            .context("socks addr read timed out")??;
-        Ok(())
-    }
     let mut t = [0u8; 1];
-    rd(s, &mut t).await?;
+    s.read_exact(&mut t).await.context("socks atyp")?;
     match t[0] {
         0x01 => {
             let mut b = [0u8; 6];
-            rd(s, &mut b).await?;
+            s.read_exact(&mut b).await.context("socks v4")?;
             Ok(())
         }
         0x04 => {
             let mut b = [0u8; 18];
-            rd(s, &mut b).await?;
+            s.read_exact(&mut b).await.context("socks v6")?;
             Ok(())
         }
         0x03 => {
             let mut n = [0u8; 1];
-            rd(s, &mut n).await?;
+            s.read_exact(&mut n).await.context("socks domain len")?;
             if n[0] == 0 {
                 anyhow::bail!("empty domain");
             }
             let mut b = vec![0u8; n[0] as usize + 2];
-            rd(s, &mut b).await?;
+            s.read_exact(&mut b).await.context("socks domain")?;
             Ok(())
         }
         x => anyhow::bail!("bad atyp {x}"),
@@ -1504,6 +1525,67 @@ mod tests {
         dm.extend_from_slice(&8443u16.to_be_bytes());
         assert!(feed(&dm, true).await.is_ok());
         assert!(feed(&[0x01, 0, 0, 0, 0, 0, 0], true).await.is_ok());
+    }
+
+    /// The whole negotiation is a linear read of greeting + request; the tests
+    /// pin the two request forms and a version mismatch, so the single-deadline
+    /// refactor cannot change which bytes are consumed.
+    #[tokio::test]
+    async fn negotiate_reads_connect_and_associate() {
+        async fn feed(bytes: &[u8]) -> Result<SocksRequest> {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let payload = bytes.to_vec();
+            let server = tokio::spawn(async move {
+                let (mut t, _) = l.accept().await.unwrap();
+                t.write_all(&payload).await.unwrap();
+                // Drain until the client closes: half-closing early races the
+                // client's remaining reads on macOS loopback.
+                let mut sink = [0u8; 64];
+                while let Ok(n) = t.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let r = negotiate(&mut c).await;
+            drop(c);
+            let _ = server.await;
+            r
+        }
+
+        let mut connect = vec![0x05, 0x01, 0x00];
+        connect.extend_from_slice(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x46, 0xA1]);
+        match feed(&connect).await.unwrap() {
+            SocksRequest::Connect(t) => {
+                assert_eq!(t, TargetAddr::Ip("127.0.0.1:18081".parse().unwrap()));
+            }
+            SocksRequest::Associate => panic!("expected CONNECT"),
+        }
+
+        let mut assoc = vec![0x05, 0x01, 0x00, 0x05, 0x03, 0x00];
+        assoc.extend_from_slice(&[0x01, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            feed(&assoc).await.unwrap(),
+            SocksRequest::Associate
+        ));
+
+        assert!(feed(&[0x04, 0x01, 0x00]).await.is_err(), "bad ver");
+    }
+
+    /// Routing must read the maintained atomic: the old shape took the
+    /// `shared` lock and `close_reason()` (quinn's connection-state mutex) per
+    /// slot per flow, and a slot whose `shared` is empty still has to report
+    /// whatever the connection loop last published.
+    #[test]
+    fn slot_liveness_is_the_maintained_atomic() {
+        let slot = ConnSlot::fresh();
+        assert!(!slot.is_live(), "no connection yet");
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(slot.is_live(), "the hint is what routing reads");
+        slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!slot.is_live());
     }
 
     #[test]
