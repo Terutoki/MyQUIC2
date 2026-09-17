@@ -1049,7 +1049,8 @@ pub fn build_transport_tuned(
     // estimate too coarse and slows the startup ramp. reordering_threshold
     // stays at quinn's recommended packet_threshold - 1 = 2.
     // Tunable: threshold 2 + small delay trades reverse-path CPU for sharper
-    // RTT/loss feedback under interactive load.
+    // RTT/loss feedback under interactive load. Note quinn fires when the
+    // count *exceeds* the threshold, so 2 means every 3rd packet, not 2nd.
     let mut ack_freq = quinn::AckFrequencyConfig::default();
     ack_freq
         .ack_eliciting_threshold(quinn::VarInt::from_u32(tuning.ack_threshold))
@@ -3068,7 +3069,6 @@ async fn copy_tcp_quic_inner(
         let c2s = async move {
             let mut buf = copy_buf_acquire();
             let mut total = 0u64;
-            let mut chunks = 0u64;
             let mut stamped = 0u64;
             loop {
                 reserve_copy_chunk(&mut buf);
@@ -3108,11 +3108,11 @@ async fn copy_tcp_quic_inner(
                     ));
                 }
                 total += n as u64;
-                chunks += 1;
-                if chunks & 7 == 0 {
-                    let now = b1.elapsed().as_millis() as u64;
-                    touch_stamp(&l1, &mut stamped, now, 100);
-                }
+                // Stamp every chunk (throttled to 100ms inside): gating on a
+                // chunk count starves slow trickle uploads past the 300s idle
+                // reap while downloads stamp every batch.
+                let now = b1.elapsed().as_millis() as u64;
+                touch_stamp(&l1, &mut stamped, now, 100);
             }
             send.finish().ok();
             copy_buf_release(buf);

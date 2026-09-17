@@ -176,6 +176,12 @@ impl SharedEgress {
         Some((c.clone(), *limit))
     }
 
+    fn get_stale(&self) -> Option<(quinn::Connection, usize)> {
+        let g = self.cached.try_read().ok()?;
+        let (c, limit, _) = g.as_ref()?;
+        Some((c.clone(), *limit))
+    }
+
     fn refresh_global(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize)> {
         // Single-flight: a loser drops fast (UDP semantics) instead of paying
         // the quinn locks while a winner is already refreshing.
@@ -1397,11 +1403,19 @@ async fn udp_associate_inner(
                 // check, no quinn lock. Only the global refresher (once per
                 // second) pays close_reason/max_datagram_size. A dead handle
                 // surfaces as ConnectionLost and invalidates the cache.
+                // Stale-while-revalidate: the 1s window expires for all
+                // associations at once and only the single-flight winner
+                // pays the quinn locks. Losers reuse the expired handle
+                // (a dead one surfaces as ConnectionLost and invalidates)
+                // instead of dropping one packet per association per second.
                 let (conn, limit) = match egress_shared.get_fresh(now) {
                     Some(v) => v,
                     None => match egress_shared.refresh_global(&pool, now) {
                         Some(v) => v,
-                        None => continue,
+                        None => match egress_shared.get_stale() {
+                            Some(v) => v,
+                            None => continue,
+                        },
                     },
                 };
                 // `limit` is the connection's live `max_datagram_size()`: the

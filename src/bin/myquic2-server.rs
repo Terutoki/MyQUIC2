@@ -98,6 +98,11 @@ const MAX_UNAUTH_CONNECTIONS: usize = 256;
 const MAX_SESSIONS_GLOBAL: usize = 8192;
 const LOCAL_SESS_MAX: usize = 4096;
 const LOCAL_SESS_TARGET: usize = LOCAL_SESS_MAX - 64;
+/// Per-shard sweep target: `sweep_local` runs on one shard, so comparing the
+/// shard length against the connection-global `LOCAL_SESS_TARGET` never fires
+/// (512 < 4032) and the per-connection cap silently stops working. Keep the
+/// global target for documentation, enforce the sharded one here.
+const LOCAL_SESS_TARGET_SHARD: usize = LOCAL_SESS_TARGET / SESS_SHARDS;
 const SESS_IDLE_MS: u64 = 180_000;
 /// Process-wide cap on concurrent TCP dials. Per-connection caps alone cannot
 /// bound fd usage when an unauthenticated peer can open many connections.
@@ -1001,16 +1006,6 @@ async fn forward_server_dgram(
         },
     }
 }
-/// Throttled liveness bump: readers only need ~1s resolution for the sweeper,
-/// so avoid a store per packet (stores bounce cache lines between cores).
-fn touch_session(t: &std::sync::atomic::AtomicU64) {
-    let now = mono_millis();
-    let prev = t.load(std::sync::atomic::Ordering::Relaxed);
-    if now.saturating_sub(prev) >= 1000 {
-        t.store(now, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// Evict sessions that are past their idle deadline, then arbitrary ones if the
 /// table is still over its target, and hand the removed entries back so the
 /// caller can abort their readers *after* releasing the table lock.
@@ -1036,7 +1031,7 @@ fn sweep_local(w: &mut HashMap<u32, SessEntry>) -> Vec<SessEntry> {
             evicted.push(e);
         }
     }
-    let over = w.len().saturating_sub(LOCAL_SESS_TARGET);
+    let over = w.len().saturating_sub(LOCAL_SESS_TARGET_SHARD);
     if over > 0 {
         let victims: Vec<u32> = w.keys().take(over).copied().collect();
         for k in victims {
@@ -1201,6 +1196,7 @@ struct TouchMemo {
     conn: usize,
     sess: u32,
     ms: u64,
+    tick: u64,
 }
 
 const TOUCH_SLOTS: usize = 8;
@@ -1223,26 +1219,22 @@ thread_local! {
 /// hash lookup and hash-map read lock this replaced.
 fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     const TOUCH_INTERVAL_MS: u64 = 1000;
-    // Clock reads are ~20ns vdso each; at 500kpps per core that is 1% CPU for
-    // timestamps alone. Sample the clock at most once per 64 packets: high-rate
-    // flows still refresh far more often than the 1 s interval, and slow flows
-    // stay safely inside the 180 s reap budget (64 packets at 1pps = 64 s).
-    thread_local! {
-        static TOUCH_TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-    let tick = TOUCH_TICK.with(|t| {
-        let v = t.get().wrapping_add(1);
-        t.set(v);
-        v
-    });
-    if tick & 63 != 0 {
-        let known = TOUCH_MEMO.with(|c| {
-            let c = c.borrow();
-            c.iter().flatten().any(|e| e.conn == conn && e.sess == sess)
-        });
-        if known {
-            return;
+    // Per-session sampling: the counter lives in the memo entry, so N
+    // round-robin sessions each sample every 64th of their own packets. A
+    // thread-global tick starves alternating flows (64 is even, so every
+    // sample lands on the same session) and lets the other expire at 180s.
+    let skip = TOUCH_MEMO.with(|c| {
+        let mut c = c.borrow_mut();
+        for e in c.iter_mut().flatten() {
+            if e.conn == conn && e.sess == sess {
+                e.tick = e.tick.wrapping_add(1);
+                return e.tick & 63 != 0;
+            }
         }
+        false
+    });
+    if skip {
+        return;
     }
     let now = mono_millis();
     let due = TOUCH_MEMO.with(|c| {
@@ -1265,6 +1257,7 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
             conn,
             sess,
             ms: now,
+            tick: 1,
         });
         true
     });
@@ -1401,7 +1394,7 @@ async fn get_or_create_sess(
         if let Some((sock, h, t, _)) = r.get(&s) {
             if !h.is_finished() {
                 let sock = sock.clone();
-                touch_session(t);
+                touch_session_throttled(conn_id, s, t);
                 return Some(sock);
             }
         }
@@ -1473,7 +1466,7 @@ async fn get_or_create_sess(
         let mut w = lock_write(sh);
         if let Some((sock2, h2, t, _)) = w.get(&s) {
             if !h2.is_finished() {
-                touch_session(t);
+                touch_session_throttled(conn_id, s, t);
                 let sock2 = sock2.clone();
                 drop(w);
                 h_pre.abort();
