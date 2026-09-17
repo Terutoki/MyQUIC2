@@ -297,6 +297,11 @@ pub fn normalize_alpn(configured: Option<&str>) -> Vec<u8> {
 /// byte be mistaken for (or polluted by) the ACK (see B1).
 pub const MQP_TCP_ACK: u8 = 0x00;
 
+/// Wire cap for the connection-auth token: the server reads at most this many
+/// bytes, so a longer configured token can never authenticate and must be
+/// rejected at startup instead of failing every handshake.
+pub const AUTH_TOKEN_MAX_BYTES: usize = 256;
+
 /// Encode a bound address for the ACK (no status byte). Datagram/stream
 /// target encoding rejects unspecified addresses; BND may legitimately be
 /// `0.0.0.0:0`, so this is a dedicated encoder that is never used to dial.
@@ -545,8 +550,12 @@ fn encode_datagram_with_header(
     let mut v = Vec::with_capacity(total);
     v.push(MQP_DGRAM_TYPE);
     v.extend_from_slice(&sess.to_le_bytes());
-    header.encode(&mut v).ok()?;
-    debug_assert_eq!(v.len(), DGRAM_PREFIX_LEN + header.len());
+    let hdr_len = header.len();
+    v.resize(v.len() + hdr_len, 0);
+    let start = v.len() - hdr_len;
+    let n = header.encode_into(&mut v[start..]);
+    debug_assert_eq!(n, hdr_len);
+    debug_assert_eq!(v.len(), DGRAM_PREFIX_LEN + hdr_len);
     v.extend_from_slice(payload);
     Some(Bytes::from(v))
 }
@@ -650,8 +659,12 @@ fn encode_fragment_with_header(
     v.extend_from_slice(&id.to_le_bytes());
     v.push(idx);
     v.push(total);
-    header.encode(&mut v).ok()?;
-    debug_assert_eq!(v.len(), FRAG_PREFIX_LEN + header.len());
+    let hdr_len = header.len();
+    v.resize(v.len() + hdr_len, 0);
+    let start = v.len() - hdr_len;
+    let n = header.encode_into(&mut v[start..]);
+    debug_assert_eq!(n, hdr_len);
+    debug_assert_eq!(v.len(), FRAG_PREFIX_LEN + hdr_len);
     v.extend_from_slice(chunk);
     Some(Bytes::from(v))
 }
@@ -695,10 +708,10 @@ pub struct ServerConf {
     #[serde(default)]
     pub auth_token: String,
     // ---- Transport tuning (all optional; None = low-latency default) ----
-    // Larger windows trade loaded latency for peak throughput: 8/16/8 MB
-    // reaches ~300 Mb/s @140 ms with ~2x the queue of the 4/8/4 MB default
-    // (~240 Mb/s). ACK threshold 8 + 10 ms delay saves reverse-path CPU at
-    // the cost of coarser RTT/loss feedback.
+    // Larger windows trade loaded latency for peak throughput: 4/8/4 MB
+    // reaches ~240 Mb/s @140 ms and 8/16/8 MB reaches ~300 Mb/s, against the
+    // 2/4/2 MB default (~114 Mb/s). ACK threshold 8 + 10 ms delay saves
+    // reverse-path CPU at the cost of coarser RTT/loss feedback.
     #[serde(default)]
     pub stream_receive_window_mb: Option<u64>,
     #[serde(default)]
@@ -776,10 +789,10 @@ fn d_5() -> u64 {
 }
 
 /// Runtime transport tuning resolved from optional TOML fields.
-/// Defaults are the low-latency preset for ~140 ms links (4/8/4 MB windows,
-/// ACK every 2nd, 5 ms delay): ~half the loaded queue of the 8/16/8 MB
-/// ceiling at ~240 Mb/s @140 ms. Raise the windows back to 8/16/8 MB for
-/// 300 Mb/s peak throughput at the cost of ~2x loaded latency.
+/// Defaults are the low-latency preset for ~140 ms links (2/4/2 MB windows,
+/// ACK every 2nd, 5 ms delay): ~114 Mb/s @140 ms with minimal loaded queue.
+/// Raise the windows to 4/8/4 MB for ~240 Mb/s or 8/16/8 MB for 300 Mb/s peak
+/// throughput at the cost of ~2x/4x loaded latency.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportTuning {
     pub stream_receive_window: u64,
@@ -792,9 +805,9 @@ pub struct TransportTuning {
 impl Default for TransportTuning {
     fn default() -> Self {
         Self {
-            stream_receive_window: 4 * 1024 * 1024,
-            receive_window: 8 * 1024 * 1024,
-            send_window: 4 * 1024 * 1024,
+            stream_receive_window: 2 * 1024 * 1024,
+            receive_window: 4 * 1024 * 1024,
+            send_window: 2 * 1024 * 1024,
             ack_threshold: 2,
             max_ack_delay: Duration::from_millis(5),
         }
@@ -809,9 +822,9 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 impl ServerConf {
     pub fn tuning(&self) -> TransportTuning {
         TransportTuning {
-            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 4),
-            receive_window: clamp_window_mb(self.receive_window_mb, 8),
-            send_window: clamp_window_mb(self.send_window_mb, 4),
+            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 2),
+            receive_window: clamp_window_mb(self.receive_window_mb, 4),
+            send_window: clamp_window_mb(self.send_window_mb, 2),
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
         }
@@ -825,9 +838,9 @@ impl ServerConf {
 impl ClientConf {
     pub fn tuning(&self) -> TransportTuning {
         TransportTuning {
-            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 4),
-            receive_window: clamp_window_mb(self.receive_window_mb, 8),
-            send_window: clamp_window_mb(self.send_window_mb, 4),
+            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 2),
+            receive_window: clamp_window_mb(self.receive_window_mb, 4),
+            send_window: clamp_window_mb(self.send_window_mb, 2),
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
         }
@@ -1317,13 +1330,11 @@ struct DnsMemo {
     expires: Instant,
 }
 
-const MEMO_SLOTS: usize = 8;
+const MEMO_SLOTS: usize = 32;
 
 thread_local! {
     static DNS_MEMO: std::cell::RefCell<[Option<DnsMemo>; MEMO_SLOTS]> =
-        const {
-            std::cell::RefCell::new([None, None, None, None, None, None, None, None])
-        };
+        std::cell::RefCell::new(std::array::from_fn(|_| None));
     static DNS_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1335,24 +1346,35 @@ struct MemoHit {
     expires: Instant,
 }
 
-/// Peek the memo slot that caches positive (`neg == false`) or negative
-/// results, but only if it holds our key. Deliberately does *not* read the
-/// clock: the caller reads it once, and only after a key match, so a memo miss
-/// is never charged a `clock_gettime` — the whole point of the memo is that a
-/// hit is cheaper than the global cache lookup, and a miss must not cost more
-/// than one.
-fn memo_peek(key: &str, neg: bool) -> Option<MemoHit> {
+/// Peek memo slots for our key in a single pass, returning the positive and
+/// negative hits separately. Deliberately does *not* read the clock: the
+/// caller reads it once, and only after a key match, so a memo miss is never
+/// charged a `clock_gettime` — the whole point of the memo is that a hit is
+/// cheaper than the global cache lookup, and a miss must not cost more than one.
+/// Single pass (not one scan per class) so the wider table stays cheap.
+fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
     DNS_MEMO.with(|c| {
         let c = c.borrow();
+        let want = key.as_bytes();
+        let mut pos = None;
+        let mut neg = None;
         for m in c.iter().flatten() {
-            if (m.addr.is_none() == neg) && &m.key[..m.len] == key.as_bytes() {
-                return Some(MemoHit {
+            if &m.key[..m.len] == want {
+                let hit = MemoHit {
                     addr: m.addr,
                     expires: m.expires,
-                });
+                };
+                if m.addr.is_none() {
+                    neg = Some(hit);
+                } else {
+                    pos = Some(hit);
+                }
+                if pos.is_some() && neg.is_some() {
+                    break;
+                }
             }
         }
-        None
+        (pos, neg)
     })
 }
 
@@ -1415,8 +1437,7 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     };
     // Memo first, and only then the clock: a memo hit costs one `Instant::now()`
     // and a byte compare instead of two global read locks.
-    let pos = memo_peek(key, false);
-    let neg = memo_peek(key, true);
+    let (pos, neg) = memo_peek_both(key);
     if pos.is_some() || neg.is_some() {
         let now = Instant::now();
         if let Some(m) = pos {
@@ -2674,7 +2695,23 @@ fn udp_retry_queues() -> &'static [tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETR
 }
 
 fn udp_retry_queue_for(dst: &SocketAddr) -> &'static tokio::sync::mpsc::Sender<UdpRetry> {
-    let h = dst.port() as usize;
+    // Shard by ip+port: port-only sharding collapses DNS(:53) / HTTPS(:443)
+    // heavy workloads into a single shard, reintroducing the HOL blocking
+    // the sharded pool was created to remove. Manual fold (no SipHash) keeps
+    // this at a few integer ops on the WouldBlock-only path.
+    const K: usize = 0x9e3779b97f4a7c15;
+    let h = match *dst {
+        SocketAddr::V4(a) => (u32::from_ne_bytes(a.ip().octets()) as usize)
+            .wrapping_mul(K)
+            .wrapping_add(a.port() as usize),
+        SocketAddr::V6(a) => {
+            let mut h = a.port() as usize;
+            for w in a.ip().segments() {
+                h = h.wrapping_mul(K).wrapping_add(w as usize);
+            }
+            h
+        }
+    };
     &udp_retry_queues()[h % UDP_RETRY_SHARDS]
 }
 
@@ -2686,7 +2723,7 @@ fn udp_retry_queue_for(dst: &SocketAddr) -> &'static tokio::sync::mpsc::Sender<U
 /// writable readiness, which would silently drop the first packet of every new
 /// session. A genuinely full socket buffer is real backpressure too. In both
 /// cases the packet is queued to a sharded global retry pool (one worker per
-/// shard, selected by destination port) so the caller never stalls, no task is
+/// shard, selected by destination ip+port) so the caller never stalls, no task is
 /// spawned per packet, and one slow destination cannot head-of-line-block every
 /// other session behind a single queue; a full shard drops (UDP semantics).
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
@@ -2698,6 +2735,38 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                 sock: sock.clone(),
                 dst,
                 payload,
+            };
+            if udp_retry_queue_for(&dst).try_send(req).is_err() {
+                let n = udp_write::dropped_no_permit();
+                warn_udp_write("retry budget exhausted", n, || {
+                    "send buffer full".to_string()
+                });
+            }
+        }
+        Err(e) => {
+            let n = udp_write::failed();
+            warn_udp_write("send failed", n, || e.to_string());
+        }
+    }
+}
+
+/// Borrowed fast path for replies built into a reused scratch buffer.
+///
+/// `udp_try_send` needs an owned `Bytes` because the WouldBlock retry queue
+/// owns the payload, which forced the reply path to `freeze()` its scratch
+/// buffer (one allocation) on every datagram. The fast path only borrows the
+/// slice for the syscall; only WouldBlock copies into an owned `Bytes` for
+/// the queue, so steady-state replies allocate nothing and the scratch buffer
+/// is reused across packets.
+pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: &[u8]) {
+    match sock.try_send_to(payload, dst) {
+        Ok(_) => udp_write::sent(),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            let _ = udp_write::retried();
+            let req = UdpRetry {
+                sock: sock.clone(),
+                dst,
+                payload: Bytes::copy_from_slice(payload),
             };
             if udp_retry_queue_for(&dst).try_send(req).is_err() {
                 let n = udp_write::dropped_no_permit();
@@ -4313,9 +4382,9 @@ mod tests {
             server_name = 'test.com'\nserver_cert_file = 'x'\n";
         let c: ClientConf = toml::from_str(base).unwrap();
         let t = c.tuning();
-        assert_eq!(t.stream_receive_window, 4 * 1024 * 1024);
-        assert_eq!(t.receive_window, 8 * 1024 * 1024);
-        assert_eq!(t.send_window, 4 * 1024 * 1024);
+        assert_eq!(t.stream_receive_window, 2 * 1024 * 1024);
+        assert_eq!(t.receive_window, 4 * 1024 * 1024);
+        assert_eq!(t.send_window, 2 * 1024 * 1024);
         assert_eq!(t.ack_threshold, 2);
         assert_eq!(t.max_ack_delay, Duration::from_millis(5));
         assert_eq!(c.conn_count(), 2);

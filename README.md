@@ -85,9 +85,9 @@ pass-15/pass-16/pass-17 throughput changes (wire-compatible, see passes 15, 16 a
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
-| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 8 MB per-connection receive window default |
+| **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 4 MB per-connection receive window default |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
-| **High-RTT tuned** | 4 MB per-stream / 8 MB aggregate receive window, 4 MB send window by default (~240 Mb/s at 140 ms, ~half the loaded queue) — 8/16/8 MB opt-in for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
+| **High-RTT tuned** | 2 MB per-stream / 4 MB aggregate receive window, 2 MB send window by default (~114 Mb/s at 140 ms, minimal loaded queue) — 4/8/4 MB opt-in for ~240 Mb/s, 8/16/8 MB for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
 | **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1 MB stripped each (rebuilt from this revision) |
 
 ---
@@ -471,12 +471,12 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the pass-17 revision (pass-16 base plus the per-shard session-cap
-fix, per-session liveness sampling, stale-while-revalidate egress, per-chunk
-upload stamps and the ACK-threshold comment fix) with the default feature set, so the relay
-counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB each. Three
-upgrade notes, all requiring **both** sides to be replaced together (plus one config
-note that needs no binary change):
+rebuilt from the current revision (pass-17 base plus the 2/4/2 MB default windows,
+ip+port retry sharding, single-validation encoder, zero-alloc reply path, wider
+memos and the over-long-token startup guard) with the default feature set, so the
+relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB
+each. Three upgrade notes, all requiring **both** sides to be replaced together
+(plus one config note that needs no binary change):
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -488,10 +488,9 @@ note that needs no binary change):
 - A binary built before pass 13 still copies every chunk through the TCP↔QUIC pump
   and allocates per SOCKS flow on the client. Wire-compatible, so a mixed pair works —
   it just leaves the pass-13 tax removals on the floor.
-- Config note (no binary change): the sample configs no longer pin 2/4/2 MB windows —
-  they omit tuning and use the 4/8/4 MB code defaults (~240 Mb/s @140 ms). A deployment
-  still on the old 2/4/2 samples stays at ~114 Mb/s single-stream until the tuning lines
-  are removed or raised; change both sides together.
+- Config note (no binary change): the sample configs omit tuning and follow the
+  code defaults, now 2/4/2 MB (~114 Mb/s @140 ms single-stream). For ~240/300 Mb/s
+  set 4/8/4 or 8/16/8 MB explicitly on both sides together.
 
 Verified by running the v1 pair under x86-64 emulation (Podman's amd64 runtime on
 Apple Silicon): both binaries execute, the QUIC handshake completes, and the full E2E
@@ -526,7 +525,7 @@ auth_token = ""                # shared secret ≤ 256 B; empty = disabled (fire
                                # Set a private random value here and on the client.
 # Optional tuning, mirrors the client (download capped by receiver window,
 # upload by sender window — change both sides together):
-# stream_receive_window_mb = 4, receive_window_mb = 8, send_window_mb = 4,
+# stream_receive_window_mb = 2, receive_window_mb = 4, send_window_mb = 2,
 # ack_threshold = 2, max_ack_delay_ms = 5, alpn = "h3"
 ```
 
@@ -542,7 +541,7 @@ gso = true
 keep_alive_secs = 5           # clamped to 1..3600; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
 auth_token = ""                     # must match the server (empty on both = disabled)
-# Optional tuning (defaults = 4/8/4 MB windows, ACK 2/5ms, dual connections):
+# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, dual connections):
 # stream_receive_window_mb, receive_window_mb, send_window_mb,
 # ack_threshold, max_ack_delay_ms, quic_conns = 1 (single), interactive_ports, alpn
 ```
@@ -557,12 +556,13 @@ Field notes:
 - `reconnect_timeout_secs` only bounds how long a *new SOCKS flow* waits for a live
   QUIC connection; it does not control redial backoff.
 - Transport tuning (`stream/receive/send_window_mb`, `ack_threshold`,
-  `max_ack_delay_ms`) defaults to the low-latency preset (4/8/4 MB, ACK 2/5 ms,
-  ~240 Mb/s @140 ms); set 8/16/8 MB + ACK 8/10 ms on **both sides** for 300 Mb/s
-  peak at ~2x loaded latency. The shipped samples omit tuning entirely and use these
-  defaults. Optimal total in flight ≈ link BDP — e.g. a
-  200M/140ms link (BDP 3.5 MB) wants 2/4/2 MB, which halves single-thread speed
-  (~114 Mb/s) while multi-thread still fills the link with minimal loaded latency.
+  `max_ack_delay_ms`) defaults to the low-latency preset (2/4/2 MB, ACK 2/5 ms,
+  ~114 Mb/s @140 ms); set 4/8/4 MB for ~240 Mb/s or 8/16/8 MB + ACK 8/10 ms on
+  **both sides** for 300 Mb/s peak at ~2x/~4x loaded latency. The shipped samples
+  omit tuning entirely and use these defaults. Optimal total in flight ≈ link BDP —
+  e.g. a 200M/140ms link (BDP 3.5 MB) is already served by the 2/4/2 MB default:
+  single-thread caps at ~114 Mb/s while multi-thread still fills the link with
+  minimal loaded latency.
 - `quic_conns = 2` (default) isolates bulk from interactive traffic; `1` restores
   the legacy single connection. `interactive_ports` pins latency-sensitive TCP
   ports to the interactive connection (default 53/123/3478–3481); all UDP always
@@ -646,9 +646,9 @@ All limits are constants in the sources; the table shows where to change them.
 | Client UDP associations | 4096 (excess replies REP=0x01, 256-datagram queue each) | `UdpHub::alloc_sess` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
-| Receive window (aggregate) | 8 MB/connection default (16 MB opt-in) | `TransportTuning` (`RECEIVE_WINDOW`) |
-| Receive window (per stream) | 4 MB default (8 MB opt-in) | `TransportTuning` (`STREAM_RECEIVE_WINDOW`) |
-| Send window | 4 MB/connection default (8 MB opt-in) | `TransportTuning` (`SEND_WINDOW`) |
+| Receive window (aggregate) | 4 MB/connection default (8/16 MB opt-in) | `TransportTuning` (`RECEIVE_WINDOW`) |
+| Receive window (per stream) | 2 MB default (4/8 MB opt-in) | `TransportTuning` (`STREAM_RECEIVE_WINDOW`) |
+| Send window | 2 MB/connection default (4/8 MB opt-in) | `TransportTuning` (`SEND_WINDOW`) |
 | Initial RTT / PMTU ceiling | 190 ms / 1472 B | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
@@ -716,10 +716,10 @@ Against RFC 1928 / RFC 1929:
 
 - **After reconnect**: UDP sessions self-heal (the server recreates `sess_id` state on
   the next packet); old TCP streams reset fast so apps reconnect instead of hanging.
-- **140 ms links**: tuned for the trans-Pacific BDP — 4 MB per-stream / 8 MB
-  aggregate receive window, 4 MB send window, BBR, ACK-every-2nd-packet with a
-  5 ms `max_ack_delay` by default (~240 Mb/s, ~half the loaded queue); opt in to
-  8/16/8 MB for 300 Mb/s. The SOCKS success reply is sent
+- **140 ms links**: tuned for the trans-Pacific BDP — 2 MB per-stream / 4 MB
+  aggregate receive window, 2 MB send window, BBR, ACK-every-2nd-packet with a
+  5 ms `max_ack_delay` by default (~114 Mb/s, minimal loaded queue); opt in to
+  4/8/4 MB for ~240 Mb/s or 8/16/8 MB for 300 Mb/s. The SOCKS success reply is sent
   optimistically (no 1-RTT wait for the remote dial), so the application's TLS
   handshake overlaps the server-side dial; server-side DNS avoids geo-misresolved IPs.
   A lossy path is the tradeoff: 8 MB allows ~6200 packets in flight per RTT, which

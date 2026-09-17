@@ -228,6 +228,12 @@ async fn main() -> Result<()> {
         .init();
     let a = Args::parse();
     let c: ServerConf = load_toml(&a.config)?;
+    if c.auth_token.len() > AUTH_MAX_BYTES {
+        anyhow::bail!(
+            "auth_token is {} B, over the {AUTH_MAX_BYTES} B wire cap (server only reads the first {AUTH_MAX_BYTES} B, so a longer token can never authenticate)",
+            c.auth_token.len()
+        );
+    }
     if !parse_congestion(&c.congestion) {
         warn!(
             "unknown congestion={:?}, falling back to bbr (want bbr|cubic)",
@@ -900,7 +906,7 @@ async fn dial_happy_eyeballs(
 /// over the IP, so remember the last few verdicts thread-locally. Same security
 /// outcome, no per-packet branch walk on the hot path.
 fn is_global_ip_cached(ip: IpAddr) -> bool {
-    const SLOTS: usize = 8;
+    const SLOTS: usize = 64;
     thread_local! {
         static CACHE: std::cell::RefCell<[(Option<IpAddr>, bool); SLOTS]> =
             const { std::cell::RefCell::new([(None, false); SLOTS]) };
@@ -1087,11 +1093,11 @@ struct SessMemo {
     abort: tokio::task::AbortHandle,
 }
 
-const SESS_MEMO_SLOTS: usize = 8;
+const SESS_MEMO_SLOTS: usize = 32;
 
 thread_local! {
     static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =
-        const { std::cell::RefCell::new([None, None, None, None, None, None, None, None]) };
+        std::cell::RefCell::new(std::array::from_fn(|_| None));
     static SESS_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1199,11 +1205,11 @@ struct TouchMemo {
     tick: u64,
 }
 
-const TOUCH_SLOTS: usize = 8;
+const TOUCH_SLOTS: usize = 32;
 
 thread_local! {
     static TOUCH_MEMO: std::cell::RefCell<[Option<TouchMemo>; TOUCH_SLOTS]> =
-        const { std::cell::RefCell::new([None, None, None, None, None, None, None, None]) };
+        std::cell::RefCell::new(std::array::from_fn(|_| None));
     static TOUCH_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

@@ -17,7 +17,7 @@ receive_window_mb = 4
 send_window_mb = 2
 ack_threshold = 2
 max_ack_delay_ms = 5
-# Transport tuning (all optional; omit = 4/8/4 MB windows, ACK 2/5ms).
+# Transport tuning (all optional; omit = 2/4/2 MB windows, ACK 2/5ms).
 # Must mirror the client's intent: download is capped by the receiver's
 # window, upload by the sender's, so change both sides together.
 # ALPN (optional; omit = h3 masquerade). Must match the client;

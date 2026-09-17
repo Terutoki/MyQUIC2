@@ -206,9 +206,12 @@ impl SharedEgress {
                 Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
                     Some(m) => {
                         let out = (c.clone(), m);
-                        if let Ok(mut w) = self.cached.try_write() {
-                            *w = Some((c.clone(), m, now_ms));
-                        }
+                        // Winner must publish the timestamp: try_write may fail under
+                        // reader load, and returning fresh without stamping causes a
+                        // refresh storm (every packet re-pays the quinn locks).
+                        // Single-flight bounds writers to one, so a blocking write
+                        // here only waits out short try_read critical sections.
+                        *myquic2::lock_write(&self.cached) = Some((c.clone(), m, now_ms));
                         return Some(out);
                     }
                     None => {
@@ -326,6 +329,12 @@ async fn main() -> Result<()> {
         .init();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
+    if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {
+        anyhow::bail!(
+            "auth_token is {} B, over the {AUTH_TOKEN_MAX_BYTES} B wire cap (server only reads the first {AUTH_TOKEN_MAX_BYTES} B, so a longer token can never authenticate)",
+            c.auth_token.len()
+        );
+    }
     if is_placeholder_token(&c.auth_token) {
         warn!("auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)");
     }
@@ -513,7 +522,7 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             };
             let reader = conn.read_datagram();
             tokio::pin!(reader);
-            const DISPATCH_CACHE: usize = 8;
+            const DISPATCH_CACHE: usize = 32;
             let mut cache: [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE] =
                 std::array::from_fn(|_| (u32::MAX, None));
             let mut rr: usize = 0;
@@ -1491,11 +1500,9 @@ async fn udp_associate_inner(
 /// holds it as `Bytes` (the received datagram). A full app socket buffer drops
 /// the datagram instead of stalling this association's reply task.
 ///
-/// The freed prefix is taken back only when the datagram was never handed to
-/// the socket task: `split_to` gives the socket an owned `Bytes`, and the buffer
-/// is refillable only while nothing else shares it. Once it is shared, a fresh
-/// buffer is allocated — otherwise the next reply would overwrite bytes another
-/// task is still holding (or, worse, be silently truncated).
+/// The scratch buffer is reused across replies: the fast path borrows it for
+/// the syscall and only WouldBlock copies into the retry queue, so there is
+/// no per-reply allocation and no aliasing with another task.
 fn send_reply(
     relay: &Arc<tokio::net::UdpSocket>,
     last_app: &std::sync::RwLock<Option<SocketAddr>>,
@@ -1524,15 +1531,7 @@ fn send_reply(
         }
     }
     pkt.extend_from_slice(payload);
-    // Hand the filled buffer over as an owned `Bytes` and start a fresh scratch
-    // buffer for the next reply. The single allocation here (exactly the
-    // datagram's size, so building it never reallocates) replaced two — the old
-    // shape allocated a `Vec` for the packet *and* copied the payload again on
-    // every slow-path send.
-    let out = std::mem::take(pkt).freeze();
-    let sent_len = out.len();
-    udp_try_send(relay, map_for_dual(app), out);
-    *pkt = bytes::BytesMut::with_capacity(sent_len.max(256));
+    udp_try_send_slice(relay, map_for_dual(app), &pkt[..]);
 }
 
 #[cfg(test)]

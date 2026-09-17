@@ -10,12 +10,12 @@ allow_private = true
 # Shared secret clients must present (set on both sides).
 # Leave empty to disable auth (then rely on firewall/network isolation).
 auth_token = ""
-# Default 4/8/4 MB matches code defaults; must mirror the client (download
+# Default 2/4/2 MB matches code defaults; must mirror the client (download
 # capped by receiver, upload by sender, so change both sides together).
-# Omit all five to use defaults; 8/16/8 MB for 300 Mb/s peak.
-# stream_receive_window_mb = 4
-# receive_window_mb = 8
-# send_window_mb = 4
+# Omit all five to use defaults; 4/8/4 MB for ~240 Mb/s, 8/16/8 MB for 300 Mb/s peak.
+# stream_receive_window_mb = 2
+# receive_window_mb = 4
+# send_window_mb = 2
 # ack_threshold = 2
 # max_ack_delay_ms = 5
 # ALPN (optional; omit = h3 masquerade). Must match the client;
