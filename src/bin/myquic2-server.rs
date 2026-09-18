@@ -1229,12 +1229,17 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
     // round-robin sessions each sample every 64th of their own packets. A
     // thread-global tick starves alternating flows (64 is even, so every
     // sample lands on the same session) and lets the other expire at 180s.
+    // Sampling starts only after 64 packets since the last store: count-based
+    // sampling starves trickle flows (< 64 packets per reap window), whose
+    // 2nd..63rd packets would all skip and leave `last` frozen until the
+    // 180 s sweep. Slow flows are rare, so a clock read per packet for them
+    // is noise; hot flows still pay 1/64 past the first 64.
     let skip = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
         for e in c.iter_mut().flatten() {
             if e.conn == conn && e.sess == sess {
                 e.tick = e.tick.wrapping_add(1);
-                return e.tick & 63 != 0;
+                return e.tick >= 64 && e.tick & 63 != 0;
             }
         }
         false
@@ -1249,6 +1254,10 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
             if e.conn == conn && e.sess == sess {
                 if now.saturating_sub(e.ms) >= TOUCH_INTERVAL_MS {
                     e.ms = now;
+                    // Reset the sampling window: the next 64 packets check
+                    // again, so a flow that slows to a trickle after a burst
+                    // can never be starved by the 1/64 sampler above.
+                    e.tick = 0;
                     return true;
                 }
                 return false;

@@ -206,12 +206,16 @@ impl SharedEgress {
                 Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
                     Some(m) => {
                         let out = (c.clone(), m);
-                        // Winner must publish the timestamp: try_write may fail under
-                        // reader load, and returning fresh without stamping causes a
-                        // refresh storm (every packet re-pays the quinn locks).
-                        // Single-flight bounds writers to one, so a blocking write
-                        // here only waits out short try_read critical sections.
-                        *myquic2::lock_write(&self.cached) = Some((c.clone(), m, now_ms));
+                        // Publish the timestamp without ever blocking the
+                        // executor: readers hold `try_read` only for an Arc
+                        // bump, but a blocking write would still park this
+                        // worker thread whenever one is inside. If the
+                        // `try_write` loses, this packet still uses the fresh
+                        // handle; the stamp stays expired so the next packet
+                        // retries (single-flight keeps it to one contender).
+                        if let Ok(mut w) = self.cached.try_write() {
+                            *w = Some((c.clone(), m, now_ms));
+                        }
                         return Some(out);
                     }
                     None => {

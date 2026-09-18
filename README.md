@@ -30,10 +30,13 @@ The previous pass removes the contention the shared paths still had at high
 association counts (single-flight egress refresh, sharded retry pool and session
 table, a per-connection fast path, sampled clocks, pooled pump buffers) — see
 [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump).
-The current pass fixes four correctness regressions the shared paths introduced
+The previous pass fixes four correctness regressions the shared paths introduced
 (per-shard session cap, per-session liveness sampling, stale-while-revalidate
 egress, slow-upload idle stamps) — see
 [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress).
+The current pass removes the last blocking lock from the shared egress path and
+fixes liveness for trickle flows — see
+[pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness).
 An earlier pass removed a **process-abort** reachable from
 normal network conditions (an MTU reduction could trip an accounting bug inside
 quinn-proto's drop-oldest DATAGRAM path); the build is back on crates.io
@@ -65,7 +68,7 @@ pass-15/pass-16/pass-17 throughput changes (wire-compatible, see passes 15, 16 a
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump) and [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress) and [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -473,7 +476,8 @@ Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
 rebuilt from the current revision (pass-17 base plus the 2/4/2 MB default windows,
 ip+port retry sharding, single-validation encoder, zero-alloc reply path, wider
-memos and the over-long-token startup guard) with the default feature set, so the
+memos, the over-long-token startup guard, and the pass-18 non-blocking egress
+publish + trickle-flow liveness fixes) with the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB
 each. Three upgrade notes, all requiring **both** sides to be replaced together
 (plus one config note that needs no binary change):
@@ -1556,6 +1560,32 @@ musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was la
 run green on pass 14 and is not re-run here — wire and behavior are unchanged, but
 treat throughput deltas as unmeasured until the bench harness runs on a real link.
 
+### 2026-09 hardening pass 18 — non-blocking egress publish, trickle-flow liveness
+
+Two small fixes on the pass-16/17 shared paths, same wire protocol (no ALPN bump,
+mixed pairs stay compatible):
+
+- **Egress publish never blocks the executor.** The single-flight winner in
+  `SharedEgress::refresh_global` published its timestamp with a blocking `std`
+  write lock. Readers hold it only for an Arc bump, but under a 4096-association
+  read flood a blocked writer can be starved, parking the whole worker thread. It
+  now uses `try_write`: on a lost race this packet still uses the fresh handle
+  and the stamp stays expired so the next packet retries (single-flight keeps it
+  to one contender). Same pattern `invalidate()` already used.
+- **Trickle flows keep their liveness.** The per-session 1/64 clock sampler never
+  checked the clock for a session's 2nd..63rd packets, so a unidirectional flow
+  under 64 packets per 180 s never advanced its stamp and was reaped as idle
+  despite live traffic — then recreated, churning a socket + task every 180 s per
+  trickle. Sampling now starts after 64 packets since the last store and the
+  window resets on every store: slow flows check every packet (noise — they are
+  rare by definition), hot flows still pay 1/64 past the first 64.
+
+Verified on this revision: `cargo test` 48/48 (47/47 without `stats`), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets.
+`dist/openwrt-x86_64/` rebuilt from this revision for all four CPU levels (static
+musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was last
+run green on pass 14 and is not re-run here — wire and behavior are unchanged.
+
 ---
 
 ## Roadmap
@@ -1585,6 +1615,7 @@ treat throughput deltas as unmeasured until the bench harness runs on a real lin
 - [x] Sharded server session table + per-connection fast path + sampled clocks (pass 16)
 - [x] Pooled TCP pump buffers + reply-path PMTU tracking + sampled abort logs (pass 16)
 - [x] Per-shard session-cap fix + per-session touch + stale-while-revalidate egress (pass 17)
+- [x] Non-blocking egress publish + trickle-flow liveness (pass 18)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
