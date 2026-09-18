@@ -1112,7 +1112,10 @@ const SESS_MEMO_SLOTS: usize = 32;
 thread_local! {
     static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =
         std::cell::RefCell::new(std::array::from_fn(|_| None));
-    static SESS_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn sess_memo_idx(conn: usize, sess: u32) -> usize {
+    (conn.wrapping_mul(31) ^ (sess as usize).wrapping_mul(0x9e3779b9)) % SESS_MEMO_SLOTS
 }
 
 fn sess_memo_put(
@@ -1124,23 +1127,7 @@ fn sess_memo_put(
 ) {
     SESS_MEMO.with(|c| {
         let mut m = c.borrow_mut();
-        for e in m.iter_mut().flatten() {
-            if e.conn == conn && e.sess == sess {
-                *e = SessMemo {
-                    conn,
-                    sess,
-                    sock,
-                    last,
-                    abort,
-                };
-                return;
-            }
-        }
-        let idx = SESS_RR.with(|r| {
-            let i = r.get() % SESS_MEMO_SLOTS;
-            r.set(i.wrapping_add(1));
-            i
-        });
+        let idx = sess_memo_idx(conn, sess);
         m[idx] = Some(SessMemo {
             conn,
             sess,
@@ -1157,10 +1144,12 @@ fn sess_memo_put(
 fn sess_memo_forget(conn: usize, sess: u32) {
     SESS_MEMO.with(|c| {
         let mut m = c.borrow_mut();
-        for e in m.iter_mut() {
-            if e.as_ref().is_some_and(|x| x.conn == conn && x.sess == sess) {
-                *e = None;
-            }
+        let idx = sess_memo_idx(conn, sess);
+        if m[idx]
+            .as_ref()
+            .is_some_and(|x| x.conn == conn && x.sess == sess)
+        {
+            m[idx] = None;
         }
     });
 }
@@ -1191,21 +1180,17 @@ enum SessHit {
 fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
     SESS_MEMO.with(|c| {
         let mut m = c.borrow_mut();
-        let mut found_stale = false;
-        for e in m.iter_mut() {
-            let Some(x) = e.as_ref() else { continue };
-            if x.conn == conn && x.sess == sess {
+        let idx = sess_memo_idx(conn, sess);
+        match m[idx].as_ref() {
+            Some(x) if x.conn == conn && x.sess == sess => {
                 if !x.abort.is_finished() {
-                    return SessHit::Fresh(x.sock.clone(), x.last.clone(), x.abort.clone());
+                    SessHit::Fresh(x.sock.clone(), x.last.clone(), x.abort.clone())
+                } else {
+                    m[idx] = None;
+                    SessHit::Stale
                 }
-                *e = None;
-                found_stale = true;
             }
-        }
-        if found_stale {
-            SessHit::Stale
-        } else {
-            SessHit::Miss
+            _ => SessHit::Miss,
         }
     })
 }
@@ -1233,7 +1218,10 @@ const TOUCH_SLOTS: usize = 32;
 thread_local! {
     static TOUCH_MEMO: std::cell::RefCell<[Option<TouchMemo>; TOUCH_SLOTS]> =
         std::cell::RefCell::new(std::array::from_fn(|_| None));
-    static TOUCH_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn touch_memo_idx(conn: usize, sess: u32) -> usize {
+    (conn.wrapping_mul(31) ^ (sess as usize).wrapping_mul(0x9e3779b9)) % TOUCH_SLOTS
 }
 
 /// Refresh `last` at most once per [`TOUCH_INTERVAL_MS`], using a thread-local
@@ -1243,26 +1231,25 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
     let now = mono_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
-        for e in c.iter_mut().flatten() {
-            if e.conn == conn && e.sess == sess {
+        let idx = touch_memo_idx(conn, sess);
+        match c[idx].as_mut() {
+            Some(e) if e.conn == conn && e.sess == sess => {
                 if now.saturating_sub(e.ms) >= TOUCH_INTERVAL_MS {
                     e.ms = now;
-                    return true;
+                    true
+                } else {
+                    false
                 }
-                return false;
+            }
+            _ => {
+                c[idx] = Some(TouchMemo {
+                    conn,
+                    sess,
+                    ms: now,
+                });
+                true
             }
         }
-        let idx = TOUCH_RR.with(|r| {
-            let i = r.get() % TOUCH_SLOTS;
-            r.set(i.wrapping_add(1));
-            i
-        });
-        c[idx] = Some(TouchMemo {
-            conn,
-            sess,
-            ms: now,
-        });
-        true
     });
     if due {
         last.store(now, std::sync::atomic::Ordering::Relaxed);
@@ -1314,9 +1301,9 @@ async fn sess_reader_task(
             last2.store(now, std::sync::atomic::Ordering::Relaxed);
         }
         // Active sessions track PMTU growth without waiting for the 60 s idle
-        // tick: at most one quinn lock per session per 5 s, and only while the
+        // tick: at most one quinn lock per session per 10 s, and only while the
         // session is actually receiving replies.
-        if now.saturating_sub(last_limit_refresh) >= 5000 {
+        if now.saturating_sub(last_limit_refresh) >= 10_000 {
             last_limit_refresh = now;
             match c2.max_datagram_size() {
                 Some(m) => limit = m,
@@ -1388,13 +1375,17 @@ async fn get_or_create_sess(
         }
         SessHit::Stale | SessHit::Miss => {}
     }
-    // Fast path: single shard read lock + lock-free timestamp bump. No write
-    // lock per packet, and concurrent sessions on different shards never share
-    // a cache line. A session whose reply reader has already exited is treated
-    // as absent so its next packet recreates it instead of black-holing.
+    // Fast path: single shard try-read + lock-free timestamp bump. Contended
+    // => fail fast through to the creation path (which also try-locks) instead
+    // of parking this reader; concurrent sessions on different shards never
+    // share a cache line. A session whose reply reader has already exited is
+    // treated as absent so its next packet recreates it instead of black-holing.
     {
         let sh = ss.shard(s);
-        let r = lock_read(sh);
+        let Some(r) = try_lock_read(sh) else {
+            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+            return None;
+        };
         if let Some((sock, h, t, _)) = r.get(&s) {
             if !h.is_finished() {
                 let sock = sock.clone();
@@ -1415,28 +1406,22 @@ async fn get_or_create_sess(
     let permit = match session_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            // Throttled reap: an O(n) sweep per packet under a new-session
-            // flood would stall the single per-connection reader behind the
-            // table write lock. At most one sweep per second; packets arriving
-            // inside the window drop fast (UDP semantics) instead of
-            // re-scanning the whole table.
-            static LAST_SWEEP_MS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let now = mono_millis();
-            let last = LAST_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
-            if now.saturating_sub(last) < 1000 {
-                dgram_drops::bump(&dgram_drops::SESSION_FULL);
-                return None;
+            // Throttled reap: per-worker 1/sec throttle (thread-local, no
+            // cross-core CAS herd) instead of one global atomic.
+            thread_local! {
+                static LAST_SWEEP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
             }
-            if LAST_SWEEP_MS
-                .compare_exchange(
-                    last,
-                    now,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_err()
-            {
+            let now = mono_millis();
+            let due = LAST_SWEEP_MS.with(|c| {
+                let last = c.get();
+                if now.saturating_sub(last) < 1000 {
+                    false
+                } else {
+                    c.set(now);
+                    true
+                }
+            });
+            if !due {
                 dgram_drops::bump(&dgram_drops::SESSION_FULL);
                 return None;
             }
@@ -1472,7 +1457,12 @@ async fn get_or_create_sess(
     let mut swept: Vec<SessEntry> = Vec::new();
     let (inserted, memo_data) = {
         let sh = ss.shard(s);
-        let mut w = lock_write(sh);
+        let Some(mut w) = try_lock_write(sh) else {
+            h_pre.abort();
+            drop(permit);
+            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+            return None;
+        };
         if let Some((sock2, h2, t, _)) = w.get(&s) {
             if !h2.is_finished() {
                 touch_session_throttled(conn_id, s, t);

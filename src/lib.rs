@@ -1271,6 +1271,42 @@ pub fn lock_mutex<T>(l: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     })
 }
 
+/// Non-blocking packet-path variants: never park a Tokio worker. `None` means
+/// "contended right now" and the caller must fail fast (UDP drop semantics or
+/// treat-as-miss), never block. Poison is still recovered the same way.
+pub fn try_lock_read<T>(l: &std::sync::RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    match l.try_read() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            warn_poisoned();
+            Some(e.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+pub fn try_lock_write<T>(l: &std::sync::RwLock<T>) -> Option<std::sync::RwLockWriteGuard<'_, T>> {
+    match l.try_write() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            warn_poisoned();
+            Some(e.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+pub fn try_lock_mutex<T>(l: &std::sync::Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match l.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            warn_poisoned();
+            Some(e.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 struct DnsInflightEntry {
     /// Own copy of the key so the cleanup guard can remove the entry even when
     /// the owner is a takeover task that did not insert it.
@@ -1343,7 +1379,11 @@ pub fn dns_is_inflight(host: &str, port: u16) -> bool {
             &owned
         }
     };
-    lock_mutex(dns_inflight_for(key)).contains_key(key)
+    // Packet path: contended => pretend inflight so we skip spawning instead
+    // of parking the worker on the singleflight mutex during a miss storm.
+    try_lock_mutex(dns_inflight_for(key))
+        .map(|inf| inf.contains_key(key))
+        .unwrap_or(true)
 }
 
 pub fn mono_millis() -> u64 {
@@ -1370,7 +1410,18 @@ const MEMO_SLOTS: usize = 32;
 thread_local! {
     static DNS_MEMO: std::cell::RefCell<[Option<DnsMemo>; MEMO_SLOTS]> =
         std::cell::RefCell::new(std::array::from_fn(|_| None));
-    static DNS_RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Direct-mapped memo index: O(1) single-slot probe instead of an O(32)
+/// linear scan per packet. A collision only evicts, never mis-serves,
+/// because the full key is still compared byte-for-byte.
+fn dns_memo_idx(key: &str) -> usize {
+    const K: u64 = 0x9e3779b97f4a7c15;
+    let mut h: u64 = 0;
+    for b in key.as_bytes() {
+        h = h.wrapping_mul(K).wrapping_add(*b as u64);
+    }
+    (h as usize) % MEMO_SLOTS
 }
 
 /// A matching memo slot, copied out so the borrow of the thread-local ends with
@@ -1390,26 +1441,22 @@ struct MemoHit {
 fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
     DNS_MEMO.with(|c| {
         let c = c.borrow();
+        let idx = dns_memo_idx(key);
         let want = key.as_bytes();
-        let mut pos = None;
-        let mut neg = None;
-        for m in c.iter().flatten() {
-            if &m.key[..m.len] == want {
+        match &c[idx] {
+            Some(m) if &m.key[..m.len] == want => {
                 let hit = MemoHit {
                     addr: m.addr,
                     expires: m.expires,
                 };
                 if m.addr.is_none() {
-                    neg = Some(hit);
+                    (None, Some(hit))
                 } else {
-                    pos = Some(hit);
-                }
-                if pos.is_some() && neg.is_some() {
-                    break;
+                    (Some(hit), None)
                 }
             }
+            _ => (None, None),
         }
-        (pos, neg)
     })
 }
 
@@ -1420,18 +1467,14 @@ fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
     }
     DNS_MEMO.with(|c| {
         let mut c = c.borrow_mut();
-        for e in c.iter_mut().flatten() {
+        let idx = dns_memo_idx(key);
+        if let Some(e) = c[idx].as_mut() {
             if &e.key[..e.len] == kb {
                 e.addr = addr;
                 e.expires = expires;
                 return;
             }
         }
-        let idx = DNS_RR.with(|r| {
-            let i = r.get() % MEMO_SLOTS;
-            r.set(i.wrapping_add(1));
-            i
-        });
         let mut m = DnsMemo {
             key: [0u8; DNS_KEY_BUF],
             len: kb.len(),
@@ -1493,7 +1536,9 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     // only their TTLs differ.
     let now = Instant::now();
     {
-        let m = lock_read(dns_cache_for(key));
+        let Some(m) = try_lock_read(dns_cache_for(key)) else {
+            return CachedLookup::Unknown;
+        };
         if let Some((t, v)) = m.get(key) {
             // Expiry is anchored to the global entry's insertion time, so the
             // memo can never outlive the cache TTL.
@@ -1507,7 +1552,9 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
         }
     }
     {
-        let n = lock_read(dns_neg_cache_for(key));
+        let Some(n) = try_lock_read(dns_neg_cache_for(key)) else {
+            return CachedLookup::Unknown;
+        };
         if let Some(t) = n.get(key) {
             let expires = *t + DNS_NEG_TTL;
             if now < expires {
@@ -1571,21 +1618,24 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
             &owned
         }
     };
-    // 1. Positive cache.
+    // 1. Positive cache. Try-lock: contended => treat as miss and fall
+    // through to singleflight instead of parking this task.
     {
-        let m = lock_read(dns_cache_for(key));
-        if let Some((t, v)) = m.get(key) {
-            if t.elapsed() < DNS_CACHE_TTL {
-                return Ok(v.clone());
+        if let Some(m) = try_lock_read(dns_cache_for(key)) {
+            if let Some((t, v)) = m.get(key) {
+                if t.elapsed() < DNS_CACHE_TTL {
+                    return Ok(v.clone());
+                }
             }
         }
     }
     // 2. Negative cache.
     {
-        let n = lock_read(dns_neg_cache_for(key));
-        if let Some(t) = n.get(key) {
-            if t.elapsed() < DNS_NEG_TTL {
-                anyhow::bail!("dns negative cached");
+        if let Some(n) = try_lock_read(dns_neg_cache_for(key)) {
+            if let Some(t) = n.get(key) {
+                if t.elapsed() < DNS_NEG_TTL {
+                    anyhow::bail!("dns negative cached");
+                }
             }
         }
     }
@@ -1632,7 +1682,9 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
             };
         }
         if !entry.owner.load(std::sync::atomic::Ordering::Acquire) {
-            // The owner died without publishing; re-enter and try to take over.
+            // The owner died without publishing; yield once so N woken
+            // waiters desynchronize instead of CAS-herding on `owner`.
+            tokio::task::yield_now().await;
             continue;
         }
         notified.await;
@@ -1648,10 +1700,11 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // the initial cache checks and the registration above; re-check before
     // issuing a duplicate upstream lookup.
     {
-        let m = lock_read(dns_cache_for(key));
-        if let Some((t, v)) = m.get(key) {
-            if t.elapsed() < DNS_CACHE_TTL {
-                return Ok(v.clone());
+        if let Some(m) = try_lock_read(dns_cache_for(key)) {
+            if let Some((t, v)) = m.get(key) {
+                if t.elapsed() < DNS_CACHE_TTL {
+                    return Ok(v.clone());
+                }
             }
         }
     }
@@ -1970,6 +2023,7 @@ pub mod dgram_drops {
 
     /// `(too_large, buffer_full)` totals since process start.
     pub fn snapshot() -> (u64, u64) {
+        flush_locals();
         (
             TOO_LARGE.load(Ordering::Relaxed),
             BUFFER_FULL.load(Ordering::Relaxed),
@@ -1978,6 +2032,7 @@ pub mod dgram_drops {
 
     /// `(too_large, buffer_full, session_full)` totals since process start.
     pub fn snapshot3() -> (u64, u64, u64) {
+        flush_locals();
         (
             TOO_LARGE.load(Ordering::Relaxed),
             BUFFER_FULL.load(Ordering::Relaxed),
@@ -1985,8 +2040,64 @@ pub mod dgram_drops {
         )
     }
 
+    fn flush_locals() {
+        L_TOO_LARGE.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                TOO_LARGE.fetch_add(v, Ordering::Relaxed);
+            }
+        });
+        L_BUFFER_FULL.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                BUFFER_FULL.fetch_add(v, Ordering::Relaxed);
+            }
+        });
+        L_SESSION_FULL.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                SESSION_FULL.fetch_add(v, Ordering::Relaxed);
+            }
+        });
+    }
+
+    thread_local! {
+        static L_TOO_LARGE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    fn batched(
+        counter: &AtomicU64,
+        local: &'static std::thread::LocalKey<std::cell::Cell<u64>>,
+    ) -> u64 {
+        let v = local.with(|c| {
+            let v = c.get().wrapping_add(1);
+            if v >= 64 {
+                c.set(0);
+                64
+            } else {
+                c.set(v);
+                0
+            }
+        });
+        if v != 0 {
+            counter.fetch_add(v, Ordering::Relaxed).saturating_add(v)
+        } else {
+            counter.load(Ordering::Relaxed).saturating_add(1)
+        }
+    }
+
     pub fn bump(counter: &AtomicU64) -> u64 {
-        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        if std::ptr::eq(counter, &TOO_LARGE) {
+            batched(counter, &L_TOO_LARGE)
+        } else if std::ptr::eq(counter, &BUFFER_FULL) {
+            batched(counter, &L_BUFFER_FULL)
+        } else if std::ptr::eq(counter, &SESSION_FULL) {
+            batched(counter, &L_SESSION_FULL)
+        } else {
+            counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        }
     }
 }
 
@@ -2731,14 +2842,15 @@ struct UdpRetry {
     payload: Bytes,
 }
 
-const UDP_RETRY_SHARDS: usize = 4;
+const UDP_RETRY_SHARDS: usize = 16;
+const UDP_RETRY_DEPTH: usize = 256;
 
 fn udp_retry_queues() -> &'static [tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETRY_SHARDS] {
     static TX: std::sync::OnceLock<[tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETRY_SHARDS]> =
         std::sync::OnceLock::new();
     TX.get_or_init(|| {
         std::array::from_fn(|_| {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(1024);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
             tokio::spawn(async move {
                 while let Some(req) = rx.recv().await {
                     let r = match req.payload.try_into_mut() {

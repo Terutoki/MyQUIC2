@@ -319,7 +319,7 @@ impl UdpHub {
     }
 
     fn sender(&self, s: u32) -> Option<tokio::sync::mpsc::Sender<Bytes>> {
-        myquic2::lock_read(self.shard(s)).get(&s).cloned()
+        myquic2::try_lock_read(self.shard(s))?.get(&s).cloned()
     }
 }
 
@@ -831,7 +831,14 @@ async fn wait_conn(
 ) -> Result<quinn::Connection> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(c) = shared.read().await.clone() {
+        if let Ok(g) = shared.try_read() {
+            if let Some(c) = g.clone() {
+                drop(g);
+                if c.close_reason().is_none() {
+                    return Ok(c);
+                }
+            }
+        } else if let Some(c) = shared.read().await.clone() {
             if c.close_reason().is_none() {
                 return Ok(c);
             }
@@ -1250,17 +1257,33 @@ async fn udp_associate_inner(
         let r2 = relay.clone();
         let last_app = last_app.clone();
         tokio::spawn(async move {
-            // One scratch buffer for the whole lifetime of the association: the
-            // reply is always "RSV/FRAG | addr | payload", so the header is
-            // written straight into it and the payload appended without any
-            // intermediate copy. `freeze()` then hands the filled buffer to the
-            // socket as a zero-copy `Bytes`; `send_reply` takes a fresh scratch
-            // buffer, because `bytes` cannot tell us whether the socket task
-            // kept the allocation.
             let mut pkt = bytes::BytesMut::with_capacity(256);
-            // Large replies arrive as MQP-2 fragments; reassemble them here so
-            // the app sees the datagram the server's peer actually sent.
             let mut reasm = DgramReassembler::new();
+            let mut cached_app: Option<SocketAddr> = None;
+            let mut cached_at: u64 = 0;
+            let mut refresh_app = |now: u64| -> Option<SocketAddr> {
+                if let Some(a) = cached_app {
+                    if now.saturating_sub(cached_at) < 200 {
+                        return Some(a);
+                    }
+                }
+                match last_app.try_read().ok().and_then(|g| *g) {
+                    Some(a) => {
+                        cached_app = Some(a);
+                        cached_at = now;
+                        Some(a)
+                    }
+                    None => {
+                        if cached_app.is_some() && now.saturating_sub(cached_at) < 1000 {
+                            cached_app
+                        } else {
+                            cached_app = None;
+                            udp_write::no_app();
+                            None
+                        }
+                    }
+                }
+            };
             while let Some(d) = rx.recv().await {
                 // ~1s resolution is plenty for the idle reaper.
                 let now = mono_millis();
@@ -1268,6 +1291,9 @@ async fn udp_associate_inner(
                 if now.saturating_sub(prev) >= 1000 {
                     last_activity_rx.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
+                let Some(app) = refresh_app(now) else {
+                    continue;
+                };
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else { continue };
                     let Some((_, a, whole)) = reasm.push(&f, now) else {
@@ -1275,10 +1301,10 @@ async fn udp_associate_inner(
                     };
                     udp_stats::payload(whole.len());
                     match a.as_ref() {
-                        TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, &whole, &mut pkt),
+                        TargetAddrRef::Ip(dst) => send_reply_addr(&r2, app, dst, &whole, &mut pkt),
                         TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
                             CachedLookup::Addr(dst) => {
-                                send_reply(&r2, &last_app, dst, &whole, &mut pkt)
+                                send_reply_addr(&r2, app, dst, &whole, &mut pkt)
                             }
                             CachedLookup::Negative | CachedLookup::Unknown => {}
                         },
@@ -1292,7 +1318,7 @@ async fn udp_associate_inner(
                 let payload = d.slice(off..);
                 udp_stats::payload(payload.len());
                 match a {
-                    TargetAddrRef::Ip(dst) => send_reply(&r2, &last_app, dst, &payload, &mut pkt),
+                    TargetAddrRef::Ip(dst) => send_reply_addr(&r2, app, dst, &payload, &mut pkt),
                     TargetAddrRef::Domain(h, p) => {
                         // The server always echoes replies with an IP-form source
                         // address, so this branch is defensive; the negative
@@ -1301,7 +1327,7 @@ async fn udp_associate_inner(
                         match lookup_cached_fast(h, p) {
                             CachedLookup::Negative => continue,
                             CachedLookup::Addr(dst) => {
-                                send_reply(&r2, &last_app, dst, &payload, &mut pkt)
+                                send_reply_addr(&r2, app, dst, &payload, &mut pkt)
                             }
                             CachedLookup::Unknown => {
                                 if dns_is_inflight(h, p) {
@@ -1413,25 +1439,18 @@ async fn udp_associate_inner(
                 if payload_off > n { continue; }
                 let payload = &buf[payload_off..n];
                 // Shared egress: per-packet path is a try_read + timestamp
-                // check, no quinn lock. Only the global refresher (once per
-                // second) pays close_reason/max_datagram_size. A dead handle
-                // surfaces as ConnectionLost and invalidates the cache.
-                // Stale-while-revalidate: the 1s window expires for all
-                // associations at once and only the single-flight winner
-                // pays the quinn locks. Losers reuse the expired handle
-                // (a dead one surfaces as ConnectionLost and invalidates)
-                // instead of dropping one packet per association per second.
+                // check, no quinn lock. Only the single-flight winner (once
+                // per second) pays close_reason/max_datagram_size. Stale
+                // handles are reused optimistically with no liveness check:
+                // a dead one surfaces as ConnectionLost on send and
+                // invalidates the cache there, so the expired window costs
+                // zero quinn locks instead of one close_reason per assoc.
                 let (conn, limit) = match egress_shared.get_fresh(now) {
                     Some(v) => v,
                     None => match egress_shared.refresh_global(&pool, now) {
                         Some(v) => v,
                         None => match egress_shared.get_stale() {
-                            Some((c, limit)) if c.close_reason().is_none() => (c, limit),
-                            Some(_) => {
-                                dgram_drops::bump(&dgram_drops::SESSION_FULL);
-                                egress_shared.invalidate();
-                                continue;
-                            }
+                            Some(v) => v,
                             None => continue,
                         },
                     },
@@ -1523,6 +1542,16 @@ fn send_reply(
         udp_write::no_app();
         return;
     };
+    send_reply_addr(relay, app, dst, payload, pkt);
+}
+
+fn send_reply_addr(
+    relay: &Arc<tokio::net::UdpSocket>,
+    app: SocketAddr,
+    dst: SocketAddr,
+    payload: &Bytes,
+    pkt: &mut bytes::BytesMut,
+) {
     pkt.truncate(0);
     pkt.extend_from_slice(&[0, 0, 0]);
     // The destination of a reply is always the source address the server
