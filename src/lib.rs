@@ -1191,10 +1191,34 @@ fn dns_key<'a>(host: &str, port: u16, buf: &'a mut [u8; DNS_KEY_BUF]) -> Option<
     std::str::from_utf8(&buf[..pos]).ok()
 }
 
-fn dns_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> {
-    static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+/// Shard count for the DNS tables. A single global `RwLock`/`Mutex` puts every
+/// packet-path reader on one reader count / one mutex cache line; sharding by
+/// key keeps the per-entry critical sections identical while spreading
+/// cross-core contention, the same pattern as the server session table and the
+/// client dispatcher hub.
+const DNS_SHARDS: usize = 16;
+
+/// Key-hash shard selector. Manual fold (no SipHash): this runs on the
+/// per-packet path and only needs spreading, not DoS resistance (keys are
+/// DNS names, and a collision only shares a lock, never a cache entry).
+fn dns_shard(key: &str) -> usize {
+    const K: u64 = 0x9e3779b97f4a7c15;
+    let mut h: u64 = 0;
+    for b in key.as_bytes() {
+        h = h.wrapping_mul(K).wrapping_add(*b as u64);
+    }
+    (h as usize) % DNS_SHARDS
+}
+
+fn dns_caches() -> &'static [std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>>; DNS_SHARDS] {
+    static CACHES: std::sync::OnceLock<
+        [std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>>; DNS_SHARDS],
+    > = std::sync::OnceLock::new();
+    CACHES.get_or_init(|| std::array::from_fn(|_| std::sync::RwLock::new(HashMap::new())))
+}
+
+fn dns_cache_for(key: &str) -> &'static std::sync::RwLock<HashMap<DnsCacheKey, DnsCacheVal>> {
+    &dns_caches()[dns_shard(key)]
 }
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -1206,10 +1230,15 @@ const DNS_NEG_MAX: usize = 4096;
 /// timeouts are sized to cover this plus the TCP connect budget.
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn dns_neg_cache() -> &'static std::sync::RwLock<HashMap<DnsCacheKey, Instant>> {
-    static NEG: std::sync::OnceLock<std::sync::RwLock<HashMap<DnsCacheKey, Instant>>> =
-        std::sync::OnceLock::new();
-    NEG.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+fn dns_neg_caches() -> &'static [std::sync::RwLock<HashMap<DnsCacheKey, Instant>>; DNS_SHARDS] {
+    static NEGS: std::sync::OnceLock<
+        [std::sync::RwLock<HashMap<DnsCacheKey, Instant>>; DNS_SHARDS],
+    > = std::sync::OnceLock::new();
+    NEGS.get_or_init(|| std::array::from_fn(|_| std::sync::RwLock::new(HashMap::new())))
+}
+
+fn dns_neg_cache_for(key: &str) -> &'static std::sync::RwLock<HashMap<DnsCacheKey, Instant>> {
+    &dns_neg_caches()[dns_shard(key)]
 }
 
 /// Poison-safe lock helpers. The previous `if let Ok(..)` handling silently
@@ -1277,7 +1306,7 @@ struct InflightCleanup<'a> {
 
 impl Drop for InflightCleanup<'_> {
     fn drop(&mut self) {
-        let mut inf = lock_mutex(dns_inflight());
+        let mut inf = lock_mutex(dns_inflight_for(&self.entry.key));
         if let Some(cur) = inf.get(&self.entry.key) {
             if Arc::ptr_eq(cur, self.entry) {
                 inf.remove(&self.entry.key);
@@ -1286,10 +1315,16 @@ impl Drop for InflightCleanup<'_> {
     }
 }
 
-fn dns_inflight() -> &'static std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>> {
-    static INF: std::sync::OnceLock<std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>> =
-        std::sync::OnceLock::new();
-    INF.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+/// Sharded single-flight table: one mutex per shard (see `DNS_SHARDS`).
+type DnsInflightTable = std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>;
+
+fn dns_inflights() -> &'static [DnsInflightTable; DNS_SHARDS] {
+    static INFS: std::sync::OnceLock<[DnsInflightTable; DNS_SHARDS]> = std::sync::OnceLock::new();
+    INFS.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())))
+}
+
+fn dns_inflight_for(key: &str) -> &'static DnsInflightTable {
+    &dns_inflights()[dns_shard(key)]
 }
 
 pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
@@ -1308,7 +1343,7 @@ pub fn dns_is_inflight(host: &str, port: u16) -> bool {
             &owned
         }
     };
-    lock_mutex(dns_inflight()).contains_key(key)
+    lock_mutex(dns_inflight_for(key)).contains_key(key)
 }
 
 pub fn mono_millis() -> u64 {
@@ -1458,7 +1493,7 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     // only their TTLs differ.
     let now = Instant::now();
     {
-        let m = lock_read(dns_cache());
+        let m = lock_read(dns_cache_for(key));
         if let Some((t, v)) = m.get(key) {
             // Expiry is anchored to the global entry's insertion time, so the
             // memo can never outlive the cache TTL.
@@ -1472,7 +1507,7 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
         }
     }
     {
-        let n = lock_read(dns_neg_cache());
+        let n = lock_read(dns_neg_cache_for(key));
         if let Some(t) = n.get(key) {
             let expires = *t + DNS_NEG_TTL;
             if now < expires {
@@ -1493,6 +1528,12 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 }
 
 const DNS_CACHE_MAX: usize = 4096;
+/// Per-shard positive-cache cap: shards share the process-wide total evenly,
+/// so the aggregate bound stays `DNS_CACHE_MAX` while no single write lock
+/// ever covers the whole table.
+const DNS_CACHE_MAX_SHARD: usize = DNS_CACHE_MAX / DNS_SHARDS;
+/// Per-shard negative-cache cap, same even split of `DNS_NEG_MAX`.
+const DNS_NEG_MAX_SHARD: usize = DNS_NEG_MAX / DNS_SHARDS;
 
 /// Batch eviction with a bounded write-lock hold: once the table crosses the
 /// cap, drop enough entries in one pass to cover the whole overflow, then
@@ -1504,11 +1545,11 @@ const DNS_CACHE_MAX: usize = 4096;
 /// reads already treat them as misses via the TTL check, so they just wait
 /// for arbitrary eviction. Work per call is O(over) clones + removes.
 fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
-    const SLACK: usize = 512;
-    if m.len() <= DNS_CACHE_MAX + SLACK {
+    const SLACK: usize = 32;
+    if m.len() <= DNS_CACHE_MAX_SHARD + SLACK {
         return;
     }
-    let over = m.len().saturating_sub(DNS_CACHE_MAX);
+    let over = m.len().saturating_sub(DNS_CACHE_MAX_SHARD);
     if over == 0 {
         return;
     }
@@ -1532,7 +1573,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     };
     // 1. Positive cache.
     {
-        let m = lock_read(dns_cache());
+        let m = lock_read(dns_cache_for(key));
         if let Some((t, v)) = m.get(key) {
             if t.elapsed() < DNS_CACHE_TTL {
                 return Ok(v.clone());
@@ -1541,7 +1582,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     }
     // 2. Negative cache.
     {
-        let n = lock_read(dns_neg_cache());
+        let n = lock_read(dns_neg_cache_for(key));
         if let Some(t) = n.get(key) {
             if t.elapsed() < DNS_NEG_TTL {
                 anyhow::bail!("dns negative cached");
@@ -1554,7 +1595,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     //    waiter re-claims it, so no waiter can sleep forever on a cell that
     //    nobody will ever fill.
     let entry = {
-        let mut inf = lock_mutex(dns_inflight());
+        let mut inf = lock_mutex(dns_inflight_for(key));
         match inf.get(key) {
             Some(c) => c.clone(),
             None => {
@@ -1607,7 +1648,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // the initial cache checks and the registration above; re-check before
     // issuing a duplicate upstream lookup.
     {
-        let m = lock_read(dns_cache());
+        let m = lock_read(dns_cache_for(key));
         if let Some((t, v)) = m.get(key) {
             if t.elapsed() < DNS_CACHE_TTL {
                 return Ok(v.clone());
@@ -1628,29 +1669,30 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     match &r {
         Ok(v) => {
             {
-                let mut m = lock_write(dns_cache());
+                let mut m = lock_write(dns_cache_for(key));
                 m.insert(key.to_owned(), (now, v.clone()));
                 evict_if_needed(&mut m);
             }
-            lock_write(dns_neg_cache()).remove(key);
+            lock_write(dns_neg_cache_for(key)).remove(key);
             if let Some(a) = v.first().copied() {
                 memo_put(key, Some(a), now + DNS_CACHE_TTL);
             }
         }
         Err(_) => {
             {
-                let mut n = lock_write(dns_neg_cache());
+                let mut n = lock_write(dns_neg_cache_for(key));
                 // Bounded hold: evict one arbitrary entry instead of a full
                 // O(n) `retain` scan under the write lock. Expired entries
                 // are already treated as misses by the TTL check on read,
                 // so eager reaping buys nothing while stalling every packet
-                // path reader during a failing-domain flood.
-                if n.len() >= DNS_NEG_MAX {
+                // path reader during a failing-domain flood. Per-shard cap
+                // keeps the process-wide total at `DNS_NEG_MAX`.
+                if n.len() >= DNS_NEG_MAX_SHARD {
                     if let Some(k) = n.keys().next().cloned() {
                         n.remove(&k);
                     }
                 }
-                if n.len() < DNS_NEG_MAX {
+                if n.len() < DNS_NEG_MAX_SHARD {
                     n.insert(key.to_owned(), now);
                 }
             }
@@ -1847,6 +1889,14 @@ pub enum DatagramSend {
 /// after: a `Pending` result may leave a waker registered, but the no-op waker
 /// is a valid `RawWaker` and the future is dropped immediately, so nothing is
 /// ever woken on a dangling task.
+///
+/// Cancellation-safety for the one caller ([`try_send_datagram`], verified
+/// against quinn 0.11.12 `connection.rs` `SendDatagram`): on `Blocked` quinn
+/// puts the datagram bytes back into the future (`this.data.replace(data)`)
+/// and parks on `datagrams_unblocked.notified()` (tokio `Notified`, whose
+/// `Drop` unregisters the waiter). Dropping the future after `Pending` therefore
+/// drops the bytes with it and leaves no waiter behind — no byte-count drift,
+/// no notify-queue residue. `cancelled_datagram_waits_leave_no_residue` pins this.
 ///
 /// Primitive behind [`try_send_datagram`]: `send_datagram_wait` takes quinn's
 /// connection-state mutex on every poll, so the non-blocking variant has to be
@@ -4257,6 +4307,29 @@ mod tests {
         assert_eq!(dns_key("same", 1, &mut a).unwrap(), "same\u{0}1");
     }
 
+    #[test]
+    fn dns_shards_split_keys_and_preserve_total_caps() {
+        assert_eq!(DNS_SHARDS, 16);
+        assert_eq!(DNS_CACHE_MAX_SHARD * DNS_SHARDS, DNS_CACHE_MAX);
+        assert_eq!(DNS_NEG_MAX_SHARD * DNS_SHARDS, DNS_NEG_MAX);
+        // Deterministic: the same key always lands on the same shard, or
+        // single-flight/warming would address a different lock than the lookup.
+        let mut a = [0u8; DNS_KEY_BUF];
+        let k = dns_key("example.com", 443, &mut a).unwrap().to_owned();
+        assert_eq!(dns_shard(&k), dns_shard(&k));
+        assert_eq!(dns_cache_for(&k) as *const _, dns_cache_for(&k) as *const _);
+        // Spreading: distinct names must cover multiple shards, or the
+        // sharding pays code without removing the single-lock contention.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..64 {
+            let h = format!("host{i}.example.com");
+            let mut b = [0u8; DNS_KEY_BUF];
+            let kk = dns_key(&h, 80, &mut b).unwrap().to_owned();
+            seen.insert(dns_shard(&kk));
+        }
+        assert!(seen.len() > 1, "sharding must spread keys, got {seen:?}");
+    }
+
     /// Live regression test for the quinn-proto datagram accounting.
     ///
     /// Saturation runs the send path that used to reach quinn's broken
@@ -4344,6 +4417,62 @@ mod tests {
             blocked > 0,
             "the send buffer must saturate within 64k x 1 KiB sends"
         );
+    }
+
+    /// P1 residue pin: hammering the `Blocked` path (each hit polls
+    /// `send_datagram_wait` once and drops the future) must leave the
+    /// endpoint/connection fully usable. A leaked waiter would wedge the
+    /// `datagrams_unblocked` notify queue and a leaked byte count would corrupt
+    /// the send-buffer accounting, either of which shows up here as a wedged
+    /// or unusable fresh connection on the same endpoint.
+    #[tokio::test]
+    async fn cancelled_datagram_waits_leave_no_residue() {
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let mut v = Vec::new();
+            for _ in 0..2 {
+                let incoming = server.accept().await.unwrap();
+                v.push(incoming.accept().unwrap().await.unwrap());
+            }
+            v
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let payload: Bytes = Bytes::from(vec![0u8; 1024]);
+        let mut blocked = 0usize;
+        for _ in 0..16 * 1024 {
+            match try_send_datagram(&conn, payload.clone()) {
+                DatagramSend::Sent => {}
+                DatagramSend::Blocked => blocked += 1,
+                other => panic!("unexpected datagram send result: {other:?}"),
+            }
+        }
+        assert!(
+            blocked > 0,
+            "must hit Blocked to exercise future cancellation"
+        );
+        assert!(conn.close_reason().is_none());
+        assert!(conn.max_datagram_size().is_some());
+        // Same endpoint, fresh connection: unaffected by the abandoned waiters.
+        let conn2 = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let _server_conns = accept.await.unwrap();
+        let mut sent = 0usize;
+        for _ in 0..16 {
+            match try_send_datagram(&conn2, payload.clone()) {
+                DatagramSend::Sent => sent += 1,
+                DatagramSend::Blocked => break,
+                other => panic!("fresh connection unexpected: {other:?}"),
+            }
+        }
+        assert!(sent > 0, "fresh connection must still send");
     }
 
     #[tokio::test]

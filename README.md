@@ -34,7 +34,12 @@ The previous pass fixes four correctness regressions the shared paths introduced
 (per-shard session cap, per-session liveness sampling, stale-while-revalidate
 egress, slow-upload idle stamps) — see
 [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress).
-The current pass fixes a liveness regression the per-session sampler introduced
+The current pass shards the DNS positive/negative/single-flight tables by key
+across 16 locks so no single reader count or mutex serializes the packet path,
+and pins `poll_once`'s future-cancellation safety with a proof plus a saturation
+regression test — see
+[pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof).
+The previous pass fixes a liveness regression the per-session sampler introduced
 (burst-then-trickle flows were reaped as idle), stops evicted sessions from
 pinning sockets in the memo/fast path, moves the memo write out of the table
 lock, counts session/DNS-budget drops, and pre-checks stale egress handles — see
@@ -50,7 +55,7 @@ coalescing and three security fixes — see
 [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
 Unit tests, clippy and fmt are re-verified on this revision on both feature sets;
 the full E2E suite was last run green on pass 14 and is not re-run for the
-pass-15 through pass-19 throughput/correctness changes (wire-compatible, see passes 15–19) — see
+pass-15 through pass-20 throughput/correctness changes (wire-compatible, see passes 15–20) — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
@@ -73,7 +78,7 @@ pass-15 through pass-19 throughput/correctness changes (wire-compatible, see pas
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness) and [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters) and [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -382,6 +387,7 @@ both feature sets, empty token):
 | 28 | Dual clients sharing sess id 1 on different server connections: 2 × 30000 UDP datagrams + 2 × 304 TCP `CONNECT`s concurrently | ✅ 60000/60000 echoed, 0 lost; 608/608 flows clean |
 | 29 | Reconnect cycle: `kill -9` server → restart → recover | ✅ detection 17.5 s (QUIC idle timeout), reconnect 1.8 s after the restarted server bound, UDP 2000/2000 self-heal |
 | 30 | `cargo test` 48/48 (47/47 without `stats`), clippy + `cargo fmt --check` clean on both feature sets | ✅ |
+| 31 | `cargo test --all-targets` 50/50 (49/49 without `stats`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets, `cargo build --release` (pass-20 revision) | ✅ |
 
 0-RTT probe (expect the last four lines):
 
@@ -479,10 +485,10 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass-19: touch-sampling regression fix, session-memo
-stale-slot GC, memo write moved out of the table lock, `SESSION_FULL` budget counters,
-and the client stale-egress liveness pre-check, on top of the pass-17/18 shared-path
-work) with the default feature set, so the
+rebuilt from the current revision (pass-20: 16-shard DNS positive/negative/
+single-flight tables, `poll_once` cancellation proof + saturation regression
+test, on top of the pass-19 touch-sampling/memo-GC/budget-counter work) with
+the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB
 each. Three upgrade notes, all requiring **both** sides to be replaced together
 (plus one config note that needs no binary change):
@@ -1624,6 +1630,32 @@ Verified on this revision: `cargo test` 48/48 (47/47 without `stats`), `cargo cl
 musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was last
 run green on pass 14 and is not re-run here — wire and behavior are unchanged.
 
+### 2026-09 hardening pass 20 — sharded DNS, cancel proof
+
+Lock-contention work on the DNS path plus a soundness pin on the DATAGRAM send
+path, same wire protocol (no ALPN bump, mixed pairs stay compatible):
+
+- **Sharded DNS tables.** The positive cache, negative cache and single-flight
+  table were each one global `std` lock, so every packet-path reader shared one
+  reader count / one mutex cache line. All three are now 16 shards selected by a
+  key fold (manual multiply-add, no SipHash on the hot path — a collision only
+  shares a lock, never an entry). Caps split evenly (256 + 32 slack / 256 per
+  shard, 4096 total preserved) and the single-flight register/cleanup paths shard
+  by the same key, so coalescing still meets.
+- **`poll_once` cancellation proof.** `try_send_datagram` polls
+  `send_datagram_wait` once with a noop waker and drops the future on `Pending`;
+  verified against quinn 0.11.12 (`Blocked` puts the bytes back into the future,
+  parks on tokio `Notified` whose `Drop` unregisters) and pinned by
+  `cancelled_datagram_waits_leave_no_residue`, which hammers the `Blocked` path
+  and proves a fresh connection on the same endpoint still sends.
+
+Verified on this revision: `cargo test --all-targets` 50/50 (49/49 without
+`stats`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
+clean on both feature sets, `cargo build --release` ok. `dist/openwrt-x86_64/`
+rebuilt from this revision for all four CPU levels (static musl, stripped,
+~4.1 MB each; `file` confirms x86-64). The full E2E suite was last run green on
+pass 14 and is not re-run here — wire and behavior are unchanged.
+
 ---
 
 ## Roadmap
@@ -1655,6 +1687,7 @@ run green on pass 14 and is not re-run here — wire and behavior are unchanged.
 - [x] Per-shard session-cap fix + per-session touch + stale-while-revalidate egress (pass 17)
 - [x] Non-blocking egress publish + trickle-flow liveness (pass 18)
 - [x] Touch-sampling regression fix + memo stale-slot GC + memo write out of the table lock + `SESSION_FULL` budget counters + stale-egress liveness pre-check (pass 19)
+- [x] Sharded DNS positive/negative/single-flight tables + `poll_once` cancellation proof and saturation regression test (pass 20)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
