@@ -34,7 +34,12 @@ The previous pass fixes four correctness regressions the shared paths introduced
 (per-shard session cap, per-session liveness sampling, stale-while-revalidate
 egress, slow-upload idle stamps) — see
 [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress).
-The current pass removes the last blocking lock from the shared egress path and
+The current pass fixes a liveness regression the per-session sampler introduced
+(burst-then-trickle flows were reaped as idle), stops evicted sessions from
+pinning sockets in the memo/fast path, moves the memo write out of the table
+lock, counts session/DNS-budget drops, and pre-checks stale egress handles — see
+[pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters).
+The previous pass removes the last blocking lock from the shared egress path and
 fixes liveness for trickle flows — see
 [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness).
 An earlier pass removed a **process-abort** reachable from
@@ -45,7 +50,7 @@ coalescing and three security fixes — see
 [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
 Unit tests, clippy and fmt are re-verified on this revision on both feature sets;
 the full E2E suite was last run green on pass 14 and is not re-run for the
-pass-15/pass-16/pass-17 throughput changes (wire-compatible, see passes 15, 16 and 17) — see
+pass-15 through pass-19 throughput/correctness changes (wire-compatible, see passes 15–19) — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
@@ -68,7 +73,7 @@ pass-15/pass-16/pass-17 throughput changes (wire-compatible, see passes 15, 16 a
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress) and [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness) and [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -474,10 +479,10 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass-17 base plus the 2/4/2 MB default windows,
-ip+port retry sharding, single-validation encoder, zero-alloc reply path, wider
-memos, the over-long-token startup guard, and the pass-18 non-blocking egress
-publish + trickle-flow liveness fixes) with the default feature set, so the
+rebuilt from the current revision (pass-19: touch-sampling regression fix, session-memo
+stale-slot GC, memo write moved out of the table lock, `SESSION_FULL` budget counters,
+and the client stale-egress liveness pre-check, on top of the pass-17/18 shared-path
+work) with the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.1 MB
 each. Three upgrade notes, all requiring **both** sides to be replaced together
 (plus one config note that needs no binary change):
@@ -1586,6 +1591,39 @@ Verified on this revision: `cargo test` 48/48 (47/47 without `stats`), `cargo cl
 musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was last
 run green on pass 14 and is not re-run here — wire and behavior are unchanged.
 
+### 2026-09 hardening pass 19 — touch regression, memo GC, budget counters
+
+Five fixes on the pass-16/17/18 shared paths, same wire protocol (no ALPN bump,
+mixed pairs stay compatible):
+
+- **Burst-then-trickle flows are no longer reaped as idle.** The per-session 1/64
+  count sampler only reset its window on a store, so a burst inside one second grew
+  `tick` without ever storing, and every later trickle packet kept skipping the clock
+  read — `last` froze until the 180 s sweep killed a live session. The throttle is
+  purely time-based now (one shared store per second per session, one clock read per
+  packet); the ~20 ns vdso read is an order of magnitude cheaper than the table lock
+  it replaces.
+- **Evicted sessions no longer pin sockets.** `sess_memo_lookup` clears stale slots on
+  read (releasing the `Arc`), so sweep/drain-aborted readers stop lingering in the
+  32-slot thread memo; the per-connection fast slot keeps its existing refresh-on-miss
+  rule and drops with its reader task.
+- **`sess_memo_put` left the table write lock.** The insert clones its `(sock, last,
+  abort)` inside the shard guard and publishes to the memo after the guard drops, so
+  the critical section holds only map operations.
+- **Budget drops are counted.** `dgram_drops::SESSION_FULL` covers the global 8192
+  session cap, the 1 s sweep throttle, `sess 0` refusals and DNS slow-path exhaustion
+  (previously silent); the server 60 s reporter prints a `udp budget` line and
+  `snapshot3()` keeps `snapshot()` compatible (`bump` is now `pub` for the binaries).
+- **Stale egress is liveness-checked.** The client reuses an expired handle only after
+  `close_reason().is_none()`; a dead one is counted, invalidated and dropped instead
+  of sending a packet that can never arrive.
+
+Verified on this revision: `cargo test` 48/48 (47/47 without `stats`), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets.
+`dist/openwrt-x86_64/` rebuilt from this revision for all four CPU levels (static
+musl, stripped, ~4.1 MB each; `file` confirms x86-64). The full E2E suite was last
+run green on pass 14 and is not re-run here — wire and behavior are unchanged.
+
 ---
 
 ## Roadmap
@@ -1616,6 +1654,7 @@ run green on pass 14 and is not re-run here — wire and behavior are unchanged.
 - [x] Pooled TCP pump buffers + reply-path PMTU tracking + sampled abort logs (pass 16)
 - [x] Per-shard session-cap fix + per-session touch + stale-while-revalidate egress (pass 17)
 - [x] Non-blocking egress publish + trickle-flow liveness (pass 18)
+- [x] Touch-sampling regression fix + memo stale-slot GC + memo write out of the table lock + `SESSION_FULL` budget counters + stale-egress liveness pre-check (pass 19)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the

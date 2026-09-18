@@ -1426,7 +1426,12 @@ async fn udp_associate_inner(
                     None => match egress_shared.refresh_global(&pool, now) {
                         Some(v) => v,
                         None => match egress_shared.get_stale() {
-                            Some(v) => v,
+                            Some((c, limit)) if c.close_reason().is_none() => (c, limit),
+                            Some(_) => {
+                                dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                                egress_shared.invalidate();
+                                continue;
+                            }
                             None => continue,
                         },
                     },

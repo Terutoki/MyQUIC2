@@ -423,6 +423,7 @@ fn spawn_udp_reporter() {
         let mut prev = udp_stats::snapshot();
         let mut prev_w = udp_write::snapshot();
         let mut prev_r = udp_stats::reassembly_drops();
+        let mut prev_d = dgram_drops::snapshot3();
         loop {
             tick.tick().await;
             let now = udp_stats::snapshot();
@@ -449,6 +450,15 @@ fn spawn_udp_reporter() {
                 );
                 prev_r = now_r;
             }
+            let now_d = dgram_drops::snapshot3();
+            let d_full = now_d.2.saturating_sub(prev_d.2);
+            if d_full > 0 {
+                info!(
+                    "udp budget (60s): {d_full} dropped (session/DNS cap); totals too_large={} buffer_full={} session_full={}",
+                    now_d.0, now_d.1, now_d.2
+                );
+            }
+            prev_d = now_d;
             prev = now;
             prev_w = now_w;
         }
@@ -980,11 +990,15 @@ async fn forward_server_dgram(
                     return;
                 }
                 if dns_slow_path_limiter().available_permits() == 0 {
+                    dgram_drops::bump(&dgram_drops::SESSION_FULL);
                     return;
                 }
                 let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
                     Ok(p) => p,
-                    Err(_) => return,
+                    Err(_) => {
+                        dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                        return;
+                    }
                 };
                 let ss = ss.clone();
                 let cd = cd.clone();
@@ -1176,13 +1190,15 @@ enum SessHit {
 /// so that connection's datagrams went out on the wrong session.
 fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
     SESS_MEMO.with(|c| {
-        let m = c.borrow();
+        let mut m = c.borrow_mut();
         let mut found_stale = false;
-        for e in m.iter().flatten() {
-            if e.conn == conn && e.sess == sess {
-                if !e.abort.is_finished() {
-                    return SessHit::Fresh(e.sock.clone(), e.last.clone(), e.abort.clone());
+        for e in m.iter_mut() {
+            let Some(x) = e.as_ref() else { continue };
+            if x.conn == conn && x.sess == sess {
+                if !x.abort.is_finished() {
+                    return SessHit::Fresh(x.sock.clone(), x.last.clone(), x.abort.clone());
                 }
+                *e = None;
                 found_stale = true;
             }
         }
@@ -1195,14 +1211,21 @@ fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
 }
 
 /// Per-thread view of the last liveness refresh, so the throttling decision
-/// costs no clock read. A `(connection, session, ms)` triple: session ids are
+/// costs no table lock. A `(connection, session, ms)` triple: session ids are
 /// only unique within a connection, so `(session, ms)` alone let two
 /// connections share — and thereby defeat — one throttle window.
+///
+/// NOTE: an earlier revision sampled the clock 1/64 by packet count. That
+/// starved trickle flows: a burst past 64 packets froze `tick` large without
+/// a store, and every later trickle packet kept skipping the clock read, so
+/// `last` froze until the 180s reap. The clock read (~20ns vdso) is an order
+/// of magnitude cheaper than the hash lookup + table lock it replaces, so the
+/// throttle is purely time-based now: at most one shared store per second per
+/// session, every packet pays one clock read.
 struct TouchMemo {
     conn: usize,
     sess: u32,
     ms: u64,
-    tick: u64,
 }
 
 const TOUCH_SLOTS: usize = 32;
@@ -1214,39 +1237,9 @@ thread_local! {
 }
 
 /// Refresh `last` at most once per [`TOUCH_INTERVAL_MS`], using a thread-local
-/// copy of the last refresh time and session id.
-///
-/// The memo hit path used to keep a session alive implicitly (it re-took the
-/// table lock and called `touch_session` on every packet). Skipping the table
-/// must not change that: an outbound-only flow would be reaped by the sweeper at
-/// its idle deadline and immediately recreated, churning a socket per flow every
-/// 180 s. The clock read stays on the hot path only in the sense that it decides
-/// whether to store — a `clock_gettime` is an order of magnitude cheaper than the
-/// hash lookup and hash-map read lock this replaced.
+/// copy of the last refresh time.
 fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     const TOUCH_INTERVAL_MS: u64 = 1000;
-    // Per-session sampling: the counter lives in the memo entry, so N
-    // round-robin sessions each sample every 64th of their own packets. A
-    // thread-global tick starves alternating flows (64 is even, so every
-    // sample lands on the same session) and lets the other expire at 180s.
-    // Sampling starts only after 64 packets since the last store: count-based
-    // sampling starves trickle flows (< 64 packets per reap window), whose
-    // 2nd..63rd packets would all skip and leave `last` frozen until the
-    // 180 s sweep. Slow flows are rare, so a clock read per packet for them
-    // is noise; hot flows still pay 1/64 past the first 64.
-    let skip = TOUCH_MEMO.with(|c| {
-        let mut c = c.borrow_mut();
-        for e in c.iter_mut().flatten() {
-            if e.conn == conn && e.sess == sess {
-                e.tick = e.tick.wrapping_add(1);
-                return e.tick >= 64 && e.tick & 63 != 0;
-            }
-        }
-        false
-    });
-    if skip {
-        return;
-    }
     let now = mono_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
@@ -1254,10 +1247,6 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
             if e.conn == conn && e.sess == sess {
                 if now.saturating_sub(e.ms) >= TOUCH_INTERVAL_MS {
                     e.ms = now;
-                    // Reset the sampling window: the next 64 packets check
-                    // again, so a flow that slows to a trickle after a burst
-                    // can never be starved by the 1/64 sampler above.
-                    e.tick = 0;
                     return true;
                 }
                 return false;
@@ -1272,7 +1261,6 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
             conn,
             sess,
             ms: now,
-            tick: 1,
         });
         true
     });
@@ -1382,6 +1370,7 @@ async fn get_or_create_sess(
     // datagram carrying it is malformed or hostile, not a new session.
     // Refusing here keeps it from pinning a global permit until the sweep.
     if s == 0 {
+        dgram_drops::bump(&dgram_drops::SESSION_FULL);
         return None;
     }
     // Zero-lock fast path: the common case (a burst of packets for one session)
@@ -1436,6 +1425,7 @@ async fn get_or_create_sess(
             let now = mono_millis();
             let last = LAST_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now.saturating_sub(last) < 1000 {
+                dgram_drops::bump(&dgram_drops::SESSION_FULL);
                 return None;
             }
             if LAST_SWEEP_MS
@@ -1447,13 +1437,17 @@ async fn get_or_create_sess(
                 )
                 .is_err()
             {
+                dgram_drops::bump(&dgram_drops::SESSION_FULL);
                 return None;
             }
             let evicted = ss.sweep_all(mono_millis());
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => return None,
+                Err(_) => {
+                    dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                    return None;
+                }
             }
         }
     };
@@ -1476,7 +1470,7 @@ async fn get_or_create_sess(
     let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();
     let mut swept: Vec<SessEntry> = Vec::new();
-    let inserted = {
+    let (inserted, memo_data) = {
         let sh = ss.shard(s);
         let mut w = lock_write(sh);
         if let Some((sock2, h2, t, _)) = w.get(&s) {
@@ -1508,12 +1502,17 @@ async fn get_or_create_sess(
             if let Some((_, hh, _, _)) = w.remove(&s) {
                 hh.abort();
             }
-            false
+            (false, None)
         } else {
-            sess_memo_put(conn_id, s, sock.clone(), last_pre.clone(), reader_abort);
-            true
+            (
+                true,
+                Some((sock.clone(), last_pre.clone(), reader_abort.clone())),
+            )
         }
     };
+    if let Some((msock, mlast, mabort)) = memo_data {
+        sess_memo_put(conn_id, s, msock, mlast, mabort);
+    }
     abort_evicted(stale_dead);
     abort_evicted(swept);
     if inserted {

@@ -1914,6 +1914,9 @@ pub mod dgram_drops {
     pub static TOO_LARGE: AtomicU64 = AtomicU64::new(0);
     /// Send buffer full: dropped per UDP semantics (quinn `Blocked`).
     pub static BUFFER_FULL: AtomicU64 = AtomicU64::new(0);
+    /// Session or DNS slow-path budget exhausted: dropped before a socket or
+    /// lookup was created (UDP semantics, fail-closed under flood).
+    pub static SESSION_FULL: AtomicU64 = AtomicU64::new(0);
 
     /// `(too_large, buffer_full)` totals since process start.
     pub fn snapshot() -> (u64, u64) {
@@ -1923,7 +1926,16 @@ pub mod dgram_drops {
         )
     }
 
-    pub(crate) fn bump(counter: &AtomicU64) -> u64 {
+    /// `(too_large, buffer_full, session_full)` totals since process start.
+    pub fn snapshot3() -> (u64, u64, u64) {
+        (
+            TOO_LARGE.load(Ordering::Relaxed),
+            BUFFER_FULL.load(Ordering::Relaxed),
+            SESSION_FULL.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn bump(counter: &AtomicU64) -> u64 {
         counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
     }
 }
