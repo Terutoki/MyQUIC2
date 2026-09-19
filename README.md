@@ -34,7 +34,15 @@ The previous pass fixes four correctness regressions the shared paths introduced
 (per-shard session cap, per-session liveness sampling, stale-while-revalidate
 egress, slow-upload idle stamps) — see
 [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress).
-The current pass removes the remaining packet-path park points the sharded
+The current pass removes the last per-packet application-side shared-state costs
+on the packet paths: a generation-tagged thread-local memo serves the client's
+outbound UDP egress handle with zero locks and zero refcount traffic, the
+dispatcher cache is direct-mapped and borrows the session sender instead of
+cloning it, the server's `is_global_ip` verdict memo is O(1), `wait_conn` trusts
+the maintained live bit instead of taking quinn's connection-state mutex per TCP
+flow, and `MAX_PAYLOAD` gets a per-thread high-water guard — see
+[pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch).
+The previous pass removes the remaining packet-path park points the sharded
 tables still had (try-lock fail-fast everywhere, optimistic stale egress with
 zero quinn locks, direct-mapped memos, batched drop counters, 16-shard retry
 pool, reply-address cache) — see
@@ -60,7 +68,12 @@ coalescing and three security fixes — see
 [Hardening notes](#2026-09-hardening-pass-10--back-to-cratesio-quinn-01118).
 Unit tests, clippy and fmt are re-verified on this revision on both feature sets;
 the full E2E suite was last run green on pass 14 and is not re-run for the
-pass-15 through pass-21 throughput/correctness changes (wire-compatible, see passes 15–21) — see
+pass-15 through pass-22 changes (wire-compatible); pass 22 additionally ran the
+real binaries end-to-end (TCP ECHO 1 MiB byte-for-byte, a UDP ASSOCIATE sweep of
+8–8000 B including the fragment path, 20 000 UDP datagrams at 0 % loss, 256 MiB
+bulk) plus a `kill -9` → restart cycle (detection 15.4 s, redial 0.13 s, the
+pre-kill UDP association self-healed) and an interleaved A/B against the
+pass-21 binaries — see
 [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
@@ -83,7 +96,7 @@ pass-15 through pass-21 throughput/correctness changes (wire-compatible, see pas
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof) and [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress) and [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -106,7 +119,7 @@ pass-15 through pass-21 throughput/correctness changes (wire-compatible, see pas
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 4 MB per-connection receive window default |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
 | **High-RTT tuned** | 2 MB per-stream / 4 MB aggregate receive window, 2 MB send window by default (~114 Mb/s at 140 ms, minimal loaded queue) — 4/8/4 MB opt-in for ~240 Mb/s, 8/16/8 MB for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.1 MB stripped each (rebuilt from this revision) |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.3 MB stripped each (rebuilt from this revision) |
 
 ---
 
@@ -394,6 +407,9 @@ both feature sets, empty token):
 | 30 | `cargo test` 48/48 (47/47 without `stats`), clippy + `cargo fmt --check` clean on both feature sets | ✅ |
 | 31 | `cargo test --all-targets` 50/50 (49/49 without `stats`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets, `cargo build --release` (pass-20 revision) | ✅ |
 | 32 | `cargo test --all-targets` 50/50 (49/49 without `stats`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets (pass-21 revision, this build) | ✅ |
+| 33 | `cargo test --all-targets` 58/58 (57/57 without `stats`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets; real-binary smoke: 200 TCP `CONNECT`s (5400 B echoed byte-for-byte), 20 000 UDP datagrams 0 % loss, 256 MiB bulk; interleaved A/B vs pass 21: bulk 126–132 vs 126–128 MB/s, UDP ~29.4k vs ~28.9k pps, TCP ~9.2k vs ~9.6k flows/s (all within noise) (pass-22 revision, this build) | ✅ |
+| 34 | Pass-22 E2E through the real binaries: TCP ECHO 1 MiB byte-for-byte; UDP ASSOCIATE sweep 8 / 1200 / 1420 / 1430 / 2000 / 8000 B × 5 each, 0 % loss in both directions (1430/2000/8000 exercise the `type=0x05` fragment path) | ✅ |
+| 35 | Pass-22 `kill -9` → restart: detection 15.4 s (QUIC idle timeout), stale 0-RTT ticket retried once, redial 0.13 s after the restarted server bound, TCP ECHO + UDP sweep green after reconnect, and a UDP association opened *before* the kill self-healed on its next datagram (20.1 s no-reply window) | ✅ |
 
 0-RTT probe (expect the last four lines):
 
@@ -491,9 +507,9 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass-21: no-park try-locks, optimistic
-stale egress, direct-mapped memos, batched drop counters, 16-shard retry pool,
-on top of the pass-20 sharded-DNS work) with
+rebuilt from the current revision (pass-22: lock-free egress memo, direct-mapped
+dispatcher cache and `is_global_ip` memo, `wait_conn` live-bit fast path, on top
+of the pass-21 no-park try-locks) with
 the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.3 MB
 each. Three upgrade notes, all requiring **both** sides to be replaced together
@@ -1704,6 +1720,86 @@ for all four CPU levels (static musl, stripped, ~4.3 MB each;
 `file` confirms x86-64). The full E2E suite was last run green on
 pass 14 and is not re-run here — wire and behavior are unchanged.
 
+### 2026-09 hardening pass 22 — lock-free egress memo, direct-mapped dispatch
+
+The last per-packet application-side shared-state costs on the client and server
+packet paths, same wire protocol (no ALPN bump, mixed pairs stay compatible).
+An architecture review rejected three larger proposals (below) with reasons, so
+this pass is deliberately narrow: it removes the remaining lock/refcount traffic
+that a single-flow loopback bench cannot resolve but that multiplies with
+association count and core count.
+
+- **Generation-tagged thread-local egress memo (client UDP outbound).** Every
+  outbound datagram used to take `SharedEgress.cached`'s `try_read` and clone the
+  `quinn::Connection` — an Arc RMW on a refcount line shared with quinn's
+  connection driver. `SharedEgress` now carries an `AtomicU64 generation` that is
+  bumped (Release) after every *successful* mutation of `cached` (the publish in
+  `refresh_global`, the clear in `invalidate`); a lost `try_write` mutates nothing
+  and does not bump. Each worker thread keeps a one-slot memo tagged with the
+  generation observed *before* its cached read, so a mutation racing an acquire
+  can only leave a stale entry, never a falsely fresh one. A hit is one Acquire
+  load plus one `RefCell` borrow, and `frag.send` runs on the borrowed handle
+  (`DgramFragmenter::send` is synchronous), so the hot path has **zero Arc RMWs
+  and zero quinn locks**. A refresh whose publish lost its `try_write` is tagged
+  with stamp 0, so it can never be served as fresh; the single-flight refresh and
+  stale-while-revalidate semantics are unchanged.
+- **Direct-mapped dispatcher cache (client UDP inbound).** The per-connection
+  dispatcher's 32-entry linear scan + round-robin replacement became a 1024-slot
+  direct-mapped table indexed by `sess & 1023`. Session ids are monotonic from
+  the hub's `AtomicU32`, so any window of ≤1024 live ids is collision-free. A
+  slot is a hit only when it names the exact session **and** holds a sender: a
+  cached absence or a collision re-probes the hub, so an id reused after `u32`
+  wrap can never be blackholed. The hit path borrows the cached `Sender`
+  (`try_send` takes `&self`), removing one channel-refcount RMW per datagram;
+  `Closed` still re-probes once and retries with the payload the error returned.
+- **Direct-mapped `is_global_ip_cached` (server).** The 64-slot linear scan with
+  a round-robin insert — paid per inbound datagram when `allow_private = false` —
+  is now a hashed O(1) probe with a full-key compare: a collision evicts the
+  slot and never serves another address's verdict. Security regression tests pin
+  the memo against `is_global_ip` across the whole filter table (private,
+  loopback, link-local, CGNAT, NAT64-embedded private, documentation, benchmark,
+  multicast, global) after every slot has been written, plus a cross-verdict
+  collision/eviction test.
+- **`wait_conn` trusts the maintained live bit (client TCP).** The per-flow
+  liveness check now reads the connection loop's `AtomicBool` first and only pays
+  `close_reason()` (quinn's connection-state mutex + error clone) when the bit
+  says dead — the accepted stale-dead window costs one failed flow, as before.
+  Because the bit can still read true for a beat after a `read_datagram` error,
+  the dispatcher waits on `gen.changed()` with a 10 ms backstop before re-entering
+  `wait_conn`, so the fast path can never busy-spin.
+- **Per-thread `MAX_PAYLOAD` high-water guard.** The per-payload shared load now
+  runs only when a thread sees a payload larger than any it has already recorded;
+  the global stays a max over all threads and the snapshot API is unchanged.
+
+**Rejected, with reasons.** *Per-thread sharded counters* (the existing 64–1024×
+thread-local batching already makes the remaining shared RMW rate noise, and
+`bump()`'s return contract is pinned by tests). *Server session-table 8→32
+shards* (the table is per-connection with exactly one DATAGRAM reader task —
+there is no cross-thread contention to spread, and more shards only worsen
+locality and shrink the per-shard cap). *DNS 16→32 shards* (memo hits dominate;
+no evidence it would help). *Forking quinn for a batch datagram receive API*
+(pass 5 measured an average drain batch of 1.06, and pass 10 retired a fork
+precisely to stop carrying security backports). quinn's per-datagram
+connection-state mutex remains the floor without an upstream batch API.
+
+Verified on this revision: `cargo test --all-targets` 58/58 (57/57 without
+`stats`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
+clean on both feature sets; the real binaries carried a 1 MiB TCP ECHO
+byte-for-byte, a UDP ASSOCIATE sweep of 8 / 1200 / 1420 / 1430 / 2000 / 8000 B
+(fragment path included) at 0 % loss, 20 000 UDP datagrams, and a 256 MiB bulk
+download. A `kill -9` → restart cycle behaved exactly as documented: detection
+after 15.4 s (QUIC idle timeout), one stale-ticket 0-RTT retry, redial 0.13 s
+after the restarted server bound, TCP ECHO and the full UDP sweep green after
+reconnect, and the UDP association opened before the kill self-healed on its
+next datagram. An interleaved A/B against the pass-21 binaries on the same host
+measured bulk 126–132 vs 126–128 MB/s, UDP ~29.4k vs ~28.9k pps and TCP ~9.2k vs
+~9.6k flows/s — **all inside run-to-run noise**, which is the expected result:
+these changes remove per-packet application-side tax that a single-association
+loopback bench cannot resolve (the same caveat as passes 13 and 15–21).
+`dist/openwrt-x86_64/` was rebuilt from this revision for all four CPU levels
+(v1–v4: static musl, x86-64, stripped, ~4.3–4.4 MB each; `file` confirms
+x86-64). The pass-21 binaries remain wire-compatible, so mixed pairs work.
+
 ---
 
 ## Roadmap
@@ -1737,6 +1833,8 @@ pass 14 and is not re-run here — wire and behavior are unchanged.
 - [x] Touch-sampling regression fix + memo stale-slot GC + memo write out of the table lock + `SESSION_FULL` budget counters + stale-egress liveness pre-check (pass 19)
 - [x] Sharded DNS positive/negative/single-flight tables + `poll_once` cancellation proof and saturation regression test (pass 20)
 - [x] No-park packet paths (try-lock fail-fast) + optimistic stale egress + direct-mapped memos + batched drop counters + 16-shard retry pool (pass 21)
+- [x] Generation-tagged thread-local egress memo (zero per-datagram locks/refcounts on client UDP outbound) + direct-mapped 1024-slot dispatcher cache with no per-packet `Sender` clone (pass 22)
+- [x] Direct-mapped `is_global_ip_cached` with security regression tests + `wait_conn` live-bit fast path + dispatcher spin guard + per-thread `MAX_PAYLOAD` high-water guard (pass 22)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the

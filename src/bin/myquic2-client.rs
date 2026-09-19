@@ -83,6 +83,42 @@ impl ConnSlot {
     fn is_live(&self) -> bool {
         self.live.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Wait for a live connection, waking on a generation bump or the deadline.
+    ///
+    /// The maintained `live` bit is trusted in the common case: it is one
+    /// atomic load where `close_reason()` takes quinn's connection-state mutex
+    /// and clones the error. `close_reason()` is still the authority when the
+    /// bit is false, which is the accepted race window before the reconnect
+    /// loop clears `shared`.
+    async fn wait_conn(
+        &self,
+        gen_rx: &mut watch::Receiver<u64>,
+        timeout: Duration,
+    ) -> Result<quinn::Connection> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(g) = self.shared.try_read() {
+                if let Some(c) = g.clone() {
+                    drop(g);
+                    if self.is_live() || c.close_reason().is_none() {
+                        return Ok(c);
+                    }
+                }
+            } else if let Some(c) = self.shared.read().await.clone() {
+                if self.is_live() || c.close_reason().is_none() {
+                    return Ok(c);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("quic unavailable (server restarting?)");
+            }
+            tokio::select! {
+                _ = gen_rx.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
 }
 
 /// Pure routing decision for tests: true = use `a`.
@@ -155,6 +191,26 @@ impl ConnPool {
     }
 }
 
+/// Thread-local single-slot memo for the shared egress handle.
+///
+/// The relay loop calls [`SharedEgress::with_fresh`] per outbound datagram.
+/// A `quinn::Connection` clone is an Arc refcount RMW on a cache line shared
+/// with quinn's connection driver, so doing it per packet ping-pongs that line
+/// across every relay task. The memo pins one clone per worker thread and
+/// serves it with no lock and no refcount traffic; a generation bump (any
+/// successful `cached` mutation) invalidates it without touching other threads.
+struct EgressMemo {
+    gen: u64,
+    conn: quinn::Connection,
+    limit: usize,
+    stamp_ms: u64,
+}
+
+thread_local! {
+    static EGRESS_MEMO: std::cell::RefCell<Option<EgressMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, Default)]
 struct SharedEgress {
     cached: std::sync::RwLock<Option<(quinn::Connection, usize, u64)>>,
@@ -164,25 +220,96 @@ struct SharedEgress {
     /// The rest fail fast (UDP drop semantics) instead of herding on the same
     /// mutexes the moment the 1 s window expires on 4096 associations at once.
     refreshing: std::sync::atomic::AtomicBool,
+    /// Bumped (Release) after every successful mutation of `cached` — the
+    /// publish in `refresh_global` and the clear in `invalidate`. A failed
+    /// `try_write` mutates nothing and does not bump. The thread-local memo
+    /// tags itself with the generation observed *before* its cached read, so a
+    /// mutation concurrent with an acquire invalidates every thread's memo at
+    /// once without a lock or a per-thread scan.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl SharedEgress {
-    fn get_fresh(&self, now_ms: u64) -> Option<(quinn::Connection, usize)> {
-        let g = self.cached.try_read().ok()?;
-        let (c, limit, t) = g.as_ref()?;
-        if now_ms.saturating_sub(*t) >= EGRESS_REFRESH_MS {
-            return None;
+    /// Serve the memoized handle when it is current and still fresh.
+    ///
+    /// `f` runs synchronously against the borrowed handle, so the hot path
+    /// costs one generation load and one `RefCell` borrow — no Arc RMW, no
+    /// quinn lock. A miss leaves the memo untouched; the caller re-acquires.
+    fn with_fresh<R>(
+        &self,
+        now_ms: u64,
+        f: impl FnOnce(&quinn::Connection, usize) -> R,
+    ) -> Option<R> {
+        let gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        EGRESS_MEMO.with(|slot| {
+            let memo = slot.borrow();
+            let entry = memo.as_ref()?;
+            if entry.gen == gen && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS {
+                Some(f(&entry.conn, entry.limit))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Publish a handle into this thread's memo (one clone per thread per
+    /// generation, not per packet). `gen` is the generation observed before the
+    /// acquire's cached read, so a mutation racing the acquire cannot leave a
+    /// stale memo entry behind.
+    fn memo_store(&self, gen: u64, conn: &quinn::Connection, limit: usize, stamp_ms: u64) {
+        EGRESS_MEMO.with(|slot| {
+            *slot.borrow_mut() = Some(EgressMemo {
+                gen,
+                conn: conn.clone(),
+                limit,
+                stamp_ms,
+            });
+        });
+    }
+
+    /// Drop this thread's memo entry (releasing a stale `Connection` promptly
+    /// when the cache has no usable handle at all).
+    fn memo_clear(&self) {
+        EGRESS_MEMO.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// Resolve a usable `(connection, limit, stamp)` from the process-wide
+    /// cache, refreshing through the single-flight gate when the cached handle
+    /// is expired. Returns `None` only when no handle is available, in which
+    /// case the caller drops the datagram (UDP semantics).
+    fn acquire(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize, u64)> {
+        if let Ok(g) = self.cached.try_read() {
+            if let Some((c, limit, t)) = g.as_ref() {
+                if now_ms.saturating_sub(*t) < EGRESS_REFRESH_MS {
+                    return Some((c.clone(), *limit, *t));
+                }
+            }
         }
-        Some((c.clone(), *limit))
+        if let Some((c, m, stamp)) = self.refresh_global(pool, now_ms) {
+            return Some((c, m, stamp));
+        }
+        // Stale-while-revalidate: an expired (or contended) handle is reused
+        // optimistically with no liveness check. A dead one surfaces as
+        // `ConnectionLost` on send and invalidates the cache there, so the
+        // expiry window costs zero quinn locks.
+        if let Ok(g) = self.cached.try_read() {
+            if let Some((c, limit, t)) = g.as_ref() {
+                return Some((c.clone(), *limit, *t));
+            }
+        }
+        self.memo_clear();
+        None
     }
 
-    fn get_stale(&self) -> Option<(quinn::Connection, usize)> {
-        let g = self.cached.try_read().ok()?;
-        let (c, limit, _) = g.as_ref()?;
-        Some((c.clone(), *limit))
-    }
-
-    fn refresh_global(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize)> {
+    /// Refresh `cached` under the single-flight gate. Returns the fresh handle
+    /// and the stamp to tag it with: `now_ms` when the publish landed, else `0`
+    /// (an unpublished handle must never be tagged fresh — the zero stamp keeps
+    /// the memo cold so the next packet retries).
+    fn refresh_global(
+        &self,
+        pool: &ConnPool,
+        now_ms: u64,
+    ) -> Option<(quinn::Connection, usize, u64)> {
         // Single-flight: a loser drops fast (UDP semantics) instead of paying
         // the quinn locks while a winner is already refreshing.
         if self
@@ -205,18 +332,26 @@ impl SharedEgress {
             match g.as_ref() {
                 Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
                     Some(m) => {
-                        let out = (c.clone(), m);
                         // Publish the timestamp without ever blocking the
                         // executor: readers hold `try_read` only for an Arc
                         // bump, but a blocking write would still park this
                         // worker thread whenever one is inside. If the
                         // `try_write` loses, this packet still uses the fresh
-                        // handle; the stamp stays expired so the next packet
-                        // retries (single-flight keeps it to one contender).
-                        if let Ok(mut w) = self.cached.try_write() {
+                        // handle; the zero stamp keeps the memo cold so the
+                        // next packet retries (single-flight keeps it to one
+                        // contender).
+                        let stamp = if let Ok(mut w) = self.cached.try_write() {
                             *w = Some((c.clone(), m, now_ms));
-                        }
-                        return Some(out);
+                            // Mutation rule: bump only after a successful
+                            // publish, so a lost `try_write` cannot invalidate
+                            // a memo that still matches the untouched cache.
+                            self.generation
+                                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                            now_ms
+                        } else {
+                            0
+                        };
+                        return Some((c.clone(), m, stamp));
                     }
                     None => {
                         if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -234,6 +369,10 @@ impl SharedEgress {
     fn invalidate(&self) {
         if let Ok(mut w) = self.cached.try_write() {
             *w = None;
+            // Mutation rule: bump only when the clear landed; a lost
+            // `try_write` leaves the cache untouched and the generation alone.
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -516,97 +655,86 @@ fn tcp_abort_log_due() -> bool {
     }
 }
 
+/// Direct-mapped dispatcher cache, one slot per session id modulo the table
+/// size. Session ids come from the hub's monotonic `AtomicU32`, so any window
+/// of ≤ `DISPATCH_CACHE` live ids maps collision-free; a collision only means
+/// the slot is re-probed, never that a packet is misrouted. Must be a power of
+/// two (the index is a mask).
+const DISPATCH_CACHE: usize = 1024;
+
+/// Route one inbound DATAGRAM to its association. A slot is a hit only when it
+/// names the exact session *and* holds a sender: a cached absence or a
+/// collision re-probes the hub (treating absence as a hit would blackhole a
+/// session id if it were ever reused after u32 wrap). The hit path borrows the
+/// cached `Sender` directly — `try_send` takes `&self`, so no refcount bump.
+fn dispatch_one(
+    cache: &mut [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE],
+    hub: &UdpHub,
+    sess: u32,
+    d: Bytes,
+) {
+    use tokio::sync::mpsc::error::TrySendError;
+    let idx = (sess as usize) & (DISPATCH_CACHE - 1);
+    if cache[idx].0 != sess || cache[idx].1.is_none() {
+        cache[idx] = (sess, hub.sender(sess));
+    }
+    if let Some(tx) = cache[idx].1.as_ref() {
+        if let Err(e) = tx.try_send(d) {
+            match e {
+                TrySendError::Closed(payload) => {
+                    let fresh = hub.sender(sess);
+                    cache[idx] = (sess, fresh.clone());
+                    match fresh.as_ref() {
+                        Some(f) => {
+                            if f.try_send(payload).is_err() {
+                                count_dispatch_drop(sess);
+                            }
+                        }
+                        None => count_dispatch_drop(sess),
+                    }
+                }
+                TrySendError::Full(_) => count_dispatch_drop(sess),
+            }
+        }
+    }
+}
+
 fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
     tokio::spawn(async move {
         let mut gen = slot.gen_rx.clone();
         loop {
-            let conn = match wait_conn(&slot.shared, &mut gen, Duration::from_secs(10)).await {
+            let conn = match slot.wait_conn(&mut gen, Duration::from_secs(10)).await {
                 Ok(c) => c,
                 Err(_) => continue,
             };
             let reader = conn.read_datagram();
             tokio::pin!(reader);
-            const DISPATCH_CACHE: usize = 32;
             let mut cache: [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE] =
                 std::array::from_fn(|_| (u32::MAX, None));
-            let mut rr: usize = 0;
+            let mut reader_failed = false;
             loop {
                 tokio::select! {
                     d = &mut reader => {
                         let d: Bytes = match d {
-                            Ok(d) => d, Err(_) => break,
+                            Ok(d) => d,
+                            Err(_) => { reader_failed = true; break; }
                         };
                         let Some(sess) = dgram_sess(&d) else {
                             continue;
                         };
-                        let mut cur: Option<tokio::sync::mpsc::Sender<Bytes>> = None;
-                        for (s, tx) in cache.iter() {
-                            if *s == sess {
-                                cur = tx.clone();
-                                break;
-                            }
-                        }
-                        if cur.is_none() {
-                            // Distinguish "never cached" from "cached as absent":
-                            // only a live sender avoids the shard lock; an
-                            // absent entry is re-probed via the hub below.
-                            let tx = hub.sender(sess);
-                            let mut placed = false;
-                            for e in cache.iter_mut() {
-                                if e.0 == sess || e.1.is_none() {
-                                    *e = (sess, tx.clone());
-                                    placed = true;
-                                    break;
-                                }
-                            }
-                            if !placed {
-                                let i = rr % DISPATCH_CACHE;
-                                rr = rr.wrapping_add(1);
-                                cache[i] = (sess, tx.clone());
-                            }
-                            cur = tx;
-                        }
-                        match cur.as_ref() {
-                            Some(tx) => {
-                                match tx.try_send(d) {
-                                    Ok(()) => {}
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(
-                                        payload,
-                                    )) => {
-                                        let fresh = hub.sender(sess);
-                                        for e in cache.iter_mut() {
-                                            if e.0 == sess {
-                                                e.1 = fresh.clone();
-                                                break;
-                                            }
-                                        }
-                                        match fresh.as_ref() {
-                                            Some(fresh) => {
-                                                if fresh.try_send(payload).is_err() {
-                                                    count_dispatch_drop(sess);
-                                                }
-                                            }
-                                            None => {
-                                                count_dispatch_drop(sess);
-                                            }
-                                        }
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        count_dispatch_drop(sess);
-                                    }
-                                }
-                            }
-                            None => {
-                                for e in cache.iter_mut() {
-                                    if e.0 == sess {
-                                        e.1 = None;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        dispatch_one(&mut cache, &hub, sess, d);
                     }
                     _ = gen.changed() => break,
+                }
+            }
+            if reader_failed {
+                // A read error can fire before the connection loop clears the
+                // live bit; without this, wait_conn would immediately hand back
+                // the same dead connection and the dispatcher would busy-spin.
+                // Wait for the generation bump, with a short backstop.
+                tokio::select! {
+                    _ = gen.changed() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                 }
             }
         }
@@ -824,35 +952,6 @@ async fn send_auth(conn: &quinn::Connection, token: &str) -> Result<()> {
     send_auth_stream(conn, token).await.map(|_| ())
 }
 
-async fn wait_conn(
-    shared: &SharedConn,
-    gen_rx: &mut watch::Receiver<u64>,
-    timeout: Duration,
-) -> Result<quinn::Connection> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Ok(g) = shared.try_read() {
-            if let Some(c) = g.clone() {
-                drop(g);
-                if c.close_reason().is_none() {
-                    return Ok(c);
-                }
-            }
-        } else if let Some(c) = shared.read().await.clone() {
-            if c.close_reason().is_none() {
-                return Ok(c);
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("quic unavailable (server restarting?)");
-        }
-        tokio::select! {
-            _ = gen_rx.changed() => {}
-            _ = tokio::time::sleep_until(deadline) => {}
-        }
-    }
-}
-
 /// One UDP activity line per minute.
 ///
 /// The only way to answer "is my UDP traffic actually going through the tunnel,
@@ -1000,7 +1099,7 @@ async fn handle_socks(
     let live = slot.live.clone();
     let mut gen_rx = slot.gen_rx.clone();
     let gen_tx = slot.gen_tx.clone();
-    let conn = match wait_conn(&shared, &mut gen_rx, timeout).await {
+    let conn = match slot.wait_conn(&mut gen_rx, timeout).await {
         Ok(c) => c,
         Err(e) => {
             // Answer the SOCKS client instead of just dropping the TCP
@@ -1438,23 +1537,15 @@ async fn udp_associate_inner(
                 let payload_off = 3 + hdr_len;
                 if payload_off > n { continue; }
                 let payload = &buf[payload_off..n];
-                // Shared egress: per-packet path is a try_read + timestamp
-                // check, no quinn lock. Only the single-flight winner (once
-                // per second) pays close_reason/max_datagram_size. Stale
-                // handles are reused optimistically with no liveness check:
-                // a dead one surfaces as ConnectionLost on send and
-                // invalidates the cache there, so the expired window costs
-                // zero quinn locks instead of one close_reason per assoc.
-                let (conn, limit) = match egress_shared.get_fresh(now) {
-                    Some(v) => v,
-                    None => match egress_shared.refresh_global(&pool, now) {
-                        Some(v) => v,
-                        None => match egress_shared.get_stale() {
-                            Some(v) => v,
-                            None => continue,
-                        },
-                    },
-                };
+                // Shared egress: the common case is a thread-local memo hit
+                // (one generation load, zero Arc RMWs and zero quinn locks);
+                // the lock path runs only on a generation change or once the
+                // memo's stamp expires, and the single-flight winner still
+                // pays close_reason/max_datagram_size at most once per refresh
+                // window. Stale handles are reused optimistically with no
+                // liveness check: a dead one surfaces as ConnectionLost on
+                // send and invalidates the cache there.
+                //
                 // `limit` is the connection's live `max_datagram_size()`: the
                 // real DATAGRAM budget for the discovered path MTU, with the
                 // QUIC overhead already subtracted. It is deliberately NOT
@@ -1462,7 +1553,27 @@ async fn udp_associate_inner(
                 // old `min(1350)` made every UDP payload above 1338 B vanish on
                 // a 1472 B path (see `dgram_payload_cap`). Payloads past a single
                 // frame are split by the fragmenter rather than dropped.
-                let sent = frag.send(&conn, sess, &addr, payload, limit);
+                let sent = match egress_shared.with_fresh(now, |c, limit| {
+                    frag.send(c, sess, &addr, payload, limit)
+                }) {
+                    Some(s) => s,
+                    None => {
+                        // Load the generation *before* the cached read: any
+                        // mutation concurrent with `acquire` then bumps past
+                        // this tag, so the memo below is never served for a
+                        // value the mutation replaced.
+                        let gen = egress_shared
+                            .generation
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        match egress_shared.acquire(&pool, now) {
+                            Some((conn, limit, stamp)) => {
+                                egress_shared.memo_store(gen, &conn, limit, stamp);
+                                frag.send(&conn, sess, &addr, payload, limit)
+                            }
+                            None => continue,
+                        }
+                    }
+                };
                 if sent.fragmented() {
                     tracing::debug!(
                         "udp assoc {sess}: {} B sent as {} fragments",
@@ -1737,5 +1848,164 @@ mod tests {
         assert!(select_slot(true, 0, false, Some(false)));
         assert!(select_slot(false, 0, false, Some(false)));
         assert!(!select_slot(false, 1, false, Some(false)));
+    }
+
+    /// Loopback QUIC endpoint pair through the same public TLS/transport
+    /// helpers `main` uses, for tests that need a real `quinn::Connection`.
+    /// The endpoints are returned alongside the client connection because
+    /// dropping them closes it.
+    async fn real_connection() -> (quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+        let certified = rcgen::generate_simple_self_signed(vec!["test.com".to_string()]).unwrap();
+        let alpn = normalize_alpn(None);
+        let server_tls = server_tls_config(
+            certified.cert.der().clone(),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into()),
+            &alpn,
+        )
+        .unwrap();
+        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+        let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        scfg.transport_config(build_transport("bbr", 5));
+        let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let client_tls = client_tls_config(certified.cert.der().clone(), &alpn).unwrap();
+        let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+        let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
+        ccfg.transport_config(build_transport("bbr", 5));
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(ccfg);
+
+        let accept = async {
+            let incoming = server.accept().await.unwrap();
+            incoming.accept().unwrap().await.unwrap()
+        };
+        let (conn, _server_conn) =
+            tokio::join!(client.connect(server_addr, "test.com").unwrap(), accept);
+        (conn.unwrap(), client, server)
+    }
+
+    /// The memo is served only while it is both current (generation matches)
+    /// and fresh (stamp inside the window); `invalidate` bumps the generation
+    /// so every thread's memo misses without a scan.
+    #[tokio::test]
+    async fn egress_memo_honours_generation_and_freshness() {
+        let (conn, _client, _server) = real_connection().await;
+        let e = SharedEgress::default();
+        let now = mono_millis();
+        *e.cached.try_write().unwrap() = Some((conn.clone(), 1200, now));
+        e.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let gen = e.generation.load(std::sync::atomic::Ordering::Acquire);
+        e.memo_store(gen, &conn, 1200, now);
+        assert_eq!(e.with_fresh(now, |_, limit| limit), Some(1200));
+        assert!(
+            e.with_fresh(now + EGRESS_REFRESH_MS, |_, _| ()).is_none(),
+            "a stamp past the refresh window must miss"
+        );
+        e.invalidate();
+        assert!(
+            e.with_fresh(now, |_, _| ()).is_none(),
+            "a successful invalidate bumps the generation and drops the memo"
+        );
+        // A memo tagged before a later bump is not served even while its stamp
+        // is still inside the window.
+        let old_gen = e.generation.load(std::sync::atomic::Ordering::Acquire);
+        e.memo_store(old_gen, &conn, 1200, now);
+        assert!(e.with_fresh(now, |_, _| ()).is_some());
+        e.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        assert!(e.with_fresh(now, |_, _| ()).is_none());
+    }
+
+    fn empty_dispatch_cache() -> [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE] {
+        std::array::from_fn(|_| (u32::MAX, None))
+    }
+
+    #[tokio::test]
+    async fn dispatch_first_packet_probes_hub_and_delivers() {
+        let hub = UdpHub::new();
+        let (sess, _tx, mut rx) = hub.alloc_sess().unwrap();
+        let mut cache = empty_dispatch_cache();
+        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"a"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+        assert_eq!(cache[(sess as usize) & (DISPATCH_CACHE - 1)].0, sess);
+    }
+
+    #[tokio::test]
+    async fn dispatch_cache_hit_does_not_reprobe_the_hub() {
+        let hub = UdpHub::new();
+        let (sess, _tx, mut rx) = hub.alloc_sess().unwrap();
+        let mut cache = empty_dispatch_cache();
+        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"a"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+        // Drop the hub subscription but keep the receiver alive: a cache hit
+        // must deliver through the cached sender with no hub probe.
+        hub.remove(sess);
+        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"b"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"b"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_absent_slot_reprobes_the_hub() {
+        let hub = UdpHub::new();
+        let sess = 7777u32;
+        let mut cache = empty_dispatch_cache();
+        // No subscription yet: the packet is dropped and the slot caches absent.
+        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"x"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        myquic2::lock_write(hub.shard(sess)).insert(sess, tx);
+        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"y"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"y"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_collision_reprobes_and_delivers_both() {
+        let hub = UdpHub::new();
+        let s1 = 100u32;
+        let s2 = s1 + DISPATCH_CACHE as u32;
+        assert_eq!(
+            (s1 as usize) & (DISPATCH_CACHE - 1),
+            (s2 as usize) & (DISPATCH_CACHE - 1)
+        );
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Bytes>(8);
+        myquic2::lock_write(hub.shard(s1)).insert(s1, tx1);
+        myquic2::lock_write(hub.shard(s2)).insert(s2, tx2);
+        let mut cache = empty_dispatch_cache();
+        dispatch_one(&mut cache, &hub, s1, Bytes::from_static(b"1"));
+        dispatch_one(&mut cache, &hub, s2, Bytes::from_static(b"2"));
+        dispatch_one(&mut cache, &hub, s1, Bytes::from_static(b"3"));
+        assert_eq!(rx1.try_recv().unwrap(), Bytes::from_static(b"1"));
+        assert_eq!(rx2.try_recv().unwrap(), Bytes::from_static(b"2"));
+        assert_eq!(rx1.try_recv().unwrap(), Bytes::from_static(b"3"));
+    }
+
+    /// `wait_conn` trusts the maintained live bit (no `close_reason()` mutex in
+    /// the common case) and still fails fast once the bit is false, with
+    /// `close_reason()` as the authority.
+    #[tokio::test]
+    async fn wait_conn_trusts_the_live_bit_and_bounds_the_dead_case() {
+        let (conn, _client, _server) = real_connection().await;
+        let slot = ConnSlot::fresh();
+        *slot.shared.try_write().unwrap() = Some(conn.clone());
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (_gen_tx, mut gen_rx) = watch::channel(0u64);
+
+        // The live bit is the maintained hint: a locally closed connection is
+        // still handed out while the bit is set (the accepted race window).
+        conn.close(0u32.into(), b"test");
+        assert!(slot
+            .wait_conn(&mut gen_rx, Duration::from_secs(1))
+            .await
+            .is_ok());
+
+        slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            slot.wait_conn(&mut gen_rx, Duration::from_millis(50))
+                .await
+                .is_err(),
+            "a dead slot must fail at the deadline, not hand out a dead handle"
+        );
     }
 }

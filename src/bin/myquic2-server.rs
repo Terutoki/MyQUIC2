@@ -908,49 +908,52 @@ async fn dial_happy_eyeballs(
     res
 }
 
-/// Forward one decoded datagram to its session socket. Takes the borrowed
-/// address form so the non-fragment fast path never materializes a
-/// `TargetAddr` (a domain packet would otherwise pay a `String` alloc per
-/// packet just to be borrowed again for the DNS lookup below).
-/// Fixed-destination flows pay `is_global_ip` per packet; the predicate is pure
-/// over the IP, so remember the last few verdicts thread-locally. Same security
-/// outcome, no per-packet branch walk on the hot path.
+const SLOTS: usize = 64;
+
+/// Mix an IP into `0..SLOTS` with a manual multiply-add fold (no
+/// SipHash on the packet path). A collision only shares a slot — the probe
+/// compares the full key — so it can evict an entry but never mis-serve one.
+fn ip_cache_idx(ip: IpAddr) -> usize {
+    let mut h: u64 = 0;
+    match ip {
+        IpAddr::V4(v4) => {
+            for o in v4.octets() {
+                h = h.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(o as u64);
+            }
+        }
+        IpAddr::V6(v6) => {
+            for s in v6.segments() {
+                h = h.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(s as u64);
+            }
+        }
+    }
+    (h % SLOTS as u64) as usize
+}
+
+/// Direct-mapped per-thread memo of `is_global_ip` verdicts.
+///
+/// Fixed-destination flows pay `is_global_ip` per inbound datagram, and the
+/// predicate is pure over the IP, so the verdict is remembered thread-locally.
+/// One hashed slot per address with a full-key compare makes a probe O(1)
+/// instead of the O(SLOTS) linear scan the first revision used; a collision
+/// only evicts the slot, so the security outcome is the same as calling the
+/// predicate directly — only an exact key match is ever returned, never
+/// another address's verdict.
 fn is_global_ip_cached(ip: IpAddr) -> bool {
-    const SLOTS: usize = 64;
     thread_local! {
         static CACHE: std::cell::RefCell<[(Option<IpAddr>, bool); SLOTS]> =
             const { std::cell::RefCell::new([(None, false); SLOTS]) };
-        static RR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
-    CACHE
-        .with(|c| {
-            let c = c.borrow();
-            for (k, v) in c.iter() {
-                if *k == Some(ip) {
-                    return Some(*v);
-                }
-            }
-            None
-        })
-        .unwrap_or_else(|| {
-            let v = is_global_ip(ip);
-            CACHE.with(|c| {
-                let mut c = c.borrow_mut();
-                for e in c.iter_mut() {
-                    if e.0 == Some(ip) {
-                        e.1 = v;
-                        return;
-                    }
-                }
-                let i = RR.with(|r| {
-                    let i = r.get() % SLOTS;
-                    r.set(i.wrapping_add(1));
-                    i
-                });
-                c[i] = (Some(ip), v);
-            });
-            v
-        })
+    let idx = ip_cache_idx(ip);
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c[idx].0 == Some(ip) {
+            return c[idx].1;
+        }
+        let v = is_global_ip(ip);
+        c[idx] = (Some(ip), v);
+        v
+    })
 }
 
 async fn forward_server_dgram(
@@ -1665,5 +1668,85 @@ mod tests {
         }
         sess_memo_put(4, 1, memo_sock(), last, aborted);
         assert!(matches!(sess_memo_lookup(4, 1), SessHit::Stale));
+    }
+
+    /// Security regression: after every cache slot has been written (and
+    /// evicted at least once), the memo must still agree with `is_global_ip`
+    /// for the whole filter table. A wrong `true` would let a peer dial
+    /// private/loopback/link-local/CGNAT space.
+    #[test]
+    fn ip_cache_matches_predicate_after_full_fill() {
+        for i in 0..200u8 {
+            let _ = is_global_ip_cached(IpAddr::V4(Ipv4Addr::new(8, 8, 8, i)));
+        }
+        for i in 0..200u16 {
+            let ip: IpAddr = format!("2001:4860::{i:x}").parse().unwrap();
+            let _ = is_global_ip_cached(ip);
+        }
+
+        let cases = [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "::1",
+            "169.254.1.1",
+            "fe80::1",
+            "100.64.0.1",
+            "64:ff9b::a00:1",
+            "192.0.2.1",
+            "2001:db8::1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "ff02::1",
+            "8.8.8.8",
+            "1.1.1.1",
+            "2001:4860:4860::8888",
+        ];
+        for s in cases {
+            let ip: IpAddr = s.parse().unwrap();
+            assert_eq!(
+                is_global_ip_cached(ip),
+                is_global_ip(ip),
+                "memo verdict diverged from is_global_ip for {s}"
+            );
+        }
+    }
+
+    /// A collision must evict, never mis-serve: two addresses sharing one slot
+    /// but carrying opposite verdicts must each return the predicate's answer,
+    /// in both probe orders.
+    #[test]
+    fn ip_cache_collision_evicts_and_never_mis_serves() {
+        use std::collections::HashMap;
+
+        // Non-global `0.0.0.0/8` candidates against global `8.8.0.0/16`
+        // candidates; 1024 of each over 64 slots guarantees a cross-verdict
+        // same-index pair.
+        let non_global = (0..1024u32).map(|i| IpAddr::V4(Ipv4Addr::from(i)));
+        let global = (0..1024u32).map(|i| IpAddr::V4(Ipv4Addr::new(8, 8, (i >> 8) as u8, i as u8)));
+
+        let mut seen: HashMap<usize, IpAddr> = HashMap::new();
+        let mut pair = None;
+        for ip in non_global.chain(global) {
+            let idx = ip_cache_idx(ip);
+            match seen.get(&idx) {
+                Some(&other) if is_global_ip(other) != is_global_ip(ip) => {
+                    pair = Some((other, ip));
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(idx, ip);
+                }
+            }
+        }
+        let (a, b) = pair.expect("two verdict classes over 64 slots must collide");
+        assert_eq!(ip_cache_idx(a), ip_cache_idx(b));
+        assert_ne!(is_global_ip(a), is_global_ip(b));
+
+        assert_eq!(is_global_ip_cached(a), is_global_ip(a));
+        assert_eq!(is_global_ip_cached(b), is_global_ip(b));
+        assert_eq!(is_global_ip_cached(a), is_global_ip(a));
     }
 }

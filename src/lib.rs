@@ -2125,6 +2125,12 @@ pub mod udp_stats {
     thread_local! {
         static L_DATAGRAMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// This thread's payload high-water mark. It guards the shared
+        /// `MAX_PAYLOAD` read on the per-payload path: the global is only
+        /// touched when this thread sees a payload larger than any it has
+        /// already recorded, so a steady flow costs one Cell compare and no
+        /// shared cache-line access at all.
+        static L_MAX_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     #[cfg(feature = "stats")]
@@ -2165,9 +2171,14 @@ pub mod udp_stats {
                 }
             });
             let l = len as u64;
-            if l > MAX_PAYLOAD.load(Ordering::Relaxed) {
-                MAX_PAYLOAD.fetch_max(l, Ordering::Relaxed);
-            }
+            L_MAX_SEEN.with(|c| {
+                if l > c.get() {
+                    c.set(l);
+                    if l > MAX_PAYLOAD.load(Ordering::Relaxed) {
+                        MAX_PAYLOAD.fetch_max(l, Ordering::Relaxed);
+                    }
+                }
+            });
         }
         let _ = len;
     }
