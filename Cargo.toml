@@ -47,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
+arc-swap = "1"
 
 [profile.release]
 opt-level = 3

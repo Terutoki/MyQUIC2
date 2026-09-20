@@ -507,9 +507,10 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass-22: lock-free egress memo, direct-mapped
-dispatcher cache and `is_global_ip` memo, `wait_conn` live-bit fast path, on top
-of the pass-21 no-park try-locks) with
+rebuilt from the current revision (pass-23: lock-free client control plane, the
+dispatcher writing the relay socket directly, and the last `try_lock`-induced
+datagram drop removed from the server session table, on top of pass-22's lock-free
+egress memo, direct-mapped dispatcher cache and `is_global_ip` memo) with
 the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.3 MB
 each. Three upgrade notes, all requiring **both** sides to be replaced together
@@ -539,6 +540,16 @@ detection. The same emulated CPU runs the **v3** binary but makes the **v4** bin
 with `Illegal instruction` (exit 132), which is the expected consequence of selecting
 an AVX512 level the CPU does not implement — and the proof that the per-level
 `target-cpu` flags are actually compiled in.
+
+The pass-23 rebuild was re-verified the same way, and the emulated container also
+corroborates the host diagnosis in the pass-23 notes below: the v1 pair relays
+**160 000 datagrams at 0.000 % loss and 22 408 pps** there, against ~3 000 pps for
+the identical binaries on the macOS host, where a network extension rate-limits
+UDP. The binaries were not the difference — the host was. Per-level flags were
+re-checked statically as well as dynamically: `objdump -d` finds **273 `zmm`
+references in the v4 build and none in v1 or v3**, with `ymm` use rising from 3 978
+(v1) to 25 025 (v3), and the emulated CPU runs v1 and v3 (exit 0) while v4 dies with
+exit 132.
 
 ---
 
@@ -1800,6 +1811,209 @@ loopback bench cannot resolve (the same caveat as passes 13 and 15–21).
 (v1–v4: static musl, x86-64, stripped, ~4.3–4.4 MB each; `file` confirms
 x86-64). The pass-21 binaries remain wire-compatible, so mixed pairs work.
 
+### 2026-09 hardening pass 23 — lock-free client control plane, and a measured refutation
+
+Removes the last `Mutex`/`RwLock` acquisitions from every client path, packet and
+control plane alike, replacing them with `arc-swap` — readers lock-free (mostly
+wait-free), writers lock-free, no reader-reader contention, `load()` borrows
+without touching the refcount. `arc-swap 1.9` has zero transitive dependencies;
+it is the entire added surface. Same wire protocol (no ALPN bump, mixed pairs
+stay compatible).
+
+**The client is now lock-free end to end outside DNS.** Four `RwLock`s are gone,
+and so is the failure mode each one carried:
+
+- **`SharedEgress.cached` (`RwLock` → `ArcSwapOption<EgressCache>`).** The old
+  publish used `try_write` and encoded a *lost* write as "stamp 0" — a handle
+  that could never be served as fresh, so the next packet re-ran the whole
+  refresh. `ArcSwap::store` cannot lose, which deletes that state outright: every
+  publish lands, every publish carries a real stamp, and `invalidate` can no
+  longer skip its generation bump. The generation-tagged thread-local memo
+  (pass 22) is unchanged, so the per-packet path still costs one Acquire load plus
+  one `RefCell` borrow — no Arc RMW, no quinn lock.
+- **`ConnSlot.shared` (`tokio::sync::RwLock` → `ArcSwapOption<Connection>`).**
+  `wait_conn` used `try_read` and fell back to `read().await`, which **parked the
+  flow's worker thread** whenever a writer held the lock. `ArcSwap::load` borrows
+  the published handle instead, so a flow opening during a reconnect never blocks
+  a runtime thread. The reconnect/teardown clear keeps its read-then-write
+  atomicity through `rcu`: the closure re-runs against the latest value and
+  matches on `stable_id`, so a fresh connection installed during the clear is
+  still never blackholed.
+- **`UdpHub.subs` (32 × `RwLock<HashMap>` → 32 × `ArcSwap<HashMap>`,
+  clone-on-publish).** The dispatcher read this with `try_lock_read`, and a losing
+  `try_read` returned `None` — which `dispatch_one` treats as "no such
+  association", i.e. a **silently dropped inbound datagram** whenever the lock was
+  momentarily held by an association opening or closing. `ArcSwap::load` cannot
+  fail, so the lookup is now lock-free *and total*: `None` means the session
+  genuinely has no subscription, never that a lock was busy. Writes publish a
+  fresh map through `rcu`, which also closes a lost-update window: `rcu` re-runs
+  against the latest map, so two associations subscribing to the same shard
+  concurrently cannot drop each other's insert (a load-clone-store would).
+  Affordable because writes happen once per association open/close and a shard
+  holds at most `MAX_UDP_ASSOCS / 32` senders.
+- **`last_app` (`RwLock` → `ArcSwapOption<SocketAddr>`).** The relay loop
+  published the app's address with `try_write`, which could silently drop the
+  update; the reply task read it behind a 200 ms cache. Both sides are now
+  lock-free and the publish cannot fail.
+
+**The last `try_lock` datagram drop in the project, removed (server).** The client
+was not the only place a busy lock cost a packet. The server's per-connection
+session table was read on the datagram path with `try_lock_read` and written with
+`try_lock_write`, and a loser **aborted the freshly spawned reply reader, released
+its global session permit and dropped the datagram** — charged, in both cases, to
+`SESSION_FULL`, a counter documented as "session or DNS slow-path budget
+exhausted". Packet loss caused by lock contention was therefore reported as a
+resource-limit event, which is how it stayed invisible.
+
+Pass 21 introduced that fail-fast policy deliberately ("packet paths never park a
+worker"). Pass 23 revisits it for this one table, and the reasoning is narrow. The
+table is per-connection, so the only cross-task writers are a session reader
+exiting (a `get` plus maybe a `remove`), the 60 s sweeper's removal loop, and a
+DNS-spawned `get_or_create_sess` — all short, allocation-free `HashMap` critical
+sections. The datagram reader is itself the commonest writer, so it cannot contend
+with itself, and the socket `syscalls` in the insert path stay outside the lock.
+`std::sync::RwLock::read` already tries before it parks, so the uncontended cost is
+unchanged; the only behavioural difference is that a datagram is no longer thrown
+away when one of those brief writers wins the race. The two `dgram_drops::bump`
+calls went with it, so `SESSION_FULL` means what it says again. The remaining
+`try_lock_*` call sites are all in the DNS tables, which are out of scope for this
+pass.
+
+**The dispatcher now writes the relay socket itself (client inbound).** The
+per-association bounded `tokio::sync::mpsc` and the reply task that drained it are
+gone. Each dispatcher owns one `DgramReassembler` and one scratch buffer and, for
+every inbound DATAGRAM, resolves the session, builds the SOCKS5 reply header and
+calls `try_send_to` directly. An association now publishes an `AssocEntry`
+instead of a channel:
+
+```rust
+struct AssocEntry {
+    relay: Arc<tokio::net::UdpSocket>,
+    app:   ArcSwapOption<SocketAddr>,   // published by the relay loop
+    alive: AtomicBool,                  // cleared as the association exits
+}
+```
+
+**What made it cheap was already true and I had missed it.** My first reading of
+this rewrite assumed it would drag per-session mutable reassembly state into the
+dispatcher, which needs `&mut`, which needs a lock or a `RefCell` that is not
+`Sync` — i.e. the "lock-free" rewrite would have reintroduced a lock. It does not,
+because `DgramReassembler` is keyed by `(sess, id)`, not by association: it is
+already connection-wide, and the server's datagram reader has always used exactly
+one per connection. So the dispatcher holds a single reassembler, nothing
+per-session is mutable, and the escape path stays allocation-free.
+
+**What actually disappeared.** Not just the hop. The 256-deep per-association
+queue and its `TrySendError::Full` arm are gone, so *a whole datagram loss mode
+no longer exists* rather than being tuned — `count_dispatch_drop` went with it,
+because the only thing it ever counted was that queue filling. One spawned task
+per association is gone too. `alive` replaces the `Closed` signal the dropped
+`mpsc::Receiver` used to provide, so a dispatcher stops writing into a socket
+nobody reads as soon as the association exits, instead of holding it open until a
+cache collision recycled the slot. Publishing the entry *before* `write_socks_reply`
+also closes a window the old ordering had, where a session existed with no relay
+socket behind it.
+
+**The honest caveat, unchanged by shipping it.** `hotpath_bench chan` measures the
+deleted hop at **52–57 ns per datagram** (depth 256, one producer + one consumer;
+140 ns at depth 8). That is the measured upside, and it is small. The cost is that
+the dispatcher — already the single stage of the inbound path, since one
+`read_datagram` stream admits exactly one poller — now performs a `send_to` syscall
+inline instead of handing the work to a task that could run on another core. That
+raises its per-datagram budget from the ~100 ns class to the ~1 µs class on a
+normal Linux host. Whether that lowers the *end-to-end* ceiling is **not
+established on this hardware**: it only binds if the dispatcher is the limiting
+stage, and the per-connection quinn driver (decrypt, ACK, GSO, congestion control)
+is serialized anyway and may well be the real floor. The change is justified by
+the structural wins above — one fewer task per association, one fewer loss mode, no
+queue to size — and is verified for correctness; it is **not** justified by a
+throughput measurement, because this host cannot produce one.
+
+**The benchmark harness was fixed first, because the old one could not resolve
+any of this.** `hotpath_bench` gained `udpmulti` (N concurrent associations on N
+OS threads, each with its own relay socket), `udpraw` (the same pump loop against
+the same target with *no proxy in the path* — the control that bounds how much of
+a measured rate is the harness), `udpsweep` (per-size payload-integrity check),
+`tcpecho` (byte-for-byte TCP echo verification) and `chan` (the hand-off cost
+above). The `echo` target now binds 8 `SO_REUSEPORT` sockets: a single-threaded
+echo costs one kernel thread wake per datagram and caps the *target* — not the
+tunnel — at a few thousand packets per second.
+
+**Why this host still cannot show the win.** `udpraw` measures **8 154 pps
+one-way** on loopback with no proxy, no echo and no lock in the path, while the
+same host does **432 545 TCP writes/s (432 MB/s)** on loopback. Bare-metal M4, no
+hypervisor; `/Library/SystemExtensions` has installed network extensions plus
+`EndpointSecurity`, so a UDP-filtering agent sits in the path. UDP on this box is
+capped roughly two orders of magnitude below where any shared-state cost matters,
+which is the same conclusion pass 22 reached empirically ("all inside run-to-run
+noise"). An interleaved A/B of pass-22 vs pass-23 binaries on this host gives
+**2664–3126 pps vs 2677–3125 pps** (N=32, the spread *within* one binary is wider
+than the gap between them) and **14–15 MB/s vs 15 MB/s** bulk. The pass-23 changes
+are therefore justified structurally — locks and their drop-on-contention failure
+modes are gone, and that is pinned by tests — not by throughput measured here.
+
+**Rejected, with reasons.** *Converting the server session table to lock-free
+reads* (it is per-connection, created inside `handle_conn`, with
+exactly one DATAGRAM reader task and two lock-free memos — the per-task `fast_sess`
+cache and the thread-local 32-slot memo — in front of it; `ArcSwap` clone-on-publish
+would cost O(512) rehashing per session open/close for a `try_read` that is
+essentially never contended. Its *drop-on-contention* defect was real and is fixed
+above; its *lock* is not the problem, so it stays a lock).
+*Forking quinn* for a batch datagram API (pass 22's measurement and the pass-10
+decision to stop carrying security backports both stand). quinn's per-datagram
+connection-state mutex remains the floor. *The dispatcher rewrite* is listed
+The dispatcher rewrite is no longer deferred; see above for why it turned out to
+need no per-session state after all.
+
+Verified on this revision: `cargo test --all-targets` 62/62 (61/61 without
+`stats`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
+clean on **both** feature sets. Four tests pin the properties this pass buys:
+`hub_sender_never_fails_because_of_concurrency` (four reader threads probing 4096
+continuously-subscribed sessions while two writer threads churn the same shards —
+every probe must hit); `hub_concurrent_subscribes_on_one_shard_all_land` (eight
+threads subscribing 4096 ids across all 32 shards, none lost);
+`dispatch_dead_entry_reprobes_and_drops` (`alive` really does stop a dispatcher
+writing into a torn-down association's socket); and
+`dispatch_reassembles_fragments_for_two_interleaved_sessions`, which pins the
+connection-wide reassembler the dispatcher rewrite depends on — two sessions'
+fragments interleaved through one dispatcher must reassemble into two intact
+payloads and must not deliver a half-assembled one. Real binaries, real
+tunnel: UDP integrity sweep at 8 / 1200 / 1420 / 1430 / 2000 / 8000 B — the last
+two through the MQP-2 fragmentation and reassembly path — **300/300 verified
+byte-for-byte at every size, 0 mismatched, 0 lost**; **160 000 datagrams at 0.000 %
+loss** (8 concurrent associations); 1 MiB TCP ECHO **1 048 576/1 048 576 bytes
+echoed, 0 mismatched**; 256 MiB bulk download across 4 connections.
+
+Wire compatibility was verified rather than asserted, in both directions: the full
+matrix (pass-22 server ↔ pass-23 client, pass-23 server ↔ pass-22 client, and
+pass-23 ↔ pass-23) completes the handshake, passes the whole UDP integrity sweep
+and the 1 MiB TCP ECHO byte-for-byte, and carries 160 000 datagrams at 0.000 %
+loss. No wire format, framing or ALPN value changed in this pass; the two files
+touched are the client and server binaries, and only on their local socket/relay
+and table side.
+
+A third full E2E run, on the binaries carrying **both** the server-side `try_lock`
+change and the dispatcher rewrite, reproduces every number above — UDP sweep
+300/300 byte-for-byte at all six sizes (including 2000 B and 8000 B, which take the
+fragmentation path through the dispatcher's new connection-wide reassembler), 0
+mismatched and 0 lost; 1 MiB TCP ECHO 1 048 576/1 048 576 with 0 mismatched;
+160 000 datagrams at 0.000 % loss; 32 concurrent associations at 0.026 % loss (the
+bench's stall-limit artefact — 31 of 32 associations completed, the remainder
+stopped early on the harness's own 10-window silence rule, not on a relay drop);
+256 MiB bulk across 4 connections — and the mixed pass-22-server ↔ pass-23-client
+pair still passes the sweep and the echo. The relay's UDP rate on this host is
+unchanged by the rewrite (2873 pps vs 3093 pps on 8 associations, inside the
+2664–3126 pps run-to-run spread the A/B above measured for a *single* binary), as
+expected: the deleted hop was 55 ns against a per-datagram cost this host's UDP
+path dominates.
+
+`dist/openwrt-x86_64/` was rebuilt from this revision for all four CPU levels
+(v1–v4: static musl, x86-64, stripped, 4 293 104–4 349 776 B each; `file` confirms
+x86-64), and the v1 pair was run through the full E2E under amd64 emulation — see
+the cross-compile section above for that run and for the static `zmm`/`ymm`
+evidence that each `target-cpu` level was compiled in. The pass-22 binaries remain
+wire-compatible, so mixed pairs work.
+
 ---
 
 ## Roadmap
@@ -1835,6 +2049,10 @@ x86-64). The pass-21 binaries remain wire-compatible, so mixed pairs work.
 - [x] No-park packet paths (try-lock fail-fast) + optimistic stale egress + direct-mapped memos + batched drop counters + 16-shard retry pool (pass 21)
 - [x] Generation-tagged thread-local egress memo (zero per-datagram locks/refcounts on client UDP outbound) + direct-mapped 1024-slot dispatcher cache with no per-packet `Sender` clone (pass 22)
 - [x] Direct-mapped `is_global_ip_cached` with security regression tests + `wait_conn` live-bit fast path + dispatcher spin guard + per-thread `MAX_PAYLOAD` high-water guard (pass 22)
+- [x] Lock-free client control plane: `SharedEgress.cached`, `ConnSlot.shared`, `UdpHub.subs` and `last_app` moved to `arc-swap`, removing the last client `Mutex`/`RwLock` and the drop-on-contention paths behind them (pass 23)
+- [x] Remove the last `try_lock`-induced datagram drop (server session table read/insert now block instead of discarding the packet), un-conflating `SESSION_FULL` from lock contention (pass 23)
+- [x] Client inbound: dispatcher writes the relay socket directly; the per-association `mpsc` queue, its `Full` drop mode and the reply task are gone, with one connection-wide reassembler per dispatcher (pass 23)
+- [x] `udpmulti` / `udpraw` / `udpsweep` / `tcpecho` / `chan` bench modes + 8-socket `SO_REUSEPORT` echo target (pass 23)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the

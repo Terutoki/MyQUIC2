@@ -1378,17 +1378,27 @@ async fn get_or_create_sess(
         }
         SessHit::Stale | SessHit::Miss => {}
     }
-    // Fast path: single shard try-read + lock-free timestamp bump. Contended
-    // => fail fast through to the creation path (which also try-locks) instead
-    // of parking this reader; concurrent sessions on different shards never
-    // share a cache line. A session whose reply reader has already exited is
-    // treated as absent so its next packet recreates it instead of black-holing.
+    // Fast path: single shard read + lock-free timestamp bump. A session whose
+    // reply reader has already exited is treated as absent so its next packet
+    // recreates it instead of black-holing.
+    //
+    // The read *blocks* rather than failing fast. Pass 21 made this a
+    // `try_lock_read` that dropped the datagram on failure and counted it in
+    // `SESSION_FULL`, reasoning that a packet path must never park a worker.
+    // Pass 23 revisited that: the table is per-connection, so the only
+    // cross-task writers are a session reader exiting (a `get` plus maybe a
+    // `remove`), the 60 s sweeper's removal loop, and a DNS-spawned
+    // `get_or_create_sess` -- all short, allocation-free critical sections. The
+    // datagram reader is by far the commonest writer itself, so it cannot
+    // contend with itself. Against that, the old behaviour silently dropped a
+    // datagram every time any of those brief writers won the race, and charged
+    // the drop to a counter documented as "budget exhausted", hiding relay loss
+    // inside a resource-limit metric. `std::sync::RwLock::read` already tries
+    // before it parks, so the uncontended cost is unchanged; only the drop is
+    // gone.
     {
         let sh = ss.shard(s);
-        let Some(r) = try_lock_read(sh) else {
-            dgram_drops::bump(&dgram_drops::SESSION_FULL);
-            return None;
-        };
+        let r = lock_read(sh);
         if let Some((sock, h, t, _)) = r.get(&s) {
             if !h.is_finished() {
                 let sock = sock.clone();
@@ -1460,12 +1470,12 @@ async fn get_or_create_sess(
     let mut swept: Vec<SessEntry> = Vec::new();
     let (inserted, memo_data) = {
         let sh = ss.shard(s);
-        let Some(mut w) = try_lock_write(sh) else {
-            h_pre.abort();
-            drop(permit);
-            dgram_drops::bump(&dgram_drops::SESSION_FULL);
-            return None;
-        };
+        // Blocks for the same reason the read path does: a losing `try_lock_write`
+        // used to abort the freshly spawned reader, release the global permit and
+        // drop the datagram, which is strictly worse than waiting out a short
+        // `HashMap` mutation. The socket syscalls above deliberately stay outside
+        // this critical section.
+        let mut w = lock_write(sh);
         if let Some((sock2, h2, t, _)) = w.get(&s) {
             if !h2.is_finished() {
                 touch_session_throttled(conn_id, s, t);

@@ -17,6 +17,27 @@
 //!   `udp <socks> <host:port> <n> [batch]`
 //!                                 send N datagrams over one UDP ASSOCIATE and
 //!                                 wait for the same number of replies.
+//!   `udpmulti <socks> <host:port> <assocs> <n> [batch]`
+//!                                 the same, but with `assocs` concurrent
+//!                                 associations on `assocs` OS threads, each
+//!                                 with its own relay socket. A single
+//!                                 association runs on one core and cannot
+//!                                 resolve lock/cache-line contention: every
+//!                                 shared-state cost this repository has been
+//!                                 removing only shows up once several
+//!                                 associations run in parallel (see the
+//!                                 hardening passes' "run-to-run noise" notes).
+//!
+//!   `chan <n> [depth]`
+//!                                 per-datagram cost of the client's inbound
+//!                                 hand-off (`tokio::sync::mpsc` bounded
+//!                                 `try_send` + `recv`) between the single
+//!                                 DATAGRAM dispatcher task and the
+//!                                 per-association reply task, measured in
+//!                                 isolation. This is the hop a "dispatcher
+//!                                 writes the socket directly" rewrite would
+//!                                 delete; the number says whether that hop is
+//!                                 worth deleting at all.
 //!
 //! Run with `--release`; the numbers are only comparable to each other.
 use std::io::{Read, Write};
@@ -42,6 +63,31 @@ fn main() {
             args[4].parse().unwrap(),
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
         ),
+        Some("udpmulti") => udpmulti(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args[5].parse().unwrap(),
+            args.get(6).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
+        Some("udpraw") => udpraw(
+            &args[2],
+            args[3].parse().unwrap(),
+            args[4].parse().unwrap(),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
+        Some("chan") => chan(
+            args[2].parse().unwrap(),
+            args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256),
+        ),
+        Some("udpsweep") => udpsweep(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            &args[5],
+            args.get(6).and_then(|s| s.parse().ok()).unwrap_or(16),
+        ),
+        Some("tcpecho") => tcpecho(&args[2], &args[3], args[4].parse().unwrap()),
         Some("server") => server(
             args[2].parse().unwrap(),
             args[3].parse().unwrap(),
@@ -55,20 +101,49 @@ fn main() {
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(4),
         ),
         _ => {
-            eprintln!("usage: hotpath_bench <echo|tcp|udp> ...");
+            eprintln!(
+                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpsweep|tcpecho|chan|server|reply|bulk> ..."
+            );
             std::process::exit(2);
         }
     }
 }
 
-/// UDP echo target. Counts replies so the client-side harness can stop at a
-/// fixed number instead of guessing how long to run.
+/// UDP echo target.
+///
+/// One thread is not enough to be a useful target: a blocking `recv_from` costs
+/// one kernel thread wake per datagram (~100 µs on macOS), which caps a
+/// single-threaded echo at a few thousand packets per second and makes the
+/// *target* — not the tunnel — the bottleneck of every UDP number measured
+/// through it. The target therefore binds `ECHO_THREADS` sockets to the same
+/// port with `SO_REUSEPORT`, and the kernel spreads datagrams across them by
+/// 4-tuple hash, so the ceiling scales with the thread count.
 fn echo(port: u16) {
-    let s = UdpSocket::bind(("127.0.0.1", port)).unwrap();
-    println!("echo listening on 127.0.0.1:{port}");
-    let mut buf = vec![0u8; 65535];
-    while let Ok((n, a)) = s.recv_from(&mut buf) {
-        let _ = s.send_to(&buf[..n], a);
+    const ECHO_THREADS: usize = 8;
+    let mut handles = Vec::with_capacity(ECHO_THREADS);
+    for _ in 0..ECHO_THREADS {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        sock.set_reuse_port(true).unwrap();
+        sock.bind(&socket2::SockAddr::from(
+            format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap(),
+        ))
+        .unwrap();
+        let s: UdpSocket = sock.into();
+        handles.push(std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, a)) = s.recv_from(&mut buf) {
+                let _ = s.send_to(&buf[..n], a);
+            }
+        }));
+    }
+    println!("echo listening on 127.0.0.1:{port} ({ECHO_THREADS} reuseport threads)");
+    for h in handles {
+        let _ = h.join();
     }
 }
 
@@ -154,23 +229,38 @@ fn split_host(target: &str) -> (String, u16) {
     )
 }
 
-/// One UDP ASSOCIATE, then `n` datagrams to the target, waiting for `n` replies.
-fn udp(socks: &str, target: &str, n: usize, batch: usize) {
-    let (host, port) = split_host(target);
-    // TCP control connection + ASSOCIATE.
-    let mut s = TcpStream::connect(socks).unwrap();
-    s.set_nodelay(true).unwrap();
-    s.write_all(&[0x05, 0x01, 0x00]).unwrap();
+/// One SOCKS5 UDP ASSOCIATE. The returned `TcpStream` is the control
+/// connection: the association lives exactly as long as it does, so the caller
+/// owns it (dropping it mid-run tears the relay socket down).
+fn socks_associate(socks: &str) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let mut s = TcpStream::connect(socks)?;
+    s.set_nodelay(true)?;
+    s.write_all(&[0x05, 0x01, 0x00])?;
     let mut g = [0u8; 2];
-    s.read_exact(&mut g).unwrap();
-    s.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .unwrap();
+    s.read_exact(&mut g)?;
+    // `0.0.0.0:0` asks the proxy for a relay endpoint on any interface.
+    s.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
     let mut rep = [0u8; 32];
-    let k = s.read(&mut rep).unwrap();
-    assert_eq!(rep[1], 0, "associate refused");
-    let relay: SocketAddr = if rep[3] == 1 {
+    let k = s.read(&mut rep)?;
+    if rep[1] != 0 {
+        return Err(std::io::Error::other(format!(
+            "associate refused rep={:#x}",
+            rep[1]
+        )));
+    }
+    // Reply lengths are 10 (v4) / 22 (v6); a short read would silently yield a
+    // zero port, which would make the bench look like a total packet loss.
+    let want = if rep[3] == 1 { 10 } else { 22 };
+    if k < want {
+        return Err(std::io::Error::other(format!(
+            "short associate reply: {k} < {want}"
+        )));
+    }
+    let relay = if rep[3] == 1 {
         let ip = std::net::Ipv4Addr::new(rep[4], rep[5], rep[6], rep[7]);
         let mut ip = std::net::IpAddr::V4(ip);
+        // The proxy binds `[::]:0` and reports the unspecified address when the
+        // control connection is loopback; dial it on loopback instead.
         if ip.is_unspecified() {
             ip = "127.0.0.1".parse().unwrap();
         }
@@ -178,31 +268,48 @@ fn udp(socks: &str, target: &str, n: usize, batch: usize) {
     } else {
         let mut o = [0u8; 16];
         o.copy_from_slice(&rep[4..20]);
-        std::net::SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(o)),
+        let ip = std::net::Ipv6Addr::from(o);
+        let ip = if ip.is_unspecified() {
+            std::net::Ipv6Addr::LOCALHOST
+        } else {
+            ip
+        };
+        SocketAddr::new(
+            std::net::IpAddr::V6(ip),
             u16::from_be_bytes([rep[20], rep[21]]),
         )
     };
-    let _ = k;
-    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
-    u.set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    // Pre-build the SOCKS5 UDP request header once; only the payload varies.
+    Ok((s, relay))
+}
+
+/// Build the SOCKS5 UDP request prefix for `host:port` once; only the payload
+/// varies per datagram, so the loop never re-encodes the header.
+fn udp_request(host: &str, port: u16, payload: usize) -> Vec<u8> {
     let ip: std::net::Ipv4Addr = host.parse().unwrap();
     let mut pkt = vec![0, 0, 0, 0x01];
     pkt.extend_from_slice(&ip.octets());
     pkt.extend_from_slice(&port.to_be_bytes());
     let hdr = pkt.len();
-    pkt.resize(hdr + 1000, 0x5A);
+    pkt.resize(hdr + payload, 0x5A);
+    pkt
+}
 
+/// Send `n` datagrams and wait for `n` replies on one association.
+/// Returns `(sent, recv)`.
+fn udp_pump(
+    u: &UdpSocket,
+    pkt: &[u8],
+    relay: SocketAddr,
+    n: usize,
+    batch: usize,
+) -> (usize, usize) {
     let mut sent = 0usize;
     let mut recv = 0usize;
     let mut stalled = 0usize;
     let mut buf = vec![0u8; 2048];
-    let t0 = Instant::now();
     while recv < n {
         while sent < n && sent - recv < batch {
-            if u.send_to(&pkt, relay).is_err() {
+            if u.send_to(pkt, relay).is_err() {
                 break;
             }
             sent += 1;
@@ -222,11 +329,352 @@ fn udp(socks: &str, target: &str, n: usize, batch: usize) {
             }
         }
     }
+    (sent, recv)
+}
+
+/// Per-datagram cost of the client's inbound hand-off, with no network in the
+/// path: the dispatcher's `try_send` into a per-association bounded
+/// `tokio::sync::mpsc`, and the reply task's `recv`.
+///
+/// This is the hop a "dispatcher writes the relay socket directly" rewrite
+/// would delete. Measuring it in isolation is the only way to judge that
+/// rewrite, because the same rewrite also *serializes* every inbound datagram
+/// onto the one dispatcher task — a cost the hop itself does not have. Two
+/// controls are printed alongside: an empty loop of the same length (the
+/// harness floor) and the same-rate `send_to` cost measured by `udpraw`.
+fn chan(n: usize, depth: usize) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap();
+
+    // Control: the same loop with no queue at all.
+    let sink = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    {
+        let sink = sink.clone();
+        rt.block_on(async move {
+            for _ in 0..n {
+                sink.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    let loop_dt = t0.elapsed();
+
+    let (dt, sent, full, got) = rt.block_on(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<usize>(depth);
+        let consumer = tokio::spawn(async move {
+            let mut got = 0usize;
+            while rx.recv().await.is_some() {
+                got += 1;
+            }
+            got
+        });
+        // Let the consumer park so the producer exercises the wake path rather
+        // than finding an already-running receiver.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let t0 = Instant::now();
+        let mut sent = 0usize;
+        let mut full = 0usize;
+        while sent < n {
+            match tx.try_send(1000usize) {
+                Ok(()) => sent += 1,
+                Err(_) => {
+                    full += 1;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        drop(tx);
+        let got = consumer.await.unwrap();
+        (t0.elapsed(), sent, full, got)
+    });
+
+    let per = dt.as_secs_f64() / (sent.max(1) as f64) * 1e9;
+    let loop_per = loop_dt.as_secs_f64() / (n.max(1) as f64) * 1e9;
+    println!(
+        "chan n={n} depth={depth} sent={sent} recv={got} full_retries={full} \
+         wall={:.3}s per_msg={per:.0}ns loop_only={loop_per:.0}ns \
+         queue_cost={:.0}ns",
+        dt.as_secs_f64(),
+        (per - loop_per).max(0.0)
+    );
+}
+
+/// Payload-integrity sweep. For each size, relay `n` datagrams of exactly that
+/// payload size through a fresh association and verify the echoed payload byte
+/// for byte.
+///
+/// This is the correctness counterpart to `udpmulti`: it pins that the relay
+/// carries *what was sent* at each size, including sizes above the path's
+/// single-frame budget (which take the MQP-2 fragmentation + reassembly path)
+/// and sizes around the common 1420/1430 B MTU boundary. A payload mismatch is
+/// reported separately from a lost datagram, because the two have completely
+/// different causes.
+fn udpsweep(socks: &str, target: &str, n: usize, sizes: &str, batch: usize) {
+    let (host, port) = split_host(target);
+    let mut all_ok = true;
+    for size in sizes.split(',').map(|s| s.trim().parse::<usize>().unwrap()) {
+        let Ok((_control, relay)) = socks_associate(socks) else {
+            println!("udpsweep size={size} FAILED: associate refused");
+            all_ok = false;
+            continue;
+        };
+        let Ok(u) = UdpSocket::bind("127.0.0.1:0") else {
+            continue;
+        };
+        u.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        // Header-only build, then append the payload so the two are never
+        // accidentally mixed by a resize.
+        let prefix = udp_request(&host, port, 0);
+        let mut pkt = prefix.clone();
+        pkt.resize(prefix.len() + size, 0);
+        for (i, b) in pkt[prefix.len()..].iter_mut().enumerate() {
+            // Position-dependent, so a shifted or truncated reply cannot match.
+            *b = (i % 251) as u8;
+        }
+        let want = &pkt[prefix.len()..];
+
+        let mut sent = 0usize;
+        let mut ok = 0usize;
+        let mut bad = 0usize;
+        let mut lost = 0usize;
+        let mut stale = 0usize;
+        let mut buf = vec![0u8; 65535];
+        while ok + bad + lost < n {
+            while sent < n && sent - (ok + bad + lost) < batch {
+                if u.send_to(&pkt, relay).is_err() {
+                    break;
+                }
+                sent += 1;
+            }
+            match u.recv_from(&mut buf) {
+                Ok((k, _)) => {
+                    // Reply framing: 3 reserved bytes, ATYP, address, port,
+                    // then the payload the target echoed.
+                    let hlen = match buf.get(3) {
+                        Some(1) => 10,
+                        Some(4) => 22,
+                        _ => {
+                            bad += 1;
+                            continue;
+                        }
+                    };
+                    if k < hlen || &buf[hlen..k] != want {
+                        bad += 1;
+                    } else {
+                        ok += 1;
+                    }
+                }
+                Err(_) => {
+                    stale += 1;
+                    if stale >= 10 {
+                        lost += n - ok - bad - lost;
+                        break;
+                    }
+                }
+            }
+        }
+        let good = bad == 0 && ok == n;
+        all_ok &= good;
+        println!(
+            "udpsweep size={size} sent={sent} verified={ok} mismatched={bad} lost={lost} {}",
+            if good { "OK" } else { "FAIL" }
+        );
+    }
+    println!("udpsweep {}", if all_ok { "ALL OK" } else { "FAILURES" });
+    if !all_ok {
+        std::process::exit(1);
+    }
+}
+
+/// Push `bytes` of a position-dependent pattern through one SOCKS5 CONNECT to
+/// the TCP echo target and verify the echo byte for byte.
+///
+/// A writer thread is required, not a courtesy: echoing `bytes` while the same
+/// thread is still writing deadlocks once the two socket buffers fill (the
+/// target stops reading because it is blocked writing to us, and we stop
+/// writing because our send buffer is full).
+fn tcpecho(socks: &str, target: &str, bytes: usize) {
+    let (host, port) = split_host(target);
+    let mut s = match socks_connect(socks, &host, port) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("tcpecho FAILED: connect {e}");
+            std::process::exit(1);
+        }
+    };
+    let payload: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    let mut w = s.try_clone().unwrap();
+    let out = payload.clone();
+    let writer = std::thread::spawn(move || {
+        let r = w.write_all(&out);
+        let _ = w.shutdown(std::net::Shutdown::Write);
+        r.is_ok()
+    });
+
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut got = 0usize;
+    let mut mismatch = 0usize;
+    let t0 = Instant::now();
+    while got < bytes {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => {
+                for (j, b) in buf[..k].iter().enumerate() {
+                    if *b != payload[got + j] {
+                        mismatch += 1;
+                    }
+                }
+                got += k;
+            }
+        }
+    }
+    let dt = t0.elapsed();
+    let wrote = writer.join().unwrap_or(false);
+    let good = mismatch == 0 && got == bytes && wrote;
+    println!(
+        "tcpecho bytes={bytes} echoed={got} mismatched={mismatch} wall={:.3}s {:.1} MB/s {}",
+        dt.as_secs_f64(),
+        got as f64 / dt.as_secs_f64() / 1e6,
+        if good { "OK" } else { "FAIL" }
+    );
+    if !good {
+        std::process::exit(1);
+    }
+}
+
+/// Raw loopback UDP echo through the *same* pump loop and the same target the
+/// tunnel benchmarks use, with no proxy in the path.
+///
+/// This is the control for [`udpmulti`]: it bounds how much of a measured rate
+/// belongs to the harness and the kernel's loopback path rather than the
+/// tunnel. A tunnel number above this one is impossible, and a tunnel number
+/// far below it is the tunnel's own cost — not the benchmark's.
+fn udpraw(target: &str, assocs: usize, n: usize, batch: usize) {
+    let (host, port) = split_host(target);
+    let echo: SocketAddr = format!("{host}:{port}").parse().unwrap();
+    let sent = Arc::new(AtomicU64::new(0));
+    let recv = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    let mut ws = Vec::with_capacity(assocs);
+    for _ in 0..assocs {
+        let sent = sent.clone();
+        let recv = recv.clone();
+        ws.push(std::thread::spawn(move || {
+            let Ok(u) = UdpSocket::bind("127.0.0.1:0") else {
+                return;
+            };
+            u.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let pkt = vec![0x5Au8; 1000];
+            let (s, r) = udp_pump(&u, &pkt, echo, n, batch);
+            sent.fetch_add(s as u64, Ordering::Relaxed);
+            recv.fetch_add(r as u64, Ordering::Relaxed);
+        }));
+    }
+    for w in ws {
+        let _ = w.join();
+    }
+    let dt = t0.elapsed();
+    let s = sent.load(Ordering::Relaxed);
+    let r = recv.load(Ordering::Relaxed);
+    println!(
+        "udpraw assocs={assocs} sent={s} recv={r} batch={batch} wall={:.3}s recv_pps={:.0} \
+         loss={:.3}%",
+        dt.as_secs_f64(),
+        r as f64 / dt.as_secs_f64(),
+        if s == 0 {
+            0.0
+        } else {
+            100.0 * (s - r) as f64 / s as f64
+        }
+    );
+}
+
+/// One UDP ASSOCIATE, then `n` datagrams to the target, waiting for `n` replies.
+fn udp(socks: &str, target: &str, n: usize, batch: usize) {
+    let (host, port) = split_host(target);
+    let (_control, relay) = socks_associate(socks).unwrap();
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let pkt = udp_request(&host, port, 1000);
+    let t0 = Instant::now();
+    let (sent, recv) = udp_pump(&u, &pkt, relay, n, batch);
     let dt = t0.elapsed();
     println!(
         "udp sent={sent} recv={recv} batch={batch} wall={:.3}s recv_pps={:.0}",
         dt.as_secs_f64(),
         recv as f64 / dt.as_secs_f64()
+    );
+}
+
+/// `assocs` concurrent associations, each on its own OS thread and relay
+/// socket, all hammering the same target.
+///
+/// This is the configuration in which per-packet *shared* state actually
+/// contends — quinn's per-connection state mutex, the client's shared egress
+/// cache, the UDP hub's subscription table, the dispatcher's inbound path. A
+/// single association runs on one core and never touches any of them from two
+/// threads at once, which is why the hardening passes' single-flow loopback
+/// numbers could not resolve those changes ("all inside run-to-run noise").
+fn udpmulti(socks: &str, target: &str, assocs: usize, n: usize, batch: usize) {
+    let (host, port) = split_host(target);
+    let sent = Arc::new(AtomicU64::new(0));
+    let recv = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+    let complete = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    let mut ws = Vec::with_capacity(assocs);
+    for _ in 0..assocs {
+        let socks = socks.to_string();
+        let host = host.clone();
+        let sent = sent.clone();
+        let recv = recv.clone();
+        let failed = failed.clone();
+        let complete = complete.clone();
+        ws.push(std::thread::spawn(move || {
+            // `_control` must outlive the pump: it *is* the association.
+            let Ok((_control, relay)) = socks_associate(&socks) else {
+                failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let Ok(u) = UdpSocket::bind("127.0.0.1:0") else {
+                failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            u.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let pkt = udp_request(&host, port, 1000);
+            let (s, r) = udp_pump(&u, &pkt, relay, n, batch);
+            sent.fetch_add(s as u64, Ordering::Relaxed);
+            recv.fetch_add(r as u64, Ordering::Relaxed);
+            if r >= n {
+                complete.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for w in ws {
+        let _ = w.join();
+    }
+    let dt = t0.elapsed();
+    let s = sent.load(Ordering::Relaxed);
+    let r = recv.load(Ordering::Relaxed);
+    let f = failed.load(Ordering::Relaxed);
+    let c = complete.load(Ordering::Relaxed);
+    println!(
+        "udpmulti assocs={assocs} complete={c} failed_assocs={f} sent={s} recv={r} \
+         batch={batch} wall={:.3}s recv_pps={:.0} loss={:.3}%",
+        dt.as_secs_f64(),
+        r as f64 / dt.as_secs_f64(),
+        if s == 0 {
+            0.0
+        } else {
+            100.0 * (s - r) as f64 / s as f64
+        }
     );
 }
 

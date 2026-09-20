@@ -1,5 +1,6 @@
 //! myquic2-client: SOCKS5 ingress (no auth) -> QUIC egress. Client-side DNS, auto-reconnect.
 use anyhow::{Context, Result};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use clap::Parser;
 use myquic2::*;
@@ -12,7 +13,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{watch, RwLock},
+    sync::watch,
 };
 use tracing::{info, warn};
 
@@ -22,7 +23,15 @@ struct Args {
     config: String,
 }
 
-type SharedConn = Arc<RwLock<Option<quinn::Connection>>>;
+/// The pool slot's published connection.
+///
+/// `ArcSwapOption` replaces the `tokio::sync::RwLock` this used to be: readers
+/// (`wait_conn`, per TCP flow) are lock-free and, unlike `RwLock::read()`, can
+/// never park a worker behind a writer, while the writers (dial / teardown, once
+/// per connection generation) are lock-free too. The published value is
+/// immutable, so a reader that wins the load keeps a consistent handle for as
+/// long as it holds the guard.
+type SharedConn = Arc<ArcSwapOption<quinn::Connection>>;
 
 /// Must cover the server's worst-case dial path:
 /// 5s header read + 3s DNS permit + 5s DNS lookup + 2s dial permit +
@@ -73,7 +82,7 @@ impl ConnSlot {
     fn fresh() -> Self {
         let (gen_tx, gen_rx) = watch::channel(0u64);
         Self {
-            shared: Arc::new(RwLock::new(None)),
+            shared: Arc::new(ArcSwapOption::const_empty()),
             gen_tx,
             gen_rx,
             live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -82,6 +91,37 @@ impl ConnSlot {
 
     fn is_live(&self) -> bool {
         self.live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish `conn` as this slot's connection.
+    fn publish(&self, conn: &quinn::Connection) {
+        self.shared.store(Some(Arc::new(conn.clone())));
+    }
+
+    /// Clear the slot when it still holds `conn` (matched by `stable_id`, which
+    /// survives a reconnect installing a different connection in the meantime).
+    /// Returns true when this call is the one that cleared it.
+    ///
+    /// `rcu` keeps the read-then-write atomicity the `RwLock` version had with a
+    /// single re-checked write: the closure runs again whenever a concurrent
+    /// writer wins the swap, so a fresh connection installed during the clear is
+    /// never blackholed. The closure is `FnMut` and its last run is the one whose
+    /// result is committed, so `cleared` reflects the committed decision.
+    fn clear_if(&self, conn: &quinn::Connection) -> bool {
+        let mut cleared = false;
+        self.shared.rcu(|cur| {
+            if cur
+                .as_ref()
+                .is_some_and(|c| c.stable_id() == conn.stable_id())
+            {
+                cleared = true;
+                None
+            } else {
+                cleared = false;
+                cur.clone()
+            }
+        });
+        cleared
     }
 
     /// Wait for a live connection, waking on a generation bump or the deadline.
@@ -98,18 +138,17 @@ impl ConnSlot {
     ) -> Result<quinn::Connection> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Ok(g) = self.shared.try_read() {
-                if let Some(c) = g.clone() {
-                    drop(g);
-                    if self.is_live() || c.close_reason().is_none() {
-                        return Ok(c);
-                    }
-                }
-            } else if let Some(c) = self.shared.read().await.clone() {
+            // Lock-free read. The old `try_read`/`read().await` pair had a
+            // fallback that parked this worker whenever a writer held the lock;
+            // `ArcSwap::load` borrows the published handle instead, so a flow
+            // opening during a reconnect never blocks a runtime thread.
+            let g = self.shared.load();
+            if let Some(c) = g.as_ref() {
                 if self.is_live() || c.close_reason().is_none() {
-                    return Ok(c);
+                    return Ok((**c).clone());
                 }
             }
+            drop(g);
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!("quic unavailable (server restarting?)");
             }
@@ -211,21 +250,36 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The process-wide egress handle plus the freshness stamp it was published
+/// with. Immutable once published, so a reader can hold it without a lock.
+#[derive(Debug)]
+struct EgressCache {
+    conn: quinn::Connection,
+    limit: usize,
+    stamp_ms: u64,
+}
+
 #[derive(Debug, Default)]
 struct SharedEgress {
-    cached: std::sync::RwLock<Option<(quinn::Connection, usize, u64)>>,
+    /// `ArcSwapOption` replaces the `RwLock` this used to be. The old code used
+    /// `try_write` and treated a lost publish as "stamp 0" — a memo that could
+    /// never be served as fresh, so the next packet retried the whole refresh.
+    /// `ArcSwap::store` is lock-free and always commits, which deletes that
+    /// whole failure mode: every publish lands and carries a real stamp.
+    cached: ArcSwapOption<EgressCache>,
     warned: std::sync::atomic::AtomicBool,
     /// Single-flight refresh gate: only one association task pays the two
     /// quinn locks (`close_reason` + `max_datagram_size`) per refresh window.
     /// The rest fail fast (UDP drop semantics) instead of herding on the same
     /// mutexes the moment the 1 s window expires on 4096 associations at once.
     refreshing: std::sync::atomic::AtomicBool,
-    /// Bumped (Release) after every successful mutation of `cached` — the
-    /// publish in `refresh_global` and the clear in `invalidate`. A failed
-    /// `try_write` mutates nothing and does not bump. The thread-local memo
-    /// tags itself with the generation observed *before* its cached read, so a
-    /// mutation concurrent with an acquire invalidates every thread's memo at
-    /// once without a lock or a per-thread scan.
+    /// Bumped (Release) after every mutation of `cached` — the publish in
+    /// `refresh_global` and the clear in `invalidate`. With `ArcSwap` a mutation
+    /// can no longer be lost, so this is bumped exactly once per mutation and
+    /// never spuriously. The thread-local memo tags itself with the generation
+    /// observed *before* its cached read, so a mutation concurrent with an
+    /// acquire invalidates every thread's memo at once without a lock or a
+    /// per-thread scan.
     generation: std::sync::atomic::AtomicU64,
 }
 
@@ -278,11 +332,9 @@ impl SharedEgress {
     /// is expired. Returns `None` only when no handle is available, in which
     /// case the caller drops the datagram (UDP semantics).
     fn acquire(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize, u64)> {
-        if let Ok(g) = self.cached.try_read() {
-            if let Some((c, limit, t)) = g.as_ref() {
-                if now_ms.saturating_sub(*t) < EGRESS_REFRESH_MS {
-                    return Some((c.clone(), *limit, *t));
-                }
+        if let Some(c) = self.cached.load().as_ref() {
+            if now_ms.saturating_sub(c.stamp_ms) < EGRESS_REFRESH_MS {
+                return Some((c.conn.clone(), c.limit, c.stamp_ms));
             }
         }
         if let Some((c, m, stamp)) = self.refresh_global(pool, now_ms) {
@@ -292,19 +344,16 @@ impl SharedEgress {
         // optimistically with no liveness check. A dead one surfaces as
         // `ConnectionLost` on send and invalidates the cache there, so the
         // expiry window costs zero quinn locks.
-        if let Ok(g) = self.cached.try_read() {
-            if let Some((c, limit, t)) = g.as_ref() {
-                return Some((c.clone(), *limit, *t));
-            }
+        if let Some(c) = self.cached.load().as_ref() {
+            return Some((c.conn.clone(), c.limit, c.stamp_ms));
         }
         self.memo_clear();
         None
     }
 
     /// Refresh `cached` under the single-flight gate. Returns the fresh handle
-    /// and the stamp to tag it with: `now_ms` when the publish landed, else `0`
-    /// (an unpublished handle must never be tagged fresh — the zero stamp keeps
-    /// the memo cold so the next packet retries).
+    /// and the stamp to tag it with, which is always `now_ms`: `ArcSwap::store`
+    /// cannot lose, so there is no unpublished-handle case to keep cold.
     fn refresh_global(
         &self,
         pool: &ConnPool,
@@ -326,32 +375,22 @@ impl SharedEgress {
         }
         let _guard = RefreshGuard(&self.refreshing);
         for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
-            let Ok(g) = slot.shared.try_read() else {
-                continue;
-            };
+            // Lock-free read: no `try_read` that can fail, so a refresh can
+            // never be skipped just because a reconnect is publishing.
+            let g = slot.shared.load();
             match g.as_ref() {
                 Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
                     Some(m) => {
-                        // Publish the timestamp without ever blocking the
-                        // executor: readers hold `try_read` only for an Arc
-                        // bump, but a blocking write would still park this
-                        // worker thread whenever one is inside. If the
-                        // `try_write` loses, this packet still uses the fresh
-                        // handle; the zero stamp keeps the memo cold so the
-                        // next packet retries (single-flight keeps it to one
-                        // contender).
-                        let stamp = if let Ok(mut w) = self.cached.try_write() {
-                            *w = Some((c.clone(), m, now_ms));
-                            // Mutation rule: bump only after a successful
-                            // publish, so a lost `try_write` cannot invalidate
-                            // a memo that still matches the untouched cache.
-                            self.generation
-                                .fetch_add(1, std::sync::atomic::Ordering::Release);
-                            now_ms
-                        } else {
-                            0
-                        };
-                        return Some((c.clone(), m, stamp));
+                        // Lock-free publish: cannot lose, cannot park the
+                        // executor, and always carries a real stamp.
+                        self.cached.store(Some(Arc::new(EgressCache {
+                            conn: (**c).clone(),
+                            limit: m,
+                            stamp_ms: now_ms,
+                        })));
+                        self.generation
+                            .fetch_add(1, std::sync::atomic::Ordering::Release);
+                        return Some(((**c).clone(), m, now_ms));
                     }
                     None => {
                         if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -367,13 +406,10 @@ impl SharedEgress {
     }
 
     fn invalidate(&self) {
-        if let Ok(mut w) = self.cached.try_write() {
-            *w = None;
-            // Mutation rule: bump only when the clear landed; a lost
-            // `try_write` leaves the cache untouched and the generation alone.
-            self.generation
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
+        self.cached.store(None);
+        // The clear always lands, so the memo invalidation is never skipped.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -384,8 +420,86 @@ impl SharedEgress {
 /// DATAGRAM: a single RwLock there is a cross-core cache-line bottleneck.
 const HUB_SHARDS: usize = 32;
 
+/// One live UDP association, as the dispatchers see it.
+///
+/// This replaces the per-association `mpsc::Sender<Bytes>` the dispatcher used
+/// to push inbound datagrams into. The dispatcher now builds the SOCKS5 reply
+/// header and writes the relay socket itself, so an entry carries the socket and
+/// the app address rather than a queue. Three consequences are deliberate:
+///
+/// - The per-association reply task is gone. So is its 256-deep queue and the
+///   `TrySendError::Full` arm that dropped datagrams when it filled — an entire
+///   loss mode disappears rather than being tuned.
+/// - The queue hop measured 52-57 ns per datagram (`hotpath_bench chan`). The
+///   dispatcher pays that back as the `send_to` it now performs inline, on a
+///   stage that is single-threaded per connection either way, because one
+///   `read_datagram` stream admits exactly one poller.
+/// - `alive` replaces the `Closed` signal the dropped receiver used to provide,
+///   so a dispatcher stops writing into a socket nobody reads as soon as the
+///   association exits, instead of holding the socket open until its cache slot
+///   is recycled by a collision.
+///
+/// Fragment reassembly deliberately does *not* live here. `DgramReassembler` is
+/// already keyed by `(sess, id)` and is therefore connection-wide — the server
+/// has always used exactly one per connection — so the dispatcher owns a single
+/// reassembler and no per-session mutable state exists anywhere.
+struct AssocEntry {
+    relay: Arc<tokio::net::UdpSocket>,
+    /// The app's source address, published by the relay loop when it first sees
+    /// a datagram from the app, read by whichever dispatcher has a reply to
+    /// deliver. Lock-free in both directions.
+    app: ArcSwapOption<SocketAddr>,
+    /// Cleared by the association as it exits.
+    alive: std::sync::atomic::AtomicBool,
+}
+
+impl AssocEntry {
+    fn new(relay: Arc<tokio::net::UdpSocket>) -> Self {
+        Self {
+            relay,
+            app: ArcSwapOption::const_empty(),
+            alive: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The app's address, if the app has sent anything yet. The returned borrow
+    /// means no refcount traffic on the per-datagram path.
+    fn app(&self) -> Option<SocketAddr> {
+        self.app.load().as_ref().map(|a| **a)
+    }
+}
+
+/// Clears an entry's liveness bit on every exit path out of the association,
+/// including `?` early returns, so dispatchers drop their cached handle promptly
+/// instead of writing replies into a socket nobody reads.
+struct AliveGuard(Arc<AssocEntry>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0
+            .alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct UdpHub {
-    subs: Vec<std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>>>,
+    /// One immutable map per shard, published through `ArcSwap`.
+    ///
+    /// This used to be `RwLock<HashMap>` read with `try_lock_read`, whose
+    /// failure mode was a **silently dropped inbound datagram** whenever the
+    /// read lock was momentarily held by an association being created or torn
+    /// down. `ArcSwap::load` cannot fail, so the dispatcher's lookup is now
+    /// lock-free *and* total: a miss means the session genuinely has no
+    /// subscription, never that a lock was busy.
+    ///
+    /// Writes are clone-on-publish (`rcu`), which is affordable because they
+    /// happen once per association open / close and each shard holds at most
+    /// `MAX_UDP_ASSOCS / HUB_SHARDS` entries.
+    subs: Vec<arc_swap::ArcSwap<HashMap<u32, Arc<AssocEntry>>>>,
     next: std::sync::atomic::AtomicU32,
     /// Exact process-wide association count across all shards.
     len: std::sync::atomic::AtomicUsize,
@@ -395,26 +509,26 @@ impl UdpHub {
     fn new() -> Self {
         Self {
             subs: (0..HUB_SHARDS)
-                .map(|_| std::sync::RwLock::new(HashMap::new()))
+                .map(|_| arc_swap::ArcSwap::from_pointee(HashMap::new()))
                 .collect(),
             next: std::sync::atomic::AtomicU32::new(1),
             len: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn shard(&self, s: u32) -> &std::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<Bytes>>> {
+    fn shard(&self, s: u32) -> &arc_swap::ArcSwap<HashMap<u32, Arc<AssocEntry>>> {
         &self.subs[(s as usize) % HUB_SHARDS]
     }
 
-    /// Allocates a session id + reply channel. `None` when the process-wide
-    /// association cap is reached (caller replies SOCKS5 REP=0x01).
-    fn alloc_sess(
-        &self,
-    ) -> Option<(
-        u32,
-        tokio::sync::mpsc::Sender<Bytes>,
-        tokio::sync::mpsc::Receiver<Bytes>,
-    )> {
+    /// Reserves a process-wide association slot and a free session id. `None`
+    /// when the cap is reached (caller replies SOCKS5 REP=0x01).
+    ///
+    /// Allocation and publication are split because the relay socket has to
+    /// exist before an entry can name it: the id is reserved here, the socket is
+    /// created by the association, and [`Self::publish`] installs the entry. The
+    /// caller must pair every successful `alloc_sess` with exactly one
+    /// [`Self::release`], including when it fails before publishing.
+    fn alloc_sess(&self) -> Option<u32> {
         use std::sync::atomic::Ordering;
         // Reserve a global slot first so the cap stays exact across shards.
         loop {
@@ -436,29 +550,61 @@ impl UdpHub {
             if s == 0 || s == u32::MAX {
                 continue;
             }
-            let shard = self.shard(s);
-            let mut m = myquic2::lock_write(shard);
-            if m.contains_key(&s) {
+            if self.shard(s).load().contains_key(&s) {
                 continue;
             }
-            // 256 queued datagrams (~350KB worst case) per association: the
-            // reply task never blocks (udp_try_send), so a deeper queue only
-            // multiplies the worst-case memory across MAX_UDP_ASSOCS.
-            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(256);
-            m.insert(s, tx.clone());
-            return Some((s, tx, rx));
+            return Some(s);
         }
     }
 
-    fn remove(&self, s: u32) {
-        let shard = self.shard(s);
-        if myquic2::lock_write(shard).remove(&s).is_some() {
-            self.len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        }
+    /// Installs an association's reply endpoint under its reserved id.
+    ///
+    /// `rcu` re-runs against the latest map, so two associations publishing to
+    /// the same shard concurrently cannot lose each other's insert (a
+    /// load-clone-store would).
+    fn publish(&self, s: u32, entry: Arc<AssocEntry>) {
+        self.shard(s).rcu(|m| {
+            let mut next = (**m).clone();
+            next.insert(s, entry.clone());
+            next
+        });
     }
 
-    fn sender(&self, s: u32) -> Option<tokio::sync::mpsc::Sender<Bytes>> {
-        myquic2::try_lock_read(self.shard(s))?.get(&s).cloned()
+    /// Tears an association down: removes the published entry (if any) and
+    /// releases its reserved slot. Must be called exactly once per successful
+    /// [`Self::alloc_sess`], whether or not `publish` ever ran — which is why the
+    /// count is released unconditionally rather than only when a map entry was
+    /// found.
+    fn release(&self, s: u32) {
+        self.unpublish(s);
+        self.len.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Removes a published entry without touching the process-wide count. Split
+    /// from [`Self::release`] so the slot accounting stays paired with
+    /// `alloc_sess` alone and cannot be driven negative by a stray removal.
+    fn unpublish(&self, s: u32) {
+        self.shard(s).rcu(|m| {
+            if !m.contains_key(&s) {
+                return (**m).clone();
+            }
+            let mut next = (**m).clone();
+            next.remove(&s);
+            next
+        });
+    }
+
+    /// Look up an association's reply endpoint. Lock-free and infallible: the
+    /// returned `None` means "no such association", never "try again".
+    fn entry(&self, s: u32) -> Option<Arc<AssocEntry>> {
+        self.shard(s).load().get(&s).cloned()
+    }
+
+    /// Test-only publish with an explicit session id, so `dispatch_one` can be
+    /// driven against a known key without going through `alloc_sess`'s counter.
+    #[cfg(test)]
+    fn subscribe(&self, s: u32, entry: Arc<AssocEntry>) {
+        self.publish(s, entry);
     }
 }
 
@@ -622,14 +768,6 @@ fn jitter_ms() -> u64 {
     })
 }
 
-fn count_dispatch_drop(sess: u32) {
-    static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n.is_multiple_of(1000) {
-        tracing::warn!("udphub sess={sess} dispatcher drops={n}");
-    }
-}
-
 fn tcp_abort_log_due() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -662,38 +800,117 @@ fn tcp_abort_log_due() -> bool {
 /// two (the index is a mask).
 const DISPATCH_CACHE: usize = 1024;
 
-/// Route one inbound DATAGRAM to its association. A slot is a hit only when it
-/// names the exact session *and* holds a sender: a cached absence or a
-/// collision re-probes the hub (treating absence as a hit would blackhole a
-/// session id if it were ever reused after u32 wrap). The hit path borrows the
-/// cached `Sender` directly — `try_send` takes `&self`, so no refcount bump.
+/// One cached session → endpoint binding. A slot is a hit only when it names the
+/// exact session *and* the entry is still alive: a cached absence, a collision,
+/// or a torn-down association re-probes the hub. Treating absence as a hit would
+/// blackhole a session id if it were ever reused after `u32` wrap, and treating a
+/// dead entry as a hit would keep writing into a socket nobody reads.
+struct DispatchSlot {
+    sess: u32,
+    entry: Option<Arc<AssocEntry>>,
+}
+
+/// Route one inbound DATAGRAM to its association, writing the relay socket
+/// directly.
+///
+/// This is the pass-23 replacement for "push into the association's queue and let
+/// its reply task do the work". Nothing per-session is mutable here: the
+/// reassembler is keyed by `(sess, id)` and therefore connection-wide, and the
+/// scratch buffer is reused across datagrams, so the escape path stays
+/// allocation-free.
 fn dispatch_one(
-    cache: &mut [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE],
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
     hub: &UdpHub,
     sess: u32,
     d: Bytes,
+    reasm: &mut DgramReassembler,
+    pkt: &mut bytes::BytesMut,
 ) {
-    use tokio::sync::mpsc::error::TrySendError;
     let idx = (sess as usize) & (DISPATCH_CACHE - 1);
-    if cache[idx].0 != sess || cache[idx].1.is_none() {
-        cache[idx] = (sess, hub.sender(sess));
+    if cache[idx].sess != sess || cache[idx].entry.as_ref().is_none_or(|e| !e.is_alive()) {
+        cache[idx] = DispatchSlot {
+            sess,
+            entry: hub.entry(sess),
+        };
     }
-    if let Some(tx) = cache[idx].1.as_ref() {
-        if let Err(e) = tx.try_send(d) {
-            match e {
-                TrySendError::Closed(payload) => {
-                    let fresh = hub.sender(sess);
-                    cache[idx] = (sess, fresh.clone());
-                    match fresh.as_ref() {
-                        Some(f) => {
-                            if f.try_send(payload).is_err() {
-                                count_dispatch_drop(sess);
-                            }
-                        }
-                        None => count_dispatch_drop(sess),
+    let Some(entry) = cache[idx].entry.as_ref() else {
+        // No such association: the reply belongs to a session that has already
+        // been torn down. Silently ignored, matching the old receiver-dropped
+        // behaviour.
+        return;
+    };
+    // `ArcSwapOption::load` borrows, so this costs no refcount traffic on the
+    // per-datagram path; the 200 ms app-address cache the reply task needed is
+    // gone with the lock it was working around.
+    let Some(app) = entry.app() else {
+        udp_write::no_app();
+        return;
+    };
+
+    if d.first() == Some(&MQP_DGRAM_FRAG) {
+        let Ok(f) = decode_fragment(&d) else {
+            return;
+        };
+        let Some((_, a, whole)) = reasm.push(&f, mono_millis()) else {
+            return;
+        };
+        udp_stats::payload(whole.len());
+        match a.as_ref() {
+            TargetAddrRef::Ip(dst) => send_reply_addr(&entry.relay, app, dst, &whole, pkt),
+            TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
+                CachedLookup::Addr(dst) => send_reply_addr(&entry.relay, app, dst, &whole, pkt),
+                CachedLookup::Negative | CachedLookup::Unknown => {}
+            },
+        }
+        return;
+    }
+
+    let Ok((_, a, p)) = decode_datagram_ref(&d) else {
+        return;
+    };
+    let off = d.len() - p.len();
+    let payload = d.slice(off..);
+    udp_stats::payload(payload.len());
+    match a {
+        TargetAddrRef::Ip(dst) => send_reply_addr(&entry.relay, app, dst, &payload, pkt),
+        TargetAddrRef::Domain(h, p) => {
+            // The server always echoes replies with an IP-form source address, so
+            // this branch is defensive; the negative cache is still consulted
+            // synchronously so a known-bad name never spawns a resolver task.
+            match lookup_cached_fast(h, p) {
+                CachedLookup::Negative => {}
+                CachedLookup::Addr(dst) => send_reply_addr(&entry.relay, app, dst, &payload, pkt),
+                CachedLookup::Unknown => {
+                    if dns_is_inflight(h, p) {
+                        return;
                     }
+                    if dns_slow_path_limiter().available_permits() == 0 {
+                        return;
+                    }
+                    let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    // Hand the resolver task its own handle on the association.
+                    // It checks nothing else: a reply resolved after the
+                    // association died writes into a socket the entry keeps
+                    // alive, which is the same best-effort UDP semantics as a
+                    // reply that arrives late on any other path.
+                    let entry = entry.clone();
+                    let host = h.to_string();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let dst = match resolve_all_cached(&host, p).await {
+                            Ok(v) => match v.first().copied() {
+                                Some(s) => s,
+                                None => return,
+                            },
+                            Err(_) => return,
+                        };
+                        let mut pkt = bytes::BytesMut::with_capacity(256);
+                        send_reply(&entry.relay, &entry.app, dst, &payload, &mut pkt);
+                    });
                 }
-                TrySendError::Full(_) => count_dispatch_drop(sess),
             }
         }
     }
@@ -709,8 +926,17 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             };
             let reader = conn.read_datagram();
             tokio::pin!(reader);
-            let mut cache: [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE] =
-                std::array::from_fn(|_| (u32::MAX, None));
+            let mut cache: [DispatchSlot; DISPATCH_CACHE] = std::array::from_fn(|_| DispatchSlot {
+                sess: u32::MAX,
+                entry: None,
+            });
+            // One reassembler for the whole connection, exactly as the server's
+            // datagram reader has always used: it is keyed by `(sess, id)`, so a
+            // per-association copy would only duplicate state. In dual-connection
+            // mode each connection keeps its own, which is correct because a
+            // payload's fragments all travel on the connection that carried them.
+            let mut reasm = DgramReassembler::new();
+            let mut pkt = bytes::BytesMut::with_capacity(256);
             let mut reader_failed = false;
             loop {
                 tokio::select! {
@@ -722,7 +948,7 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         let Some(sess) = dgram_sess(&d) else {
                             continue;
                         };
-                        dispatch_one(&mut cache, &hub, sess, d);
+                        dispatch_one(&mut cache, &hub, sess, d, &mut reasm, &mut pkt);
                     }
                     _ = gen.changed() => break,
                 }
@@ -764,7 +990,7 @@ fn spawn_conn_loop(
             match dial_once(&ep, server, &sname, &auth).await {
                 Ok(conn) => {
                     info!("QUIC connected to {server}");
-                    *slot.shared.write().await = Some(conn.clone());
+                    slot.publish(&conn);
                     slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
                     bump_gen(&slot.gen_tx);
                     let connected_at = std::time::Instant::now();
@@ -799,14 +1025,8 @@ fn spawn_conn_loop(
                         warn!("QUIC close reason: {reason}");
                     }
                     slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
-                    {
-                        let mut w = slot.shared.write().await;
-                        if let Some(cur) = w.as_ref() {
-                            if cur.stable_id() == conn.stable_id() {
-                                *w = None;
-                                bump_gen(&slot.gen_tx);
-                            }
-                        }
+                    if slot.clear_if(&conn) {
+                        bump_gen(&slot.gen_tx);
                     }
                     if connected_at.elapsed() >= Duration::from_secs(5) {
                         backoff = Duration::from_millis(200);
@@ -1095,8 +1315,6 @@ async fn handle_socks(
     });
 
     let slot = pool.pick_tcp(&target);
-    let shared = slot.shared.clone();
-    let live = slot.live.clone();
     let mut gen_rx = slot.gen_rx.clone();
     let gen_tx = slot.gen_tx.clone();
     let conn = match slot.wait_conn(&mut gen_rx, timeout).await {
@@ -1117,20 +1335,15 @@ async fn handle_socks(
         }
         _ => {
             if conn.close_reason().is_some() {
-                // Single write lock with re-check (no read-then-write split):
-                // a reconnect may install a fresh connection between a read
-                // and a later write, and clearing unconditionally would
-                // blackhole the new connection until it dies. Matches the
-                // reconnect loop's own clear path.
-                {
-                    let mut w = shared.write().await;
-                    if let Some(cur) = w.as_ref() {
-                        if cur.stable_id() == conn.stable_id() {
-                            *w = None;
-                            live.store(false, std::sync::atomic::Ordering::Relaxed);
-                            bump_gen(&gen_tx);
-                        }
-                    }
+                // Atomic read-then-clear with re-check: a reconnect may install
+                // a fresh connection between a read and a later clear, and
+                // clearing unconditionally would blackhole the new connection
+                // until it dies. `clear_if` matches on `stable_id` inside the
+                // `rcu` closure, so the re-check and the store cannot be split.
+                // Matches the reconnect loop's own clear path.
+                if slot.clear_if(&conn) {
+                    slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+                    bump_gen(&gen_tx);
                 }
                 write_socks_reply(&mut s, 0x04, bnd).await.ok();
                 anyhow::bail!("quic connection dead, retry");
@@ -1297,8 +1510,8 @@ async fn handle_udp_associate(
     hub: Arc<UdpHub>,
     egress_shared: Arc<SharedEgress>,
 ) -> Result<()> {
-    let (sess, _tx, rx) = match hub.alloc_sess() {
-        Some(x) => x,
+    let sess = match hub.alloc_sess() {
+        Some(s) => s,
         None => {
             let bnd = bnd_for(&tcp)
                 .unwrap_or_else(|_| SocketAddr::new(unmap("127.0.0.1".parse().unwrap()), 0));
@@ -1307,19 +1520,21 @@ async fn handle_udp_associate(
         }
     };
     udp_stats::session();
-    // Wrapper guarantees the subscription is torn down on every exit path,
+    // Wrapper guarantees the reservation is released on every exit path,
     // including early setup errors that used to leak the hub entry forever.
-    let res = udp_associate_inner(tcp, pool, egress_shared, sess, rx).await;
-    hub.remove(sess);
+    // `release` is unconditional because `alloc_sess` reserved the slot whether
+    // or not the association ever got as far as publishing an entry.
+    let res = udp_associate_inner(tcp, pool, hub.clone(), egress_shared, sess).await;
+    hub.release(sess);
     res
 }
 
 async fn udp_associate_inner(
     mut tcp: tokio::net::TcpStream,
     pool: ConnPool,
+    hub: Arc<UdpHub>,
     egress_shared: Arc<SharedEgress>,
     sess: u32,
-    mut rx: tokio::sync::mpsc::Receiver<Bytes>,
 ) -> Result<()> {
     let relay = tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0")?)?;
     let relay_port = relay.local_addr()?.port();
@@ -1337,131 +1552,25 @@ async fn udp_associate_inner(
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
     };
     let relay_reply = SocketAddr::new(relay_ip, relay_port);
-    write_socks_reply(&mut tcp, 0x00, relay_reply).await?;
     let relay = Arc::new(relay);
+    // Publish the association's reply endpoint *before* the app is told the relay
+    // address, so a reply can never arrive for a session the dispatchers cannot
+    // resolve. The app address is still unknown at this point and is filled in by
+    // the relay loop below; a reply that arrives before the app has sent anything
+    // is dropped by `udp_write::no_app`, exactly as it was when the reply task
+    // owned this state.
+    let entry = Arc::new(AssocEntry::new(relay.clone()));
+    hub.publish(sess, entry.clone());
+    // Cleared on every exit path out of this function, including the `?` below.
+    let _alive = AliveGuard(entry.clone());
+    write_socks_reply(&mut tcp, 0x00, relay_reply).await?;
     // Pin the app's source IP to the SOCKS control connection's peer. The
     // relay binds [::]:0 (all interfaces), so without this the last datagram
     // sender (any host that can reach the ephemeral port) would hijack replies.
     // Ports are intentionally not pinned: RFC 1928 clients commonly send UDP
     // from a different socket/port than the TCP control connection.
     let expected_app_ip = tcp.peer_addr().ok().map(|p| unmap(p.ip()));
-    // Sync lock: the critical section is a single `Option<SocketAddr>` copy
-    // and is never held across an await.
-    let last_app: Arc<std::sync::RwLock<Option<SocketAddr>>> =
-        Arc::new(std::sync::RwLock::new(None));
-    let last_app_w = last_app.clone();
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
-    let last_activity_rx = last_activity.clone();
-    let reply_handle = {
-        let r2 = relay.clone();
-        let last_app = last_app.clone();
-        tokio::spawn(async move {
-            let mut pkt = bytes::BytesMut::with_capacity(256);
-            let mut reasm = DgramReassembler::new();
-            let mut cached_app: Option<SocketAddr> = None;
-            let mut cached_at: u64 = 0;
-            let mut refresh_app = |now: u64| -> Option<SocketAddr> {
-                if let Some(a) = cached_app {
-                    if now.saturating_sub(cached_at) < 200 {
-                        return Some(a);
-                    }
-                }
-                match last_app.try_read().ok().and_then(|g| *g) {
-                    Some(a) => {
-                        cached_app = Some(a);
-                        cached_at = now;
-                        Some(a)
-                    }
-                    None => {
-                        if cached_app.is_some() && now.saturating_sub(cached_at) < 1000 {
-                            cached_app
-                        } else {
-                            cached_app = None;
-                            udp_write::no_app();
-                            None
-                        }
-                    }
-                }
-            };
-            while let Some(d) = rx.recv().await {
-                // ~1s resolution is plenty for the idle reaper.
-                let now = mono_millis();
-                let prev = last_activity_rx.load(std::sync::atomic::Ordering::Relaxed);
-                if now.saturating_sub(prev) >= 1000 {
-                    last_activity_rx.store(now, std::sync::atomic::Ordering::Relaxed);
-                }
-                let Some(app) = refresh_app(now) else {
-                    continue;
-                };
-                if d.first() == Some(&MQP_DGRAM_FRAG) {
-                    let Ok(f) = decode_fragment(&d) else { continue };
-                    let Some((_, a, whole)) = reasm.push(&f, now) else {
-                        continue;
-                    };
-                    udp_stats::payload(whole.len());
-                    match a.as_ref() {
-                        TargetAddrRef::Ip(dst) => send_reply_addr(&r2, app, dst, &whole, &mut pkt),
-                        TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
-                            CachedLookup::Addr(dst) => {
-                                send_reply_addr(&r2, app, dst, &whole, &mut pkt)
-                            }
-                            CachedLookup::Negative | CachedLookup::Unknown => {}
-                        },
-                    }
-                    continue;
-                }
-                let Ok((_, a, p)) = decode_datagram_ref(&d) else {
-                    continue;
-                };
-                let off = d.len() - p.len();
-                let payload = d.slice(off..);
-                udp_stats::payload(payload.len());
-                match a {
-                    TargetAddrRef::Ip(dst) => send_reply_addr(&r2, app, dst, &payload, &mut pkt),
-                    TargetAddrRef::Domain(h, p) => {
-                        // The server always echoes replies with an IP-form source
-                        // address, so this branch is defensive; the negative
-                        // cache is still consulted synchronously so a known-bad
-                        // name never spawns a resolver task.
-                        match lookup_cached_fast(h, p) {
-                            CachedLookup::Negative => continue,
-                            CachedLookup::Addr(dst) => {
-                                send_reply_addr(&r2, app, dst, &payload, &mut pkt)
-                            }
-                            CachedLookup::Unknown => {
-                                if dns_is_inflight(h, p) {
-                                    continue;
-                                }
-                                if dns_slow_path_limiter().available_permits() == 0 {
-                                    continue;
-                                }
-                                let permit =
-                                    match dns_slow_path_limiter().clone().try_acquire_owned() {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    };
-                                let r2 = r2.clone();
-                                let last_app = last_app.clone();
-                                let host = h.to_string();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let dst = match resolve_all_cached(&host, p).await {
-                                        Ok(v) => match v.first().copied() {
-                                            Some(s) => s,
-                                            None => return,
-                                        },
-                                        Err(_) => return,
-                                    };
-                                    let mut pkt = bytes::BytesMut::with_capacity(256);
-                                    send_reply(&r2, &last_app, dst, &payload, &mut pkt);
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        })
-    };
     // app -> QUIC with this association's sess. Idle assoc (no packets
     // either way for 180s) is reaped so leaked TCP controls cannot hold
     // relay sockets forever (B6).
@@ -1483,9 +1592,8 @@ async fn udp_associate_inner(
     // every datagram to decide that.
     let mut activity_stamp = mono_millis();
     // Local copy of the last published app address: the value almost never
-    // changes (one UDP socket per association), so only `try_write` on change
-    // instead of CAS-ing the shared lock per packet where a loaded reply task
-    // would starve the write.
+    // changes (one UDP socket per association), so only publish on change
+    // instead of storing per packet.
     let mut published_app: Option<SocketAddr> = None;
     loop {
         tokio::select! {
@@ -1521,10 +1629,11 @@ async fn udp_associate_inner(
                     last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
                 if published_app != Some(app) {
-                    if let Ok(mut w) = last_app_w.try_write() {
-                        *w = Some(app);
-                        published_app = Some(app);
-                    }
+                    // Cannot lose: the publish always lands, so `published_app`
+                    // and the shared slot can never drift apart. This is the
+                    // hand-off to every dispatcher holding this entry.
+                    entry.app.store(Some(Arc::new(app)));
+                    published_app = Some(app);
                 }
                 if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
                     continue;
@@ -1627,7 +1736,6 @@ async fn udp_associate_inner(
             }
         }
     }
-    reply_handle.abort();
     Ok(())
 }
 
@@ -1644,12 +1752,12 @@ async fn udp_associate_inner(
 /// no per-reply allocation and no aliasing with another task.
 fn send_reply(
     relay: &Arc<tokio::net::UdpSocket>,
-    last_app: &std::sync::RwLock<Option<SocketAddr>>,
+    last_app: &ArcSwapOption<SocketAddr>,
     dst: SocketAddr,
     payload: &Bytes,
     pkt: &mut bytes::BytesMut,
 ) {
-    let Some(app) = last_app.try_read().ok().and_then(|g| *g) else {
+    let Some(app) = last_app.load().as_ref().map(|a| **a) else {
         udp_write::no_app();
         return;
     };
@@ -1893,7 +2001,11 @@ mod tests {
         let (conn, _client, _server) = real_connection().await;
         let e = SharedEgress::default();
         let now = mono_millis();
-        *e.cached.try_write().unwrap() = Some((conn.clone(), 1200, now));
+        e.cached.store(Some(Arc::new(EgressCache {
+            conn: conn.clone(),
+            limit: 1200,
+            stamp_ms: now,
+        })));
         e.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         let gen = e.generation.load(std::sync::atomic::Ordering::Acquire);
@@ -1918,45 +2030,197 @@ mod tests {
         assert!(e.with_fresh(now, |_, _| ()).is_none());
     }
 
-    fn empty_dispatch_cache() -> [(u32, Option<tokio::sync::mpsc::Sender<Bytes>>); DISPATCH_CACHE] {
-        std::array::from_fn(|_| (u32::MAX, None))
+    fn empty_dispatch_cache() -> [DispatchSlot; DISPATCH_CACHE] {
+        std::array::from_fn(|_| DispatchSlot {
+            sess: u32::MAX,
+            entry: None,
+        })
     }
+
+    /// A fake association: a dual-stack relay socket (the production shape —
+    /// `map_for_dual` maps the reply destination to a v4-mapped address, so a
+    /// v4-only relay could not send), an "app" socket that receives replies, and
+    /// the entry the hub would hold, with the app address already published.
+    struct TestAssoc {
+        entry: Arc<AssocEntry>,
+        app: tokio::net::UdpSocket,
+    }
+
+    async fn test_assoc() -> TestAssoc {
+        let relay =
+            tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap();
+        let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app.local_addr().unwrap();
+        let entry = Arc::new(AssocEntry::new(Arc::new(relay)));
+        entry.app.store(Some(Arc::new(app_addr)));
+        TestAssoc { entry, app }
+    }
+
+    /// Drain one reply from the fake app, or `None` if nothing arrives. The
+    /// timeout is what lets a "must be dropped" assertion terminate.
+    async fn recv_reply(app: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+        let mut b = vec![0u8; 2048];
+        match tokio::time::timeout(Duration::from_millis(300), app.recv_from(&mut b)).await {
+            Ok(Ok((n, _))) => Some(b[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    /// A well-formed MQP-2 datagram carrying `payload` for `sess`.
+    fn dgram(sess: u32, payload: &[u8]) -> Bytes {
+        encode_datagram(
+            sess,
+            &TargetAddr::Ip("203.0.113.7:53".parse().unwrap()),
+            payload,
+        )
+        .unwrap()
+    }
+
+    /// The SOCKS5 reply header is RSV(3) + ATYP(1) + v4(4) + port(2).
+    const REPLY_HDR_V4: usize = 10;
 
     #[tokio::test]
     async fn dispatch_first_packet_probes_hub_and_delivers() {
         let hub = UdpHub::new();
-        let (sess, _tx, mut rx) = hub.alloc_sess().unwrap();
+        let a = test_assoc().await;
+        let sess = hub.alloc_sess().unwrap();
+        hub.publish(sess, a.entry.clone());
         let mut cache = empty_dispatch_cache();
-        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"a"));
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"a"));
-        assert_eq!(cache[(sess as usize) & (DISPATCH_CACHE - 1)].0, sess);
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"hello"),
+            &mut reasm,
+            &mut pkt,
+        );
+        let got = recv_reply(&a.app).await.expect("reply must be delivered");
+        assert_eq!(got[0..3], [0, 0, 0]);
+        assert_eq!(got[3], 0x01, "ATYP must be IPv4");
+        assert_eq!(&got[REPLY_HDR_V4..], b"hello");
+        assert_eq!(cache[(sess as usize) & (DISPATCH_CACHE - 1)].sess, sess);
     }
 
+    /// The dispatcher writes the relay socket itself, so a cached live entry must
+    /// keep delivering even after the hub has forgotten the session. This is the
+    /// replacement for the old "receiver still alive after `hub.remove`" case.
     #[tokio::test]
     async fn dispatch_cache_hit_does_not_reprobe_the_hub() {
         let hub = UdpHub::new();
-        let (sess, _tx, mut rx) = hub.alloc_sess().unwrap();
+        let a = test_assoc().await;
+        let sess = hub.alloc_sess().unwrap();
+        hub.publish(sess, a.entry.clone());
         let mut cache = empty_dispatch_cache();
-        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"a"));
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"a"));
-        // Drop the hub subscription but keep the receiver alive: a cache hit
-        // must deliver through the cached sender with no hub probe.
-        hub.remove(sess);
-        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"b"));
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"b"));
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"a"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert_eq!(
+            &recv_reply(&a.app).await.expect("first reply")[REPLY_HDR_V4..],
+            b"a"
+        );
+        // Unpublish but leave the entry alive: the cache must still serve it.
+        hub.release(sess);
+        assert!(a.entry.is_alive());
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"b"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert_eq!(
+            &recv_reply(&a.app).await.expect("cached reply")[REPLY_HDR_V4..],
+            b"b"
+        );
+    }
+
+    /// `alive` replaces the `Closed` signal the dropped `mpsc::Receiver` used to
+    /// give: once the association clears it, the dispatcher must re-probe, find
+    /// nothing, and drop — not keep writing into a socket nobody reads.
+    #[tokio::test]
+    async fn dispatch_dead_entry_reprobes_and_drops() {
+        let hub = UdpHub::new();
+        let a = test_assoc().await;
+        let sess = hub.alloc_sess().unwrap();
+        hub.publish(sess, a.entry.clone());
+        let mut cache = empty_dispatch_cache();
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"a"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(recv_reply(&a.app).await.is_some());
+
+        a.entry
+            .alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        hub.release(sess);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"b"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(
+            recv_reply(&a.app).await.is_none(),
+            "a torn-down association must not receive further replies"
+        );
+        assert!(
+            cache[(sess as usize) & (DISPATCH_CACHE - 1)]
+                .entry
+                .is_none(),
+            "the dead slot must have been re-probed away"
+        );
     }
 
     #[tokio::test]
     async fn dispatch_absent_slot_reprobes_the_hub() {
         let hub = UdpHub::new();
+        let a = test_assoc().await;
         let sess = 7777u32;
         let mut cache = empty_dispatch_cache();
-        // No subscription yet: the packet is dropped and the slot caches absent.
-        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"x"));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
-        myquic2::lock_write(hub.shard(sess)).insert(sess, tx);
-        dispatch_one(&mut cache, &hub, sess, Bytes::from_static(b"y"));
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"y"));
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        // Not published yet: the packet is dropped and the slot caches absent.
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"x"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(recv_reply(&a.app).await.is_none());
+        hub.publish(sess, a.entry.clone());
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"y"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert_eq!(
+            &recv_reply(&a.app).await.expect("reply after publish")[REPLY_HDR_V4..],
+            b"y"
+        );
     }
 
     #[tokio::test]
@@ -1968,17 +2232,176 @@ mod tests {
             (s1 as usize) & (DISPATCH_CACHE - 1),
             (s2 as usize) & (DISPATCH_CACHE - 1)
         );
-        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<Bytes>(8);
-        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Bytes>(8);
-        myquic2::lock_write(hub.shard(s1)).insert(s1, tx1);
-        myquic2::lock_write(hub.shard(s2)).insert(s2, tx2);
+        let a1 = test_assoc().await;
+        let a2 = test_assoc().await;
+        hub.publish(s1, a1.entry.clone());
+        hub.publish(s2, a2.entry.clone());
         let mut cache = empty_dispatch_cache();
-        dispatch_one(&mut cache, &hub, s1, Bytes::from_static(b"1"));
-        dispatch_one(&mut cache, &hub, s2, Bytes::from_static(b"2"));
-        dispatch_one(&mut cache, &hub, s1, Bytes::from_static(b"3"));
-        assert_eq!(rx1.try_recv().unwrap(), Bytes::from_static(b"1"));
-        assert_eq!(rx2.try_recv().unwrap(), Bytes::from_static(b"2"));
-        assert_eq!(rx1.try_recv().unwrap(), Bytes::from_static(b"3"));
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        for (s, want) in [(s1, &b"1"[..]), (s2, &b"2"[..]), (s1, &b"3"[..])] {
+            dispatch_one(&mut cache, &hub, s, dgram(s, want), &mut reasm, &mut pkt);
+        }
+        let f = |v: Vec<u8>| v[REPLY_HDR_V4..].to_vec();
+        assert_eq!(f(recv_reply(&a1.app).await.unwrap()), b"1");
+        assert_eq!(f(recv_reply(&a2.app).await.unwrap()), b"2");
+        assert_eq!(f(recv_reply(&a1.app).await.unwrap()), b"3");
+    }
+
+    /// Phase 3 moved fragment reassembly out of the per-association reply task
+    /// and into the dispatcher, relying on `DgramReassembler` being keyed by
+    /// `(sess, id)` — i.e. connection-wide, exactly as the server has always used
+    /// it. This pins that a payload split across fragments still arrives whole,
+    /// and that two sessions reassembling *concurrently* on the one dispatcher
+    /// reassembler do not cross-contaminate.
+    #[tokio::test]
+    async fn dispatch_reassembles_fragments_for_two_interleaved_sessions() {
+        let hub = UdpHub::new();
+        let s1 = 11u32;
+        let s2 = 12u32;
+        let a1 = test_assoc().await;
+        let a2 = test_assoc().await;
+        hub.publish(s1, a1.entry.clone());
+        hub.publish(s2, a2.entry.clone());
+        let mut cache = empty_dispatch_cache();
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        let addr = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+        let limit = 1400usize;
+        let send = |reasm: &mut DgramReassembler,
+                    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+                    pkt: &mut bytes::BytesMut,
+                    sess: u32,
+                    id: u16,
+                    total: u8,
+                    idx: u8,
+                    chunk: &[u8]| {
+            let f = encode_fragment(sess, id, idx, total, &addr.as_ref(), chunk, limit).unwrap();
+            dispatch_one(cache, &hub, sess, f, reasm, pkt);
+        };
+        // Interleave the two sessions' fragments deliberately.
+        send(&mut reasm, &mut cache, &mut pkt, s1, 5, 2, 0, b"AAAA");
+        send(&mut reasm, &mut cache, &mut pkt, s2, 9, 2, 0, b"BBBB");
+        assert!(
+            recv_reply(&a1.app).await.is_none(),
+            "a half-reassembled payload must not be delivered"
+        );
+        send(&mut reasm, &mut cache, &mut pkt, s1, 5, 2, 1, b"aaaa");
+        send(&mut reasm, &mut cache, &mut pkt, s2, 9, 2, 1, b"bbbb");
+        assert_eq!(
+            &recv_reply(&a1.app).await.expect("s1 reassembled")[REPLY_HDR_V4..],
+            b"AAAAaaaa"
+        );
+        assert_eq!(
+            &recv_reply(&a2.app).await.expect("s2 reassembled")[REPLY_HDR_V4..],
+            b"BBBBbbbb"
+        );
+    }
+
+    /// The dispatcher's lookup is *total*: `sender` reports `None` only for a
+    /// session that genuinely has no subscription, never because a lock was
+    /// busy. This is the property the old `try_lock_read` violated — a losing
+    /// `try_read` returned `None` and the inbound datagram was silently dropped.
+    ///
+    /// Hammered from several threads, a subscribed id must be observable on
+    /// every single probe until it is removed, and `remove` must be the only
+    /// thing that makes it disappear.
+    #[tokio::test]
+    async fn hub_sender_never_fails_because_of_concurrency() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let hub = Arc::new(UdpHub::new());
+        const PROBES: u32 = 4096;
+        // Subscribe everything *before* any reader runs, so from this point on
+        // every id in 1..=PROBES is continuously subscribed and a `None` can
+        // only mean a lost lookup.
+        // One socket shared by every stub entry: these tests only exercise the
+        // hub's lookup, never a dispatch, so 4096 real sockets would only risk
+        // the fd limit.
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        for s in 1..=PROBES {
+            hub.subscribe(s, Arc::new(AssocEntry::new(sock.clone())));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let hub = hub.clone();
+            let stop = stop.clone();
+            readers.push(std::thread::spawn(move || {
+                let mut seen = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for s in 1..=PROBES {
+                        assert!(
+                            hub.entry(s).is_some(),
+                            "subscribed session {s} probed as absent"
+                        );
+                        seen += 1;
+                    }
+                }
+                seen
+            }));
+        }
+        let mut churn = Vec::new();
+        for t in 0..2u32 {
+            let hub = hub.clone();
+            let sock = sock.clone();
+            churn.push(std::thread::spawn(move || {
+                // A disjoint id range, hashed across the same 32 shards, so the
+                // writers keep re-publishing maps the readers are loading.
+                for i in 0..256u32 {
+                    let s = 1_000_000 + t * 1000 + i;
+                    hub.subscribe(s, Arc::new(AssocEntry::new(sock.clone())));
+                    hub.unpublish(s);
+                }
+            }));
+        }
+        for c in churn {
+            let _ = c.join();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(total > 0, "readers never ran");
+        // Everything subscribed must still be present, and nothing else.
+        for s in 1..=PROBES {
+            assert!(hub.entry(s).is_some(), "session {s} lost after churn");
+        }
+        assert!(hub.entry(PROBES + 1).is_none());
+    }
+
+    /// `rcu` re-runs against the latest published map, so two associations
+    /// subscribing to the same shard concurrently cannot lose each other's
+    /// insert (which a load-clone-store would).
+    #[tokio::test]
+    async fn hub_concurrent_subscribes_on_one_shard_all_land() {
+        let hub = Arc::new(UdpHub::new());
+        // HUB_SHARDS == 32, so ids 0..32 spread over every shard exactly once
+        // per round; each thread therefore contends on all shards.
+        const PER_THREAD: u32 = 512;
+        let mut threads = Vec::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        for t in 0..8u32 {
+            let hub = hub.clone();
+            let sock = sock.clone();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let s = 1 + t * PER_THREAD + i;
+                    hub.subscribe(s, Arc::new(AssocEntry::new(sock.clone())));
+                }
+            }));
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+        for s in 1..=(8 * PER_THREAD) {
+            assert!(
+                hub.entry(s).is_some(),
+                "concurrent subscribe lost session {s}"
+            );
+        }
+        assert_eq!(
+            hub.len.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "subscribe must not move the global association counter"
+        );
     }
 
     /// `wait_conn` trusts the maintained live bit (no `close_reason()` mutex in
@@ -1988,7 +2411,7 @@ mod tests {
     async fn wait_conn_trusts_the_live_bit_and_bounds_the_dead_case() {
         let (conn, _client, _server) = real_connection().await;
         let slot = ConnSlot::fresh();
-        *slot.shared.try_write().unwrap() = Some(conn.clone());
+        slot.publish(&conn);
         slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
         let (_gen_tx, mut gen_rx) = watch::channel(0u64);
 
