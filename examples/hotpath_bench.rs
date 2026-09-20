@@ -17,6 +17,12 @@
 //!   `udp <socks> <host:port> <n> [batch]`
 //!                                 send N datagrams over one UDP ASSOCIATE and
 //!                                 wait for the same number of replies.
+//!   `udpdomain <socks> <host:port> <n> [batch]`
+//!                                 the same, but the request carries the target
+//!                                 as a SOCKS5 *domain* (ATYP 0x03), so the
+//!                                 proxy resolves per datagram instead of
+//!                                 receiving an address. This is the only mode
+//!                                 that exercises the DNS path on the relay.
 //!   `udpmulti <socks> <host:port> <assocs> <n> [batch]`
 //!                                 the same, but with `assocs` concurrent
 //!                                 associations on `assocs` OS threads, each
@@ -51,6 +57,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("echo") => echo(args[2].parse().unwrap()),
         Some("techo") => techo(args[2].parse().unwrap()),
+        Some("utag") => utag(args[2].parse().unwrap(), args[3].as_bytes()[0]),
         Some("tcp") => tcp(
             &args[2],
             &args[3],
@@ -62,6 +69,25 @@ fn main() {
             &args[3],
             args[4].parse().unwrap(),
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
+        Some("udpdomain") => udpdomain(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
+        Some("udpdomainswitch") => udpdomainswitch(
+            &args[2],
+            args[3].parse().unwrap(),
+            args[4].parse().unwrap(),
+            args[5].parse().unwrap(),
+        ),
+        Some("udpdomainmulti") => udpdomainmulti(
+            &args[2],
+            args[3].parse().unwrap(),
+            args[4].parse().unwrap(),
+            args[5].parse().unwrap(),
+            args[6].parse().unwrap(),
         ),
         Some("udpmulti") => udpmulti(
             &args[2],
@@ -292,6 +318,40 @@ fn udp_request(host: &str, port: u16, payload: usize) -> Vec<u8> {
     let hdr = pkt.len();
     pkt.resize(hdr + payload, 0x5A);
     pkt
+}
+
+/// The same request prefix in SOCKS5 *domain* form (ATYP 0x03). The proxy's
+/// per-datagram DNS path only runs for this encoding: with ATYP 0x01 the target
+/// is already an address and no resolver is involved, so an IP-literal
+/// benchmark cannot see that path at all.
+fn udp_request_domain(host: &str, port: u16, payload: usize) -> Vec<u8> {
+    let hb = host.as_bytes();
+    let mut pkt = vec![0, 0, 0, 0x03, hb.len() as u8];
+    pkt.extend_from_slice(hb);
+    pkt.extend_from_slice(&port.to_be_bytes());
+    let hdr = pkt.len();
+    pkt.resize(hdr + payload, 0x5A);
+    pkt
+}
+
+/// `udp` against a *domain* target, which is the case the server-side
+/// destination memo exists for: every datagram of the association carries the
+/// name, so the proxy must resolve (or reuse a resolution) per packet.
+fn udpdomain(socks: &str, target: &str, n: usize, batch: usize) {
+    let (host, port) = split_host(target);
+    let (_control, relay) = socks_associate(socks).unwrap();
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let pkt = udp_request_domain(&host, port, 1000);
+    let t0 = Instant::now();
+    let (sent, recv) = udp_pump(&u, &pkt, relay, n, batch);
+    let dt = t0.elapsed();
+    println!(
+        "udpdomain sent={sent} recv={recv} batch={batch} wall={:.3}s recv_pps={:.0}",
+        dt.as_secs_f64(),
+        recv as f64 / dt.as_secs_f64()
+    );
 }
 
 /// Send `n` datagrams and wait for `n` replies on one association.
@@ -612,6 +672,170 @@ fn udp(socks: &str, target: &str, n: usize, batch: usize) {
     );
 }
 
+/// One UDP ASSOCIATE whose datagrams alternate between two *different* domain
+/// targets that resolve to two different addresses, each running a server that
+/// stamps its own response. Every reply is checked against the server that owns
+/// the address the datagram was addressed to.
+///
+/// This is the correctness question a per-session destination pin raises: if a
+/// session's remembered address were used for a datagram naming a different
+/// name, replies would arrive from — and be sent to — the wrong target.
+fn udpdomainswitch(socks: &str, port_a: u16, port_b: u16, n: usize) {
+    let (a_host, a_port) = ("alpha.localhost", port_a);
+    let (b_host, b_port) = ("beta.localhost", port_b);
+    let (_control, relay) = socks_associate(socks).unwrap();
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    u.set_read_timeout(Some(Duration::from_millis(2000)))
+        .unwrap();
+    // The payload carries the intended target's initial, and each echo server
+    // replies with its own initial, so a mis-route is visible in the payload.
+    let pkt_a = udp_request_domain(a_host, a_port, 0);
+    let pkt_b = udp_request_domain(b_host, b_port, 0);
+    let mut buf = vec![0u8; 2048];
+    let (mut ok_a, mut ok_b, mut bad) = (0usize, 0usize, 0usize);
+    for i in 0..n {
+        let (pkt, want) = if i % 2 == 0 {
+            (&pkt_a, b'A')
+        } else {
+            (&pkt_b, b'B')
+        };
+        if u.send_to(pkt, relay).is_err() {
+            break;
+        }
+        match u.recv_from(&mut buf) {
+            Ok((len, _)) => {
+                // SOCKS5 UDP reply header: 2 rsv + 1 frag + atyp + addr + port.
+                let hdr = match buf.get(3) {
+                    Some(0x01) => 4 + 4 + 2,
+                    Some(0x04) => 4 + 16 + 2,
+                    _ => {
+                        bad += 1;
+                        continue;
+                    }
+                };
+                if len < hdr {
+                    bad += 1;
+                    continue;
+                }
+                let body = &buf[hdr..len];
+                if body.first() == Some(&want) {
+                    if want == b'A' {
+                        ok_a += 1;
+                    } else {
+                        ok_b += 1;
+                    }
+                } else {
+                    bad += 1;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    println!("udpdomainswitch n={n} ok_alpha={ok_a} ok_beta={ok_b} misrouted={bad}");
+
+    // The same check across encodings: alternate a *domain* target with an
+    // *IP* target in one session. The IP target memoizes an empty host, so a
+    // memo that matched on the session alone would answer the domain's
+    // datagrams with the IP target's address (or vice versa).
+    let ip_pkt = udp_request("127.0.0.1", port_b, 0);
+    let (mut ok_ip, mut ok_dom, mut bad2) = (0usize, 0usize, 0usize);
+    let mut buf = vec![0u8; 2048];
+    for i in 0..n {
+        let (pkt, want) = if i % 2 == 0 {
+            (&ip_pkt, b'B')
+        } else {
+            (&pkt_a, b'A')
+        };
+        if u.send_to(pkt, relay).is_err() {
+            break;
+        }
+        match u.recv_from(&mut buf) {
+            Ok((len, _)) => {
+                let hdr = match buf.get(3) {
+                    Some(0x01) => 4 + 4 + 2,
+                    Some(0x04) => 4 + 16 + 2,
+                    _ => {
+                        bad2 += 1;
+                        continue;
+                    }
+                };
+                if len < hdr {
+                    bad2 += 1;
+                    continue;
+                }
+                match (buf[hdr], want) {
+                    (b'B', b'B') => ok_ip += 1,
+                    (b'A', b'A') => ok_dom += 1,
+                    _ => bad2 += 1,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    println!("udpipswitch n={n} ok_ip_target={ok_ip} ok_domain_target={ok_dom} misrouted={bad2}");
+}
+
+/// `assocs` concurrent associations, each cycling through a pool of `domains`
+/// distinct *domain* targets, so the per-datagram DNS work is on the hot path
+/// and the thread-local memo is under pressure from more names than it can
+/// hold at once.
+///
+/// This is the shape the DNS memo's associativity exists for: one name per
+/// association is absorbed by a single memo slot, but N names per worker thread
+/// is what turns a memo hit into a shared-cache lookup.
+fn udpdomainmulti(socks: &str, port: u16, domains: usize, assocs: usize, n: usize) {
+    // Distinct names, all resolving to loopback through a wildcard resolver: to
+    // the memo and the DNS cache `sub0.localhost` and `sub1.localhost` are
+    // different names even though they land on the same address, which is what
+    // puts the memo under pressure without needing /etc/hosts entries.
+    let recv = Arc::new(AtomicU64::new(0));
+    let sent = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    let mut ws = Vec::with_capacity(assocs);
+    for _a in 0..assocs {
+        let socks = socks.to_string();
+        let recv = recv.clone();
+        let sent = sent.clone();
+        let pkts: Vec<Vec<u8>> = (0..domains)
+            .map(|i| udp_request_domain(&format!("sub{i}.localhost"), port, 1000))
+            .collect();
+        ws.push(std::thread::spawn(move || {
+            let Ok((_control, relay)) = socks_associate(&socks) else {
+                return;
+            };
+            let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+            u.set_read_timeout(Some(Duration::from_millis(2000)))
+                .unwrap();
+            let mut buf = vec![0u8; 2048];
+            let mut got = 0usize;
+            let mut snt = 0usize;
+            for i in 0..n {
+                let pkt = &pkts[i % pkts.len()];
+                if u.send_to(pkt, relay).is_err() {
+                    break;
+                }
+                snt += 1;
+                if u.recv_from(&mut buf).is_ok() {
+                    got += 1;
+                }
+            }
+            recv.fetch_add(got as u64, Ordering::Relaxed);
+            sent.fetch_add(snt as u64, Ordering::Relaxed);
+        }));
+    }
+    for w in ws {
+        let _ = w.join();
+    }
+    let dt = t0.elapsed();
+    let r = recv.load(Ordering::Relaxed);
+    println!(
+        "udpdomainmulti sent={} recv={r} domains={domains} assocs={assocs} wall={:.3}s recv_pps={:.0}",
+        sent.load(Ordering::Relaxed),
+        dt.as_secs_f64(),
+        r as f64 / dt.as_secs_f64()
+    );
+}
+
 /// `assocs` concurrent associations, each on its own OS thread and relay
 /// socket, all hammering the same target.
 ///
@@ -681,6 +905,24 @@ fn udpmulti(socks: &str, target: &str, assocs: usize, n: usize, batch: usize) {
 /// TCP echo target: echoes every byte it reads back verbatim. Unlike the reply
 /// server it never closes on its own, so a client can keep one connection open
 /// across several exchanges and verify each payload exactly.
+/// UDP echo that replies with `tag` followed by the request, so a client can
+/// tell *which* target answered — the check `udpdomainswitch` needs to prove a
+/// multi-target session is not served by the wrong address.
+fn utag(port: u16, tag: u8) {
+    let s = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    println!("tagged udp echo on 127.0.0.1:{port} tag={}", tag as char);
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, from)) = s.recv_from(&mut buf) else {
+            continue;
+        };
+        let mut out = Vec::with_capacity(n + 1);
+        out.push(tag);
+        out.extend_from_slice(&buf[..n]);
+        let _ = s.send_to(&out, from);
+    }
+}
+
 fn techo(port: u16) {
     let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     println!("tcp echo on 127.0.0.1:{port}");

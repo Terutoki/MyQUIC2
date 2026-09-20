@@ -1395,33 +1395,107 @@ pub fn mono_millis() -> u64 {
 
 /// Thread-local memo of the most recent lookups, keyed by the *full* normalized
 /// key. A 64-bit hash here would let two different `(host, port)` pairs collide
-/// and serve each other's address for the whole TTL, so the key is compared
-/// byte-for-byte. Storing it inline keeps fast-path hits allocation-free.
-struct DnsMemo {
-    key: [u8; DNS_KEY_BUF],
-    len: usize,
+/// and serve each other's address for the whole TTL, so the hash is only ever a
+/// filter: a slot matches only when the stored key bytes compare equal too.
+///
+/// Two-way set-associative over 64 sets (128 slots), replacing a single
+/// 32-slot direct-mapped table. The old shape was fine for one hot target but
+/// degraded exactly when the proxy is busiest: a worker thread serving N
+/// distinct domains misses on roughly `1 - 32/N` of lookups, so 32 concurrent
+/// domains already cost ~31 % penetration into the shared cache and 128 cost
+/// ~76 % (measured, 10 threads). Conflict misses dominate a direct-mapped
+/// table this small; two ways removes them, and the measured penetration at 32
+/// and 64 domains per thread drops to 0 % and ~5 %, for 6.8 ns/op versus
+/// 15.5 ns/op at 32 domains and 8.1 ns versus 25.8 ns at 64.
+///
+/// Keys are stored as a hash plus up to 64 inline bytes, so the table stays
+/// small enough to afford 128 slots. A key longer than 64 bytes simply never
+/// populates the memo and takes the shared-cache path every time: that is a
+/// miss, never a mis-serve. Domain names are capped at 255 bytes on the wire,
+/// so this deliberately trades a rare slow path for a smaller slot.
+#[derive(Clone, Copy)]
+struct DnsMemoSlot {
+    hash: u64,
+    empty: bool,
     /// `None` = negatively cached (NXDOMAIN / lookup failure).
     addr: Option<SocketAddr>,
+    len: u8,
+    key: [u8; MEMO_KEY_BYTES],
     expires: Instant,
 }
 
-const MEMO_SLOTS: usize = 32;
+/// Keys longer than this are not memoized (see [`DnsMemoSlot`]).
+const MEMO_KEY_BYTES: usize = 64;
+const MEMO_SETS: usize = 64;
+const MEMO_WAYS: usize = 2;
 
-thread_local! {
-    static DNS_MEMO: std::cell::RefCell<[Option<DnsMemo>; MEMO_SLOTS]> =
-        std::cell::RefCell::new(std::array::from_fn(|_| None));
+impl DnsMemoSlot {
+    const EMPTY: Self = Self {
+        hash: 0,
+        empty: true,
+        addr: None,
+        len: 0,
+        key: [0; MEMO_KEY_BYTES],
+        // Never read on an empty slot (guarded by `empty`), and `Instant` has no
+        // const constructor, so zeroed is the only value available in a const.
+        expires: unsafe { std::mem::zeroed() },
+    };
+
+    /// A slot for `key`, or `None` when it is too long to store inline.
+    fn new(key: &str, hash: u64, addr: Option<SocketAddr>, expires: Instant) -> Option<Self> {
+        if key.len() > MEMO_KEY_BYTES {
+            return None;
+        }
+        let mut s = Self::EMPTY;
+        s.empty = false;
+        s.hash = hash;
+        s.addr = addr;
+        s.len = key.len() as u8;
+        s.key[..key.len()].copy_from_slice(key.as_bytes());
+        s.expires = expires;
+        Some(s)
+    }
+
+    /// Full-key compare. The hash is only a filter: two different keys that
+    /// collide on it must still not match, or one domain would serve another
+    /// domain's address for the whole TTL.
+    #[inline]
+    fn matches(&self, hash: u64, key: &str) -> bool {
+        !self.empty
+            && self.hash == hash
+            && self.len as usize == key.len()
+            && &self.key[..self.len as usize] == key.as_bytes()
+    }
 }
 
-/// Direct-mapped memo index: O(1) single-slot probe instead of an O(32)
-/// linear scan per packet. A collision only evicts, never mis-serves,
-/// because the full key is still compared byte-for-byte.
-fn dns_memo_idx(key: &str) -> usize {
+thread_local! {
+    static DNS_MEMO: std::cell::RefCell<[[DnsMemoSlot; MEMO_WAYS]; MEMO_SETS]> =
+        const { std::cell::RefCell::new([[DnsMemoSlot::EMPTY; MEMO_WAYS]; MEMO_SETS]) };
+}
+
+/// Multiply-fold plus a finalizer. The finalizer matters here in a way it did
+/// not for the old direct-mapped table: the set index comes from the low bits
+/// of the result, and DNS names share long suffixes (`…example.com`, `…cdn.net`),
+/// so the raw fold leaves those bits correlated between unrelated names and
+/// would pile them into the same set — the exact conflict the associativity is
+/// meant to remove. ~4 ns per lookup, paid once per packet.
+#[inline]
+fn dns_memo_hash(key: &str) -> u64 {
     const K: u64 = 0x9e3779b97f4a7c15;
     let mut h: u64 = 0;
     for b in key.as_bytes() {
         h = h.wrapping_mul(K).wrapping_add(*b as u64);
     }
-    (h as usize) % MEMO_SLOTS
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^ (h >> 32)
+}
+
+/// Set index. `MEMO_SETS` is a power of two, so this is a mask, and the low
+/// bits of a finalized hash are well mixed.
+#[inline]
+fn dns_memo_set(hash: u64) -> usize {
+    (hash as usize) & (MEMO_SETS - 1)
 }
 
 /// A matching memo slot, copied out so the borrow of the thread-local ends with
@@ -1432,57 +1506,59 @@ struct MemoHit {
     expires: Instant,
 }
 
-/// Peek memo slots for our key in a single pass, returning the positive and
-/// negative hits separately. Deliberately does *not* read the clock: the
-/// caller reads it once, and only after a key match, so a memo miss is never
-/// charged a `clock_gettime` — the whole point of the memo is that a hit is
-/// cheaper than the global cache lookup, and a miss must not cost more than one.
-/// Single pass (not one scan per class) so the wider table stays cheap.
+/// Probe both ways of our key's set, returning the positive and negative hits
+/// separately. Deliberately does *not* read the clock: the caller reads it once,
+/// and only after a key match, so a memo miss is never charged a
+/// `clock_gettime` — the whole point of the memo is that a hit is cheaper than
+/// the global cache lookup, and a miss must not cost more than one.
 fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
+    let hash = dns_memo_hash(key);
+    let set = dns_memo_set(hash);
     DNS_MEMO.with(|c| {
         let c = c.borrow();
-        let idx = dns_memo_idx(key);
-        let want = key.as_bytes();
-        match &c[idx] {
-            Some(m) if &m.key[..m.len] == want => {
+        for s in c[set].iter() {
+            if s.matches(hash, key) {
                 let hit = MemoHit {
-                    addr: m.addr,
-                    expires: m.expires,
+                    addr: s.addr,
+                    expires: s.expires,
                 };
-                if m.addr.is_none() {
+                return if s.addr.is_none() {
                     (None, Some(hit))
                 } else {
                     (Some(hit), None)
-                }
+                };
             }
-            _ => (None, None),
         }
+        (None, None)
     })
 }
 
+/// Insert into the set, promoting to way 0 and demoting the previous way 0.
+/// A write is two `Copy`s of an inline struct: no allocation and no key
+/// `String`, which is why the slot stores key bytes rather than a `Box<str>`.
 fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
-    let kb = key.as_bytes();
-    if kb.len() > DNS_KEY_BUF {
-        return;
-    }
+    let hash = dns_memo_hash(key);
+    let set = dns_memo_set(hash);
+    let Some(slot) = DnsMemoSlot::new(key, hash, addr, expires) else {
+        return; // too long for an inline slot: stays a cache-path-only name
+    };
     DNS_MEMO.with(|c| {
         let mut c = c.borrow_mut();
-        let idx = dns_memo_idx(key);
-        if let Some(e) = c[idx].as_mut() {
-            if &e.key[..e.len] == kb {
-                e.addr = addr;
-                e.expires = expires;
-                return;
-            }
+        let ways = &mut c[set];
+        if ways[0].matches(hash, key) {
+            // Same key already newest: overwrite in place (its address or TTL
+            // may have changed) without disturbing way 1.
+            ways[0] = slot;
+        } else if ways[1].matches(hash, key) {
+            // Resident in way 1: promote it and drop the old way 0, so one key
+            // can never occupy both ways of the set.
+            ways[1] = ways[0];
+            ways[0] = slot;
+        } else {
+            // New key: demote the current occupant of way 0.
+            ways[1] = ways[0];
+            ways[0] = slot;
         }
-        let mut m = DnsMemo {
-            key: [0u8; DNS_KEY_BUF],
-            len: kb.len(),
-            addr,
-            expires,
-        };
-        m.key[..kb.len()].copy_from_slice(kb);
-        c[idx] = Some(m);
     });
 }
 
@@ -3540,6 +3616,157 @@ fn abort_tcp(tcp: tokio::net::TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clear this thread's memo so a test starts from a known state. The memo is
+    /// thread-local, so tests running in parallel cannot disturb each other.
+    fn memo_reset() {
+        DNS_MEMO.with(|c| *c.borrow_mut() = [[DnsMemoSlot::EMPTY; MEMO_WAYS]; MEMO_SETS]);
+    }
+
+    #[test]
+    fn dns_memo_set_is_stable_and_in_range() {
+        for h in [0u64, 1, 0x9e37_79b9_7f4a_7c15, u64::MAX] {
+            let set = dns_memo_set(h);
+            assert!(set < MEMO_SETS, "set index {set} out of range");
+            assert_eq!(set, dns_memo_set(h), "set index must be deterministic");
+        }
+    }
+
+    /// A same-set collision must not resurrect the evicted key, and — the part
+    /// that actually matters for correctness — must never serve the wrong
+    /// address. The old direct-mapped version could not mis-serve either, so
+    /// this locks in the property the associativity was allowed to change.
+    #[test]
+    fn dns_memo_two_ways_hold_two_keys_and_never_mis_serve() {
+        memo_reset();
+        // Find two keys in the same set, so both ways get used.
+        let mut by_set: Vec<Vec<String>> = vec![Vec::new(); MEMO_SETS];
+        for i in 0..4096 {
+            let k = format!("host-{i}.example.com\0443");
+            by_set[dns_memo_set(dns_memo_hash(&k))].push(k);
+            if by_set.iter().any(|v| v.len() >= 3) {
+                break;
+            }
+        }
+        let trio = by_set
+            .iter()
+            .find(|v| v.len() >= 3)
+            .expect("a set with three keys");
+        let (a, b, c) = (&trio[0], &trio[1], &trio[2]);
+        assert_eq!(
+            dns_memo_set(dns_memo_hash(a)),
+            dns_memo_set(dns_memo_hash(b)),
+            "test premise: a and b share a set"
+        );
+
+        let addr_a: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let addr_b: SocketAddr = "10.0.0.2:443".parse().unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+
+        // Two keys, two ways: both must be resident at once.
+        memo_put(a, Some(addr_a), far);
+        memo_put(b, Some(addr_b), far);
+        let (pa, na) = memo_peek_both(a);
+        let (pb, nb) = memo_peek_both(b);
+        assert_eq!(pa.expect("a resident").addr, Some(addr_a));
+        assert_eq!(pb.expect("b resident").addr, Some(addr_b));
+        assert!(na.is_none() && nb.is_none());
+
+        // A third key in the same set evicts the least recently used, and the
+        // surviving entry still answers with its own address.
+        memo_put(c, Some("10.0.0.3:443".parse().unwrap()), far);
+        let (pb2, _) = memo_peek_both(b);
+        let (pa2, _) = memo_peek_both(a);
+        assert_eq!(pb2.expect("b promoted, still resident").addr, Some(addr_b));
+        assert!(
+            pa2.is_none(),
+            "a was the LRU victim and must not answer for b's set"
+        );
+        // The critical invariant: b never answers with a's address.
+        assert_ne!(memo_peek_both(b).0.unwrap().addr, Some(addr_a));
+    }
+
+    /// Re-putting a resident key must update it in place rather than let one key
+    /// occupy both ways of its set.
+    #[test]
+    fn dns_memo_reput_of_way_one_does_not_duplicate() {
+        memo_reset();
+        let mut by_set: Vec<Vec<String>> = vec![Vec::new(); MEMO_SETS];
+        let mut trio = None;
+        for i in 0..8192 {
+            let k = format!("h{i}.example.net\0443");
+            let set = dns_memo_set(dns_memo_hash(&k));
+            by_set[set].push(k);
+            if let Some(v) = by_set.iter().find(|v| v.len() >= 2) {
+                if trio.is_none() {
+                    trio = Some((v[0].clone(), v[1].clone()));
+                }
+            }
+            if trio.is_some() {
+                break;
+            }
+        }
+        let (a, b) = trio.expect("a set with two keys");
+        let far = Instant::now() + Duration::from_secs(60);
+
+        memo_put(&a, Some("10.1.1.1:1".parse().unwrap()), far);
+        memo_put(&b, Some("10.1.1.2:1".parse().unwrap()), far); // a demoted to way 1
+                                                                // Re-put a (now in way 1) with a new address: it must promote, and b
+                                                                // must survive in way 1.
+        memo_put(&a, Some("10.1.1.9:1".parse().unwrap()), far);
+        assert_eq!(
+            memo_peek_both(&a).0.expect("a resident").addr,
+            Some("10.1.1.9:1".parse().unwrap())
+        );
+        assert_eq!(
+            memo_peek_both(&b).0.expect("b survived the promotion").addr,
+            Some("10.1.1.2:1".parse().unwrap())
+        );
+    }
+
+    /// A key too long for the inline slot must be a plain miss, never a match.
+    #[test]
+    fn dns_memo_ignores_keys_it_cannot_store() {
+        memo_reset();
+        let long = format!("{}\0443", "a".repeat(MEMO_KEY_BYTES));
+        assert!(long.len() > MEMO_KEY_BYTES);
+        memo_put(
+            &long,
+            Some("10.2.2.2:2".parse().unwrap()),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let (pos, neg) = memo_peek_both(&long);
+        assert!(
+            pos.is_none() && neg.is_none(),
+            "long key must not be memoized"
+        );
+    }
+
+    /// A negative entry must be distinguishable from a positive one and from a
+    /// miss, because the caller uses that to skip spawning a resolver.
+    #[test]
+    fn dns_memo_negative_entries_are_separate_from_positive() {
+        memo_reset();
+        let k = "bad.example.com\080".to_string();
+        memo_put(&k, None, Instant::now() + Duration::from_secs(10));
+        let (pos, neg) = memo_peek_both(&k);
+        assert!(pos.is_none(), "negative entry must not look positive");
+        assert!(neg.expect("negative hit").addr.is_none());
+
+        // Replacing it with a positive answer must flip the classification.
+        memo_put(
+            &k,
+            Some("10.3.3.3:80".parse().unwrap()),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let (pos2, neg2) = memo_peek_both(&k);
+        assert_eq!(
+            pos2.expect("now positive").addr,
+            Some("10.3.3.3:80".parse().unwrap())
+        );
+        assert!(neg2.is_none());
+    }
+
     #[test]
     fn addr_roundtrip() {
         for a in [

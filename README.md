@@ -507,12 +507,12 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass-23: lock-free client control plane, the
-dispatcher writing the relay socket directly, and the last `try_lock`-induced
-datagram drop removed from the server session table, on top of pass-22's lock-free
-egress memo, direct-mapped dispatcher cache and `is_global_ip` memo) with
-the default feature set, so the
-relay counters are **on** in these builds: static musl, x86-64, stripped, ~4.3 MB
+rebuilt from the current revision (the cache-substitution pass: the DNS memo is now
+128-slot 2-way and the server no longer re-resolves a domain target per datagram,
+on top of pass-23's lock-free client control plane and pass-22's direct-mapped
+memos) with the default feature set, so the
+relay counters are **on** in these builds: static musl, x86-64, stripped,
+4 317 504–4 368 520 B (clients 4 344 096–4 365 512, servers 4 317 504–4 339 976)
 each. Three upgrade notes, all requiring **both** sides to be replaced together
 (plus one config note that needs no binary change):
 
@@ -550,6 +550,25 @@ re-checked statically as well as dynamically: `objdump -d` finds **273 `zmm`
 references in the v4 build and none in v1 or v3**, with `ymm` use rising from 3 978
 (v1) to 25 025 (v3), and the emulated CPU runs v1 and v3 (exit 0) while v4 dies with
 exit 132.
+
+The cache-substitution rebuild was re-verified the same way, with a small static
+musl driver (`e2eclient`, built by the same `cargo zigbuild` invocation) so the
+checks run *inside* the container next to the artifacts:
+
+- both v1 artifacts execute and stay up under emulation;
+- UDP over one `UDP ASSOCIATE`: **8/8 datagrams relayed** to an IP-literal target
+  and **8/8** to a domain target — the latter exercises the server's DNS path and
+  its new destination memo;
+- the multi-target session check that caught the bug in the first version of that
+  memo: two domain targets alternating in **one** session, **10 alpha / 10 beta, 0
+  misrouted** (the session-keyed-only version scored 0/0 with all datagrams routed
+  to the wrong target);
+- TCP `CONNECT`: **4096/4096 bytes** relayed.
+
+The per-level flags hold in the new binaries too: `objdump -d` counts **0 / 0 / 0 /
+273 `zmm`** references for v1 / v2 / v3 / v4 and `ymm` **3 978 → 25 281** from v1 to
+v3, and under emulation v1, v2 and v3 all exit 0 on `--help` while v4 dies with exit
+132 — the same signature the pass-23 rebuild showed.
 
 ---
 
@@ -2016,6 +2035,139 @@ wire-compatible, so mixed pairs work.
 
 ---
 
+## Cache-substitution evaluation, and the two changes worth making instead
+
+The question "should this repository use a general-purpose cache crate (moka and
+friends) for the DNS and session caches?" was answered by measurement rather than
+by taste. The short version: **no cache crate earned its place**, and the two
+changes that did were worth making. Both are in this revision.
+
+### The shoot-out
+
+Five backing stores behind the *same* interface — the repository's own key
+encoding (lowercased host, NUL, decimal port), the same `Arc<[SocketAddr]>` value
+shape, the same 60 s TTL and 4096-entry cap, the same thread-local memo where one
+applied. 10 cores, 128-key hot set, 10 threads, `ns/op` on a 100 %-hit read loop:
+
+| backing store | 10 thr hot-128 | note |
+|---|---|---|
+| `papaya::HashMap` (lock-free) | **6.0 ns** | no TTL, no capacity bound |
+| `quick_cache` (CLOCK-Pro) | **23.7 ns** | automatic capacity eviction |
+| hand-rolled sharded map + memo (shipped) | 46.8 ns | |
+| `moka::sync::Cache` | 109.2 ns | |
+| `mini_moka::sync::Cache` | 258.2 ns | `get` needs an owned key: allocates per lookup |
+
+Read latency while inserts churn past capacity (10 threads, p99 / p999):
+
+| backing store | p99 | p999 |
+|---|---|---|
+| `papaya` | 333 ns | 1.7 µs |
+| `quick_cache` | 458 ns | 709 ns |
+| hand-rolled (shipped) | 1 375 ns | 18.6 µs |
+| `moka` | 9 000 ns | 56.8 µs (max 11 ms) |
+
+`moka` is the slowest of the five on the concurrent read path and has by far the
+worst tail, because every `get` goes through per-entry `MiniArc` bookkeeping and
+the write path queues through a single write-order channel drained by a
+housekeeper thread. `mini_moka` is worse still and cannot be looked up with a
+borrowed key at all. `quick_cache` and `papaya` are genuinely faster than the
+hand-rolled table — but the whole comparison is beside the point, which is the
+second finding.
+
+### The per-thread memo is the cache
+
+Every shared store in this proxy already sits behind a thread-local memo
+(`DNS_MEMO`, `SESS_MEMO`, `DISPATCH_CACHE`, `EGRESS_MEMO`,
+`is_global_ip_cached`). A memo hit costs ~5 ns and never touches the store, so
+the store's own throughput is irrelevant for the common case and the *memo's hit
+rate* is what decides cost. That is what the measurements found:
+
+| distinct domains per worker thread | 32-slot direct-mapped memo (was) | 128-slot 2-way (now) |
+|---|---|---|
+| 4 | 0 % penetration | 0 % |
+| 32 | **31 %** | **0 %** |
+| 64 | **59 %** | **5 %** |
+| 128 | **76 %** | 21 % |
+
+"Penetration" is the fraction of lookups that miss the memo and reach the shared
+cache. 32 slots was sized for one hot target; a worker serving 32 concurrent
+domains already missed a third of the time, and each miss costs a shard read lock
+plus a full key compare (~44 ns/op measured with the memo defeated, against
+~5 ns for a hit). This is the regime a busy proxy actually runs in, so the memo
+was the thing to fix — not the store behind it.
+
+### Change 1 — the DNS memo is now 2-way set-associative, 128 slots
+
+`DnsMemoSlot` stores a 64-bit hash plus up to 64 inline key bytes, 2 ways × 64
+sets. The hash is only a filter; the bytes are always compared, so a collision
+evicts and can never serve one domain's address for another's — the same
+guarantee the old direct-mapped table gave. Keys longer than 64 bytes are not
+memoized at all (a miss, never a mis-serve). End-to-end effect at 32 and 64
+domains/thread, 10 threads, measured: **15.5 → 6.8 ns/op** and **25.8 → 8.1
+ns/op**. The finalizer added to the key hash matters: the set index comes from
+the low bits, and DNS names share long suffixes, so the raw multiply-fold left
+those bits correlated between unrelated names and piled them into one set — the
+exact conflict the associativity exists to remove.
+
+### Change 2 — the server no longer re-resolves a domain target per datagram
+
+The UDP relay resolved a domain target on **every** datagram
+(`forward_server_dgram` → `lookup_cached_fast`), forever, for a flow that had
+already been resolved. `SessEntry` now carries a `DestMemo` — the resolved
+address, a deadline, and the target it was resolved *for* — so later datagrams
+for the session are a lock-free compare. The connection-level fast slot carries
+the same pin, so a steady flow skips the session table too.
+
+The memo is keyed on the target **name and port**, not on the session. That is
+not a refinement: the first version keyed it on the session alone, and
+`hotpath_bench udpdomainswitch` caught it — a session alternating between two
+domain targets had **1000 of 2000 datagrams misrouted** to the other target's
+address, silently, because the pin answered every datagram with the address it
+had resolved first. With the name in the key: 0 misrouted, and the same check
+across encodings (domain alternating with an IP literal in one session) is also
+0. Names beyond 64 bytes are not memoized, so a truncated key can never match a
+different name sharing its prefix. The `DEST_PIN_TTL` is 30 s — deliberately
+under the 60 s DNS TTL — so a name that moves is picked up by an established
+session rather than only at session teardown.
+
+### Honest cost accounting
+
+Neither change moves this host's end-to-end UDP relay number, and the README's
+own rule is to say so rather than claim a win. `udpdomainmulti` at 64 domains ×
+8 associations × 4000 datagrams: **2950 pps before / 2861–2894 pps after**, which
+is inside the 2504–2894 run-to-run spread measured on the *single* binary. The
+reason is arithmetic: the per-datagram DNS work was ~6 ns on a memo hit and a
+miss costs ~44 ns, while a loopback datagram costs this host ~350 µs end to end.
+Removing even 100 % of the DNS work removes ≤ 0.01 % of the per-datagram budget.
+The changes are worth keeping because they delete per-packet work from a path
+that should not have it and make the memo scale to the many-domains case, not
+because they are measurable here; a deployment whose domains are far away, or
+whose per-datagram cost is otherwise small, would see more.
+
+Two new bench modes make the second change testable, because no existing mode
+could reach it: `udpdomain` sends the target as a SOCKS5 **domain** (ATYP 0x03)
+instead of an IP literal, and `udpdomainswitch` alternates targets within one
+association and verifies *which* target answered via `utag`, a UDP echo that
+prefixes its reply with its own tag.
+
+### Rejected
+
+- **`moka` / `mini_moka`**: measured slower than the hand-rolled table (table
+  above) and would add ~10 crates plus background housekeeping threads to a
+  binary that ships to routers, for caches that are not the bottleneck.
+- **`quick_cache`**: the only crate that beat the hand-rolled table on every
+  axis, and the natural pick *if* a crate were adopted. Not adopted, because the
+  measured end-to-end effect is nil while it would add a dependency and change
+  `evict_if_needed`'s behaviour from "batch-evict on write" to CLOCK-Pro — a
+  trade with no demonstrated upside here. The measurements are kept above so
+  this decision can be revisited with a real workload instead of re-argued.
+- **`papaya` for the client `UdpHub`**: it replaces an `ArcSwap` map with a
+  lock-free one, but `hub.entry()` already sits behind the 1024-slot per-thread
+  `DISPATCH_CACHE`, so the remaining traffic is one lookup per association, not
+  per datagram.
+
+---
+
 ## Roadmap
 
 - [x] Optional client authentication (`auth_token`)
@@ -2053,6 +2205,7 @@ wire-compatible, so mixed pairs work.
 - [x] Remove the last `try_lock`-induced datagram drop (server session table read/insert now block instead of discarding the packet), un-conflating `SESSION_FULL` from lock contention (pass 23)
 - [x] Client inbound: dispatcher writes the relay socket directly; the per-association `mpsc` queue, its `Full` drop mode and the reply task are gone, with one connection-wide reassembler per dispatcher (pass 23)
 - [x] `udpmulti` / `udpraw` / `udpsweep` / `tcpecho` / `chan` bench modes + 8-socket `SO_REUSEPORT` echo target (pass 23)
+- [x] DNS memo widened to 128 slots / 2-way (31 % → 0 % penetration at 32 domains per thread) and the server's per-datagram domain re-resolution replaced by a name-keyed per-session destination memo (see the cache-substitution evaluation)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
