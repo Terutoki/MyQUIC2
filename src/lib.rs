@@ -2950,30 +2950,67 @@ struct UdpRetry {
 const UDP_RETRY_SHARDS: usize = 16;
 const UDP_RETRY_DEPTH: usize = 256;
 
-fn udp_retry_queues() -> &'static [tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETRY_SHARDS] {
-    static TX: std::sync::OnceLock<[tokio::sync::mpsc::Sender<UdpRetry>; UDP_RETRY_SHARDS]> =
-        std::sync::OnceLock::new();
+/// One shard's retry worker, published so it can be replaced.
+///
+/// The worker is a task on whatever runtime first needed the shard. That is the
+/// process runtime in the shipped binaries -- but a test binary runs one
+/// runtime per `#[tokio::test]` and an embedder may run several, and a task
+/// dies with its runtime. The old shape kept the `Sender` in a `OnceLock`
+/// forever, so after the first runtime ended every later `try_send` went into a
+/// queue whose receiver was gone: the datagram was dropped and the caller
+/// counted it under a resource budget it had not exceeded. The sender is behind
+/// an `ArcSwap` instead, and `udp_retry_submit` re-arms the shard on the
+/// runtime it is called from whenever it finds the worker gone.
+struct RetryShard {
+    tx: arc_swap::ArcSwap<tokio::sync::mpsc::Sender<UdpRetry>>,
+}
+
+fn retry_shards() -> &'static [RetryShard; UDP_RETRY_SHARDS] {
+    static TX: std::sync::OnceLock<[RetryShard; UDP_RETRY_SHARDS]> = std::sync::OnceLock::new();
     TX.get_or_init(|| {
-        std::array::from_fn(|_| {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
-            tokio::spawn(async move {
-                while let Some(req) = rx.recv().await {
-                    let r = match req.payload.try_into_mut() {
-                        Ok(v) => req.sock.send_to(&v, req.dst).await,
-                        Err(b) => req.sock.send_to(&b, req.dst).await,
-                    };
-                    if let Err(e) = r {
-                        let n = udp_write::retry_failed();
-                        warn_udp_write("detached retry failed", n, || e.to_string());
-                    }
-                }
-            });
-            tx
+        std::array::from_fn(|_| RetryShard {
+            tx: arc_swap::ArcSwap::from_pointee(spawn_retry_worker()),
         })
     })
 }
 
-fn udp_retry_queue_for(dst: &SocketAddr) -> &'static tokio::sync::mpsc::Sender<UdpRetry> {
+fn spawn_retry_worker() -> tokio::sync::mpsc::Sender<UdpRetry> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let r = match req.payload.try_into_mut() {
+                Ok(v) => req.sock.send_to(&v, req.dst).await,
+                Err(b) => req.sock.send_to(&b, req.dst).await,
+            };
+            if let Err(e) = r {
+                let n = udp_write::retry_failed();
+                warn_udp_write("detached retry failed", n, || e.to_string());
+            }
+        }
+    });
+    tx
+}
+
+/// Queue a datagram for a detached retry on the shard that owns `dst`.
+///
+/// Returns false when the shard is full (UDP semantics: drop). A shard whose
+/// worker died with its runtime is re-armed here, so a retry never disappears
+/// just because the queue outlived the task that was draining it.
+fn udp_retry_submit(dst: &SocketAddr, req: UdpRetry) -> bool {
+    let shard = retry_shard_for(dst);
+    let cur = shard.tx.load_full();
+    let tx = if cur.is_closed() {
+        let fresh = std::sync::Arc::new(spawn_retry_worker());
+        // One winner publishes; every caller then uses whichever sender won.
+        shard.tx.compare_and_swap(&cur, fresh);
+        shard.tx.load_full()
+    } else {
+        cur
+    };
+    tx.try_send(req).is_ok()
+}
+
+fn retry_shard_for(dst: &SocketAddr) -> &'static RetryShard {
     // Shard by ip+port: port-only sharding collapses DNS(:53) / HTTPS(:443)
     // heavy workloads into a single shard, reintroducing the HOL blocking
     // the sharded pool was created to remove. Manual fold (no SipHash) keeps
@@ -2991,7 +3028,7 @@ fn udp_retry_queue_for(dst: &SocketAddr) -> &'static tokio::sync::mpsc::Sender<U
             h
         }
     };
-    &udp_retry_queues()[h % UDP_RETRY_SHARDS]
+    &retry_shards()[h % UDP_RETRY_SHARDS]
 }
 
 /// Best-effort non-blocking UDP send for shared loops (one datagram reader per
@@ -3015,7 +3052,7 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                 dst,
                 payload,
             };
-            if udp_retry_queue_for(&dst).try_send(req).is_err() {
+            if !udp_retry_submit(&dst, req) {
                 let n = udp_write::dropped_no_permit();
                 warn_udp_write("retry budget exhausted", n, || {
                     "send buffer full".to_string()
@@ -3047,7 +3084,7 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
                 dst,
                 payload: Bytes::copy_from_slice(payload),
             };
-            if udp_retry_queue_for(&dst).try_send(req).is_err() {
+            if !udp_retry_submit(&dst, req) {
                 let n = udp_write::dropped_no_permit();
                 warn_udp_write("retry budget exhausted", n, || {
                     "send buffer full".to_string()
@@ -3634,6 +3671,64 @@ fn abort_tcp(tcp: tokio::net::TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retry pool outlives the runtime that first needed it.
+    ///
+    /// Every shard's worker is a task, and a task dies with its runtime. The
+    /// pool used to keep the `Sender` in a `OnceLock` forever, so once the first
+    /// runtime ended, every later `WouldBlock` retry went into a queue nobody
+    /// was draining: `try_send` returned `Closed`, the datagram was dropped, and
+    /// the drop was charged to a "budget exhausted" counter that had not been
+    /// touched. That is not hypothetical — it is why the client's loopback
+    /// dispatcher tests failed *every* time they ran serially (one runtime per
+    /// `#[tokio::test]`) and intermittently when they ran in parallel. A shard
+    /// whose worker is gone has to be re-armed on the runtime that needs it.
+    #[test]
+    fn retry_shard_is_rearmed_after_its_runtime_ends() {
+        // Runtime 1 initializes the pool, exactly as the first test that hits a
+        // `WouldBlock` send does.
+        let rt1 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt1.block_on(async {
+            let _ = retry_shards();
+        });
+        drop(rt1);
+
+        // Runtime 2 queues a retry through the same process-wide shard; the
+        // datagram still has to come out.
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let delivered = rt2.block_on(async {
+            let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            listener
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let dst = listener.local_addr().unwrap();
+            let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            assert!(
+                udp_retry_submit(
+                    &dst,
+                    UdpRetry {
+                        sock,
+                        dst,
+                        payload: Bytes::from_static(b"rearmed"),
+                    },
+                ),
+                "a retry queued after the pool's runtime ended must still be accepted"
+            );
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let mut b = [0u8; 64];
+            listener.recv_from(&mut b).is_ok()
+        });
+        assert!(
+            delivered,
+            "the re-armed shard must actually send the datagram it accepted"
+        );
+    }
 
     /// Clear this thread's memo so a test starts from a known state. The memo is
     /// thread-local, so tests running in parallel cannot disturb each other.

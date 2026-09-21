@@ -440,6 +440,9 @@ before every run):
 | 42 | `cargo update`: 11 patch-level bumps — `rustls` 0.23.44 → 0.23.45, `clap` 4.6.6 → 4.6.7 (+ `clap_builder` / `clap_derive` / `clap_lex`), `cc`, `cfg-if`, `find-msvc-tools`, `rand` 0.10.2 → 0.10.3, `syn` 3.0.5 → 3.0.6, `unicode-ident`. quinn 0.11.12 / quinn-proto 0.11.18 / quinn-udp 0.5.15, tokio 1.53.1, time 0.3.55 and rcgen 0.14.10 were already the newest in-range versions, so the documented dependency line and the 1.88 MSRV (every bumped crate declares `rust-version` ≤ 1.85) are unchanged | ✅ |
 | 43 | Flaky-test fix (test-only, `#[cfg(test)]`, no product code): the loopback reply wait is now 2 s for positive assertions and a separate 300 ms `no_reply` probe for negative ones, kept under `FRAG_TIMEOUT_MS`. Result: `cargo test --all-targets` green in **8/8** consecutive runs and 4/4 with `--no-default-features` (was red in ~1 of every 2 runs), the six `dispatch_*` tests 10/10, clippy `-D warnings` + `cargo fmt --check` clean on both feature sets | ✅ |
 | 44 | `dist/` rebuilt a second time from the final tree: all **eight artifacts came out byte-for-byte identical** to the previous rebuild (`sha256` equal for every level and both binaries), which both confirms the build is reproducible from this revision and proves the test-only change above cannot have altered the shipped binaries. The fresh v1 pair re-ran the emulated E2E green (4 connections, TCP 1 MiB, domain `CONNECT`, UDP sweep, 20 CONNECTs), and v3 runs / v4 dies with exit 132 under the emulated CPU | ✅ |
+| 45 | Server destination-memo writes made conditional: an IP target no longer stores a memo nothing can read back, and a domain target's memo is rewritten only when the address changed or the entry is inside the last quarter of its TTL (`DEST_PIN_REFRESH_MS`). Correctness on the fixed binaries: `udpdomainswitch` 1000 alpha + 1000 beta and `udpipswitch` 1000 IP + 1000 domain targets inside one session, **0 misrouted** in both; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verified verbatim**; `udpdomain` 20 000/20 000; `udpdomainmulti` 160 000 sent / 159 993 received; 4 connections up with 0 dial failures. Perf: the removed store measures 35 ns/op against the 27 ns read-lock lookup it piggybacked on, but an interleaved A/B of the two server binaries (2 rounds each) shows **no end-to-end effect** — 19 957 → 19 822 pps at 16 associations on one connection, 24 998 → 24 575 pps across two connections, both inside this host's spread — so it is kept for deleting a provably useless exclusive write, not for a measured win | ✅ |
+| 46 | `WouldBlock` retry pool re-arms a shard whose worker died with its runtime. Each shard's `Sender` used to live in a `OnceLock` forever while its worker was a task on whichever runtime first needed it, so any later runtime (a test binary has one per `#[tokio::test]`; an embedder may have several) queued retries into a closed channel and the datagram was dropped silently, charged to a budget counter that had not been touched. Each shard publishes its sender through an `ArcSwap` and re-arms on demand; the probe against the old code printed `queued=false delivered=false`, and the new regression test `retry_shard_is_rearmed_after_its_runtime_ends` passes. Effect on the suite: the client bin went **0/5 → 5/5 green when run serially** (the file's runtime churn hit it every run) and the full suite to **10/10** on the default feature set and 4/4 on `--no-default-features` | ✅ |
+| 47 | `dist/` rebuilt from this revision for all four CPU levels (static musl, stripped; clients 4 390 120–4 416 280 B, servers 4 325 792–4 348 536 B, i.e. +4 992–5 120 / +6 432–6 512 B per level for the retry-pool and memo changes) and re-verified under amd64 emulation (Podman on Apple Silicon) **using the repo's own harness** — the `hotpath_bench` example built for the same musl target, so no external tooling is involved. On the v1 pair: 4 connections, 0 dial failures, 4 server accepts; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 160 000 sent / 159 993 received; `udpmulti` 16 associations 603 728 received at 0.082 % loss; 40 domain-target TCP `CONNECT`s; `udpdomainswitch` **1000 alpha + 1000 beta, 0 misrouted** and `udpipswitch` **1000 IP + 1000 domain, 0 misrouted**. A second four-level build came out byte-identical (`sha256` equal for all eight files), and v3 runs / v4 dies with exit 132 under the emulated CPU, with `zmm` = 0/0/0/235 and `ymm` 3 978 → 26 900 | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -449,17 +452,30 @@ and fails over to slot 1 when slot 0's live bit clears).
 
 The client bin's loopback `dispatch_*` tests were timing-flaky on the pass-23 tree
 too — the full 18-test client bin was red in roughly half of back-to-back
-`cargo test --all-targets` runs, because their 300 ms `recv_reply` window lost a
-loopback datagram whenever the concurrent real-QUIC tests saturated the loopback
-path. The waits are now split: **2 s** for a positive "the reply must arrive"
-assertion, and a **300 ms** `no_reply` probe for "must be dropped" assertions. The
-probe deliberately stays well under `FRAG_TIMEOUT_MS` (2 s): the
-fragment-reassembly test probes *between* the fragments of one payload, so a 2 s
-probe would expire the partial and fail an assertion that has nothing to do with
-timing (measured: that version was 0/8 green). After the split, the full suite is
-8/8 green on the default feature set and 4/4 on `--no-default-features`, with the
-six `dispatch_*` tests 10/10. The change is test-only (`#[cfg(test)]`), so the
-shipped binaries are byte-for-byte the same build.
+`cargo test --all-targets` runs. Two separate causes, and the first fix below
+turned out to be the smaller one:
+
+- **Latency.** A 300 ms `recv_reply` window lost a loopback datagram whenever the
+  concurrent real-QUIC tests saturated the loopback path. The waits are now split:
+  **2 s** for a positive "the reply must arrive" assertion, and a **300 ms**
+  `no_reply` probe for "must be dropped" assertions. The probe deliberately stays
+  well under `FRAG_TIMEOUT_MS` (2 s): the fragment-reassembly test probes *between*
+  the fragments of one payload, so a 2 s probe would expire the partial and fail
+  an assertion that has nothing to do with timing (measured: that version was 0/8
+  green). This part is test-only (`#[cfg(test)]`).
+- **A dropped datagram, which no window can fix.** Every shard of the client's
+  `WouldBlock` retry pool was a task on whichever runtime first needed it, while
+  the `Sender` lived in a `OnceLock` forever. A `#[tokio::test]` has its own
+  runtime and drops it at the end of the test, so from the second test onwards
+  every retry went into a queue whose receiver had died: `try_send` returned
+  `Closed`, the datagram was dropped, and the drop was charged to a
+  "budget exhausted" counter that had not been touched. That is why the file
+  failed **5/5** serially (one runtime per test) and intermittently in parallel.
+  The pool now publishes each shard's sender through an `ArcSwap` and re-arms a
+  shard whose worker is gone, on the runtime that needs it
+  (`retry_shard_is_rearmed_after_its_runtime_ends`). Serial runs went 0/5 → 5/5
+  and the full suite 10/10 on the default feature set, 4/4 on
+  `--no-default-features`.
 
 0-RTT probe (expect the last four lines):
 
@@ -558,17 +574,17 @@ done
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
 rebuilt from the current revision (the four-connection pool default and its
-`papaya` slot registry, on top of pass-23's lock-free client control plane and the
+`papaya` slot registry, the conditional destination-memo writes, and the re-arming
+`WouldBlock` retry pool, on top of pass-23's lock-free client control plane and the
 cache-substitution pass's DNS/destination memos, against the refreshed `Cargo.lock`)
 with the default feature set, so the relay counters are **on** in these builds: static
-musl, x86-64, stripped, 4 319 360–4 411 160 B (clients 4 385 128–4 411 160, servers
-4 319 360–4 342 088) each. Against the pass-23 rebuild the client grew
-38 408–45 968 B per level (`papaya` + `seize`, plus the rustls/clap patch bumps) and
-the server 1 856–2 432 B (the patch bumps only — LTO still strips the slot registry
-the server never references). The four-level build is reproducible: rebuilding this
-revision a second time produced byte-identical artifacts at every level. Three
-upgrade notes, all requiring **both** sides to be replaced together (plus two notes
-below that need no binary change):
+musl, x86-64, stripped, 4 325 792–4 416 280 B (clients 4 390 120–4 416 280, servers
+4 325 792–4 348 536) each. Against the previous rebuild the client grew
+4 992–5 120 B and the server 6 432–6 512 B per level (the retry pool's `ArcSwap`
+shard table plus the memo path changes). The four-level build is reproducible:
+rebuilding this revision a second time produced byte-identical artifacts at every
+level. Three upgrade notes, all requiring **both** sides to be replaced together
+(plus two notes below that need no binary change):
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -2196,6 +2212,32 @@ across encodings (domain alternating with an IP literal in one session) is also
 different name sharing its prefix. The `DEST_PIN_TTL` is 30 s — deliberately
 under the 60 s DNS TTL — so a name that moves is picked up by an established
 session rather than only at session teardown.
+
+The memo is *written*, not clobbered, on the datagram path. An **IP target
+stores nothing**: its address is already in every datagram it sends, and the
+memo's only reader consults it for domain targets, so an entry recorded under an
+empty host could never be read back — it was a shard write lock plus a 72 B memo
+write per datagram for nothing. A domain target's memo is rewritten only when
+the address changed or the entry sits inside the last quarter of its TTL
+(`DEST_PIN_REFRESH_MS`), which keeps it continuously live at one write per
+~7.5 s per session instead of one per packet. Measured through the production
+functions: the unconditional store cost **35 ns/op** (shard write lock +
+`get_mut` + the 72 B write) on top of the 27 ns read-lock lookup it piggybacked
+on.
+
+That 35 ns does **not** survive to the end-to-end number, and saying otherwise
+would be a lie: an interleaved A/B of the two server binaries (2 rounds each)
+gave 19 957 → 19 822 pps at 16 associations on one connection and 24 998 →
+24 575 pps across two connections — both inside this host's ±3 % run-to-run and
+code-layout spread, i.e. no measurable effect, because 35 ns is 0.04 % of the
+~87 µs of server CPU a loopback datagram already costs here. The change is kept
+because the removed work was provably useless, because it deletes an *exclusive*
+write to a shard that several client connections share (4 threads on one shard
+halve write throughput in the same microbenchmark), and because its correctness
+is cheap to pin: `udpipswitch` / `udpdomainswitch` alternate IP and domain
+targets inside one session and report **0 misrouted**, and
+`session_dest_store_writes_only_when_the_memo_needs_it` asserts that a redundant
+store leaves the memo's expiry untouched while a near-expiry one refreshes it.
 
 ### Honest cost accounting
 

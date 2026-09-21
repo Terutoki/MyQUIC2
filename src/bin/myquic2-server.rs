@@ -132,6 +132,14 @@ impl DestMemo {
     fn get(&self, now: u64, host: &str, port: u16) -> Option<SocketAddr> {
         (self.expires > now && self.key.matches(host, port)).then_some(self.addr)
     }
+
+    /// True when this memo already names exactly `addr` for `(host, port)`,
+    /// whatever its remaining life. The caller decides whether that life is
+    /// short enough to be worth a refresh.
+    #[inline]
+    fn is_for(&self, host: &str, port: u16, addr: SocketAddr) -> bool {
+        self.addr == addr && self.key.matches(host, port)
+    }
 }
 
 /// How long a resolved destination is reused before it is re-resolved.
@@ -140,6 +148,15 @@ impl DestMemo {
 /// while the cache entry is still live, so this bounds how long a session can
 /// keep sending to an address the name no longer resolves to.
 const DEST_PIN_TTL_MS: u64 = 30_000;
+
+/// How close to expiry a memo must be before a datagram refreshes it.
+///
+/// A steady flow stores the same `(key, addr)` on every datagram, so refreshing
+/// on each one turned the datagram path into a shard *write* lock per packet
+/// (35 ns of lock plus a dirty line in the shared table, measured) for a value
+/// that had not changed. Refreshing only in the last quarter of the TTL keeps
+/// the entry continuously live with one write per ~7.5 s per session instead.
+const DEST_PIN_REFRESH_MS: u64 = DEST_PIN_TTL_MS / 4;
 type SessTable = Arc<ShardedSessTable>;
 
 const SESS_SHARDS: usize = 8;
@@ -1167,7 +1184,14 @@ async fn forward_server_dgram(
             if !allow_private && !is_global_ip_cached(dst.ip()) {
                 return None;
             }
-            let sock = get_or_create_sess(ss, cd, conn_id, s, Some(("", 0, dst))).await?;
+            // No destination memo for an IP target: `resolve_pin` — the memo's
+            // only reader on the datagram path — consults it for domain targets
+            // exclusively (an IP target's address is already in the datagram),
+            // and `PortKey::matches` would need an empty host *and* port 0 to
+            // ever match this entry, which the wire decoder rejects. Storing it
+            // was a shard write lock plus a 72-byte memo write per datagram that
+            // nothing could read back.
+            let sock = get_or_create_sess(ss, cd, conn_id, s, None).await?;
             udp_try_send(&sock, map_for_dual(dst), payload);
             Some(dst)
         }
@@ -1290,6 +1314,14 @@ fn sess_dest_lookup(ss: &SessTable, now: u64, s: u32, host: &str, port: u16) -> 
 /// Record (or refresh) the session's pinned destination. Best effort: a session
 /// that vanished between the send and this call is simply not memoized, and the
 /// next datagram re-resolves and tries again.
+///
+/// Read first, write only when the memo actually needs it. The datagram path
+/// calls this for every domain-target packet, and the answer for a steady flow
+/// is the same `(key, addr)` every time — so an unconditional write lock made
+/// every packet of that flow take the shard exclusively. Now a packet whose
+/// memo already names the right address and still has more than
+/// [`DEST_PIN_REFRESH_MS`] of life left takes only the read lock it would take
+/// anyway, and the write happens once per refresh window instead of per packet.
 fn sess_dest_store(ss: &SessTable, s: u32, host: &str, port: u16, addr: SocketAddr) {
     // A name too long for the inline key is not memoized. Storing it under a
     // truncated key would be worse than not storing it: a later datagram for a
@@ -1297,12 +1329,23 @@ fn sess_dest_store(ss: &SessTable, s: u32, host: &str, port: u16, addr: SocketAd
     let Some(key) = PortKey::new(host, port) else {
         return;
     };
+    let now = mono_millis();
+    {
+        let r = lock_read(ss.shard(s));
+        if let Some(e) = r.get(&s) {
+            if e.dest.is_for(host, port, addr)
+                && e.dest.expires.saturating_sub(now) > DEST_PIN_REFRESH_MS
+            {
+                return;
+            }
+        }
+    }
     let mut w = lock_write(ss.shard(s));
     if let Some(e) = w.get_mut(&s) {
         e.dest = DestMemo {
             key,
             addr,
-            expires: mono_millis() + DEST_PIN_TTL_MS,
+            expires: now + DEST_PIN_TTL_MS,
         };
     }
 }
@@ -1590,9 +1633,10 @@ async fn get_or_create_sess(
     cd: &quinn::Connection,
     conn_id: usize,
     s: u32,
-    // `(host, port, resolved address)` when the caller already knows the
-    // destination, so the session can memoize it. `host` is empty for an IP
-    // target, which has no name to re-check.
+    // `(host, port, resolved address)` when the caller already knows a *named*
+    // destination, so the session can memoize it. An IP target passes `None`:
+    // its address is already in every datagram it sends, and the memo is only
+    // ever read back for domain targets (`sess_dest_store`).
     dest: Option<(&str, u16, SocketAddr)>,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
     // Session 0 is reserved (never allocated by any client hub): a wire
@@ -1920,6 +1964,58 @@ mod tests {
 
         // A different session number must never see another session's pin.
         assert_eq!(sess_dest_lookup(&ss, mono_millis(), 8, "a.test", 443), None);
+    }
+
+    /// The datagram path stores this memo for every domain-target packet, so the
+    /// store must cost a read lock — not a write — whenever the answer has not
+    /// changed. A redundant write per packet was measurable (35 ns of exclusive
+    /// shard lock plus a dirty line in the shared table) and a redundant
+    /// *refresh* is what the refresh window exists to avoid.
+    #[tokio::test]
+    async fn session_dest_store_writes_only_when_the_memo_needs_it() {
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let moved: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let (ss, _sock) = sess_with_dest(None);
+        let expires = || ss.shard(7).read().unwrap().get(&7).unwrap().dest.expires;
+
+        sess_dest_store(&ss, 7, "alpha.test", 443, dst);
+        let first = expires();
+        assert!(first > mono_millis(), "a store must leave a live memo");
+        assert_eq!(
+            sess_dest_lookup(&ss, mono_millis(), 7, "alpha.test", 443),
+            Some(dst)
+        );
+
+        // Same name, same address, TTL still fresh: nothing to write.
+        sess_dest_store(&ss, 7, "alpha.test", 443, dst);
+        assert_eq!(
+            expires(),
+            first,
+            "a redundant store must not rewrite (and so must not take the write lock)"
+        );
+
+        // Same name, new address: the memo must follow it.
+        sess_dest_store(&ss, 7, "alpha.test", 443, moved);
+        assert_eq!(
+            sess_dest_lookup(&ss, mono_millis(), 7, "alpha.test", 443),
+            Some(moved)
+        );
+
+        // Inside the refresh window the value is unchanged but the life is not:
+        // that one must rewrite, or the entry would expire and the next packet
+        // would pay a full resolve.
+        ss.shard(7)
+            .write()
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .dest
+            .expires = mono_millis() + 1;
+        sess_dest_store(&ss, 7, "alpha.test", 443, moved);
+        assert!(
+            expires() > mono_millis() + DEST_PIN_REFRESH_MS,
+            "a memo inside the refresh window must be refreshed"
+        );
     }
 
     /// The bug this memo was rewritten for: a session is not bound to one
