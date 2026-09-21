@@ -160,35 +160,91 @@ impl ConnSlot {
     }
 }
 
-/// Pure routing decision for tests: true = use `a`.
-/// A dead preferred slot fails over to the live one; both dead keeps the
-/// preferred slot so `wait_conn` still bounds the stall and fails fast.
-fn select_slot(pinned: bool, rr: usize, a_live: bool, b_live: Option<bool>) -> bool {
-    let Some(b_live) = b_live else {
-        return true;
-    };
-    if pinned || rr.is_multiple_of(2) {
-        a_live || !b_live
-    } else {
-        a_live && !b_live
+/// Pure routing decision for tests: index of the slot a new TCP flow uses.
+///
+/// A pinned (interactive) flow prefers slot 0; a bulk flow prefers `rr % n`, so
+/// consecutive flows land on different congestion windows. A dead preference
+/// fails over to the first live slot; when nothing is live the preference is
+/// kept, so `wait_conn` bounds the stall and fails the flow fast instead of the
+/// pool inventing a slot that has no connection behind it.
+///
+/// For a two-slot pool this reproduces the old dual-pool truth table exactly —
+/// `slot_routing_table` pins every row of it for both n = 2 and n = 4.
+fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
+    debug_assert!(!live.is_empty(), "the pool always has at least one slot");
+    let n = live.len();
+    if n == 1 {
+        return 0;
     }
+    let preferred = if pinned { 0 } else { rr % n };
+    if live[preferred] {
+        return preferred;
+    }
+    (0..n).find(|&i| live[i]).unwrap_or(preferred)
 }
 
-/// Dual-connection pool for loaded-latency isolation.
-/// `a` is the interactive connection (all UDP + pinned ports, and the sole
-/// connection when `quic_conns == 1`). `b` exists only in dual mode and
-/// absorbs half the bulk TCP streams so each cwnd holds ~half the queue.
-/// quinn 0.11 has no per-stream priority, so separate congestion windows are
-/// the isolation mechanism.
+/// The client's QUIC connection pool: `n` slots indexed `0..n`, where
+/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`).
+///
+/// Slot 0 is the interactive connection: all UDP and every port in
+/// `interactive_ports` ride it, and it is the sole slot when `quic_conns == 1`.
+/// The other slots absorb their share of the bulk TCP streams, so each cwnd
+/// holds ~1/n of the queue instead of all of it. quinn 0.11 has no per-stream
+/// priority, so separate congestion windows are the isolation mechanism.
+///
+/// The slots live in a lock-free `papaya::HashMap` keyed by slot index. Three
+/// properties of this pool are what make that a fit rather than decoration:
+///
+/// - Slots are inserted once at startup and never removed, so a routing read is
+///   a pin plus a hash lookup on an integer key, and papaya's reclamation never
+///   has a retired value to collect on the per-flow path.
+/// - The `Arc` is load-bearing: `papaya::HashMap`'s own `Clone` deep-copies the
+///   table, and this pool is cloned once per accepted SOCKS connection. Behind
+///   the `Arc` a clone is one refcount bump.
+/// - A pin guard is `!Send`, so a future edit that holds one across an `.await`
+///   fails to compile instead of silently pinning a runtime thread.
 #[derive(Clone, Debug)]
 struct ConnPool {
-    a: ConnSlot,
-    b: Option<ConnSlot>,
+    slots: Arc<papaya::HashMap<usize, ConnSlot>>,
     rr: Arc<std::sync::atomic::AtomicUsize>,
     interactive_ports: Arc<std::collections::HashSet<u16>>,
 }
 
 impl ConnPool {
+    /// Build the process pool: `n` fresh (unconnected) slots, indexed `0..n`.
+    /// `n` is re-clamped here so no caller can build a pool wider than the
+    /// stack liveness array the routing path uses to describe it.
+    fn new(n: usize, interactive_ports: Vec<u16>) -> Self {
+        let n = n.clamp(1, MAX_POOL_CONNS);
+        let slots = papaya::HashMap::with_capacity(n);
+        {
+            let g = slots.pin();
+            for i in 0..n {
+                g.insert(i, ConnSlot::fresh());
+            }
+        }
+        Self {
+            slots: Arc::new(slots),
+            rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
+        }
+    }
+
+    fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The slot at `i`. Slots are installed by `new` and never removed, so the
+    /// key is always present; a miss would mean the pool was not built by
+    /// `new`.
+    fn slot(&self, i: usize) -> ConnSlot {
+        self.slots
+            .pin()
+            .get(&i)
+            .cloned()
+            .expect("pool slots are installed at startup and never removed")
+    }
+
     fn target_port(t: &TargetAddr) -> u16 {
         match t {
             TargetAddr::Ip(s) => s.port(),
@@ -196,33 +252,33 @@ impl ConnPool {
         }
     }
 
-    /// Pick the slot for a new TCP flow. Pinned ports prefer `a` and bulk
-    /// spreads round-robin in dual mode; a dead preferred slot fails over to
-    /// the live one (returning flows stick to their slot for life, so nothing
-    /// oscillates). Both dead keeps the preference and `wait_conn` fails fast.
-    fn pick_tcp(&self, t: &TargetAddr) -> ConnSlot {
-        match &self.b {
-            None => self.a.clone(),
-            Some(b) => {
-                let pinned = self.interactive_ports.contains(&Self::target_port(t));
-                let n = if pinned {
-                    0
-                } else {
-                    self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                };
-                if select_slot(pinned, n, self.a.is_live(), Some(b.is_live())) {
-                    self.a.clone()
-                } else {
-                    b.clone()
-                }
-            }
+    /// Index of the slot a new TCP flow should use (see [`select_slot`]).
+    ///
+    /// One pin, `n` lookups and a stack liveness array: no lock, no per-flow
+    /// allocation, and no `close_reason()` (which takes quinn's
+    /// connection-state mutex) — the maintained `live` bit is what routing
+    /// reads, and `wait_conn` remains the authority that fails a flow fast.
+    fn pick_tcp_index(&self, t: &TargetAddr) -> usize {
+        let n = self.slot_count();
+        debug_assert!(n <= MAX_POOL_CONNS);
+        let g = self.slots.pin();
+        let mut live = [false; MAX_POOL_CONNS];
+        for (i, l) in live[..n].iter_mut().enumerate() {
+            *l = g.get(&i).is_some_and(ConnSlot::is_live);
         }
+        let pinned = self.is_interactive(t);
+        let rr = if pinned {
+            0
+        } else {
+            self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        select_slot(pinned, rr, &live[..n])
     }
 
-    /// Bulk-slot fallback for UDP while the interactive slot is down
-    /// (see `refresh_udp_egress`). `None` in single-connection mode.
-    fn udp_fallback(&self) -> Option<ConnSlot> {
-        self.b.clone()
+    /// Pick the slot for a new TCP flow. Returning flows stick to their slot
+    /// for life, so nothing oscillates.
+    fn pick_tcp(&self, t: &TargetAddr) -> ConnSlot {
+        self.slot(self.pick_tcp_index(t))
     }
 
     fn is_interactive(&self, t: &TargetAddr) -> bool {
@@ -374,7 +430,14 @@ impl SharedEgress {
             }
         }
         let _guard = RefreshGuard(&self.refreshing);
-        for slot in [&pool.a].into_iter().chain(pool.udp_fallback().as_ref()) {
+        // Slot 0 first — the interactive connection — then the rest in index
+        // order: the same preference the dual pool gave `a` before its `b`
+        // fallback. Egress is sticky to whichever connection it lands on while
+        // that connection lives; a dead one is skipped here and, once cached,
+        // surfaces as `ConnectionLost` on send, which invalidates the cache.
+        let slots = pool.slots.pin();
+        for i in 0..pool.slot_count() {
+            let Some(slot) = slots.get(&i) else { continue };
             // Lock-free read: no `try_read` that can fail, so a refresh can
             // never be skipped just because a reconnect is publishing.
             let g = slot.shared.load();
@@ -658,17 +721,11 @@ async fn main() -> Result<()> {
     )?;
     ep.set_default_client_config((*ccfg).clone());
 
-    let dual = c.conn_count() >= 2;
-    let pool = ConnPool {
-        a: ConnSlot::fresh(),
-        b: if dual { Some(ConnSlot::fresh()) } else { None },
-        rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        interactive_ports: Arc::new(c.interactive_port_list().into_iter().collect()),
-    };
+    let conns = c.conn_count();
+    let pool = ConnPool::new(conns, c.interactive_port_list());
     info!(
-        "quic pool: {} connection(s){}",
-        if dual { 2 } else { 1 },
-        if dual {
+        "quic pool: {conns} connection(s){}",
+        if conns > 1 {
             " (bulk round-robin + interactive pin)"
         } else {
             ""
@@ -676,30 +733,24 @@ async fn main() -> Result<()> {
     );
     let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
     let egress_shared: Arc<SharedEgress> = Arc::new(SharedEgress::default());
-    spawn_dispatcher(pool.a.clone(), hub.clone());
-    if let Some(b) = pool.b.clone() {
-        spawn_dispatcher(b, hub.clone());
-    }
-    // One reconnect loop per pool slot, sharing the same Endpoint (one UDP
-    // socket, one ticket cache). Dual mode doubles idle keepalives; each
-    // connection carries ~half the streams, so each cwnd holds ~half the queue.
+    // One DATAGRAM dispatcher and one reconnect loop per pool slot, all sharing
+    // the same Endpoint (one UDP socket, one ticket cache, one CID router).
+    // Every slot keeps its own reassembler, which is correct because a
+    // payload's fragments all travel on the connection that carried them.
+    // Four slots mean four idle keepalives; each connection carries ~1/n of the
+    // streams, so each cwnd holds ~1/n of the queue.
     let keep_alive_secs = c.keep_alive_secs.clamp(1, 3600);
     let watchdog_silence = Duration::from_secs(keep_alive_secs.saturating_mul(4).max(20));
-    spawn_conn_loop(
-        ep.clone(),
-        server_str.clone(),
-        c.server_name.clone(),
-        c.auth_token.clone(),
-        pool.a.clone(),
-        watchdog_silence,
-    );
-    if let Some(b) = pool.b.clone() {
+    for i in 0..conns {
+        spawn_dispatcher(pool.slot(i), hub.clone());
+    }
+    for i in 0..conns {
         spawn_conn_loop(
             ep.clone(),
             server_str.clone(),
             c.server_name.clone(),
             c.auth_token.clone(),
-            b,
+            pool.slot(i),
             watchdog_silence,
         );
     }
@@ -932,9 +983,9 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             });
             // One reassembler for the whole connection, exactly as the server's
             // datagram reader has always used: it is keyed by `(sess, id)`, so a
-            // per-association copy would only duplicate state. In dual-connection
-            // mode each connection keeps its own, which is correct because a
-            // payload's fragments all travel on the connection that carried them.
+            // per-association copy would only duplicate state. Each pool slot
+            // keeps its own, which is correct because a payload's fragments all
+            // travel on the connection that carried them.
             let mut reasm = DgramReassembler::new();
             let mut pkt = bytes::BytesMut::with_capacity(256);
             let mut reader_failed = false;
@@ -1935,27 +1986,110 @@ mod tests {
         assert!(!slot.is_live());
     }
 
+    /// The routing table, row by row; the first three blocks are the *old*
+    /// dual-pool assertions restated for the generalized selector, so a
+    /// two-slot pool still behaves exactly as it did (including "keep the
+    /// preference and fail fast" when both are down).
     #[test]
-    fn slot_routing_fails_over_to_the_live_connection() {
-        // Single mode always keeps `a`.
-        assert!(select_slot(false, 0, false, None));
-        assert!(select_slot(true, 1, false, None));
-        // Dual, all live: pinned -> a, bulk round-robins.
-        assert!(select_slot(true, 0, true, Some(true)));
-        assert!(select_slot(false, 0, true, Some(true)));
-        assert!(!select_slot(false, 1, true, Some(true)));
-        // Dual, `a` down: everything fails over to `b`.
-        assert!(!select_slot(true, 0, false, Some(true)));
-        assert!(!select_slot(false, 0, false, Some(true)));
-        assert!(!select_slot(false, 1, false, Some(true)));
+    fn slot_routing_table() {
+        // Single slot: always slot 0, whatever the liveness says.
+        assert_eq!(select_slot(false, 0, &[false]), 0);
+        assert_eq!(select_slot(true, 1, &[true]), 0);
+        assert_eq!(select_slot(false, 7, &[false]), 0);
+        // Dual, all live: pinned -> a (0), bulk round-robins.
+        assert_eq!(select_slot(true, 0, &[true, true]), 0);
+        assert_eq!(select_slot(false, 0, &[true, true]), 0);
+        assert_eq!(select_slot(false, 1, &[true, true]), 1);
+        // Dual, `a` down: everything fails over to `b` (1).
+        assert_eq!(select_slot(true, 0, &[false, true]), 1);
+        assert_eq!(select_slot(false, 0, &[false, true]), 1);
+        assert_eq!(select_slot(false, 1, &[false, true]), 1);
         // Dual, `b` down: bulk falls back to `a`, pinned stays.
-        assert!(select_slot(true, 0, true, Some(false)));
-        assert!(select_slot(false, 0, true, Some(false)));
-        assert!(select_slot(false, 1, true, Some(false)));
+        assert_eq!(select_slot(true, 0, &[true, false]), 0);
+        assert_eq!(select_slot(false, 0, &[true, false]), 0);
+        assert_eq!(select_slot(false, 1, &[true, false]), 0);
         // Dual, both down: keep the preference for a bounded fail-fast.
-        assert!(select_slot(true, 0, false, Some(false)));
-        assert!(select_slot(false, 0, false, Some(false)));
-        assert!(!select_slot(false, 1, false, Some(false)));
+        assert_eq!(select_slot(true, 0, &[false, false]), 0);
+        assert_eq!(select_slot(false, 0, &[false, false]), 0);
+        assert_eq!(select_slot(false, 1, &[false, false]), 1);
+        // Four slots live: bulk cycles every slot, pinned never leaves 0.
+        for rr in 0..8 {
+            assert_eq!(select_slot(false, rr, &[true; 4]), rr % 4);
+            assert_eq!(select_slot(true, rr, &[true; 4]), 0);
+        }
+        // Four slots, 0 down: pinned and bulk both fail over to the first live.
+        assert_eq!(select_slot(true, 0, &[false, true, true, true]), 1);
+        assert_eq!(select_slot(false, 0, &[false, true, true, true]), 1);
+        // ...but a live preference is never abandoned just because a lower slot
+        // is dead: rr = 3 keeps slot 3.
+        assert_eq!(select_slot(false, 3, &[false, true, true, true]), 3);
+        assert_eq!(select_slot(true, 0, &[false, false, true, false]), 2);
+        // Every slot down: the round-robin preference is kept, so each flow
+        // waits on a real slot and fails fast rather than picking a random one.
+        assert_eq!(select_slot(false, 2, &[false; 4]), 2);
+        assert_eq!(select_slot(true, 2, &[false; 4]), 0);
+    }
+
+    /// The pool is a real papaya registry: N distinct slots, bulk flows cycling
+    /// through all of them, the interactive port pinned to slot 0, and failover
+    /// driven by the maintained liveness bits.
+    #[test]
+    fn pool_round_robins_bulk_over_every_slot_and_pins_interactive() {
+        let pool = ConnPool::new(4, vec![53]);
+        assert_eq!(pool.slot_count(), 4, "every slot is registered");
+        assert_eq!(pool.slots.pin().len(), 4, "papaya holds all four");
+        assert!(
+            !Arc::ptr_eq(&pool.slot(0).live, &pool.slot(1).live),
+            "each index is its own slot, not one shared handle"
+        );
+        let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+        let interactive = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+        // All slots still down: bulk keeps its round-robin preference (bounded
+        // stall), the pinned port keeps slot 0.
+        assert_eq!(pool.pick_tcp_index(&bulk), 0);
+        assert_eq!(pool.pick_tcp_index(&bulk), 1);
+        assert_eq!(pool.pick_tcp_index(&interactive), 0);
+        for i in 0..4 {
+            pool.slot(i)
+                .live
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+        let seq: Vec<usize> = (0..8).map(|_| pool.pick_tcp_index(&bulk)).collect();
+        assert_eq!(seq, vec![0, 1, 2, 3, 0, 1, 2, 3], "bulk spreads over all 4");
+        for _ in 0..4 {
+            assert_eq!(pool.pick_tcp_index(&interactive), 0, "pinned to slot 0");
+        }
+        // Slot 0 down: both pinned and bulk fail over to the first live slot,
+        // and `pick_tcp` hands back that slot's handle rather than slot 0's.
+        pool.slot(0)
+            .live
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.pick_tcp_index(&interactive), 1);
+        assert_eq!(pool.pick_tcp_index(&bulk), 1);
+        assert!(Arc::ptr_eq(
+            &pool.pick_tcp(&interactive).live,
+            &pool.slot(1).live
+        ));
+    }
+
+    /// A one-slot pool is the legacy single-connection mode: every flow, pinned
+    /// or bulk, resolves to slot 0 no matter what the liveness bit says.
+    #[test]
+    fn pool_of_one_slot_always_routes_to_slot_zero() {
+        let pool = ConnPool::new(1, vec![]);
+        assert_eq!(pool.slot_count(), 1);
+        let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+        assert_eq!(pool.pick_tcp_index(&bulk), 0);
+        assert_eq!(pool.pick_tcp_index(&bulk), 0);
+        pool.slot(0)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(pool.pick_tcp_index(&bulk), 0);
+        // The constructor clamps, so a wider pool can never be built than the
+        // routing path's stack liveness array can describe.
+        assert_eq!(ConnPool::new(999, vec![]).slot_count(), MAX_POOL_CONNS);
+        assert_eq!(ConnPool::new(0, vec![]).slot_count(), 1);
     }
 
     /// Loopback QUIC endpoint pair through the same public TLS/transport
@@ -2056,14 +2190,46 @@ mod tests {
         TestAssoc { entry, app }
     }
 
-    /// Drain one reply from the fake app, or `None` if nothing arrives. The
-    /// timeout is what lets a "must be dropped" assertion terminate.
-    async fn recv_reply(app: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+    /// How long a *positive* delivery assertion waits.
+    ///
+    /// 2 s, not the 300 ms this used to be: the reply is a loopback datagram
+    /// sent by `dispatch_one` from *this* process, so it cannot be lost on the
+    /// wire — but the suite runs several real-QUIC loopback tests concurrently,
+    /// and while those saturate the loopback path a 300 ms window misses the
+    /// datagram often enough that the client bin went red in roughly half of
+    /// back-to-back `cargo test --all-targets` runs. Nothing here is sensitive
+    /// to how long a *successful* wait takes.
+    const REPLY_WAIT: Duration = Duration::from_secs(2);
+
+    /// How long a *negative* probe waits before concluding "nothing arrived".
+    ///
+    /// Deliberately short, and it must stay well under `FRAG_TIMEOUT_MS`
+    /// (2 s): `dispatch_reassembles_fragments_for_two_interleaved_sessions`
+    /// probes *between* the fragments of one payload, so a 2 s probe would let
+    /// the partial expire and the completed datagram could never be delivered —
+    /// the assertion would fail for a reason that has nothing to do with the
+    /// dispatcher. A reply sent synchronously by `dispatch_one` lands in
+    /// microseconds, so 300 ms is a generous margin for a wrong-reply check.
+    const REPLY_PROBE: Duration = Duration::from_millis(300);
+
+    async fn recv_reply_in(app: &tokio::net::UdpSocket, wait: Duration) -> Option<Vec<u8>> {
         let mut b = vec![0u8; 2048];
-        match tokio::time::timeout(Duration::from_millis(300), app.recv_from(&mut b)).await {
+        match tokio::time::timeout(wait, app.recv_from(&mut b)).await {
             Ok(Ok((n, _))) => Some(b[..n].to_vec()),
             _ => None,
         }
+    }
+
+    /// Drain one reply from the fake app, or `None` if nothing arrives within
+    /// [`REPLY_WAIT`] — the timeout is what lets a "must be dropped" assertion
+    /// terminate.
+    async fn recv_reply(app: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+        recv_reply_in(app, REPLY_WAIT).await
+    }
+
+    /// True when no reply arrives within [`REPLY_PROBE`].
+    async fn no_reply(app: &tokio::net::UdpSocket) -> bool {
+        recv_reply_in(app, REPLY_PROBE).await.is_none()
     }
 
     /// A well-formed MQP-2 datagram carrying `payload` for `sess`.
@@ -2179,7 +2345,7 @@ mod tests {
             &mut pkt,
         );
         assert!(
-            recv_reply(&a.app).await.is_none(),
+            no_reply(&a.app).await,
             "a torn-down association must not receive further replies"
         );
         assert!(
@@ -2207,7 +2373,7 @@ mod tests {
             &mut reasm,
             &mut pkt,
         );
-        assert!(recv_reply(&a.app).await.is_none());
+        assert!(no_reply(&a.app).await);
         hub.publish(sess, a.entry.clone());
         dispatch_one(
             &mut cache,
@@ -2283,7 +2449,7 @@ mod tests {
         send(&mut reasm, &mut cache, &mut pkt, s1, 5, 2, 0, b"AAAA");
         send(&mut reasm, &mut cache, &mut pkt, s2, 9, 2, 0, b"BBBB");
         assert!(
-            recv_reply(&a1.app).await.is_none(),
+            no_reply(&a1.app).await,
             "a half-reassembled payload must not be delivered"
         );
         send(&mut reasm, &mut cache, &mut pkt, s1, 5, 2, 1, b"aaaa");

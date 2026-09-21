@@ -20,10 +20,11 @@ auth_token = ""
 # send_window_mb = 2
 # ack_threshold = 2
 # max_ack_delay_ms = 5
-# Connection isolation (optional; omit = dual connections).
-# quic_conns=2 spreads bulk TCP round-robin across two cwnds while
+# Connection isolation (optional; omit = 4 connections, the code default).
+# quic_conns=4 spreads bulk TCP round-robin across four cwnds while
 # interactive_ports + all UDP pin to the first, so probes skip bulk queues.
-quic_conns = 2
+# 1 restores the legacy single shared connection; clamped to 1..=8.
+quic_conns = 4
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the

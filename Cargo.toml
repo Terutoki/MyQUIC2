@@ -48,6 +48,13 @@ clap = { version = "4", features = ["derive"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 arc-swap = "1"
+# Lock-free concurrent map behind the client's connection-slot registry. The
+# pool is written once at startup and read per TCP flow, so what matters is a
+# read path that never takes a lock and never parks a runtime thread: a pin plus
+# a hash lookup on an integer key. No slot is ever removed, so papaya's
+# reclamation has nothing to collect on that path, and `seize` (its GC) spawns
+# no threads — which matters for the router builds.
+papaya = "0.2"
 
 [profile.release]
 opt-level = 3

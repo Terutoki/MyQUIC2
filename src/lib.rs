@@ -756,10 +756,11 @@ pub struct ClientConf {
     #[serde(default)]
     pub max_ack_delay_ms: Option<u64>,
     // ---- Connection isolation ----
-    // 2 = dual connections (default): bulk TCP spreads round-robin across
-    // both while ports in `interactive_ports` (plus all UDP) pin to the
-    // interactive one, so a latency probe never queues behind bulk on the
-    // same cwnd. 1 = legacy single shared connection.
+    // Pool size: bulk TCP spreads round-robin across every slot while ports in
+    // `interactive_ports` (plus all UDP) pin to slot 0, so a latency probe
+    // never queues behind bulk on the same cwnd. Unset = DEFAULT_QUIC_CONNS
+    // (4); 1 restores the legacy single shared connection; clamped to
+    // 1..=MAX_POOL_CONNS.
     // quinn 0.11 exposes no per-stream priority API, so separate cwnds are
     // the only reliable isolation.
     #[serde(default)]
@@ -787,6 +788,19 @@ fn d_keepalive() -> u64 {
 fn d_5() -> u64 {
     5
 }
+
+/// Default client connection-pool size, i.e. `quic_conns` unset: four QUIC
+/// connections sharing one Endpoint/UDP socket. Bulk TCP spreads round-robin
+/// across all four congestion windows while UDP and `interactive_ports` pin to
+/// the interactive slot, so one heavy flow cannot queue every other flow behind
+/// its cwnd. Independent of the server, which accepts any number of them.
+pub const DEFAULT_QUIC_CONNS: usize = 4;
+
+/// Hard cap on the client connection pool. Every slot owns a QUIC connection
+/// (dial loop, DATAGRAM dispatcher, keepalives, its own 0-RTT ticket state), so
+/// this cap — not the config parser — is what bounds the per-client cost a
+/// `quic_conns` typo can request.
+pub const MAX_POOL_CONNS: usize = 8;
 
 /// Runtime transport tuning resolved from optional TOML fields.
 /// Defaults are the low-latency preset for ~140 ms links (2/4/2 MB windows,
@@ -846,9 +860,13 @@ impl ClientConf {
         }
     }
 
-    /// 2 = dual connections (default). 1 restores the legacy single connection.
+    /// Pool size: [`DEFAULT_QUIC_CONNS`] (4) when `quic_conns` is unset,
+    /// clamped to `1..=`[`MAX_POOL_CONNS`]. 1 restores the legacy single
+    /// connection.
     pub fn conn_count(&self) -> usize {
-        self.quic_conns.unwrap_or(2).clamp(1, 2)
+        self.quic_conns
+            .unwrap_or(DEFAULT_QUIC_CONNS)
+            .clamp(1, MAX_POOL_CONNS)
     }
 
     pub fn interactive_port_list(&self) -> Vec<u16> {
@@ -4868,7 +4886,7 @@ mod tests {
     }
 
     #[test]
-    fn tuning_defaults_are_low_latency_dual() {
+    fn tuning_defaults_are_low_latency() {
         let base = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
             server_name = 'test.com'\nserver_cert_file = 'x'\n";
         let c: ClientConf = toml::from_str(base).unwrap();
@@ -4878,9 +4896,18 @@ mod tests {
         assert_eq!(t.send_window, 2 * 1024 * 1024);
         assert_eq!(t.ack_threshold, 2);
         assert_eq!(t.max_ack_delay, Duration::from_millis(5));
-        assert_eq!(c.conn_count(), 2);
-        let c1: ClientConf = toml::from_str(&format!("{base}quic_conns = 1\n")).unwrap();
-        assert_eq!(c1.conn_count(), 1);
+        assert_eq!(c.conn_count(), 4, "pool default is four connections");
+        assert_eq!(DEFAULT_QUIC_CONNS, 4);
+        let conf =
+            |extra: &str| -> ClientConf { toml::from_str(&format!("{base}{extra}")).unwrap() };
+        assert_eq!(conf("quic_conns = 1\n").conn_count(), 1);
+        assert_eq!(conf("quic_conns = 3\n").conn_count(), 3);
+        assert_eq!(conf("quic_conns = 0\n").conn_count(), 1, "clamped up");
+        assert_eq!(
+            conf("quic_conns = 999\n").conn_count(),
+            MAX_POOL_CONNS,
+            "a config typo cannot spawn an unbounded dial loop"
+        );
     }
 
     /// Window sizing invariant: every flow-control window must clear the BDP of

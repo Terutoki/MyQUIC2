@@ -12,7 +12,7 @@ reconnect_timeout_secs = 5
 # Empty on BOTH sides disables auth (firewall isolation only).
 auth_token = ""
 # Latency-first preset for a 200M/140ms link (W_total ~= BDP): 2/4/2 MB
-# windows + dual connections. Single-thread caps at ~114M; multi-thread
+# windows + 4 connections. Single-thread caps at ~114M; multi-thread
 # still fills 200M with loaded ping ~= 150-160ms.
 stream_receive_window_mb = 2
 receive_window_mb = 4
@@ -22,10 +22,11 @@ max_ack_delay_ms = 5
 # Transport tuning (all optional; omit = 2/4/2 MB windows, ACK 2/5ms).
 # For ~240 Mb/s use 4/8/4 MB; for 300 Mb/s peak use 8/16/8 MB at ~4x loaded latency; ack_threshold=8 +
 # max_ack_delay_ms=10 saves reverse-path CPU at coarser RTT feedback.
-# Connection isolation (optional; omit = dual connections).
-# quic_conns=2 spreads bulk TCP round-robin across two cwnds while
+# Connection isolation (optional; omit = 4 connections, the code default).
+# quic_conns=4 spreads bulk TCP round-robin across four cwnds while
 # interactive_ports + all UDP pin to the first, so probes skip bulk queues.
-quic_conns = 2
+# 1 restores the legacy single shared connection; clamped to 1..=8.
+quic_conns = 4
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the

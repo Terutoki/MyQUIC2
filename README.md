@@ -1,7 +1,7 @@
 # MyQUIC2
 
 **An ultra-high-performance QUIC-based SOCKS5 proxy** — multiplexes TCP and UDP traffic
-over QUIC (dual connections by default for loaded-latency isolation), written in Rust.
+over QUIC (four connections by default for loaded-latency isolation), written in Rust.
 
 MyQUIC2 speaks standard SOCKS5 (RFC 1928) on the ingress side, so browsers, CLIs and
 apps work unchanged (`curl --socks5`, system proxy settings, etc.), while the wire
@@ -10,7 +10,7 @@ QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption,
 ALPN `h3` by default for masquerade, `myquic2/2` opt-in for a versioned fail-closed handshake).
 
 ```
-[ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (2 connections by default)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
+[ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (4 connections by default)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
 ```
 
 The 2026-09 hardening revision adds optional shared-secret client authentication,
@@ -75,6 +75,16 @@ bulk) plus a `kill -9` → restart cycle (detection 15.4 s, redial 0.13 s, the
 pre-kill UDP association self-healed) and an interleaved A/B against the
 pass-21 binaries — see
 [Verification & E2E Tests](#verification--e2e-tests).
+The current revision raises the client's connection-pool default from two
+connections to **four** and moves the slot registry to a lock-free
+`papaya::HashMap`, so bulk TCP spreads across four congestion windows while UDP
+and `interactive_ports` stay pinned to slot 0; `quic_conns` (1–8) overrides it.
+The lock file was refreshed to the newest in-range version of every dependency
+(11 patch bumps; the quinn/quinn-proto/quinn-udp, tokio, time and rcgen versions
+the docs cite did not move). Its unit + clippy + fmt suite, a fresh real-binary
+E2E (4 connections established, TCP/UDP echo, `kill -9` → 4-slot reconnect) and a
+full four-level cross-build of `dist/` re-verified under x86-64 emulation are
+recorded in [Verification & E2E Tests](#verification--e2e-tests).
 
 ---
 
@@ -107,7 +117,7 @@ pass-21 binaries — see
 | Area | Detail |
 |---|---|
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
-| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, dual QUIC connections per client by default (bulk round-robin, interactive pinning, failover) — `quic_conns = 1` restores a single shared connection |
+| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, four QUIC connections per client by default (`quic_conns`, clamped 1–8; bulk round-robin, interactive pinning, failover) — `quic_conns = 1` restores a single shared connection |
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
@@ -119,7 +129,7 @@ pass-21 binaries — see
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 4 MB per-connection receive window default |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
 | **High-RTT tuned** | 2 MB per-stream / 4 MB aggregate receive window, 2 MB send window by default (~114 Mb/s at 140 ms, minimal loaded queue) — 4/8/4 MB opt-in for ~240 Mb/s, 8/16/8 MB for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.3 MB stripped each (rebuilt from this revision) |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.4 MB stripped each (rebuilt from this revision, four-connection default included) |
 
 ---
 
@@ -131,7 +141,7 @@ Single crate, three units sharing one protocol library:
 |---|---|---|
 | `myquic2` (lib) | `src/lib.rs` | MQP-2 codec (owned + borrowed forms), TOML config schema, TLS/cert helpers, QUIC transport builder, TCP↔QUIC bridge |
 | `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; token auth; self-signed cert issuance |
-| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; dual-connection pool with reconnect loop + DATAGRAM dispatcher per slot; per-association UDP relay; token auth |
+| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; papaya-backed N-slot connection pool (4 by default) with a reconnect loop + DATAGRAM dispatcher per slot; per-association UDP relay; token auth |
 | `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | End-to-end 0-RTT verification probe (with token support) |
 
 **Data-plane mapping:**
@@ -156,18 +166,22 @@ Single crate, three units sharing one protocol library:
 **Concurrency model:** Tokio multi-threaded runtime. The server spawns one task per
 incoming connection (handshake included), one DATAGRAM reader and one session sweeper
 per connection, and one lightweight reader task per UDP session. The client keeps a
-pool of QUIC connections (2 by default, `quic_conns`) sharing one Endpoint/UDP socket,
-each slot with its own reconnect loop and DATAGRAM dispatcher; one task per SOCKS
-connection and one relay + reply task per UDP association. Subscriptions die with their
-association, so stale tasks can never steal another session's packets.
+pool of QUIC connections (4 by default, `quic_conns`, clamped 1–8) sharing one
+Endpoint/UDP socket, each slot with its own reconnect loop and DATAGRAM dispatcher; one
+task per SOCKS connection and one relay + reply task per UDP association. Subscriptions
+die with their association, so stale tasks can never steal another session's packets.
+The pool's slot registry is a lock-free `papaya::HashMap` keyed by slot index: slots are
+installed once at startup and never removed, so picking a slot for a new TCP flow is a
+pin plus an integer hash lookup — no lock, no per-flow allocation, and nothing for the
+reclaimer to collect on that path.
 
 **Connection isolation (client):** quinn 0.11 exposes no per-stream priority, so
 separate congestion windows are the isolation mechanism. Bulk TCP spreads round-robin
-across the pool while ports in `interactive_ports` (default DNS/NTP/STUN) plus **all
-UDP** pin to the interactive connection, so a latency probe never queues behind bulk
-on the same cwnd. Routing is liveness-aware: a dead preferred slot fails over to the
-live one (returning flows stay on their slot; both dead fails the flow fast via the
-normal reconnect timeout). Isolation holds while both connections are alive: with a
+across every slot of the pool while ports in `interactive_ports` (default DNS/NTP/STUN)
+plus **all UDP** pin to slot 0, so a latency probe never queues behind bulk on the same
+cwnd. Routing is liveness-aware: a dead preferred slot fails over to the first live slot
+(returning flows stay on their slot; all slots dead fails the flow fast via the normal
+reconnect timeout). Isolation holds while more than one connection is alive: with a
 single live connection every flow shares one cwnd. UDP egress is sticky to its
 connection while it lives (no flap-back churn when the preferred slot recovers;
 new associations prefer the interactive slot again). The TCP open header is always its own write, never batched
@@ -411,6 +425,42 @@ both feature sets, empty token):
 | 34 | Pass-22 E2E through the real binaries: TCP ECHO 1 MiB byte-for-byte; UDP ASSOCIATE sweep 8 / 1200 / 1420 / 1430 / 2000 / 8000 B × 5 each, 0 % loss in both directions (1430/2000/8000 exercise the `type=0x05` fragment path) | ✅ |
 | 35 | Pass-22 `kill -9` → restart: detection 15.4 s (QUIC idle timeout), stale 0-RTT ticket retried once, redial 0.13 s after the restarted server bound, TCP ECHO + UDP sweep green after reconnect, and a UDP association opened *before* the kill self-healed on its next datagram (20.1 s no-reply window) | ✅ |
 
+Additional checks run on the four-connection-pool revision (macOS, loopback,
+`cargo build --release`, both feature sets, empty token, the SOCKS listener free
+before every run):
+
+| # | Test | Result |
+|---|---|---|
+| 36 | `cargo test --all-targets` 74/74 (44 lib + 18 client + 12 server; 73/73 with `--no-default-features`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets | ✅ |
+| 37 | Pool default: `quic_conns = 4` **and** `quic_conns` omitted both log `quic pool: 4 connection(s)`, and the server logs exactly 4 `new QUIC conn` — all four from the client's single UDP socket, as designed | ✅ |
+| 38 | Pool E2E: TCP `CONNECT` 1 MiB byte-for-byte, UDP ASSOCIATE sweep 8 / 1200 / 1420 / 1430 / 2000 / 8000 B 6/6 byte-for-byte (the last three exercise the `type=0x05` fragment path), 40 back-to-back CONNECTs clean | ✅ |
+| 39 | `quic_conns = 1` still degrades to the legacy single connection (`quic pool: 1 connection(s)`, one dial, one dispatcher) with the same TCP/UDP E2E green | ✅ |
+| 40 | Four-slot reconnect: `kill -9` server → all four connections reported `lost` / `timed out` at detection 16.5 s (QUIC idle timeout), the four redials landed within 0.33 s of each other against the restarted server, TCP ECHO + UDP sweep green afterwards. Four client restarts came up 4/4 each with zero dial failures | ✅ |
+| 41 | `dist/` rebuilt for all four CPU levels (`cargo zigbuild`, static musl, stripped; clients +38 408–45 968 B and servers +1 856–2 432 B vs the pass-23 artifacts) and re-verified under amd64 emulation (Podman on Apple Silicon): the **v1** pair established 4 connections with 0 dial failures and passed TCP ECHO 1 MiB, a domain-target `CONNECT` (64 KiB), the 8–8000 B UDP sweep and 20 CONNECTs byte-for-byte; the earlier rebuild's v3 pair passed the same suite, and this one re-checked that v3 runs under the emulated CPU while v4 dies with `Illegal instruction` (exit 132); `objdump -d` finds 235 `zmm` refs in v4 and 0 in v1–v3 | ✅ |
+| 42 | `cargo update`: 11 patch-level bumps — `rustls` 0.23.44 → 0.23.45, `clap` 4.6.6 → 4.6.7 (+ `clap_builder` / `clap_derive` / `clap_lex`), `cc`, `cfg-if`, `find-msvc-tools`, `rand` 0.10.2 → 0.10.3, `syn` 3.0.5 → 3.0.6, `unicode-ident`. quinn 0.11.12 / quinn-proto 0.11.18 / quinn-udp 0.5.15, tokio 1.53.1, time 0.3.55 and rcgen 0.14.10 were already the newest in-range versions, so the documented dependency line and the 1.88 MSRV (every bumped crate declares `rust-version` ≤ 1.85) are unchanged | ✅ |
+| 43 | Flaky-test fix (test-only, `#[cfg(test)]`, no product code): the loopback reply wait is now 2 s for positive assertions and a separate 300 ms `no_reply` probe for negative ones, kept under `FRAG_TIMEOUT_MS`. Result: `cargo test --all-targets` green in **8/8** consecutive runs and 4/4 with `--no-default-features` (was red in ~1 of every 2 runs), the six `dispatch_*` tests 10/10, clippy `-D warnings` + `cargo fmt --check` clean on both feature sets | ✅ |
+| 44 | `dist/` rebuilt a second time from the final tree: all **eight artifacts came out byte-for-byte identical** to the previous rebuild (`sha256` equal for every level and both binaries), which both confirms the build is reproducible from this revision and proves the test-only change above cannot have altered the shipped binaries. The fresh v1 pair re-ran the emulated E2E green (4 connections, TCP 1 MiB, domain `CONNECT`, UDP sweep, 20 CONNECTs), and v3 runs / v4 dies with exit 132 under the emulated CPU | ✅ |
+
+Round-robin *distribution* is pinned by the unit tests rather than by the E2E
+harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
+rows) and `pool_round_robins_bulk_over_every_slot_and_pins_interactive` (a real
+`ConnPool` drives `pick_tcp` to slot indices 0,1,2,3, keeps the pinned port on 0,
+and fails over to slot 1 when slot 0's live bit clears).
+
+The client bin's loopback `dispatch_*` tests were timing-flaky on the pass-23 tree
+too — the full 18-test client bin was red in roughly half of back-to-back
+`cargo test --all-targets` runs, because their 300 ms `recv_reply` window lost a
+loopback datagram whenever the concurrent real-QUIC tests saturated the loopback
+path. The waits are now split: **2 s** for a positive "the reply must arrive"
+assertion, and a **300 ms** `no_reply` probe for "must be dropped" assertions. The
+probe deliberately stays well under `FRAG_TIMEOUT_MS` (2 s): the
+fragment-reassembly test probes *between* the fragments of one payload, so a 2 s
+probe would expire the partial and fail an assertion that has nothing to do with
+timing (measured: that version was 0/8 green). After the split, the full suite is
+8/8 green on the default feature set and 4/4 on `--no-default-features`, with the
+six `dispatch_*` tests 10/10. The change is test-only (`#[cfg(test)]`), so the
+shipped binaries are byte-for-byte the same build.
+
 0-RTT probe (expect the last four lines):
 
 ```sh
@@ -507,14 +557,18 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (the cache-substitution pass: the DNS memo is now
-128-slot 2-way and the server no longer re-resolves a domain target per datagram,
-on top of pass-23's lock-free client control plane and pass-22's direct-mapped
-memos) with the default feature set, so the
-relay counters are **on** in these builds: static musl, x86-64, stripped,
-4 317 504–4 368 520 B (clients 4 344 096–4 365 512, servers 4 317 504–4 339 976)
-each. Three upgrade notes, all requiring **both** sides to be replaced together
-(plus one config note that needs no binary change):
+rebuilt from the current revision (the four-connection pool default and its
+`papaya` slot registry, on top of pass-23's lock-free client control plane and the
+cache-substitution pass's DNS/destination memos, against the refreshed `Cargo.lock`)
+with the default feature set, so the relay counters are **on** in these builds: static
+musl, x86-64, stripped, 4 319 360–4 411 160 B (clients 4 385 128–4 411 160, servers
+4 319 360–4 342 088) each. Against the pass-23 rebuild the client grew
+38 408–45 968 B per level (`papaya` + `seize`, plus the rustls/clap patch bumps) and
+the server 1 856–2 432 B (the patch bumps only — LTO still strips the slot registry
+the server never references). The four-level build is reproducible: rebuilding this
+revision a second time produced byte-identical artifacts at every level. Three
+upgrade notes, all requiring **both** sides to be replaced together (plus two notes
+below that need no binary change):
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -529,6 +583,12 @@ each. Three upgrade notes, all requiring **both** sides to be replaced together
 - Config note (no binary change): the sample configs omit tuning and follow the
   code defaults, now 2/4/2 MB (~114 Mb/s @140 ms single-stream). For ~240/300 Mb/s
   set 4/8/4 or 8/16/8 MB explicitly on both sides together.
+- Pool-size note (client only): the new default is 4 connections and the shipped
+  sample pins `quic_conns = 4`. A client binary built before this revision silently
+  clamps that to 2 — harmless (the server accepts any number of connections), but
+  the extra congestion windows only appear once the client binary is replaced.
+  Omitting the field means "that build's own default", so an untouched old config
+  keeps behaving exactly as before after an upgrade.
 
 Verified by running the v1 pair under x86-64 emulation (Podman's amd64 runtime on
 Apple Silicon): both binaries execute, the QUIC handshake completes, and the full E2E
@@ -566,9 +626,13 @@ checks run *inside* the container next to the artifacts:
 - TCP `CONNECT`: **4096/4096 bytes** relayed.
 
 The per-level flags hold in the new binaries too: `objdump -d` counts **0 / 0 / 0 /
-273 `zmm`** references for v1 / v2 / v3 / v4 and `ymm` **3 978 → 25 281** from v1 to
-v3, and under emulation v1, v2 and v3 all exit 0 on `--help` while v4 dies with exit
-132 — the same signature the pass-23 rebuild showed.
+235 `zmm`** references for v1 / v2 / v3 / v4 and `ymm` **3 978 → 25 972** from v1 to
+v3, and under emulation v3 runs (exit 0) while v4 dies with exit 132 — the same
+signature the pass-23 rebuild showed. The four-connection revision was re-verified
+the same way: the **v1 and v3 pairs** each brought up 4 connections (0 dial failures,
+4 server-side accepts) and passed TCP ECHO 1 MiB, a domain-target `CONNECT`, the
+8–8000 B UDP sweep and 20 back-to-back CONNECTs byte-for-byte inside the emulated
+container, running the `dist/` artifacts themselves.
 
 ---
 
@@ -608,9 +672,9 @@ gso = true
 keep_alive_secs = 5           # clamped to 1..3600; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
 auth_token = ""                     # must match the server (empty on both = disabled)
-# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, dual connections):
+# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, 4 connections):
 # stream_receive_window_mb, receive_window_mb, send_window_mb,
-# ack_threshold, max_ack_delay_ms, quic_conns = 1 (single), interactive_ports, alpn
+# ack_threshold, max_ack_delay_ms, quic_conns = 1..8 (1 = single), interactive_ports, alpn
 ```
 
 Field notes:
@@ -630,10 +694,13 @@ Field notes:
   e.g. a 200M/140ms link (BDP 3.5 MB) is already served by the 2/4/2 MB default:
   single-thread caps at ~114 Mb/s while multi-thread still fills the link with
   minimal loaded latency.
-- `quic_conns = 2` (default) isolates bulk from interactive traffic; `1` restores
-  the legacy single connection. `interactive_ports` pins latency-sensitive TCP
-  ports to the interactive connection (default 53/123/3478–3481); all UDP always
-  rides it. A dead slot fails over automatically.
+- `quic_conns = 4` (default, clamped 1–8) sets the pool size: bulk TCP spreads
+  round-robin across every slot, so each connection's congestion window holds ~1/n
+  of the queue. `1` restores the legacy single connection; the cap bounds what a
+  config typo can request, since every slot owns a dial loop, a DATAGRAM dispatcher,
+  keepalives and its own 0-RTT ticket state. `interactive_ports` pins
+  latency-sensitive TCP ports to slot 0 (default 53/123/3478–3481); all UDP always
+  rides it. A dead slot fails over to the first live one automatically.
 - `alpn` defaults to `h3` masquerade (label only); `myquic2/2` restores the
   versioned fail-closed handshake. Same value required on both sides.
 - Paths are resolved against the process CWD — use absolute paths on OpenWrt.
@@ -2164,7 +2231,11 @@ prefixes its reply with its own tag.
 - **`papaya` for the client `UdpHub`**: it replaces an `ArcSwap` map with a
   lock-free one, but `hub.entry()` already sits behind the 1024-slot per-thread
   `DISPATCH_CACHE`, so the remaining traffic is one lookup per association, not
-  per datagram.
+  per datagram. (This rejection is about the `UdpHub` only: the client's
+  connection pool does use `papaya::HashMap` — see
+  [Connection isolation](#architecture) — because that registry is a fixed,
+  write-once set read once per TCP flow, where the read path's cost is the only
+  thing that matters.)
 
 ---
 
@@ -2190,7 +2261,7 @@ prefixes its reply with its own tag.
 - [x] Reconnect `shared` TOCTOU + DNS overload-path write-lock stalls (pass 7)
 - [x] Batched TCP download pump (`read_chunks` + vectored write, pass 15)
 - [x] Sharded per-packet counters + shared UDP egress + wider session/DNS memos (pass 15)
-- [x] Stream priorities for interactive vs bulk TCP (pass 15; DATAGRAM isolation still via dual connections)
+- [x] Stream priorities for interactive vs bulk TCP (pass 15; DATAGRAM isolation still via the connection pool)
 - [x] Single-flight egress refresh + 8-slot dispatcher cache + sharded retry pool (pass 16)
 - [x] Sharded server session table + per-connection fast path + sampled clocks (pass 16)
 - [x] Pooled TCP pump buffers + reply-path PMTU tracking + sampled abort logs (pass 16)
