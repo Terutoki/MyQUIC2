@@ -2100,11 +2100,29 @@ async fn udp_associate_inner(
                                 // No isolated egress connection right now: the
                                 // dedicated UDP slot has not come up, is
                                 // reconnecting, or another thread owns the
-                                // refresh gate. Counted — this used to be a bare
-                                // `continue` with no counter and no log, so a
-                                // fail-closed pool's whole loss mode was
-                                // invisible in the 60 s report.
-                                dgram_drops::bump(&dgram_drops::NO_EGRESS);
+                                // refresh gate. Counted *exactly* (this counter is
+                                // not batched) and warned once per
+                                // `DROP_WARN_INTERVAL_MS`, because "is
+                                // `udp_fail_closed` costing me anything" is only
+                                // answerable if a short outage is visible at all.
+                                // The detail separates the three causes, which is
+                                // the difference between "the WAN is flapping" and
+                                // "another thread won the refresh race".
+                                let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+                                dgram_drops::warn_egress_drop(
+                                    dgram_drops::EgressDrop::NoConnection,
+                                    n,
+                                    || {
+                                        format!(
+                                            "; udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                                            pool.udp_fail_closed(),
+                                            pool.slot(pool.udp_slot()).is_live(),
+                                            egress_shared
+                                                .refreshing
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        )
+                                    },
+                                );
                                 continue;
                             }
                         }
@@ -2117,21 +2135,33 @@ async fn udp_associate_inner(
                         sent.frames
                     );
                 }
-                match sent.outcome() {
+                let outcome = sent.outcome();
+                match outcome {
                     DatagramSend::Sent => {}
                     // `Blocked`/`TooLarge` are counted inside the fragmenter
-                    // (`dgram_drops::BUFFER_FULL` / `TOO_LARGE`).
+                    // (`dgram_drops::BUFFER_FULL` / `TOO_LARGE`), which has its own
+                    // rate-limited size warning.
                     DatagramSend::Blocked => {
                         tracing::debug!("client datagram dropped: send buffer full");
                     }
                     DatagramSend::TooLarge | DatagramSend::ConnectionLost => {
                         tracing::debug!("client egress stale, invalidating shared cache");
-                        dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                        let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                        dgram_drops::warn_egress_drop(
+                            dgram_drops::EgressDrop::ConnectionLost,
+                            n,
+                            || format!("; send outcome {outcome:?}, cached handle invalidated"),
+                        );
                         egress_shared.invalidate();
                     }
                     DatagramSend::Unsupported => {
                         tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
-                        dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                        let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                        dgram_drops::warn_egress_drop(
+                            dgram_drops::EgressDrop::ConnectionLost,
+                            n,
+                            || "; peer does not support DATAGRAM".to_string(),
+                        );
                     }
                 }
             }

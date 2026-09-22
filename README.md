@@ -85,7 +85,7 @@ now dials `quic_conns + 1`: bulk TCP spreads across the bulk slots while UDP nev
 shares a congestion window — or a packet payload — with a TCP flow.
 The lock file was refreshed to the newest in-range version of every dependency
 (11 patch bumps; the quinn/quinn-proto/quinn-udp, tokio, time and rcgen versions
-the docs cite did not move). Its unit + clippy + fmt suite (91/91, and 90/90 with
+the docs cite did not move). Its unit + clippy + fmt suite (93/93, and 92/92 with
 `--no-default-features`), a fresh real-binary E2E (5 connections established —
 4 TCP + the dedicated UDP slot, TCP/UDP echo including the fragment path, 0 % loss
 across 16 associations, the fail-closed drop counter, and self-healing after a
@@ -458,7 +458,7 @@ before every run):
 | 46 | `WouldBlock` retry pool re-arms a shard whose worker died with its runtime. Each shard's `Sender` used to live in a `OnceLock` forever while its worker was a task on whichever runtime first needed it, so any later runtime (a test binary has one per `#[tokio::test]`; an embedder may have several) queued retries into a closed channel and the datagram was dropped silently, charged to a budget counter that had not been touched. Each shard publishes its sender through an `ArcSwap` and re-arms on demand; the probe against the old code printed `queued=false delivered=false`, and the new regression test `retry_shard_is_rearmed_after_its_runtime_ends` passes. Effect on the suite: the client bin went **0/5 → 5/5 green when run serially** (the file's runtime churn hit it every run) and the full suite to **10/10** on the default feature set and 4/4 on `--no-default-features` | ✅ |
 | 47 | `dist/` rebuilt from this revision for all four CPU levels (static musl, stripped; clients 4 390 120–4 416 280 B, servers 4 325 792–4 348 536 B, i.e. +4 992–5 120 / +6 432–6 512 B per level for the retry-pool and memo changes) and re-verified under amd64 emulation (Podman on Apple Silicon) **using the repo's own harness** — the `hotpath_bench` example built for the same musl target, so no external tooling is involved. On the v1 pair: 4 connections, 0 dial failures, 4 server accepts; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 160 000 sent / 159 993 received; `udpmulti` 16 associations 603 728 received at 0.082 % loss; 40 domain-target TCP `CONNECT`s; `udpdomainswitch` **1000 alpha + 1000 beta, 0 misrouted** and `udpipswitch` **1000 IP + 1000 domain, 0 misrouted**. A second four-level build came out byte-identical (`sha256` equal for all eight files), and v3 runs / v4 dies with exit 132 under the emulated CPU, with `zmm` = 0/0/0/235 and `ymm` 3 978 → 26 900 | ✅ |
 | 48 | Post-audit fixes (pass 24): session-memo ownership, sweeper re-check, connection-pin deadline, `dns_inflight` accounting. `cargo test --all-targets` **79/79** (45 lib + 18 client + 16 server; **78/78** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. E2E on the fixed binaries: `udpdomainswitch` 500 alpha + 500 beta and `udpipswitch` 500 IP + 500 domain inside one session, **0 misrouted**; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 4 000 sent / 3 999 received; 20 TCP flows with replies; a 40-datagram burst at an uncached name reported as `9 dropped (resolution in flight)` in the new counter. The fd leak is closed, measured with `lsof`: 100 associations on one connection, client `kill -9`, then **1** UDP fd (the listener) after the QUIC idle timeout, against **85** on the previous binary. `dist/openwrt-x86_64/` was rebuilt for all four CPU levels from this revision (static musl, x86-64, stripped; servers 4 327 072–4 349 816 B, +1 216–1 536 B per level; clients 4 390 120–4 416 280 B, same sizes as before) — `file` confirms the format, a second four-level build came out byte-identical at every level, and `objdump -d` finds 273 `zmm` refs in v4 with none in v1/v3 (`ymm` 3 978 → 25 306 from v1 to v3), so each `target-cpu` level really is compiled in. The emulated-container re-run was **not** repeated here (the local Podman machine did not respond): the dist artifacts are cross-compiled and statically checked, while the native-binary E2E below is green | ✅ |
-| 49 | Pass 25 — dedicated UDP egress and the pool audit. `cargo test --all-targets` **91/91** (47 lib + 27 client + 17 server; **90/90** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Native-binary E2E (macOS loopback, the repo's own `hotpath_bench` harness): the client logs `quic pool: 4 TCP connection(s) … + 1 dedicated UDP connection (slot 4), UDP is fail-closed` and the server logs exactly **5** `new QUIC conn`; `tcpecho` 64 KiB byte-for-byte; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim**; `udpmulti` 16 associations × 400 = **6400/6400, 0.000 % loss** at 19 451 pps. `quic_conns = 1` dials **2** connections (1 TCP + 1 UDP) and still passes TCP plus the full UDP sweep, so the separation is structural rather than load-dependent. With every connection dead (`kill -9` the server), the next 60 s line reads `66 dropped (no egress connection)` — the fail-closed path counted and reported instead of sharing a TCP connection silently — and after the restart the same client logs 2 `QUIC connected` with TCP and the 8/8000 B sweep green again. `dist/` was rebuilt for all four CPU levels (clients 4 401 768–4 425 096 B, servers 4 334 320–4 361 992 B; `file` confirms static musl + stripped) and the **shipped v1 pair was re-run end-to-end under amd64 emulation** (Podman on Apple Silicon, the `hotpath_bench` example cross-built for the same musl target): 5 connections accepted, `tcpecho` 256 KiB byte-for-byte, `udpsweep` 8/1200/1430/8000 B **4/4 verbatim**, `udpmulti` 8 × 200 = **1600/1600, 0.000 % loss**; `objdump -d` finds 235 `zmm` refs in v4 and none in v1–v3 (`ymm` 3 978 → 27 045 from v1 to v3), so each `target-cpu` level is compiled in | ✅ |
+| 49 | Pass 25 — dedicated UDP egress and the pool audit. `cargo test --all-targets` **93/93** (49 lib + 27 client + 17 server; **92/92** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Native-binary E2E (macOS loopback, the repo's own `hotpath_bench` harness): the client logs `quic pool: 4 TCP connection(s) … + 1 dedicated UDP connection (slot 4), UDP is fail-closed` and the server logs exactly **5** `new QUIC conn`; `tcpecho` 64 KiB byte-for-byte; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim**; `udpmulti` 16 associations × 400 = **6400/6400, 0.000 % loss** at 19 451 pps. `quic_conns = 1` dials **2** connections (1 TCP + 1 UDP) and still passes TCP plus the full UDP sweep, so the separation is structural rather than load-dependent. With every connection dead (`kill -9` the server), the next 60 s line reads `66 dropped (no egress connection)` — the fail-closed path counted and reported instead of sharing a TCP connection silently — and after the restart the same client logs 2 `QUIC connected` with TCP and the 8/8000 B sweep green again. `dist/` was rebuilt for all four CPU levels (clients 4 406 656–4 430 000 B, servers 4 334 128–4 361 864 B; `file` confirms static musl + stripped) and the **shipped v1 pair was re-run end-to-end under amd64 emulation** (Podman on Apple Silicon, the `hotpath_bench` example cross-built for the same musl target) for pass 25's artifacts and again for the clock-free reply-path build: 5 connections accepted, `tcpecho` 256 KiB byte-for-byte, `udpsweep` 8/1200/1430/8000 B **4/4 verbatim**, `udpmulti` 8 × 200 = **1600/1600, 0.000 % loss**. The egress drop-accounting build that follows does **not** repeat that emulated run: it changes only what happens to a datagram that is *already* being dropped (an exact counter, a rate-limited warning) and no data-path decision, so its coverage is the unit suite — `egress_drops_are_exact_across_threads`, falsified against the batched wiring before being kept, and `egress_drop_warnings_use_independent_slots`; `objdump -d` finds 235 `zmm` refs in v4 and none in v1–v3 (`ymm` 3 978 → 27 045 from v1 to v3), so each `target-cpu` level is compiled in | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -596,13 +596,17 @@ destination-memo writes, the re-arming `WouldBlock` retry pool, and pass 24's
 session-memo ownership / sweeper re-check / connection-pin deadline fixes, pass-23's
 lock-free client control plane and the cache-substitution pass's DNS/destination memos,
 against the refreshed `Cargo.lock`) with the default feature set, so the relay counters
-are **on** in these builds: static musl, x86-64, stripped, 4 334 320–4 425 096 B
-(clients 4 401 768–4 425 096, servers 4 334 320–4 361 992) each. Against the previous
-rebuild the clients grew 8 304–11 712 B and the servers 7 248–12 176 B per level (the
-pass-25 changes: the UDP slot and its egress order, the six-counter `DropSnapshot`, the
-association liveness bit and its idle-tick fold, the RAII reservation and the idle-first
-session sweep). The client artifacts are 128–192 B *smaller* than pass 25's first build of
-them: the reply path's per-datagram `mono_millis()` call site is gone. The
+are **on** in these builds: static musl, x86-64, stripped, 4 334 128–4 430 000 B
+(clients 4 406 656–4 430 000, servers 4 334 128–4 361 864) each. Against the **pass-24**
+artifacts the clients grew 13 208–16 856 B and the servers 7 056–12 048 B per level, for
+the UDP slot and its egress order, the six-counter `DropSnapshot`, the association
+liveness bit and its idle-tick fold (which also deleted a per-datagram `clock_gettime` and
+the `send_reply_at` seam), the exact-and-warning egress drop accounting, the RAII
+reservation and the idle-first session sweep. The intermediate steps are visible in the
+sizes: the clock-free reply path came out 128–192 B *smaller* than pass 25's first build
+of the clients, and the egress drop accounting that followed added 4 888–5 144 B to them
+while shaving 128–192 B off the servers (the library no longer keeps per-thread batching
+cells for those two counters). The
 earlier growth was the client 4 992–5 120 B and the server 6 432–6 512 B per level (the
 retry pool's `ArcSwap` shard table plus the memo path changes). Three upgrade notes, all
 requiring **both** sides to be replaced together (plus two notes below that need no
@@ -2274,6 +2278,23 @@ fail-closed by default).
   `every_drop_counter_has_its_own_snapshot_field` pinning that each counter reaches a
   distinct field — the batching table is keyed on identity, so a counter missing one of
   its two arms would sit in a thread-local cell forever.
+- **The two egress counters are exact, and warn on the spot**, because they are the
+  numbers that answer "is `udp_fail_closed` costing me anything". Four of the six
+  counters batch per thread, which is right for a flood and wrong for a discrete,
+  seconds-long outage: a worker thread's count reaches the global only at 64, and the
+  reporter's `snapshot` flushes *its own* thread's cells, so a 20-datagram outage could
+  stay invisible until that thread dropped 63 more — or forever, if the thread exited
+  with the count still pending. `bump`'s return value (what the per-packet warn lines
+  print as "N so far") was the *global* total rather than the pending one, so even a
+  warning understated the loss. `NO_EGRESS`/`EGRESS_DEAD` now take the direct `fetch_add`
+  path — one RMW per *dropped* datagram, never per sent one — and the client calls the
+  new `dgram_drops::warn_egress_drop` on both, with one rate-limited slot per state
+  (`EgressDrop::{NoConnection, ConnectionLost}`, 10 s each) and a detail that separates
+  the causes: `udp_fail_closed`, whether the dedicated slot is live, and whether the
+  single-flight refresh was merely owned by another thread at that instant. Regression
+  tests: `egress_drops_are_exact_across_threads` (verified to fail when the counters are
+  routed back through the batching path, by a temporary probe) and
+  `egress_drop_warnings_use_independent_slots`.
 - **The association idle stamp is refreshed by replies — without a clock read per
   reply.** It lived as a local in the relay loop fed only by app-side traffic, so an
   association whose flow was receive-only after the first request (RTP after RTSP
@@ -2325,8 +2346,8 @@ fail-closed by default).
   further allocations — hours at any rate a 4032-association cap permits — against a
   reply lifetime of seconds).
 
-Verification: `cargo test --all-targets` **91/91** (47 lib + 27 client + 17 server) and
-**90/90** with `--no-default-features`; `cargo clippy --all-targets -- -D warnings`
+Verification: `cargo test --all-targets` **93/93** (49 lib + 27 client + 17 server) and
+**92/92** with `--no-default-features`; `cargo clippy --all-targets -- -D warnings`
 and `cargo fmt --check` clean on both feature sets. The three behaviour changes are all
 config-visible: one extra connection per client, UDP fail-closed by default, and the
 client-side association cap 4096 → 4032. `dist/` was rebuilt for all four CPU levels

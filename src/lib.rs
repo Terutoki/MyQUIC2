@@ -2198,18 +2198,21 @@ pub mod dgram_drops {
     /// Totals since process start.
     ///
     /// **Batching bound, stated because a line reading `0` is not proof of no
-    /// loss.** Each counter accumulates in a thread-local cell and is pushed to
-    /// the global when it reaches 64, or when this function flushes the *calling*
-    /// thread's cells. A reporter task runs on its own thread and cannot see
-    /// another thread's pending count, so a low-rate loss — under 64 drops per
-    /// worker thread between two reports — can be missing from one 60 s line and
-    /// appear in the next (observed on the fail-closed path: 76 real drops, a
-    /// line reporting 66). The counters converge, and the process-lifetime totals
-    /// are exact to within that pending set; the per-packet `warn` lines
-    /// (`warn_udp_write`, `warn_datagram_drop`) carry the pending count
-    /// immediately and are the low-rate signal. The batching itself is
-    /// deliberate: these paths fire per packet under a flood, and pass 19 moved
-    /// them off the shared cache lines for exactly that reason.
+    /// loss.** `too_large`, `buffer_full`, `session_full` and `dns_inflight`
+    /// accumulate in a thread-local cell and reach the global when they hit 64 or
+    /// when `snapshot` runs *on that thread*. A reporter task runs on its own
+    /// thread, so a loss under 64 drops on a worker thread is not "delayed to the
+    /// next report" — it stays invisible until that thread drops 63 more, and a
+    /// thread that exits takes its pending count with it. Treat those four as
+    /// flood indicators, and the per-packet `warn` lines (which carry the total
+    /// `bump` returned) as the immediate signal.
+    ///
+    /// `no_egress` and `egress_dead` are exempt by construction: they are counted
+    /// with a direct `fetch_add` (see `bump`), so a two-second fail-closed outage
+    /// that drops twenty datagrams shows up in the very next report. That is
+    /// deliberate — they describe a discrete state of the egress connection, not a
+    /// flood, and they are the numbers an operator uses to decide whether
+    /// `udp_fail_closed` is costing them anything.
     pub fn snapshot() -> DropSnapshot {
         flush_locals();
         DropSnapshot {
@@ -2247,18 +2250,6 @@ pub mod dgram_drops {
                 DNS_INFLIGHT.fetch_add(v, Ordering::Relaxed);
             }
         });
-        L_NO_EGRESS.with(|c| {
-            let v = c.replace(0);
-            if v != 0 {
-                NO_EGRESS.fetch_add(v, Ordering::Relaxed);
-            }
-        });
-        L_EGRESS_DEAD.with(|c| {
-            let v = c.replace(0);
-            if v != 0 {
-                EGRESS_DEAD.fetch_add(v, Ordering::Relaxed);
-            }
-        });
     }
 
     thread_local! {
@@ -2266,8 +2257,6 @@ pub mod dgram_drops {
         static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        static L_NO_EGRESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        static L_EGRESS_DEAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     fn batched(
@@ -2291,12 +2280,21 @@ pub mod dgram_drops {
         }
     }
 
-    /// `counter` must be one of this module's statics: the batching table is
-    /// keyed on identity, and an unknown counter falls through to a plain
-    /// `fetch_add` (correct, just unbatched). Every static therefore needs its
-    /// own arm *and* its own `flush_locals` arm, or a batched bump would sit in
-    /// the thread-local cell and never reach the snapshot —
-    /// `every_drop_counter_has_its_own_snapshot_field` fails if that happens.
+    /// `counter` must be one of this module's statics. Four of them batch per
+    /// thread (flushed at 64, or by a `snapshot` on the *same* thread), which is
+    /// what keeps a flood off the shared cache lines; each of those needs its own
+    /// arm here *and* its own `flush_locals` arm, or its count would sit in a
+    /// thread-local cell and never reach the snapshot.
+    ///
+    /// The two **egress** states deliberately do not batch and fall through to
+    /// the direct `fetch_add` below. A fail-closed outage is a discrete event
+    /// that lasts seconds, and batching let a short one hide in a worker thread's
+    /// cell indefinitely: this thread only flushes at 64, and the reporter's
+    /// `snapshot` flushes its own cells, not this thread's — so a 20-datagram
+    /// outage could go unreported forever, and a thread that exits takes its
+    /// pending count with it. One RMW per *dropped* datagram (never per sent
+    /// datagram) is the right price for a number that has to be true;
+    /// `egress_drops_are_exact_across_threads` pins it.
     pub fn bump(counter: &AtomicU64) -> u64 {
         if std::ptr::eq(counter, &TOO_LARGE) {
             batched(counter, &L_TOO_LARGE)
@@ -2306,13 +2304,57 @@ pub mod dgram_drops {
             batched(counter, &L_SESSION_FULL)
         } else if std::ptr::eq(counter, &DNS_INFLIGHT) {
             batched(counter, &L_DNS_INFLIGHT)
-        } else if std::ptr::eq(counter, &NO_EGRESS) {
-            batched(counter, &L_NO_EGRESS)
-        } else if std::ptr::eq(counter, &EGRESS_DEAD) {
-            batched(counter, &L_EGRESS_DEAD)
         } else {
             counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
         }
+    }
+
+    /// Which egress state a warning is about. An enum rather than a reason
+    /// string: the slot is picked from it, and a typo in a substring match would
+    /// silently merge two different faults into one rate limit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EgressDrop {
+        /// No usable egress connection at all: the dedicated UDP connection had
+        /// not come up, was reconnecting, or the single-flight refresh was owned
+        /// by another thread.
+        NoConnection,
+        /// The connection was gone (or the peer stopped offering DATAGRAM) at
+        /// send time.
+        ConnectionLost,
+    }
+
+    /// Rate-limited, once-per-state warning for a datagram dropped because its
+    /// **egress connection** was unusable.
+    ///
+    /// Split from `warn_datagram_drop`: that helper's text is about the packet
+    /// ("a packet this size would have been carried by a direct UDP path") and its
+    /// three slots are shared with the size/buffer cases, so folding egress drops
+    /// into them would both misdescribe the fault and let one class starve the
+    /// other's warning. The two states get a slot each, limited to one line per
+    /// `DROP_WARN_INTERVAL_MS`, so the *first* drop of an outage is in the log
+    /// immediately — before this existed the whole fail-closed loss mode was
+    /// visible only in the 60 s aggregate, and (for a short outage) sometimes not
+    /// even there, because of the batching bound.
+    ///
+    /// Costs one clock read per *dropped* datagram (the rate limiter needs it) and
+    /// builds `detail` only when a line is actually emitted.
+    pub fn warn_egress_drop(kind: EgressDrop, total: u64, detail: impl FnOnce() -> String) {
+        use crate::{claim_drop_warning, NEVER_WARNED};
+        static LAST_NO_CONNECTION: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+        static LAST_LOST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+        let slot = match kind {
+            EgressDrop::NoConnection => &LAST_NO_CONNECTION,
+            EgressDrop::ConnectionLost => &LAST_LOST,
+        };
+        if !claim_drop_warning(slot) {
+            return;
+        }
+        let reason = match kind {
+            EgressDrop::NoConnection => "no usable udp egress connection",
+            EgressDrop::ConnectionLost => "udp egress connection lost at send",
+        };
+        let detail = detail();
+        tracing::warn!("udp datagram dropped ({reason}): {total} so far{detail}");
     }
 }
 
@@ -4252,6 +4294,63 @@ mod tests {
         assert!(after.egress_dead > before.egress_dead, "egress_dead");
         let d = after.since(&before);
         assert!(d.lost() >= 6, "every drop counts as loss: {d:?}");
+    }
+
+    /// The two egress counters must be visible **immediately and from another
+    /// thread**, which is the whole reason they do not batch.
+    ///
+    /// Batching (four of the six counters) keeps the count in the bumping
+    /// thread's cell until it reaches 64, and `snapshot` only flushes the thread
+    /// it runs on — so a worker thread's short outage stays invisible until that
+    /// thread drops 63 more, and a thread that exits takes its pending count with
+    /// it. This test spawns exactly such a thread: with the egress counters
+    /// batched, the spawned thread's cell dies with it and the delta below is
+    /// zero, deterministically. Other tests only ever *add* to these counters, so
+    /// the assertions are lower bounds and cannot flake.
+    #[test]
+    fn egress_drops_are_exact_across_threads() {
+        let before = dgram_drops::snapshot();
+        std::thread::spawn(|| {
+            // One outage's worth of drops, on a thread that never reports and
+            // never reaches the batching threshold.
+            for _ in 0..20 {
+                dgram_drops::bump(&dgram_drops::NO_EGRESS);
+            }
+            dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+        })
+        .join()
+        .expect("the drop thread must not panic");
+
+        let after = dgram_drops::snapshot();
+        assert!(
+            after.no_egress >= before.no_egress + 20,
+            "a 20-datagram fail-closed outage must be in the next snapshot: {} -> {}",
+            before.no_egress,
+            after.no_egress
+        );
+        assert!(
+            after.egress_dead > before.egress_dead,
+            "a dead-egress drop must be in the next snapshot: {} -> {}",
+            before.egress_dead,
+            after.egress_dead
+        );
+        assert!(
+            after.since(&before).lost() >= 21,
+            "both egress states count as loss"
+        );
+    }
+
+    /// The warn helper picks its rate-limit slot from the enum, so two different
+    /// egress faults cannot share one 10 s window and silently swallow each
+    /// other's first line.
+    #[test]
+    fn egress_drop_warnings_use_independent_slots() {
+        // Both kinds emit on a fresh process (the first call always warns), and
+        // calling them repeatedly is safe: the second call inside the interval is
+        // suppressed rather than panicking or blocking.
+        dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, 1, String::new);
+        dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::ConnectionLost, 1, String::new);
+        dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, 2, String::new);
     }
 
     /// The first drop must warn, and only then does the interval apply. A rate
