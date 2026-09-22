@@ -1431,6 +1431,103 @@ pub fn mono_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Step of the coarse clock below.
+const COARSE_TICK: Duration = Duration::from_secs(1);
+
+/// Monotonic milliseconds, advanced in [`COARSE_TICK`] steps by one lazily
+/// armed task: the same epoch as [`mono_millis`], sampled once per second.
+///
+/// **Why.** Every hot-path throttle and deadline in this crate is measured in
+/// whole seconds — the 1 s liveness-touch throttle, the 1 s egress-memo
+/// refresh, the 10 s PMTU refresh, the 30 s destination pin, the 180 s idle
+/// reap, the 300 s TCP idle watchdog and the 10 s drop-warning interval.
+/// `mono_millis()` (a vDSO `clock_gettime`, measured at ~22 ns here) was being
+/// paid *per packet* to answer "has a second passed?", which is the shape this
+/// replaces with one relaxed load.
+///
+/// **Why not a packet counter.** Sampling the clock every Nth packet was tried
+/// and reverted — see `TouchMemo`. A burst advances the local counter past its
+/// sample point without storing anything, and every later trickle packet then
+/// keeps skipping the clock read, so the stamp freezes until the 180 s reaper
+/// kills a session that was live the whole time. A task-driven epoch advances
+/// with wall time regardless of how packets arrive: a trickle flow is refreshed
+/// on its first packet after each tick, which is exactly the guarantee the
+/// throttle is supposed to provide.
+///
+/// **Frozen-epoch safety.** A stalled epoch would be that same liveness bug, so
+/// the ticker is not fire-and-forget: the task clears the armed flag as it goes
+/// down (including when its runtime is dropped mid-flight), and any reader that
+/// finds the flag clear re-arms it. A reader that *is* running is therefore
+/// never more than one call away from a live clock, and the cursor it publishes
+/// is monotonic either way — a stale value can only make a deadline look
+/// further away, never closer, so the failure mode is a delay, not a false
+/// expiry.
+///
+/// Because the cursor is a sample of the same clock, coarse and fine values are
+/// directly comparable and both are used side by side; a coarse value is simply
+/// up to one tick behind.
+///
+/// Callers must be on a Tokio runtime (every call site is inside a task); with
+/// no runtime the cursor is left where it is and the next caller arms it.
+pub fn coarse_millis() -> u64 {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static CURSOR: AtomicU64 = AtomicU64::new(0);
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// Clears `ARMED` however the ticker task ends — loop exit, panic or the
+    /// runtime dropping the task. Without this the flag would stay set across a
+    /// runtime hand-off and the epoch would stay frozen forever.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            ARMED.store(false, Ordering::Release);
+        }
+    }
+
+    let mut v = CURSOR.load(Ordering::Relaxed);
+    if v == 0 {
+        // No sample yet (first call ever, or the ticker has not been polled).
+        // Seed it here rather than returning 0: a consumer that stores the value
+        // as its baseline would otherwise read "idle since process start", and
+        // its very first deadline check would fire — a silent TCP flow would be
+        // torn down after one watchdog step instead of after 300 s. Costs one
+        // clock read once per process.
+        v = mono_millis();
+        CURSOR.store(v, Ordering::Relaxed);
+    }
+    if !ARMED.load(Ordering::Relaxed) && !ARMED.swap(true, Ordering::AcqRel) {
+        // The guard is built *here* and moved into the task, not constructed
+        // inside it. A runtime that is already shutting down drops the future
+        // without ever polling it (`OwnedTasks::bind_inner` calls
+        // `task.shutdown()` and schedules nothing), so an inside-the-block guard
+        // would never exist and `ARMED` would stay set forever — and a frozen
+        // epoch is exactly the liveness bug this clock exists to avoid. As a
+        // capture it is dropped whichever way the future ends.
+        let disarm = Disarm;
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    let _disarm = disarm;
+                    let mut tick = tokio::time::interval(COARSE_TICK);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        // `interval` completes its first tick immediately, so
+                        // the cursor is real from the first packet rather than
+                        // after one tick of startup lag.
+                        tick.tick().await;
+                        CURSOR.store(mono_millis(), Ordering::Relaxed);
+                    }
+                });
+            }
+            // No runtime here: let the next caller — always a task — try again
+            // rather than leaving the flag set on a ticker that was never
+            // spawned. `disarm` drops at the end of this arm and clears it.
+            Err(_) => ARMED.store(false, Ordering::Release),
+        }
+    }
+    v
+}
+
 /// Thread-local memo of the most recent lookups, keyed by the *full* normalized
 /// key. A 64-bit hash here would let two different `(host, port)` pairs collide
 /// and serve each other's address for the whole TTL, so the hash is only ever a
@@ -2153,6 +2250,14 @@ pub mod dgram_drops {
     /// support) at send time. The datagram is lost; the client invalidates its
     /// cached egress handle and the next datagram re-picks a connection.
     pub static EGRESS_DEAD: AtomicU64 = AtomicU64::new(0);
+    /// An inbound relay datagram named a session this process has no
+    /// association for: the association was reaped (or its control connection
+    /// closed) while the server's session was still live and its target kept
+    /// answering. Client-only, and *not* a tunnel degradation — the peer is
+    /// entitled to send until its own 180 s reap — but it used to be dropped in
+    /// total silence while every sibling drop path was counted, which made "the
+    /// 60 s budget line is clean" a claim the code could not support.
+    pub static UNKNOWN_SESS: AtomicU64 = AtomicU64::new(0);
 
     /// Every drop counter in one read, so the 60 s report cannot silently omit
     /// one. Named fields rather than a tuple: a 6-tuple read at two call sites
@@ -2166,6 +2271,7 @@ pub mod dgram_drops {
         pub dns_inflight: u64,
         pub no_egress: u64,
         pub egress_dead: u64,
+        pub unknown_sess: u64,
     }
 
     impl DropSnapshot {
@@ -2178,6 +2284,7 @@ pub mod dgram_drops {
                 dns_inflight: d(self.dns_inflight, prev.dns_inflight),
                 no_egress: d(self.no_egress, prev.no_egress),
                 egress_dead: d(self.egress_dead, prev.egress_dead),
+                unknown_sess: d(self.unknown_sess, prev.unknown_sess),
             }
         }
 
@@ -2185,6 +2292,11 @@ pub mod dgram_drops {
         /// except a datagram that was already destined for a dead connection's
         /// peers. Used by the reporter to decide whether the line is worth
         /// printing at all.
+        ///
+        /// `unknown_sess` is deliberately *not* counted here. It is a late reply
+        /// to a session this side already closed, not a packet the tunnel failed
+        /// to carry, and folding it in would make every ordinary association
+        /// teardown look like loss.
         pub fn lost(&self) -> u64 {
             self.too_large
                 .saturating_add(self.buffer_full)
@@ -2198,14 +2310,14 @@ pub mod dgram_drops {
     /// Totals since process start.
     ///
     /// **Batching bound, stated because a line reading `0` is not proof of no
-    /// loss.** `too_large`, `buffer_full`, `session_full` and `dns_inflight`
-    /// accumulate in a thread-local cell and reach the global when they hit 64 or
-    /// when `snapshot` runs *on that thread*. A reporter task runs on its own
-    /// thread, so a loss under 64 drops on a worker thread is not "delayed to the
-    /// next report" — it stays invisible until that thread drops 63 more, and a
-    /// thread that exits takes its pending count with it. Treat those four as
-    /// flood indicators, and the per-packet `warn` lines (which carry the total
-    /// `bump` returned) as the immediate signal.
+    /// loss.** `too_large`, `buffer_full`, `session_full`, `dns_inflight` and
+    /// `unknown_sess` accumulate in a thread-local cell and reach the global when
+    /// they hit 64 or when `snapshot` runs *on that thread*. A reporter task runs
+    /// on its own thread, so a loss under 64 drops on a worker thread is not
+    /// "delayed to the next report" — it stays invisible until that thread drops
+    /// 63 more, and a thread that exits takes its pending count with it. Treat
+    /// those five as flood indicators, and the per-packet `warn` lines (which
+    /// carry the total `bump` returned) as the immediate signal.
     ///
     /// `no_egress` and `egress_dead` are exempt by construction: they are counted
     /// with a direct `fetch_add` (see `bump`), so a two-second fail-closed outage
@@ -2222,6 +2334,7 @@ pub mod dgram_drops {
             dns_inflight: DNS_INFLIGHT.load(Ordering::Relaxed),
             no_egress: NO_EGRESS.load(Ordering::Relaxed),
             egress_dead: EGRESS_DEAD.load(Ordering::Relaxed),
+            unknown_sess: UNKNOWN_SESS.load(Ordering::Relaxed),
         }
     }
 
@@ -2250,6 +2363,12 @@ pub mod dgram_drops {
                 DNS_INFLIGHT.fetch_add(v, Ordering::Relaxed);
             }
         });
+        L_UNKNOWN_SESS.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                UNKNOWN_SESS.fetch_add(v, Ordering::Relaxed);
+            }
+        });
     }
 
     thread_local! {
@@ -2257,6 +2376,7 @@ pub mod dgram_drops {
         static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_UNKNOWN_SESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     fn batched(
@@ -2280,7 +2400,7 @@ pub mod dgram_drops {
         }
     }
 
-    /// `counter` must be one of this module's statics. Four of them batch per
+    /// `counter` must be one of this module's statics. Five of them batch per
     /// thread (flushed at 64, or by a `snapshot` on the *same* thread), which is
     /// what keeps a flood off the shared cache lines; each of those needs its own
     /// arm here *and* its own `flush_locals` arm, or its count would sit in a
@@ -2295,6 +2415,11 @@ pub mod dgram_drops {
     /// pending count with it. One RMW per *dropped* datagram (never per sent
     /// datagram) is the right price for a number that has to be true;
     /// `egress_drops_are_exact_across_threads` pins it.
+    ///
+    /// `UNKNOWN_SESS` *does* batch, and is the one counter that may: its trigger
+    /// is a peer still answering a session this side already closed, so a burst
+    /// of it is the flood case batching exists for, and the number is a
+    /// diagnostic rather than a loss an operator has to act on.
     pub fn bump(counter: &AtomicU64) -> u64 {
         if std::ptr::eq(counter, &TOO_LARGE) {
             batched(counter, &L_TOO_LARGE)
@@ -2304,6 +2429,8 @@ pub mod dgram_drops {
             batched(counter, &L_SESSION_FULL)
         } else if std::ptr::eq(counter, &DNS_INFLIGHT) {
             batched(counter, &L_DNS_INFLIGHT)
+        } else if std::ptr::eq(counter, &UNKNOWN_SESS) {
+            batched(counter, &L_UNKNOWN_SESS)
         } else {
             counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
         }
@@ -2318,9 +2445,15 @@ pub mod dgram_drops {
         /// not come up, was reconnecting, or the single-flight refresh was owned
         /// by another thread.
         NoConnection,
-        /// The connection was gone (or the peer stopped offering DATAGRAM) at
-        /// send time.
+        /// The connection was gone at send time.
         ConnectionLost,
+        /// The peer never negotiated DATAGRAM support, so this connection can
+        /// never carry a datagram. Its own slot: the condition is static rather
+        /// than transient, the remedy is a configuration change rather than a
+        /// reconnect, and sharing `ConnectionLost`'s line made the log read
+        /// "egress connection lost … peer does not support DATAGRAM" about a
+        /// connection that was up and healthy.
+        Unsupported,
     }
 
     /// Rate-limited, once-per-state warning for a datagram dropped because its
@@ -2330,29 +2463,31 @@ pub mod dgram_drops {
     /// ("a packet this size would have been carried by a direct UDP path") and its
     /// three slots are shared with the size/buffer cases, so folding egress drops
     /// into them would both misdescribe the fault and let one class starve the
-    /// other's warning. The two states get a slot each, limited to one line per
+    /// other's warning. Each state gets a slot, limited to one line per
     /// `DROP_WARN_INTERVAL_MS`, so the *first* drop of an outage is in the log
     /// immediately — before this existed the whole fail-closed loss mode was
     /// visible only in the 60 s aggregate, and (for a short outage) sometimes not
     /// even there, because of the batching bound.
     ///
-    /// Costs one clock read per *dropped* datagram (the rate limiter needs it) and
-    /// builds `detail` only when a line is actually emitted.
+    /// Costs one clock read per *dropped* datagram (the rate limiter needs it; it
+    /// reads the coarse epoch, so the cost is a relaxed load in the common case)
+    /// and builds `detail` only when a line is actually emitted.
     pub fn warn_egress_drop(kind: EgressDrop, total: u64, detail: impl FnOnce() -> String) {
         use crate::{claim_drop_warning, NEVER_WARNED};
         static LAST_NO_CONNECTION: AtomicU64 = AtomicU64::new(NEVER_WARNED);
         static LAST_LOST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-        let slot = match kind {
-            EgressDrop::NoConnection => &LAST_NO_CONNECTION,
-            EgressDrop::ConnectionLost => &LAST_LOST,
+        static LAST_UNSUPPORTED: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+        let (slot, reason) = match kind {
+            EgressDrop::NoConnection => (&LAST_NO_CONNECTION, "no usable udp egress connection"),
+            EgressDrop::ConnectionLost => (&LAST_LOST, "udp egress connection lost at send"),
+            EgressDrop::Unsupported => (
+                &LAST_UNSUPPORTED,
+                "udp egress peer does not support DATAGRAM",
+            ),
         };
         if !claim_drop_warning(slot) {
             return;
         }
-        let reason = match kind {
-            EgressDrop::NoConnection => "no usable udp egress connection",
-            EgressDrop::ConnectionLost => "udp egress connection lost at send",
-        };
         let detail = detail();
         tracing::warn!("udp datagram dropped ({reason}): {total} so far{detail}");
     }
@@ -2464,7 +2599,9 @@ pub mod udp_stats {
         }
     }
 
-    /// A partial datagram was discarded to stay inside [`FRAG_MAX_HELD_BYTES`].
+    /// A partial datagram was discarded to stay inside [`MQP_FRAG_MAX_PAYLOAD`]
+    /// (a peer sent fragments whose sum exceeds the protocol's payload ceiling)
+    /// or [`FRAG_MAX_HELD_BYTES`] (the aggregate reassembly budget).
     pub fn reassembly_evicted() {
         stats_only! {
             REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
@@ -2790,11 +2927,25 @@ fn send_udp_datagram_with_header(
 }
 
 /// Queue an already-encoded datagram body, counting a full send buffer.
+///
+/// This is also the only place that sees quinn's own verdict on a body the
+/// encoder already accepted, so it is where quinn's `TooLarge` is accounted:
+/// a path-MTU reduction under a cached budget is a *size* drop, and there is
+/// no other point on the path that can tell it apart from a dead connection.
+/// Leaving it uncounted made it invisible in the size counters; letting it
+/// fall through to the callers made them report a healthy connection as lost.
 fn send_encoded(conn: &quinn::Connection, body: Bytes) -> DatagramSend {
     let outcome = try_send_datagram(conn, body);
     if outcome == DatagramSend::Blocked {
         let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
         warn_datagram_drop("send buffer full", n, String::new);
+    } else if outcome == DatagramSend::TooLarge {
+        let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        warn_datagram_drop(
+            "path budget shrank under the encoded datagram",
+            n,
+            String::new,
+        );
     }
     outcome
 }
@@ -2964,9 +3115,13 @@ impl Partial {
 ///
 /// Keyed by `(sess, id)`. Because every fragment carries the address header,
 /// out-of-order arrival needs no special case and a lost fragment 0 does not
-/// strand the rest — the partial simply expires. Memory is bounded twice over:
-/// per partial by [`MQP_FRAG_MAX_PAYLOAD`], and in aggregate by
-/// [`FRAG_MAX_HELD_BYTES`], past which the oldest partial is evicted.
+/// strand the rest — the partial simply expires. Memory is bounded twice over,
+/// and both bounds are enforced on every push: per partial by
+/// [`MQP_FRAG_MAX_PAYLOAD`] (a fragment whose chunk would push the partial past
+/// the protocol's payload ceiling discards the whole partial, so a peer cannot
+/// make this side relay a datagram the encoder on the other end would have
+/// refused), and in aggregate by [`FRAG_MAX_HELD_BYTES`], past which the oldest
+/// partial is evicted.
 #[derive(Default)]
 pub struct DgramReassembler {
     parts: HashMap<(u32, u16), Partial>,
@@ -3013,6 +3168,30 @@ impl DgramReassembler {
             && (!self.evict_oldest() || self.parts.len() >= FRAG_MAX_PARTIALS)
         {
             return None;
+        }
+        // The per-partial byte cap the module documents, actually enforced.
+        // `total` is bounded by `MQP_FRAG_MAX_TOTAL`, but nothing bounds a
+        // *chunk*: at the QUIC path MTU each fragment carries ~1.4 KiB, so a
+        // 64-fragment partial assembles to ~91 KiB — far past the payload
+        // ceiling this protocol states, and the caller relays whatever comes out
+        // (`udp_try_send` would hand the kernel a 91 KiB datagram to
+        // IP-fragment). `held`'s aggregate bound does not catch it: one such
+        // partial sits well under `FRAG_MAX_HELD_BYTES`.
+        //
+        // Discarded whole rather than truncated or partially kept: a prefix of a
+        // datagram is not a short datagram, it is a *corrupt* one, and UDP above
+        // this has no integrity check to notice. A duplicate fragment is exempt
+        // (it adds no bytes) so a replayed fragment cannot kill a partial that
+        // was already at the cap.
+        if let Some(p) = self.parts.get(&key) {
+            let duplicate = p.chunks.get(f.idx as usize).is_some_and(Option::is_some);
+            if !duplicate && p.bytes.saturating_add(f.chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
+                if let Some(p) = self.parts.remove(&key) {
+                    self.held = self.held.saturating_sub(p.bytes);
+                    udp_stats::reassembly_evicted();
+                }
+                return None;
+            }
         }
         let complete = {
             let entry = self
@@ -3191,7 +3370,7 @@ fn spawn_retry_worker() -> tokio::sync::mpsc::Sender<UdpRetry> {
             // the last strong `Arc<UdpSocket>` on this path.
             if let Err(reason) = retry_one(&req).await {
                 let n = udp_write::retry_failed();
-                warn_udp_write("detached retry failed", n, || reason);
+                warn_udp_write(UdpWriteDrop::RetryFailed, n, || reason);
             }
         }
     });
@@ -3253,22 +3432,26 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
     match sock.try_send_to(&payload, dst) {
         Ok(_) => udp_write::sent(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            let _ = udp_write::retried();
             let req = UdpRetry {
                 sock: sock.clone(),
                 dst,
                 payload,
             };
-            if !udp_retry_submit(&dst, req) {
+            // Counted *after* the queue accepts it. `retried` means "handed to a
+            // detached task", and the old order counted the hand-off before
+            // knowing whether it happened, so a datagram dropped on a full shard
+            // was booked as both retried and dropped — one datagram, two mutually
+            // exclusive outcomes.
+            if udp_retry_submit(&dst, req) {
+                udp_write::retried();
+            } else {
                 let n = udp_write::dropped_no_permit();
-                warn_udp_write("retry budget exhausted", n, || {
-                    "send buffer full".to_string()
-                });
+                warn_udp_write(UdpWriteDrop::Budget, n, || "send buffer full".to_string());
             }
         }
         Err(e) => {
             let n = udp_write::failed();
-            warn_udp_write("send failed", n, || e.to_string());
+            warn_udp_write(UdpWriteDrop::SendFailed, n, || e.to_string());
         }
     }
 }
@@ -3285,38 +3468,60 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
     match sock.try_send_to(payload, dst) {
         Ok(_) => udp_write::sent(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            let _ = udp_write::retried();
+            // The copy is paid before the queue decision; it only happens on
+            // `WouldBlock`, which is already the exceptional path, and buying it
+            // back would mean a capacity pre-check whose answer `try_send` can
+            // invalidate anyway.
             let req = UdpRetry {
                 sock: sock.clone(),
                 dst,
                 payload: Bytes::copy_from_slice(payload),
             };
-            if !udp_retry_submit(&dst, req) {
+            // See `udp_try_send`: counted only once the queue owns it.
+            if udp_retry_submit(&dst, req) {
+                udp_write::retried();
+            } else {
                 let n = udp_write::dropped_no_permit();
-                warn_udp_write("retry budget exhausted", n, || {
-                    "send buffer full".to_string()
-                });
+                warn_udp_write(UdpWriteDrop::Budget, n, || "send buffer full".to_string());
             }
         }
         Err(e) => {
             let n = udp_write::failed();
-            warn_udp_write("send failed", n, || e.to_string());
+            warn_udp_write(UdpWriteDrop::SendFailed, n, || e.to_string());
         }
     }
 }
 
+/// Which last-hop write fault a warning is about.
+///
+/// An enum rather than the substring-matched reason string this used to take,
+/// for the same reason [`dgram_drops::EgressDrop`] is one: the substring version
+/// tested `reason.contains("budget") || reason.contains("retry")` *first*, so
+/// `"detached retry failed"` — the one message that describes a **send** failure
+/// — matched "retry" and shared a 10 s window with queue exhaustion, silently
+/// merging two different faults. Each variant now carries its own slot and its
+/// own text, so neither can starve the other's first line and a rename cannot
+/// re-merge them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpWriteDrop {
+    /// `WouldBlock` and the detached-retry queue was full: no retry was queued.
+    Budget,
+    /// A direct (non-queued) last-hop send failed.
+    SendFailed,
+    /// A queued retry ran and its send failed, or it hit the retry deadline.
+    RetryFailed,
+}
+
 /// Rate-limited warning for a last-hop UDP write failure.
-fn warn_udp_write(reason: &str, total: u64, detail: impl FnOnce() -> String) {
+fn warn_udp_write(kind: UdpWriteDrop, total: u64, detail: impl FnOnce() -> String) {
     use std::sync::atomic::AtomicU64;
     static LAST_FAIL: AtomicU64 = AtomicU64::new(NEVER_WARNED);
     static LAST_NOPERM: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    static LAST_OTHER: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    let slot = if reason.contains("budget") || reason.contains("retry") {
-        &LAST_NOPERM
-    } else if reason.contains("failed") {
-        &LAST_FAIL
-    } else {
-        &LAST_OTHER
+    static LAST_RETRY_FAIL: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+    let (slot, reason) = match kind {
+        UdpWriteDrop::Budget => (&LAST_NOPERM, "retry budget exhausted"),
+        UdpWriteDrop::SendFailed => (&LAST_FAIL, "send failed"),
+        UdpWriteDrop::RetryFailed => (&LAST_RETRY_FAIL, "detached retry failed"),
     };
     if !claim_drop_warning(slot) {
         return;
@@ -3508,6 +3713,23 @@ const COPY_CHUNK: usize = 32 * 1024;
 /// quinn's own `to_owned()` allocates exactly the bytes it needs.
 const ZEROCOPY_MIN_WRITE: usize = 8 * 1024;
 
+/// Segments one batched download round moves to TCP.
+///
+/// Shared by the `Bytes` batch the receive side fills and the iovec array
+/// [`write_batch_vectored`] fills, so the two cannot drift: the iovec array is
+/// fixed-size, and a `bufs` longer than it would store out of bounds — a panic
+/// inside a relay task, which skips the RST/stop disposition in
+/// [`copy_tcp_quic_inner`] and so fails *silently* rather than loudly.
+const COPY_BATCH: usize = 8;
+
+/// Throttle on the shared idle stamp in [`copy_tcp_quic_inner`].
+///
+/// The stamp is only ever compared against the 300 s idle deadline, and it is
+/// read from the coarse millisecond epoch, so the finest interval this can
+/// resolve is one epoch step. It exists to keep [`touch_stamp`]'s contract
+/// ("at most one shared store per interval") honest, not to buy resolution.
+const IDLE_STAMP_THROTTLE_MS: u64 = 100;
+
 /// Make room for a whole copy chunk before a `read_buf`.
 ///
 /// `BytesMut::chunk_mut` only reserves 64 B once the buffer is full, so without
@@ -3589,9 +3811,13 @@ where
         if skip >= bufs.len() {
             break;
         }
-        let mut ios: [std::io::IoSlice<'_>; 8] = [std::io::IoSlice::new(&[]); 8];
+        let mut ios: [std::io::IoSlice<'_>; COPY_BATCH] = [std::io::IoSlice::new(&[]); COPY_BATCH];
         let mut nios = 0usize;
-        for (i, b) in bufs[skip..].iter().enumerate() {
+        // `take(COPY_BATCH)`: the iovec array is fixed-size, and a `bufs` longer
+        // than it would store out of bounds. Taking only what fits is also
+        // *correct* for a longer slice — `skip` advances past the buffers that
+        // were written and the outer loop comes back for the rest.
+        for (i, b) in bufs[skip..].iter().take(COPY_BATCH).enumerate() {
             let s = if i == 0 {
                 &b[off.min(b.len())..]
             } else {
@@ -3643,9 +3869,13 @@ async fn copy_tcp_quic_inner(
 ) -> Result<(u64, u64)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // Monotonic base: all timestamps are ms since here, immune to NTP/wall jumps.
-    let base = tokio::time::Instant::now();
-    let last_ms = Arc::new(AtomicU64::new(0));
+    // Liveness stamp shared by both directions, in the coarse millisecond epoch
+    // (see [`coarse_millis`]): the value is only ever compared against the 300 s
+    // idle deadline, so it does not need a clock read per chunk. Seeded with
+    // "now" rather than 0 because it is compared against that same epoch — a 0
+    // would read as "idle since process start", and the first idle tick of a
+    // long-running process would tear every flow down on the spot.
+    let last_ms = Arc::new(AtomicU64::new(coarse_millis()));
     // Borrowed halves: `tcp` itself stays owned here so the final disposition
     // (graceful FIN on clean EOF, RST on any abnormal end) is decided in one
     // place after both directions settle, instead of each direction racing to
@@ -3653,12 +3883,19 @@ async fn copy_tcp_quic_inner(
     let (mut tr, mut tw) = tcp.split();
     let l1 = last_ms.clone();
     let l2 = last_ms.clone();
-    let b1 = base;
-    let b2 = base;
-    // Scope the pump futures: everything borrowing `tcp` ends at the block
-    // end, so the final disposition below owns it outright.
+    // Per-direction completion flags, declared outside the pump scope so the
+    // error disposition below can tell a half that finished cleanly from one
+    // that was abandoned mid-flight.
+    let mut c2s_total: Option<u64> = None;
+    let mut s2c_total: Option<u64> = None;
+    // Scope the pump futures: everything borrowing `tcp`, `send` and `recv` ends
+    // at the block end, so the final disposition below owns all three outright.
+    // The futures deliberately *borrow* the two QUIC halves rather than taking
+    // them (no `move`): a dropped `quinn::SendStream` calls `finish()`, so a
+    // future that owned the send half would announce an abnormal end to the peer
+    // as a clean FIN — see the disposition, and `peer_sees_reset_not_fin`.
     let outcome: Result<(u64, u64)> = {
-        let c2s = async move {
+        let c2s = async {
             let mut buf = copy_buf_acquire();
             let mut total = 0u64;
             let mut stamped = 0u64;
@@ -3668,7 +3905,6 @@ async fn copy_tcp_quic_inner(
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
-                        send.reset(0x04u32.into()).ok();
                         let total_copy = total;
                         let buf_ret = std::mem::replace(&mut buf, BytesMut::new());
                         copy_buf_release(buf_ret);
@@ -3691,7 +3927,6 @@ async fn copy_tcp_quic_inner(
                     r
                 };
                 if let Err(e) = res {
-                    send.reset(0x04u32.into()).ok();
                     let total_copy = total;
                     let buf_ret = std::mem::replace(&mut buf, BytesMut::new());
                     copy_buf_release(buf_ret);
@@ -3700,17 +3935,17 @@ async fn copy_tcp_quic_inner(
                     ));
                 }
                 total += n as u64;
-                // Stamp every chunk (throttled to 100ms inside): gating on a
-                // chunk count starves slow trickle uploads past the 300s idle
-                // reap while downloads stamp every batch.
-                let now = b1.elapsed().as_millis() as u64;
-                touch_stamp(&l1, &mut stamped, now, 100);
+                // Stamp every chunk (throttled inside): gating on a chunk count
+                // starves slow trickle uploads past the 300s idle reap while
+                // downloads stamp every batch.
+                let now = coarse_millis();
+                touch_stamp(&l1, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
             }
             send.finish().ok();
             copy_buf_release(buf);
             Ok::<u64, anyhow::Error>(total)
         };
-        let s2c = async move {
+        let s2c = async {
             let mut total = 0u64;
             let mut stamped = 0u64;
             // Optimistic SOCKS replies have already told the application the
@@ -3731,14 +3966,14 @@ async fn copy_tcp_quic_inner(
                     ));
                 }
             }
-            let mut batch: [Bytes; 8] = std::array::from_fn(|_| Bytes::new());
+            let mut batch: [Bytes; COPY_BATCH] = std::array::from_fn(|_| Bytes::new());
             loop {
-                // Batched zero-copy receive: `read_chunks` drains up to 8
-                // assembler segments under one connection-lock acquisition,
-                // then a single vectored write pushes them to TCP. The old
-                // `read_chunk(MAX)+write_all` paid one lock + one syscall per
-                // ~1.4 KiB STREAM frame; batching amortizes both. Clock is
-                // sampled once per batch, not per chunk.
+                // Batched zero-copy receive: `read_chunks` drains up to
+                // `COPY_BATCH` assembler segments under one connection-lock
+                // acquisition, then a single vectored write pushes them to TCP.
+                // The old `read_chunk(MAX)+write_all` paid one lock + one syscall
+                // per ~1.4 KiB STREAM frame; batching amortizes both. The idle
+                // stamp is written once per batch, not per chunk.
                 let n = match recv.read_chunks(&mut batch).await {
                     Ok(Some(n)) => n,
                     Ok(None) => break,
@@ -3771,8 +4006,8 @@ async fn copy_tcp_quic_inner(
                     ));
                 }
                 total += batch_bytes as u64;
-                let now = b2.elapsed().as_millis() as u64;
-                touch_stamp(&l2, &mut stamped, now, 100);
+                let now = coarse_millis();
+                touch_stamp(&l2, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
             }
             // QUIC-recv EOF: half-close the TCP write side now. Without
             // this FIN the peer waits for EOF while our own c2s direction
@@ -3789,14 +4024,13 @@ async fn copy_tcp_quic_inner(
             Ok::<u64, anyhow::Error>(total)
         };
         // Drive both directions manually instead of `join!`: when one direction
-        // fails, returning from this function drops the other future immediately,
-        // which closes its TCP half and resets/stops its QUIC stream. `join!` left
-        // the other side blocked in `read()` until the 300 s idle deadline, so a
-        // dead QUIC connection could pin the target fd and buffers for minutes.
+        // fails, leaving the loop drops the other future immediately, which closes
+        // its TCP half and (see the disposition below) resets/stops its QUIC
+        // stream. `join!` left the other side blocked in `read()` until the 300 s
+        // idle deadline, so a dead QUIC connection could pin the target fd and
+        // buffers for minutes.
         tokio::pin!(c2s);
         tokio::pin!(s2c);
-        let mut c2s_total: Option<u64> = None;
-        let mut s2c_total: Option<u64> = None;
         // Idle watchdog on a *fixed* cadence. The previous shape created a fresh
         // `sleep(step)` on every loop iteration, and any progress in either
         // direction re-entered the loop — so a busy stream registered and cancelled
@@ -3822,7 +4056,7 @@ async fn copy_tcp_quic_inner(
                     Err(e) => break Err(e),
                 },
                 _ = &mut idle_tick, if idle_enabled => {
-                    let elapsed_ms = base.elapsed().as_millis() as u64;
+                    let elapsed_ms = coarse_millis();
                     let last = last_ms.load(Ordering::Relaxed);
                     if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
                         break Err(anyhow::anyhow!(
@@ -3843,7 +4077,7 @@ async fn copy_tcp_quic_inner(
                 break Ok((a, b));
             }
         }
-    }; // pump futures (and their borrows of `tcp`) end here
+    }; // pump futures (and their borrows of `tcp`, `send` and `recv`) end here
     match outcome {
         Ok((a, b)) => {
             // Both halves reached clean EOF: graceful FIN close.
@@ -3854,6 +4088,31 @@ async fn copy_tcp_quic_inner(
             // Any abnormal end aborts with RST (see `abort_tcp`): a FIN here
             // would pose as a complete transfer and silently corrupt downloads.
             abort_tcp(tcp);
+            // ...and the *peer* has to learn the same thing, which is why the
+            // pump futures only borrow the QUIC halves. `Drop for
+            // quinn::SendStream` calls `finish()` — a graceful FIN — so an
+            // upload direction abandoned because the download failed (or because
+            // the idle watchdog fired) used to tell the peer "transfer
+            // complete". The peer's `read_chunks` then returns a clean
+            // `Ok(None)` instead of a reset, its own `abort_tcp` never runs, and
+            // the application on that side accepts a truncated transfer as a
+            // whole one: exactly the silent corruption `abort_tcp` exists to
+            // prevent, one hop further out. `recv.stop` is the mirror image for a
+            // download abandoned mid-flight — it makes the peer's `write_chunk`
+            // fail with `Stopped` instead of succeeding into a void.
+            //
+            // Both are gated on the direction's own completion flag, because a
+            // half that already reached clean EOF must *not* be reset: its data
+            // was delivered and the peer may already have acted on it, and a
+            // reset after FIN would retroactively mark a complete transfer as
+            // aborted. (`stop` on a fully-read stream is a protocol no-op, so
+            // skipping it costs nothing either.)
+            if c2s_total.is_none() {
+                send.reset(0x04u32.into()).ok();
+            }
+            if s2c_total.is_none() {
+                recv.stop(0x04u32.into()).ok();
+            }
             Err(e)
         }
     }
@@ -4410,6 +4669,165 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
+    /// The per-partial byte cap is enforced, not merely documented.
+    ///
+    /// `f.total` is bounded by `MQP_FRAG_MAX_TOTAL`, but nothing bounds a
+    /// *chunk*: at the QUIC path MTU a hostile or buggy peer fits ~1.4 KiB in
+    /// each of 64 fragments, which assembles to ~91 KiB — a datagram the
+    /// fragmenter on the *sending* side would have refused outright, handed to
+    /// `udp_try_send` and then to the kernel to IP-fragment. The aggregate
+    /// `FRAG_MAX_HELD_BYTES` bound does not catch it (one such partial is well
+    /// under 256 KiB), so the cap has to be checked per partial.
+    #[test]
+    fn a_partial_past_the_payload_cap_is_discarded_whole() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        // 8 x 1400 B = 11200 B, past MQP_FRAG_MAX_PAYLOAD (8192) but far inside
+        // both the fragment-count cap and the aggregate byte cap.
+        let over = frag_frames(1, 1, &addr.as_ref(), &pattern(11_200), 1400);
+        assert_eq!(over.len(), 8);
+        let mut r = DgramReassembler::new();
+        for (i, fr) in over.iter().enumerate() {
+            let got = r.push(&decode_fragment(fr).unwrap(), 1_000);
+            assert!(
+                got.is_none(),
+                "fragment {i} completed a partial past the payload cap"
+            );
+        }
+        assert!(
+            r.held_bytes() <= MQP_FRAG_MAX_PAYLOAD,
+            "the over-cap partial must be released, not retained: {} B held",
+            r.held_bytes()
+        );
+
+        // Positive control: the same shape one fragment shorter *does* complete,
+        // so the test cannot pass by rejecting everything.
+        let under = frag_frames(2, 1, &addr.as_ref(), &pattern(7_000), 1400);
+        assert_eq!(under.len(), 5);
+        let mut r = DgramReassembler::new();
+        let mut done = None;
+        for fr in &under {
+            done = r.push(&decode_fragment(fr).unwrap(), 1_000);
+        }
+        assert_eq!(
+            done.expect("a 7000 B payload is inside the cap").2.len(),
+            7_000
+        );
+
+        // A *duplicate* fragment adds no bytes, so a replay of an already-filled
+        // index must not be what pushes a legal partial over the cap.
+        let mut r = DgramReassembler::new();
+        let exact = frag_frames(3, 1, &addr.as_ref(), &pattern(8_192), 1_024);
+        assert_eq!(exact.len(), 8);
+        for fr in &exact[..7] {
+            assert!(r.push(&decode_fragment(fr).unwrap(), 1_000).is_none());
+        }
+        // Replaying index 0 must be ignored, and the last fragment must still
+        // complete the datagram.
+        assert!(r
+            .push(&decode_fragment(&exact[0]).unwrap(), 1_000)
+            .is_none());
+        let done = r.push(&decode_fragment(&exact[7]).unwrap(), 1_000);
+        assert_eq!(
+            done.expect("a payload exactly at the cap must complete")
+                .2
+                .len(),
+            8_192
+        );
+    }
+
+    /// The coarse epoch advances with wall time, on its own.
+    ///
+    /// This is the property that makes it a safe replacement for a per-packet
+    /// `mono_millis()` in the throttles: a *packet-count* sampler freezes when
+    /// packets stop arriving (see `TouchMemo`), so a trickle flow's stamp stops
+    /// moving and the 180 s reaper kills a live session. An epoch that advances
+    /// because a task says so cannot do that — and this test fails if the
+    /// implementation is ever swapped for a counter.
+    #[tokio::test]
+    async fn coarse_millis_advances_without_traffic() {
+        // The cursor must be a real sample of the shared clock, not an
+        // uninitialized sentinel. A consumer stores the first value it sees as
+        // its baseline and compares later samples against it, so a 0 read *long
+        // after* process start would mean "idle since the epoch began" and its
+        // very first deadline check would fire — which is why `coarse_millis`
+        // seeds the cursor on the way out rather than returning 0 until the
+        // ticker is first polled. (A literal 0 is still legitimate during the
+        // process's first millisecond, when `mono_millis` is 0 as well, so the
+        // assertion is about the *gap* between the two clocks.)
+        let first = coarse_millis();
+        let fine = mono_millis();
+        assert!(
+            first <= fine,
+            "the cursor is a sample of mono_millis and cannot run ahead of it"
+        );
+        assert!(
+            fine.saturating_sub(first) < 1_000,
+            "first sample {first} is more than one tick behind the fine clock {fine}: \
+             the cursor was left at a sentinel instead of seeded"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let later = coarse_millis();
+        assert!(
+            later > first,
+            "the epoch must advance with wall time ({first} -> {later}), with no \
+             packets in flight: a count-based sampler would freeze here, which is \
+             the liveness bug `TouchMemo` records"
+        );
+    }
+
+    /// A ticker whose runtime ended is re-armed, not left frozen.
+    ///
+    /// This is the failure mode the whole design has to rule out: a frozen
+    /// cursor does not corrupt anything, it silently stops every idle watchdog
+    /// and every reaper in the process — the exact liveness bug the epoch was
+    /// chosen over a packet counter to avoid, arriving by a different route. A
+    /// runtime hand-off is how it happens in practice (one runtime per
+    /// `#[tokio::test]`; an embedder may run several), so the armed flag has to
+    /// be cleared by the outgoing task and re-armed by the next caller.
+    ///
+    /// The assertion is "the cursor advanced while a second runtime was live",
+    /// which holds whichever runtime ends up owning the ticker — so it is a
+    /// genuine test of the property rather than of one implementation's
+    /// bookkeeping.
+    #[test]
+    fn the_coarse_epoch_is_rearmed_after_its_runtime_ends() {
+        let rt1 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Both runtimes must live long enough for their ticker to publish a
+        // *non-zero* sample. `coarse_millis` re-seeds while its cursor is 0, so
+        // a test that dropped the first runtime inside the process's first
+        // millisecond would be rescued by that re-seed and would pass even with
+        // the re-arm broken — measured: it did.
+        rt1.block_on(async {
+            let _ = coarse_millis();
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+        });
+        drop(rt1);
+
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, later) = rt2.block_on(async {
+            let first = coarse_millis();
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            (first, coarse_millis())
+        });
+        assert!(
+            first > 0,
+            "the seed path is still in play, so this test cannot tell a live ticker from \
+             a frozen one"
+        );
+        assert!(
+            later > first,
+            "the epoch froze across a runtime hand-off ({first} -> {later}): the outgoing \
+             task left the armed flag set and nothing re-armed it"
+        );
+    }
+
     /// The `u8` fragment count must reach the UDP maximum even at QUIC's
     /// minimum path MTU, so raising `MQP_FRAG_MAX_PAYLOAD` later is a one-line
     /// change and never a wire-format change. (The same bound is asserted at
@@ -4845,6 +5263,110 @@ mod tests {
             .unwrap()
             .expect("pump2 must end clean");
         assert_eq!((up, down), (0, 16));
+    }
+
+    /// An abnormal pump end must be **told to the peer as a reset**, not dropped
+    /// into a clean FIN.
+    ///
+    /// `Drop for quinn::SendStream` calls `finish()`, so before this was fixed a
+    /// pump that gave up — because the other direction failed, or because the
+    /// idle watchdog fired — left its send half to be dropped, and the peer's
+    /// `read_chunks` returned a clean `Ok(None)`. The peer's own `abort_tcp`
+    /// then never ran, so the application on that side saw EOF and accepted a
+    /// truncated transfer as a whole one: precisely the silent corruption
+    /// `abort_tcp` exists to prevent, one hop further out. The pump now resets
+    /// the abandoned half explicitly.
+    ///
+    /// The test drives it from the *far* side: it resets its send stream (a
+    /// download failure, the common case), which fails the near pump's `s2c`,
+    /// and then asserts that the near pump's abandoned upload half arrives as a
+    /// reset rather than as EOF. Falsified against the old code, which reported
+    /// `Ok(0)` here.
+    #[tokio::test]
+    async fn abnormal_pump_end_resets_the_peer_stream_instead_of_finishing() {
+        use tokio::io::AsyncWriteExt;
+
+        async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let a = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (b, _) = listener.accept().await.unwrap();
+            (a, b)
+        }
+
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        let far = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            conn.accept_bi().await.unwrap()
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let (send, recv) = conn.open_bi().await.unwrap();
+
+        let (mut app, pump_tcp) = tcp_pair().await;
+        let pump = tokio::spawn(copy_tcp_quic_idle(
+            pump_tcp,
+            send,
+            recv,
+            Duration::from_secs(30),
+        ));
+        // The far accept only resolves once a STREAM frame arrives, so the app
+        // must write first. It then stays open and silent: `c2s` has to be *in
+        // flight* when `s2c` fails, or there would be nothing to abandon and the
+        // completion gate would rightly decline to reset a finished half.
+        app.write_all(b"up").await.unwrap();
+        let (mut far_send, mut far_recv) = tokio::time::timeout(Duration::from_secs(10), far)
+            .await
+            .expect("far accept fires once the first STREAM frame arrives")
+            .unwrap();
+        // Kill the download half.
+        far_send.write_all(b"x").await.unwrap();
+        far_send.reset(7u32.into()).unwrap();
+
+        let out = tokio::time::timeout(Duration::from_secs(10), pump)
+            .await
+            .expect("the pump must fail fast, not linger to the idle reap")
+            .unwrap();
+        assert!(
+            out.is_err(),
+            "a reset download half is not a clean end: {out:?}"
+        );
+
+        // The assertion that matters: the far side must observe a *reset*, which
+        // is what makes it fail instead of believing the upload completed. Drain
+        // whatever is legitimately queued first — the terminal event is what is
+        // being judged.
+        let mut buf = [0u8; 64];
+        let mut drains = 0;
+        let terminal = loop {
+            match tokio::time::timeout(Duration::from_secs(10), far_recv.read(&mut buf)).await {
+                Ok(Ok(Some(n))) if n > 0 && drains < 16 => {
+                    drains += 1;
+                    continue;
+                }
+                Ok(other) => break other,
+                Err(_) => {
+                    panic!("no terminal event within 10s: the stream neither reset nor finished")
+                }
+            }
+        };
+        match terminal {
+            Err(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), 0x04, "the pump's own reset code");
+            }
+            Ok(None) => panic!(
+                "the peer saw a clean FIN on an abandoned stream: a truncated transfer \
+                 would be accepted as a complete one"
+            ),
+            other => panic!("expected a reset, got {other:?}"),
+        }
     }
 
     /// End to end over a real connection: every size up to the protocol cap

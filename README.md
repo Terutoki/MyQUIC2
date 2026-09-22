@@ -93,6 +93,19 @@ across 16 associations, the fail-closed drop counter, and self-healing after a
 x86-64 emulation are recorded in
 [Verification & E2E Tests](#verification--e2e-tests).
 
+The pass after that one is a fresh outside-in audit of the echo hot paths rather than
+a new feature, and it is the first pass in this series to fix a defect that could
+*silently corrupt* a transfer: an abnormal end on either side of a TCP flow was
+delivered to the *peer* as a clean FIN, so a truncated download could be accepted as a
+whole one by the application at the far end. It also stops treating a size rejection as
+a dead egress connection, releases a server-side socket a swept session had left pinned,
+enforces the reassembler's documented per-partial byte cap, and replaces the last
+per-datagram `clock_gettime` calls with a coarse epoch that cannot freeze — see
+[pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths).
+Its `dist/` artifacts **are** rebuilt from this revision, but — unlike every earlier pass
+— **nothing was verified for them**: no format check, no emulation, no E2E. Treat them as
+compiled, not as tested.
+
 ---
 
 ## Table of Contents
@@ -459,6 +472,7 @@ before every run):
 | 47 | `dist/` rebuilt from this revision for all four CPU levels (static musl, stripped; clients 4 390 120–4 416 280 B, servers 4 325 792–4 348 536 B, i.e. +4 992–5 120 / +6 432–6 512 B per level for the retry-pool and memo changes) and re-verified under amd64 emulation (Podman on Apple Silicon) **using the repo's own harness** — the `hotpath_bench` example built for the same musl target, so no external tooling is involved. On the v1 pair: 4 connections, 0 dial failures, 4 server accepts; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 160 000 sent / 159 993 received; `udpmulti` 16 associations 603 728 received at 0.082 % loss; 40 domain-target TCP `CONNECT`s; `udpdomainswitch` **1000 alpha + 1000 beta, 0 misrouted** and `udpipswitch` **1000 IP + 1000 domain, 0 misrouted**. A second four-level build came out byte-identical (`sha256` equal for all eight files), and v3 runs / v4 dies with exit 132 under the emulated CPU, with `zmm` = 0/0/0/235 and `ymm` 3 978 → 26 900 | ✅ |
 | 48 | Post-audit fixes (pass 24): session-memo ownership, sweeper re-check, connection-pin deadline, `dns_inflight` accounting. `cargo test --all-targets` **79/79** (45 lib + 18 client + 16 server; **78/78** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. E2E on the fixed binaries: `udpdomainswitch` 500 alpha + 500 beta and `udpipswitch` 500 IP + 500 domain inside one session, **0 misrouted**; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 4 000 sent / 3 999 received; 20 TCP flows with replies; a 40-datagram burst at an uncached name reported as `9 dropped (resolution in flight)` in the new counter. The fd leak is closed, measured with `lsof`: 100 associations on one connection, client `kill -9`, then **1** UDP fd (the listener) after the QUIC idle timeout, against **85** on the previous binary. `dist/openwrt-x86_64/` was rebuilt for all four CPU levels from this revision (static musl, x86-64, stripped; servers 4 327 072–4 349 816 B, +1 216–1 536 B per level; clients 4 390 120–4 416 280 B, same sizes as before) — `file` confirms the format, a second four-level build came out byte-identical at every level, and `objdump -d` finds 273 `zmm` refs in v4 with none in v1/v3 (`ymm` 3 978 → 25 306 from v1 to v3), so each `target-cpu` level really is compiled in. The emulated-container re-run was **not** repeated here (the local Podman machine did not respond): the dist artifacts are cross-compiled and statically checked, while the native-binary E2E below is green | ✅ |
 | 49 | Pass 25 — dedicated UDP egress and the pool audit. `cargo test --all-targets` **93/93** (49 lib + 27 client + 17 server; **92/92** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Native-binary E2E (macOS loopback, the repo's own `hotpath_bench` harness): the client logs `quic pool: 4 TCP connection(s) … + 1 dedicated UDP connection (slot 4), UDP is fail-closed` and the server logs exactly **5** `new QUIC conn`; `tcpecho` 64 KiB byte-for-byte; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim**; `udpmulti` 16 associations × 400 = **6400/6400, 0.000 % loss** at 19 451 pps. `quic_conns = 1` dials **2** connections (1 TCP + 1 UDP) and still passes TCP plus the full UDP sweep, so the separation is structural rather than load-dependent. With every connection dead (`kill -9` the server), the next 60 s line reads `66 dropped (no egress connection)` — the fail-closed path counted and reported instead of sharing a TCP connection silently — and after the restart the same client logs 2 `QUIC connected` with TCP and the 8/8000 B sweep green again. `dist/` was rebuilt for all four CPU levels (clients 4 406 656–4 430 000 B, servers 4 334 128–4 361 864 B; `file` confirms static musl + stripped) and the **shipped v1 pair was re-run end-to-end under amd64 emulation** (Podman on Apple Silicon, the `hotpath_bench` example cross-built for the same musl target) for pass 25's artifacts and again for the clock-free reply-path build: 5 connections accepted, `tcpecho` 256 KiB byte-for-byte, `udpsweep` 8/1200/1430/8000 B **4/4 verbatim**, `udpmulti` 8 × 200 = **1600/1600, 0.000 % loss**. The egress drop-accounting build that follows does **not** repeat that emulated run: it changes only what happens to a datagram that is *already* being dropped (an exact counter, a rate-limited warning) and no data-path decision, so its coverage is the unit suite — `egress_drops_are_exact_across_threads`, falsified against the batched wiring before being kept, and `egress_drop_warnings_use_independent_slots`; `objdump -d` finds 235 `zmm` refs in v4 and none in v1–v3 (`ymm` 3 978 → 27 045 from v1 to v3), so each `target-cpu` level is compiled in | ✅ |
+| 50 | Pass 26 — TCP/UDP echo hot-path audit. `cargo test --all-targets` **98/98** (53 lib + 28 client + 17 server; **97/97** with `--no-default-features`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets. Five fixes, one of them a silent-corruption defect: an abnormal pump end was announced to the *peer* as a clean FIN (`Drop for quinn::SendStream` calls `finish()`), so a truncated download looked complete one hop out; the pump now borrows its stream halves and resets/stops the abandoned one, gated on that direction's own completion. New regression tests: `abnormal_pump_end_resets_the_peer_stream_instead_of_finishing` (falsified against the old code — it panics with `the peer saw a clean FIN on an abandoned stream`), `a_partial_past_the_payload_cap_is_discarded_whole`, `coarse_millis_advances_without_traffic`, `the_coarse_epoch_is_rearmed_after_its_runtime_ends` and `too_large_refreshes_the_budget_without_discarding_the_handle`. Also: `TooLarge` no longer counted/logged as an egress loss nor allowed to flush the process-wide egress cache; the server's `fast_sock` is `Weak` (it was a second strong owner that outlived a swept session); the reassembler's documented per-partial `MQP_FRAG_MAX_PAYLOAD` cap is enforced (64 maximum-size fragments previously assembled ~91 KiB); per-datagram `mono_millis()` on three hot paths and per-*dropped*-datagram in the warn limiter replaced by `coarse_millis()`, a lazily armed 1 Hz epoch that advances with wall time (a count-based sampler freezes on trickle flows, which is why the earlier attempt was reverted) and re-arms itself if its runtime dies. Native-binary E2E (macOS loopback, the repo's `hotpath_bench`): `tcpecho` 64 KiB + 1 MiB byte-for-byte 0 mismatched; `udpsweep` 8/1200/1420/1430/2000/8000 B × 40 **6/6 verbatim**; `udpmulti` 16 × 400 = **6400/6400, 0.000 % loss** at 23 381 pps; `udpdomainswitch`/`udpipswitch` 100+100+100+100 **0 misrouted**; `bulk` 256 MiB at 105 MB/s; a 30 s mixed loop over ~30 epoch ticks with 0 failures. The session's only abort warning is the intentionally-truncated `bulk` flow, and the server's mirror line (`sending stopped by peer: error 4`) is the new propagation arriving; 0 UDP drops, 0 reassembly losses, `unknown_sess = 0`. `dist/` **was** rebuilt from this revision for all four CPU levels (static musl, x86-64, default features; clients 4 419 928–4 441 928 B, servers 4 345 120–4 373 048 B, +11 928–13 336 / +10 544–11 440 B per level vs pass 25) but, unlike every earlier pass that touched `dist/`, **no check of any kind was run on those bytes** — no `file`, no `objdump`, no reproducibility rebuild, no emulated or native run of the shipped pair; they are compiled, not tested | ⚠️ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -589,21 +603,24 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 25's dedicated UDP egress slot,
-class-preserving bulk failover, retry-pool deadline and client drop accounting, on top
-of the four-connection pool default and its `papaya` slot registry, the conditional
-destination-memo writes, the re-arming `WouldBlock` retry pool, and pass 24's
-session-memo ownership / sweeper re-check / connection-pin deadline fixes, pass-23's
-lock-free client control plane and the cache-substitution pass's DNS/destination memos,
-against the refreshed `Cargo.lock`) with the default feature set, so the relay counters
-are **on** in these builds: static musl, x86-64, stripped, 4 334 128–4 430 000 B
-(clients 4 406 656–4 430 000, servers 4 334 128–4 361 864) each. Against the **pass-24**
-artifacts the clients grew 13 208–16 856 B and the servers 7 056–12 048 B per level, for
-the UDP slot and its egress order, the six-counter `DropSnapshot`, the association
-liveness bit and its idle-tick fold (which also deleted a per-datagram `clock_gettime` and
-the `send_reply_at` seam), the exact-and-warning egress drop accounting, the RAII
-reservation and the idle-first session sweep. The intermediate steps are visible in the
-sizes: the clock-free reply path came out 128–192 B *smaller* than pass 25's first build
+rebuilt from the current revision (pass 26's TCP-pump reset/stop on an abnormal end, the
+`coarse_millis` epoch, the enforced reassembler per-partial cap and the egress-drop
+accounting fixes, on top of pass 25's dedicated UDP egress slot, class-preserving bulk
+failover, retry-pool deadline and client drop accounting, the four-connection pool
+default and its `papaya` slot registry, the conditional destination-memo writes, the
+re-arming `WouldBlock` retry pool, and pass 24's session-memo ownership / sweeper
+re-check / connection-pin deadline fixes, pass-23's lock-free client control plane and
+the cache-substitution pass's DNS/destination memos, against the refreshed `Cargo.lock`)
+with the default feature set, so the relay counters are **on** in these builds: static
+musl, x86-64, stripped, 4 345 120–4 441 928 B (clients 4 419 928–4 441 928, servers
+4 345 120–4 373 048) each. Against the **pass-25** artifacts the clients grew
+11 928–13 336 B and the servers 10 544–11 440 B per level, for the pump's reset/stop
+disposition and its two completion flags, the coarse-epoch ticker and its call sites, the
+reassembler's per-partial check, and the `UNKNOWN_SESS` / `UdpWriteDrop` accounting.
+These four levels were **compiled only** — no `file` check, no emulated run, no E2E was
+performed on them, so their format is asserted by the build command and nothing else.
+The sizes of the intermediate pass-25 steps remain visible: the clock-free reply path
+came out 128–192 B *smaller* than pass 25's first build
 of the clients, and the egress drop accounting that followed added 4 888–5 144 B to them
 while shaving 128–192 B off the servers (the library no longer keeps per-thread batching
 cells for those two counters). The
@@ -2352,6 +2369,166 @@ and `cargo fmt --check` clean on both feature sets. The three behaviour changes 
 config-visible: one extra connection per client, UDP fail-closed by default, and the
 client-side association cap 4096 → 4032. `dist/` was rebuilt for all four CPU levels
 from this revision.
+
+---
+
+### 2026-09 hardening pass 26 — independent hot-path audit of the TCP/UDP echo paths
+
+An outside-in audit of exactly the code an ECHO test exercises (the TCP pump, the
+client's UDP relay, the server's datagram reader and per-session reply reader) found one
+defect that could silently corrupt a transfer, three smaller ones, and one per-packet
+cost the project had already removed everywhere else. Nothing below was found by the
+existing suite: it was green before and after.
+
+**1. An abnormal pump end was delivered to the peer as a clean FIN.** This is the one
+that matters. `Drop for quinn::SendStream` calls `finish()` — a *graceful* FIN — so when
+one direction failed and the other future was dropped, the abandoned upload half told
+the peer "transfer complete". Concretely, on a pure download: the target RSTs the
+server's socket mid-response, the server's `s2c` fails, its `c2s` (owner of `send`) is
+dropped, and the peer's `read_chunks` returns a clean `Ok(None)` instead of a reset.
+The peer's own `abort_tcp` never runs, so the application accepts a truncated body as a
+whole one — precisely the silent corruption `abort_tcp` was written to prevent, one hop
+further out. The pump futures now *borrow* `send`/`recv` instead of taking them, and the
+error disposition issues `send.reset(0x04)` / `recv.stop(0x04)` — gated on each
+direction's own completion flag, because a half that already reached clean EOF must not
+be reset (its data was delivered and the peer may have acted on it). The new
+`abnormal_pump_end_resets_the_peer_stream_instead_of_finishing` fails against the old
+code with `the peer saw a clean FIN on an abandoned stream`, and the native E2E below
+shows both halves of the new propagation in one run: the client logs
+`quic>tcp tcp write failed … Broken pipe` (the app closed early) and the server logs
+`tcp>quic quic write failed … sending stopped by peer: error 4` — the mirror of the
+client's `recv.stop`. Every clean echo flow in that same run finished with no abort line
+at all, which is the discrimination the completion gate exists for.
+
+**2. `TooLarge` was counted and reported as "egress connection lost".** The client's
+match arm folded `DatagramSend::TooLarge` in with `ConnectionLost`, so it bumped the
+connection-lost counter, logged *"udp egress connection lost at send"* about a healthy
+connection, and called `egress_shared.invalidate()` — flushing the process-wide egress
+cache so every thread re-acquired through two quinn state-mutex acquisitions. It is
+reachable without any network event: the relay buffer accepts payloads up to 8204 B
+while `MQP_FRAG_MAX_PAYLOAD` is 8192, so an app sending 8193–8204 B datagrams to an IPv4
+target trips it per datagram. `TooLarge` is now its own arm calling a new
+`SharedEgress::refresh_budget()`, which re-reads the live `max_datagram_size()` on the
+*same* handle and is a no-op when nothing moved; quinn's own size verdict is accounted in
+`send_encoded`, the one place that sees it. The `Unsupported` state also got its own
+`EgressDrop` variant, so its line no longer reads "connection lost … peer does not
+support DATAGRAM"; it deliberately does *not* invalidate, because re-acquiring on a
+statically DATAGRAM-less connection costs more per datagram than the failed send it is
+reacting to.
+
+**3. A strong `fast_sock` kept a dead session's socket alive.** `SessMemo.sock` was made
+`Weak` in pass 24 so a permit-released socket could not be pinned outside
+`MAX_SESSIONS_GLOBAL`, but the per-connection reader's inline fast slot was a second
+strong owner: after the 180 s sweeper removed the entry and aborted the reply reader,
+the fd and its 2 × 256 KiB buffer caps survived until the next datagram on that
+connection happened to take the slow path. `abort.is_finished()` already stopped it being
+*used*, so retaining it bought nothing. It is a `Weak` with a per-datagram `upgrade` now,
+and a failed upgrade is a miss that lets the slow path rebuild the slot — the same
+discipline as the thread-local memo, and the sharpest liveness signal available. (Pass
+24's `lsof` methodology could not see this: killing the client closes the connection,
+which is exactly the event that drops the handle.)
+
+**4. The reassembler's per-partial byte cap was documented but not enforced.** `total` is
+bounded by `MQP_FRAG_MAX_TOTAL`, but nothing bounded a *chunk*, so 64 maximum-size
+fragments assembled ~91 KiB — far past the payload ceiling the protocol states — and the
+server relayed whatever came out to the target (the kernel then IP-fragments it). The
+aggregate `FRAG_MAX_HELD_BYTES` bound does not catch one such partial. `push` now
+discards the whole partial when a fragment would push it past `MQP_FRAG_MAX_PAYLOAD`;
+whole rather than truncated, because a prefix of a datagram is not a short datagram, it
+is a corrupt one, and UDP above this has no integrity check to notice. A duplicate
+fragment is exempt so a replay cannot kill a partial that was already at the cap, and
+`a_partial_past_the_payload_cap_is_discarded_whole` covers the cap, a positive control
+just under it, and the exact-cap-with-a-replay case.
+
+**5. Per-packet vDSO clock reads, and the drop-path rate limiter.** Three hot paths read
+`mono_millis()` (`Instant::now`, measured at ~22 ns here) on *every* datagram to answer
+"has a second passed?" — the client's UDP relay loop, the server's
+`touch_session_throttled`, and the server's per-session reply reader — and
+`claim_drop_warning` read one per *dropped* datagram, including the drops the limiter
+then suppressed. The project had already deleted this exact call from the reply path for
+this exact reason, and had already rejected the obvious fix: a packet-count sampler
+freezes when packets stop arriving, so a trickle flow's stamp stops moving and the 180 s
+reaper kills a live session (see `TouchMemo`). The replacement is a *time* source
+instead: `coarse_millis()`, a lazily armed 1 Hz task that publishes `mono_millis()` into
+an atomic. It cannot freeze the way a counter can — it advances because a task says so,
+not because packets arrive — and it cannot freeze silently either: the task clears its
+armed flag as it goes down (including when its runtime is dropped), and any reader that
+finds the flag clear re-arms it, the same contract as the UDP retry pool. It publishes
+the *same epoch* as `mono_millis()`, so the two values are directly comparable and a
+coarse one is merely up to a tick behind; a stale value can only make a deadline look
+further away, never closer, so the failure mode is a delay rather than a false expiry.
+The cursor is also seeded on the first read, because a consumer that stored an
+uninitialized 0 as its baseline would read "idle since process start" and expire the next
+flow through it on the spot — `coarse_millis_advances_without_traffic` pins both the
+seeding and the advance-with-no-traffic property, and fails against any count-based
+implementation; `the_coarse_epoch_is_rearmed_after_its_runtime_ends` covers the
+runtime hand-off, and was **verified to fail** when the task's disarm guard is neutered —
+its first revision passed anyway, because the 0-sentinel re-seed path made the cursor
+move on its own, which is exactly the kind of accidental rescue a liveness test has to
+exclude. The TCP pump's chunk stamps and its idle watchdog moved to the same
+clock; the reapers, reporters and the 2 s reassembly timeout deliberately did not, being
+cold or genuinely in want of sub-second resolution.
+
+**Smaller:** `write_batch_vectored`'s fixed 8-entry iovec array was only *incidentally*
+safe (its sole caller happens to pass ≤ 8 buffers) — a 9th would have panicked inside a
+relay task, which skips the RST disposition above and so fails silently rather than
+loudly; the array and the `Bytes` batch now share one `COPY_BATCH` constant and the fill
+loop is bounded by it, which is also correct for a longer slice. A reply for an unknown
+or already-reaped session was dropped with *no counter at all* while the 60 s line
+claimed to account for every drop — it now bumps a batched `UNKNOWN_SESS`, reported on
+its own line and deliberately excluded from `lost()` (a late reply to a closed
+association is not a packet the tunnel failed to carry, and folding it in would make
+every ordinary teardown look like loss). `warn_udp_write` picked its rate-limit slot by
+substring, so `"detached retry failed"` matched `contains("retry")` and shared one 10 s
+window with queue exhaustion; it takes a `UdpWriteDrop` enum now, the same fix its
+sibling `EgressDrop` already had. `udp_write::retried` was counted before the retry queue
+accepted the datagram, so a packet dropped on a full shard was booked as both retried and
+dropped. The control-connection drain loop no longer re-zeroes its 512 B buffer per
+iteration (the bytes are discarded per RFC 1928). Comments corrected where they had
+drifted from the code: `DISPATCH_CACHE`'s "collision-free" claim (1024 slots against
+4032 associations, handed out *consecutively*, means collisions are the norm and the busy
+case is the one that pays), the client's "the reply path never reads a clock" (scope:
+unfragmented replies), the server's session-socket memory bound (still quoted at the
+pre-halving 512 KiB / 8 GiB), and the reason an IP target's destination memo is useless.
+
+Verification: `cargo test --all-targets` **98/98** (53 lib + 28 client + 17 server) and
+**97/97** with `--no-default-features`; `cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` clean on both feature sets. Native-binary E2E on macOS loopback
+through the repo's own `hotpath_bench` harness, release build: `tcpecho` 64 KiB and
+1 MiB **byte-for-byte, 0 mismatched**; `udpsweep` 8/1200/1420/1430/2000/8000 B × 40
+**6/6 verified verbatim** (1430/2000/8000 B exercise the fragment path); `udpmulti` 16
+associations × 400 = **6400/6400, 0.000 % loss** at 23 381 pps;
+`udpdomainswitch`/`udpipswitch` 100 alpha + 100 beta + 100 IP + 100 domain targets in one
+session, **0 misrouted** — the run that exercises the coarse clock on the domain-pin and
+session-memo paths; `bulk` 256 MiB aggregate across 4 flows at 105 MB/s. A 30 s mixed
+TCP+UDP loop crossing ~30 coarse-epoch ticks passed with **zero** failures, and the logs
+for the whole session carry exactly **one** abort warning — the `bulk` flow whose
+application closed its socket early, i.e. the truncating case — with no warning for any
+of the echo flows, `0 dropped(no permit) / 0 failed / 0 retry-failed` on both sides, no
+`udp budget` line (no drops at all), no reassembly expiry or eviction across 120
+fragmented datagrams, and no `udp late replies` line (`unknown_sess == 0`).
+
+`dist/`: **rebuilt, and deliberately not verified.** All four CPU levels were
+cross-compiled from this revision with the documented `cargo zigbuild` recipe (static
+musl, x86-64, default feature set so the relay counters are on) and copied into
+`dist/openwrt-x86_64/`: clients 4 419 928–4 441 928 B (v1 4 431 592, v2 4 419 928,
+v3 4 441 928, v4 4 434 744), servers 4 345 120–4 373 048 B (v1 4 360 176, v2 4 345 120,
+v3 4 373 048, v4 4 366 968) — i.e. **+11 928–13 336 B** per client level and
+**+10 544–11 440 B** per server level against the pass-25 artifacts. Unlike every earlier
+pass that touched `dist/`, **no** check of any kind was run on these bytes: no `file`
+format confirmation, no `objdump` verification that each `target-cpu` level is compiled
+in, no second build compared for reproducibility, and no emulated or native run of the
+shipped pair. They are compiled, not tested — the verification above applies to the
+native release build only, and a target that needs a loadable binary should be validated
+on the target.
+
+Also not done here, stated rather than implied: the download batch size was **not** raised
+from 8 (quinn only fills the chunks
+already buffered in the assembler, so the win is load-dependent and unmeasured — measure
+before changing it); and the malformed-frame drops in the dispatcher (`dgram_sess`
+returning `None`, a failed `decode_fragment` / `decode_datagram_ref`) still carry no
+counter, because they are unreachable from a conforming peer and adding a class for them
+is a separate decision from the ordinary unknown-session race that item 5 does count.
 
 ---
 

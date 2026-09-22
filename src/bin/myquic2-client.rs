@@ -616,6 +616,40 @@ impl SharedEgress {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+
+    /// Re-read the live DATAGRAM budget on the cached handle, keeping it.
+    ///
+    /// The recovery for a `TooLarge` send. That outcome is a **size** verdict,
+    /// never a connection fault: the payload is past the protocol's own
+    /// fragmentation cap, or the path MTU shrank under the budget this handle
+    /// was memoized with. Either way the connection is healthy and must keep
+    /// carrying the next datagram, so this deliberately does *not* go through
+    /// the single-flight gate or the slot scan — those exist to *choose* a
+    /// connection, and there is nothing to choose here.
+    ///
+    /// A no-op when the budget has not actually moved, which is the case for
+    /// every payload past `MQP_FRAG_MAX_PAYLOAD` (the fragmenter rejects those
+    /// before quinn ever sees them, and its `limit` was already correct).
+    fn refresh_budget(&self) {
+        let current = self.cached.load();
+        let Some(c) = current.as_ref() else {
+            return;
+        };
+        let Some(m) = c.conn.max_datagram_size() else {
+            return;
+        };
+        if m == c.limit {
+            return;
+        }
+        self.cached.store(Some(Arc::new(EgressCache {
+            conn: c.conn.clone(),
+            limit: m,
+            stamp_ms: coarse_millis(),
+            slot: c.slot,
+        })));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Routes inbound QUIC DATAGRAMs to their UDP ASSOCIATE by sess_id.
@@ -660,18 +694,24 @@ struct AssocEntry {
     /// writes a reply to this association, consumed by the association's own
     /// idle tick.
     ///
-    /// This exists so the **reply path never reads a clock**. Stamping `last`
-    /// directly per reply cost a `clock_gettime` through the vDSO (~25 ns) on
-    /// every datagram, forever, for a signal that only has to prove "something
-    /// happened in the last 180 s" — and the tick that folds this flag into the
-    /// stamp already reads a clock once per [`ASSOC_IDLE_TICK_SECS`]. The store
-    /// is idempotent and has one writer per association in steady state (a
-    /// session's replies arrive on the one connection that carried its
-    /// datagrams), so it cannot lose an update the way a read-modify-write
-    /// could, and it never shares a cache line's write ownership per packet with
-    /// the app direction, whose stamp stays throttled to 1 Hz.
+    /// This exists so the **reply path never reads a clock** — true for every
+    /// unfragmented datagram, which is the steady state. (A *fragmented* reply
+    /// still reads one, in `dispatch_one`: `DgramReassembler::push` takes its
+    /// timestamp as an argument because the 2 s reassembly timeout genuinely
+    /// wants sub-second resolution, so the caller samples `mono_millis` per
+    /// fragment frame.) Stamping `last` directly per reply cost a
+    /// `clock_gettime` through the vDSO (~25 ns) on every datagram, forever, for
+    /// a signal that only has to prove "something happened in the last 180 s" —
+    /// and the tick that folds this flag into the stamp already reads a clock
+    /// once per [`ASSOC_IDLE_TICK_SECS`]. The store is idempotent and has one
+    /// writer per association in steady state (a session's replies arrive on the
+    /// one connection that carried its datagrams), so it cannot lose an update
+    /// the way a read-modify-write could, and it never shares a cache line's
+    /// write ownership per packet with the app direction, whose stamp stays
+    /// throttled to 1 Hz.
     replied: std::sync::atomic::AtomicBool,
-    /// Last activity stamp ([`mono_millis`] epoch). Written by the association
+    /// Last activity stamp ([`coarse_millis`] epoch — the same clock as
+    /// [`mono_millis`], sampled once per second). Written by the association
     /// task only: the relay loop on an app datagram (throttled to
     /// [`ASSOC_TOUCH_INTERVAL_MS`]), the idle tick when it consumes [`Self::replied`],
     /// and the SOCKS control-readiness branch.
@@ -1123,10 +1163,21 @@ fn tcp_abort_log_due() -> bool {
 }
 
 /// Direct-mapped dispatcher cache, one slot per session id modulo the table
-/// size. Session ids come from the hub's monotonic `AtomicU32`, so any window
-/// of ≤ `DISPATCH_CACHE` live ids maps collision-free; a collision only means
-/// the slot is re-probed, never that a packet is misrouted. Must be a power of
-/// two (the index is a mask).
+/// size. A collision only means the slot is re-probed, never that a packet is
+/// misrouted (the slot validates the exact id *and* the entry's liveness).
+///
+/// **Collisions are expected, not exceptional.** Session ids come from the
+/// hub's monotonic `AtomicU32`, but they are handed out *consecutively*, so two
+/// live associations `DISPATCH_CACHE` apart collide by construction and more
+/// than `DISPATCH_CACHE` live associations collide by pigeonhole — and
+/// `MAX_UDP_ASSOCS` is 4032, four times this table. An earlier revision of this
+/// comment claimed a window of ≤ `DISPATCH_CACHE` live ids "maps
+/// collision-free", which is exactly backwards: it is the ≤ `DISPATCH_CACHE`-live
+/// case that cannot collide, and the busy case this cache exists for is the one
+/// where both sessions in a colliding pair pay the hub probe on every datagram.
+/// Sizing it to `MAX_UDP_ASSOCS` would remove that, at 4x the per-dispatcher
+/// footprint (each of the pool's connections keeps its own).
+/// Must be a power of two (the index is a mask).
 const DISPATCH_CACHE: usize = 1024;
 
 /// One cached session → endpoint binding. A slot is a hit only when it names the
@@ -1143,8 +1194,9 @@ const DISPATCH_CACHE: usize = 1024;
 /// colliding on the same index happened to arrive (or the connection was
 /// redialed, which rebuilds the cache). Measured before the fix: 1200
 /// short-lived associations left **1024** UDP fds open in the client, which on a
-/// 1024-fd router exhausts the table by itself. Upgrading on a hit costs one
-/// atomic on a path that already performs a `send_to`.
+/// 1024-fd router exhausts the table by itself. Upgrading on a hit costs two
+/// atomics (the `Weak` CAS and the `Arc` drop that follows it), not one, on a
+/// path that already performs a `send_to`.
 struct DispatchSlot {
     sess: u32,
     entry: Option<std::sync::Weak<AssocEntry>>,
@@ -1188,8 +1240,15 @@ fn dispatch_one(
             let Some(fresh) = hub.entry(sess) else {
                 cache[idx] = DispatchSlot { sess, entry: None };
                 // No such association: the reply belongs to a session that has
-                // already been torn down. Silently ignored, matching the old
-                // receiver-dropped behaviour.
+                // already been torn down. Still dropped — best-effort UDP, and
+                // the server's own reap is what stops it — but *counted*, because
+                // this fires in a perfectly ordinary race: the client reaps an
+                // idle association (or the app closes the control TCP) at 180 s
+                // while the server's session is still live and its target keeps
+                // answering, so every reply until the server's own timeout shows
+                // up here. It used to be a bare `return`, which made the 60 s
+                // budget line's silence a claim the code could not support.
+                dgram_drops::bump(&dgram_drops::UNKNOWN_SESS);
                 return;
             };
             // `hub.entry` answers "is it published", not "is it alive": between
@@ -1598,7 +1657,7 @@ fn spawn_udp_reporter() {
             let now_r = udp_stats::reassembly_drops();
             if now_r != prev_r {
                 info!(
-                    "udp reassembly (60s): {} expired (missing fragment), {} evicted (memory cap)",
+                    "udp reassembly (60s): {} expired (missing fragment), {} evicted (cap)",
                     now_r.0.saturating_sub(prev_r.0),
                     now_r.1.saturating_sub(prev_r.1)
                 );
@@ -1623,6 +1682,18 @@ fn spawn_udp_reporter() {
                     now_d.egress_dead,
                     now_d.dns_inflight,
                     now_d.session_full
+                );
+            }
+            // Reported on its own line, and outside `lost()`: a late reply to a
+            // session this side already closed is not a packet the tunnel failed
+            // to carry, so folding it into the budget line would make every
+            // ordinary association teardown look like loss. It is still worth a
+            // line of its own — a number that only ever grows means the client is
+            // reaping associations the server still considers live.
+            if dd.unknown_sess > 0 {
+                info!(
+                    "udp late replies (60s): {} dropped (no such association); total {}",
+                    dd.unknown_sess, now_d.unknown_sess
                 );
             }
             prev_d = now_d;
@@ -2040,7 +2111,12 @@ async fn udp_associate_inner(
                         continue;
                     }
                 }
-                let now = mono_millis();
+                // The coarse epoch: this value feeds the 1 s liveness throttle
+                // and the egress memo's 1 s freshness window, and both are whole
+                // seconds. `mono_millis()` here was a vDSO `clock_gettime` on
+                // every app datagram — the same cost the reply path already had
+                // removed for the same reason (see `AssocEntry::replied`).
+                let now = coarse_millis();
                 if now.saturating_sub(activity_stamp) >= ASSOC_TOUCH_INTERVAL_MS {
                     activity_stamp = now;
                     entry.touch(now);
@@ -2138,13 +2214,32 @@ async fn udp_associate_inner(
                 let outcome = sent.outcome();
                 match outcome {
                     DatagramSend::Sent => {}
-                    // `Blocked`/`TooLarge` are counted inside the fragmenter
-                    // (`dgram_drops::BUFFER_FULL` / `TOO_LARGE`), which has its own
-                    // rate-limited size warning.
+                    // `Blocked`/`TooLarge` are counted where they are decided —
+                    // `DgramFragmenter::send` for the protocol's own size caps,
+                    // `send_encoded` for quinn's path-budget verdict — each with
+                    // its own rate-limited size warning.
                     DatagramSend::Blocked => {
                         tracing::debug!("client datagram dropped: send buffer full");
                     }
-                    DatagramSend::TooLarge | DatagramSend::ConnectionLost => {
+                    // A **size** verdict, not a connection fault: either the
+                    // payload is past the protocol's fragmentation cap or the
+                    // path's DATAGRAM budget shrank since this handle was
+                    // memoized. Both are already counted as size drops. The
+                    // recovery is to re-read the live budget so the next datagram
+                    // is encoded against it — and emphatically *not* to
+                    // invalidate: this arm used to be folded in with
+                    // `ConnectionLost`, so one oversized payload flushed the
+                    // process-wide egress cache (costing every thread two quinn
+                    // state-mutex acquisitions), bumped the connection-lost
+                    // counter, and logged "udp egress connection lost at send"
+                    // about a connection that was perfectly healthy.
+                    DatagramSend::TooLarge => {
+                        tracing::debug!(
+                            "client datagram dropped: past the path's DATAGRAM budget"
+                        );
+                        egress_shared.refresh_budget();
+                    }
+                    DatagramSend::ConnectionLost => {
                         tracing::debug!("client egress stale, invalidating shared cache");
                         let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
                         dgram_drops::warn_egress_drop(
@@ -2158,10 +2253,18 @@ async fn udp_associate_inner(
                         tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
                         let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
                         dgram_drops::warn_egress_drop(
-                            dgram_drops::EgressDrop::ConnectionLost,
+                            dgram_drops::EgressDrop::Unsupported,
                             n,
-                            || "; peer does not support DATAGRAM".to_string(),
+                            String::new,
                         );
+                        // Deliberately *not* invalidated. The condition is static
+                        // for the life of the connection, so a re-acquire cannot
+                        // find a better slot — but it does pay two quinn
+                        // state-mutex acquisitions per datagram, which is strictly
+                        // more than the failed send this arm is reacting to.
+                        // Keeping the handle memoized leaves each datagram at one
+                        // send attempt and one counted drop, and the dedicated
+                        // warning class above keeps the cause visible.
                     }
                 }
             }
@@ -2172,8 +2275,12 @@ async fn udp_associate_inner(
                 // inside one select branch lets a flooding local app starve the
                 // relay and idle branches. Tokio keeps readiness set until a
                 // `WouldBlock`, so the remainder is picked up on the next poll.
+                // Hoisted out of the loop: the buffer's contents are discarded
+                // (RFC 1928 puts no data on the control connection after the
+                // reply), so zeroing it once per iteration was up to 8 KiB of
+                // dead stores per readiness event.
+                let mut b = [0u8; 512];
                 for _ in 0..16 {
-                    let mut b = [0u8; 512];
                     match tcp.try_read(&mut b) {
                         Ok(0) => { closed = true; break; }
                         Ok(_) => { got = true; }
@@ -2678,6 +2785,72 @@ mod tests {
         e.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         assert!(e.with_fresh(now, |_, _| ()).is_none());
+    }
+
+    /// A `TooLarge` send refreshes the cached DATAGRAM budget instead of
+    /// throwing the handle away.
+    ///
+    /// The two reactions are not interchangeable. `invalidate` drops the
+    /// process-wide cache, so the next datagram on *every* thread re-acquires
+    /// through `refresh_global` — two quinn state-mutex acquisitions — and the
+    /// connection-lost counter and warning both lie about a healthy connection.
+    /// `refresh_budget` keeps the handle and only re-reads the one number that
+    /// moved.
+    #[tokio::test]
+    async fn too_large_refreshes_the_budget_without_discarding_the_handle() {
+        let (conn, _client, _server) = real_connection().await;
+        let live = conn
+            .max_datagram_size()
+            .expect("both ends negotiate DATAGRAM");
+        let e = SharedEgress::default();
+        // A deliberately stale, too-small budget, as if the path MTU had shrunk
+        // under a memoized handle.
+        e.cached.store(Some(Arc::new(EgressCache {
+            conn: conn.clone(),
+            limit: live.saturating_sub(64).max(1),
+            stamp_ms: mono_millis(),
+            slot: 0,
+        })));
+        let gen_before = e.generation.load(std::sync::atomic::Ordering::Acquire);
+        let cached_before = e.cached.load_full().expect("published above");
+
+        e.refresh_budget();
+
+        let after = e.cached.load_full().expect("the handle must survive");
+        assert_eq!(
+            after.conn.stable_id(),
+            cached_before.conn.stable_id(),
+            "refresh_budget must keep the same connection, not re-pick one"
+        );
+        assert_eq!(
+            after.limit, live,
+            "the stale budget must be replaced by the live one"
+        );
+        assert_eq!(after.slot, cached_before.slot);
+        assert_eq!(
+            e.generation.load(std::sync::atomic::Ordering::Acquire),
+            gen_before + 1,
+            "every thread's memo must be invalidated so the new budget is used"
+        );
+
+        // And it is a no-op once the budget already matches — the case for a
+        // payload past MQP_FRAG_MAX_PAYLOAD, where the fragmenter rejects the
+        // datagram before quinn ever sees it and nothing moved.
+        let gen_now = e.generation.load(std::sync::atomic::Ordering::Acquire);
+        e.refresh_budget();
+        assert_eq!(
+            e.generation.load(std::sync::atomic::Ordering::Acquire),
+            gen_now,
+            "an unchanged budget must not churn the generation"
+        );
+
+        // With no cached handle at all it must not resurrect one.
+        e.invalidate();
+        e.refresh_budget();
+        assert!(
+            e.cached.load().is_none(),
+            "refresh_budget never re-picks a connection; that is acquire's job"
+        );
     }
 
     fn empty_dispatch_cache() -> [DispatchSlot; DISPATCH_CACHE] {

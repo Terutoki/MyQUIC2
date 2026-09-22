@@ -266,8 +266,14 @@ const MAX_CONNECTIONS: usize = 4096;
 /// windows.
 const MAX_UNAUTH_CONNECTIONS: usize = 256;
 /// Process-wide UDP session cap. Each session owns a kernel socket with a
-/// 512KB send + 512KB receive buffer (see `udp_socket_dual_small`), so 8192
-/// sessions bound the kernel side to ~8GB worst case instead of ~32GB.
+/// `SESS_SOCKET_BUF` send buffer and the same again for receive (see
+/// `udp_socket_dual_small`), i.e. 256 KiB per direction, so 8192 sessions bound
+/// the kernel side to ~4 GiB worst case instead of ~32 GiB.
+///
+/// (This said "512KB send + 512KB receive … ~8GB" until `SESS_SOCKET_BUF` was
+/// halved from 512 KiB to 256 KiB; `lib.rs`'s own note on that constant was
+/// updated at the time and this one was not, so the number an operator would
+/// size a router against was double the real bound.)
 const MAX_SESSIONS_GLOBAL: usize = 8192;
 const LOCAL_SESS_MAX: usize = 4096;
 const LOCAL_SESS_TARGET: usize = LOCAL_SESS_MAX - 64;
@@ -696,7 +702,19 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // connection on this worker, so a burst to one session still pays two
         // RefCell scans per packet. This slot lives in the reader task itself.
         let mut fast_sess: u32 = u32::MAX;
-        let mut fast_sock: Option<Arc<tokio::net::UdpSocket>> = None;
+        // **Weak**, exactly like [`SessMemo::sock`], and for the same reason: a
+        // strong handle here is a second owner of the session's socket, and it
+        // outlives the session. The 180 s sweeper removes the table entry and
+        // aborts the reply reader, which drops both of *their* handles — but a
+        // strong `fast_sock` would keep the socket (and its 2 x 256 KiB kernel
+        // buffers) alive outside the `MAX_SESSIONS_GLOBAL` budget until the next
+        // datagram on this connection happened to take the slow path, or until
+        // the connection closed. `abort.is_finished()` already stops the fast
+        // path from *using* such a socket, so retaining it bought nothing. An
+        // `upgrade` that fails is also the sharpest possible liveness signal: the
+        // session is gone, and the datagram falls through to the slow path, which
+        // recreates it.
+        let mut fast_sock: Option<std::sync::Weak<tokio::net::UdpSocket>> = None;
         let mut fast_last: Option<Arc<std::sync::atomic::AtomicU64>> = None;
         let mut fast_abort: Option<tokio::task::AbortHandle> = None;
         // The address the pinned session resolves to, so a domain target's
@@ -739,9 +757,16 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         {
                             if !ab.is_finished() && (allow_private || is_global_ip_cached(dst.ip()))
                             {
-                                touch_session_throttled(conn_id, s, last);
-                                udp_try_send(sock, map_for_dual(dst), whole.clone());
-                                fast_hit = true;
+                                // A failed upgrade means the session exited since
+                                // the handle check; treat it as a miss so the slow
+                                // path rebuilds the slot, and note that it is the
+                                // *only* signal that releases the socket — see
+                                // `fast_sock`.
+                                if let Some(sock) = sock.upgrade() {
+                                    touch_session_throttled(conn_id, s, last);
+                                    udp_try_send(&sock, map_for_dual(dst), whole.clone());
+                                    fast_hit = true;
+                                }
                             }
                         }
                     }
@@ -756,7 +781,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     match sess_memo_lookup(conn_id, s) {
                         SessHit::Fresh(sock, last, ab) => {
                             fast_sess = s;
-                            fast_sock = Some(sock);
+                            fast_sock = Some(Arc::downgrade(&sock));
                             fast_last = Some(last);
                             fast_abort = Some(ab);
                             let (ph, pp) = target_name(a.as_ref());
@@ -765,7 +790,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 host: ph.to_owned(),
                                 port: pp,
                                 addr: dst,
-                                expires: mono_millis() + DEST_PIN_TTL_MS,
+                                expires: coarse_millis() + DEST_PIN_TTL_MS,
                             });
                         }
                         SessHit::Stale | SessHit::Miss => {
@@ -795,11 +820,14 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         {
                             if !ab.is_finished() && (allow_private || is_global_ip_cached(dst.ip()))
                             {
-                                let off = owned.len() - p.len();
-                                udp_stats::payload(p.len());
-                                touch_session_throttled(conn_id, s, last);
-                                udp_try_send(sock, map_for_dual(dst), owned.slice(off..));
-                                fast_hit = true;
+                                // See the fragment branch above, and `fast_sock`.
+                                if let Some(sock) = sock.upgrade() {
+                                    let off = owned.len() - p.len();
+                                    udp_stats::payload(p.len());
+                                    touch_session_throttled(conn_id, s, last);
+                                    udp_try_send(&sock, map_for_dual(dst), owned.slice(off..));
+                                    fast_hit = true;
+                                }
                             }
                         }
                     }
@@ -816,7 +844,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                     match sess_memo_lookup(conn_id, s) {
                         SessHit::Fresh(sock, last, ab) => {
                             fast_sess = s;
-                            fast_sock = Some(sock);
+                            fast_sock = Some(Arc::downgrade(&sock));
                             fast_last = Some(last);
                             fast_abort = Some(ab);
                             let (ph, pp) = target_name(a);
@@ -825,7 +853,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 host: ph.to_owned(),
                                 port: pp,
                                 addr: dst,
-                                expires: mono_millis() + DEST_PIN_TTL_MS,
+                                expires: coarse_millis() + DEST_PIN_TTL_MS,
                             });
                         }
                         SessHit::Stale | SessHit::Miss => {
@@ -1198,7 +1226,12 @@ fn resolve_pin(
     h: &str,
     p: u16,
 ) -> Option<SocketAddr> {
-    let now = mono_millis();
+    // The coarse epoch: this value only ever feeds 30 s comparisons (the pin's
+    // deadline and the session memo's TTL), and it sits on the per-datagram
+    // domain path, so it must not be a vDSO `clock_gettime` per packet.
+    // `sess_dest_store` writes the memo's `expires` from the same epoch, so the
+    // two sides are directly comparable.
+    let now = coarse_millis();
     // The connection-level pin is only trusted for the exact
     // (session, name, port) it was stored for, and only until its deadline.
     // Matching on the session alone would send a datagram naming a *different*
@@ -1249,11 +1282,15 @@ async fn forward_server_dgram(
             }
             // No destination memo for an IP target: `resolve_pin` — the memo's
             // only reader on the datagram path — consults it for domain targets
-            // exclusively (an IP target's address is already in the datagram),
-            // and `PortKey::matches` would need an empty host *and* port 0 to
-            // ever match this entry, which the wire decoder rejects. Storing it
-            // was a shard write lock plus a 72-byte memo write per datagram that
-            // nothing could read back.
+            // exclusively (an IP target's address is already in the datagram, so
+            // it takes the `TargetAddrRef::Ip` arm and never reaches the memo).
+            // An entry keyed `("", port)` *is* readable in principle — see
+            // `session_dest_memo_distinguishes_ip_and_domain_targets`, which
+            // stores and reads exactly that — but nothing on the datagram path
+            // would ever ask for it, because the wire decoder refuses a
+            // zero-length domain, so the lookup that could match it is
+            // unreachable. Storing it was a shard write lock plus a 72-byte memo
+            // write per datagram that nothing could read back.
             let sock = get_or_create_sess(ss, cd, conn_id, s, None).await?;
             udp_try_send(&sock, map_for_dual(dst), payload);
             Some(dst)
@@ -1413,7 +1450,9 @@ fn sess_dest_store(ss: &SessTable, s: u32, host: &str, port: u16, addr: SocketAd
     let Some(key) = PortKey::new(host, port) else {
         return;
     };
-    let now = mono_millis();
+    // Same coarse epoch `resolve_pin` compares against; a fresher stamp here
+    // would only make the memo look shorter-lived than the reader believes.
+    let now = coarse_millis();
     {
         let r = lock_read(ss.shard(s));
         if let Some(e) = r.get(&s) {
@@ -1614,7 +1653,12 @@ fn touch_memo_idx(conn: usize, sess: u32) -> usize {
 /// copy of the last refresh time.
 fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     const TOUCH_INTERVAL_MS: u64 = 1000;
-    let now = mono_millis();
+    // The coarse epoch, not `mono_millis()`: this runs on *every* inbound
+    // datagram and only ever compares against a 1 s throttle and a 180 s
+    // deadline. The `TouchMemo` note below explains why the clock read cannot
+    // simply be sampled by packet count — the replacement is a time source that
+    // advances on its own, which is what `coarse_millis` is.
+    let now = coarse_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
         let idx = touch_memo_idx(conn, sess);
@@ -1656,7 +1700,7 @@ async fn sess_reader_task(
     let mut frag = DgramFragmenter::new();
     let mut limit = c2.max_datagram_size().unwrap_or(0);
     let mut last_touch = 0u64;
-    let mut last_limit_refresh = mono_millis();
+    let mut last_limit_refresh = coarse_millis();
     loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
@@ -1681,7 +1725,9 @@ async fn sess_reader_task(
                 continue;
             }
         };
-        let now = mono_millis();
+        // Coarse epoch: per *reply datagram*, and both consumers are second
+        // scale (the 1 s liveness touch and the 10 s PMTU refresh).
+        let now = coarse_millis();
         if now.saturating_sub(last_touch) >= 1000 {
             last_touch = now;
             last2.store(now, std::sync::atomic::Ordering::Relaxed);
