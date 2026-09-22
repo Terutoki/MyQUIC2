@@ -2114,6 +2114,12 @@ pub mod dgram_drops {
     /// Session or DNS slow-path budget exhausted: dropped before a socket or
     /// lookup was created (UDP semantics, fail-closed under flood).
     pub static SESSION_FULL: AtomicU64 = AtomicU64::new(0);
+    /// The name's resolution was already in flight, so this datagram was
+    /// dropped rather than queued behind it (single-flight delivers only the
+    /// packet that spawned the resolver). Counted apart from `SESSION_FULL`
+    /// because charging relay loss to a budget counter is exactly the
+    /// misreport that counter's note warns about.
+    pub static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 
     /// `(too_large, buffer_full)` totals since process start.
     pub fn snapshot() -> (u64, u64) {
@@ -2131,6 +2137,18 @@ pub mod dgram_drops {
             TOO_LARGE.load(Ordering::Relaxed),
             BUFFER_FULL.load(Ordering::Relaxed),
             SESSION_FULL.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(too_large, buffer_full, session_full, dns_inflight)` totals since
+    /// process start.
+    pub fn snapshot4() -> (u64, u64, u64, u64) {
+        flush_locals();
+        (
+            TOO_LARGE.load(Ordering::Relaxed),
+            BUFFER_FULL.load(Ordering::Relaxed),
+            SESSION_FULL.load(Ordering::Relaxed),
+            DNS_INFLIGHT.load(Ordering::Relaxed),
         )
     }
 
@@ -2153,12 +2171,19 @@ pub mod dgram_drops {
                 SESSION_FULL.fetch_add(v, Ordering::Relaxed);
             }
         });
+        L_DNS_INFLIGHT.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                DNS_INFLIGHT.fetch_add(v, Ordering::Relaxed);
+            }
+        });
     }
 
     thread_local! {
         static L_TOO_LARGE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     fn batched(
@@ -2189,6 +2214,8 @@ pub mod dgram_drops {
             batched(counter, &L_BUFFER_FULL)
         } else if std::ptr::eq(counter, &SESSION_FULL) {
             batched(counter, &L_SESSION_FULL)
+        } else if std::ptr::eq(counter, &DNS_INFLIGHT) {
+            batched(counter, &L_DNS_INFLIGHT)
         } else {
             counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
         }

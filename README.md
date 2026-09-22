@@ -106,7 +106,7 @@ recorded in [Verification & E2E Tests](#verification--e2e-tests).
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress) and [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch) and [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -443,6 +443,7 @@ before every run):
 | 45 | Server destination-memo writes made conditional: an IP target no longer stores a memo nothing can read back, and a domain target's memo is rewritten only when the address changed or the entry is inside the last quarter of its TTL (`DEST_PIN_REFRESH_MS`). Correctness on the fixed binaries: `udpdomainswitch` 1000 alpha + 1000 beta and `udpipswitch` 1000 IP + 1000 domain targets inside one session, **0 misrouted** in both; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verified verbatim**; `udpdomain` 20 000/20 000; `udpdomainmulti` 160 000 sent / 159 993 received; 4 connections up with 0 dial failures. Perf: the removed store measures 35 ns/op against the 27 ns read-lock lookup it piggybacked on, but an interleaved A/B of the two server binaries (2 rounds each) shows **no end-to-end effect** — 19 957 → 19 822 pps at 16 associations on one connection, 24 998 → 24 575 pps across two connections, both inside this host's spread — so it is kept for deleting a provably useless exclusive write, not for a measured win | ✅ |
 | 46 | `WouldBlock` retry pool re-arms a shard whose worker died with its runtime. Each shard's `Sender` used to live in a `OnceLock` forever while its worker was a task on whichever runtime first needed it, so any later runtime (a test binary has one per `#[tokio::test]`; an embedder may have several) queued retries into a closed channel and the datagram was dropped silently, charged to a budget counter that had not been touched. Each shard publishes its sender through an `ArcSwap` and re-arms on demand; the probe against the old code printed `queued=false delivered=false`, and the new regression test `retry_shard_is_rearmed_after_its_runtime_ends` passes. Effect on the suite: the client bin went **0/5 → 5/5 green when run serially** (the file's runtime churn hit it every run) and the full suite to **10/10** on the default feature set and 4/4 on `--no-default-features` | ✅ |
 | 47 | `dist/` rebuilt from this revision for all four CPU levels (static musl, stripped; clients 4 390 120–4 416 280 B, servers 4 325 792–4 348 536 B, i.e. +4 992–5 120 / +6 432–6 512 B per level for the retry-pool and memo changes) and re-verified under amd64 emulation (Podman on Apple Silicon) **using the repo's own harness** — the `hotpath_bench` example built for the same musl target, so no external tooling is involved. On the v1 pair: 4 connections, 0 dial failures, 4 server accepts; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 160 000 sent / 159 993 received; `udpmulti` 16 associations 603 728 received at 0.082 % loss; 40 domain-target TCP `CONNECT`s; `udpdomainswitch` **1000 alpha + 1000 beta, 0 misrouted** and `udpipswitch` **1000 IP + 1000 domain, 0 misrouted**. A second four-level build came out byte-identical (`sha256` equal for all eight files), and v3 runs / v4 dies with exit 132 under the emulated CPU, with `zmm` = 0/0/0/235 and `ymm` 3 978 → 26 900 | ✅ |
+| 48 | Post-audit fixes (pass 24): session-memo ownership, sweeper re-check, connection-pin deadline, `dns_inflight` accounting. `cargo test --all-targets` **79/79** (45 lib + 18 client + 16 server; **78/78** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. E2E on the fixed binaries: `udpdomainswitch` 500 alpha + 500 beta and `udpipswitch` 500 IP + 500 domain inside one session, **0 misrouted**; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 4 000 sent / 3 999 received; 20 TCP flows with replies; a 40-datagram burst at an uncached name reported as `9 dropped (resolution in flight)` in the new counter. The fd leak is closed, measured with `lsof`: 100 associations on one connection, client `kill -9`, then **1** UDP fd (the listener) after the QUIC idle timeout, against **85** on the previous binary. `dist/openwrt-x86_64/` was rebuilt for all four CPU levels from this revision (static musl, x86-64, stripped; servers 4 327 072–4 349 816 B, +1 216–1 536 B per level; clients 4 390 120–4 416 280 B, same sizes as before) — `file` confirms the format, a second four-level build came out byte-identical at every level, and `objdump -d` finds 273 `zmm` refs in v4 with none in v1/v3 (`ymm` 3 978 → 25 306 from v1 to v3), so each `target-cpu` level really is compiled in. The emulated-container re-run was **not** repeated here (the local Podman machine did not respond): the dist artifacts are cross-compiled and statically checked, while the native-binary E2E below is green | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -574,17 +575,18 @@ done
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
 rebuilt from the current revision (the four-connection pool default and its
-`papaya` slot registry, the conditional destination-memo writes, and the re-arming
-`WouldBlock` retry pool, on top of pass-23's lock-free client control plane and the
-cache-substitution pass's DNS/destination memos, against the refreshed `Cargo.lock`)
-with the default feature set, so the relay counters are **on** in these builds: static
-musl, x86-64, stripped, 4 325 792–4 416 280 B (clients 4 390 120–4 416 280, servers
-4 325 792–4 348 536) each. Against the previous rebuild the client grew
-4 992–5 120 B and the server 6 432–6 512 B per level (the retry pool's `ArcSwap`
-shard table plus the memo path changes). The four-level build is reproducible:
-rebuilding this revision a second time produced byte-identical artifacts at every
-level. Three upgrade notes, all requiring **both** sides to be replaced together
-(plus two notes below that need no binary change):
+`papaya` slot registry, the conditional destination-memo writes, the re-arming
+`WouldBlock` retry pool, and pass 24's session-memo ownership / sweeper re-check /
+connection-pin deadline fixes, on top of pass-23's lock-free client control plane and
+the cache-substitution pass's DNS/destination memos, against the refreshed
+`Cargo.lock`) with the default feature set, so the relay counters are **on** in these
+builds: static musl, x86-64, stripped, 4 327 072–4 416 280 B (clients 4 390 120–4 416 280,
+servers 4 327 072–4 349 816) each. Against the previous rebuild the servers grew
+1 216–1 536 B per level (the pass-24 changes) while the client artifacts came out the
+same size per level, though their bytes differ. The earlier growth was the client
+4 992–5 120 B and the server 6 432–6 512 B per level (the retry pool's `ArcSwap` shard
+table plus the memo path changes). Three upgrade notes, all requiring **both** sides to
+be replaced together (plus two notes below that need no binary change):
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -1755,6 +1757,8 @@ mixed pairs stay compatible):
   session cap, the 1 s sweep throttle, `sess 0` refusals and DNS slow-path exhaustion
   (previously silent); the server 60 s reporter prints a `udp budget` line and
   `snapshot3()` keeps `snapshot()` compatible (`bump` is now `pub` for the binaries).
+  *(Pass 24 adds `DNS_INFLIGHT` / `snapshot4()` for the resolution-in-flight drops
+  this pass left uncounted.)*
 - **Stale egress is liveness-checked.** The client reuses an expired handle only after
   `close_reason().is_none()`; a dead one is counted, invalidated and dropped instead
   of sending a packet that can never arrive.
@@ -2118,6 +2122,61 @@ wire-compatible, so mixed pairs work.
 
 ---
 
+### 2026-09 hardening pass 24 — post-audit fixes: memo ownership, sweeper race, pin deadline
+
+An audit of `src/bin/myquic2-server.rs` found four defects on the UDP session
+paths; all four are fixed here, plus two smaller consequences of the same review.
+Same wire protocol: no frame, framing or ALPN change, so mixed pairs keep working.
+
+- **A dead session's socket no longer outlives its connection.** `SessMemo` stored
+  a strong `Arc<UdpSocket>`, and the only things that cleared a slot were
+  `sess_memo_put` (overwrite) and a `sess_memo_lookup` for the *same* `(conn, sess)`
+  — a key that never recurs, because `next_conn_id` never repeats. `sess_memo_forget`
+  runs only at the tail of the reply reader, which an abort never reaches, so pass
+  19's "clear stale slots on read" covered only the voluntary-exit case. The slot now
+  holds a `Weak` and `sess_memo_lookup` upgrades it: the table entry and the reader
+  are the owners, and once both are gone the slot is released and the failed upgrade
+  reads as `Stale` — also the sharpest liveness signal available. Measured with
+  `lsof`: 100 associations on one connection, client `kill -9`, then **1 UDP fd after
+  the idle timeout** (the listener alone) against **85** before (84 leaked session
+  sockets + the listener), and 84 after four separate one-session connections. Each
+  retained socket was an fd plus 256 KiB × 2 kernel buffers, held *outside*
+  `MAX_SESSIONS_GLOBAL` (the permit was released; only the fd leaked).
+- **The 60 s sweeper can no longer kill a live session.** `sweep_all` snapshotted
+  idle keys under the shard *read* lock and then removed them unconditionally under
+  the write lock, so a session the client touched — or one recreated — while the
+  sweeper waited for that lock was evicted and its freshly started reader aborted
+  (socket, destination memo and in-flight replies with it). The removal now re-tests
+  every key against the snapshot's `now` (`take_idle`), which is what `sweep_local`
+  gets for free by scanning and removing under one write guard.
+- **The connection-level destination pin has a deadline.** `fast_pin` cached
+  `(session, name, port) → addr` and was consulted before the session memo and the
+  DNS cache on every datagram, so a steady flow kept using the address resolved when
+  it started for the whole connection lifetime: the 30 s `DEST_PIN_TTL` — and the
+  60 s DNS TTL behind it — was bypassed for exactly the flow that never missed. It is
+  now a `ConnPin` with the same 30 s deadline; past it the session memo (and then the
+  DNS cache) answers and re-arms it. The deadline costs a lock-free, thread-local cache
+  probe per datagram *after* the first 30 s of a flow — cheap against a per-datagram
+  server budget, and the price of never pinning an address forever.
+- **Resolution-in-flight drops are counted.** `forward_server_dgram` dropped every
+  datagram that arrived while the name's single-flight resolution was pending, with
+  no counter at all, so the loss showed up only as missing replies. A new
+  `dgram_drops::DNS_INFLIGHT` — its own `snapshot4()` field, deliberately not
+  `SESSION_FULL`, which means "budget exhausted" — is bumped there and printed in the
+  60 s `udp budget` line. Measured: a 40-datagram burst at an uncached name reports
+  `9 dropped (resolution in flight)`.
+
+Two smaller consequences of the same review: a session created by a DNS-spawned
+resolver task now publishes its live table entry into the calling thread's memo, so
+the per-connection fast path can arm for it instead of being cleared by a
+`SessHit::Miss` on every datagram; and `resolve_pin` / `target_name` moved to module
+scope so the pin's deadline is unit-testable. Regression tests:
+`session_memo_does_not_own_the_socket`,
+`sweep_recheck_keeps_a_session_touched_after_the_snapshot`,
+`conn_pin_stops_answering_when_its_ttl_expires`.
+
+---
+
 ## Cache-substitution evaluation, and the two changes worth making instead
 
 The question "should this repository use a general-purpose cache crate (moka and
@@ -2211,7 +2270,10 @@ across encodings (domain alternating with an IP literal in one session) is also
 0. Names beyond 64 bytes are not memoized, so a truncated key can never match a
 different name sharing its prefix. The `DEST_PIN_TTL` is 30 s — deliberately
 under the 60 s DNS TTL — so a name that moves is picked up by an established
-session rather than only at session teardown.
+session rather than only at session teardown. The connection-level fast slot
+carries the same pin **and the same deadline** (pass 24: it used to carry no
+deadline at all, which pinned a steady flow's address for the connection's whole
+lifetime and bypassed both the memo and the DNS cache).
 
 The memo is *written*, not clobbered, on the datagram path. An **IP target
 stores nothing**: its address is already in every datagram it sends, and the

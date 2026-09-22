@@ -157,6 +157,26 @@ const DEST_PIN_TTL_MS: u64 = 30_000;
 /// that had not changed. Refreshing only in the last quarter of the TTL keeps
 /// the entry continuously live with one write per ~7.5 s per session instead.
 const DEST_PIN_REFRESH_MS: u64 = DEST_PIN_TTL_MS / 4;
+
+/// The connection's pinned destination: the last `(session, name, port)` a
+/// datagram was relayed to, plus the deadline that pin may still be trusted
+/// for.
+///
+/// A per-connection shortcut for the per-session [`DestMemo`], and bounded the
+/// same way on purpose. It carries its own deadline and is never refreshed on a
+/// hit: a pin with no expiry kept a domain target's address for the whole
+/// connection lifetime, so after a DNS change the flow was relayed to the old
+/// address with no lookup ever consulted again — silently bypassing
+/// [`DEST_PIN_TTL_MS`] for exactly the flow that never missed.
+struct ConnPin {
+    sess: u32,
+    host: String,
+    port: u16,
+    addr: SocketAddr,
+    /// Monotonic deadline ([`mono_millis`] epoch), like [`DestMemo::expires`].
+    expires: u64,
+}
+
 type SessTable = Arc<ShardedSessTable>;
 
 const SESS_SHARDS: usize = 8;
@@ -203,14 +223,35 @@ impl ShardedSessTable {
                 continue;
             }
             let mut m = lock_write(sh);
-            for k in expired {
-                if let Some(e) = m.remove(&k) {
-                    out.push(e);
-                }
-            }
+            out.extend(take_idle(&mut m, &expired, now));
         }
         out
     }
+}
+
+/// Remove the snapshotted keys that are *still* idle, returning the entries so
+/// the caller can abort their readers after the lock is dropped.
+///
+/// The key list is collected under a read lock, so between the snapshot and
+/// this write-locked removal the client can touch the session — or the key can
+/// be recreated outright. Removing unconditionally destroyed a live session and
+/// aborted its freshly started reader (its socket, its destination memo and the
+/// replies in flight went with it). `sweep_local` gets the re-check for free by
+/// scanning and removing under one write guard; here the snapshot is reused and
+/// every key is re-tested against the same `now` before it is removed.
+fn take_idle(w: &mut HashMap<u32, SessEntry>, keys: &[u32], now: u64) -> Vec<SessEntry> {
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        let idle = w.get(k).is_some_and(|e| {
+            now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
+        });
+        if idle {
+            if let Some(e) = w.remove(k) {
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 /// Hard process-wide bounds: new QUIC connections are refused past this count
@@ -555,7 +596,7 @@ fn spawn_udp_reporter() {
         let mut prev = udp_stats::snapshot();
         let mut prev_w = udp_write::snapshot();
         let mut prev_r = udp_stats::reassembly_drops();
-        let mut prev_d = dgram_drops::snapshot3();
+        let mut prev_d = dgram_drops::snapshot4();
         loop {
             tick.tick().await;
             let now = udp_stats::snapshot();
@@ -582,12 +623,13 @@ fn spawn_udp_reporter() {
                 );
                 prev_r = now_r;
             }
-            let now_d = dgram_drops::snapshot3();
+            let now_d = dgram_drops::snapshot4();
             let d_full = now_d.2.saturating_sub(prev_d.2);
-            if d_full > 0 {
+            let d_wait = now_d.3.saturating_sub(prev_d.3);
+            if d_full > 0 || d_wait > 0 {
                 info!(
-                    "udp budget (60s): {d_full} dropped (session/DNS cap); totals too_large={} buffer_full={} session_full={}",
-                    now_d.0, now_d.1, now_d.2
+                    "udp budget (60s): {d_full} dropped (session/DNS cap), {d_wait} dropped (resolution in flight); totals too_large={} buffer_full={} session_full={} dns_inflight={}",
+                    now_d.0, now_d.1, now_d.2, now_d.3
                 );
             }
             prev_d = now_d;
@@ -660,56 +702,8 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // datagrams skip the DNS lookup entirely instead of paying a hash, a
         // key build and a key compare on every packet. Only meaningful while
         // `fast_sess` names the session it was resolved for; it is cleared
-        // whenever the pin is.
-        /// The target a datagram names, as `(host, port)`. An IP target reports
-        /// an empty host: it has no name that could rotate to another address,
-        /// so there is nothing for a pin to re-check.
-        fn target_name(a: TargetAddrRef<'_>) -> (&str, u16) {
-            match a {
-                TargetAddrRef::Ip(dst) => ("", dst.port()),
-                TargetAddrRef::Domain(h, p) => (h, p),
-            }
-        }
-        let mut fast_pin: Option<(u32, String, u16, SocketAddr)> = None;
-        // Resolve this datagram's target once, for both the fragment and the
-        // plain branch. Order matters: the connection's pin first (free, and
-        // only trusted while it still names the pinned session), then the
-        // session's own memo, then the DNS cache. `None` means "not known yet"
-        // -- `forward_server_dgram` spawns the resolver, so it is not an error.
-        //
-        // A free function rather than a closure: it both reads and writes the
-        // pin, and a closure capturing it mutably would conflict with the pin
-        // assignments below.
-        fn resolve_pin(
-            ss: &SessTable,
-            pin: &mut Option<(u32, String, u16, SocketAddr)>,
-            pinned_sess: u32,
-            s: u32,
-            h: &str,
-            p: u16,
-        ) -> Option<SocketAddr> {
-            // The connection-level pin is only trusted for the exact
-            // (session, name, port) it was stored for. Matching on the session
-            // alone would send a datagram naming a *different* target to the
-            // address resolved for the previous one -- a silent mis-route.
-            if s == pinned_sess {
-                if let Some((ps, ph, pp, dst)) = pin {
-                    if *ps == s && *pp == p && ph == h {
-                        return Some(*dst);
-                    }
-                }
-            }
-            if let Some(dst) = sess_dest_lookup(ss, mono_millis(), s, h, p) {
-                // Adopt the session's memo so the next datagram is a pure
-                // compare with no table read at all.
-                *pin = Some((s, h.to_string(), p, dst));
-                return Some(dst);
-            }
-            match lookup_cached_fast(h, p) {
-                CachedLookup::Addr(dst) => Some(dst),
-                CachedLookup::Negative | CachedLookup::Unknown => None,
-            }
-        }
+        // whenever the pin is, and it expires on its own — see [`ConnPin`].
+        let mut fast_pin: Option<ConnPin> = None;
         loop {
             let d: Bytes = match reader.as_mut().await {
                 Ok(d) => d,
@@ -765,7 +759,13 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             fast_last = Some(last);
                             fast_abort = Some(ab);
                             let (ph, pp) = target_name(a.as_ref());
-                            fast_pin = Some((s, ph.to_string(), pp, dst));
+                            fast_pin = Some(ConnPin {
+                                sess: s,
+                                host: ph.to_owned(),
+                                port: pp,
+                                addr: dst,
+                                expires: mono_millis() + DEST_PIN_TTL_MS,
+                            });
                         }
                         SessHit::Stale | SessHit::Miss => {
                             fast_sess = u32::MAX;
@@ -819,7 +819,13 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             fast_last = Some(last);
                             fast_abort = Some(ab);
                             let (ph, pp) = target_name(a);
-                            fast_pin = Some((s, ph.to_string(), pp, dst));
+                            fast_pin = Some(ConnPin {
+                                sess: s,
+                                host: ph.to_owned(),
+                                port: pp,
+                                addr: dst,
+                                expires: mono_millis() + DEST_PIN_TTL_MS,
+                            });
                         }
                         SessHit::Stale | SessHit::Miss => {
                             fast_sess = u32::MAX;
@@ -1166,6 +1172,62 @@ fn is_global_ip_cached(ip: IpAddr) -> bool {
     })
 }
 
+/// The target a datagram names, as `(host, port)`. An IP target reports an
+/// empty host: it has no name that could rotate to another address, so there is
+/// nothing for a pin to re-check. A domain name is never empty on the wire
+/// (`TargetAddrRef::decode` refuses a zero-length one), so the two forms cannot
+/// collide in a [`ConnPin`].
+fn target_name(a: TargetAddrRef<'_>) -> (&str, u16) {
+    match a {
+        TargetAddrRef::Ip(dst) => ("", dst.port()),
+        TargetAddrRef::Domain(h, p) => (h, p),
+    }
+}
+
+/// Resolve this datagram's target once, for both the fragment and the plain
+/// branch. Order matters: the connection's pin first (free, and only trusted
+/// while it still names the pinned session *and* has not expired), then the
+/// session's own memo, then the DNS cache. `None` means "not known yet" --
+/// `forward_server_dgram` spawns the resolver, so it is not an error.
+fn resolve_pin(
+    ss: &SessTable,
+    pin: &mut Option<ConnPin>,
+    pinned_sess: u32,
+    s: u32,
+    h: &str,
+    p: u16,
+) -> Option<SocketAddr> {
+    let now = mono_millis();
+    // The connection-level pin is only trusted for the exact
+    // (session, name, port) it was stored for, and only until its deadline.
+    // Matching on the session alone would send a datagram naming a *different*
+    // target to the address resolved for the previous one -- a silent
+    // mis-route; ignoring the deadline would never re-resolve at all.
+    if s == pinned_sess {
+        if let Some(pin) = pin.as_ref() {
+            if pin.sess == s && pin.port == p && pin.host == h && pin.expires > now {
+                return Some(pin.addr);
+            }
+        }
+    }
+    if let Some(dst) = sess_dest_lookup(ss, now, s, h, p) {
+        // Adopt the session's memo so the next datagram is a pure compare with
+        // no table read at all -- for the memo's remaining life, never longer.
+        *pin = Some(ConnPin {
+            sess: s,
+            host: h.to_owned(),
+            port: p,
+            addr: dst,
+            expires: now + DEST_PIN_TTL_MS,
+        });
+        return Some(dst);
+    }
+    match lookup_cached_fast(h, p) {
+        CachedLookup::Addr(dst) => Some(dst),
+        CachedLookup::Negative | CachedLookup::Unknown => None,
+    }
+}
+
 /// Relay one datagram to its target. `Some(dst)` is the address actually used,
 /// which the caller pins onto the session so the next datagram for the same
 /// session skips this whole function; `None` means the datagram was dropped
@@ -1207,6 +1269,11 @@ async fn forward_server_dgram(
             }
             CachedLookup::Unknown => {
                 if dns_is_inflight(h, p) {
+                    // Single-flight: the packet that spawned the resolver is
+                    // delivered by that task, this one has no owner. Counted so
+                    // the loss shows up in the 60 s budget line instead of
+                    // being invisible.
+                    dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
                     return None;
                 }
                 if dns_slow_path_limiter().available_permits() == 0 {
@@ -1377,7 +1444,14 @@ struct SessMemo {
     /// connection whose DATAGRAM reader runs on this worker thread.
     conn: usize,
     sess: u32,
-    sock: Arc<tokio::net::UdpSocket>,
+    /// Weak on purpose: the table entry and the reply reader own the socket, so
+    /// the memo must never be its last owner. A strong `Arc` here outlived the
+    /// connection — a slot is only rewritten by a later session hashing to the
+    /// same index on the same thread, and `next_conn_id` never repeats, so the
+    /// fd and its kernel buffers were pinned for the process lifetime. A failed
+    /// `upgrade` is also the sharpest liveness signal available: it means the
+    /// session's socket is gone.
+    sock: std::sync::Weak<tokio::net::UdpSocket>,
     /// The session table's liveness stamp, kept so a memo hit can refresh it
     /// without re-taking the table lock.
     last: Arc<std::sync::atomic::AtomicU64>,
@@ -1399,6 +1473,9 @@ fn sess_memo_idx(conn: usize, sess: u32) -> usize {
     (conn.wrapping_mul(31) ^ (sess as usize).wrapping_mul(0x9e3779b9)) % SESS_MEMO_SLOTS
 }
 
+/// Publish `(conn, sess)` into this thread's memo. The socket is stored weakly
+/// (see [`SessMemo::sock`]); callers hand over a strong `Arc` purely as the
+/// upgrade source while the session is alive.
 fn sess_memo_put(
     conn: usize,
     sess: u32,
@@ -1412,7 +1489,7 @@ fn sess_memo_put(
         m[idx] = Some(SessMemo {
             conn,
             sess,
-            sock,
+            sock: Arc::downgrade(&sock),
             last,
             abort,
         });
@@ -1446,8 +1523,10 @@ enum SessHit {
         Arc<std::sync::atomic::AtomicU64>,
         tokio::task::AbortHandle,
     ),
-    /// The memo's reader has exited: the table (not the memo) must decide,
-    /// so this falls through and lets the table path recreate the session.
+    /// The memo cannot serve `(conn, sess)`: either its reader has exited or its
+    /// socket is gone (see [`SessMemo::sock`]). The table (not the memo) must
+    /// decide, so this falls through and lets the table path recreate the
+    /// session.
     Stale,
 }
 
@@ -1464,8 +1543,17 @@ fn sess_memo_lookup(conn: usize, sess: u32) -> SessHit {
         let idx = sess_memo_idx(conn, sess);
         match m[idx].as_ref() {
             Some(x) if x.conn == conn && x.sess == sess => {
-                if !x.abort.is_finished() {
-                    SessHit::Fresh(x.sock.clone(), x.last.clone(), x.abort.clone())
+                // Live means the reader has not exited *and* something still
+                // owns the socket: `upgrade` fails once the table entry and the
+                // reader are gone, which is exactly when the slot must be
+                // released instead of pinning a dead fd.
+                let live = if x.abort.is_finished() {
+                    None
+                } else {
+                    x.sock.upgrade()
+                };
+                if let Some(sock) = live {
+                    SessHit::Fresh(sock, x.last.clone(), x.abort.clone())
                 } else {
                     m[idx] = None;
                     SessHit::Stale
@@ -1688,8 +1776,17 @@ async fn get_or_create_sess(
         if let Some(e) = r.get(&s) {
             if !e.reader.is_finished() {
                 let sock = e.sock.clone();
+                let last = e.last.clone();
+                let abort = e.reader.abort_handle();
                 touch_session_throttled(conn_id, s, &e.last);
                 drop(r);
+                // Publish this thread's memo from the table. A session created
+                // by a DNS-spawned resolver task lives on another worker's memo
+                // (or on none), and without this the per-connection fast path
+                // could never arm for it: the caller's `SessHit::Miss` would
+                // clear the fast state on every datagram instead of adopting
+                // the session that was just used.
+                sess_memo_put(conn_id, s, sock.clone(), last, abort);
                 if let Some((h, p, d)) = dest {
                     sess_dest_store(ss, s, h, p, d);
                 }
@@ -1770,9 +1867,14 @@ async fn get_or_create_sess(
             if !e.reader.is_finished() {
                 touch_session_throttled(conn_id, s, &e.last);
                 let sock2 = e.sock.clone();
+                let last2 = e.last.clone();
+                let abort2 = e.reader.abort_handle();
                 drop(w);
                 h_pre.abort();
                 drop(permit);
+                // Same reason as the read path above: adopt the live entry into
+                // this thread's memo so the caller's fast path can arm.
+                sess_memo_put(conn_id, s, sock2.clone(), last2, abort2);
                 if let Some((h, p, d)) = dest {
                     sess_dest_store(ss, s, h, p, d);
                 }
@@ -2103,6 +2205,132 @@ mod tests {
         let ss = Arc::new(ShardedSessTable::new());
         sess_dest_store(&ss, 7, "a.test", 443, "10.0.0.1:1".parse().unwrap());
         assert_eq!(sess_dest_lookup(&ss, mono_millis(), 7, "a.test", 443), None);
+    }
+
+    /// The connection-level pin is a hint *with a deadline*. Without one, a
+    /// steady flow to a domain target kept using the address resolved when the
+    /// flow started for the whole connection lifetime: the session memo, the
+    /// DNS cache and `DEST_PIN_TTL_MS` were all bypassed for the one flow that
+    /// never missed, so a name that moved was never re-resolved.
+    #[tokio::test]
+    async fn conn_pin_stops_answering_when_its_ttl_expires() {
+        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let stale: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let (ss, _sock) = sess_with_dest(None);
+        sess_dest_store(&ss, 7, "pin-expiry.invalid", 443, dst);
+
+        // A live pin answers for exactly the (session, name, port) it was
+        // stored for...
+        let mut pin = Some(ConnPin {
+            sess: 7,
+            host: "pin-expiry.invalid".into(),
+            port: 443,
+            addr: stale,
+            expires: mono_millis() + DEST_PIN_TTL_MS,
+        });
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 443),
+            Some(stale)
+        );
+        // ...and for nothing else.
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, "other-pin.invalid", 443),
+            None
+        );
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 80),
+            None
+        );
+
+        // Past its deadline it must not answer at all; the session's own memo
+        // is consulted instead and the pin is re-armed from it, freshly.
+        pin.as_mut().unwrap().expires = mono_millis().saturating_sub(1);
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 443),
+            Some(dst),
+            "an expired pin must not answer"
+        );
+        let rearmed = pin.as_ref().expect("the memo must re-arm the pin");
+        assert_eq!(rearmed.addr, dst);
+        assert!(rearmed.expires > mono_millis(), "re-armed pin must be live");
+    }
+
+    /// A memo slot must never be the last owner of a session socket. With a
+    /// strong `Arc` there, a dead session's fd and kernel buffers outlived the
+    /// connection: the slot is only rewritten by a later session hashing to the
+    /// same index on the same thread, and connection ids never repeat, so
+    /// nothing ever released it.
+    #[tokio::test]
+    async fn session_memo_does_not_own_the_socket() {
+        use std::sync::atomic::AtomicU64;
+
+        let last = Arc::new(AtomicU64::new(1));
+        let weak = {
+            let sock = memo_sock();
+            let weak = Arc::downgrade(&sock);
+            // The strong reference is handed over and dropped here, exactly as
+            // the table entry and the aborted reader are when a session dies.
+            sess_memo_put(11, 5, sock, last.clone(), live_reader());
+            weak
+        };
+        assert!(
+            weak.upgrade().is_none(),
+            "the memo must not keep the session socket alive"
+        );
+        assert!(matches!(sess_memo_lookup(11, 5), SessHit::Stale));
+
+        // While something else (the table, a reader) owns the socket, the memo
+        // still serves it -- the weak reference must not over-stale a live
+        // session.
+        let sock = memo_sock();
+        sess_memo_put(12, 5, sock.clone(), last, live_reader());
+        match sess_memo_lookup(12, 5) {
+            SessHit::Fresh(s, _, _) => assert!(Arc::ptr_eq(&s, &sock)),
+            _ => panic!("a live session must still be served from the memo"),
+        }
+    }
+
+    /// The 60 s sweeper snapshots idle keys under a *read* lock and removes
+    /// them under the write lock. A key that was touched (or recreated) while
+    /// the sweeper waited for that write lock is a live session, and removing
+    /// it aborted a reader the client was actively using. `take_idle` re-tests
+    /// every snapshotted key against the snapshot's `now`.
+    #[tokio::test]
+    async fn sweep_recheck_keeps_a_session_touched_after_the_snapshot() {
+        let (ss, _sock) = sess_with_dest(None);
+        let last = ss.shard(7).read().unwrap().get(&7).unwrap().last.clone();
+        // A sweep that starts well past the session's idle deadline.
+        let now = last.load(std::sync::atomic::Ordering::Relaxed) + SESS_IDLE_MS + 10_000;
+
+        // Phase 1: the read-locked snapshot.
+        let keys: Vec<u32> = ss
+            .shard(7)
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| {
+                now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed))
+                    >= SESS_IDLE_MS
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(keys, vec![7], "the idle session must be in the snapshot");
+
+        // The client's next datagram lands in the window before phase 2. A
+        // touch always stamps a time at or after the sweeper's snapshot, so the
+        // worst case this must survive is a stamp equal to `now`.
+        last.store(now, std::sync::atomic::Ordering::Relaxed);
+
+        // Phase 2: the write-locked removal must skip it.
+        let evicted = {
+            let mut w = ss.shard(7).write().unwrap();
+            take_idle(&mut w, &keys, now)
+        };
+        assert!(
+            evicted.is_empty(),
+            "a session touched after the snapshot must survive"
+        );
+        assert!(ss.shard(7).read().unwrap().contains_key(&7));
     }
 
     /// A reader that stays alive (`SessHit::Fresh` requires a running task).
