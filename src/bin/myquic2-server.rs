@@ -596,7 +596,7 @@ fn spawn_udp_reporter() {
         let mut prev = udp_stats::snapshot();
         let mut prev_w = udp_write::snapshot();
         let mut prev_r = udp_stats::reassembly_drops();
-        let mut prev_d = dgram_drops::snapshot4();
+        let mut prev_d = dgram_drops::snapshot();
         loop {
             tick.tick().await;
             let now = udp_stats::snapshot();
@@ -623,13 +623,14 @@ fn spawn_udp_reporter() {
                 );
                 prev_r = now_r;
             }
-            let now_d = dgram_drops::snapshot4();
-            let d_full = now_d.2.saturating_sub(prev_d.2);
-            let d_wait = now_d.3.saturating_sub(prev_d.3);
-            if d_full > 0 || d_wait > 0 {
+            let now_d = dgram_drops::snapshot();
+            let dd = now_d.since(&prev_d);
+            // The budget paths only: `too_large`/`buffer_full` have their own
+            // rate-limited per-packet warning and would double-report here.
+            if dd.session_full > 0 || dd.dns_inflight > 0 {
                 info!(
-                    "udp budget (60s): {d_full} dropped (session/DNS cap), {d_wait} dropped (resolution in flight); totals too_large={} buffer_full={} session_full={} dns_inflight={}",
-                    now_d.0, now_d.1, now_d.2, now_d.3
+                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (resolution in flight); totals too_large={} buffer_full={} session_full={} dns_inflight={}",
+                    dd.session_full, dd.dns_inflight, now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.dns_inflight
                 );
             }
             prev_d = now_d;
@@ -1321,9 +1322,9 @@ async fn forward_server_dgram(
         },
     }
 }
-/// Evict sessions that are past their idle deadline, then arbitrary ones if the
-/// table is still over its target, and hand the removed entries back so the
-/// caller can abort their readers *after* releasing the table lock.
+/// Evict sessions that are past their idle deadline, then the longest-idle ones
+/// if the table is still over its target, and hand the removed entries back so
+/// the caller can abort their readers *after* releasing the table lock.
 ///
 /// Expired entries must be aborted, not merely dropped: a dropped `JoinHandle`
 /// leaves the reply reader (and its socket fd / kernel buffer) alive until its
@@ -1332,7 +1333,17 @@ async fn forward_server_dgram(
 /// Returning a `Vec` instead of aborting inline keeps `abort()` — which touches
 /// the task's vtable and may wake a worker thread — off the write-lock hold,
 /// and removes the key-collection allocations from that critical section.
-fn sweep_local(w: &mut HashMap<u32, SessEntry>) -> Vec<SessEntry> {
+///
+/// Over-cap eviction is **idle-first**, not arbitrary. The shard is already
+/// scanned under this guard (that is how the expired set is found), so ranking
+/// the survivors by `last` costs one `(last, key)` collect and a
+/// `select_nth_unstable` over a vector bounded by the shard cap, and it stops the
+/// cap from killing a session that was active milliseconds ago while a session
+/// idle for three minutes survives by hash order. Both cases are reachable: the
+/// client's `MAX_UDP_ASSOCS` is aligned to `LOCAL_SESS_TARGET`, so hitting the
+/// cap means every association is live. `target` is a parameter so the ranking
+/// is testable without 504 real sessions.
+fn sweep_local(w: &mut HashMap<u32, SessEntry>, target: usize) -> Vec<SessEntry> {
     let now = mono_millis();
     let mut expired: Vec<u32> = Vec::new();
     for (k, e) in w.iter() {
@@ -1346,11 +1357,17 @@ fn sweep_local(w: &mut HashMap<u32, SessEntry>) -> Vec<SessEntry> {
             evicted.push(e);
         }
     }
-    let over = w.len().saturating_sub(LOCAL_SESS_TARGET_SHARD);
+    let over = w.len().saturating_sub(target);
     if over > 0 {
-        let victims: Vec<u32> = w.keys().take(over).copied().collect();
-        for k in victims {
-            if let Some(e) = w.remove(&k) {
+        let mut ranked: Vec<(u64, u32)> = w
+            .iter()
+            .map(|(k, e)| (e.last.load(std::sync::atomic::Ordering::Relaxed), *k))
+            .collect();
+        // Oldest stamp first; ties broken by key so the choice is deterministic.
+        let nth = over.min(ranked.len()).saturating_sub(1);
+        ranked.select_nth_unstable(nth);
+        for (_, k) in ranked.iter().take(over) {
+            if let Some(e) = w.remove(k) {
                 evicted.push(e);
             }
         }
@@ -1887,7 +1904,7 @@ async fn get_or_create_sess(
         // Per-connection cap is enforced on the owning shard; shards share the
         // cap evenly so no single shard lock ever scans the whole table.
         if w.len() >= LOCAL_SESS_MAX / SESS_SHARDS {
-            swept = sweep_local(&mut w);
+            swept = sweep_local(&mut w, LOCAL_SESS_TARGET_SHARD);
         }
         let dead = h_pre.is_finished();
         w.insert(
@@ -2339,6 +2356,57 @@ mod tests {
         let abort = h.abort_handle();
         drop(h);
         abort
+    }
+
+    /// One over-cap session in a scratch shard, stamped `idle_ms` ago.
+    fn capped_session(idle_ms: u64) -> SessEntry {
+        SessEntry {
+            sock: memo_sock(),
+            reader: tokio::spawn(std::future::pending::<()>()),
+            last: Arc::new(std::sync::atomic::AtomicU64::new(
+                mono_millis().saturating_sub(idle_ms),
+            )),
+            _permit: session_limiter().clone().try_acquire_owned().unwrap(),
+            dest: DestMemo::NONE,
+        }
+    }
+
+    /// Over the per-shard target, the sessions that go are the longest-idle
+    /// ones. Arbitrary (hash-order) eviction killed sessions that were active
+    /// milliseconds ago while sessions idle for minutes survived, and the case is
+    /// reachable rather than theoretical: the client's association cap is aligned
+    /// to the per-connection target, so crossing the cap means every session is
+    /// live. `sweep_local` takes the target as a parameter so this needs six
+    /// sessions instead of 504.
+    #[tokio::test]
+    async fn over_cap_eviction_takes_the_longest_idle_first() {
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        // Keys 0..6 with ascending idle times: 0 is the oldest (most idle).
+        for (k, idle) in [(0u32, 60_000u64), (1, 50_000), (2, 40_000), (3, 30_000)] {
+            m.insert(k, capped_session(idle));
+        }
+        // Two freshly touched sessions, the ones a busy proxy must not lose.
+        m.insert(4, capped_session(5));
+        m.insert(5, capped_session(1));
+
+        let evicted = sweep_local(&mut m, 4);
+        assert_eq!(evicted.len(), 2, "the shard must come back to its target");
+        let mut left: Vec<u32> = m.keys().copied().collect();
+        left.sort_unstable();
+        assert_eq!(
+            left,
+            vec![2, 3, 4, 5],
+            "the two longest-idle sessions go; the fresh ones stay"
+        );
+
+        // At or under the target nothing is evicted, however idle it is: the
+        // idle deadline is the only thing that reaps below the cap.
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        for k in 0..4u32 {
+            m.insert(k, capped_session(60_000));
+        }
+        assert!(sweep_local(&mut m, 4).is_empty());
+        assert_eq!(m.len(), 4);
     }
 
     /// Session ids are allocated per client and every client hub counts from 1,

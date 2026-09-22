@@ -756,17 +756,26 @@ pub struct ClientConf {
     #[serde(default)]
     pub max_ack_delay_ms: Option<u64>,
     // ---- Connection isolation ----
-    // Pool size: bulk TCP spreads round-robin across every slot while ports in
-    // `interactive_ports` (plus all UDP) pin to slot 0, so a latency probe
-    // never queues behind bulk on the same cwnd. Unset = DEFAULT_QUIC_CONNS
-    // (4); 1 restores the legacy single shared connection; clamped to
-    // 1..=MAX_POOL_CONNS.
+    // TCP pool size: bulk TCP spreads round-robin across the bulk slots while
+    // ports in `interactive_ports` pin to slot 0, so a latency probe never
+    // queues behind bulk on the same cwnd. Unset = DEFAULT_QUIC_CONNS (4); 1
+    // restores the legacy single shared TCP connection; clamped to
+    // 1..=MAX_POOL_CONNS. UDP egress is a separate, additional connection (see
+    // `udp_fail_closed`) — it is never one of these slots.
     // quinn 0.11 exposes no per-stream priority API, so separate cwnds are
     // the only reliable isolation.
     #[serde(default)]
     pub quic_conns: Option<usize>,
     #[serde(default)]
     pub interactive_ports: Option<Vec<u16>>,
+    /// What UDP egress does when its dedicated connection is down. `true`
+    /// (default) drops the datagram — counted in `dgram_drops::NO_EGRESS` —
+    /// instead of putting it on a TCP connection's congestion window. `false`
+    /// restores the pre-separation behaviour: fall back to the interactive
+    /// connection, then to the bulk slots, so UDP keeps flowing while sharing a
+    /// cwnd with TCP traffic.
+    #[serde(default)]
+    pub udp_fail_closed: Option<bool>,
     /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
@@ -789,17 +798,21 @@ fn d_5() -> u64 {
     5
 }
 
-/// Default client connection-pool size, i.e. `quic_conns` unset: four QUIC
+/// Default client TCP pool size, i.e. `quic_conns` unset: four QUIC
 /// connections sharing one Endpoint/UDP socket. Bulk TCP spreads round-robin
-/// across all four congestion windows while UDP and `interactive_ports` pin to
-/// the interactive slot, so one heavy flow cannot queue every other flow behind
-/// its cwnd. Independent of the server, which accepts any number of them.
+/// across the three bulk slots while `interactive_ports` pin to the interactive
+/// slot, so one heavy flow cannot queue every other flow behind its cwnd.
+/// A fifth, separate connection carries UDP egress exclusively (see
+/// `ClientConf::udp_fail_closed`), so TCP and UDP never share a congestion
+/// window or a packet payload. Independent of the server, which accepts any
+/// number of them.
 pub const DEFAULT_QUIC_CONNS: usize = 4;
 
-/// Hard cap on the client connection pool. Every slot owns a QUIC connection
-/// (dial loop, DATAGRAM dispatcher, keepalives, its own 0-RTT ticket state), so
-/// this cap — not the config parser — is what bounds the per-client cost a
-/// `quic_conns` typo can request.
+/// Hard cap on the client **TCP** connection pool. Every slot owns a QUIC
+/// connection (dial loop, DATAGRAM dispatcher, keepalives, its own 0-RTT ticket
+/// state), so this cap — not the config parser — is what bounds the per-client
+/// cost a `quic_conns` typo can request. The dedicated UDP egress connection is
+/// one slot beyond this, so a client's worst case is `MAX_POOL_CONNS + 1`.
 pub const MAX_POOL_CONNS: usize = 8;
 
 /// Runtime transport tuning resolved from optional TOML fields.
@@ -873,6 +886,13 @@ impl ClientConf {
         self.interactive_ports
             .clone()
             .unwrap_or_else(|| vec![53, 123, 3478, 3479, 3480, 3481])
+    }
+
+    /// Whether UDP egress is confined to its dedicated connection. Default
+    /// `true`: a datagram that has nowhere isolated to go is dropped and
+    /// counted, rather than queued behind TCP traffic on a shared connection.
+    pub fn udp_fail_closed(&self) -> bool {
+        self.udp_fail_closed.unwrap_or(true)
     }
 
     pub fn alpn_bytes(&self) -> Vec<u8> {
@@ -2120,36 +2140,86 @@ pub mod dgram_drops {
     /// because charging relay loss to a budget counter is exactly the
     /// misreport that counter's note warns about.
     pub static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+    /// No usable egress connection at the moment the datagram was ready: the
+    /// dedicated UDP connection had not come up yet, was reconnecting, or the
+    /// single-flight refresh was already owned by another thread. The client
+    /// drops the datagram (UDP semantics) — before this counter existed that
+    /// loss was a bare `continue` with no counter and no log at all.
+    ///
+    /// On the server there is no egress-connection choice, so a non-zero value
+    /// here is client-only.
+    pub static NO_EGRESS: AtomicU64 = AtomicU64::new(0);
+    /// The egress connection was gone (or the peer stopped offering DATAGRAM
+    /// support) at send time. The datagram is lost; the client invalidates its
+    /// cached egress handle and the next datagram re-picks a connection.
+    pub static EGRESS_DEAD: AtomicU64 = AtomicU64::new(0);
 
-    /// `(too_large, buffer_full)` totals since process start.
-    pub fn snapshot() -> (u64, u64) {
-        flush_locals();
-        (
-            TOO_LARGE.load(Ordering::Relaxed),
-            BUFFER_FULL.load(Ordering::Relaxed),
-        )
+    /// Every drop counter in one read, so the 60 s report cannot silently omit
+    /// one. Named fields rather than a tuple: a 6-tuple read at two call sites
+    /// is exactly the shape that pairs a socket with the wrong field elsewhere
+    /// in this codebase (see the client's `SessEntry` note).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct DropSnapshot {
+        pub too_large: u64,
+        pub buffer_full: u64,
+        pub session_full: u64,
+        pub dns_inflight: u64,
+        pub no_egress: u64,
+        pub egress_dead: u64,
     }
 
-    /// `(too_large, buffer_full, session_full)` totals since process start.
-    pub fn snapshot3() -> (u64, u64, u64) {
-        flush_locals();
-        (
-            TOO_LARGE.load(Ordering::Relaxed),
-            BUFFER_FULL.load(Ordering::Relaxed),
-            SESSION_FULL.load(Ordering::Relaxed),
-        )
+    impl DropSnapshot {
+        pub fn since(&self, prev: &Self) -> Self {
+            let d = |a: u64, b: u64| a.saturating_sub(b);
+            Self {
+                too_large: d(self.too_large, prev.too_large),
+                buffer_full: d(self.buffer_full, prev.buffer_full),
+                session_full: d(self.session_full, prev.session_full),
+                dns_inflight: d(self.dns_inflight, prev.dns_inflight),
+                no_egress: d(self.no_egress, prev.no_egress),
+                egress_dead: d(self.egress_dead, prev.egress_dead),
+            }
+        }
+
+        /// Drops that mean "the tunnel degraded this packet", i.e. everything
+        /// except a datagram that was already destined for a dead connection's
+        /// peers. Used by the reporter to decide whether the line is worth
+        /// printing at all.
+        pub fn lost(&self) -> u64 {
+            self.too_large
+                .saturating_add(self.buffer_full)
+                .saturating_add(self.session_full)
+                .saturating_add(self.dns_inflight)
+                .saturating_add(self.no_egress)
+                .saturating_add(self.egress_dead)
+        }
     }
 
-    /// `(too_large, buffer_full, session_full, dns_inflight)` totals since
-    /// process start.
-    pub fn snapshot4() -> (u64, u64, u64, u64) {
+    /// Totals since process start.
+    ///
+    /// **Batching bound, stated because a line reading `0` is not proof of no
+    /// loss.** Each counter accumulates in a thread-local cell and is pushed to
+    /// the global when it reaches 64, or when this function flushes the *calling*
+    /// thread's cells. A reporter task runs on its own thread and cannot see
+    /// another thread's pending count, so a low-rate loss — under 64 drops per
+    /// worker thread between two reports — can be missing from one 60 s line and
+    /// appear in the next (observed on the fail-closed path: 76 real drops, a
+    /// line reporting 66). The counters converge, and the process-lifetime totals
+    /// are exact to within that pending set; the per-packet `warn` lines
+    /// (`warn_udp_write`, `warn_datagram_drop`) carry the pending count
+    /// immediately and are the low-rate signal. The batching itself is
+    /// deliberate: these paths fire per packet under a flood, and pass 19 moved
+    /// them off the shared cache lines for exactly that reason.
+    pub fn snapshot() -> DropSnapshot {
         flush_locals();
-        (
-            TOO_LARGE.load(Ordering::Relaxed),
-            BUFFER_FULL.load(Ordering::Relaxed),
-            SESSION_FULL.load(Ordering::Relaxed),
-            DNS_INFLIGHT.load(Ordering::Relaxed),
-        )
+        DropSnapshot {
+            too_large: TOO_LARGE.load(Ordering::Relaxed),
+            buffer_full: BUFFER_FULL.load(Ordering::Relaxed),
+            session_full: SESSION_FULL.load(Ordering::Relaxed),
+            dns_inflight: DNS_INFLIGHT.load(Ordering::Relaxed),
+            no_egress: NO_EGRESS.load(Ordering::Relaxed),
+            egress_dead: EGRESS_DEAD.load(Ordering::Relaxed),
+        }
     }
 
     fn flush_locals() {
@@ -2177,6 +2247,18 @@ pub mod dgram_drops {
                 DNS_INFLIGHT.fetch_add(v, Ordering::Relaxed);
             }
         });
+        L_NO_EGRESS.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                NO_EGRESS.fetch_add(v, Ordering::Relaxed);
+            }
+        });
+        L_EGRESS_DEAD.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                EGRESS_DEAD.fetch_add(v, Ordering::Relaxed);
+            }
+        });
     }
 
     thread_local! {
@@ -2184,6 +2266,8 @@ pub mod dgram_drops {
         static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_NO_EGRESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_EGRESS_DEAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     fn batched(
@@ -2207,6 +2291,12 @@ pub mod dgram_drops {
         }
     }
 
+    /// `counter` must be one of this module's statics: the batching table is
+    /// keyed on identity, and an unknown counter falls through to a plain
+    /// `fetch_add` (correct, just unbatched). Every static therefore needs its
+    /// own arm *and* its own `flush_locals` arm, or a batched bump would sit in
+    /// the thread-local cell and never reach the snapshot —
+    /// `every_drop_counter_has_its_own_snapshot_field` fails if that happens.
     pub fn bump(counter: &AtomicU64) -> u64 {
         if std::ptr::eq(counter, &TOO_LARGE) {
             batched(counter, &L_TOO_LARGE)
@@ -2216,6 +2306,10 @@ pub mod dgram_drops {
             batched(counter, &L_SESSION_FULL)
         } else if std::ptr::eq(counter, &DNS_INFLIGHT) {
             batched(counter, &L_DNS_INFLIGHT)
+        } else if std::ptr::eq(counter, &NO_EGRESS) {
+            batched(counter, &L_NO_EGRESS)
+        } else if std::ptr::eq(counter, &EGRESS_DEAD) {
+            batched(counter, &L_EGRESS_DEAD)
         } else {
             counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
         }
@@ -2968,6 +3062,14 @@ impl DgramReassembler {
     }
 }
 
+/// One queued retry: the socket it must go out on, the destination and the
+/// bytes.
+///
+/// `sock` is deliberately strong — the queue has to be able to write after the
+/// caller returns — but that also makes this entry the socket's *last* owner once
+/// the association (client relay) or session (server session socket) has dropped
+/// its own handle. The retention is therefore bounded by
+/// [`UDP_RETRY_TIMEOUT`], not by luck: see the note on the retry worker.
 struct UdpRetry {
     sock: Arc<tokio::net::UdpSocket>,
     dst: SocketAddr,
@@ -3001,17 +3103,53 @@ fn retry_shards() -> &'static [RetryShard; UDP_RETRY_SHARDS] {
     })
 }
 
+/// Deadline on one detached retry.
+///
+/// A retry holds a **strong** `Arc<UdpSocket>` (see [`UdpRetry::sock`]) after the
+/// association or session that owned the socket has already dropped its own
+/// handle, so this queue is the socket's last owner for as long as the entry
+/// lives. `send_to(...).await` parks until the socket is writable, and a
+/// destination that never becomes writable — a peer that stopped reading, a full
+/// qdisc, a black-holed route — parks it forever. That pinned the fd (and the
+/// session's 2 x 256 KiB kernel buffers on the server) for the process lifetime
+/// *and* wedged the whole shard: a worker parked in `send_to` retries nothing
+/// else, so every later datagram hashing to that shard was silently dropped.
+/// 200 ms is far above the loopback/LAN drain this path exists for and far below
+/// any user-visible retry interval; the datagram is best-effort UDP either way,
+/// and now the fd and the shard are released on a bounded schedule.
+const UDP_RETRY_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Await one send under [`UDP_RETRY_TIMEOUT`].
+///
+/// Generic over the future on purpose: it is the deadline itself that has to be
+/// provable, and no portable socket stays unwritable on every platform, so
+/// `retry_deadline_bounds_a_never_writable_socket` drives it with a future that
+/// is never ready.
+async fn under_retry_deadline<F: std::future::Future>(fut: F) -> Result<F::Output, ()> {
+    tokio::time::timeout(UDP_RETRY_TIMEOUT, fut)
+        .await
+        .map_err(|_| ())
+}
+
+/// Send one queued retry under the retry deadline. Returns the reason on
+/// failure, so the worker's only job is counting and logging.
+async fn retry_one(req: &UdpRetry) -> Result<(), String> {
+    match under_retry_deadline(req.sock.send_to(&req.payload, req.dst)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(()) => Err(format!("socket not writable within {UDP_RETRY_TIMEOUT:?}")),
+    }
+}
+
 fn spawn_retry_worker() -> tokio::sync::mpsc::Sender<UdpRetry> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
-            let r = match req.payload.try_into_mut() {
-                Ok(v) => req.sock.send_to(&v, req.dst).await,
-                Err(b) => req.sock.send_to(&b, req.dst).await,
-            };
-            if let Err(e) = r {
+            // `req` is dropped here whatever the outcome, which is what releases
+            // the last strong `Arc<UdpSocket>` on this path.
+            if let Err(reason) = retry_one(&req).await {
                 let n = udp_write::retry_failed();
-                warn_udp_write("detached retry failed", n, || e.to_string());
+                warn_udp_write("detached retry failed", n, || reason);
             }
         }
     });
@@ -3757,6 +3895,38 @@ mod tests {
         );
     }
 
+    /// The retry deadline is what bounds the socket's retention.
+    ///
+    /// A queued retry is the *last* strong owner of its `Arc<UdpSocket>` once the
+    /// association (client relay) or session (server session socket) has dropped
+    /// its own handle, and the worker used to await `send_to` with no deadline:
+    /// a socket that never became writable pinned the fd — and on the server its
+    /// 2 x 256 KiB kernel buffers — for the process lifetime, and parked the
+    /// whole shard with it, so no later datagram hashing to that shard was ever
+    /// retried. `pending()` stands in for that socket: the point is that the
+    /// deadline, not the kernel, ends the wait. Real time (no `test-util`
+    /// dependency), so the assertion is a generous upper bound around the
+    /// deadline rather than an exact instant.
+    #[tokio::test]
+    async fn retry_deadline_bounds_a_never_writable_socket() {
+        let start = tokio::time::Instant::now();
+        assert!(
+            under_retry_deadline(std::future::pending::<()>())
+                .await
+                .is_err(),
+            "a send that never completes must be abandoned by the deadline"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= UDP_RETRY_TIMEOUT && waited < UDP_RETRY_TIMEOUT * 20,
+            "the wait must be the deadline ({UDP_RETRY_TIMEOUT:?}), not open-ended: {waited:?}"
+        );
+        assert!(
+            UDP_RETRY_TIMEOUT <= Duration::from_millis(500),
+            "the retry deadline is a retention bound, not a retry policy"
+        );
+    }
+
     /// Clear this thread's memo so a test starts from a known state. The memo is
     /// thread-local, so tests running in parallel cannot disturb each other.
     fn memo_reset() {
@@ -4046,10 +4216,42 @@ mod tests {
 
         // The process-wide snapshot must observe a bump on the real counter.
         // Other tests may bump concurrently, so assert a lower bound only.
-        let (before, _) = dgram_drops::snapshot();
+        let before = dgram_drops::snapshot();
         dgram_drops::bump(&dgram_drops::TOO_LARGE);
-        let (after, _) = dgram_drops::snapshot();
-        assert!(after > before, "snapshot must observe the bump");
+        let after = dgram_drops::snapshot();
+        assert!(
+            after.too_large > before.too_large,
+            "snapshot must observe the bump"
+        );
+    }
+
+    /// Every drop counter must reach its own named field in the snapshot: the
+    /// six-field struct exists so the 60 s report cannot silently omit one, and
+    /// the batching table (`bump` + `flush_locals`) is keyed on identity, so a
+    /// counter missing one of the two arms would sit in a thread-local cell
+    /// forever. One bump per counter, one field asserted per counter.
+    #[test]
+    fn every_drop_counter_has_its_own_snapshot_field() {
+        let before = dgram_drops::snapshot();
+        for c in [
+            &dgram_drops::TOO_LARGE,
+            &dgram_drops::BUFFER_FULL,
+            &dgram_drops::SESSION_FULL,
+            &dgram_drops::DNS_INFLIGHT,
+            &dgram_drops::NO_EGRESS,
+            &dgram_drops::EGRESS_DEAD,
+        ] {
+            dgram_drops::bump(c);
+        }
+        let after = dgram_drops::snapshot();
+        assert!(after.too_large > before.too_large, "too_large");
+        assert!(after.buffer_full > before.buffer_full, "buffer_full");
+        assert!(after.session_full > before.session_full, "session_full");
+        assert!(after.dns_inflight > before.dns_inflight, "dns_inflight");
+        assert!(after.no_egress > before.no_egress, "no_egress");
+        assert!(after.egress_dead > before.egress_dead, "egress_dead");
+        let d = after.since(&before);
+        assert!(d.lost() >= 6, "every drop counts as loss: {d:?}");
     }
 
     /// The first drop must warn, and only then does the interval apply. A rate

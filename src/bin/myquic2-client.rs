@@ -47,7 +47,16 @@ const EGRESS_REFRESH_MS: u64 = 1000;
 /// peer can spawn unbounded tasks / relay sockets (each with 512 KB kernel
 /// buffers) and exhaust fds and memory on the proxy host.
 const MAX_SOCKS_CONNS: usize = 8192;
-const MAX_UDP_ASSOCS: usize = 4096;
+/// Server-side live sessions one client connection can keep. The server's
+/// session table evicts as soon as a shard crosses `LOCAL_SESS_MAX / SESS_SHARDS`
+/// and settles back to `LOCAL_SESS_TARGET / SESS_SHARDS`, i.e.
+/// `LOCAL_SESS_TARGET = LOCAL_SESS_MAX - 64 = 4032` sessions per connection
+/// (`myquic2-server.rs`). A client that admits more concurrent associations than
+/// the server will keep alive loses live flows at the ceiling, so this cap is
+/// aligned to that target rather than to `LOCAL_SESS_MAX`: all of a client's UDP
+/// associations ride one egress connection (the dedicated UDP slot), so the
+/// per-connection target is exactly this client's ceiling.
+const MAX_UDP_ASSOCS: usize = 4032;
 
 fn socks_conn_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
@@ -160,37 +169,74 @@ impl ConnSlot {
     }
 }
 
-/// Pure routing decision for tests: index of the slot a new TCP flow uses.
+/// Pure routing decision for tests: index of the TCP slot a new TCP flow uses.
 ///
-/// A pinned (interactive) flow prefers slot 0; a bulk flow prefers `rr % n`, so
-/// consecutive flows land on different congestion windows. A dead preference
-/// fails over to the first live slot; when nothing is live the preference is
-/// kept, so `wait_conn` bounds the stall and fails the flow fast instead of the
-/// pool inventing a slot that has no connection behind it.
+/// A pinned (interactive) flow uses slot 0, the interactive connection. A bulk
+/// flow rotates over the *other* TCP slots: slot 0 is what every
+/// `interactive_ports` flow rides, so a bulk flow on it would put a latency probe
+/// behind a bulk queue — which is exactly what `rr % n` used to do for one flow
+/// in every n, making the isolation the pool exists for only (n-1)/n effective.
 ///
-/// For a two-slot pool this reproduces the old dual-pool truth table exactly —
-/// `slot_routing_table` pins every row of it for both n = 2 and n = 4.
+/// Failover is class-preserving. A dead bulk preference falls back to another
+/// **bulk** slot first, and only a pool with no live bulk slot at all falls back
+/// to slot 0. The first version of this function scanned `0..n` and therefore
+/// took slot 0 whenever the round-robin preference happened to be the dead slot,
+/// even with two live bulk slots available: any single bulk reconnect put
+/// `1/(n-1)` of new bulk flows onto the interactive connection, i.e. it broke the
+/// isolation precisely when a connection was already degraded. For a two-slot
+/// pool the two rules coincide, so the old dual-pool truth table still holds.
+/// When nothing is live the preference is kept, so `wait_conn` bounds the stall
+/// and fails the flow fast instead of the pool inventing a slot that has no
+/// connection behind it.
+///
+/// `live` describes the **TCP** slots only. The dedicated UDP egress slot lives
+/// outside this range (see [`ConnPool::udp_slot`]) and is never a TCP target.
 fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     debug_assert!(!live.is_empty(), "the pool always has at least one slot");
     let n = live.len();
     if n == 1 {
         return 0;
     }
-    let preferred = if pinned { 0 } else { rr % n };
+    let preferred = if pinned { 0 } else { 1 + rr % (n - 1) };
     if live[preferred] {
         return preferred;
     }
-    (0..n).find(|&i| live[i]).unwrap_or(preferred)
+    if pinned {
+        // The interactive class has nowhere else to go: first live slot.
+        return (0..n).find(|&i| live[i]).unwrap_or(preferred);
+    }
+    // Bulk stays in its own class while any bulk slot is live.
+    if let Some(i) = (1..n).find(|&i| live[i]) {
+        return i;
+    }
+    // Every bulk slot is down: share the interactive connection rather than
+    // stall, but only if it is actually carrying traffic.
+    if live[0] {
+        0
+    } else {
+        preferred
+    }
 }
 
-/// The client's QUIC connection pool: `n` slots indexed `0..n`, where
-/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`).
+/// The client's QUIC connection pool: `n` TCP slots indexed `0..n`, where
+/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`), plus one
+/// **dedicated UDP egress slot** at index `n`.
 ///
-/// Slot 0 is the interactive connection: all UDP and every port in
-/// `interactive_ports` ride it, and it is the sole slot when `quic_conns == 1`.
-/// The other slots absorb their share of the bulk TCP streams, so each cwnd
-/// holds ~1/n of the queue instead of all of it. quinn 0.11 has no per-stream
-/// priority, so separate congestion windows are the isolation mechanism.
+/// Slot 0 is the interactive connection: every port in `interactive_ports` rides
+/// it, and it is the sole TCP slot when `quic_conns == 1`. The other TCP slots
+/// absorb their share of the bulk TCP streams, so each cwnd holds ~1/n of the
+/// queue instead of all of it. quinn 0.11 has no per-stream priority, so separate
+/// congestion windows are the isolation mechanism.
+///
+/// The UDP slot is *additional*, not carved out of the TCP range: making UDP
+/// independent must not cost TCP a congestion window, and `quic_conns` keeps its
+/// documented meaning ("TCP pool size"). UDP and TCP on one connection is not a
+/// theoretical concern — quinn fills every packet with queued DATAGRAM frames
+/// *before* STREAM frames (`quinn-proto` `populate_packet`) and both share one
+/// congestion window, so a bulk UDP flow (HTTP/3, WireGuard, video) starves the
+/// TCP streams on the same connection, and a bulk TCP flow makes every UDP
+/// datagram hit the 1 MiB datagram-send-buffer `Blocked` drop. One connection per
+/// class is the only isolation QUIC gives without stream priorities.
 ///
 /// The slots live in a lock-free `papaya::HashMap` keyed by slot index. Three
 /// properties of this pool are what make that a fit rather than decoration:
@@ -208,18 +254,28 @@ struct ConnPool {
     slots: Arc<papaya::HashMap<usize, ConnSlot>>,
     rr: Arc<std::sync::atomic::AtomicUsize>,
     interactive_ports: Arc<std::collections::HashSet<u16>>,
+    /// TCP slots: the routing range is `0..tcp_slots` (0 interactive, rest
+    /// bulk). Never includes the UDP slot.
+    tcp_slots: usize,
+    /// Index of the dedicated UDP egress slot, one past the TCP range.
+    udp_slot: usize,
+    /// When set, UDP only ever uses `udp_slot`: if that connection is down the
+    /// datagram is dropped (counted in `dgram_drops::NO_EGRESS`) instead of
+    /// sharing a TCP connection's congestion window.
+    udp_fail_closed: bool,
 }
 
 impl ConnPool {
-    /// Build the process pool: `n` fresh (unconnected) slots, indexed `0..n`.
-    /// `n` is re-clamped here so no caller can build a pool wider than the
+    /// Build the process pool: `tcp + 1` fresh (unconnected) slots — `tcp` TCP
+    /// slots indexed `0..tcp`, then the dedicated UDP slot at index `tcp`.
+    /// `tcp` is re-clamped here so no caller can build a pool wider than the
     /// stack liveness array the routing path uses to describe it.
-    fn new(n: usize, interactive_ports: Vec<u16>) -> Self {
-        let n = n.clamp(1, MAX_POOL_CONNS);
-        let slots = papaya::HashMap::with_capacity(n);
+    fn new(n: usize, interactive_ports: Vec<u16>, udp_fail_closed: bool) -> Self {
+        let tcp = n.clamp(1, MAX_POOL_CONNS);
+        let slots = papaya::HashMap::with_capacity(tcp + 1);
         {
             let g = slots.pin();
-            for i in 0..n {
+            for i in 0..=tcp {
                 g.insert(i, ConnSlot::fresh());
             }
         }
@@ -227,11 +283,31 @@ impl ConnPool {
             slots: Arc::new(slots),
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
+            tcp_slots: tcp,
+            udp_slot: tcp,
+            udp_fail_closed,
         }
     }
 
-    fn slot_count(&self) -> usize {
-        self.slots.len()
+    /// TCP slots; slot indices are `0..tcp_slots`.
+    fn tcp_slots(&self) -> usize {
+        self.tcp_slots
+    }
+
+    /// Every slot, TCP first then the UDP egress slot: the range to walk when
+    /// spawning per-slot tasks or scanning the registry.
+    fn slots_total(&self) -> usize {
+        self.tcp_slots + 1
+    }
+
+    /// The dedicated UDP egress slot. Equal to `tcp_slots`, i.e. outside every
+    /// TCP routing range by construction.
+    fn udp_slot(&self) -> usize {
+        self.udp_slot
+    }
+
+    fn udp_fail_closed(&self) -> bool {
+        self.udp_fail_closed
     }
 
     /// The slot at `i`. Slots are installed by `new` and never removed, so the
@@ -252,14 +328,14 @@ impl ConnPool {
         }
     }
 
-    /// Index of the slot a new TCP flow should use (see [`select_slot`]).
+    /// Index of the TCP slot a new TCP flow should use (see [`select_slot`]).
     ///
     /// One pin, `n` lookups and a stack liveness array: no lock, no per-flow
     /// allocation, and no `close_reason()` (which takes quinn's
     /// connection-state mutex) — the maintained `live` bit is what routing
     /// reads, and `wait_conn` remains the authority that fails a flow fast.
     fn pick_tcp_index(&self, t: &TargetAddr) -> usize {
-        let n = self.slot_count();
+        let n = self.tcp_slots();
         debug_assert!(n <= MAX_POOL_CONNS);
         let g = self.slots.pin();
         let mut live = [false; MAX_POOL_CONNS];
@@ -313,6 +389,10 @@ struct EgressCache {
     conn: quinn::Connection,
     limit: usize,
     stamp_ms: u64,
+    /// The pool slot this handle came from. Recorded so the fail-closed UDP
+    /// policy can assert (and re-check) that the cache never serves a TCP
+    /// connection, and so the 60 s line can name which connection egress is on.
+    slot: usize,
 }
 
 #[derive(Debug, Default)]
@@ -386,9 +466,16 @@ impl SharedEgress {
     /// Resolve a usable `(connection, limit, stamp)` from the process-wide
     /// cache, refreshing through the single-flight gate when the cached handle
     /// is expired. Returns `None` only when no handle is available, in which
-    /// case the caller drops the datagram (UDP semantics).
+    /// case the caller drops the datagram (UDP semantics) and counts it in
+    /// `dgram_drops::NO_EGRESS`.
     fn acquire(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize, u64)> {
         if let Some(c) = self.cached.load().as_ref() {
+            // A fail-closed pool only ever publishes the UDP slot (see
+            // `egress_order`), so this is an invariant check, not a filter.
+            debug_assert!(
+                !pool.udp_fail_closed() || c.slot == pool.udp_slot(),
+                "fail-closed egress must never cache a shared TCP slot"
+            );
             if now_ms.saturating_sub(c.stamp_ms) < EGRESS_REFRESH_MS {
                 return Some((c.conn.clone(), c.limit, c.stamp_ms));
             }
@@ -407,6 +494,35 @@ impl SharedEgress {
         None
     }
 
+    /// Slot scan order for the UDP egress: the dedicated UDP slot first, then
+    /// the interactive TCP slot, then the bulk TCP slots in index order.
+    ///
+    /// A fail-closed pool stops after the first entry, which is what makes UDP
+    /// independent of TCP: when the dedicated connection is down the datagram is
+    /// dropped rather than queued on a connection whose congestion window and
+    /// packet payload it would compete with (quinn writes DATAGRAM frames before
+    /// STREAM frames, so a bulk UDP flow on a shared connection starves the TCP
+    /// streams on it). The shared order is kept for operators who would rather
+    /// lose isolation than lose packets, via `udp_fail_closed = false`.
+    ///
+    /// Stack-array, not a `Vec`: this runs once per refresh window on the
+    /// single-flight winner, and `MAX_POOL_CONNS + 1` bounds it.
+    fn egress_order(&self, pool: &ConnPool) -> ([usize; MAX_POOL_CONNS + 1], usize) {
+        let mut order = [0usize; MAX_POOL_CONNS + 1];
+        let udp = pool.udp_slot();
+        order[0] = udp;
+        let mut k = 1;
+        if !pool.udp_fail_closed() {
+            for i in 0..pool.slots_total() {
+                if i != udp {
+                    order[k] = i;
+                    k += 1;
+                }
+            }
+        }
+        (order, k)
+    }
+
     /// Refresh `cached` under the single-flight gate. Returns the fresh handle
     /// and the stamp to tag it with, which is always `now_ms`: `ArcSwap::store`
     /// cannot lose, so there is no unpublished-handle case to keep cold.
@@ -416,7 +532,8 @@ impl SharedEgress {
         now_ms: u64,
     ) -> Option<(quinn::Connection, usize, u64)> {
         // Single-flight: a loser drops fast (UDP semantics) instead of paying
-        // the quinn locks while a winner is already refreshing.
+        // the quinn locks while a winner is already refreshing. The losing
+        // datagram is counted in `dgram_drops::NO_EGRESS` by the caller.
         if self
             .refreshing
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -430,13 +547,37 @@ impl SharedEgress {
             }
         }
         let _guard = RefreshGuard(&self.refreshing);
-        // Slot 0 first — the interactive connection — then the rest in index
-        // order: the same preference the dual pool gave `a` before its `b`
-        // fallback. Egress is sticky to whichever connection it lands on while
-        // that connection lives; a dead one is skipped here and, once cached,
-        // surfaces as `ConnectionLost` on send, which invalidates the cache.
+        // Stickiness first: while the cached connection is still usable, keep it
+        // and only re-read its DATAGRAM budget (the path MTU can have changed
+        // under it). Re-running the slot scan here instead is what used to move
+        // every UDP association back onto the interactive slot the moment that
+        // slot recovered — a second target-side source-port change (and a new
+        // server-side session) for a flow that had already failed over, i.e.
+        // exactly the flap-back churn the docs promise not to do. A fail-closed
+        // pool can only have published the UDP slot, so stickiness cannot keep it
+        // on a TCP connection.
+        let current = self.cached.load();
+        if let Some(c) = current.as_ref() {
+            if c.conn.close_reason().is_none() {
+                if let Some(m) = c.conn.max_datagram_size() {
+                    self.cached.store(Some(Arc::new(EgressCache {
+                        conn: c.conn.clone(),
+                        limit: m,
+                        stamp_ms: now_ms,
+                        slot: c.slot,
+                    })));
+                    self.generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    return Some((c.conn.clone(), m, now_ms));
+                }
+            }
+        }
+        drop(current);
+        // The cached connection is gone (or lost DATAGRAM support): walk the
+        // egress order above.
+        let (order, k) = self.egress_order(pool);
         let slots = pool.slots.pin();
-        for i in 0..pool.slot_count() {
+        for &i in &order[..k] {
             let Some(slot) = slots.get(&i) else { continue };
             // Lock-free read: no `try_read` that can fail, so a refresh can
             // never be skipped just because a reconnect is publishing.
@@ -450,6 +591,7 @@ impl SharedEgress {
                             conn: (**c).clone(),
                             limit: m,
                             stamp_ms: now_ms,
+                            slot: i,
                         })));
                         self.generation
                             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -514,7 +656,25 @@ struct AssocEntry {
     app: ArcSwapOption<SocketAddr>,
     /// Cleared by the association as it exits.
     alive: std::sync::atomic::AtomicBool,
+    /// Last activity stamp ([`mono_millis`] epoch), refreshed by **both**
+    /// directions: the relay loop on an app datagram or TCP control chatter,
+    /// and [`AssocEntry::touch`] from the dispatcher when a reply is written.
+    ///
+    /// The reply direction has to refresh it. It used to live as a local in the
+    /// relay loop fed only by app-side traffic, so an association whose flow was
+    /// receive-only after the first request (RTSP/RTP after SETUP, a market-data
+    /// or log subscription, anything NAT-kept-alive by the far end) was reaped at
+    /// 180 s while the server's own session — whose reader *does* refresh on
+    /// target replies (`sess_reader_task`) — was still live. The app then lost a
+    /// working flow, which is the same "evicted a session the client was using"
+    /// failure the server-side sweeper was fixed for.
+    last: std::sync::atomic::AtomicU64,
 }
+
+/// Activity is stamped at most once per interval per association. A reply burst
+/// performs one relaxed load per datagram and one store per second; the stamp
+/// only has to be finer than the 180 s idle deadline.
+const ASSOC_TOUCH_INTERVAL_MS: u64 = 1000;
 
 impl AssocEntry {
     fn new(relay: Arc<tokio::net::UdpSocket>) -> Self {
@@ -522,11 +682,26 @@ impl AssocEntry {
             relay,
             app: ArcSwapOption::const_empty(),
             alive: std::sync::atomic::AtomicBool::new(true),
+            last: std::sync::atomic::AtomicU64::new(mono_millis()),
         }
     }
 
     fn is_alive(&self) -> bool {
         self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Refresh the idle stamp, at most once per [`ASSOC_TOUCH_INTERVAL_MS`].
+    fn touch(&self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last.load(std::sync::atomic::Ordering::Relaxed))
+            >= ASSOC_TOUCH_INTERVAL_MS
+        {
+            self.last
+                .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn idle_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.last.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The app's address, if the app has sent anything yet. The returned borrow
@@ -546,6 +721,27 @@ impl Drop for AliveGuard {
         self.0
             .alive
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Returns an `UdpHub` reservation on every exit path out of
+/// `handle_udp_associate`, including unwinding.
+///
+/// A bare `hub.release(sess)` after the `.await` covers `Ok` and `Err` returns
+/// but not a panic in the association body: unwinding skips it, and the reserved
+/// process-wide slot plus the shard's strong `Arc<AssocEntry>` (the relay
+/// socket's last owner) then survive every later sweep, because nothing else
+/// removes a hub entry. `len` decrementing exactly once per `alloc_sess` is the
+/// invariant the `MAX_UDP_ASSOCS` cap is documented on, so a single leaked slot
+/// is a permanent budget loss and the entry is a permanent fd.
+struct SessReservation<'a> {
+    hub: &'a UdpHub,
+    sess: u32,
+}
+
+impl Drop for SessReservation<'_> {
+    fn drop(&mut self) {
+        self.hub.release(self.sess);
     }
 }
 
@@ -590,7 +786,19 @@ impl UdpHub {
     /// exist before an entry can name it: the id is reserved here, the socket is
     /// created by the association, and [`Self::publish`] installs the entry. The
     /// caller must pair every successful `alloc_sess` with exactly one
-    /// [`Self::release`], including when it fails before publishing.
+    /// [`Self::release`] — [`SessReservation`] is what enforces it — including
+    /// when it fails before publishing.
+    ///
+    /// **Why a bare `u32` counter cannot misroute after it wraps.** An id is only
+    /// dangerous once reused while a reply for its previous owner is still in
+    /// flight, and the reuse distance here is fixed by the counter, not by luck:
+    /// `next` is a single `fetch_add`, so an id is handed out again only after
+    /// `u32::MAX - 2` other allocations (0 and `u32::MAX` are skipped). A reply
+    /// lives for the RTT plus the server's session lifetime, seconds at most, so
+    /// reaching the wrap needs on the order of 4.3e9 associations inside that
+    /// window — more than a million associations per second sustained for an
+    /// hour, against a 4032-association cap. The live-id check below (`contains_key`)
+    /// covers the remaining case where the previous owner is still published.
     fn alloc_sess(&self) -> Option<u32> {
         use std::sync::atomic::Ordering;
         // Reserve a global slot first so the cap stays exact across shards.
@@ -722,13 +930,23 @@ async fn main() -> Result<()> {
     ep.set_default_client_config((*ccfg).clone());
 
     let conns = c.conn_count();
-    let pool = ConnPool::new(conns, c.interactive_port_list());
+    let udp_fail_closed = c.udp_fail_closed();
+    let pool = ConnPool::new(conns, c.interactive_port_list(), udp_fail_closed);
+    // One extra connection is dialed for UDP, so `quic_conns` keeps meaning
+    // "TCP pool size" and the dedicated UDP connection never takes a congestion
+    // window away from the bulk TCP class.
     info!(
-        "quic pool: {conns} connection(s){}",
+        "quic pool: {conns} TCP connection(s){} + 1 dedicated UDP connection (slot {}){}",
         if conns > 1 {
             " (bulk round-robin + interactive pin)"
         } else {
-            ""
+            " (single connection: interactive and bulk share slot 0)"
+        },
+        pool.udp_slot(),
+        if udp_fail_closed {
+            ", UDP is fail-closed: dropped rather than shared while it reconnects"
+        } else {
+            ", UDP may fall back to a TCP connection while it reconnects"
         }
     );
     let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
@@ -737,14 +955,14 @@ async fn main() -> Result<()> {
     // the same Endpoint (one UDP socket, one ticket cache, one CID router).
     // Every slot keeps its own reassembler, which is correct because a
     // payload's fragments all travel on the connection that carried them.
-    // Four slots mean four idle keepalives; each connection carries ~1/n of the
-    // streams, so each cwnd holds ~1/n of the queue.
+    // Each connection carries its own class: the interactive ports and the UDP
+    // associations have connections no bulk flow can queue on.
     let keep_alive_secs = c.keep_alive_secs.clamp(1, 3600);
     let watchdog_silence = Duration::from_secs(keep_alive_secs.saturating_mul(4).max(20));
-    for i in 0..conns {
+    for i in 0..pool.slots_total() {
         spawn_dispatcher(pool.slot(i), hub.clone());
     }
-    for i in 0..conns {
+    for i in 0..pool.slots_total() {
         spawn_conn_loop(
             ep.clone(),
             server_str.clone(),
@@ -856,9 +1074,20 @@ const DISPATCH_CACHE: usize = 1024;
 /// or a torn-down association re-probes the hub. Treating absence as a hit would
 /// blackhole a session id if it were ever reused after `u32` wrap, and treating a
 /// dead entry as a hit would keep writing into a socket nobody reads.
+///
+/// The entry is `Weak` on purpose. This cache lives in a dispatcher task that
+/// outlives every association, so a strong reference here made the cache the
+/// relay socket's *last* owner once `UdpHub::release` dropped the hub's and the
+/// association task exited: up to `DISPATCH_CACHE` dead relay sockets — an fd
+/// plus its 2 x 256 KiB kernel buffers each — stayed open until a session id
+/// colliding on the same index happened to arrive (or the connection was
+/// redialed, which rebuilds the cache). Measured before the fix: 1200
+/// short-lived associations left **1024** UDP fds open in the client, which on a
+/// 1024-fd router exhausts the table by itself. Upgrading on a hit costs one
+/// atomic on a path that already performs a `send_to`.
 struct DispatchSlot {
     sess: u32,
-    entry: Option<Arc<AssocEntry>>,
+    entry: Option<std::sync::Weak<AssocEntry>>,
 }
 
 /// Route one inbound DATAGRAM to its association, writing the relay socket
@@ -878,17 +1107,47 @@ fn dispatch_one(
     pkt: &mut bytes::BytesMut,
 ) {
     let idx = (sess as usize) & (DISPATCH_CACHE - 1);
-    if cache[idx].sess != sess || cache[idx].entry.as_ref().is_none_or(|e| !e.is_alive()) {
-        cache[idx] = DispatchSlot {
-            sess,
-            entry: hub.entry(sess),
-        };
-    }
-    let Some(entry) = cache[idx].entry.as_ref() else {
-        // No such association: the reply belongs to a session that has already
-        // been torn down. Silently ignored, matching the old receiver-dropped
-        // behaviour.
-        return;
+    // A hit needs the exact session *and* an endpoint that is still alive. The
+    // upgrade also answers "has the association exited?": once it has, the weak
+    // reference is dead (so nothing keeps its relay socket open) and the hub
+    // would no longer serve the session either.
+    let cached = if cache[idx].sess == sess {
+        cache[idx]
+            .entry
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|e| e.is_alive())
+    } else {
+        None
+    };
+    let entry = match cached {
+        Some(e) => e,
+        None => {
+            // Miss, collision, torn-down association, or an upgrade that lost to
+            // the association's exit: re-probe the hub.
+            let Some(fresh) = hub.entry(sess) else {
+                cache[idx] = DispatchSlot { sess, entry: None };
+                // No such association: the reply belongs to a session that has
+                // already been torn down. Silently ignored, matching the old
+                // receiver-dropped behaviour.
+                return;
+            };
+            // `hub.entry` answers "is it published", not "is it alive": between
+            // `AliveGuard` clearing the bit and `UdpHub::release` unpublishing
+            // (and permanently, if that release is ever skipped) the map still
+            // serves the entry. Without this filter the reply would be written
+            // into a socket nobody reads, which is exactly what the cache-hit
+            // path above filters with `is_alive`.
+            if !fresh.is_alive() {
+                cache[idx] = DispatchSlot { sess, entry: None };
+                return;
+            }
+            cache[idx] = DispatchSlot {
+                sess,
+                entry: Some(Arc::downgrade(&fresh)),
+            };
+            fresh
+        }
     };
     // `ArcSwapOption::load` borrows, so this costs no refcount traffic on the
     // per-datagram path; the 200 ms app-address cache the reply task needed is
@@ -907,9 +1166,9 @@ fn dispatch_one(
         };
         udp_stats::payload(whole.len());
         match a.as_ref() {
-            TargetAddrRef::Ip(dst) => send_reply_addr(&entry.relay, app, dst, &whole, pkt),
+            TargetAddrRef::Ip(dst) => send_reply_addr(&entry, app, dst, &whole, pkt),
             TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
-                CachedLookup::Addr(dst) => send_reply_addr(&entry.relay, app, dst, &whole, pkt),
+                CachedLookup::Addr(dst) => send_reply_addr(&entry, app, dst, &whole, pkt),
                 CachedLookup::Negative | CachedLookup::Unknown => {}
             },
         }
@@ -923,24 +1182,37 @@ fn dispatch_one(
     let payload = d.slice(off..);
     udp_stats::payload(payload.len());
     match a {
-        TargetAddrRef::Ip(dst) => send_reply_addr(&entry.relay, app, dst, &payload, pkt),
+        TargetAddrRef::Ip(dst) => send_reply_addr(&entry, app, dst, &payload, pkt),
         TargetAddrRef::Domain(h, p) => {
             // The server always echoes replies with an IP-form source address, so
             // this branch is defensive; the negative cache is still consulted
             // synchronously so a known-bad name never spawns a resolver task.
             match lookup_cached_fast(h, p) {
                 CachedLookup::Negative => {}
-                CachedLookup::Addr(dst) => send_reply_addr(&entry.relay, app, dst, &payload, pkt),
+                CachedLookup::Addr(dst) => send_reply_addr(&entry, app, dst, &payload, pkt),
                 CachedLookup::Unknown => {
+                    // Both of these are counted. The server's equivalent drop
+                    // (`forward_server_dgram`) charges `DNS_INFLIGHT`, and an
+                    // uncounted drop here showed up only as missing replies: a
+                    // 40-datagram burst at one uncached name silently loses 39
+                    // of them, and under contention (`dns_is_inflight` reports
+                    // `true` when its shard mutex is busy, `lookup_cached_fast`
+                    // reports `Unknown` when its read lock is) that can be a
+                    // sustained loss with no counter and no log at all.
                     if dns_is_inflight(h, p) {
+                        dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
                         return;
                     }
                     if dns_slow_path_limiter().available_permits() == 0 {
+                        dgram_drops::bump(&dgram_drops::SESSION_FULL);
                         return;
                     }
                     let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
                         Ok(p) => p,
-                        Err(_) => return,
+                        Err(_) => {
+                            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                            return;
+                        }
                     };
                     // Hand the resolver task its own handle on the association.
                     // It checks nothing else: a reply resolved after the
@@ -959,7 +1231,7 @@ fn dispatch_one(
                             Err(_) => return,
                         };
                         let mut pkt = bytes::BytesMut::with_capacity(256);
-                        send_reply(&entry.relay, &entry.app, dst, &payload, &mut pkt);
+                        send_reply(&entry, dst, &payload, &mut pkt);
                     });
                 }
             }
@@ -1231,6 +1503,13 @@ async fn send_auth(conn: &quinn::Connection, token: &str) -> Result<()> {
 /// check on `MQP_FRAG_MAX_PAYLOAD`: a deployment that never approaches it needs
 /// no larger cap, whatever its workload is.
 fn spawn_udp_reporter() {
+    // One reporter per process: `main` calls this once today, and a second call
+    // would double every 60 s line (the server's reporter has carried this guard
+    // since it was written).
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_err() {
+        return;
+    }
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1238,6 +1517,7 @@ fn spawn_udp_reporter() {
         let mut prev = udp_stats::snapshot();
         let mut prev_w = udp_write::snapshot();
         let mut prev_r = udp_stats::reassembly_drops();
+        let mut prev_d = dgram_drops::snapshot();
         loop {
             tick.tick().await;
             let now = udp_stats::snapshot();
@@ -1264,6 +1544,28 @@ fn spawn_udp_reporter() {
                 );
                 prev_r = now_r;
             }
+            // Every dropped datagram, including the two client-only egress paths
+            // and the DNS ones this side used to drop without a counter. Without
+            // this line the counters existed but nothing ever read them: the
+            // server's reporter printed the same block, the client's did not.
+            let now_d = dgram_drops::snapshot();
+            let dd = now_d.since(&prev_d);
+            if dd.lost() > 0 {
+                info!(
+                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (resolution in flight), {} dropped (DNS/session cap); totals too_large={} buffer_full={} no_egress={} egress_dead={} dns_inflight={} session_full={}",
+                    dd.no_egress,
+                    dd.egress_dead,
+                    dd.dns_inflight,
+                    dd.session_full,
+                    now_d.too_large,
+                    now_d.buffer_full,
+                    now_d.no_egress,
+                    now_d.egress_dead,
+                    now_d.dns_inflight,
+                    now_d.session_full
+                );
+            }
+            prev_d = now_d;
             prev = now;
             prev_w = now_w;
         }
@@ -1571,13 +1873,18 @@ async fn handle_udp_associate(
         }
     };
     udp_stats::session();
-    // Wrapper guarantees the reservation is released on every exit path,
-    // including early setup errors that used to leak the hub entry forever.
-    // `release` is unconditional because `alloc_sess` reserved the slot whether
-    // or not the association ever got as far as publishing an entry.
-    let res = udp_associate_inner(tcp, pool, hub.clone(), egress_shared, sess).await;
-    hub.release(sess);
-    res
+    // The reservation is released by a `Drop` guard, not by a statement after
+    // the call: `udp_associate_inner` is a large function whose body can panic
+    // (and a task can be dropped at an await point), and unwinding past a plain
+    // `hub.release(sess)` would leak the hub's `len` slot *and* leave the shard's
+    // `Arc<AssocEntry>` — hence the relay socket, its fd and its kernel buffers —
+    // reachable for the process lifetime. That is exactly the defect
+    // `SessMemo`'s strong `Arc` was in the server; the sibling `AliveGuard`
+    // inside the inner function was already RAII, so this is the same discipline
+    // applied to the reservation. `release` is unconditional because `alloc_sess`
+    // reserved the slot whether or not an entry was ever published.
+    let _reservation = SessReservation { hub: &hub, sess };
+    udp_associate_inner(tcp, pool, hub.clone(), egress_shared, sess).await
 }
 
 async fn udp_associate_inner(
@@ -1621,7 +1928,11 @@ async fn udp_associate_inner(
     // Ports are intentionally not pinned: RFC 1928 clients commonly send UDP
     // from a different socket/port than the TCP control connection.
     let expected_app_ip = tcp.peer_addr().ok().map(|p| unmap(p.ip()));
-    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
+    // The idle stamp lives on the entry (`AssocEntry::last`), because the reply
+    // direction has to refresh it too — see the field's note. This is only this
+    // loop's local copy of "when did I last store it", so the store stays at one
+    // per second instead of one per app datagram.
+    let mut activity_stamp = mono_millis();
     // app -> QUIC with this association's sess. Idle assoc (no packets
     // either way for 180s) is reaped so leaked TCP controls cannot hold
     // relay sockets forever (B6).
@@ -1638,10 +1949,6 @@ async fn udp_associate_inner(
     // not reset the idle timer and keep an otherwise dead association alive.
     let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Local copy of the last liveness stamp: the relay loop bumps at most once
-    // per second, but it must not pay a clock read *and* an atomic reload on
-    // every datagram to decide that.
-    let mut activity_stamp = mono_millis();
     // Local copy of the last published app address: the value almost never
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
@@ -1677,7 +1984,7 @@ async fn udp_associate_inner(
                 let now = mono_millis();
                 if now.saturating_sub(activity_stamp) >= 1000 {
                     activity_stamp = now;
-                    last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
+                    entry.touch(now);
                 }
                 if published_app != Some(app) {
                     // Cannot lose: the publish always lands, so `published_app`
@@ -1730,7 +2037,17 @@ async fn udp_associate_inner(
                                 egress_shared.memo_store(gen, &conn, limit, stamp);
                                 frag.send(&conn, sess, &addr, payload, limit)
                             }
-                            None => continue,
+                            None => {
+                                // No isolated egress connection right now: the
+                                // dedicated UDP slot has not come up, is
+                                // reconnecting, or another thread owns the
+                                // refresh gate. Counted — this used to be a bare
+                                // `continue` with no counter and no log, so a
+                                // fail-closed pool's whole loss mode was
+                                // invisible in the 60 s report.
+                                dgram_drops::bump(&dgram_drops::NO_EGRESS);
+                                continue;
+                            }
                         }
                     }
                 };
@@ -1743,15 +2060,19 @@ async fn udp_associate_inner(
                 }
                 match sent.outcome() {
                     DatagramSend::Sent => {}
+                    // `Blocked`/`TooLarge` are counted inside the fragmenter
+                    // (`dgram_drops::BUFFER_FULL` / `TOO_LARGE`).
                     DatagramSend::Blocked => {
                         tracing::debug!("client datagram dropped: send buffer full");
                     }
                     DatagramSend::TooLarge | DatagramSend::ConnectionLost => {
                         tracing::debug!("client egress stale, invalidating shared cache");
+                        dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
                         egress_shared.invalidate();
                     }
                     DatagramSend::Unsupported => {
                         tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
+                        dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
                     }
                 }
             }
@@ -1774,14 +2095,22 @@ async fn udp_associate_inner(
                 if got {
                     // An open control connection that is actively used counts
                     // as activity; only truly abandoned associations idle out.
-                    last_activity.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
+                    // Stored directly, not through `touch`: this is already
+                    // gated on an actual read.
+                    entry
+                        .last
+                        .store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
                 }
                 if closed {
                     break;
                 }
             }
             _ = idle_tick.tick() => {
-                if mono_millis().saturating_sub(last_activity.load(std::sync::atomic::Ordering::Relaxed)) >= idle_limit_ms {
+                // Both directions count: `entry.last` is refreshed by the relay
+                // loop (app datagrams, TCP control chatter) and by the
+                // dispatcher that writes a reply (`send_reply_addr`), so a
+                // receive-only flow is not reaped out from under the app.
+                if entry.idle_ms(mono_millis()) >= idle_limit_ms {
                     break;
                 }
             }
@@ -1801,27 +2130,45 @@ async fn udp_associate_inner(
 /// The scratch buffer is reused across replies: the fast path borrows it for
 /// the syscall and only WouldBlock copies into the retry queue, so there is
 /// no per-reply allocation and no aliasing with another task.
-fn send_reply(
-    relay: &Arc<tokio::net::UdpSocket>,
-    last_app: &ArcSwapOption<SocketAddr>,
-    dst: SocketAddr,
-    payload: &Bytes,
-    pkt: &mut bytes::BytesMut,
-) {
-    let Some(app) = last_app.load().as_ref().map(|a| **a) else {
+fn send_reply(entry: &AssocEntry, dst: SocketAddr, payload: &Bytes, pkt: &mut bytes::BytesMut) {
+    let Some(app) = entry.app() else {
         udp_write::no_app();
         return;
     };
-    send_reply_addr(relay, app, dst, payload, pkt);
+    send_reply_at(entry, app, dst, payload, pkt, mono_millis());
 }
 
 fn send_reply_addr(
-    relay: &Arc<tokio::net::UdpSocket>,
+    entry: &AssocEntry,
     app: SocketAddr,
     dst: SocketAddr,
     payload: &Bytes,
     pkt: &mut bytes::BytesMut,
 ) {
+    send_reply_at(entry, app, dst, payload, pkt, mono_millis());
+}
+
+/// [`send_reply_addr`] with the liveness stamp's clock read hoisted into the
+/// caller.
+///
+/// Split out so `replies_refresh_the_association_idle_stamp` can drive an
+/// arbitrary `now_ms`: the association stamp is compared against
+/// [`ASSOC_TOUCH_INTERVAL_MS`], and a test process is younger than that interval,
+/// so no reachable value of the real clock can both (a) be due and (b) be
+/// observed. Production callers pass [`mono_millis`].
+fn send_reply_at(
+    entry: &AssocEntry,
+    app: SocketAddr,
+    dst: SocketAddr,
+    payload: &Bytes,
+    pkt: &mut bytes::BytesMut,
+    now_ms: u64,
+) {
+    // A reply is activity: refresh the association's idle stamp before the
+    // syscall so a receive-only flow is not reaped at 180 s. Throttled inside
+    // (`touch`), so this is one relaxed load per datagram plus one store per
+    // second for the whole association.
+    entry.touch(now_ms);
     pkt.truncate(0);
     pkt.extend_from_slice(&[0, 0, 0]);
     // The destination of a reply is always the source address the server
@@ -1839,7 +2186,7 @@ fn send_reply_addr(
         }
     }
     pkt.extend_from_slice(payload);
-    udp_try_send_slice(relay, map_for_dual(app), &pkt[..]);
+    udp_try_send_slice(&entry.relay, map_for_dual(app), &pkt[..]);
 }
 
 #[cfg(test)]
@@ -1996,9 +2343,9 @@ mod tests {
         assert_eq!(select_slot(false, 0, &[false]), 0);
         assert_eq!(select_slot(true, 1, &[true]), 0);
         assert_eq!(select_slot(false, 7, &[false]), 0);
-        // Dual, all live: pinned -> a (0), bulk round-robins.
+        // Dual, all live: pinned -> a (0), bulk -> b (1) only.
         assert_eq!(select_slot(true, 0, &[true, true]), 0);
-        assert_eq!(select_slot(false, 0, &[true, true]), 0);
+        assert_eq!(select_slot(false, 0, &[true, true]), 1);
         assert_eq!(select_slot(false, 1, &[true, true]), 1);
         // Dual, `a` down: everything fails over to `b` (1).
         assert_eq!(select_slot(true, 0, &[false, true]), 1);
@@ -2010,34 +2357,40 @@ mod tests {
         assert_eq!(select_slot(false, 1, &[true, false]), 0);
         // Dual, both down: keep the preference for a bounded fail-fast.
         assert_eq!(select_slot(true, 0, &[false, false]), 0);
-        assert_eq!(select_slot(false, 0, &[false, false]), 0);
+        assert_eq!(select_slot(false, 0, &[false, false]), 1);
         assert_eq!(select_slot(false, 1, &[false, false]), 1);
-        // Four slots live: bulk cycles every slot, pinned never leaves 0.
+        // Four slots live: bulk cycles the three *non-interactive* slots and
+        // never takes slot 0, while pinned never leaves it. This is the
+        // isolation the pool exists for.
         for rr in 0..8 {
-            assert_eq!(select_slot(false, rr, &[true; 4]), rr % 4);
+            assert_eq!(select_slot(false, rr, &[true; 4]), 1 + rr % 3);
             assert_eq!(select_slot(true, rr, &[true; 4]), 0);
         }
         // Four slots, 0 down: pinned and bulk both fail over to the first live.
         assert_eq!(select_slot(true, 0, &[false, true, true, true]), 1);
         assert_eq!(select_slot(false, 0, &[false, true, true, true]), 1);
         // ...but a live preference is never abandoned just because a lower slot
-        // is dead: rr = 3 keeps slot 3.
-        assert_eq!(select_slot(false, 3, &[false, true, true, true]), 3);
+        // is dead: rr = 2 prefers slot 3 and keeps it.
+        assert_eq!(select_slot(false, 2, &[false, true, true, true]), 3);
         assert_eq!(select_slot(true, 0, &[false, false, true, false]), 2);
         // Every slot down: the round-robin preference is kept, so each flow
         // waits on a real slot and fails fast rather than picking a random one.
-        assert_eq!(select_slot(false, 2, &[false; 4]), 2);
+        assert_eq!(select_slot(false, 0, &[false; 4]), 1);
+        assert_eq!(select_slot(false, 2, &[false; 4]), 3);
         assert_eq!(select_slot(true, 2, &[false; 4]), 0);
     }
 
-    /// The pool is a real papaya registry: N distinct slots, bulk flows cycling
-    /// through all of them, the interactive port pinned to slot 0, and failover
-    /// driven by the maintained liveness bits.
+    /// The pool is a real papaya registry: N distinct TCP slots plus the
+    /// dedicated UDP slot, bulk flows cycling through every *non-interactive* TCP
+    /// slot, the interactive port pinned to slot 0, and failover driven by the
+    /// maintained liveness bits.
     #[test]
-    fn pool_round_robins_bulk_over_every_slot_and_pins_interactive() {
-        let pool = ConnPool::new(4, vec![53]);
-        assert_eq!(pool.slot_count(), 4, "every slot is registered");
-        assert_eq!(pool.slots.pin().len(), 4, "papaya holds all four");
+    fn pool_round_robins_bulk_over_every_non_interactive_slot() {
+        let pool = ConnPool::new(4, vec![53], true);
+        assert_eq!(pool.tcp_slots(), 4, "every TCP slot is registered");
+        assert_eq!(pool.udp_slot(), 4, "UDP is one past the TCP range");
+        assert_eq!(pool.slots_total(), 5);
+        assert_eq!(pool.slots.pin().len(), 5, "papaya holds all five");
         assert!(
             !Arc::ptr_eq(&pool.slot(0).live, &pool.slot(1).live),
             "each index is its own slot, not one shared handle"
@@ -2046,8 +2399,8 @@ mod tests {
         let interactive = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
         // All slots still down: bulk keeps its round-robin preference (bounded
         // stall), the pinned port keeps slot 0.
-        assert_eq!(pool.pick_tcp_index(&bulk), 0);
         assert_eq!(pool.pick_tcp_index(&bulk), 1);
+        assert_eq!(pool.pick_tcp_index(&bulk), 2);
         assert_eq!(pool.pick_tcp_index(&interactive), 0);
         for i in 0..4 {
             pool.slot(i)
@@ -2056,7 +2409,11 @@ mod tests {
         }
         pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
         let seq: Vec<usize> = (0..8).map(|_| pool.pick_tcp_index(&bulk)).collect();
-        assert_eq!(seq, vec![0, 1, 2, 3, 0, 1, 2, 3], "bulk spreads over all 4");
+        assert_eq!(
+            seq,
+            vec![1, 2, 3, 1, 2, 3, 1, 2],
+            "bulk spreads over the three non-interactive slots and never takes slot 0"
+        );
         for _ in 0..4 {
             assert_eq!(pool.pick_tcp_index(&interactive), 0, "pinned to slot 0");
         }
@@ -2066,19 +2423,67 @@ mod tests {
             .live
             .store(false, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(pool.pick_tcp_index(&interactive), 1);
-        assert_eq!(pool.pick_tcp_index(&bulk), 1);
+        // rr has advanced to 8 by now, so the bulk preference is slot 3 — still
+        // live, so it is kept rather than collapsed onto slot 1.
+        assert_eq!(pool.pick_tcp_index(&bulk), 3);
         assert!(Arc::ptr_eq(
             &pool.pick_tcp(&interactive).live,
             &pool.slot(1).live
         ));
     }
 
-    /// A one-slot pool is the legacy single-connection mode: every flow, pinned
-    /// or bulk, resolves to slot 0 no matter what the liveness bit says.
+    /// The regression the class-preserving failover exists for: with one bulk
+    /// slot reconnecting, a bulk flow whose round-robin preference lands on that
+    /// dead slot must take *another bulk slot*, never the interactive slot. The
+    /// pre-fix selector scanned `0..n` and returned 0 here — one flow in three
+    /// sharing the connection every interactive port rides, precisely while a
+    /// connection was degraded.
+    #[test]
+    fn bulk_failover_never_takes_the_interactive_slot() {
+        // Slots 0 (interactive), 1 (bulk), 3 (bulk) live; slot 2 (bulk) down.
+        let live = [true, true, false, true];
+        // rr = 1 prefers slot 2, which is down: fail over inside the bulk class.
+        assert_eq!(select_slot(false, 1, &live), 1);
+        assert_eq!(select_slot(false, 4, &live), 1);
+        // A live preference is still kept.
+        assert_eq!(select_slot(false, 0, &live), 1);
+        assert_eq!(select_slot(false, 2, &live), 3);
+        // Only when *no* bulk slot is live does slot 0 become the fallback.
+        assert_eq!(select_slot(false, 1, &[true, false, false, false]), 0);
+        assert_eq!(select_slot(false, 1, &[false, false, false, false]), 2);
+        // ...and a pinned flow still prefers slot 0 or the first live slot.
+        assert_eq!(select_slot(true, 0, &live), 0);
+        assert_eq!(select_slot(true, 0, &[false, true, false, true]), 1);
+        // The pool-level form of the same case.
+        let pool = ConnPool::new(4, vec![], true);
+        for i in [0usize, 1, 3] {
+            pool.slot(i)
+                .live
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+        let rr0 = pool.rr.load(std::sync::atomic::Ordering::Relaxed);
+        // Walk enough flows to hit the dead slot's round-robin turn.
+        let mut hits = [0usize; 4];
+        for _ in 0..30 {
+            hits[pool.pick_tcp_index(&bulk)] += 1;
+        }
+        assert_eq!(hits[0], 0, "bulk never lands on the interactive slot");
+        assert_eq!(hits[2], 0, "the dead bulk slot is never selected");
+        assert!(hits[1] > 0 && hits[3] > 0, "both live bulk slots are used");
+        assert!(rr0 < pool.rr.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A one-slot pool is the legacy single-TCP-connection mode: every flow,
+    /// pinned or bulk, resolves to slot 0 no matter what the liveness bit says.
+    /// UDP still gets its own connection (slot 1), so even the legacy mode keeps
+    /// the two classes off one congestion window.
     #[test]
     fn pool_of_one_slot_always_routes_to_slot_zero() {
-        let pool = ConnPool::new(1, vec![]);
-        assert_eq!(pool.slot_count(), 1);
+        let pool = ConnPool::new(1, vec![], true);
+        assert_eq!(pool.tcp_slots(), 1);
+        assert_eq!(pool.udp_slot(), 1);
+        assert_eq!(pool.slots_total(), 2);
         let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
         assert_eq!(pool.pick_tcp_index(&bulk), 0);
         assert_eq!(pool.pick_tcp_index(&bulk), 0);
@@ -2088,8 +2493,47 @@ mod tests {
         assert_eq!(pool.pick_tcp_index(&bulk), 0);
         // The constructor clamps, so a wider pool can never be built than the
         // routing path's stack liveness array can describe.
-        assert_eq!(ConnPool::new(999, vec![]).slot_count(), MAX_POOL_CONNS);
-        assert_eq!(ConnPool::new(0, vec![]).slot_count(), 1);
+        assert_eq!(ConnPool::new(999, vec![], true).tcp_slots(), MAX_POOL_CONNS);
+        assert_eq!(ConnPool::new(0, vec![], true).tcp_slots(), 1);
+        // Clamping holds for the physical registry too: `tcp + 1` slots.
+        assert_eq!(
+            ConnPool::new(999, vec![], true).slots_total(),
+            MAX_POOL_CONNS + 1
+        );
+    }
+
+    /// The dedicated UDP slot is outside every TCP range, and the fail-closed
+    /// policy keeps egress on it: a datagram is never handed a TCP slot's
+    /// connection, whatever the rest of the pool is doing.
+    #[test]
+    fn udp_egress_is_confined_to_the_dedicated_slot() {
+        let pool = ConnPool::new(4, vec![], true);
+        assert_eq!(pool.udp_slot(), 4);
+        assert!(pool.udp_slot() >= pool.tcp_slots());
+        // Bulk rotation can never reach the UDP slot, live or dead.
+        for rr in 0..16 {
+            let i = select_slot(false, rr, &[true; 4]);
+            assert!(i < pool.tcp_slots(), "rr={rr} picked {i}");
+        }
+        // Fail-closed: exactly one candidate.
+        let egress = SharedEgress::default();
+        let (order, k) = egress.egress_order(&pool);
+        assert_eq!(k, 1, "fail-closed egress has a single candidate");
+        assert_eq!(order[0], pool.udp_slot());
+        // Fallback allowed: UDP first, then interactive, then bulk — and the UDP
+        // slot appears exactly once.
+        let pool = ConnPool::new(4, vec![], false);
+        let (order, k) = egress.egress_order(&pool);
+        assert_eq!(k, pool.slots_total());
+        assert_eq!(&order[..5], &[4, 0, 1, 2, 3]);
+        assert_eq!(
+            order[..k].iter().filter(|&&i| i == pool.udp_slot()).count(),
+            1
+        );
+        // The one-slot legacy pool still separates the classes.
+        let pool = ConnPool::new(1, vec![], true);
+        let (order, k) = egress.egress_order(&pool);
+        assert_eq!((order[0], k), (1, 1));
     }
 
     /// Loopback QUIC endpoint pair through the same public TLS/transport
@@ -2139,6 +2583,7 @@ mod tests {
             conn: conn.clone(),
             limit: 1200,
             stamp_ms: now,
+            slot: 0,
         })));
         e.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2169,6 +2614,122 @@ mod tests {
             sess: u32::MAX,
             entry: None,
         })
+    }
+
+    /// The dispatcher cache must never be the last owner of an association's
+    /// relay socket.
+    ///
+    /// A cached binding outlives the association: the hub drops its entry and the
+    /// association task exits, but the cache entry is only re-validated when
+    /// another datagram for the *same session id* arrives. With a strong `Arc`
+    /// there, every retired association stayed cached — up to `DISPATCH_CACHE`
+    /// dead relay sockets, each an fd plus 2 x 256 KiB of kernel buffers, per
+    /// dispatcher — until a colliding session id happened to arrive or the
+    /// connection was redialed. Measured before the fix: 1200 short-lived
+    /// associations left 1024 UDP fds open in the client.
+    #[tokio::test]
+    async fn dispatch_cache_does_not_own_the_relay_socket() {
+        let hub = Arc::new(UdpHub::new());
+        let a = test_assoc().await;
+        hub.subscribe(7, a.entry.clone());
+        let mut cache = empty_dispatch_cache();
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            7,
+            dgram(7, b"hello"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(
+            cache[7 & (DISPATCH_CACHE - 1)].entry.is_some(),
+            "the dispatcher must have cached the binding"
+        );
+
+        let weak = Arc::downgrade(&a.entry);
+        let weak_relay = Arc::downgrade(&a.entry.relay);
+        hub.release(7); // the association exits: hub entry and slot released
+        drop(a); // ... and its own Arc goes with the task
+                 // The relay socket can still be in the global `WouldBlock` retry pool for
+                 // a moment — the first send on a fresh socket is answered with
+                 // `WouldBlock` on this platform — so poll briefly instead of demanding
+                 // instant release.
+        let mut released = false;
+        for _ in 0..100 {
+            if weak.upgrade().is_none() && weak_relay.upgrade().is_none() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            released,
+            "the dispatcher cache must not keep a retired association's relay socket alive"
+        );
+    }
+
+    /// UDP egress must stay on the connection it first used while that
+    /// connection is alive.
+    ///
+    /// Re-running the slot scan on every refresh moved every association back
+    /// onto the interactive slot the moment that slot recovered: a second
+    /// target-side source-port change (the server builds a new session on the new
+    /// connection) for a flow that had already failed over, which is the
+    /// flap-back the docs promise not to do. The pool here has *no* live slot,
+    /// which is the sharpest form of the check: a scan-based refresh gives up
+    /// (`None`, so the datagram is dropped), while the sticky path still serves
+    /// the live cached handle.
+    #[tokio::test]
+    async fn egress_stays_on_its_connection_while_it_lives() {
+        let (conn, _c, _s) = real_connection().await;
+        let pool = ConnPool::new(2, Vec::new(), true);
+        let e = SharedEgress::default();
+        let now = mono_millis();
+        // Cached, but past the freshness window, so a refresh is required. Slot
+        // 2 is this pool's dedicated UDP slot, which is what a fail-closed pool
+        // can legitimately hold.
+        e.cached.store(Some(Arc::new(EgressCache {
+            conn: conn.clone(),
+            limit: 1200,
+            stamp_ms: now.saturating_sub(EGRESS_REFRESH_MS),
+            slot: pool.udp_slot(),
+        })));
+        let (got, limit, stamp) = e
+            .refresh_global(&pool, now)
+            .expect("a live cached connection must be reused, not re-picked");
+        assert_eq!(
+            got.stable_id(),
+            conn.stable_id(),
+            "the cached connection must survive the refresh"
+        );
+        assert_eq!(stamp, now, "the refresh re-stamps the cached handle");
+        assert!(
+            limit > 0,
+            "the DATAGRAM budget is re-read from the live path"
+        );
+        assert_eq!(
+            e.cached.load().as_ref().map(|c| c.conn.stable_id()),
+            Some(conn.stable_id()),
+            "the published handle must still be that same connection"
+        );
+
+        // Once it is really gone the refresh falls back to the pool scan — and
+        // with nothing live there is nothing to select, so the caller drops the
+        // datagram instead of writing into a dead connection.
+        conn.close(0u32.into(), b"test");
+        for _ in 0..1000 {
+            if conn.close_reason().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(conn.close_reason().is_some(), "close must be observable");
+        assert!(
+            e.refresh_global(&pool, now).is_none(),
+            "a dead cached handle with no live slot must not be re-served"
+        );
     }
 
     /// A fake association: a dual-stack relay socket (the production shape —
@@ -2354,6 +2915,191 @@ mod tests {
                 .is_none(),
             "the dead slot must have been re-probed away"
         );
+    }
+
+    /// The hub-probe path must filter liveness, not just publication.
+    ///
+    /// `dispatch_dead_entry_reprobes_and_drops` above releases the hub entry, so
+    /// the map is already empty and `hub.entry` returns `None`. The window that
+    /// test does not cover is the real one: `AliveGuard` clears the bit when the
+    /// association exits, and the entry leaves the shard only later (in
+    /// `UdpHub::release`, or never if that release is unwound past). A reply in
+    /// that window was written into a socket nobody reads — the exact thing the
+    /// cache-hit path filters with `is_alive`.
+    #[tokio::test]
+    async fn dispatch_published_but_dead_entry_is_dropped() {
+        let hub = UdpHub::new();
+        let a = test_assoc().await;
+        let sess = hub.alloc_sess().unwrap();
+        hub.publish(sess, a.entry.clone());
+        let mut cache = empty_dispatch_cache();
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"a"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(recv_reply(&a.app).await.is_some());
+
+        // The association has exited, but its entry is still published: this is
+        // the `AliveGuard`-before-`release` window.
+        a.entry
+            .alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(hub.entry(sess).is_some(), "the entry is still published");
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"b"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(
+            no_reply(&a.app).await,
+            "a published-but-dead association must not receive replies"
+        );
+        assert!(
+            cache[(sess as usize) & (DISPATCH_CACHE - 1)]
+                .entry
+                .is_none(),
+            "the dead entry must not be cached"
+        );
+    }
+
+    /// A reply is activity: the association's idle stamp is refreshed on the
+    /// inbound direction, so a flow that is receive-only after its first request
+    /// is not reaped at 180 s while the server-side session is still live. The
+    /// clock is injected (`send_reply_at`) because a test process is younger than
+    /// one touch interval, so no real stamp could be both due and observable.
+    #[tokio::test]
+    async fn replies_refresh_the_association_idle_stamp() {
+        let a = test_assoc().await;
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        let dst: SocketAddr = "203.0.113.7:53".parse().unwrap();
+        let payload = Bytes::from_static(b"reply");
+        let app = a.entry.app().expect("the app address is published");
+
+        // An association that has been idle for four touch intervals.
+        let now = ASSOC_TOUCH_INTERVAL_MS * 4;
+        a.entry.last.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(a.entry.idle_ms(now) >= ASSOC_TOUCH_INTERVAL_MS);
+
+        send_reply_at(&a.entry, app, dst, &payload, &mut pkt, now);
+        assert_eq!(
+            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
+            now,
+            "the reply must have refreshed the idle stamp"
+        );
+        assert!(a.entry.idle_ms(now) < ASSOC_TOUCH_INTERVAL_MS);
+        assert!(
+            recv_reply(&a.app).await.is_some(),
+            "the reply still goes out"
+        );
+
+        // The throttle holds: inside the interval the stamp is not rewritten,
+        // and at the boundary it is.
+        send_reply_at(
+            &a.entry,
+            app,
+            dst,
+            &payload,
+            &mut pkt,
+            now + ASSOC_TOUCH_INTERVAL_MS - 1,
+        );
+        assert_eq!(
+            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
+            now,
+            "within the touch interval the stamp is not rewritten"
+        );
+        let later = now + ASSOC_TOUCH_INTERVAL_MS;
+        send_reply_at(&a.entry, app, dst, &payload, &mut pkt, later);
+        assert_eq!(
+            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
+            later,
+            "at the boundary the stamp advances"
+        );
+    }
+
+    /// The dispatcher path (not just `send_reply_at`) is what production uses, so
+    /// pin that `dispatch_one` reaches the same stamp update.
+    #[tokio::test]
+    async fn dispatch_refreshes_the_idle_stamp() {
+        let hub = UdpHub::new();
+        let a = test_assoc().await;
+        let sess = hub.alloc_sess().unwrap();
+        hub.publish(sess, a.entry.clone());
+        let mut cache = empty_dispatch_cache();
+        let mut reasm = DgramReassembler::new();
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        // Zero is always older than one touch interval *once the process clock has
+        // passed that interval*, which is the one thing a just-started test binary
+        // cannot assume: `touch` would then see `now - 0 < interval` and correctly
+        // decline to store. Wait the remainder out (≤ one interval, once per test
+        // binary) so the assertion below tests the dispatcher, not the clock.
+        let shortfall = ASSOC_TOUCH_INTERVAL_MS.saturating_sub(mono_millis());
+        if shortfall > 0 {
+            tokio::time::sleep(Duration::from_millis(shortfall + 5)).await;
+        }
+        a.entry.last.store(0, std::sync::atomic::Ordering::Relaxed);
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"reply"),
+            &mut reasm,
+            &mut pkt,
+        );
+        assert!(recv_reply(&a.app).await.is_some());
+        assert!(
+            a.entry.last.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the dispatcher must refresh the idle stamp"
+        );
+        hub.release(sess);
+    }
+
+    /// The hub reservation is released by a `Drop` guard, so a panic in the
+    /// association body cannot leak the process-wide slot or the shard's strong
+    /// `Arc<AssocEntry>` (the relay socket's last owner). The reservation is the
+    /// one release in this file that used to be a plain statement after an
+    /// `.await`, which unwinding skips.
+    #[tokio::test]
+    async fn association_reservation_survives_a_panicking_body() {
+        let hub = Arc::new(UdpHub::new());
+        let sess = hub.alloc_sess().unwrap();
+        let before = hub.len.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(before, 1, "one association reserved");
+
+        let h = hub.clone();
+        let joined = tokio::spawn(async move {
+            let _res = SessReservation { hub: &h, sess };
+            // A body that panics for any reason: a `?`-less failure, an
+            // unexpected `None`, a poisoned helper.
+            panic!("association body panicked");
+        })
+        .await;
+        assert!(joined.is_err(), "the task must have unwound");
+
+        assert_eq!(
+            hub.len.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the reserved slot must come back on unwinding"
+        );
+        assert!(
+            hub.entry(sess).is_none(),
+            "the released id must not stay published"
+        );
+        // The budget is reusable: a later association still gets an id. Ids are
+        // not recycled by a monotonic counter (`alloc_sess`'s reuse-distance
+        // note), so this asserts availability, not identity.
+        let next = hub.alloc_sess().expect("the budget must be reusable");
+        assert_ne!(next, 0);
+        hub.release(next);
+        assert_eq!(hub.len.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[tokio::test]

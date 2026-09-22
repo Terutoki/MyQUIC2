@@ -10,7 +10,7 @@ QUIC (TLS 1.3, BBR congestion control, GSO/GRO batching, 0-RTT resumption,
 ALPN `h3` by default for masquerade, `myquic2/2` opt-in for a versioned fail-closed handshake).
 
 ```
-[ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (4 connections by default)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
+[ App ] --TCP/UDP--> [ myquic2-client :1080 ] ==QUIC (4 TCP + 1 UDP connection by default)==> [ myquic2-server :8443 ] --TCP/UDP--> [ Internet ]
 ```
 
 The 2026-09 hardening revision adds optional shared-secret client authentication,
@@ -75,16 +75,23 @@ bulk) plus a `kill -9` → restart cycle (detection 15.4 s, redial 0.13 s, the
 pre-kill UDP association self-healed) and an interleaved A/B against the
 pass-21 binaries — see
 [Verification & E2E Tests](#verification--e2e-tests).
-The current revision raises the client's connection-pool default from two
-connections to **four** and moves the slot registry to a lock-free
-`papaya::HashMap`, so bulk TCP spreads across four congestion windows while UDP
-and `interactive_ports` stay pinned to slot 0; `quic_conns` (1–8) overrides it.
+The current revision gives the client's UDP egress its **own dedicated QUIC
+connection**, separate from every TCP slot, and fixes the class-preserving bulk
+failover, the retry-pool deadline, the association liveness stamp and the client's
+drop accounting — see
+[pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline).
+The pool default stays at four **TCP** connections (`quic_conns` 1–8), so a client
+now dials `quic_conns + 1`: bulk TCP spreads across the bulk slots while UDP never
+shares a congestion window — or a packet payload — with a TCP flow.
 The lock file was refreshed to the newest in-range version of every dependency
 (11 patch bumps; the quinn/quinn-proto/quinn-udp, tokio, time and rcgen versions
-the docs cite did not move). Its unit + clippy + fmt suite, a fresh real-binary
-E2E (4 connections established, TCP/UDP echo, `kill -9` → 4-slot reconnect) and a
-full four-level cross-build of `dist/` re-verified under x86-64 emulation are
-recorded in [Verification & E2E Tests](#verification--e2e-tests).
+the docs cite did not move). Its unit + clippy + fmt suite (90/90, and 89/89 with
+`--no-default-features`), a fresh real-binary E2E (5 connections established —
+4 TCP + the dedicated UDP slot, TCP/UDP echo including the fragment path, 0 % loss
+across 16 associations, the fail-closed drop counter, and self-healing after a
+`kill -9`) and a full four-level cross-build of `dist/` re-run end-to-end under
+x86-64 emulation are recorded in
+[Verification & E2E Tests](#verification--e2e-tests).
 
 ---
 
@@ -106,7 +113,7 @@ recorded in [Verification & E2E Tests](#verification--e2e-tests).
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch) and [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -117,7 +124,7 @@ recorded in [Verification & E2E Tests](#verification--e2e-tests).
 | Area | Detail |
 |---|---|
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
-| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, four QUIC connections per client by default (`quic_conns`, clamped 1–8; bulk round-robin, interactive pinning, failover) — `quic_conns = 1` restores a single shared connection |
+| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, four **TCP** connections per client by default (`quic_conns`, clamped 1–8; bulk round-robin, interactive pinning, class-preserving failover) plus one dedicated UDP connection, so TCP and UDP never share a congestion window — `quic_conns = 1` restores a single shared TCP connection |
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
@@ -129,7 +136,7 @@ recorded in [Verification & E2E Tests](#verification--e2e-tests).
 | **Hard bounds** | 4096 concurrent QUIC connections (256 pre-auth), 8192 UDP sessions process-wide, 4 MB per-connection receive window default |
 | **DNS** | Resolved **server-side** (correct egress geo, no client resolver cost): 60 s positive / 10 s negative cache, single-flight, 1024-entry slow-path limiter |
 | **High-RTT tuned** | 2 MB per-stream / 4 MB aggregate receive window, 2 MB send window by default (~114 Mb/s at 140 ms, minimal loaded queue) — 4/8/4 MB opt-in for ~240 Mb/s, 8/16/8 MB for 300 Mb/s — plus a 190 ms `initial_rtt`, ACK-every-2nd-packet with 5 ms `max_ack_delay` by default, and a 1472 B PMTU search ceiling |
-| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.4 MB stripped each (rebuilt from this revision, four-connection default included) |
+| **Releases** | Static musl binaries for OpenWrt x86-64 at four CPU levels (v1–v4), ~4.4 MB stripped each (rebuilt from this revision, dedicated UDP egress included) |
 
 ---
 
@@ -141,7 +148,7 @@ Single crate, three units sharing one protocol library:
 |---|---|---|
 | `myquic2` (lib) | `src/lib.rs` | MQP-2 codec (owned + borrowed forms), TOML config schema, TLS/cert helpers, QUIC transport builder, TCP↔QUIC bridge |
 | `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; token auth; self-signed cert issuance |
-| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; papaya-backed N-slot connection pool (4 by default) with a reconnect loop + DATAGRAM dispatcher per slot; per-association UDP relay; token auth |
+| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; papaya-backed N-slot TCP connection pool (4 by default) plus a dedicated UDP egress slot, each with a reconnect loop + DATAGRAM dispatcher; per-association UDP relay; token auth |
 | `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | End-to-end 0-RTT verification probe (with token support) |
 
 **Data-plane mapping:**
@@ -166,8 +173,9 @@ Single crate, three units sharing one protocol library:
 **Concurrency model:** Tokio multi-threaded runtime. The server spawns one task per
 incoming connection (handshake included), one DATAGRAM reader and one session sweeper
 per connection, and one lightweight reader task per UDP session. The client keeps a
-pool of QUIC connections (4 by default, `quic_conns`, clamped 1–8) sharing one
-Endpoint/UDP socket, each slot with its own reconnect loop and DATAGRAM dispatcher; one
+pool of QUIC connections (4 TCP by default, `quic_conns`, clamped 1–8, **plus one
+dedicated UDP egress connection**) sharing one Endpoint/UDP socket, each slot with
+its own reconnect loop and DATAGRAM dispatcher; one
 task per SOCKS connection and one relay + reply task per UDP association. Subscriptions
 die with their association, so stale tasks can never steal another session's packets.
 The pool's slot registry is a lock-free `papaya::HashMap` keyed by slot index: slots are
@@ -176,17 +184,23 @@ pin plus an integer hash lookup — no lock, no per-flow allocation, and nothing
 reclaimer to collect on that path.
 
 **Connection isolation (client):** quinn 0.11 exposes no per-stream priority, so
-separate congestion windows are the isolation mechanism. Bulk TCP spreads round-robin
-across every slot of the pool while ports in `interactive_ports` (default DNS/NTP/STUN)
-plus **all UDP** pin to slot 0, so a latency probe never queues behind bulk on the same
-cwnd. Routing is liveness-aware: a dead preferred slot fails over to the first live slot
-(returning flows stay on their slot; all slots dead fails the flow fast via the normal
-reconnect timeout). Isolation holds while more than one connection is alive: with a
-single live connection every flow shares one cwnd. UDP egress is sticky to its
-connection while it lives (no flap-back churn when the preferred slot recovers;
-new associations prefer the interactive slot again). The TCP open header is always its own write, never batched
-behind first application bytes, so server-first peers (game logins, banners) see it
-within ~100 ms.
+separate congestion windows are the isolation mechanism — and because
+`quinn-proto` fills every packet with queued DATAGRAM frames *before* STREAM frames,
+"separate congestion windows" is also the only way to stop a bulk UDP flow from
+starving the TCP streams that share its connection. The pool therefore has three
+classes of slot: slot 0 is the **interactive** connection (every port in
+`interactive_ports`, default DNS/NTP/STUN), slots `1..quic_conns` are the **bulk**
+class (bulk TCP round-robin), and slot `quic_conns` is the **dedicated UDP egress**
+connection — UDP is never one of the TCP slots. Class-preserving failover: a dead
+bulk preference fails over to another *bulk* slot, and only a pool with no live bulk
+slot at all shares slot 0; UDP is fail-closed by default (`udp_fail_closed`), i.e. a
+datagram with no isolated connection to go out on is dropped and counted in the 60 s
+`udp budget` line rather than queued behind TCP traffic. Returning TCP flows stick to
+their slot for life; UDP egress is sticky to its connection while it lives. Isolation
+holds while more than one connection is alive: with `quic_conns = 1` all *TCP* shares
+one cwnd (UDP still does not). The TCP open header is always its own write, never
+batched behind first application bytes, so server-first peers (game logins, banners)
+see it within ~100 ms.
 
 ---
 
@@ -444,6 +458,7 @@ before every run):
 | 46 | `WouldBlock` retry pool re-arms a shard whose worker died with its runtime. Each shard's `Sender` used to live in a `OnceLock` forever while its worker was a task on whichever runtime first needed it, so any later runtime (a test binary has one per `#[tokio::test]`; an embedder may have several) queued retries into a closed channel and the datagram was dropped silently, charged to a budget counter that had not been touched. Each shard publishes its sender through an `ArcSwap` and re-arms on demand; the probe against the old code printed `queued=false delivered=false`, and the new regression test `retry_shard_is_rearmed_after_its_runtime_ends` passes. Effect on the suite: the client bin went **0/5 → 5/5 green when run serially** (the file's runtime churn hit it every run) and the full suite to **10/10** on the default feature set and 4/4 on `--no-default-features` | ✅ |
 | 47 | `dist/` rebuilt from this revision for all four CPU levels (static musl, stripped; clients 4 390 120–4 416 280 B, servers 4 325 792–4 348 536 B, i.e. +4 992–5 120 / +6 432–6 512 B per level for the retry-pool and memo changes) and re-verified under amd64 emulation (Podman on Apple Silicon) **using the repo's own harness** — the `hotpath_bench` example built for the same musl target, so no external tooling is involved. On the v1 pair: 4 connections, 0 dial failures, 4 server accepts; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 160 000 sent / 159 993 received; `udpmulti` 16 associations 603 728 received at 0.082 % loss; 40 domain-target TCP `CONNECT`s; `udpdomainswitch` **1000 alpha + 1000 beta, 0 misrouted** and `udpipswitch` **1000 IP + 1000 domain, 0 misrouted**. A second four-level build came out byte-identical (`sha256` equal for all eight files), and v3 runs / v4 dies with exit 132 under the emulated CPU, with `zmm` = 0/0/0/235 and `ymm` 3 978 → 26 900 | ✅ |
 | 48 | Post-audit fixes (pass 24): session-memo ownership, sweeper re-check, connection-pin deadline, `dns_inflight` accounting. `cargo test --all-targets` **79/79** (45 lib + 18 client + 16 server; **78/78** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. E2E on the fixed binaries: `udpdomainswitch` 500 alpha + 500 beta and `udpipswitch` 500 IP + 500 domain inside one session, **0 misrouted**; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 4 000 sent / 3 999 received; 20 TCP flows with replies; a 40-datagram burst at an uncached name reported as `9 dropped (resolution in flight)` in the new counter. The fd leak is closed, measured with `lsof`: 100 associations on one connection, client `kill -9`, then **1** UDP fd (the listener) after the QUIC idle timeout, against **85** on the previous binary. `dist/openwrt-x86_64/` was rebuilt for all four CPU levels from this revision (static musl, x86-64, stripped; servers 4 327 072–4 349 816 B, +1 216–1 536 B per level; clients 4 390 120–4 416 280 B, same sizes as before) — `file` confirms the format, a second four-level build came out byte-identical at every level, and `objdump -d` finds 273 `zmm` refs in v4 with none in v1/v3 (`ymm` 3 978 → 25 306 from v1 to v3), so each `target-cpu` level really is compiled in. The emulated-container re-run was **not** repeated here (the local Podman machine did not respond): the dist artifacts are cross-compiled and statically checked, while the native-binary E2E below is green | ✅ |
+| 49 | Pass 25 — dedicated UDP egress and the pool audit. `cargo test --all-targets` **90/90** (47 lib + 26 client + 17 server; **89/89** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Native-binary E2E (macOS loopback, the repo's own `hotpath_bench` harness): the client logs `quic pool: 4 TCP connection(s) … + 1 dedicated UDP connection (slot 4), UDP is fail-closed` and the server logs exactly **5** `new QUIC conn`; `tcpecho` 64 KiB byte-for-byte; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim**; `udpmulti` 16 associations × 400 = **6400/6400, 0.000 % loss** at 19 451 pps. `quic_conns = 1` dials **2** connections (1 TCP + 1 UDP) and still passes TCP plus the full UDP sweep, so the separation is structural rather than load-dependent. With every connection dead (`kill -9` the server), the next 60 s line reads `66 dropped (no egress connection)` — the fail-closed path counted and reported instead of sharing a TCP connection silently — and after the restart the same client logs 2 `QUIC connected` with TCP and the 8/8000 B sweep green again. `dist/` was rebuilt for all four CPU levels (clients 4 401 896–4 425 288 B, servers 4 334 320–4 361 992 B; `file` confirms static musl + stripped) and the **shipped v1 pair was re-run end-to-end under amd64 emulation** (Podman on Apple Silicon, the `hotpath_bench` example cross-built for the same musl target): 5 connections accepted, `tcpecho` 256 KiB byte-for-byte, `udpsweep` 8/1200/1430/8000 B **4/4 verbatim**, `udpmulti` 8 × 200 = **1600/1600, 0.000 % loss**; `objdump -d` finds 235 `zmm` refs in v4 and none in v1–v3 (`ymm` 3 978 → 27 045 from v1 to v3), so each `target-cpu` level is compiled in | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -574,19 +589,22 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (the four-connection pool default and its
-`papaya` slot registry, the conditional destination-memo writes, the re-arming
-`WouldBlock` retry pool, and pass 24's session-memo ownership / sweeper re-check /
-connection-pin deadline fixes, on top of pass-23's lock-free client control plane and
-the cache-substitution pass's DNS/destination memos, against the refreshed
-`Cargo.lock`) with the default feature set, so the relay counters are **on** in these
-builds: static musl, x86-64, stripped, 4 327 072–4 416 280 B (clients 4 390 120–4 416 280,
-servers 4 327 072–4 349 816) each. Against the previous rebuild the servers grew
-1 216–1 536 B per level (the pass-24 changes) while the client artifacts came out the
-same size per level, though their bytes differ. The earlier growth was the client
-4 992–5 120 B and the server 6 432–6 512 B per level (the retry pool's `ArcSwap` shard
-table plus the memo path changes). Three upgrade notes, all requiring **both** sides to
-be replaced together (plus two notes below that need no binary change):
+rebuilt from the current revision (pass 25's dedicated UDP egress slot,
+class-preserving bulk failover, retry-pool deadline and client drop accounting, on top
+of the four-connection pool default and its `papaya` slot registry, the conditional
+destination-memo writes, the re-arming `WouldBlock` retry pool, and pass 24's
+session-memo ownership / sweeper re-check / connection-pin deadline fixes, pass-23's
+lock-free client control plane and the cache-substitution pass's DNS/destination memos,
+against the refreshed `Cargo.lock`) with the default feature set, so the relay counters
+are **on** in these builds: static musl, x86-64, stripped, 4 334 320–4 425 288 B
+(clients 4 401 896–4 425 288, servers 4 334 320–4 361 992) each. Against the previous
+rebuild the clients grew 8 496–11 904 B and the servers 7 248–12 176 B per level (the
+pass-25 changes: the UDP slot and its egress order, the six-counter `DropSnapshot`, the
+association liveness stamp, the RAII reservation and the idle-first session sweep). The
+earlier growth was the client 4 992–5 120 B and the server 6 432–6 512 B per level (the
+retry pool's `ArcSwap` shard table plus the memo path changes). Three upgrade notes, all
+requiring **both** sides to be replaced together (plus two notes below that need no
+binary change):
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a
@@ -607,6 +625,17 @@ be replaced together (plus two notes below that need no binary change):
   the extra congestion windows only appear once the client binary is replaced.
   Omitting the field means "that build's own default", so an untouched old config
   keeps behaving exactly as before after an upgrade.
+- Pass-25 note (client only, no wire change): a client built from this revision dials
+  one connection **more** than `quic_conns` (`quic_conns + 1`, ≤ 9) and moves UDP
+  egress onto that dedicated connection, so the server sees 5 connections where it
+  used to see 4. Two consequences for an operator: the extra connection costs one
+  keepalive/dial loop on both ends, and `udp_fail_closed` defaults to `true`, so UDP
+  datagrams are *dropped* (and counted in the 60 s `udp budget` line) while the UDP
+  connection is reconnecting instead of falling back onto a TCP connection. Set
+  `udp_fail_closed = false` to keep the old always-share-a-connection behaviour.
+  The client's association cap also drops 4096 → 4032 to match what the server keeps
+  alive per connection. A new client against an old server, or an old client against
+  a new server, is fully wire-compatible: the pool size is a local decision.
 
 Verified by running the v1 pair under x86-64 emulation (Podman's amd64 runtime on
 Apple Silicon): both binaries execute, the QUIC handshake completes, and the full E2E
@@ -690,9 +719,9 @@ gso = true
 keep_alive_secs = 5           # clamped to 1..3600; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
 auth_token = ""                     # must match the server (empty on both = disabled)
-# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, 4 connections):
+# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, 4 TCP + 1 UDP connection):
 # stream_receive_window_mb, receive_window_mb, send_window_mb,
-# ack_threshold, max_ack_delay_ms, quic_conns = 1..8 (1 = single), interactive_ports, alpn
+# ack_threshold, max_ack_delay_ms, quic_conns = 1..8 (1 = single TCP), udp_fail_closed, interactive_ports, alpn
 ```
 
 Field notes:
@@ -712,13 +741,20 @@ Field notes:
   e.g. a 200M/140ms link (BDP 3.5 MB) is already served by the 2/4/2 MB default:
   single-thread caps at ~114 Mb/s while multi-thread still fills the link with
   minimal loaded latency.
-- `quic_conns = 4` (default, clamped 1–8) sets the pool size: bulk TCP spreads
-  round-robin across every slot, so each connection's congestion window holds ~1/n
-  of the queue. `1` restores the legacy single connection; the cap bounds what a
-  config typo can request, since every slot owns a dial loop, a DATAGRAM dispatcher,
-  keepalives and its own 0-RTT ticket state. `interactive_ports` pins
-  latency-sensitive TCP ports to slot 0 (default 53/123/3478–3481); all UDP always
-  rides it. A dead slot fails over to the first live one automatically.
+- `quic_conns = 4` (default, clamped 1–8) sets the **TCP** pool size: bulk TCP
+  spreads round-robin across the bulk slots, so each connection's congestion window
+  holds ~1/(n−1) of the queue, while `interactive_ports` (default 53/123/3478–3481)
+  pin to slot 0. `1` restores the legacy single shared TCP connection; the cap
+  bounds what a config typo can request, since every slot owns a dial loop, a
+  DATAGRAM dispatcher, keepalives and its own 0-RTT ticket state. One further
+  connection is always dialed for UDP (slot `quic_conns`), so a client's worst case
+  is 9 connections; UDP never shares a TCP connection's congestion window, and a
+  dead bulk slot fails over to another *bulk* slot before it will touch slot 0.
+- `udp_fail_closed` (default `true`) decides what UDP does while its dedicated
+  connection is reconnecting: drop the datagram — counted, and reported in the 60 s
+  `udp budget` line — rather than put it on a TCP connection. Set it to `false` to
+  restore the old fallback (interactive slot, then bulk slots), which keeps UDP
+  flowing at the cost of sharing a cwnd and a packet payload with TCP traffic.
 - `alpn` defaults to `h3` masquerade (label only); `myquic2/2` restores the
   versioned fail-closed handshake. Same value required on both sides.
 - Paths are resolved against the process CWD — use absolute paths on OpenWrt.
@@ -2174,6 +2210,114 @@ scope so the pin's deadline is unit-testable. Regression tests:
 `session_memo_does_not_own_the_socket`,
 `sweep_recheck_keeps_a_session_touched_after_the_snapshot`,
 `conn_pin_stops_answering_when_its_ttl_expires`.
+
+---
+
+### 2026-09 hardening pass 25 — dedicated UDP egress, class-preserving failover, retry deadline
+
+Pass 24 fixed the server's UDP session paths. This pass applies the same audit to
+the **client connection pool** and finds that three of its defects are the same
+classes, plus a routing bug that defeats the isolation the pool exists for. No wire
+change: no frame, framing, ALPN or protocol field is touched, so mixed old/new pairs
+keep working. One behaviour change is intentional and documented below (UDP is now
+fail-closed by default).
+
+- **UDP gets its own connection (the pool's central fix).** Every UDP association in
+  the process rode slot 0 — the same QUIC connection as the `interactive_ports` TCP
+  flows — through one process-global `SharedEgress`. TCP and UDP on one connection is
+  not a latency nicety: `quinn-proto`'s `populate_packet` writes queued **DATAGRAM
+  frames before STREAM frames** (verified in 0.11.18,
+  `src/connection/mod.rs:3353` then `:3409`), so a bulk UDP flow (HTTP/3 over UDP:443,
+  WireGuard, video) takes the packet payload and the shared congestion window ahead of
+  the TCP streams on that connection, and a bulk TCP flow makes every UDP datagram hit
+  the 1 MiB datagram send-buffer `Blocked` drop. The pool now has three classes of
+  slot: `0` interactive, `1..quic_conns` bulk, and `quic_conns` a **dedicated UDP
+  egress connection** — an *extra* slot, so `quic_conns` keeps its meaning ("TCP pool
+  size") and the UDP fix costs TCP no congestion window. Clients dial `quic_conns + 1`
+  connections (≤ 9). `udp_fail_closed` (default `true`) keeps a datagram off a TCP
+  connection entirely while the UDP slot reconnects: it is dropped and counted in the
+  60 s `udp budget` line instead of sharing a cwnd; `false` restores the fallback.
+- **Bulk failover can no longer take the interactive slot.** `select_slot`'s failover
+  was `(0..n).find(|&i| live[i])`, which starts at slot 0, so whenever a flow's
+  round-robin preference happened to be a *dead* bulk slot it returned the interactive
+  connection — even with two live bulk slots available. One dead bulk connection
+  therefore put `1/(n-1)` of new bulk flows onto the connection every UDP association
+  and every interactive port rides, i.e. it broke the isolation exactly when a
+  connection was already degraded, contradicting the function's own documentation
+  ("bulk never takes the interactive slot while another slot is live"). Failover is now
+  class-preserving: another bulk slot first, slot 0 only when no bulk slot is live.
+  Proven before the fix with the function extracted verbatim (`live = [true, true,
+  false, true]`: `rr=1 → slot 0` instead of slot 1) and pinned by
+  `bulk_failover_never_takes_the_interactive_slot` plus the pool-level form.
+- **The retry pool's strong `Arc<UdpSocket>` has a deadline.** A queued `UdpRetry` is
+  the *last* strong owner of its socket once the association (client relay) or session
+  (server session socket) drops its own handle, and the worker awaited `send_to` with no
+  timeout: a socket that never became writable pinned the fd — the server's session
+  sockets carry 2 × 256 KiB kernel buffers — for the process lifetime *and* wedged the
+  shard, so no later datagram hashing to that shard was ever retried. This is pass 24's
+  C1/C3 class surviving in the shared library, which both binaries link. `retry_one`
+  now sends under a 200 ms `UDP_RETRY_TIMEOUT` and counts the timeout as
+  `udp_write::retry_failed`; `retry_deadline_bounds_a_never_writable_socket` drives the
+  deadline with a never-ready future, so the bound is testable without a socket that
+  happens to stay unwritable.
+- **The client counts and reports the drops it used to swallow.** `dgram_drops` gained
+  `NO_EGRESS` (no isolated connection: cold start, reconnect, or a lost single-flight
+  refresh race) and `EGRESS_DEAD` (send found the connection gone / DATAGRAM
+  unsupported), and the client's reporter now prints the same 60 s `udp budget` line the
+  server has printed since pass 24 — before this, `TOO_LARGE`/`BUFFER_FULL` were bumped
+  inside the library and *never read* on the client. Three bare `return`s on the
+  inbound domain-reply path (`dns_is_inflight`, the slow-path limiter's two refusal
+  arms) now charge `DNS_INFLIGHT`/`SESSION_FULL`, the keys the server already charges.
+  `dgram_drops::snapshot4` became a named `DropSnapshot` (six counters) with
+  `every_drop_counter_has_its_own_snapshot_field` pinning that each counter reaches a
+  distinct field — the batching table is keyed on identity, so a counter missing one of
+  its two arms would sit in a thread-local cell forever.
+- **The association idle stamp is refreshed by replies.** It lived as a local in the
+  relay loop fed only by app-side traffic, so an association whose flow was receive-only
+  after the first request (RTP after RTSP SETUP, a subscription feed, anything
+  NAT-kept-alive by the far end) was reaped at 180 s while the server's own session —
+  whose reader *does* refresh on target replies — was still live: the same
+  "evicted a session the client was using" failure pass 24 fixed on the sweeper, in its
+  missing-signal form. The stamp now lives on `AssocEntry` and `send_reply_addr`
+  refreshes it (one relaxed load per reply, one store per second per association via
+  `ASSOC_TOUCH_INTERVAL_MS`). Regression tests:
+  `replies_refresh_the_association_idle_stamp` (injected clock) and
+  `dispatch_refreshes_the_idle_stamp` (dispatcher path).
+- **The hub reservation is released by RAII.** `handle_udp_associate` released the
+  process-wide slot with a statement after an `.await`; unwinding skips it, which would
+  leak the `MAX_UDP_ASSOCS` budget *and* leave the shard's strong `Arc<AssocEntry>` —
+  the relay socket's last owner — reachable for the process lifetime, since nothing else
+  removes a hub entry. `SessReservation` is the `Drop` guard (the sibling `AliveGuard`
+  was already RAII); `association_reservation_survives_a_panicking_body` unwinds a real
+  task to prove the slot and the entry come back.
+- **The dispatcher's hub-probe path filters liveness.** The cache-hit path filtered
+  `is_alive`; the `hub.entry` fallback did not, so in the window between `AliveGuard`
+  clearing the bit and `UdpHub::release` unpublishing (and permanently, had the release
+  above been skipped) a reply was written into a socket nobody reads.
+  `dispatch_published_but_dead_entry_is_dropped` covers the window the existing
+  `dispatch_dead_entry_reprobes_and_drops` cannot: it releases the entry first, so its
+  map lookup returns `None`.
+- **The association cap now fits what the server keeps.** `MAX_UDP_ASSOCS` was 4096
+  while the server evicts once a shard crosses `LOCAL_SESS_MAX / SESS_SHARDS` and
+  settles at `LOCAL_SESS_TARGET = 4032` sessions per connection — and all of a client's
+  associations ride one egress connection, so the client's own ceiling was above the
+  server's. It is now 4032. Over-cap eviction in `sweep_local` is **idle-first**
+  (longest-idle stamp first, `select_nth_unstable` over the shard it already scans)
+  instead of arbitrary, so hitting the cap no longer kills a session touched
+  milliseconds ago while a session idle for minutes survives by hash order;
+  `over_cap_eviction_takes_the_longest_idle_first` pins the ranking.
+- **Smaller:** the client's reporter took the server's `OnceLock` guard (a second call
+  would have double-logged every 60 s line), and `alloc_sess` documents why its
+  monotonic `u32` cannot misroute after a wrap (an id recurs only after `u32::MAX - 2`
+  further allocations — hours at any rate a 4032-association cap permits — against a
+  reply lifetime of seconds).
+
+Verification: `cargo test --all-targets` **90/90** (47 lib + 26 client + 17 server) and
+**89/89** with `--no-default-features`; `cargo clippy --all-targets -- -D warnings`
+and `cargo fmt --check` clean on both feature sets. The three behaviour changes are all
+config-visible: one extra connection per client, UDP fail-closed by default, and the
+client-side association cap 4096 → 4032. `dist/` was rebuilt for all four CPU levels
+from this revision.
 
 ---
 
