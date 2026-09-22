@@ -656,12 +656,29 @@ struct AssocEntry {
     app: ArcSwapOption<SocketAddr>,
     /// Cleared by the association as it exits.
     alive: std::sync::atomic::AtomicBool,
-    /// Last activity stamp ([`mono_millis`] epoch), refreshed by **both**
-    /// directions: the relay loop on an app datagram or TCP control chatter,
-    /// and [`AssocEntry::touch`] from the dispatcher when a reply is written.
+    /// Inbound activity, as one bit: set (relaxed) by whichever dispatcher
+    /// writes a reply to this association, consumed by the association's own
+    /// idle tick.
     ///
-    /// The reply direction has to refresh it. It used to live as a local in the
-    /// relay loop fed only by app-side traffic, so an association whose flow was
+    /// This exists so the **reply path never reads a clock**. Stamping `last`
+    /// directly per reply cost a `clock_gettime` through the vDSO (~25 ns) on
+    /// every datagram, forever, for a signal that only has to prove "something
+    /// happened in the last 180 s" — and the tick that folds this flag into the
+    /// stamp already reads a clock once per [`ASSOC_IDLE_TICK_SECS`]. The store
+    /// is idempotent and has one writer per association in steady state (a
+    /// session's replies arrive on the one connection that carried its
+    /// datagrams), so it cannot lose an update the way a read-modify-write
+    /// could, and it never shares a cache line's write ownership per packet with
+    /// the app direction, whose stamp stays throttled to 1 Hz.
+    replied: std::sync::atomic::AtomicBool,
+    /// Last activity stamp ([`mono_millis`] epoch). Written by the association
+    /// task only: the relay loop on an app datagram (throttled to
+    /// [`ASSOC_TOUCH_INTERVAL_MS`]), the idle tick when it consumes [`Self::replied`],
+    /// and the SOCKS control-readiness branch.
+    ///
+    /// The reply direction has to feed it — that is what [`Self::replied`] and
+    /// [`Self::idle_since_tick`] are for. It used to live as a local in the relay
+    /// loop fed only by app-side traffic, so an association whose flow was
     /// receive-only after the first request (RTSP/RTP after SETUP, a market-data
     /// or log subscription, anything NAT-kept-alive by the far end) was reaped at
     /// 180 s while the server's own session — whose reader *does* refresh on
@@ -671,9 +688,23 @@ struct AssocEntry {
     last: std::sync::atomic::AtomicU64,
 }
 
-/// Activity is stamped at most once per interval per association. A reply burst
-/// performs one relaxed load per datagram and one store per second; the stamp
-/// only has to be finer than the 180 s idle deadline.
+/// The association's own idle cadence and the deadline it is checked against.
+///
+/// The reply direction's activity bit is consumed on this tick, so the tick
+/// period is also the worst-case staleness of `last`. It must stay far below the
+/// deadline (18x here) or a receive-only flow could be reaped while replies are
+/// still arriving. The reap *schedule* is unchanged by folding the flag at the
+/// tick instead of stamping per reply: the flag is consumed before the deadline
+/// is evaluated, and the association is only reported idle when no tick in the
+/// preceding `ASSOC_IDLE_MS` observed activity.
+const ASSOC_IDLE_TICK_SECS: u64 = 10;
+const ASSOC_IDLE_MS: u64 = 180_000;
+
+/// App-direction stamp throttle. One relaxed load plus one store per second,
+/// not per datagram: the relay loop reads a clock anyway (the egress memo's
+/// freshness stamp needs it), but the shared stamp must not be rewritten per
+/// packet or it would steal the cache line from the dispatcher's [`AssocEntry::replied`]
+/// store on every datagram.
 const ASSOC_TOUCH_INTERVAL_MS: u64 = 1000;
 
 impl AssocEntry {
@@ -682,6 +713,7 @@ impl AssocEntry {
             relay,
             app: ArcSwapOption::const_empty(),
             alive: std::sync::atomic::AtomicBool::new(true),
+            replied: std::sync::atomic::AtomicBool::new(false),
             last: std::sync::atomic::AtomicU64::new(mono_millis()),
         }
     }
@@ -690,7 +722,35 @@ impl AssocEntry {
         self.alive.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Refresh the idle stamp, at most once per [`ASSOC_TOUCH_INTERVAL_MS`].
+    /// Record that a reply was written. One relaxed store — no clock read.
+    fn mark_replied(&self) {
+        self.replied
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One idle tick: fold any reply activity into the stamp, then report whether
+    /// the association has gone idle.
+    ///
+    /// Folding here is exact rather than approximate. `replied` is consumed
+    /// *before* the deadline is evaluated, so an association whose replies are
+    /// still arriving can never be reported idle; and because the flag is read at
+    /// the tick after the last reply, `last` is stamped at or after that reply —
+    /// the reap can only be later than an exactly-stamped association's, never
+    /// earlier. Called from the association task, the only writer of `last` on
+    /// the reply side.
+    fn idle_since_tick(&self, now_ms: u64, idle_limit_ms: u64) -> bool {
+        if self
+            .replied
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.last
+                .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.idle_ms(now_ms) >= idle_limit_ms
+    }
+
+    /// Refresh the idle stamp (app direction), at most once per
+    /// [`ASSOC_TOUCH_INTERVAL_MS`].
     fn touch(&self, now_ms: u64) {
         if now_ms.saturating_sub(self.last.load(std::sync::atomic::Ordering::Relaxed))
             >= ASSOC_TOUCH_INTERVAL_MS
@@ -1944,10 +2004,9 @@ async fn udp_associate_inner(
     let mut buf = vec![0u8; UDP_RECV_MAX + SOCKS_UDP_HDR_MAX + UDP_RECV_SLACK];
     // One id counter per association: `(sess, id)` is the receiver's key.
     let mut frag = DgramFragmenter::new();
-    let idle_limit_ms = 180_000u64;
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
     // not reset the idle timer and keep an otherwise dead association alive.
-    let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(ASSOC_IDLE_TICK_SECS));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Local copy of the last published app address: the value almost never
     // changes (one UDP socket per association), so only publish on change
@@ -1982,7 +2041,7 @@ async fn udp_associate_inner(
                     }
                 }
                 let now = mono_millis();
-                if now.saturating_sub(activity_stamp) >= 1000 {
+                if now.saturating_sub(activity_stamp) >= ASSOC_TOUCH_INTERVAL_MS {
                     activity_stamp = now;
                     entry.touch(now);
                 }
@@ -2106,11 +2165,12 @@ async fn udp_associate_inner(
                 }
             }
             _ = idle_tick.tick() => {
-                // Both directions count: `entry.last` is refreshed by the relay
-                // loop (app datagrams, TCP control chatter) and by the
-                // dispatcher that writes a reply (`send_reply_addr`), so a
-                // receive-only flow is not reaped out from under the app.
-                if entry.idle_ms(mono_millis()) >= idle_limit_ms {
+                // Both directions count, but only one of them reads a clock: the
+                // relay loop stamps `last` for app-side traffic, and this tick
+                // folds the dispatcher's `replied` flag in for the reply side, so
+                // a receive-only flow is not reaped out from under the app and
+                // the per-reply path stays clock-free.
+                if entry.idle_since_tick(mono_millis(), ASSOC_IDLE_MS) {
                     break;
                 }
             }
@@ -2135,7 +2195,7 @@ fn send_reply(entry: &AssocEntry, dst: SocketAddr, payload: &Bytes, pkt: &mut by
         udp_write::no_app();
         return;
     };
-    send_reply_at(entry, app, dst, payload, pkt, mono_millis());
+    send_reply_addr(entry, app, dst, payload, pkt);
 }
 
 fn send_reply_addr(
@@ -2145,30 +2205,11 @@ fn send_reply_addr(
     payload: &Bytes,
     pkt: &mut bytes::BytesMut,
 ) {
-    send_reply_at(entry, app, dst, payload, pkt, mono_millis());
-}
-
-/// [`send_reply_addr`] with the liveness stamp's clock read hoisted into the
-/// caller.
-///
-/// Split out so `replies_refresh_the_association_idle_stamp` can drive an
-/// arbitrary `now_ms`: the association stamp is compared against
-/// [`ASSOC_TOUCH_INTERVAL_MS`], and a test process is younger than that interval,
-/// so no reachable value of the real clock can both (a) be due and (b) be
-/// observed. Production callers pass [`mono_millis`].
-fn send_reply_at(
-    entry: &AssocEntry,
-    app: SocketAddr,
-    dst: SocketAddr,
-    payload: &Bytes,
-    pkt: &mut bytes::BytesMut,
-    now_ms: u64,
-) {
-    // A reply is activity: refresh the association's idle stamp before the
-    // syscall so a receive-only flow is not reaped at 180 s. Throttled inside
-    // (`touch`), so this is one relaxed load per datagram plus one store per
-    // second for the whole association.
-    entry.touch(now_ms);
+    // A reply is activity. This is the whole of the reply path's liveness cost:
+    // one relaxed store, folded into the stamp by the association's next idle
+    // tick. It used to be a `mono_millis()` here — a vDSO `clock_gettime` per
+    // datagram — for a signal whose only consumer compares it against 180 s.
+    entry.mark_replied();
     pkt.truncate(0);
     pkt.extend_from_slice(&[0, 0, 0]);
     // The destination of a reply is always the source address the server
@@ -2971,64 +3012,110 @@ mod tests {
         );
     }
 
-    /// A reply is activity: the association's idle stamp is refreshed on the
-    /// inbound direction, so a flow that is receive-only after its first request
-    /// is not reaped at 180 s while the server-side session is still live. The
-    /// clock is injected (`send_reply_at`) because a test process is younger than
-    /// one touch interval, so no real stamp could be both due and observable.
+    /// A reply is activity: it sets the association's activity bit, and the
+    /// association's next idle tick folds that bit into the stamp, so a flow that
+    /// is receive-only after its first request is not reaped at 180 s while the
+    /// server-side session is still live.
+    ///
+    /// Both halves are driven with explicit clocks (the send path no longer reads
+    /// one at all), so this asserts the semantics rather than the test process's
+    /// uptime: a test binary is younger than one idle tick, so no real-clock run
+    /// could observe both "the flag was consumed" and "the deadline passed".
     #[tokio::test]
-    async fn replies_refresh_the_association_idle_stamp() {
+    async fn replies_mark_the_association_active_until_the_next_tick() {
         let a = test_assoc().await;
         let mut pkt = bytes::BytesMut::with_capacity(256);
         let dst: SocketAddr = "203.0.113.7:53".parse().unwrap();
         let payload = Bytes::from_static(b"reply");
         let app = a.entry.app().expect("the app address is published");
 
-        // An association that has been idle for four touch intervals.
-        let now = ASSOC_TOUCH_INTERVAL_MS * 4;
+        // The association was last active at t=0 and its deadline has just passed.
         a.entry.last.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert!(a.entry.idle_ms(now) >= ASSOC_TOUCH_INTERVAL_MS);
+        let now = ASSOC_IDLE_MS + ASSOC_IDLE_TICK_SECS * 1000;
+        assert!(
+            a.entry.idle_since_tick(now, ASSOC_IDLE_MS),
+            "without activity the deadline must be reported"
+        );
 
-        send_reply_at(&a.entry, app, dst, &payload, &mut pkt, now);
+        // One reply, then the tick that follows it: the flag is folded into the
+        // stamp and the association stays alive, however stale the old stamp was.
+        send_reply_addr(&a.entry, app, dst, &payload, &mut pkt);
+        assert!(
+            a.entry.replied.load(std::sync::atomic::Ordering::Relaxed),
+            "a written reply must set the activity bit"
+        );
+        assert_eq!(
+            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the reply path itself must not touch the stamp (no clock read)"
+        );
+        assert!(
+            !a.entry.idle_since_tick(now, ASSOC_IDLE_MS),
+            "a reply inside the window must keep the association alive"
+        );
         assert_eq!(
             a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
             now,
-            "the reply must have refreshed the idle stamp"
+            "the tick folds the bit into the stamp"
         );
-        assert!(a.entry.idle_ms(now) < ASSOC_TOUCH_INTERVAL_MS);
         assert!(
             recv_reply(&a.app).await.is_some(),
             "the reply still goes out"
         );
 
-        // The throttle holds: inside the interval the stamp is not rewritten,
-        // and at the boundary it is.
-        send_reply_at(
-            &a.entry,
-            app,
-            dst,
-            &payload,
-            &mut pkt,
-            now + ASSOC_TOUCH_INTERVAL_MS - 1,
+        // The bit is consumed exactly once: the next tick with no further replies
+        // reports idle at the deadline, and no earlier.
+        assert!(
+            !a.entry.replied.load(std::sync::atomic::Ordering::Relaxed),
+            "the tick must consume the bit"
         );
-        assert_eq!(
-            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
-            now,
-            "within the touch interval the stamp is not rewritten"
+        assert!(!a.entry.idle_since_tick(now + 1000, ASSOC_IDLE_MS));
+        assert!(
+            !a.entry
+                .idle_since_tick(now + ASSOC_IDLE_MS - 1, ASSOC_IDLE_MS),
+            "one millisecond short of the deadline is not idle"
         );
-        let later = now + ASSOC_TOUCH_INTERVAL_MS;
-        send_reply_at(&a.entry, app, dst, &payload, &mut pkt, later);
-        assert_eq!(
-            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
-            later,
-            "at the boundary the stamp advances"
+        assert!(
+            a.entry.idle_since_tick(now + ASSOC_IDLE_MS, ASSOC_IDLE_MS),
+            "the deadline itself is idle"
         );
     }
 
-    /// The dispatcher path (not just `send_reply_at`) is what production uses, so
-    /// pin that `dispatch_one` reaches the same stamp update.
+    /// A receive-only association is never reaped while replies flow, even when
+    /// its stamp is older than the deadline on every single tick: this is the
+    /// property the per-reply stamp existed for, restated for the bit.
     #[tokio::test]
-    async fn dispatch_refreshes_the_idle_stamp() {
+    async fn flowing_replies_never_let_the_deadline_fire() {
+        let a = test_assoc().await;
+        let mut pkt = bytes::BytesMut::with_capacity(256);
+        let dst: SocketAddr = "203.0.113.7:53".parse().unwrap();
+        let payload = Bytes::from_static(b"stream");
+        let app = a.entry.app().expect("the app address is published");
+        a.entry.last.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // 60 ticks, one reply in each: the app never sends anything.
+        let mut now = ASSOC_IDLE_TICK_SECS * 1000;
+        for _ in 0..60 {
+            send_reply_addr(&a.entry, app, dst, &payload, &mut pkt);
+            assert!(
+                !a.entry.idle_since_tick(now, ASSOC_IDLE_MS),
+                "replies are still arriving at t={now}ms"
+            );
+            now += ASSOC_IDLE_TICK_SECS * 1000;
+        }
+        assert_eq!(
+            a.entry.last.load(std::sync::atomic::Ordering::Relaxed),
+            now - ASSOC_IDLE_TICK_SECS * 1000,
+            "the stamp tracks the last tick that saw activity"
+        );
+    }
+
+    /// The dispatcher path (not just `send_reply_addr`) is what production uses,
+    /// so pin that `dispatch_one` sets the same activity bit. No clock is read on
+    /// either side of this assertion any more, which is why the test needs no
+    /// sleep: it used to have to wait out a full touch interval.
+    #[tokio::test]
+    async fn dispatch_marks_the_association_active() {
         let hub = UdpHub::new();
         let a = test_assoc().await;
         let sess = hub.alloc_sess().unwrap();
@@ -3036,16 +3123,7 @@ mod tests {
         let mut cache = empty_dispatch_cache();
         let mut reasm = DgramReassembler::new();
         let mut pkt = bytes::BytesMut::with_capacity(256);
-        // Zero is always older than one touch interval *once the process clock has
-        // passed that interval*, which is the one thing a just-started test binary
-        // cannot assume: `touch` would then see `now - 0 < interval` and correctly
-        // decline to store. Wait the remainder out (≤ one interval, once per test
-        // binary) so the assertion below tests the dispatcher, not the clock.
-        let shortfall = ASSOC_TOUCH_INTERVAL_MS.saturating_sub(mono_millis());
-        if shortfall > 0 {
-            tokio::time::sleep(Duration::from_millis(shortfall + 5)).await;
-        }
-        a.entry.last.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(!a.entry.replied.load(std::sync::atomic::Ordering::Relaxed));
         dispatch_one(
             &mut cache,
             &hub,
@@ -3056,8 +3134,8 @@ mod tests {
         );
         assert!(recv_reply(&a.app).await.is_some());
         assert!(
-            a.entry.last.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "the dispatcher must refresh the idle stamp"
+            a.entry.replied.load(std::sync::atomic::Ordering::Relaxed),
+            "the dispatcher must mark the association active"
         );
         hub.release(sess);
     }
