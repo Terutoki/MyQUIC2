@@ -633,10 +633,10 @@ fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             // The budget paths only: `too_large`/`buffer_full` have their own
             // rate-limited per-packet warning and would double-report here.
-            if dd.session_full > 0 || dd.dns_inflight > 0 {
+            if dd.session_full > 0 || dd.dns_inflight > 0 || dd.refused > 0 {
                 info!(
-                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (resolution in flight); totals too_large={} buffer_full={} session_full={} dns_inflight={}",
-                    dd.session_full, dd.dns_inflight, now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.dns_inflight
+                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (resolution in flight), {} refused (policy); totals too_large={} buffer_full={} session_full={} dns_inflight={} refused={}",
+                    dd.session_full, dd.dns_inflight, dd.refused, now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.dns_inflight, now_d.refused
                 );
             }
             prev_d = now_d;
@@ -1000,7 +1000,14 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             let mut ack = [0u8; 20];
             ack[0] = MQP_TCP_ACK;
             let n = 1 + encode_bnd_addr_into(bnd, &mut ack[1..]);
-            if send.write_all(&ack[..n]).await.is_err() {
+            // Bounded: a stalled stream must not pin this task and its
+            // stream-task permit until connection death; the client tears the
+            // flow down on a missing ACK, so a slow write here buys nothing.
+            let ack_sent = tokio::time::timeout(Duration::from_secs(5), send.write_all(&ack[..n]))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            if !ack_sent {
                 return;
             }
             match copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await {
@@ -1294,6 +1301,7 @@ async fn forward_server_dgram(
     match addr {
         TargetAddrRef::Ip(dst) => {
             if !allow_private && !is_global_ip_cached(dst.ip()) {
+                dgram_drops::bump(&dgram_drops::REFUSED);
                 return None;
             }
             // No destination memo for an IP target: `resolve_pin` — the memo's
@@ -1312,9 +1320,13 @@ async fn forward_server_dgram(
             Some(dst)
         }
         TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
-            CachedLookup::Negative => None,
+            CachedLookup::Negative => {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                None
+            }
             CachedLookup::Addr(dst) => {
                 if !allow_private && !is_global_ip_cached(dst.ip()) {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
                     return None;
                 }
                 let sock = get_or_create_sess(ss, cd, conn_id, s, Some((h, p, dst))).await?;
@@ -1818,7 +1830,7 @@ async fn get_or_create_sess(
     // datagram carrying it is malformed or hostile, not a new session.
     // Refusing here keeps it from pinning a global permit until the sweep.
     if s == 0 {
-        dgram_drops::bump(&dgram_drops::SESSION_FULL);
+        dgram_drops::bump(&dgram_drops::REFUSED);
         return None;
     }
     // Zero-lock fast path: the common case (a burst of packets for one session)
