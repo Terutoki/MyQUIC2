@@ -450,8 +450,12 @@ const _: () = {
 pub const UDP_RECV_MAX: usize = MQP_FRAG_MAX_PAYLOAD;
 
 /// Largest SOCKS5 UDP framing in front of a payload:
-/// `RSV(2) | FRAG(1) | atyp(1) | addr(≤16) | port(2)`.
-pub const SOCKS_UDP_HDR_MAX: usize = 3 + 1 + 16 + 2;
+/// `RSV(2) | FRAG(1) | atyp(1) | addr | port(2)`, where the address is largest
+/// in its domain form (`len(1) | host(≤255)`), not its IPv6 form (16 B) — an
+/// IPv6-sized reservation silently truncates app datagrams that pair a long
+/// domain name with a near-maximum payload, before the fragmenter ever sees
+/// them.
+pub const SOCKS_UDP_HDR_MAX: usize = 3 + 1 + 1 + 255 + 2;
 
 /// One byte of slack on every relay read buffer.
 ///
@@ -2301,6 +2305,13 @@ pub mod dgram_drops {
     /// total silence while every sibling drop path was counted, which made "the
     /// 60 s budget line is clean" a claim the code could not support.
     pub static UNKNOWN_SESS: AtomicU64 = AtomicU64::new(0);
+    /// A datagram refused on policy, not on budget: a negatively-cached name,
+    /// an SSRF-filtered target, or the reserved session id 0. Each used to be
+    /// dropped with no counter (or, for sess 0, charged to `SESSION_FULL`,
+    /// which means "budget exhausted" and misreported malformed input as a
+    /// resource event). Batched like the other flood-type counters: an app
+    /// retrying a refused target is exactly the flood case batching exists for.
+    pub static REFUSED: AtomicU64 = AtomicU64::new(0);
 
     /// Every drop counter in one read, so the 60 s report cannot silently omit
     /// one. Named fields rather than a tuple: a 6-tuple read at two call sites
@@ -2315,6 +2326,7 @@ pub mod dgram_drops {
         pub no_egress: u64,
         pub egress_dead: u64,
         pub unknown_sess: u64,
+        pub refused: u64,
     }
 
     impl DropSnapshot {
@@ -2328,6 +2340,7 @@ pub mod dgram_drops {
                 no_egress: d(self.no_egress, prev.no_egress),
                 egress_dead: d(self.egress_dead, prev.egress_dead),
                 unknown_sess: d(self.unknown_sess, prev.unknown_sess),
+                refused: d(self.refused, prev.refused),
             }
         }
 
@@ -2347,14 +2360,15 @@ pub mod dgram_drops {
                 .saturating_add(self.dns_inflight)
                 .saturating_add(self.no_egress)
                 .saturating_add(self.egress_dead)
+                .saturating_add(self.refused)
         }
     }
 
     /// Totals since process start.
     ///
     /// **Batching bound, stated because a line reading `0` is not proof of no
-    /// loss.** `too_large`, `buffer_full`, `session_full`, `dns_inflight` and
-    /// `unknown_sess` accumulate in a thread-local cell and reach the global when
+    /// loss.** `too_large`, `buffer_full`, `session_full`, `dns_inflight`,
+    /// `unknown_sess` and `refused` accumulate in a thread-local cell and reach
     /// they hit 64 or when `snapshot` runs *on that thread*. A reporter task runs
     /// on its own thread, so a loss under 64 drops on a worker thread is not
     /// "delayed to the next report" — it stays invisible until that thread drops
@@ -2378,6 +2392,7 @@ pub mod dgram_drops {
             no_egress: NO_EGRESS.load(Ordering::Relaxed),
             egress_dead: EGRESS_DEAD.load(Ordering::Relaxed),
             unknown_sess: UNKNOWN_SESS.load(Ordering::Relaxed),
+            refused: REFUSED.load(Ordering::Relaxed),
         }
     }
 
@@ -2412,6 +2427,12 @@ pub mod dgram_drops {
                 UNKNOWN_SESS.fetch_add(v, Ordering::Relaxed);
             }
         });
+        L_REFUSED.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                REFUSED.fetch_add(v, Ordering::Relaxed);
+            }
+        });
     }
 
     thread_local! {
@@ -2420,6 +2441,7 @@ pub mod dgram_drops {
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_UNKNOWN_SESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     fn batched(
@@ -2443,7 +2465,7 @@ pub mod dgram_drops {
         }
     }
 
-    /// `counter` must be one of this module's statics. Five of them batch per
+    /// `counter` must be one of this module's statics. Six of them batch per
     /// thread (flushed at 64, or by a `snapshot` on the *same* thread), which is
     /// what keeps a flood off the shared cache lines; each of those needs its own
     /// arm here *and* its own `flush_locals` arm, or its count would sit in a
@@ -2474,6 +2496,8 @@ pub mod dgram_drops {
             batched(counter, &L_DNS_INFLIGHT)
         } else if std::ptr::eq(counter, &UNKNOWN_SESS) {
             batched(counter, &L_UNKNOWN_SESS)
+        } else if std::ptr::eq(counter, &REFUSED) {
+            batched(counter, &L_REFUSED)
         } else {
             counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
         }
@@ -4654,6 +4678,7 @@ mod tests {
             &dgram_drops::DNS_INFLIGHT,
             &dgram_drops::NO_EGRESS,
             &dgram_drops::EGRESS_DEAD,
+            &dgram_drops::REFUSED,
         ] {
             dgram_drops::bump(c);
         }
@@ -4664,14 +4689,15 @@ mod tests {
         assert!(after.dns_inflight > before.dns_inflight, "dns_inflight");
         assert!(after.no_egress > before.no_egress, "no_egress");
         assert!(after.egress_dead > before.egress_dead, "egress_dead");
+        assert!(after.refused > before.refused, "refused");
         let d = after.since(&before);
-        assert!(d.lost() >= 6, "every drop counts as loss: {d:?}");
+        assert!(d.lost() >= 7, "every drop counts as loss: {d:?}");
     }
 
     /// The two egress counters must be visible **immediately and from another
     /// thread**, which is the whole reason they do not batch.
     ///
-    /// Batching (four of the six counters) keeps the count in the bumping
+    /// Batching (six of the eight counters) keeps the count in the bumping
     /// thread's cell until it reaches 64, and `snapshot` only flushes the thread
     /// it runs on — so a worker thread's short outage stays invisible until that
     /// thread drops 63 more, and a thread that exits takes its pending count with
