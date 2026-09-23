@@ -1273,7 +1273,12 @@ fn dispatch_one(
             TargetAddrRef::Ip(dst) => send_reply_addr(&entry, app, dst, &whole, pkt),
             TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
                 CachedLookup::Addr(dst) => send_reply_addr(&entry, app, dst, &whole, pkt),
-                CachedLookup::Negative | CachedLookup::Unknown => {}
+                // Unreachable from a conforming server (replies are always
+                // IP-form); counted rather than silently dropped so a
+                // future or hostile peer cannot create invisible loss here.
+                CachedLookup::Negative | CachedLookup::Unknown => {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                }
             },
         }
         return;
@@ -1292,7 +1297,9 @@ fn dispatch_one(
             // this branch is defensive; the negative cache is still consulted
             // synchronously so a known-bad name never spawns a resolver task.
             match lookup_cached_fast(h, p) {
-                CachedLookup::Negative => {}
+                CachedLookup::Negative => {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                }
                 CachedLookup::Addr(dst) => send_reply_addr(&entry, app, dst, &payload, pkt),
                 CachedLookup::Unknown => {
                     // Both of these are counted. The server's equivalent drop
@@ -1656,17 +1663,19 @@ fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             if dd.lost() > 0 {
                 info!(
-                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (resolution in flight), {} dropped (DNS/session cap); totals too_large={} buffer_full={} no_egress={} egress_dead={} dns_inflight={} session_full={}",
+                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (resolution in flight), {} dropped (DNS/session cap), {} refused (policy); totals too_large={} buffer_full={} no_egress={} egress_dead={} dns_inflight={} session_full={} refused={}",
                     dd.no_egress,
                     dd.egress_dead,
                     dd.dns_inflight,
                     dd.session_full,
+                    dd.refused,
                     now_d.too_large,
                     now_d.buffer_full,
                     now_d.no_egress,
                     now_d.egress_dead,
                     now_d.dns_inflight,
-                    now_d.session_full
+                    now_d.session_full,
+                    now_d.refused
                 );
             }
             // Reported on its own line, and outside `lost()`: a late reply to a
@@ -1830,7 +1839,20 @@ async fn handle_socks(
     // used to allocate was one heap round trip for bytes that live one write.
     let mut hdr = [0u8; AddrHeader::MAX_LEN];
     let hdr_len = target.as_ref().header()?.encode_into(&mut hdr);
-    send.write_all(&hdr[..hdr_len]).await?;
+    // Bounded: without a deadline a stalled connection parks this write until
+    // the QUIC idle timeout, pinning the app socket with no SOCKS answer and
+    // no idle watchdog (the watchdog lives inside the pump, which has not
+    // started yet). SOCKS success has not been sent at this point, so the
+    // failure still surfaces as a SOCKS error rather than a close.
+    let hdr_sent = tokio::time::timeout(Duration::from_secs(5), send.write_all(&hdr[..hdr_len]))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !hdr_sent {
+        send.reset(0x04u32.into()).ok();
+        write_socks_reply(&mut s, 0x04, bnd).await.ok();
+        anyhow::bail!("quic stream header write failed or timed out");
+    }
     // Optimistic SOCKS success: the application's first bytes must not be
     // serialized behind the server-side dial. Waiting for the MQP-2 ACK here
     // costs one full client<->server RTT on every connection (Hysteria/
