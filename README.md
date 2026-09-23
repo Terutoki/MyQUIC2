@@ -117,6 +117,19 @@ Its `dist/` artifacts are rebuilt from this revision and — unlike the pass-26 
 statically checked (`file` plus per-level `objdump`), though still not run under emulation
 or natively.
 
+The current pass is a second review-and-fix cycle on the same echo paths, confirmed
+finding-by-finding through two rounds of code review before anything was touched: the
+TCP stream-head writes on both ends get a 5 s deadline (a stalled connection used to
+park the client before its SOCKS answer and the server's stream-task permit until the
+QUIC idle timeout), `SOCKS_UDP_HDR_MAX` reserves the worst-case domain header instead
+of the IPv6 one (a long name plus a near-max payload was truncated before the fragmenter
+saw it), and every policy refusal — negative DNS cache, SSRF-filtered target, the
+reserved session id 0 — is counted in a new `dgram_drops::REFUSED` counter and printed
+on both 60 s `udp budget` lines — see
+[pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap).
+Its `dist/` artifacts are rebuilt from this revision and statically checked the same way
+(`file` plus per-level `objdump`), again not run under emulation or natively.
+
 ---
 
 ## Table of Contents
@@ -137,7 +150,7 @@ or natively.
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths) and [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild) and [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -486,6 +499,7 @@ before every run):
 | 49 | Pass 25 — dedicated UDP egress and the pool audit. `cargo test --all-targets` **93/93** (49 lib + 27 client + 17 server; **92/92** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Native-binary E2E (macOS loopback, the repo's own `hotpath_bench` harness): the client logs `quic pool: 4 TCP connection(s) … + 1 dedicated UDP connection (slot 4), UDP is fail-closed` and the server logs exactly **5** `new QUIC conn`; `tcpecho` 64 KiB byte-for-byte; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim**; `udpmulti` 16 associations × 400 = **6400/6400, 0.000 % loss** at 19 451 pps. `quic_conns = 1` dials **2** connections (1 TCP + 1 UDP) and still passes TCP plus the full UDP sweep, so the separation is structural rather than load-dependent. With every connection dead (`kill -9` the server), the next 60 s line reads `66 dropped (no egress connection)` — the fail-closed path counted and reported instead of sharing a TCP connection silently — and after the restart the same client logs 2 `QUIC connected` with TCP and the 8/8000 B sweep green again. `dist/` was rebuilt for all four CPU levels (clients 4 406 656–4 430 000 B, servers 4 334 128–4 361 864 B; `file` confirms static musl + stripped) and the **shipped v1 pair was re-run end-to-end under amd64 emulation** (Podman on Apple Silicon, the `hotpath_bench` example cross-built for the same musl target) for pass 25's artifacts and again for the clock-free reply-path build: 5 connections accepted, `tcpecho` 256 KiB byte-for-byte, `udpsweep` 8/1200/1430/8000 B **4/4 verbatim**, `udpmulti` 8 × 200 = **1600/1600, 0.000 % loss**. The egress drop-accounting build that follows does **not** repeat that emulated run: it changes only what happens to a datagram that is *already* being dropped (an exact counter, a rate-limited warning) and no data-path decision, so its coverage is the unit suite — `egress_drops_are_exact_across_threads`, falsified against the batched wiring before being kept, and `egress_drop_warnings_use_independent_slots`; `objdump -d` finds 235 `zmm` refs in v4 and none in v1–v3 (`ymm` 3 978 → 27 045 from v1 to v3), so each `target-cpu` level is compiled in | ✅ |
 | 50 | Pass 26 — TCP/UDP echo hot-path audit. `cargo test --all-targets` **98/98** (53 lib + 28 client + 17 server; **97/97** with `--no-default-features`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets. Five fixes, one of them a silent-corruption defect: an abnormal pump end was announced to the *peer* as a clean FIN (`Drop for quinn::SendStream` calls `finish()`), so a truncated download looked complete one hop out; the pump now borrows its stream halves and resets/stops the abandoned one, gated on that direction's own completion. New regression tests: `abnormal_pump_end_resets_the_peer_stream_instead_of_finishing` (falsified against the old code — it panics with `the peer saw a clean FIN on an abandoned stream`), `a_partial_past_the_payload_cap_is_discarded_whole`, `coarse_millis_advances_without_traffic`, `the_coarse_epoch_is_rearmed_after_its_runtime_ends` and `too_large_refreshes_the_budget_without_discarding_the_handle`. Also: `TooLarge` no longer counted/logged as an egress loss nor allowed to flush the process-wide egress cache; the server's `fast_sock` is `Weak` (it was a second strong owner that outlived a swept session); the reassembler's documented per-partial `MQP_FRAG_MAX_PAYLOAD` cap is enforced (64 maximum-size fragments previously assembled ~91 KiB); per-datagram `mono_millis()` on three hot paths and per-*dropped*-datagram in the warn limiter replaced by `coarse_millis()`, a lazily armed 1 Hz epoch that advances with wall time (a count-based sampler freezes on trickle flows, which is why the earlier attempt was reverted) and re-arms itself if its runtime dies. Native-binary E2E (macOS loopback, the repo's `hotpath_bench`): `tcpecho` 64 KiB + 1 MiB byte-for-byte 0 mismatched; `udpsweep` 8/1200/1420/1430/2000/8000 B × 40 **6/6 verbatim**; `udpmulti` 16 × 400 = **6400/6400, 0.000 % loss** at 23 381 pps; `udpdomainswitch`/`udpipswitch` 100+100+100+100 **0 misrouted**; `bulk` 256 MiB at 105 MB/s; a 30 s mixed loop over ~30 epoch ticks with 0 failures. The session's only abort warning is the intentionally-truncated `bulk` flow, and the server's mirror line (`sending stopped by peer: error 4`) is the new propagation arriving; 0 UDP drops, 0 reassembly losses, `unknown_sess = 0`. `dist/` **was** rebuilt from this revision for all four CPU levels (static musl, x86-64, default features; clients 4 419 928–4 441 928 B, servers 4 345 120–4 373 048 B, +11 928–13 336 / +10 544–11 440 B per level vs pass 25) but, unlike every earlier pass that touched `dist/`, **no check of any kind was run on those bytes** — no `file`, no `objdump`, no reproducibility rebuild, no emulated or native run of the shipped pair; they are compiled, not tested | ⚠️ |
 | 51 | Pass 27 — hot-path review fixes. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Three changes, all on the relay hot paths: the connection pin is written back from a DNS-cache hit (pinned by the new `dns_hit_arms_the_pin_when_pin_and_memo_miss`); the c2s pump double-buffers its 32 KiB copy buffer so a frozen half gets one extra cycle to be ACK-released before its capacity is needed again; fragment reassembly stores `parent.slice(..)` instead of copying every chunk, guarded by an O(1) pointer suffix check with a copy fallback. `dist/` rebuilt for all four CPU levels (servers 4 348 224–4 375 064 B, clients 4 421 240–4 444 584 B; `file` confirms static musl + stripped, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). No native E2E or benchmark re-run: wire-compatible throughout, and the removed work is nanoseconds against this host's ~350 µs loopback datagram (same caveat as passes 13 and 15) | ✅ |
+| 52 | Pass 28 — bounded stream-head writes, refused-datagram accounting, SOCKS header size. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two review rounds confirmed four findings before any edit; two were dispositioned as non-issues (an unreachable fragment-branch, and malformed-frame drops staying uncounted per pass 26's documented decision). Changes: client MQP-2 stream-head write and server TCP-open ACK write each under a 5 s `timeout` (failure resets/tears the flow down before the optimistic SOCKS success, answering `0x04` on the client); `SOCKS_UDP_HDR_MAX` 22 → 262 (worst-case domain header); new batched `dgram_drops::REFUSED` wired through `bump`/`flush_locals`/`snapshot`/`since`/`lost()`, bumped at five policy-refusal sites (server negative cache, both SSRF arms, `sess == 0` — reclassified off `SESSION_FULL` — and the client's domain-reply refusals) and printed in both 60 s `udp budget` lines; `every_drop_counter_has_its_own_snapshot_field` extended to all seven counters (`lost() >= 7`). `dist/` rebuilt for all four CPU levels (servers 4 344 544–4 373 480 B, clients 4 379 536–4 403 000 B; `file` confirms static musl + stripped on all eight, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). Client levels come out 38 824–42 224 B *smaller* than the pass-27 recorded figures and server levels −3 680…+1 424 B, a code-size move this pass's additions do not by themselves explain — the recipe and feature set are unchanged, `Cargo.lock` is untouched, and the pre-rebuild `dist/` files already sat at ~4.39/4.36 MB rather than the pass-27 recorded sizes. No native E2E or benchmark re-run: wire-compatible throughout (timeout paths and counters only) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -616,18 +630,20 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 27's connection-pin DNS write-back, the
-double-buffered c2s pump, the zero-copy fragment reassembly with its O(1) suffix check,
-and the `dns_cache_seed` test helper, on top of everything pass 26 shipped) with the
+rebuilt from the current revision (pass 28's 5 s stream-head write deadlines, the
+`SOCKS_UDP_HDR_MAX` domain-header fix, and the `REFUSED` policy-refusal counter and its
+five bump sites, on top of everything pass 27 shipped) with the
 default feature set, so the relay counters are **on** in these builds: static musl,
-x86-64, stripped, 4 348 224–4 375 064 B (servers: v1 4 363 280, v2 4 348 224,
-v3 4 375 064, v4 4 369 048) and 4 421 240–4 444 584 B (clients: v1 4 432 584,
-v2 4 421 240, v3 4 444 584, v4 4 437 272) each — i.e. **+2 016–+3 104 B** per server
-level and **+992–+2 656 B** per client level against the pass-26 artifacts, for the pin
-write-back, the pump's second buffer and its release helper, and the reassembler's split
-entry points (the new `#[cfg(test)]` regression test itself ships no bytes). Unlike the
-pass-26 rebuild these **were** statically checked: `file` confirms ELF 64-bit LSB x86-64,
-statically linked, stripped on all eight artifacts, and `objdump -d` finds 273 `zmm`
+x86-64, stripped, 4 344 544–4 373 480 B (servers: v1 4 359 840, v2 4 344 544,
+v3 4 373 480, v4 4 370 472) and 4 379 536–4 403 000 B (clients: v1 4 393 760,
+v2 4 379 536, v3 4 403 000, v4 4 395 048) each. Against the pass-27 *recorded* figures
+the servers move −3 680…+1 424 B per level and the clients **−38 824…−42 224 B**; the
+client shrink is larger than this pass's additions can account for, the recipe and
+feature set are unchanged, `Cargo.lock` is untouched, and the pre-rebuild `dist/` files
+already sat near these sizes rather than the pass-27 recorded ones — recorded here as
+measured, not explained. The builds **were** statically checked: `file` confirms ELF
+64-bit LSB x86-64, statically linked, stripped on all eight artifacts, and `objdump -d`
+finds 273 `zmm`
 refs in the v4 server and 235 in the v4 client with none in v1–v3 of either binary, so
 each `target-cpu` level really is compiled in. What was **not** repeated is any emulated
 or native run of the shipped pairs — the verification below applies to the native
@@ -2804,6 +2820,108 @@ refs in the v4 server and 235 in the v4 client with none in v1–v3 of either bi
 each `target-cpu` level really is compiled in. No emulated or native run of the shipped
 pairs was performed — the verification above applies to the native release build, and a
 target that needs a loadable binary should be validated on the target.
+
+---
+
+### 2026-09 hardening pass 28 — bounded stream-head writes, refused-datagram accounting, and the SOCKS header cap
+
+A second review-and-fix cycle on the same TCP/UDP echo paths, in the same wire protocol
+(no frame, framing, ALPN or protocol-field change, so mixed old/new pairs keep working).
+Two rounds of code review confirmed each finding against the code path before any edit,
+and two candidates were dispositioned as non-issues rather than fixed (listed below).
+
+**1. The TCP stream-head writes had no deadline (client + server).** Two writes sit
+outside every other bound in the flow. The client's MQP-2 target header is written
+immediately after `open_bi`, *before* the optimistic SOCKS success — and the idle
+watchdog lives inside the pump, which has not started yet — so a stalled connection
+parked `send.write_all` until the QUIC idle timeout (~15 s) with the application socket
+held and no SOCKS answer on the wire. The server's TCP-open ACK write had the same
+shape: it pinned the connection task *and* a `MAX_STREAM_TASKS` permit (16 384 process
+wide) for the same duration. Both are now under a 5 s `tokio::time::timeout`. On the
+client, a timeout or write error tears the QUIC stream down (`send.reset(0x04)`) and
+answers the pending SOCKS request with `0x04` — the failure still occurs before SOCKS
+success is sent, so the application gets an explicit refusal instead of a success
+followed by a silent close; the bail path matches the existing `open_bi` failure arm
+byte for byte. On the server, a timeout returns from the handler exactly as a write
+error did before, releasing the permit immediately. 5 s is two orders of magnitude
+above the ~100 ms the design targets for a header on a connection just proven alive by
+`wait_conn`, so no healthy slow path is affected; the client's 25 s total ACK budget is
+untouched.
+
+**2. `SOCKS_UDP_HDR_MAX` reserved the IPv6 address, not the worst-case domain header.**
+The constant (`RSV(2) | FRAG(1) | atyp(1) | addr | port(2)`) computed its address slot
+as 16 B — the IPv6 form — but `TargetAddrRef::decode` accepts a domain of up to 255
+bytes, so the true worst case is `3 + 1 + (1 + 255) + 2 = 262 B`. It is now written
+that way (`3 + 1 + 1 + 255 + 2`), with a docstring pinning the invariant: an
+IPv6-sized reservation silently truncates an application datagram that pairs a long
+domain name with a near-maximum payload *before the fragmenter ever sees it*, i.e.
+exactly the traffic the fragment path exists to carry. Every buffer sized from the
+constant grew by 240 B (the client's association relay buffer 8215 → 8455 B, ~1 MB
+worst-case virtual growth at the 4032-association cap, allocated on demand); the
+`n == buf.len()` truncation-slack logic is unchanged, since the slack byte still sits
+after the new maximum.
+
+**3. Policy refusals were dropped invisibly (or charged to the wrong counter).** Five
+sites discarded a datagram on *policy* — the decision was correct, the observability
+was not. The server's negative-cache arm (`forward_server_dgram`), both of its
+SSRF-filter rejections (the IP arm and the domain arm after resolution — with
+`allow_private = false`, the default, this is the first gate an echo to a LAN target
+hits), the reserved session id `0` in `get_or_create_sess`, and the client's
+domain-reply refusal arms all returned `None`/`{}` with no counter; `sess == 0` was
+worse, bumping `SESSION_FULL` — a counter whose documented meaning is "budget
+exhausted" — for what the adjacent comment correctly calls malformed or hostile input.
+All five now bump a new `dgram_drops::REFUSED`, a batched counter alongside the other
+flood-type counters (an application retrying a refused target *is* the flood case
+batching exists for), wired through the full plumbing the batching table requires: its
+own thread-local cell, its own `flush_locals` arm, its own `bump` arm (the table is
+keyed on pointer identity — a missing arm would strand the count in the thread-local
+forever), a `DropSnapshot.refused` field, `since()`, and `lost()` — a refused datagram
+is, from the application's view, a datagram the tunnel did not carry. Both 60 s
+`udp budget` lines print it (the client's gate is `lost() > 0`, which now includes it;
+the server's condition gained `|| dd.refused > 0`). `every_drop_counter_has_its_own_
+snapshot_field` covers all seven counters with `lost() >= 7`, so the next counter that
+misses an arm fails the suite.
+
+**What was deliberately not changed.** Two candidates from the same review were
+dispositioned as non-issues: the client fragment path's `Domain`/fragmented-name arm is
+unreachable from a conforming server (replies are always IP-form), so it keeps its
+drop-and-count-only shape rather than spawning a resolver defensively; and malformed
+frame drops in the dispatcher (`dgram_sess` returning `None`, failed `decode_*`) still
+carry no counter, which pass 26 already recorded as a documented decision — they are
+unreachable from a conforming peer, and adding a class for them is a separate decision
+from the policy refusals this pass does count. The two review rounds also re-verified
+the timeout disposition against quinn's own semantics: cancelling a `write_all` future
+mid-poll is safe (a partial header is discarded by the subsequent reset/FIN, matching
+the old error path), and the server's bare `return` on ACK timeout deliberately stays a
+FIN rather than a reset, byte-identical to the previous write-error behaviour — the
+client already treats FIN and RST the same way in `read_mqp_ack`.
+
+Verification: `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server) and
+**98/98** with `--no-default-features` (52 + 28 + 18); `cargo clippy --all-targets --
+-D warnings` and `cargo fmt --check` clean on both feature sets. No native E2E or
+benchmark re-run: every change is either on a failure path, behind a policy gate, or a
+counter — no success-path data-plane decision moved, so the wire is unchanged and the
+suite plus two review rounds are the applicable evidence (same rationale as passes
+15–22).
+
+`dist/`: **rebuilt and statically checked.** All four CPU levels were cross-compiled
+from this revision with the documented `cargo zigbuild` recipe (static musl, x86-64,
+default feature set) and copied into `dist/openwrt-x86_64/`: servers 4 344 544–
+4 373 480 B (v1 4 359 840, v2 4 344 544, v3 4 373 480, v4 4 370 472), clients
+4 379 536–4 403 000 B (v1 4 393 760, v2 4 379 536, v3 4 403 000, v4 4 395 048).
+Against the pass-27 recorded figures that is **−3 680…+1 424 B** per server level and
+**−38 824…−42 224 B** per client level — a client shrink larger than this pass's
+additions (two timeouts, one counter arm set, a widened constant) can account for. The
+recipe and feature set are unchanged, `Cargo.lock` is untouched, and the `dist/` files
+found in place before this rebuild already sat at ~4.39/4.36 MB rather than the
+pass-27 recorded 4.42–4.44 MB, so the delta appears to straddle an earlier unrecorded
+rebuild as much as this pass's code; it is recorded as measured, not explained. `file`
+confirms ELF 64-bit LSB x86-64, statically linked, stripped on all eight; `objdump -d`
+finds 273 `zmm` refs in the v4 server and 235 in the v4 client with none in v1–v3 of
+either binary, so each `target-cpu` level really is compiled in. No emulated or native
+run of the shipped pairs was performed — the verification above applies to the native
+release build, and a target that needs a loadable binary should be validated on the
+target.
 
 ---
 
