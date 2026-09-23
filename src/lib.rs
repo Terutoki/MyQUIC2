@@ -1556,7 +1556,11 @@ struct DnsMemoSlot {
     addr: Option<SocketAddr>,
     len: u8,
     key: [u8; MEMO_KEY_BYTES],
-    expires: Instant,
+    /// Same deadline in the [`coarse_millis`] epoch, so the per-packet hit path
+    /// compares two atomics instead of reading the clock: at most one tick
+    /// behind the true TTL, hence an entry can only look expired early, never
+    /// fresh late — a miss falls through to the shared cache, never a mis-serve.
+    expires_ms: u64,
 }
 
 /// Keys longer than this are not memoized (see [`DnsMemoSlot`]).
@@ -1571,9 +1575,7 @@ impl DnsMemoSlot {
         addr: None,
         len: 0,
         key: [0; MEMO_KEY_BYTES],
-        // Never read on an empty slot (guarded by `empty`), and `Instant` has no
-        // const constructor, so zeroed is the only value available in a const.
-        expires: unsafe { std::mem::zeroed() },
+        expires_ms: 0,
     };
 
     /// A slot for `key`, or `None` when it is too long to store inline.
@@ -1587,7 +1589,7 @@ impl DnsMemoSlot {
         s.addr = addr;
         s.len = key.len() as u8;
         s.key[..key.len()].copy_from_slice(key.as_bytes());
-        s.expires = expires;
+        s.expires_ms = coarse_deadline(expires);
         Some(s)
     }
 
@@ -1638,7 +1640,7 @@ fn dns_memo_set(hash: u64) -> usize {
 #[derive(Clone, Copy)]
 struct MemoHit {
     addr: Option<SocketAddr>,
-    expires: Instant,
+    expires_ms: u64,
 }
 
 /// Probe both ways of our key's set, returning the positive and negative hits
@@ -1655,7 +1657,7 @@ fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
             if s.matches(hash, key) {
                 let hit = MemoHit {
                     addr: s.addr,
-                    expires: s.expires,
+                    expires_ms: s.expires_ms,
                 };
                 return if s.addr.is_none() {
                     (None, Some(hit))
@@ -1697,6 +1699,19 @@ fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
     });
 }
 
+/// Translate an `Instant` deadline into the [`coarse_millis`] epoch.
+/// Paid once per memo insert (the miss path, which already holds locks); the
+/// per-packet hit path then compares without any clock read. Rounds the safe
+/// way: `coarse_millis` never runs ahead of `mono_millis`, so the translated
+/// deadline can only fire up to one tick early — an early miss falls through
+/// to the shared cache, never a stale serve.
+fn coarse_deadline(expires: Instant) -> u64 {
+    let remain_ms = expires
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
+    coarse_millis().saturating_add(remain_ms)
+}
+
 /// Result of a synchronous cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedLookup {
@@ -1713,7 +1728,8 @@ pub enum CachedLookup {
 /// Consults the thread-local memo, then the positive cache, then the negative
 /// cache, so a known-bad name never costs a task spawn. A hit performs no heap
 /// allocation (stack-built key + full-key compare against the memo) and, on the
-/// memo hit path, exactly one clock read — it never touches a lock at all.
+/// memo hit path, no precise clock read (the deadline is compared in the coarse
+/// epoch) — it never touches a lock at all.
 pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
@@ -1724,13 +1740,15 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
             &owned
         }
     };
-    // Memo first, and only then the clock: a memo hit costs one `Instant::now()`
-    // and a byte compare instead of two global read locks.
+    // Memo first, and only then the clock: a memo hit costs two atomic loads
+    // and a byte compare instead of two global read locks. The deadline lives
+    // in the coarse epoch (see `expires_ms`), so even the hit path reads no
+    // precise clock — only whole-second TTLs are at stake.
     let (pos, neg) = memo_peek_both(key);
     if pos.is_some() || neg.is_some() {
-        let now = Instant::now();
+        let now = coarse_millis();
         if let Some(m) = pos {
-            if now < m.expires {
+            if now < m.expires_ms {
                 return match m.addr {
                     Some(a) => CachedLookup::Addr(a),
                     None => CachedLookup::Unknown,
@@ -1738,7 +1756,7 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
             }
         }
         if let Some(m) = neg {
-            if now < m.expires {
+            if now < m.expires_ms {
                 return CachedLookup::Negative;
             }
         }
@@ -3955,14 +3973,15 @@ async fn copy_tcp_quic_inner(
     // "now" rather than 0 because it is compared against that same epoch — a 0
     // would read as "idle since process start", and the first idle tick of a
     // long-running process would tear every flow down on the spot.
-    let last_ms = Arc::new(AtomicU64::new(coarse_millis()));
+    // Stack stamp, not `Arc`: both pump futures only borrow it (shared `&`),
+    // and they are driven to completion inside this function, so no heap
+    // allocation per flow.
+    let last_ms = AtomicU64::new(coarse_millis());
     // Borrowed halves: `tcp` itself stays owned here so the final disposition
     // (graceful FIN on clean EOF, RST on any abnormal end) is decided in one
     // place after both directions settle, instead of each direction racing to
     // shut the socket down on its own.
     let (mut tr, mut tw) = tcp.split();
-    let l1 = last_ms.clone();
-    let l2 = last_ms.clone();
     // Per-direction completion flags, declared outside the pump scope so the
     // error disposition below can tell a half that finished cleanly from one
     // that was abandoned mid-flight.
@@ -4033,7 +4052,7 @@ async fn copy_tcp_quic_inner(
                 // starves slow trickle uploads past the 300s idle reap while
                 // downloads stamp every batch.
                 let now = coarse_millis();
-                touch_stamp(&l1, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
+                touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
             }
             send.finish().ok();
             release_copy_bufs(&mut bufs);
@@ -4101,7 +4120,7 @@ async fn copy_tcp_quic_inner(
                 }
                 total += batch_bytes as u64;
                 let now = coarse_millis();
-                touch_stamp(&l2, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
+                touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
             }
             // QUIC-recv EOF: half-close the TCP write side now. Without
             // this FIN the peer waits for EOF while our own c2s direction

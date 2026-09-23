@@ -728,15 +728,14 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 Ok(d) => d,
                 Err(_) => break,
             };
-            // Keep an owned handle so the payload can be handed to the send
-            // path as a zero-copy `Bytes::slice` (instead of a per-packet
-            // copy) even after `decode_datagram_ref` borrowed `d`.
-            let owned = d.clone();
+            // `d` is already owned (from `read_datagram`), so payload slices borrow
+            // it directly: one refcount bump per slice, no extra clone per packet.
+            // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
             if d.first() == Some(&MQP_DGRAM_FRAG) {
                 let Ok(f) = decode_fragment(&d) else {
                     continue;
                 };
-                let Some((s, a, whole)) = reasm.push_zero_copy(&d, &f, mono_millis()) else {
+                let Some((s, a, whole)) = reasm.push_zero_copy(&d, &f, coarse_millis()) else {
                     continue;
                 };
                 udp_stats::payload(whole.len());
@@ -822,10 +821,10 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             {
                                 // See the fragment branch above, and `fast_sock`.
                                 if let Some(sock) = sock.upgrade() {
-                                    let off = owned.len() - p.len();
+                                    let off = d.len() - p.len();
                                     udp_stats::payload(p.len());
                                     touch_session_throttled(conn_id, s, last);
-                                    udp_try_send(&sock, map_for_dual(dst), owned.slice(off..));
+                                    udp_try_send(&sock, map_for_dual(dst), d.slice(off..));
                                     fast_hit = true;
                                 }
                             }
@@ -835,8 +834,8 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         continue;
                     }
                 }
-                let off = owned.len() - p.len();
-                let payload = owned.slice(off..);
+                let off = d.len() - p.len();
+                let payload = d.slice(off..);
                 udp_stats::payload(payload.len());
                 let used =
                     forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
@@ -1508,7 +1507,7 @@ fn next_conn_id() -> usize {
 /// A datagram-heavy flow sends a long run of packets to the *same* session, so
 /// the connection-level `RwLock` read plus hash lookup in `get_or_create_sess`
 /// is pure per-packet overhead for all but the first packet of the run. The
-/// memo is a single slot on purpose: a miss simply falls through to the table.
+/// memo is direct-mapped on purpose: a miss simply falls through to the table.
 /// The key is `(conn, sess)`, never `sess` alone: session ids are allocated per
 /// client, so two connections sharing this thread would otherwise serve each
 /// other's sockets and route replies onto the wrong QUIC connection.
@@ -1535,7 +1534,12 @@ struct SessMemo {
     abort: tokio::task::AbortHandle,
 }
 
-const SESS_MEMO_SLOTS: usize = 32;
+/// 128 direct-mapped slots: session ids hash uniformly (odd multiplier is a
+/// bijection mod power-of-two), so 32 interleaved sessions already thrashed the
+/// old 32-slot table back to the table lock on every packet. 128 covers
+/// multi-association concurrency; past it entries still just miss through to the
+/// table — a miss is never a mis-serve, the key compare guarantees that.
+const SESS_MEMO_SLOTS: usize = 128;
 
 thread_local! {
     static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =
@@ -1655,7 +1659,10 @@ struct TouchMemo {
     ms: u64,
 }
 
-const TOUCH_SLOTS: usize = 32;
+/// Same 128-slot sizing as the session memo above: the throttle decision must
+/// not itself become the per-packet cost, and 32 interleaved sessions thrashed
+/// the old table into an unconditional store per packet pair.
+const TOUCH_SLOTS: usize = 128;
 
 thread_local! {
     static TOUCH_MEMO: std::cell::RefCell<[Option<TouchMemo>; TOUCH_SLOTS]> =

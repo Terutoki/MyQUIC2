@@ -172,7 +172,7 @@ Single crate, three units sharing one protocol library:
 |---|---|---|
 | `myquic2` (lib) | `src/lib.rs` | MQP-2 codec (owned + borrowed forms), TOML config schema, TLS/cert helpers, QUIC transport builder, TCP↔QUIC bridge |
 | `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; token auth; self-signed cert issuance |
-| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; papaya-backed N-slot TCP connection pool (4 by default) plus a dedicated UDP egress slot, each with a reconnect loop + DATAGRAM dispatcher; per-association UDP relay; token auth |
+| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; fixed N-slot TCP connection pool (plain indexed `Vec`, 4 by default) plus a dedicated UDP egress slot, each with a reconnect loop + DATAGRAM dispatcher; per-association UDP relay; token auth |
 | `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | End-to-end 0-RTT verification probe (with token support) |
 
 **Data-plane mapping:**
@@ -202,10 +202,11 @@ dedicated UDP egress connection**) sharing one Endpoint/UDP socket, each slot wi
 its own reconnect loop and DATAGRAM dispatcher; one
 task per SOCKS connection and one relay + reply task per UDP association. Subscriptions
 die with their association, so stale tasks can never steal another session's packets.
-The pool's slot registry is a lock-free `papaya::HashMap` keyed by slot index: slots are
-installed once at startup and never removed, so picking a slot for a new TCP flow is a
-pin plus an integer hash lookup — no lock, no per-flow allocation, and nothing for the
-reclaimer to collect on that path.
+The pool's slot registry is a plain `Arc<Vec<ConnSlot>>` indexed by slot number:
+slots are installed once at startup and never removed, so picking a slot for a
+new TCP flow is one indexed load — no lock, no per-flow allocation, no pin, no
+hash lookup. (It used to be a `papaya::HashMap`; the map bought nothing for a
+fixed write-once set, so the dependency is gone.)
 
 **Connection isolation (client):** quinn 0.11 exposes no per-stream priority, so
 separate congestion windows are the isolation mechanism — and because
@@ -2701,13 +2702,12 @@ prefixes its reply with its own tag.
   trade with no demonstrated upside here. The measurements are kept above so
   this decision can be revisited with a real workload instead of re-argued.
 - **`papaya` for the client `UdpHub`**: it replaces an `ArcSwap` map with a
-  lock-free one, but `hub.entry()` already sits behind the 1024-slot per-thread
+  lock-free one, but `hub.entry()` already sits behind the 4096-slot per-thread
   `DISPATCH_CACHE`, so the remaining traffic is one lookup per association, not
-  per datagram. (This rejection is about the `UdpHub` only: the client's
-  connection pool does use `papaya::HashMap` — see
-  [Connection isolation](#architecture) — because that registry is a fixed,
-  write-once set read once per TCP flow, where the read path's cost is the only
-  thing that matters.)
+  per datagram. (This rejection is about the `UdpHub` only; the client's
+  connection pool likewise no longer uses `papaya::HashMap` — see
+  [Connection isolation](#architecture) — since a fixed write-once set reads
+  cheapest as a plain indexed `Vec`.)
 
 ---
 

@@ -238,20 +238,13 @@ fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
 /// datagram hit the 1 MiB datagram-send-buffer `Blocked` drop. One connection per
 /// class is the only isolation QUIC gives without stream priorities.
 ///
-/// The slots live in a lock-free `papaya::HashMap` keyed by slot index. Three
-/// properties of this pool are what make that a fit rather than decoration:
-///
-/// - Slots are inserted once at startup and never removed, so a routing read is
-///   a pin plus a hash lookup on an integer key, and papaya's reclamation never
-///   has a retired value to collect on the per-flow path.
-/// - The `Arc` is load-bearing: `papaya::HashMap`'s own `Clone` deep-copies the
-///   table, and this pool is cloned once per accepted SOCKS connection. Behind
-///   the `Arc` a clone is one refcount bump.
-/// - A pin guard is `!Send`, so a future edit that holds one across an `.await`
-///   fails to compile instead of silently pinning a runtime thread.
+/// The slots live in a plain `Arc<Vec<ConnSlot>>` indexed by slot number. The
+/// set is fixed at startup and never mutated, so a routing read is one indexed
+/// load — no pin, no hash, no reclamation — and a `ConnPool` clone
+/// (once per accepted SOCKS connection) stays one refcount bump.
 #[derive(Clone, Debug)]
 struct ConnPool {
-    slots: Arc<papaya::HashMap<usize, ConnSlot>>,
+    slots: Arc<Vec<ConnSlot>>,
     rr: Arc<std::sync::atomic::AtomicUsize>,
     interactive_ports: Arc<std::collections::HashSet<u16>>,
     /// TCP slots: the routing range is `0..tcp_slots` (0 interactive, rest
@@ -272,13 +265,7 @@ impl ConnPool {
     /// stack liveness array the routing path uses to describe it.
     fn new(n: usize, interactive_ports: Vec<u16>, udp_fail_closed: bool) -> Self {
         let tcp = n.clamp(1, MAX_POOL_CONNS);
-        let slots = papaya::HashMap::with_capacity(tcp + 1);
-        {
-            let g = slots.pin();
-            for i in 0..=tcp {
-                g.insert(i, ConnSlot::fresh());
-            }
-        }
+        let slots: Vec<ConnSlot> = (0..=tcp).map(|_| ConnSlot::fresh()).collect();
         Self {
             slots: Arc::new(slots),
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -311,12 +298,11 @@ impl ConnPool {
     }
 
     /// The slot at `i`. Slots are installed by `new` and never removed, so the
-    /// key is always present; a miss would mean the pool was not built by
-    /// `new`.
+    /// index is always in range; out-of-range would mean the pool was not
+    /// built by `new`.
     fn slot(&self, i: usize) -> ConnSlot {
         self.slots
-            .pin()
-            .get(&i)
+            .get(i)
             .cloned()
             .expect("pool slots are installed at startup and never removed")
     }
@@ -330,17 +316,16 @@ impl ConnPool {
 
     /// Index of the TCP slot a new TCP flow should use (see [`select_slot`]).
     ///
-    /// One pin, `n` lookups and a stack liveness array: no lock, no per-flow
-    /// allocation, and no `close_reason()` (which takes quinn's
+    /// `n` indexed liveness reads and a stack liveness array: no lock, no
+    /// per-flow allocation, and no `close_reason()` (which takes quinn's
     /// connection-state mutex) — the maintained `live` bit is what routing
     /// reads, and `wait_conn` remains the authority that fails a flow fast.
     fn pick_tcp_index(&self, t: &TargetAddr) -> usize {
         let n = self.tcp_slots();
         debug_assert!(n <= MAX_POOL_CONNS);
-        let g = self.slots.pin();
         let mut live = [false; MAX_POOL_CONNS];
         for (i, l) in live[..n].iter_mut().enumerate() {
-            *l = g.get(&i).is_some_and(ConnSlot::is_live);
+            *l = self.slots.get(i).is_some_and(ConnSlot::is_live);
         }
         let pinned = self.is_interactive(t);
         let rr = if pinned {
@@ -576,9 +561,10 @@ impl SharedEgress {
         // The cached connection is gone (or lost DATAGRAM support): walk the
         // egress order above.
         let (order, k) = self.egress_order(pool);
-        let slots = pool.slots.pin();
         for &i in &order[..k] {
-            let Some(slot) = slots.get(&i) else { continue };
+            let Some(slot) = pool.slots.get(i) else {
+                continue;
+            };
             // Lock-free read: no `try_read` that can fail, so a refresh can
             // never be skipped just because a reconnect is publishing.
             let g = slot.shared.load();
@@ -694,12 +680,12 @@ struct AssocEntry {
     /// writes a reply to this association, consumed by the association's own
     /// idle tick.
     ///
-    /// This exists so the **reply path never reads a clock** — true for every
+    /// This exists so the **reply path never reads a precise clock** — true for every
     /// unfragmented datagram, which is the steady state. (A *fragmented* reply
-    /// still reads one, in `dispatch_one`: `DgramReassembler::push` takes its
-    /// timestamp as an argument because the 2 s reassembly timeout genuinely
-    /// wants sub-second resolution, so the caller samples `mono_millis` per
-    /// fragment frame.) Stamping `last` directly per reply cost a
+    /// still samples the coarse 1 s epoch in `dispatch_one`: `DgramReassembler::push`
+    /// takes its timestamp as an argument, and the 2 s reassembly timeout plus the
+    /// 1 s sweep throttle only need second-scale resolution, so `coarse_millis`
+    /// — same epoch as `mono_millis`, at most one tick behind — is sufficient.) Stamping `last` directly per reply cost a
     /// `clock_gettime` through the vDSO (~25 ns) on every datagram, forever, for
     /// a signal that only has to prove "something happened in the last 180 s" —
     /// and the tick that folds this flag into the stamp already reads a clock
@@ -1167,18 +1153,17 @@ fn tcp_abort_log_due() -> bool {
 /// misrouted (the slot validates the exact id *and* the entry's liveness).
 ///
 /// **Collisions are expected, not exceptional.** Session ids come from the
-/// hub's monotonic `AtomicU32`, but they are handed out *consecutively*, so two
-/// live associations `DISPATCH_CACHE` apart collide by construction and more
-/// than `DISPATCH_CACHE` live associations collide by pigeonhole — and
-/// `MAX_UDP_ASSOCS` is 4032, four times this table. An earlier revision of this
-/// comment claimed a window of ≤ `DISPATCH_CACHE` live ids "maps
-/// collision-free", which is exactly backwards: it is the ≤ `DISPATCH_CACHE`-live
-/// case that cannot collide, and the busy case this cache exists for is the one
-/// where both sessions in a colliding pair pay the hub probe on every datagram.
-/// Sizing it to `MAX_UDP_ASSOCS` would remove that, at 4x the per-dispatcher
-/// footprint (each of the pool's connections keeps its own).
+/// hub's monotonic `AtomicU32` and are never reused while live, but releases
+/// leave gaps, so the live set is a subset — not a window — of the counter
+/// range: under churn two live ids `DISPATCH_CACHE` apart collide, and more
+/// than `DISPATCH_CACHE` live associations collide by pigeonhole. Sized at 4096
+/// (`MAX_UDP_ASSOCS` 4032 rounded up to a power of two) so a full house averages
+/// one id per slot instead of four: round-robin hit rate goes from ~2% to ~37%
+/// under churn, 100% for a fresh consecutive window. Costs ~96 KiB per
+/// dispatcher (a slot is one id plus one `Weak`) — noise against the 512 KiB of
+/// kernel socket caps each association already carries.
 /// Must be a power of two (the index is a mask).
-const DISPATCH_CACHE: usize = 1024;
+const DISPATCH_CACHE: usize = 4096;
 
 /// One cached session → endpoint binding. A slot is a hit only when it names the
 /// exact session *and* the entry is still alive: a cached absence, a collision,
@@ -1280,7 +1265,7 @@ fn dispatch_one(
         let Ok(f) = decode_fragment(&d) else {
             return;
         };
-        let Some((_, a, whole)) = reasm.push_zero_copy(&d, &f, mono_millis()) else {
+        let Some((_, a, whole)) = reasm.push_zero_copy(&d, &f, coarse_millis()) else {
             return;
         };
         udp_stats::payload(whole.len());
@@ -2558,7 +2543,7 @@ mod tests {
         assert_eq!(select_slot(true, 2, &[false; 4]), 0);
     }
 
-    /// The pool is a real papaya registry: N distinct TCP slots plus the
+    /// The pool holds N distinct TCP slots plus the
     /// dedicated UDP slot, bulk flows cycling through every *non-interactive* TCP
     /// slot, the interactive port pinned to slot 0, and failover driven by the
     /// maintained liveness bits.
@@ -2568,7 +2553,7 @@ mod tests {
         assert_eq!(pool.tcp_slots(), 4, "every TCP slot is registered");
         assert_eq!(pool.udp_slot(), 4, "UDP is one past the TCP range");
         assert_eq!(pool.slots_total(), 5);
-        assert_eq!(pool.slots.pin().len(), 5, "papaya holds all five");
+        assert_eq!(pool.slots.len(), 5, "all five slots are installed");
         assert!(
             !Arc::ptr_eq(&pool.slot(0).live, &pool.slot(1).live),
             "each index is its own slot, not one shared handle"
