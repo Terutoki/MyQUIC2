@@ -106,6 +106,17 @@ Its `dist/` artifacts **are** rebuilt from this revision, but — unlike every e
 — **nothing was verified for them**: no format check, no emulation, no E2E. Treat them as
 compiled, not as tested.
 
+The pass after that one is a review-and-fix cycle on three relay-hot-path findings
+rather than a new feature: the connection pin is written back from a DNS-cache hit (a
+steady domain flow used to pay a session-table read lock on every packet for the second
+half of the DNS TTL), the TCP upload pump double-buffers its copy buffer around quinn's
+zero-copy handover, and fragment reassembly keeps a refcounted slice of the received
+datagram instead of copying every chunk — see
+[pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild).
+Its `dist/` artifacts are rebuilt from this revision and — unlike the pass-26 rebuild —
+statically checked (`file` plus per-level `objdump`), though still not run under emulation
+or natively.
+
 ---
 
 ## Table of Contents
@@ -126,7 +137,7 @@ compiled, not as tested.
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths) and [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -473,6 +484,7 @@ before every run):
 | 48 | Post-audit fixes (pass 24): session-memo ownership, sweeper re-check, connection-pin deadline, `dns_inflight` accounting. `cargo test --all-targets` **79/79** (45 lib + 18 client + 16 server; **78/78** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. E2E on the fixed binaries: `udpdomainswitch` 500 alpha + 500 beta and `udpipswitch` 500 IP + 500 domain inside one session, **0 misrouted**; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim** (fragment path included); `udpdomainmulti` 4 000 sent / 3 999 received; 20 TCP flows with replies; a 40-datagram burst at an uncached name reported as `9 dropped (resolution in flight)` in the new counter. The fd leak is closed, measured with `lsof`: 100 associations on one connection, client `kill -9`, then **1** UDP fd (the listener) after the QUIC idle timeout, against **85** on the previous binary. `dist/openwrt-x86_64/` was rebuilt for all four CPU levels from this revision (static musl, x86-64, stripped; servers 4 327 072–4 349 816 B, +1 216–1 536 B per level; clients 4 390 120–4 416 280 B, same sizes as before) — `file` confirms the format, a second four-level build came out byte-identical at every level, and `objdump -d` finds 273 `zmm` refs in v4 with none in v1/v3 (`ymm` 3 978 → 25 306 from v1 to v3), so each `target-cpu` level really is compiled in. The emulated-container re-run was **not** repeated here (the local Podman machine did not respond): the dist artifacts are cross-compiled and statically checked, while the native-binary E2E below is green | ✅ |
 | 49 | Pass 25 — dedicated UDP egress and the pool audit. `cargo test --all-targets` **93/93** (49 lib + 27 client + 17 server; **92/92** with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Native-binary E2E (macOS loopback, the repo's own `hotpath_bench` harness): the client logs `quic pool: 4 TCP connection(s) … + 1 dedicated UDP connection (slot 4), UDP is fail-closed` and the server logs exactly **5** `new QUIC conn`; `tcpecho` 64 KiB byte-for-byte; `udpsweep` 8/1200/1420/1430/2000/8000 B **6/6 verbatim**; `udpmulti` 16 associations × 400 = **6400/6400, 0.000 % loss** at 19 451 pps. `quic_conns = 1` dials **2** connections (1 TCP + 1 UDP) and still passes TCP plus the full UDP sweep, so the separation is structural rather than load-dependent. With every connection dead (`kill -9` the server), the next 60 s line reads `66 dropped (no egress connection)` — the fail-closed path counted and reported instead of sharing a TCP connection silently — and after the restart the same client logs 2 `QUIC connected` with TCP and the 8/8000 B sweep green again. `dist/` was rebuilt for all four CPU levels (clients 4 406 656–4 430 000 B, servers 4 334 128–4 361 864 B; `file` confirms static musl + stripped) and the **shipped v1 pair was re-run end-to-end under amd64 emulation** (Podman on Apple Silicon, the `hotpath_bench` example cross-built for the same musl target) for pass 25's artifacts and again for the clock-free reply-path build: 5 connections accepted, `tcpecho` 256 KiB byte-for-byte, `udpsweep` 8/1200/1430/8000 B **4/4 verbatim**, `udpmulti` 8 × 200 = **1600/1600, 0.000 % loss**. The egress drop-accounting build that follows does **not** repeat that emulated run: it changes only what happens to a datagram that is *already* being dropped (an exact counter, a rate-limited warning) and no data-path decision, so its coverage is the unit suite — `egress_drops_are_exact_across_threads`, falsified against the batched wiring before being kept, and `egress_drop_warnings_use_independent_slots`; `objdump -d` finds 235 `zmm` refs in v4 and none in v1–v3 (`ymm` 3 978 → 27 045 from v1 to v3), so each `target-cpu` level is compiled in | ✅ |
 | 50 | Pass 26 — TCP/UDP echo hot-path audit. `cargo test --all-targets` **98/98** (53 lib + 28 client + 17 server; **97/97** with `--no-default-features`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets. Five fixes, one of them a silent-corruption defect: an abnormal pump end was announced to the *peer* as a clean FIN (`Drop for quinn::SendStream` calls `finish()`), so a truncated download looked complete one hop out; the pump now borrows its stream halves and resets/stops the abandoned one, gated on that direction's own completion. New regression tests: `abnormal_pump_end_resets_the_peer_stream_instead_of_finishing` (falsified against the old code — it panics with `the peer saw a clean FIN on an abandoned stream`), `a_partial_past_the_payload_cap_is_discarded_whole`, `coarse_millis_advances_without_traffic`, `the_coarse_epoch_is_rearmed_after_its_runtime_ends` and `too_large_refreshes_the_budget_without_discarding_the_handle`. Also: `TooLarge` no longer counted/logged as an egress loss nor allowed to flush the process-wide egress cache; the server's `fast_sock` is `Weak` (it was a second strong owner that outlived a swept session); the reassembler's documented per-partial `MQP_FRAG_MAX_PAYLOAD` cap is enforced (64 maximum-size fragments previously assembled ~91 KiB); per-datagram `mono_millis()` on three hot paths and per-*dropped*-datagram in the warn limiter replaced by `coarse_millis()`, a lazily armed 1 Hz epoch that advances with wall time (a count-based sampler freezes on trickle flows, which is why the earlier attempt was reverted) and re-arms itself if its runtime dies. Native-binary E2E (macOS loopback, the repo's `hotpath_bench`): `tcpecho` 64 KiB + 1 MiB byte-for-byte 0 mismatched; `udpsweep` 8/1200/1420/1430/2000/8000 B × 40 **6/6 verbatim**; `udpmulti` 16 × 400 = **6400/6400, 0.000 % loss** at 23 381 pps; `udpdomainswitch`/`udpipswitch` 100+100+100+100 **0 misrouted**; `bulk` 256 MiB at 105 MB/s; a 30 s mixed loop over ~30 epoch ticks with 0 failures. The session's only abort warning is the intentionally-truncated `bulk` flow, and the server's mirror line (`sending stopped by peer: error 4`) is the new propagation arriving; 0 UDP drops, 0 reassembly losses, `unknown_sess = 0`. `dist/` **was** rebuilt from this revision for all four CPU levels (static musl, x86-64, default features; clients 4 419 928–4 441 928 B, servers 4 345 120–4 373 048 B, +11 928–13 336 / +10 544–11 440 B per level vs pass 25) but, unlike every earlier pass that touched `dist/`, **no check of any kind was run on those bytes** — no `file`, no `objdump`, no reproducibility rebuild, no emulated or native run of the shipped pair; they are compiled, not tested | ⚠️ |
+| 51 | Pass 27 — hot-path review fixes. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Three changes, all on the relay hot paths: the connection pin is written back from a DNS-cache hit (pinned by the new `dns_hit_arms_the_pin_when_pin_and_memo_miss`); the c2s pump double-buffers its 32 KiB copy buffer so a frozen half gets one extra cycle to be ACK-released before its capacity is needed again; fragment reassembly stores `parent.slice(..)` instead of copying every chunk, guarded by an O(1) pointer suffix check with a copy fallback. `dist/` rebuilt for all four CPU levels (servers 4 348 224–4 375 064 B, clients 4 421 240–4 444 584 B; `file` confirms static musl + stripped, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). No native E2E or benchmark re-run: wire-compatible throughout, and the removed work is nanoseconds against this host's ~350 µs loopback datagram (same caveat as passes 13 and 15) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -603,22 +615,23 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 26's TCP-pump reset/stop on an abnormal end, the
-`coarse_millis` epoch, the enforced reassembler per-partial cap and the egress-drop
-accounting fixes, on top of pass 25's dedicated UDP egress slot, class-preserving bulk
-failover, retry-pool deadline and client drop accounting, the four-connection pool
-default and its `papaya` slot registry, the conditional destination-memo writes, the
-re-arming `WouldBlock` retry pool, and pass 24's session-memo ownership / sweeper
-re-check / connection-pin deadline fixes, pass-23's lock-free client control plane and
-the cache-substitution pass's DNS/destination memos, against the refreshed `Cargo.lock`)
-with the default feature set, so the relay counters are **on** in these builds: static
-musl, x86-64, stripped, 4 345 120–4 441 928 B (clients 4 419 928–4 441 928, servers
-4 345 120–4 373 048) each. Against the **pass-25** artifacts the clients grew
-11 928–13 336 B and the servers 10 544–11 440 B per level, for the pump's reset/stop
-disposition and its two completion flags, the coarse-epoch ticker and its call sites, the
-reassembler's per-partial check, and the `UNKNOWN_SESS` / `UdpWriteDrop` accounting.
-These four levels were **compiled only** — no `file` check, no emulated run, no E2E was
-performed on them, so their format is asserted by the build command and nothing else.
+rebuilt from the current revision (pass 27's connection-pin DNS write-back, the
+double-buffered c2s pump, the zero-copy fragment reassembly with its O(1) suffix check,
+and the `dns_cache_seed` test helper, on top of everything pass 26 shipped) with the
+default feature set, so the relay counters are **on** in these builds: static musl,
+x86-64, stripped, 4 348 224–4 375 064 B (servers: v1 4 363 280, v2 4 348 224,
+v3 4 375 064, v4 4 369 048) and 4 421 240–4 444 584 B (clients: v1 4 432 584,
+v2 4 421 240, v3 4 444 584, v4 4 437 272) each — i.e. **+2 016–+3 104 B** per server
+level and **+992–+2 656 B** per client level against the pass-26 artifacts, for the pin
+write-back, the pump's second buffer and its release helper, and the reassembler's split
+entry points (the new `#[cfg(test)]` regression test itself ships no bytes). Unlike the
+pass-26 rebuild these **were** statically checked: `file` confirms ELF 64-bit LSB x86-64,
+statically linked, stripped on all eight artifacts, and `objdump -d` finds 273 `zmm`
+refs in the v4 server and 235 in the v4 client with none in v1–v3 of either binary, so
+each `target-cpu` level really is compiled in. What was **not** repeated is any emulated
+or native run of the shipped pairs — the verification below applies to the native
+release build, and a target that needs a loadable binary should be validated on the
+target. The pass-26 "compiled only" wording below is kept as the history of that build:
 The sizes of the intermediate pass-25 steps remain visible: the clock-free reply path
 came out 128–192 B *smaller* than pass 25's first build
 of the clients, and the egress drop accounting that followed added 4 888–5 144 B to them
@@ -2695,6 +2708,102 @@ prefixes its reply with its own tag.
   [Connection isolation](#architecture) — because that registry is a fixed,
   write-once set read once per TCP flow, where the read path's cost is the only
   thing that matters.)
+
+---
+
+### 2026-09 hardening pass 27 — hot-path review fixes and a verified OpenWrt rebuild
+
+A review-and-fix cycle on three relay-hot-path findings, in the same wire protocol (no
+frame, framing, ALPN or protocol-field change, so mixed old/new pairs keep working).
+Each finding below was confirmed by reading the code path end to end, fixed minimally,
+re-reviewed as a diff, and re-verified with the full suite on both feature sets.
+
+**1. The connection pin is written back from a DNS-cache hit (server).** `resolve_pin`
+answers a datagram from three levels: the connection's `ConnPin`, the session's
+destination memo, then the DNS cache. The pin used to be written only from the session
+memo — but a fast-path success never calls `forward_server_dgram`, so it never calls
+`sess_dest_store` either. The pin and the session memo therefore expired together at
+T+30 s while the 60 s DNS cache was still live, and every subsequent packet of a steady
+domain flow paid a `sess_dest_lookup` shard read lock for the rest of the DNS TTL
+(~50 % duty-cycle degradation on exactly the flow that never misses). The DNS arm now
+adopts its hit into the pin under the same contract as the memo arm (`now +
+DEST_PIN_TTL_MS`, same coarse epoch, same `(session, name, port)` identity). The pin
+still cannot bypass the SSRF filter: the fast path gates every send on
+`allow_private || is_global_ip_cached`, and the slow path re-validates in
+`forward_server_dgram`. Pinned by `dns_hit_arms_the_pin_when_pin_and_memo_miss`, which
+covers both shapes — a cold start (no pin, no memo) and the actual degradation (expired
+pin, empty memo, live DNS) — and which fails against the pre-fix code (the pin stays
+`None` while the answer is still returned). The test seeds the cache through a new
+`#[doc(hidden)] pub fn dns_cache_seed`, because a bin unit test cannot reach the
+private cache tables and must not depend on a live resolver; it is callable only by
+linked code, so it exposes nothing to the network, and it mirrors the production
+insert path exactly (same key builder, same TTL anchoring, negative-entry removal,
+bounded eviction, thread-memo publish).
+
+**2. The TCP upload pump double-buffers its copy buffer (lib).** quinn's `write_chunk`
+moves the caller's `Bytes` into the stream's send queue with no copy, so bulk chunks go
+`read_buf` → `split_to(n).freeze()` → `write_chunk`. But `split_to` promotes the
+remainder to a shared handle while quinn holds the frozen half in `unacked_segments`,
+so the next `reserve` on the *same* buffer cannot reclaim in place and allocates a
+fresh 32 KiB — every chunk, on a bulk flow. The pump now holds two pooled buffers and
+rotates (`cur ^= 1`) on the large-write path only, giving the ACK one full
+other-buffer cycle to drop the first frozen half before that capacity is needed again;
+when the half is released inside the window the allocation is skipped, and when it is
+not the behaviour is identical to the old single-buffer path (allocate on reserve) —
+never worse. Small writes (`write_all`) do not split, so they stay on the current
+buffer and `clear()` it. All three exits (TCP read error, QUIC write error, clean EOF)
+return *both* halves through a new `release_copy_bufs` helper. A code-review pass on
+this diff corrected the original comment, which had stated the best case ("roughly
+every other chunk") as the typical one. The pool pressure is unchanged in kind: two
+acquisitions per flow against a depth-4 pool, both returned.
+
+**3. Fragment reassembly no longer copies every chunk (lib, both relays, tests).**
+`DgramReassembler::push` copied each fragment body with `Bytes::copy_from_slice`. It is
+now a thin wrapper over a shared `push_with_chunk` core, plus a new
+`push_zero_copy(parent: &Bytes, f: &FragmentRef, now_ms)` that stores
+`parent.slice(..)` — a refcount bump — instead. The suffix math is exact rather than
+assumed: `decode_fragment` always slices the chunk out to the *end* of the frame, so
+the start offset is `parent.len() - f.chunk.len()`, and the "is this chunk really the
+suffix of `parent`?" check is a single O(1) pointer comparison at that offset, not a
+body compare (the first version of this change did a full memcmp on every fragment,
+which re-read up to ~1.4 KiB on the path the change exists to speed up; the review
+replaced it). `Bytes` is immutable, so a pointer match implies the body compare would
+match too, and a mismatched pair falls back to a copy rather than slicing the wrong
+bytes — correctness never depends on the caller. All three production-adjacent call
+sites pass the exact `Bytes` the fragment was decoded from (the server fast path, the
+client `dispatch_one`, and the real-QUIC round-trip integration test), while the ~25
+existing unit tests keep calling the copying `push`, so both chunk representations stay
+covered. One accounting note: a stored slice retains the whole parent frame, but `held`
+charges only `chunk.len()` — the frame header (~20–30 B per fragment) is uncounted.
+That is the same accounting-skew class as the `Bytes` overhead that was never counted,
+and it is noise against `FRAG_MAX_HELD_BYTES` (256 KiB).
+
+**What was deliberately not changed.** The review's remaining notes were dispositioned
+as non-issues: the double-buffer's extra pool acquisition is returned on every exit;
+cancellation mid-`write_chunk` drops the buffers without pool return, but that matches
+the pre-existing single-buffer behaviour; the `held` undercount above is negligible by
+construction. No benchmark-harness run is claimed for this pass: the removed work is a
+few allocations and memcmps per chunk against this host's ~350 µs loopback datagram,
+which a single-host bench cannot resolve (the same caveat as passes 13 and 15) — the
+changes delete per-packet work that multiplies with concurrency instead.
+
+Verification: `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server) and
+**98/98** with `--no-default-features` (52 + 28 + 18); `cargo clippy --all-targets --
+-D warnings` and `cargo fmt --check` clean on both feature sets.
+
+`dist/`: **rebuilt and statically checked.** All four CPU levels were cross-compiled
+from this revision with the documented `cargo zigbuild` recipe (static musl, x86-64,
+default feature set) and copied into `dist/openwrt-x86_64/`: servers 4 348 224–
+4 375 064 B (v1 4 363 280, v2 4 348 224, v3 4 375 064, v4 4 369 048), clients
+4 421 240–4 444 584 B (v1 4 432 584, v2 4 421 240, v3 4 444 584, v4 4 437 272) —
+**+2 016–+3 104 B** per server level and **+992–+2 656 B** per client level against
+the pass-26 artifacts, for the pin write-back, the pump's second buffer and its
+release helper, and the reassembler's split entry points. `file` confirms ELF 64-bit
+LSB x86-64, statically linked, stripped on all eight; `objdump -d` finds 273 `zmm`
+refs in the v4 server and 235 in the v4 client with none in v1–v3 of either binary, so
+each `target-cpu` level really is compiled in. No emulated or native run of the shipped
+pairs was performed — the verification above applies to the native release build, and a
+target that needs a loadable binary should be validated on the target.
 
 ---
 

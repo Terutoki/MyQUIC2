@@ -736,7 +736,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 let Ok(f) = decode_fragment(&d) else {
                     continue;
                 };
-                let Some((s, a, whole)) = reasm.push(&f, mono_millis()) else {
+                let Some((s, a, whole)) = reasm.push_zero_copy(&d, &f, mono_millis()) else {
                     continue;
                 };
                 udp_stats::payload(whole.len());
@@ -1257,7 +1257,24 @@ fn resolve_pin(
         return Some(dst);
     }
     match lookup_cached_fast(h, p) {
-        CachedLookup::Addr(dst) => Some(dst),
+        CachedLookup::Addr(dst) => {
+            // Adopt the DNS hit into the connection pin. Without this the pin
+            // was only ever written from `sess_dest_lookup`, and a fast-path
+            // success skips `forward_server_dgram` → `sess_dest_store` entirely:
+            // the pin and the session dest expired together at T+30s while the
+            // 60s DNS cache was still live, so every subsequent packet paid
+            // `sess_dest_lookup` again for the rest of the DNS TTL (~50%
+            // duty-cycle degradation on a steady domain flow). Same contract as
+            // the memo branch above: pin for at most `DEST_PIN_TTL_MS`.
+            *pin = Some(ConnPin {
+                sess: s,
+                host: h.to_owned(),
+                port: p,
+                addr: dst,
+                expires: now + DEST_PIN_TTL_MS,
+            });
+            Some(dst)
+        }
         CachedLookup::Negative | CachedLookup::Unknown => None,
     }
 }
@@ -2316,6 +2333,54 @@ mod tests {
         let rearmed = pin.as_ref().expect("the memo must re-arm the pin");
         assert_eq!(rearmed.addr, dst);
         assert!(rearmed.expires > mono_millis(), "re-armed pin must be live");
+    }
+
+    /// The DNS-cache branch must arm the connection pin. Without that
+    /// write-back a fast-path success never called `sess_dest_store`, so pin
+    /// and session memo expired together at T+30 s while the 60 s DNS cache
+    /// was still live — every later packet paid `sess_dest_lookup` again for
+    /// the rest of the DNS TTL.
+    #[tokio::test]
+    async fn dns_hit_arms_the_pin_when_pin_and_memo_miss() {
+        let dst: SocketAddr = "93.184.216.34:8443".parse().unwrap();
+        let host = "dns-pin-arm.test";
+        let port = 18443u16;
+        dns_cache_seed(host, port, dst);
+
+        let (ss, _sock) = sess_with_dest(None);
+
+        // Cold start: no pin, no session memo — only the DNS cache answers.
+        let mut pin: Option<ConnPin> = None;
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, host, port),
+            Some(dst),
+            "the DNS cache must answer when pin and memo both miss"
+        );
+        let armed = pin.as_ref().expect("a DNS hit must arm the pin");
+        assert_eq!(armed.addr, dst);
+        assert_eq!(armed.host, host);
+        assert_eq!(armed.port, port);
+        assert_eq!(armed.sess, 7);
+        assert!(
+            armed.expires > coarse_millis(),
+            "the newly armed pin must be live"
+        );
+
+        // The P1 shape: pin expired, session memo still empty, DNS still live.
+        // The DNS hit must re-arm the pin, or the flow degrades to a
+        // `sess_dest_lookup` read lock on every packet for the rest of the TTL.
+        pin.as_mut().unwrap().expires = coarse_millis().saturating_sub(1);
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, host, port),
+            Some(dst),
+            "an expired pin must still fall through to the DNS cache"
+        );
+        let rearmed = pin.as_ref().expect("the DNS hit must re-arm the pin");
+        assert_eq!(rearmed.addr, dst);
+        assert!(
+            rearmed.expires > coarse_millis(),
+            "the re-armed pin must be live"
+        );
     }
 
     /// A memo slot must never be the last owner of a session socket. With a

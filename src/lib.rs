@@ -1785,6 +1785,31 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
     }
 }
 
+/// Seed the positive DNS cache as if `host:port` had just resolved to `addr`.
+///
+/// Bin unit tests need this to exercise a DNS-hit path without a live
+/// resolver; production always warms the cache through `resolve_all_cached`.
+#[doc(hidden)]
+pub fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = dns_key_owned(host, port);
+            &owned
+        }
+    };
+    let now = Instant::now();
+    {
+        let mut m = lock_write(dns_cache_for(key));
+        m.insert(key.to_owned(), (now, Arc::from([addr])));
+        evict_if_needed(&mut m);
+    }
+    lock_write(dns_neg_cache_for(key)).remove(key);
+    memo_put(key, Some(addr), now + DNS_CACHE_TTL);
+}
+
 const DNS_CACHE_MAX: usize = 4096;
 /// Per-shard positive-cache cap: shards share the process-wide total evenly,
 /// so the aggregate bound stays `DNS_CACHE_MAX` while no single write lock
@@ -3152,7 +3177,53 @@ impl DgramReassembler {
     /// after delivery is delivered again: UDP permits duplicates, the id is
     /// freed on completion, and suppressing them would cost a window of
     /// completed ids for no semantic gain.
+    ///
+    /// This form copies `f.chunk` into a fresh `Bytes`. Prefer
+    /// [`push_zero_copy`](Self::push_zero_copy) when the decoded frame still
+    /// borrows from an owned datagram — the hot path does.
     pub fn push(&mut self, f: &FragmentRef<'_>, now_ms: u64) -> Option<(u32, TargetAddr, Bytes)> {
+        self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), now_ms)
+    }
+
+    /// Zero-copy [`push`](Self::push): `parent` must be the exact `Bytes` `f`
+    /// was decoded from, so the stored chunk is `parent.slice(..)` — a refcount
+    /// bump — instead of `Bytes::copy_from_slice` (a full copy of every
+    /// fragment body).
+    ///
+    /// [`decode_fragment`] always slices the chunk out to the *end* of the
+    /// frame, so the start offset is `parent.len() - f.chunk.len()`. The
+    /// "is this chunk really the suffix of `parent`?" check is a single
+    /// pointer comparison against that offset — not a body compare — so the
+    /// hot path stays O(1). A caller that passes a mismatched pair falls back
+    /// to a copy rather than slicing the wrong bytes.
+    pub fn push_zero_copy(
+        &mut self,
+        parent: &Bytes,
+        f: &FragmentRef<'_>,
+        now_ms: u64,
+    ) -> Option<(u32, TargetAddr, Bytes)> {
+        let chunk = if f.chunk.len() <= parent.len() {
+            let start = parent.len() - f.chunk.len();
+            // `f.chunk` is a subslice of the same allocation as `parent` at
+            // exactly this offset iff the two pointers agree. `Bytes` is
+            // immutable, so a match means the body compare would also match.
+            if f.chunk.as_ptr() == parent.as_ptr().wrapping_add(start) {
+                parent.slice(start..)
+            } else {
+                Bytes::copy_from_slice(f.chunk)
+            }
+        } else {
+            Bytes::copy_from_slice(f.chunk)
+        };
+        self.push_with_chunk(f, chunk, now_ms)
+    }
+
+    fn push_with_chunk(
+        &mut self,
+        f: &FragmentRef<'_>,
+        chunk: Bytes,
+        now_ms: u64,
+    ) -> Option<(u32, TargetAddr, Bytes)> {
         if f.total < 2 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total {
             return None;
         }
@@ -3185,7 +3256,7 @@ impl DgramReassembler {
         // was already at the cap.
         if let Some(p) = self.parts.get(&key) {
             let duplicate = p.chunks.get(f.idx as usize).is_some_and(Option::is_some);
-            if !duplicate && p.bytes.saturating_add(f.chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
+            if !duplicate && p.bytes.saturating_add(chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
                 if let Some(p) = self.parts.remove(&key) {
                     self.held = self.held.saturating_sub(p.bytes);
                     udp_stats::reassembly_evicted();
@@ -3223,7 +3294,7 @@ impl DgramReassembler {
             }
             let slot = &mut entry.chunks[f.idx as usize];
             if slot.is_none() {
-                *slot = Some(Bytes::copy_from_slice(f.chunk));
+                *slot = Some(chunk);
                 entry.got += 1;
                 entry.bytes += f.chunk.len();
                 self.held = self.held.saturating_add(f.chunk.len());
@@ -3777,6 +3848,15 @@ fn copy_buf_release(mut buf: BytesMut) {
     });
 }
 
+/// Return both halves of the c2s double-buffer to the pool (or drop them).
+///
+/// A `BytesMut::new()` empty slot is fine to pass through: zero capacity means
+/// `copy_buf_release` skips the pool and the slot is simply left empty.
+fn release_copy_bufs(bufs: &mut [BytesMut; 2]) {
+    copy_buf_release(std::mem::replace(&mut bufs[0], BytesMut::new()));
+    copy_buf_release(std::mem::replace(&mut bufs[1], BytesMut::new()));
+}
+
 /// Throttled liveness stamp shared by the two copy directions.
 ///
 /// `since_ms` is the caller's last observed elapsed time, kept in a local so the
@@ -3896,18 +3976,29 @@ async fn copy_tcp_quic_inner(
     // as a clean FIN — see the disposition, and `peer_sees_reset_not_fin`.
     let outcome: Result<(u64, u64)> = {
         let c2s = async {
-            let mut buf = copy_buf_acquire();
+            // Double-buffer. `split_to(n).freeze()` promotes the remainder to
+            // a shared handle while quinn holds the frozen half in
+            // `unacked_segments`, so the next `reserve` on the same buffer
+            // cannot reclaim in place and would allocate a fresh 32 KiB.
+            // Rotating gives the ACK one full other-buffer cycle to drop the
+            // first frozen half before we need its capacity again; when the
+            // half is released within that window the alloc is skipped, and
+            // when it is not the behaviour is the same as the old
+            // single-buffer path (allocate on reserve). Small writes
+            // (`write_all`) do not split, so they keep the current buffer and
+            // clear it.
+            let mut bufs = [copy_buf_acquire(), copy_buf_acquire()];
+            let mut cur = 0usize;
             let mut total = 0u64;
             let mut stamped = 0u64;
             loop {
-                reserve_copy_chunk(&mut buf);
-                let n = match tr.read_buf(&mut buf).await {
+                reserve_copy_chunk(&mut bufs[cur]);
+                let n = match tr.read_buf(&mut bufs[cur]).await {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
                         let total_copy = total;
-                        let buf_ret = std::mem::replace(&mut buf, BytesMut::new());
-                        copy_buf_release(buf_ret);
+                        release_copy_bufs(&mut bufs);
                         return Err::<u64, anyhow::Error>(anyhow::anyhow!(
                             "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
                         ));
@@ -3918,18 +4009,21 @@ async fn copy_tcp_quic_inner(
                 // moves it into `unacked_segments`); the remaining allocation is
                 // the one quinn's `to_owned()` used to perform, minus the copy.
                 let res = if n >= ZEROCOPY_MIN_WRITE {
-                    send.write_chunk(buf.split_to(n).freeze()).await
+                    let frozen = bufs[cur].split_to(n).freeze();
+                    // Next read uses the other buffer; this one may be shared
+                    // with `frozen` until the ACK drops it.
+                    cur ^= 1;
+                    send.write_chunk(frozen).await
                 } else {
-                    let r = send.write_all(&buf[..n]).await;
+                    let r = send.write_all(&bufs[cur][..n]).await;
                     if r.is_ok() {
-                        buf.clear();
+                        bufs[cur].clear();
                     }
                     r
                 };
                 if let Err(e) = res {
                     let total_copy = total;
-                    let buf_ret = std::mem::replace(&mut buf, BytesMut::new());
-                    copy_buf_release(buf_ret);
+                    release_copy_bufs(&mut bufs);
                     return Err::<u64, anyhow::Error>(anyhow::anyhow!(
                         "tcp>quic quic write failed after {total_copy}B up: {e:#}"
                     ));
@@ -3942,7 +4036,7 @@ async fn copy_tcp_quic_inner(
                 touch_stamp(&l1, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
             }
             send.finish().ok();
-            copy_buf_release(buf);
+            release_copy_bufs(&mut bufs);
             Ok::<u64, anyhow::Error>(total)
         };
         let s2c = async {
@@ -5387,7 +5481,7 @@ mod tests {
             while let Ok(d) = conn.read_datagram().await {
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else { continue };
-                    if let Some(x) = reasm.push(&f, mono_millis()) {
+                    if let Some(x) = reasm.push_zero_copy(&d, &f, mono_millis()) {
                         out.push(x);
                     }
                 } else {

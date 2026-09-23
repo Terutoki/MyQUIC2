@@ -1280,7 +1280,7 @@ fn dispatch_one(
         let Ok(f) = decode_fragment(&d) else {
             return;
         };
-        let Some((_, a, whole)) = reasm.push(&f, mono_millis()) else {
+        let Some((_, a, whole)) = reasm.push_zero_copy(&d, &f, mono_millis()) else {
             return;
         };
         udp_stats::payload(whole.len());
