@@ -131,11 +131,17 @@ impl ConnSlot {
 
     /// Wait for a live connection, waking on a generation bump or the deadline.
     ///
-    /// The maintained `live` bit is trusted in the common case: it is one
-    /// atomic load where `close_reason()` takes quinn's connection-state mutex
-    /// and clones the error. `close_reason()` is still the authority when the
-    /// bit is false, which is the accepted race window before the reconnect
-    /// loop clears `shared`.
+    /// Authority is `close_reason()`; the maintained `live` bit is only a hint
+    /// that lets a known-dead slot skip quinn's connection-state mutex (`live`
+    /// false waits without taking the lock). A `live` true handle is confirmed
+    /// via `close_reason()` before it is handed out, so a stale-true window —
+    /// `read_datagram` failing before the conn loop clears `live` + `bump_gen`
+    /// — waits instead of returning a dead handle for the dispatcher to spin
+    /// on. Cost is one quinn lock per `wait_conn` return (per TCP flow / per
+    /// dispatcher generation, never per packet). Race window: `close_reason()`
+    /// may flip right after this check; the TCP `open_bi` failure path
+    /// (`clear_if` + `live=false` + `bump_gen`) stays the authoritative
+    /// self-heal, so a handle that dies in flight still heals in one flow.
     async fn wait_conn(
         &self,
         gen_rx: &mut watch::Receiver<u64>,
@@ -149,7 +155,7 @@ impl ConnSlot {
             // opening during a reconnect never blocks a runtime thread.
             let g = self.shared.load();
             if let Some(c) = g.as_ref() {
-                if self.is_live() || c.close_reason().is_none() {
+                if self.is_live() && c.close_reason().is_none() {
                     return Ok((**c).clone());
                 }
             }
@@ -1349,6 +1355,12 @@ fn dispatch_one(
 fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
     tokio::spawn(async move {
         let mut gen = slot.gen_rx.clone();
+        // Backstop across consecutive dead reads, 100ms -> 1s cap. A read
+        // error fires before the conn loop clears `live` + `bump_gen`, so a
+        // fixed 10ms backstop spins every slot at 100Hz for the whole dead
+        // window; exponential growth bounds it at ~10Hz then ~1Hz while
+        // `gen.changed()` keeps priority wakeup (fresh generation resets).
+        let mut backoff = Duration::from_millis(100);
         loop {
             let conn = match slot.wait_conn(&mut gen, Duration::from_secs(10)).await {
                 Ok(c) => c,
@@ -1387,11 +1399,20 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                 // A read error can fire before the connection loop clears the
                 // live bit; without this, wait_conn would immediately hand back
                 // the same dead connection and the dispatcher would busy-spin.
-                // Wait for the generation bump, with a short backstop.
+                // Wait for the generation bump, with an exponential backstop
+                // (100ms -> 1s): gen.changed() keeps priority wakeup so a
+                // fresh connection resets immediately, while a dead window
+                // that outlives several reads decays to ~1Hz instead of 100Hz.
                 tokio::select! {
-                    _ = gen.changed() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    _ = gen.changed() => {
+                        backoff = Duration::from_millis(100);
+                    }
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = (backoff * 2).min(Duration::from_secs(1));
+                    }
                 }
+            } else {
+                backoff = Duration::from_millis(100);
             }
         }
     });
@@ -3621,9 +3642,13 @@ mod tests {
         );
     }
 
-    /// `wait_conn` trusts the maintained live bit (no `close_reason()` mutex in
-    /// the common case) and still fails fast once the bit is false, with
-    /// `close_reason()` as the authority.
+    /// `wait_conn` confirms a `live`-true handle via `close_reason()` and
+    /// still fails fast once the bit is false, with `close_reason()` as the
+    /// authority. A locally closed connection with a stale-true bit waits to
+    /// the deadline instead of handing back a dead handle (the race window
+    /// before the conn loop clears `live` + bumps the generation); the TCP
+    /// `open_bi` failure path stays the self-heal for handles that die after
+    /// this check.
     #[tokio::test]
     async fn wait_conn_trusts_the_live_bit_and_bounds_the_dead_case() {
         let (conn, _client, _server) = real_connection().await;
@@ -3632,13 +3657,15 @@ mod tests {
         slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
         let (_gen_tx, mut gen_rx) = watch::channel(0u64);
 
-        // The live bit is the maintained hint: a locally closed connection is
-        // still handed out while the bit is set (the accepted race window).
+        // Stale-true bit with a closed connection: must wait, not hand back
+        // the dead handle that used to let the dispatcher busy-spin.
         conn.close(0u32.into(), b"test");
-        assert!(slot
-            .wait_conn(&mut gen_rx, Duration::from_secs(1))
-            .await
-            .is_ok());
+        assert!(
+            slot.wait_conn(&mut gen_rx, Duration::from_millis(50))
+                .await
+                .is_err(),
+            "a closed connection must not be handed out even while live is stale-true"
+        );
 
         slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(

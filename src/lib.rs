@@ -3034,21 +3034,45 @@ fn claim_drop_warning(last: &std::sync::atomic::AtomicU64) -> bool {
             .is_ok()
 }
 
+/// Which datagram-drop class a warning is about.
+///
+/// An enum rather than a reason substring: the slot used to be picked with
+/// `reason.contains("buffer full" | "budget" | "fragment" | "header")`, so a
+/// reworded message would silently merge two faults into one rate limit — the
+/// same failure mode [`UdpWriteDrop`] documents. Each variant keeps its
+/// historical slot (`LAST_LARGE` / `LAST_FULL` / `LAST_OTHER`); the
+/// human-readable `reason` stays a separate parameter so the log line keeps
+/// its diagnostic specificity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatagramDropKind {
+    /// The payload did not fit the path budget or the fragmentation cap
+    /// (including a bad address header, which only affects sizing).
+    Large,
+    /// quinn's DATAGRAM send buffer was full.
+    BufferFull,
+    /// Any other drop. No current call site maps here; the slot is kept so a
+    /// future class gets its own rate limit instead of sharing one.
+    #[allow(dead_code)]
+    Other,
+}
+
 /// Rate-limited (at most one per [`DROP_WARN_INTERVAL_MS`], process-wide)
 /// warning for a dropped datagram. A per-packet `warn!` would itself become the
 /// bottleneck under the flood that causes drops.
-fn warn_datagram_drop(reason: &str, total: u64, detail: impl FnOnce() -> String) {
+fn warn_datagram_drop(
+    kind: DatagramDropKind,
+    reason: &str,
+    total: u64,
+    detail: impl FnOnce() -> String,
+) {
     use std::sync::atomic::AtomicU64;
     static LAST_LARGE: AtomicU64 = AtomicU64::new(NEVER_WARNED);
     static LAST_FULL: AtomicU64 = AtomicU64::new(NEVER_WARNED);
     static LAST_OTHER: AtomicU64 = AtomicU64::new(NEVER_WARNED);
-    let slot = if reason.contains("buffer full") {
-        &LAST_FULL
-    } else if reason.contains("budget") || reason.contains("fragment") || reason.contains("header")
-    {
-        &LAST_LARGE
-    } else {
-        &LAST_OTHER
+    let slot = match kind {
+        DatagramDropKind::Large => &LAST_LARGE,
+        DatagramDropKind::BufferFull => &LAST_FULL,
+        DatagramDropKind::Other => &LAST_OTHER,
     };
     if !claim_drop_warning(slot) {
         return;
@@ -3082,7 +3106,12 @@ pub fn send_udp_datagram(
 ) -> DatagramSend {
     let Ok(header) = address.header() else {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-        warn_datagram_drop("bad address header", n, String::new);
+        warn_datagram_drop(
+            DatagramDropKind::Large,
+            "bad address header",
+            n,
+            String::new,
+        );
         return DatagramSend::TooLarge;
     };
     send_udp_datagram_with_header(conn, sess, &header, payload, limit)
@@ -3097,9 +3126,12 @@ fn send_udp_datagram_with_header(
 ) -> DatagramSend {
     let Some(d) = encode_datagram_with_header(sess, header, payload, limit) else {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-        warn_datagram_drop("payload exceeds the path budget", n, || {
-            budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len()))
-        });
+        warn_datagram_drop(
+            DatagramDropKind::Large,
+            "payload exceeds the path budget",
+            n,
+            || budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len())),
+        );
         return DatagramSend::TooLarge;
     };
     send_encoded(conn, d)
@@ -3117,10 +3149,16 @@ fn send_encoded(conn: &quinn::Connection, body: Bytes) -> DatagramSend {
     let outcome = try_send_datagram(conn, body);
     if outcome == DatagramSend::Blocked {
         let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-        warn_datagram_drop("send buffer full", n, String::new);
+        warn_datagram_drop(
+            DatagramDropKind::BufferFull,
+            "send buffer full",
+            n,
+            String::new,
+        );
     } else if outcome == DatagramSend::TooLarge {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
         warn_datagram_drop(
+            DatagramDropKind::Large,
             "path budget shrank under the encoded datagram",
             n,
             String::new,
@@ -3181,7 +3219,12 @@ impl DgramFragmenter {
     ) -> PayloadSend {
         let Ok(header) = address.header() else {
             let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            warn_datagram_drop("bad address header", n, String::new);
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "bad address header",
+                n,
+                String::new,
+            );
             return PayloadSend {
                 frames: 0,
                 failed: Some(DatagramSend::TooLarge),
@@ -3216,12 +3259,17 @@ impl DgramFragmenter {
         };
         if total_usize > MQP_FRAG_MAX_TOTAL as usize || payload.len() > MQP_FRAG_MAX_PAYLOAD {
             let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            warn_datagram_drop("payload above the MQP-2 fragmentation limit", n, || {
-                format!(
-                    "; {} B exceeds the {MQP_FRAG_MAX_PAYLOAD} B reassembly cap",
-                    payload.len()
-                )
-            });
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "payload above the MQP-2 fragmentation limit",
+                n,
+                || {
+                    format!(
+                        "; {} B exceeds the {MQP_FRAG_MAX_PAYLOAD} B reassembly cap",
+                        payload.len()
+                    )
+                },
+            );
             return PayloadSend {
                 frames: 0,
                 failed: Some(DatagramSend::TooLarge),
@@ -3239,7 +3287,12 @@ impl DgramFragmenter {
                 // Only reachable if `chunk` and the encoder disagree; report it
                 // rather than send a payload that can never reassemble.
                 let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-                warn_datagram_drop("fragment does not fit the path budget", n, String::new);
+                warn_datagram_drop(
+                    DatagramDropKind::Large,
+                    "fragment does not fit the path budget",
+                    n,
+                    String::new,
+                );
                 return PayloadSend {
                     frames,
                     failed: Some(DatagramSend::TooLarge),
@@ -3929,7 +3982,17 @@ async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
         a => anyhow::bail!("bad bnd atyp {a}"),
     };
     recv.read_exact(&mut buf[1..n]).await.context("bnd addr")?;
-    decode_bnd_addr(&buf[..n])?;
+    let (addr, consumed) = decode_bnd_addr(&buf[..n])?;
+    // Minimal consistency with `encode_bnd_addr_into`: the decoder accepts any
+    // well-formed atyp, but the dial ACK must carry the server's real bound
+    // socket — never the unknown `0.0.0.0:0` the optimistic SOCKS reply uses,
+    // and never a length the encoder could not have produced.
+    if consumed != n {
+        anyhow::bail!("bnd length mismatch");
+    }
+    if addr.ip().is_unspecified() && addr.port() == 0 {
+        anyhow::bail!("refused bnd {addr}");
+    }
     Ok(())
 }
 
@@ -4171,6 +4234,17 @@ async fn copy_tcp_quic_inner(
     // and they are driven to completion inside this function, so no heap
     // allocation per flow.
     let last_ms = AtomicU64::new(coarse_millis());
+    // Per-direction progress stamps, same epoch and throttle as `last_ms`. A
+    // shared stamp alone cannot see a stall in one direction while the other
+    // keeps flowing: the live direction refreshes it, so a half-dead stream
+    // (e.g. a bulk download with a wedged upload) never looks idle and the
+    // watchdog never fires. Each direction therefore stamps its own counter
+    // alongside the shared one, and the idle tick below fails a direction
+    // that made no progress for the whole window provided the shared stamp
+    // is expired too (AND gate): one live direction keeps a healthy
+    // half-idle flow alive, so only a stall on top of global silence kills.
+    let c2s_last = AtomicU64::new(coarse_millis());
+    let s2c_last = AtomicU64::new(coarse_millis());
     // Borrowed halves: `tcp` itself stays owned here so the final disposition
     // (graceful FIN on clean EOF, RST on any abnormal end) is decided in one
     // place after both directions settle, instead of each direction racing to
@@ -4204,6 +4278,7 @@ async fn copy_tcp_quic_inner(
             let mut cur = 0usize;
             let mut total = 0u64;
             let mut stamped = 0u64;
+            let mut stamped_dir = 0u64;
             loop {
                 reserve_copy_chunk(&mut bufs[cur]);
                 let n = match tr.read_buf(&mut bufs[cur]).await {
@@ -4244,9 +4319,13 @@ async fn copy_tcp_quic_inner(
                 total += n as u64;
                 // Stamp every chunk (throttled inside): gating on a chunk count
                 // starves slow trickle uploads past the 300s idle reap while
-                // downloads stamp every batch.
+                // downloads stamp every batch. Both the shared stamp and this
+                // direction's own progress stamp move here (separate throttle
+                // locals: one `touch_stamp` call consumes the observation, so a
+                // second call with the same local would never store).
                 let now = coarse_millis();
                 touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
+                touch_stamp(&c2s_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
             }
             send.finish().ok();
             release_copy_bufs(&mut bufs);
@@ -4255,6 +4334,7 @@ async fn copy_tcp_quic_inner(
         let s2c = async {
             let mut total = 0u64;
             let mut stamped = 0u64;
+            let mut stamped_dir = 0u64;
             // Optimistic SOCKS replies have already told the application the
             // connection is up, so the MQP-2 dial ACK only gates the reply
             // direction here. A failure means the remote dial failed (or the
@@ -4315,6 +4395,7 @@ async fn copy_tcp_quic_inner(
                 total += batch_bytes as u64;
                 let now = coarse_millis();
                 touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
+                touch_stamp(&s2c_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
             }
             // QUIC-recv EOF: half-close the TCP write side now. Without
             // this FIN the peer waits for EOF while our own c2s direction
@@ -4364,8 +4445,45 @@ async fn copy_tcp_quic_inner(
                 },
                 _ = &mut idle_tick, if idle_enabled => {
                     let elapsed_ms = coarse_millis();
-                    let last = last_ms.load(Ordering::Relaxed);
-                    if elapsed_ms.saturating_sub(last) >= idle.as_millis() as u64 {
+                    let idle_ms = idle.as_millis() as u64;
+                    // Per-direction stall, AND-gated on the shared stamp below: a
+                    // direction that already reached clean EOF is exempt — its
+                    // stamp legitimately stops — and the `Err` runs the shared
+                    // reset/stop+RST disposition, so the peer learns the stall
+                    // as a reset.
+                    let c2s_stalled = c2s_total.is_none()
+                        && elapsed_ms.saturating_sub(c2s_last.load(Ordering::Relaxed))
+                            >= idle_ms;
+                    let s2c_stalled = s2c_total.is_none()
+                        && elapsed_ms.saturating_sub(s2c_last.load(Ordering::Relaxed))
+                            >= idle_ms;
+                    // AND-gated on the shared stamp: a direction that went quiet
+                    // on its own (e.g. c2s done sending while s2c downloads past
+                    // the window) is healthy, not a stall — the old shared-stamp
+                    // logic kept such flows alive. Kill only when some unfinished
+                    // direction is silent AND nothing flowed anywhere, keeping
+                    // the direction name for the log line.
+                    let shared_expired = elapsed_ms
+                        .saturating_sub(last_ms.load(Ordering::Relaxed))
+                        >= idle_ms;
+                    if (c2s_stalled || s2c_stalled) && shared_expired {
+                        let dir = if c2s_stalled && s2c_stalled {
+                            "both directions"
+                        } else if c2s_stalled {
+                            "c2s"
+                        } else {
+                            "s2c"
+                        };
+                        break Err(anyhow::anyhow!(
+                            "tcp stream stall ({dir}) idle>{idle:?} after {}B up/{}B down",
+                            c2s_total.unwrap_or(0),
+                            s2c_total.unwrap_or(0),
+                        ));
+                    }
+                    // Shared-only expiry (no unfinished direction silent, yet
+                    // nothing flowed anywhere): kept as the overall-idle arm so
+                    // this check is not dead code behind the gate above.
+                    if shared_expired {
                         break Err(anyhow::anyhow!(
                             "tcp stream idle>{idle:?} after {}B up/{}B down",
                             c2s_total.unwrap_or(0),

@@ -380,8 +380,6 @@ const SESS_IDLE_MS: u64 = 180_000;
 /// Process-wide cap on concurrent TCP dials. Per-connection caps alone cannot
 /// bound fd usage when an unauthenticated peer can open many connections.
 const MAX_DIALS_GLOBAL: usize = 4096;
-/// How long a dial may wait for a global dial permit before giving up.
-const DIAL_PERMIT_WAIT: Duration = Duration::from_secs(2);
 /// Wall-clock budget for the post-handshake token exchange (accept the uni
 /// stream and read the token). `Incoming::accept()` is synchronous, so the
 /// handshake itself is bounded separately by [`HANDSHAKE_TIMEOUT`]; together
@@ -426,6 +424,12 @@ fn dial_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_DIALS_GLOBAL)))
 }
+
+/// TCP dial refusal counters, kept separate so a dial-permit exhaustion flood
+/// is distinguishable from a dial-connect failure in debug logs (same split
+/// the stream_task_limiter fail-fast path reports via its own reset code).
+static DIAL_PERMIT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAL_CONNECT_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Process-wide cap on concurrently handled QUIC bidi streams. The transport's
 /// per-connection stream limit alone allows 1024 x 4096 = ~4M live stream tasks,
@@ -1125,14 +1129,17 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             };
             // Hold the global dial permit only for the connect phase; the copy
             // phase is bounded by the transport's stream limit instead.
-            let _dial_permit = match tokio::time::timeout(
-                DIAL_PERMIT_WAIT,
-                dial_limiter().clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(p)) => p,
-                _ => {
+            // Fail fast instead of parking this stream task (and its
+            // stream-task permit) in a DIAL_PERMIT_WAIT queue: a dial flood
+            // would otherwise hold up to MAX_STREAM_TASKS permits while
+            // later flows starve behind them. Matches the stream_task_limiter
+            // and dns_slow_path_limiter try_acquire paths; the client retries.
+            let _dial_permit = match dial_limiter().clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    let n =
+                        DIAL_PERMIT_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::debug!("tcp dial permit refused ({n} so far)");
                     send.reset(0x04u32.into()).ok();
                     return;
                 }
@@ -1140,6 +1147,9 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             let tcp = match dial_happy_eyeballs(cands, allow_private).await {
                 Some(t) => t,
                 None => {
+                    let n =
+                        DIAL_CONNECT_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::debug!("tcp dial failed ({n} so far)");
                     send.reset(0x04u32.into()).ok();
                     return;
                 }
@@ -1161,11 +1171,14 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
             // Bounded: a stalled stream must not pin this task and its
             // stream-task permit until connection death; the client tears the
             // flow down on a missing ACK, so a slow write here buys nothing.
+            // Reset symmetrically with the dial-failure paths above so the
+            // client fails fast instead of waiting out its 25s ACK timeout.
             let ack_sent = tokio::time::timeout(Duration::from_secs(5), send.write_all(&ack[..n]))
                 .await
                 .map(|r| r.is_ok())
                 .unwrap_or(false);
             if !ack_sent {
+                send.reset(0x04u32.into()).ok();
                 return;
             }
             match copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await {

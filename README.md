@@ -144,6 +144,21 @@ Its `dist/` artifacts are rebuilt from this revision and statically checked (`fi
 plus per-level `objdump`, plus a byte-identical second build), again not run under
 emulation or natively.
 
+The current pass fixes six findings from another two-round review of the echo hot
+paths — five confirmed, one falsified-and-kept-as-documented, then independently
+re-verified: the TCP pump gets per-direction stall stamps (a flow half-wedged while
+the other half flows no longer hides behind the shared liveness stamp), a failed
+server ACK resets the stream like every other dial failure instead of leaving the
+client on its 25 s ACK timeout, the drop-warning slot picker moves from substring
+matching to an enum, the dial ACK validates the bound address, `wait_conn` trusts
+`close_reason()` instead of the stale live bit (the dispatcher backs off
+exponentially instead of spinning), and the server dial permit fails fast instead
+of parking stream tasks — see
+[pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial).
+Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
+plus per-level `objdump`, plus a byte-identical second build), again not run under
+emulation or natively.
+
 ---
 
 ## Table of Contents
@@ -164,7 +179,7 @@ emulation or natively.
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap) and [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -524,6 +539,7 @@ before every run):
 | 51 | Pass 27 — hot-path review fixes. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Three changes, all on the relay hot paths: the connection pin is written back from a DNS-cache hit (pinned by the new `dns_hit_arms_the_pin_when_pin_and_memo_miss`); the c2s pump double-buffers its 32 KiB copy buffer so a frozen half gets one extra cycle to be ACK-released before its capacity is needed again; fragment reassembly stores `parent.slice(..)` instead of copying every chunk, guarded by an O(1) pointer suffix check with a copy fallback. `dist/` rebuilt for all four CPU levels (servers 4 348 224–4 375 064 B, clients 4 421 240–4 444 584 B; `file` confirms static musl + stripped, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). No native E2E or benchmark re-run: wire-compatible throughout, and the removed work is nanoseconds against this host's ~350 µs loopback datagram (same caveat as passes 13 and 15) | ✅ |
 | 52 | Pass 28 — bounded stream-head writes, refused-datagram accounting, SOCKS header size. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two review rounds confirmed four findings before any edit; two were dispositioned as non-issues (an unreachable fragment-branch, and malformed-frame drops staying uncounted per pass 26's documented decision). Changes: client MQP-2 stream-head write and server TCP-open ACK write each under a 5 s `timeout` (failure resets/tears the flow down before the optimistic SOCKS success, answering `0x04` on the client); `SOCKS_UDP_HDR_MAX` 22 → 262 (worst-case domain header); new batched `dgram_drops::REFUSED` wired through `bump`/`flush_locals`/`snapshot`/`since`/`lost()`, bumped at five policy-refusal sites (server negative cache, both SSRF arms, `sess == 0` — reclassified off `SESSION_FULL` — and the client's domain-reply refusals) and printed in both 60 s `udp budget` lines; `every_drop_counter_has_its_own_snapshot_field` extended to all seven counters (`lost() >= 7`). `dist/` rebuilt for all four CPU levels (servers 4 344 544–4 373 480 B, clients 4 379 536–4 403 000 B; `file` confirms static musl + stripped on all eight, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). Client levels come out 38 824–42 224 B *smaller* than the pass-27 recorded figures and server levels −3 680…+1 424 B, a code-size move this pass's additions do not by themselves explain — the recipe and feature set are unchanged, `Cargo.lock` is untouched, and the pre-rebuild `dist/` files already sat at ~4.39/4.36 MB rather than the pass-27 recorded sizes. No native E2E or benchmark re-run: wire-compatible throughout (timeout paths and counters only) | ✅ |
 | 53 | Pass 29 — replay-safe auth, reply-source validation, DNS parity, truncation counting, session fairness. `cargo test --all-targets` **102/102** (53 lib + 28 client + 21 server; **101/101** with `--no-default-features`: 52 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review (round two tasked to falsify; three candidates rejected): token sent at 1-RTT only, per-session reply allowlist, per-association app lock, full-set DNS fallback on the UDP fast path, `TOO_LARGE` on relay truncations, live fair-share session gate. New regression tests: `reply_allowlist_accepts_only_recorded_destinations`, `resolve_pin_withholds_a_filtered_cached_address`, `fair_share_splits_the_global_budget_across_live_connections`. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness) | ✅ |
+| 54 | Pass 31 — per-direction stall, symmetric ACK reset, enum warn slots, fail-fast dial. `cargo test --all-targets` **104/104** (55 lib + 28 client + 21 server; **103/103** with `--no-default-features`: 54 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review plus an independent oracle re-verification (5 PASS / 1 FAIL; the FAIL — per-direction stall killing healthy half-idle flows — fixed as an AND gate with the shared stamp and re-verified PASS): per-direction pump stall stamps gated on shared-stamp expiry, server ACK failure resets like dial failures, `warn_datagram_drop` substring slots moved to `DatagramDropKind`, dial-ACK bound-address validation, `wait_conn` trusting `close_reason()` with exponential dispatcher backoff, fail-fast server dial permit with its own counters. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -654,27 +670,26 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 30's retained-byte reassembly accounting, the
-session-holder fair share, the throttled fair-cap reap, pre-lock SOCKS5 framing
-validation on the client, the record-before-send reply allowlist, the DNS
-negative-entry guard, and the window guard test rewired to the real config path — on
-top of everything pass 29 shipped) with the default feature set, so the relay counters
-are **on** in these builds: static musl, x86-64, stripped — servers
-4 355 024–4 383 768 B (v1 4 374 032, v2 4 355 024, v3 4 383 768, v4 4 380 568) and
-clients 4 377 608–4 401 312 B (v1 4 391 896, v2 4 377 608, v3 4 401 312, v4 4 393 296).
-Against the pass-29 *recorded* figures that is **+960…+1 344 B** per server level (the
-session-holder counter plus the throttled reap) and **−192…−448 B** per client level
-(the reassembler's destructured address move outweighs the reordered lock) — the
-direction each side's changes predict. Two independent four-level builds came out
-byte-identical (`cmp` equal for all eight files; the second ran after
-`cargo clean -p myquic2`, so no level could be reused from cache). `file` confirms ELF
-64-bit LSB x86-64, statically linked, stripped on all eight, and `objdump -d` finds
-283 `zmm` refs in the v4 server and 235 in the v4 client with none in v1–v3 of either
-binary (`ymm` 3 978 → 25 420/26 834 from v1 to v3), so each `target-cpu` level really
-is compiled in. What was **not** repeated is any emulated or native run of the shipped
+rebuilt from the current revision (pass 31's per-direction pump stall stamps, the
+symmetric ACK reset, the enum warn slots, the dial-ACK validation, the
+`close_reason()`-first `wait_conn` with dispatcher backoff, and the fail-fast dial
+permit — on top of everything pass 30 shipped) with the default feature set, so the
+relay counters are **on** in these builds: static musl, x86-64, stripped — servers
+4 352 472–4 381 280 B (v1 4 371 416, v2 4 352 472, v3 4 381 280, v4 4 378 016) and
+clients 4 376 320–4 399 960 B (v1 4 391 504, v2 4 376 320, v3 4 399 960, v4 4 392 008).
+Against the pass-30 *recorded* figures that is **−2 488…−2 616 B** per server level
+and **−392…−1 352 B** per client level — recorded as measured, not explained: the
+additions (stall stamps, enum, counters) predict growth, and LTO/inlining swings of
+this size have been seen before (see the pass-28 note below). Two independent
+four-level builds came out byte-identical (`cmp` equal for all eight files; the
+second ran after `cargo clean -p myquic2`, so no level could be reused from
+cache). `file` confirms ELF 64-bit LSB x86-64, statically linked, stripped on all
+eight, and `objdump -d` finds 283 `zmm` refs in the v4 server and 235 in the v4
+client with none in v1–v3 of either binary (`ymm` 3 978 → 25 397/26 835 from v1 to
+v3), so each `target-cpu` level really is compiled in. What was **not** repeated is any emulated or native run of the shipped
 pairs — the verification below applies to the native release build, and a target that
-needs a loadable binary should be validated on the target. The pass-28 rebuild note is
-kept verbatim below (its "this pass" means pass 28); pass-27/26 follow. Against the pass-27
+needs a loadable binary should be validated on the target. The pass-30 rebuild note is
+kept verbatim below (its figures are pass 30's); pass-28/27/26 follow. Against the pass-27
 *recorded* figures,
 the servers move −3 680…+1 424 B per level and the clients **−38 824…−42 224 B**; the
 client shrink is larger than this pass's additions can account for, the recipe and
@@ -3177,6 +3192,89 @@ the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`y
 3 978 → 25 420/26 834 from v1 to v3), so each `target-cpu` level really is compiled
 in. No emulated or native run of the shipped pairs was performed — a target that
 needs a loadable binary should be validated on the target.
+
+### 2026-09 hardening pass 31 — per-direction stall, symmetric ACK reset, enum warn slots, and fail-fast dial
+
+A two-round review of the echo hot paths (the second round tasked to falsify)
+confirmed six findings; five shipped as found, and an independent oracle
+re-verification then returned 5 PASS / 1 FAIL — the FAIL (below, item 1) fixed as
+an AND gate and re-verified PASS. No wire change: no frame, framing, ALPN or
+protocol-field byte moves, so mixed old/new pairs keep working.
+
+**1. A half-wedged TCP flow hid behind the shared liveness stamp.** The pump's idle
+watchdog compared one shared stamp against the 300 s deadline, so a flow whose
+download was wedged while its upload kept flowing (or vice versa) never looked idle.
+Each direction now stamps its own counter alongside the shared one — but the first
+revision killed on *either* direction's silence alone, which would have reaped
+healthy half-idle flows (a request sent, then a >300 s download). The kill is
+therefore an AND gate: a direction silent for the whole window **and** the shared
+stamp expired. The direction name is kept for the log line. The oracle's
+falsification and the AND-gate correction are recorded because this is exactly the
+class of "fix" that trades one reap bug for another.
+
+**2. A failed server ACK left the client on its 25 s timeout.** Every other server
+dial failure resets the stream, but the ACK-write failure just returned — the send
+half's `Drop` then delivered a FIN while the client sat in `read_mqp_ack` until the
+dial-ACK budget ran out. It now resets like the dial failures, so the client tears
+the flow down immediately.
+
+**3. The drop-warning slot picker matched on substrings.** `warn_datagram_drop`
+picked its rate-limit slot with `contains("budget"/"fragment"/"header")`, so any
+future reason string containing those words would silently share a 10 s window with
+an unrelated class. It takes a `DatagramDropKind` enum now, the same fix its
+siblings `UdpWriteDrop` and `EgressDrop` already had; the seven call sites map
+one-to-one onto the old slots and the log text is byte-identical.
+
+**4. The dial ACK validated shape but not sense.** `read_mqp_ack` decoded the bound
+address without checking it: a consumed-length mismatch or the `0.0.0.0:0`
+placeholder (the optimistic SOCKS reply's "unknown" value, never a real dial
+result) is now refused. The check lives only on the ACK path — `decode_bnd_addr`
+itself is untouched.
+
+**5. `wait_conn` trusted the maintained live bit.** The per-flow liveness check
+returned a connection while the bit still read true after a `read_datagram` error,
+and the dispatcher then spun on the same dead connection with only a 10 ms
+backstop. `close_reason()` is the authority again (the bit is only a hint that
+skips the quinn lock when false), and the dispatcher backs off exponentially from
+100 ms to 1 s — `gen.changed()` still preempts either wait, so reconnect perception
+is unchanged and the spin drops from 100 Hz to ~1 Hz. Cost: one quinn lock per TCP
+flow setup, never per packet.
+
+**6. The server dial permit parked stream tasks.** The dial phase awaited a global
+permit with a 2 s timeout while holding its 16384-pool stream-task permit, so a
+dial flood parked the stream pool. It now uses `try_acquire` like the DNS and
+stream-task limiters, failing the flow fast for the client to retry; permit
+exhaustion and connect failure get separate counters instead of sharing one `0x04`.
+
+Also fixed: the pump-stamp comment now states the AND-gate semantic (it previously
+read as "either direction silent kills", contradicting the code).
+
+Falsified and kept as documented (not bugs): the optimistic SOCKS reply, the
+per-association app lock, fail-closed UDP, the reply-allowlist empty check (a reply
+cannot precede its outbound), and the auth `read_to_end` cap (quinn errors on
+overflow rather than truncating — fail-closed).
+
+Verification: `cargo test --all-targets` **104/104** (55 lib + 28 client + 21 server)
+and **103/103** with `--no-default-features`; `cargo clippy --all-targets -- -D
+warnings` and `cargo fmt --check` clean on both feature sets. No native E2E or
+benchmark re-run: no success-path decision moved on the wire.
+
+`dist/`: **rebuilt from this revision and statically checked.** All four CPU levels
+were cross-compiled with the documented `cargo zigbuild` recipe (static musl, x86-64,
+default feature set) into `dist/openwrt-x86_64/`: servers 4 352 472–4 381 280 B
+(v1 4 371 416, v2 4 352 472, v3 4 381 280, v4 4 378 016) and clients
+4 376 320–4 399 960 B (v1 4 391 504, v2 4 376 320, v3 4 399 960, v4 4 392 008) —
+**−2 488…−2 616 B** per server level and **−392…−1 352 B** per client level against
+the pass-30 recorded figures, recorded as measured, not explained (the additions
+predict growth; LTO swings of this size have precedent — see the pass-28 note). A
+second four-level build, run after `cargo clean -p myquic2` so no level could be
+reused from cache, came out byte-identical for all eight files (`cmp` equal). `file`
+confirms ELF 64-bit LSB x86-64, statically linked, stripped on all eight;
+`objdump -d` finds 283 `zmm` refs in the v4 server and 235 in the v4 client with none
+in v1–v3 of either binary (`ymm` 3 978 → 25 397/26 835 from v1 to v3), so each
+`target-cpu` level really is compiled in. No emulated or native run of the shipped
+pairs was performed — a target that needs a loadable binary should be validated on
+the target.
 
 ---
 
