@@ -1517,14 +1517,15 @@ async fn dial_once(
 ) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
     let connecting = ep.connect(server, name)?;
-    // 0-RTT: send the auth token in early data, then WAIT for the handshake to
-    // complete before handing the connection to application flows. quinn
-    // discards every stream and DATAGRAM sent in rejected early data (and
-    // resets stream ids), so using the connection before the handshake is known
-    // to have completed would silently lose SOCKS requests and could make a
-    // stale stream handle alias a newly opened stream. The token still rides
-    // early data, which is the part that actually saves a round trip on
-    // resumption.
+    // 0-RTT: the token is deliberately NOT sent in early data. A bearer
+    // secret in replayable early data lets anyone who observes one handshake
+    // open new authenticated connections by replaying it inside the ticket
+    // window (rustls single-use tickets narrow the window but cannot close
+    // it: a replay that arrives first wins). Application flows still benefit
+    // from resumption (one handshake instead of a full one); only the token
+    // waits for the 1-RTT keys, which are never replayable. This costs the
+    // resumed handshake one RTT before the server admits flows, in exchange
+    // for the token never appearing in replayable bytes.
     //
     // 0.11 API: `into_0rtt()` yields `(Connection, ZeroRttAccepted)`; the
     // future resolves when the handshake completes with true = early data
@@ -1534,21 +1535,6 @@ async fn dial_once(
     let conn = match connecting.into_0rtt() {
         Ok((conn, accepted_fut)) => {
             let token = auth_token.to_owned();
-            let needs_auth = !token.is_empty();
-            // A failed early-data write must not fail the whole dial: the
-            // handshake may still complete at 1-RTT, in which case the token is
-            // re-sent below.
-            let early_ok = if needs_auth {
-                match send_auth_stream(&conn, &token).await {
-                    Ok(_) => true,
-                    Err(e) => {
-                        tracing::debug!("0-RTT auth write failed ({e:#}); will re-send at 1-RTT");
-                        false
-                    }
-                }
-            } else {
-                true
-            };
             let accepted = match tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, accepted_fut).await {
                 Ok(a) => a,
                 Err(_) => anyhow::bail!("0-RTT offered but the handshake did not complete"),
@@ -1557,12 +1543,10 @@ async fn dial_once(
             if !ensure_dialed_alive(&conn).await {
                 anyhow::bail!("connection lost during handshake");
             }
-            // Rejected early data discarded the auth stream; re-send it on the
-            // now-established connection so the server does not sit out its auth
-            // timeout and close us. A failed early write needs the same recovery
-            // even when the server kept 0-RTT.
-            if needs_auth && (!accepted || !early_ok) {
-                tracing::debug!("QUIC 0-RTT rejected: re-sending auth at 1-RTT");
+            // 1-RTT only: the established connection's keys are fresh per
+            // handshake, so a captured token can never be replayed into a new
+            // connection the way captured early data could.
+            if !token.is_empty() {
                 send_auth(&conn, &token).await?;
             }
             conn
@@ -2102,7 +2086,9 @@ async fn udp_associate_inner(
                 if n == buf.len() {
                     // The kernel truncates a datagram larger than the buffer and
                     // reports only the buffer length, so the excess is already
-                    // gone. Say so instead of dropping it without a trace.
+                    // gone. Counted as oversized (the payload is past the
+                    // protocol cap by construction) as well as warned.
+                    dgram_drops::bump(&dgram_drops::TOO_LARGE);
                     warn!(
                         "udp assoc {sess}: app datagram of >= {} B truncated; raise \
                          MQP_FRAG_MAX_PAYLOAD to carry it",
@@ -2124,16 +2110,28 @@ async fn udp_associate_inner(
                 // every app datagram — the same cost the reply path already had
                 // removed for the same reason (see `AssocEntry::replied`).
                 let now = coarse_millis();
+                if published_app != Some(app) {
+                    // Lock to the first app address: the relay port is reachable
+                    // by any local process, and IP-only pinning lets a different
+                    // socket on the same host (same IP, another port) take over
+                    // the association and steal its replies. A legitimate client
+                    // uses one UDP socket per association, so its source never
+                    // changes; a changed source is a hijack attempt, not a
+                    // rebinding, and is ignored instead of published — before
+                    // the liveness stamp below, so dropped packets cannot keep
+                    // a dead association alive.
+                    if let Some(first) = published_app {
+                        tracing::debug!(
+                            "udp assoc {sess}: datagram from {app} ignored (locked to {first})"
+                        );
+                        continue;
+                    }
+                    entry.app.store(Some(Arc::new(app)));
+                    published_app = Some(app);
+                }
                 if now.saturating_sub(activity_stamp) >= ASSOC_TOUCH_INTERVAL_MS {
                     activity_stamp = now;
                     entry.touch(now);
-                }
-                if published_app != Some(app) {
-                    // Cannot lose: the publish always lands, so `published_app`
-                    // and the shared slot can never drift apart. This is the
-                    // hand-off to every dispatcher holding this entry.
-                    entry.app.store(Some(Arc::new(app)));
-                    published_app = Some(app);
                 }
                 if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
                     continue;
