@@ -38,6 +38,53 @@ struct SessEntry {
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// Per-session destination memo — see [`DestMemo`].
     dest: DestMemo,
+    /// Destinations this session actually sent to (normalized: unmapped IP +
+    /// port), consulted by the reply reader to drop forged replies. A session
+    /// may legally serve several targets (one association, many datagrams), so
+    /// this is a small allowlist rather than a single pin; past
+    /// [`RECENT_DST_CAP`] the oldest entry is evicted and a reply from it is
+    /// dropped until the session sends there again.
+    recent: Arc<std::sync::Mutex<RecentAddrs>>,
+}
+
+/// Destinations a session recently sent to, for reply-source validation.
+///
+/// The session socket is unconnected (one session may serve many targets), so
+/// `recv_from` accepts packets from any source. Without this list, anyone who
+/// discovers the ephemeral session port can inject replies the client will
+/// trust (DNS spoofing, forged media). A reply is accepted only when its
+/// normalized source is in this list; anything else is dropped and counted as
+/// `REFUSED`.
+#[derive(Debug, Default)]
+struct RecentAddrs {
+    /// Ring of the last [`RECENT_DST_CAP`] destinations sent to.
+    slots: [Option<SocketAddr>; RECENT_DST_CAP],
+    /// Next write position.
+    pos: usize,
+}
+
+/// How many distinct destinations one session remembers for reply validation.
+/// 8 covers the multi-target session tests (2 alternating targets) with room;
+/// a session talking to more distinct targets concurrently re-learns evicted
+/// ones on its next outbound datagram.
+const RECENT_DST_CAP: usize = 8;
+
+impl RecentAddrs {
+    fn push(&mut self, dst: SocketAddr) {
+        if self.slots.contains(&Some(dst)) {
+            return;
+        }
+        self.slots[self.pos % RECENT_DST_CAP] = Some(dst);
+        self.pos = self.pos.wrapping_add(1);
+    }
+
+    fn contains(&self, src: &SocketAddr) -> bool {
+        self.slots.contains(&Some(*src))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(|s| s.is_none())
+    }
 }
 
 /// Where a session's target address came from, so a domain target is not
@@ -198,6 +245,13 @@ impl ShardedSessTable {
         &self.shards[(s as usize) % SESS_SHARDS]
     }
 
+    /// Sessions live on this connection. Summed under short read locks; used
+    /// only on the session-creation path (never per datagram) to bound one
+    /// connection's share of the process-wide session budget.
+    fn len(&self) -> usize {
+        self.shards.iter().map(|sh| lock_read(sh).len()).sum()
+    }
+
     fn drain_all(&self) -> Vec<SessEntry> {
         let mut out = Vec::new();
         for sh in &self.shards {
@@ -300,6 +354,41 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 fn session_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS_GLOBAL)))
+}
+
+/// Live server QUIC connections (inside `handle_conn`). Sizes the per-
+/// connection fair share of the process-wide session budget below.
+fn active_conns() -> &'static std::sync::atomic::AtomicUsize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &N
+}
+
+struct ActiveConnGuard;
+
+impl ActiveConnGuard {
+    fn enter() -> Self {
+        active_conns().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        active_conns().fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Sessions one connection may hold: its own cap, or an equal share of the
+/// process-wide budget when several connections are live — whichever is
+/// smaller. Without the share term, two connections at `LOCAL_SESS_MAX` fill
+/// `MAX_SESSIONS_GLOBAL` and every later connection's sessions fail, so one
+/// busy client starves the rest. The floor keeps a many-connection host
+/// usable; the global semaphore still caps the true total.
+fn fair_sess_cap() -> usize {
+    let active = active_conns()
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    (MAX_SESSIONS_GLOBAL / active).clamp(256, LOCAL_SESS_MAX)
 }
 
 fn dial_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -648,6 +737,7 @@ fn spawn_udp_reporter() {
 
 async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()> {
     info!("new QUIC conn from {}", conn.remote_address());
+    let _active = ActiveConnGuard::enter();
     let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
@@ -723,6 +813,11 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // `fast_sess` names the session it was resolved for; it is cleared
         // whenever the pin is, and it expires on its own — see [`ConnPin`].
         let mut fast_pin: Option<ConnPin> = None;
+        // Last destination recorded into the session's reply allowlist on this
+        // fast path. The allowlist update takes the table read lock, so it runs
+        // only when the destination actually changed (steady single-target
+        // flows pay nothing after the first datagram).
+        let mut fast_last_dst: Option<(u32, SocketAddr)> = None;
         loop {
             let d: Bytes = match reader.as_mut().await {
                 Ok(d) => d,
@@ -745,7 +840,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 let want = match a.as_ref() {
                     TargetAddrRef::Ip(dst) => Some(dst),
                     TargetAddrRef::Domain(h, p) => {
-                        resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p)
+                        resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p, allow_private)
                     }
                 };
                 if let Some(dst) = want {
@@ -764,6 +859,10 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 if let Some(sock) = sock.upgrade() {
                                     touch_session_throttled(conn_id, s, last);
                                     udp_try_send(&sock, map_for_dual(dst), whole.clone());
+                                    if fast_last_dst != Some((s, dst)) {
+                                        remember_dst(&ss, s, dst);
+                                        fast_last_dst = Some((s, dst));
+                                    }
                                     fast_hit = true;
                                 }
                             }
@@ -798,6 +897,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             fast_last = None;
                             fast_abort = None;
                             fast_pin = None;
+                            fast_last_dst = None;
                         }
                     }
                 }
@@ -808,7 +908,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 let want = match a {
                     TargetAddrRef::Ip(dst) => Some(dst),
                     TargetAddrRef::Domain(h, p) => {
-                        resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p)
+                        resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p, allow_private)
                     }
                 };
                 if let Some(dst) = want {
@@ -825,6 +925,10 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                     udp_stats::payload(p.len());
                                     touch_session_throttled(conn_id, s, last);
                                     udp_try_send(&sock, map_for_dual(dst), d.slice(off..));
+                                    if fast_last_dst != Some((s, dst)) {
+                                        remember_dst(&ss, s, dst);
+                                        fast_last_dst = Some((s, dst));
+                                    }
                                     fast_hit = true;
                                 }
                             }
@@ -861,6 +965,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             fast_last = None;
                             fast_abort = None;
                             fast_pin = None;
+                            fast_last_dst = None;
                         }
                     }
                 }
@@ -1231,6 +1336,7 @@ fn resolve_pin(
     s: u32,
     h: &str,
     p: u16,
+    allow_private: bool,
 ) -> Option<SocketAddr> {
     // The coarse epoch: this value only ever feeds 30 s comparisons (the pin's
     // deadline and the session memo's TTL), and it sits on the per-datagram
@@ -1251,19 +1357,29 @@ fn resolve_pin(
         }
     }
     if let Some(dst) = sess_dest_lookup(ss, now, s, h, p) {
-        // Adopt the session's memo so the next datagram is a pure compare with
-        // no table read at all -- for the memo's remaining life, never longer.
-        *pin = Some(ConnPin {
-            sess: s,
-            host: h.to_owned(),
-            port: p,
-            addr: dst,
-            expires: now + DEST_PIN_TTL_MS,
-        });
-        return Some(dst);
+        // A filtered memo hit is unusable: the name may still resolve to an
+        // allowed address, which only the full-set lookup below can find.
+        if allow_private || is_global_ip_cached(dst.ip()) {
+            // Adopt the session's memo so the next datagram is a pure compare with
+            // no table read at all -- for the memo's remaining life, never longer.
+            *pin = Some(ConnPin {
+                sess: s,
+                host: h.to_owned(),
+                port: p,
+                addr: dst,
+                expires: now + DEST_PIN_TTL_MS,
+            });
+            return Some(dst);
+        }
+        return None;
     }
     match lookup_cached_fast(h, p) {
         CachedLookup::Addr(dst) => {
+            // The fast cache serves the first address only; a filtered first
+            // address is unusable even when a later one would be allowed.
+            if !allow_private && !is_global_ip_cached(dst.ip()) {
+                return None;
+            }
             // Adopt the DNS hit into the connection pin. Without this the pin
             // was only ever written from `sess_dest_lookup`, and a fast-path
             // success skips `forward_server_dgram` → `sess_dest_store` entirely:
@@ -1316,6 +1432,7 @@ async fn forward_server_dgram(
             // unreachable. Storing it was a shard write lock plus a 72-byte memo
             // write per datagram that nothing could read back.
             let sock = get_or_create_sess(ss, cd, conn_id, s, None).await?;
+            remember_dst(ss, s, dst);
             udp_try_send(&sock, map_for_dual(dst), payload);
             Some(dst)
         }
@@ -1324,65 +1441,98 @@ async fn forward_server_dgram(
                 dgram_drops::bump(&dgram_drops::REFUSED);
                 None
             }
-            CachedLookup::Addr(dst) => {
-                if !allow_private && !is_global_ip_cached(dst.ip()) {
-                    dgram_drops::bump(&dgram_drops::REFUSED);
-                    return None;
-                }
+            CachedLookup::Addr(dst) if allow_private || is_global_ip_cached(dst.ip()) => {
                 let sock = get_or_create_sess(ss, cd, conn_id, s, Some((h, p, dst))).await?;
+                remember_dst(ss, s, dst);
                 udp_try_send(&sock, map_for_dual(dst), payload);
                 Some(dst)
             }
-            CachedLookup::Unknown => {
-                if dns_is_inflight(h, p) {
-                    // Single-flight: the packet that spawned the resolver is
-                    // delivered by that task, this one has no owner. Counted so
-                    // the loss shows up in the 60 s budget line instead of
-                    // being invisible.
-                    dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-                    return None;
-                }
-                if dns_slow_path_limiter().available_permits() == 0 {
-                    dgram_drops::bump(&dgram_drops::SESSION_FULL);
-                    return None;
-                }
-                let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        dgram_drops::bump(&dgram_drops::SESSION_FULL);
-                        return None;
+            // Filtered first address or uncached: scan the full cached set
+            // synchronously so this reader never awaits DNS on a cache hit.
+            // Only a set that is not synchronously visible (contended lock or
+            // expired entry) reaches the resolving send below.
+            _ => {
+                let full = lookup_cached_all_fast(h, p);
+                match full.as_ref().and_then(|v| {
+                    v.iter()
+                        .copied()
+                        .find(|a| allow_private || is_global_ip_cached(a.ip()))
+                }) {
+                    Some(d2) => {
+                        let sock = get_or_create_sess(ss, cd, conn_id, s, Some((h, p, d2))).await?;
+                        remember_dst(ss, s, d2);
+                        udp_try_send(&sock, map_for_dual(d2), payload);
+                        Some(d2)
                     }
-                };
-                let ss = ss.clone();
-                let cd = cd.clone();
-                let host = h.to_owned();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let dst = match resolve_all_cached(&host, p).await {
-                        Ok(v) => match v
-                            .iter()
-                            .copied()
-                            .find(|a| allow_private || is_global_ip(a.ip()))
-                        {
-                            Some(v) => v,
-                            None => return,
-                        },
-                        Err(_) => return,
-                    };
-                    let sock = match get_or_create_sess(&ss, &cd, conn_id, s, Some((&host, p, dst)))
-                        .await
-                    {
-                        Some(v) => v,
-                        None => return,
-                    };
-                    udp_try_send(&sock, map_for_dual(dst), payload);
-                });
-                // The resolution happens in the spawned task above (it awaits),
-                // so this datagram is delivered there and there is no pin for
-                // the caller to record yet. The next datagram for this session
-                // finds the answer in the DNS cache -- or, once one datagram has
-                // completed this path, in the session's own destination memo.
-                None
+                    None if full.is_some() => {
+                        dgram_drops::bump(&dgram_drops::REFUSED);
+                        None
+                    }
+                    None => {
+                        if dns_is_inflight(h, p) {
+                            // Single-flight: the packet that spawned the resolver is
+                            // delivered by that task, this one has no owner. Counted so
+                            // the loss shows up in the 60 s budget line instead of
+                            // being invisible.
+                            dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+                            return None;
+                        }
+                        if dns_slow_path_limiter().available_permits() == 0 {
+                            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                            return None;
+                        }
+                        let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                                return None;
+                            }
+                        };
+                        let ss = ss.clone();
+                        let cd = cd.clone();
+                        let host = h.to_owned();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let dst = match resolve_all_cached(&host, p).await {
+                                Ok(v) => match v
+                                    .iter()
+                                    .copied()
+                                    .find(|a| allow_private || is_global_ip(a.ip()))
+                                {
+                                    Some(v) => v,
+                                    None => {
+                                        dgram_drops::bump(&dgram_drops::REFUSED);
+                                        return;
+                                    }
+                                },
+                                Err(_) => {
+                                    dgram_drops::bump(&dgram_drops::REFUSED);
+                                    return;
+                                }
+                            };
+                            let sock = match get_or_create_sess(
+                                &ss,
+                                &cd,
+                                conn_id,
+                                s,
+                                Some((&host, p, dst)),
+                            )
+                            .await
+                            {
+                                Some(v) => v,
+                                None => return,
+                            };
+                            remember_dst(&ss, s, dst);
+                            udp_try_send(&sock, map_for_dual(dst), payload);
+                        });
+                        // The resolution happens in the spawned task above (it awaits),
+                        // so this datagram is delivered there and there is no pin for
+                        // the caller to record yet. The next datagram for this session
+                        // finds the answer in the DNS cache -- or, once one datagram has
+                        // completed this path, in the session's own destination memo.
+                        None
+                    }
+                }
             }
         },
     }
@@ -1722,6 +1872,24 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
     }
 }
 
+/// Normalize a destination for the reply allowlist: strip any IPv4 mapping
+/// so the stored form compares equal to the normalized reply source.
+fn normalize_dst(dst: SocketAddr) -> SocketAddr {
+    SocketAddr::new(unmap(dst.ip()), dst.port())
+}
+
+/// Record that session `s` sent to `dst`. Best effort: a vanished session is
+/// simply not updated and its next datagram recreates it.
+fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
+    let dst = normalize_dst(dst);
+    let sh = ss.shard(s);
+    if let Some(e) = lock_read(sh).get(&s) {
+        if let Ok(mut r) = e.recent.lock() {
+            r.push(dst);
+        }
+    }
+}
+
 async fn sess_reader_task(
     conn_id: usize,
     s: u32,
@@ -1729,6 +1897,7 @@ async fn sess_reader_task(
     ss2: SessTable,
     c2: quinn::Connection,
     last2: Arc<std::sync::atomic::AtomicU64>,
+    recent: Arc<std::sync::Mutex<RecentAddrs>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1783,12 +1952,24 @@ async fn sess_reader_task(
                 "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
                  raise MQP_FRAG_MAX_PAYLOAD to carry it"
             );
+            dgram_drops::bump(&dgram_drops::TOO_LARGE);
             continue;
         }
         if limit == 0 {
             break;
         }
         let src = SocketAddr::new(unmap(src.ip()), src.port());
+        // Reply-source validation: the socket is unconnected, so any source
+        // that reaches the ephemeral port would otherwise be forwarded as the
+        // target's answer. Drop anything the session never sent to.
+        let allowed = recent
+            .lock()
+            .map(|r| !r.is_empty() && r.contains(&src))
+            .unwrap_or(false);
+        if !allowed {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            continue;
+        }
         let ta = TargetAddr::Ip(src);
         let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
         if sent.fragmented() {
@@ -1900,6 +2081,19 @@ async fn get_or_create_sess(
     // session that passed this check already, it stays off the per-packet path
     // instead of taking the connection-state lock for every datagram.
     cd.max_datagram_size()?;
+    // Fair share first: one connection must not grow past an equal split of
+    // the process-wide budget while others are live. Only expired sessions
+    // are reclaimed here; live ones keep their sockets and the global
+    // semaphore still caps the true total.
+    let fair_cap = fair_sess_cap();
+    if ss.len() >= fair_cap {
+        let evicted = ss.sweep_all(mono_millis());
+        abort_evicted(evicted);
+        if ss.len() >= fair_cap {
+            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+            return None;
+        }
+    }
     // Check the global pool BEFORE creating the socket: once every session slot
     // is held there is no point paying socket()+setsockopt()+bind() per packet.
     let permit = match session_limiter().clone().try_acquire_owned() {
@@ -1943,6 +2137,8 @@ async fn get_or_create_sess(
     let rs_pre = sock.clone();
     let ss_pre = ss.clone();
     let last_pre = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
+    let recent_pre: Arc<std::sync::Mutex<RecentAddrs>> =
+        Arc::new(std::sync::Mutex::new(RecentAddrs::default()));
     let h_pre = tokio::spawn(sess_reader_task(
         conn_id,
         s,
@@ -1950,6 +2146,7 @@ async fn get_or_create_sess(
         ss_pre,
         c2_pre,
         last_pre.clone(),
+        recent_pre.clone(),
     ));
     let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();
@@ -1984,9 +2181,12 @@ async fn get_or_create_sess(
             }
         }
         // Per-connection cap is enforced on the owning shard; shards share the
-        // cap evenly so no single shard lock ever scans the whole table.
+        // cap evenly so no single shard lock ever scans the whole table. The
+        // target also respects the live fair share, so an over-cap shard
+        // converges toward it instead of only toward the static maximum.
+        let fair_shard = fair_sess_cap() / SESS_SHARDS;
         if w.len() >= LOCAL_SESS_MAX / SESS_SHARDS {
-            swept = sweep_local(&mut w, LOCAL_SESS_TARGET_SHARD);
+            swept = sweep_local(&mut w, LOCAL_SESS_TARGET_SHARD.min(fair_shard.max(1)));
         }
         let dead = h_pre.is_finished();
         w.insert(
@@ -2003,6 +2203,7 @@ async fn get_or_create_sess(
                         addr,
                         expires: mono_millis() + DEST_PIN_TTL_MS,
                     }),
+                recent: recent_pre.clone(),
             },
         );
         udp_stats::session();
@@ -2133,6 +2334,7 @@ mod tests {
                     addr: a,
                     expires: mono_millis() + DEST_PIN_TTL_MS,
                 }),
+                recent: Arc::new(std::sync::Mutex::new(RecentAddrs::default())),
             },
         );
         (ss, sock)
@@ -2328,16 +2530,16 @@ mod tests {
             expires: mono_millis() + DEST_PIN_TTL_MS,
         });
         assert_eq!(
-            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 443),
+            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 443, true),
             Some(stale)
         );
         // ...and for nothing else.
         assert_eq!(
-            resolve_pin(&ss, &mut pin, 7, 7, "other-pin.invalid", 443),
+            resolve_pin(&ss, &mut pin, 7, 7, "other-pin.invalid", 443, true),
             None
         );
         assert_eq!(
-            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 80),
+            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 80, true),
             None
         );
 
@@ -2345,7 +2547,7 @@ mod tests {
         // is consulted instead and the pin is re-armed from it, freshly.
         pin.as_mut().unwrap().expires = mono_millis().saturating_sub(1);
         assert_eq!(
-            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 443),
+            resolve_pin(&ss, &mut pin, 7, 7, "pin-expiry.invalid", 443, true),
             Some(dst),
             "an expired pin must not answer"
         );
@@ -2371,7 +2573,7 @@ mod tests {
         // Cold start: no pin, no session memo — only the DNS cache answers.
         let mut pin: Option<ConnPin> = None;
         assert_eq!(
-            resolve_pin(&ss, &mut pin, 7, 7, host, port),
+            resolve_pin(&ss, &mut pin, 7, 7, host, port, true),
             Some(dst),
             "the DNS cache must answer when pin and memo both miss"
         );
@@ -2390,7 +2592,7 @@ mod tests {
         // `sess_dest_lookup` read lock on every packet for the rest of the TTL.
         pin.as_mut().unwrap().expires = coarse_millis().saturating_sub(1);
         assert_eq!(
-            resolve_pin(&ss, &mut pin, 7, 7, host, port),
+            resolve_pin(&ss, &mut pin, 7, 7, host, port, true),
             Some(dst),
             "an expired pin must still fall through to the DNS cache"
         );
@@ -2399,6 +2601,30 @@ mod tests {
         assert!(
             rearmed.expires > coarse_millis(),
             "the re-armed pin must be live"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pin_withholds_a_filtered_cached_address() {
+        let private: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let host = "filtered-first.test";
+        let port = 18444u16;
+        dns_cache_seed(host, port, private);
+        let (ss, _sock) = sess_with_dest(None);
+        let mut pin: Option<ConnPin> = None;
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, host, port, false),
+            None,
+            "a filtered first address must not be served or pinned"
+        );
+        assert!(
+            pin.is_none(),
+            "a filtered address must not arm the pin either"
+        );
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, host, port, true),
+            Some(private),
+            "allow_private must still serve it"
         );
     }
 
@@ -2498,7 +2724,43 @@ mod tests {
             )),
             _permit: session_limiter().clone().try_acquire_owned().unwrap(),
             dest: DestMemo::NONE,
+            recent: Arc::new(std::sync::Mutex::new(RecentAddrs::default())),
         }
+    }
+
+    #[test]
+    fn reply_allowlist_accepts_only_recorded_destinations() {
+        let mut r = RecentAddrs::default();
+        assert!(r.is_empty());
+        let a: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let b: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        r.push(a);
+        assert!(!r.is_empty());
+        assert!(r.contains(&a));
+        assert!(!r.contains(&b));
+        r.push(a);
+        r.push(b);
+        assert!(r.contains(&a) && r.contains(&b));
+        for i in 0..RECENT_DST_CAP {
+            let d: SocketAddr = format!("9.9.9.{}:53", i).parse().unwrap();
+            r.push(d);
+        }
+        assert!(
+            r.slots.iter().flatten().count() <= RECENT_DST_CAP,
+            "the allowlist must stay bounded"
+        );
+    }
+
+    #[test]
+    fn fair_share_splits_the_global_budget_across_live_connections() {
+        let prev = active_conns().load(std::sync::atomic::Ordering::Relaxed);
+        active_conns().store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fair_sess_cap(), LOCAL_SESS_MAX);
+        active_conns().store(2, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fair_sess_cap(), MAX_SESSIONS_GLOBAL / 2);
+        active_conns().store(64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fair_sess_cap(), 256);
+        active_conns().store(prev, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Over the per-shard target, the sessions that go are the longest-idle
