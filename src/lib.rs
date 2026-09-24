@@ -1807,6 +1807,33 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
     }
 }
 
+/// Full cached address set, read synchronously without spawning resolution.
+///
+/// The fast probe serves the first address only; when that one is filtered the
+/// caller must scan the rest the way TCP does, but awaiting `resolve_all_cached`
+/// on a packet path parks the reader task for up to a DNS timeout. This returns
+/// the cached set — or `None` when it is not synchronously visible (contended
+/// lock or expired entry) — so the caller stays off the async path whenever the
+/// answer is already in memory.
+pub fn lookup_cached_all_fast(host: &str, port: u16) -> Option<Arc<[SocketAddr]>> {
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = dns_key_owned(host, port);
+            &owned
+        }
+    };
+    let m = try_lock_read(dns_cache_for(key))?;
+    let (t, v) = m.get(key)?;
+    if t.elapsed() < DNS_CACHE_TTL {
+        Some(v.clone())
+    } else {
+        None
+    }
+}
+
 /// Seed the positive DNS cache as if `host:port` had just resolved to `addr`.
 ///
 /// Bin unit tests need this to exercise a DNS-hit path without a live
