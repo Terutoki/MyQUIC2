@@ -230,6 +230,10 @@ const SESS_SHARDS: usize = 8;
 
 struct ShardedSessTable {
     shards: Vec<std::sync::RwLock<HashMap<u32, SessEntry>>>,
+    /// Whether this table is currently counted in [`session_holders`]. Kept in
+    /// step by [`ShardedSessTable::note_empty_state`] on every insert/removal
+    /// that can change emptiness.
+    counted: std::sync::atomic::AtomicBool,
 }
 
 impl ShardedSessTable {
@@ -238,11 +242,40 @@ impl ShardedSessTable {
             shards: (0..SESS_SHARDS)
                 .map(|_| std::sync::RwLock::new(HashMap::new()))
                 .collect(),
+            counted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn shard(&self, s: u32) -> &std::sync::RwLock<HashMap<u32, SessEntry>> {
         &self.shards[(s as usize) % SESS_SHARDS]
+    }
+
+    /// Keep the process-wide holder count in step with whether this table holds
+    /// any session.
+    ///
+    /// The fair share must divide the global session budget among connections
+    /// that actually *hold* sessions. Counting every live QUIC connection made a
+    /// client's four idle TCP slots dilute its own UDP connection by 5x (and a
+    /// busy server's pool by much more), so a lone client could only ever reach
+    /// `8192 / (quic_conns + 1)` associations instead of the documented
+    /// `MAX_UDP_ASSOCS`.
+    ///
+    /// Must be called with **no** guard on any of `self.shards` held —
+    /// `is_empty()` takes the shard read locks, and `std::sync::RwLock` is not
+    /// reentrant. Two concurrent calls can transiently mis-count by one (the
+    /// emptiness check and the `counted` swap are not one atomic step); the
+    /// error self-corrects on the next insert/removal and only ever moves the
+    /// share, never a data path.
+    fn note_empty_state(&self) {
+        use std::sync::atomic::Ordering;
+        let any = self.shards.iter().any(|sh| !lock_read(sh).is_empty());
+        if any {
+            if !self.counted.swap(true, Ordering::AcqRel) {
+                session_holders().fetch_add(1, Ordering::AcqRel);
+            }
+        } else if self.counted.swap(false, Ordering::AcqRel) {
+            session_holders().fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Sessions live on this connection. Summed under short read locks; used
@@ -257,6 +290,7 @@ impl ShardedSessTable {
         for sh in &self.shards {
             out.extend(lock_write(sh).drain().map(|(_, v)| v));
         }
+        self.note_empty_state();
         out
     }
 
@@ -279,6 +313,7 @@ impl ShardedSessTable {
             let mut m = lock_write(sh);
             out.extend(take_idle(&mut m, &expired, now));
         }
+        self.note_empty_state();
         out
     }
 }
@@ -331,6 +366,11 @@ const MAX_UNAUTH_CONNECTIONS: usize = 256;
 const MAX_SESSIONS_GLOBAL: usize = 8192;
 const LOCAL_SESS_MAX: usize = 4096;
 const LOCAL_SESS_TARGET: usize = LOCAL_SESS_MAX - 64;
+/// The client's per-process UDP-association cap and this connection's static
+/// session target are one number, defined once in `lib.rs`: if either drifts,
+/// the client admits associations the server will refuse — a silent black hole,
+/// because UDP DATAGRAMs carry no back-channel. Fail the build instead.
+const _: () = assert!(LOCAL_SESS_TARGET == MAX_UDP_ASSOCS);
 /// Per-shard sweep target: `sweep_local` runs on one shard, so comparing the
 /// shard length against the connection-global `LOCAL_SESS_TARGET` never fires
 /// (512 < 4032) and the per-connection cap silently stops working. Keep the
@@ -356,39 +396,30 @@ fn session_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS_GLOBAL)))
 }
 
-/// Live server QUIC connections (inside `handle_conn`). Sizes the per-
-/// connection fair share of the process-wide session budget below.
-fn active_conns() -> &'static std::sync::atomic::AtomicUsize {
+/// Connections currently holding at least one UDP session, across the process.
+///
+/// This is the denominator of the per-connection session fair share. It counts
+/// *session holders*, not live QUIC connections: a client's idle TCP slots must
+/// not dilute its own UDP connection's budget, which is what made a default
+/// client (four TCP slots + one UDP slot) cap out at `8192 / 5` sessions instead
+/// of [`MAX_UDP_ASSOCS`]. Maintained by
+/// [`ShardedSessTable::note_empty_state`].
+fn session_holders() -> &'static std::sync::atomic::AtomicUsize {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     &N
 }
 
-struct ActiveConnGuard;
-
-impl ActiveConnGuard {
-    fn enter() -> Self {
-        active_conns().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for ActiveConnGuard {
-    fn drop(&mut self) {
-        active_conns().fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// Sessions one connection may hold: its own cap, or an equal share of the
-/// process-wide budget when several connections are live — whichever is
-/// smaller. Without the share term, two connections at `LOCAL_SESS_MAX` fill
+/// process-wide budget across the connections that are *using* it — whichever
+/// is smaller. Without the share term, two connections at `LOCAL_SESS_MAX` fill
 /// `MAX_SESSIONS_GLOBAL` and every later connection's sessions fail, so one
 /// busy client starves the rest. The floor keeps a many-connection host
 /// usable; the global semaphore still caps the true total.
 fn fair_sess_cap() -> usize {
-    let active = active_conns()
+    let holders = session_holders()
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
-    (MAX_SESSIONS_GLOBAL / active).clamp(256, LOCAL_SESS_MAX)
+    (MAX_SESSIONS_GLOBAL / holders).clamp(256, LOCAL_SESS_MAX)
 }
 
 fn dial_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -737,10 +768,12 @@ fn spawn_udp_reporter() {
 
 async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()> {
     info!("new QUIC conn from {}", conn.remote_address());
-    let _active = ActiveConnGuard::enter();
     let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
+    // The connection joins the fair-share denominator only once it actually
+    // holds a session (`ShardedSessTable::note_empty_state`); an idle TCP-only
+    // connection must not dilute anyone's session budget.
     let sess: SessTable = Arc::new(ShardedSessTable::new());
     {
         let sess = sess.clone();
@@ -858,11 +891,18 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                 // `fast_sock`.
                                 if let Some(sock) = sock.upgrade() {
                                     touch_session_throttled(conn_id, s, last);
-                                    udp_try_send(&sock, map_for_dual(dst), whole.clone());
+                                    // Record *before* the send: the reply reader
+                                    // validates the source against this
+                                    // allowlist, and a failable fast path (a
+                                    // local echo target, a LAN DNS resolver)
+                                    // can answer inside the window between the
+                                    // two calls. `forward_server_dgram` has
+                                    // always ordered it this way.
                                     if fast_last_dst != Some((s, dst)) {
                                         remember_dst(&ss, s, dst);
                                         fast_last_dst = Some((s, dst));
                                     }
+                                    udp_try_send(&sock, map_for_dual(dst), whole.clone());
                                     fast_hit = true;
                                 }
                             }
@@ -872,6 +912,14 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         continue;
                     }
                 }
+                // The slow path records destinations itself, so this task-local
+                // mirror of the allowlist can no longer describe it: clear it so
+                // the next fast-path send re-records. Without this a destination
+                // pushed by the slow path can fall out of `RecentAddrs` (8
+                // entries) while `fast_last_dst` still claims it is present, and
+                // that destination's replies are dropped as REFUSED until it is
+                // sent to again.
+                fast_last_dst = None;
                 let used =
                     forward_server_dgram(&ss, &cd, conn_id, s, a.as_ref(), whole, allow_private)
                         .await;
@@ -924,11 +972,13 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                                     let off = d.len() - p.len();
                                     udp_stats::payload(p.len());
                                     touch_session_throttled(conn_id, s, last);
-                                    udp_try_send(&sock, map_for_dual(dst), d.slice(off..));
+                                    // Record before the send — see the fragment
+                                    // branch above.
                                     if fast_last_dst != Some((s, dst)) {
                                         remember_dst(&ss, s, dst);
                                         fast_last_dst = Some((s, dst));
                                     }
+                                    udp_try_send(&sock, map_for_dual(dst), d.slice(off..));
                                     fast_hit = true;
                                 }
                             }
@@ -938,6 +988,9 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                         continue;
                     }
                 }
+                // Keep the allowlist mirror honest across the slow path — see
+                // the fragment branch above.
+                fast_last_dst = None;
                 let off = d.len() - p.len();
                 let payload = d.slice(off..);
                 udp_stats::payload(payload.len());
@@ -1994,6 +2047,11 @@ async fn sess_reader_task(
             }
         }
     }
+    // The table may now be empty: if this was its last session, drop out of the
+    // fair-share denominator so other connections immediately get their full
+    // share back. Must run with the write guard above dropped (see
+    // `note_empty_state`).
+    ss2.note_empty_state();
 }
 
 async fn get_or_create_sess(
@@ -2081,14 +2139,36 @@ async fn get_or_create_sess(
     // session that passed this check already, it stays off the per-packet path
     // instead of taking the connection-state lock for every datagram.
     cd.max_datagram_size()?;
-    // Fair share first: one connection must not grow past an equal split of
-    // the process-wide budget while others are live. Only expired sessions
-    // are reclaimed here; live ones keep their sockets and the global
-    // semaphore still caps the true total.
+    // Fair share first: one connection must not grow past an equal split of the
+    // process-wide budget while others live. Only expired sessions are
+    // reclaimed here; live ones keep their sockets and the global semaphore
+    // still caps the true total.
+    //
+    // The reap is **throttled** (per worker, 1/s) for the same reason the global
+    // pool's failed-acquire path is: past the cap every further new-session
+    // datagram reaches this branch, and an unthrottled `sweep_all` would walk
+    // all shards and every session entry *per packet* — an O(sessions) CPU
+    // amplifier any peer can drive with fabricated session ids, for a sweep
+    // that can only ever free sessions that went idle >= SESS_IDLE_MS ago.
     let fair_cap = fair_sess_cap();
     if ss.len() >= fair_cap {
-        let evicted = ss.sweep_all(mono_millis());
-        abort_evicted(evicted);
+        thread_local! {
+            static LAST_FAIR_SWEEP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        let now = mono_millis();
+        let due = LAST_FAIR_SWEEP_MS.with(|c| {
+            let last = c.get();
+            if now.saturating_sub(last) < 1000 {
+                false
+            } else {
+                c.set(now);
+                true
+            }
+        });
+        if due {
+            let evicted = ss.sweep_all(now);
+            abort_evicted(evicted);
+        }
         if ss.len() >= fair_cap {
             dgram_drops::bump(&dgram_drops::SESSION_FULL);
             return None;
@@ -2201,7 +2281,7 @@ async fn get_or_create_sess(
                     .map_or(DestMemo::NONE, |(key, addr)| DestMemo {
                         key,
                         addr,
-                        expires: mono_millis() + DEST_PIN_TTL_MS,
+                        expires: coarse_millis() + DEST_PIN_TTL_MS,
                     }),
                 recent: recent_pre.clone(),
             },
@@ -2219,6 +2299,11 @@ async fn get_or_create_sess(
             )
         }
     };
+    // This connection may have just become a session holder: join the fair-share
+    // denominator. Called after the write guard is dropped (see
+    // `note_empty_state`), and on the `dead` branch too, where the insert was
+    // rolled back and the connection may not hold anything at all.
+    ss.note_empty_state();
     if let Some((msock, mlast, mabort)) = memo_data {
         sess_memo_put(conn_id, s, msock, mlast, mabort);
     }
@@ -2751,16 +2836,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fair_share_splits_the_global_budget_across_live_connections() {
-        let prev = active_conns().load(std::sync::atomic::Ordering::Relaxed);
-        active_conns().store(1, std::sync::atomic::Ordering::Relaxed);
+    /// The fair share divides the global session budget among connections that
+    /// actually **hold sessions**, and a table joins/leaves that denominator as
+    /// its emptiness changes.
+    ///
+    /// Counting every live QUIC connection was the pass-29 defect: a client's
+    /// four idle TCP slots diluted its own UDP connection by 5x, so a lone
+    /// default client capped at `8192 / 5 = 1638` associations while the client
+    /// (and the README) admitted `MAX_UDP_ASSOCS = 4032` — and the excess was
+    /// silently black-holed server-side. All three properties are asserted in
+    /// one test so they cannot race each other over the process-global counter.
+    #[tokio::test]
+    async fn fair_share_counts_session_holders_not_live_connections() {
+        use std::sync::atomic::Ordering;
+        let prev = session_holders().load(Ordering::Relaxed);
+        // The client cap and the server's static per-connection target are one
+        // number, shared through `lib.rs`.
+        assert_eq!(LOCAL_SESS_TARGET, MAX_UDP_ASSOCS);
+
+        // Pure arithmetic of the share.
+        session_holders().store(1, Ordering::Relaxed);
         assert_eq!(fair_sess_cap(), LOCAL_SESS_MAX);
-        active_conns().store(2, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fair_sess_cap() >= MAX_UDP_ASSOCS,
+            "a lone session holder keeps its whole client cap"
+        );
+        session_holders().store(2, Ordering::Relaxed);
         assert_eq!(fair_sess_cap(), MAX_SESSIONS_GLOBAL / 2);
-        active_conns().store(64, std::sync::atomic::Ordering::Relaxed);
+        session_holders().store(64, Ordering::Relaxed);
         assert_eq!(fair_sess_cap(), 256);
-        active_conns().store(prev, std::sync::atomic::Ordering::Relaxed);
+
+        // A table is counted only while non-empty.
+        session_holders().store(prev, Ordering::Relaxed);
+        let before = session_holders().load(Ordering::Relaxed);
+        let empty = ShardedSessTable::new();
+        empty.note_empty_state();
+        assert_eq!(
+            session_holders().load(Ordering::Relaxed),
+            before,
+            "an empty table is not a holder"
+        );
+        let (holding, _sock) = sess_with_dest(None);
+        holding.note_empty_state();
+        assert_eq!(
+            session_holders().load(Ordering::Relaxed),
+            before + 1,
+            "a table holding a session joins the denominator"
+        );
+        let drained = holding.drain_all();
+        assert!(!drained.is_empty());
+        drop(drained);
+        assert_eq!(
+            session_holders().load(Ordering::Relaxed),
+            before,
+            "draining the last session leaves the denominator"
+        );
+        session_holders().store(prev, Ordering::Relaxed);
     }
 
     /// Over the per-shard target, the sessions that go are the longest-idle

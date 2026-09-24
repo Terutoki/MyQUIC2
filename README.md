@@ -334,8 +334,6 @@ never misparse. Both ends must be on this revision to carry them.
 
 ### Connection authentication (`auth_token` non-empty)
 
-### Connection authentication (`auth_token` non-empty)
-
 ```
 client → server : uni stream (stream type 0x02) carrying the token bytes, FIN
 server          : waits ≤ 5 s, reads ≤ 256 B, constant-time compare
@@ -656,25 +654,27 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 29's 1-RTT-only token, the reply-source
-allowlist, the app-address lock, the full-set DNS fallback, `TOO_LARGE` on relay
-truncations and the fair-share session gate, on top of everything pass 28 shipped)
-with the default feature set, so the relay counters are **on** in these builds:
-static musl, x86-64, stripped, 4 353 680–4 382 680 B (servers: v1 4 373 072,
-v2 4 353 680, v3 4 382 680, v4 4 379 288) and 4 378 056–4 401 504 B (clients:
-v1 4 392 280, v2 4 378 056, v3 4 401 504, v4 4 393 616) each. Against the pass-28
-*recorded* figures that is **+8 816…+13 232 B** per server level (allowlist, fair
-share, DNS fallback) and **−1 432…−1 496 B** per client level (the removed
-early-auth path outweighs the app lock and the truncation counter) — the direction
-each side's changes predict. A second four-level build came out byte-identical
-(`sha256` equal for all eight files). `file` confirms ELF 64-bit LSB x86-64,
-statically linked, stripped on all eight, and `objdump -d` finds 283 `zmm` refs in
-the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
-3 978 → 25 433/26 843 from v1 to v3), so each `target-cpu` level really is compiled
-in. What was **not** repeated is any emulated or native run of the shipped pairs —
-the verification below applies to the native release build, and a target that needs
-a loadable binary should be validated on the target. The pass-28 rebuild note it
-replaces is kept verbatim below (its "this pass" means pass 28). Against the pass-27
+rebuilt from the current revision (pass 30's retained-byte reassembly accounting, the
+session-holder fair share, the throttled fair-cap reap, pre-lock SOCKS5 framing
+validation on the client, the record-before-send reply allowlist, the DNS
+negative-entry guard, and the window guard test rewired to the real config path — on
+top of everything pass 29 shipped) with the default feature set, so the relay counters
+are **on** in these builds: static musl, x86-64, stripped — servers
+4 355 024–4 383 768 B (v1 4 374 032, v2 4 355 024, v3 4 383 768, v4 4 380 568) and
+clients 4 377 608–4 401 312 B (v1 4 391 896, v2 4 377 608, v3 4 401 312, v4 4 393 296).
+Against the pass-29 *recorded* figures that is **+960…+1 344 B** per server level (the
+session-holder counter plus the throttled reap) and **−192…−448 B** per client level
+(the reassembler's destructured address move outweighs the reordered lock) — the
+direction each side's changes predict. Two independent four-level builds came out
+byte-identical (`cmp` equal for all eight files; the second ran after
+`cargo clean -p myquic2`, so no level could be reused from cache). `file` confirms ELF
+64-bit LSB x86-64, statically linked, stripped on all eight, and `objdump -d` finds
+283 `zmm` refs in the v4 server and 235 in the v4 client with none in v1–v3 of either
+binary (`ymm` 3 978 → 25 420/26 834 from v1 to v3), so each `target-cpu` level really
+is compiled in. What was **not** repeated is any emulated or native run of the shipped
+pairs — the verification below applies to the native release build, and a target that
+needs a loadable binary should be validated on the target. The pass-28 rebuild note is
+kept verbatim below (its "this pass" means pass 28); pass-27/26 follow. Against the pass-27
 *recorded* figures,
 the servers move −3 680…+1 424 B per level and the clients **−38 824…−42 224 B**; the
 client shrink is larger than this pass's additions can account for, the recipe and
@@ -919,18 +919,18 @@ All limits are constants in the sources; the table shows where to change them.
 | Concurrent *unauthenticated* connections | 256 (pre-auth slot, released after token check) | `MAX_UNAUTH_CONNECTIONS` |
 | TLS session store (server, 0-RTT/resumption) | 8192 sessions | `server_tls_config` |
 | UDP sessions, process-wide | 8192 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
-| UDP session socket buffers | 512 KB send + 512 KB receive per session | `udp_socket_dual_small` |
-| UDP sessions per connection | 4096, subdivided by the live fair share `clamp(8192/active_conns, 256, 4096)` (new sessions refused past it with `SESSION_FULL`) | `LOCAL_SESS_MAX`, `fair_sess_cap()` |
+| UDP session socket buffers | 256 KB send + 256 KB receive per session | `SESS_SOCKET_BUF` |
+| UDP sessions per connection | live fair share `clamp(8192 / session-holding connections, 256, 4096)` (new sessions refused past it with `SESSION_FULL`) | `LOCAL_SESS_MAX`, `fair_sess_cap()` |
 | Concurrent TCP dials, process-wide | 4096, 2 s permit wait (released after connect) | `dial_limiter` |
 | Concurrent bidi streams per connection | 1024 | `build_transport` |
 | Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset) | `MAX_STREAM_TASKS` |
 | Client SOCKS connections | 8192 (excess connections dropped) | `socks_conn_limiter` |
-| Client UDP associations | 4096 (excess replies REP=0x01, 256-datagram queue each) | `UdpHub::alloc_sess` |
+| Client UDP associations | 4032 (excess replies REP=0x01) | `MAX_UDP_ASSOCS` (lib.rs; the server asserts its per-connection target equals it) |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
-| Deferred UDP sends (fresh-socket / full buffer) | 4096 | `udp_send_limiter` |
-| Receive window (aggregate) | 4 MB/connection default (8/16 MB opt-in) | `TransportTuning` (`RECEIVE_WINDOW`) |
-| Receive window (per stream) | 2 MB default (4/8 MB opt-in) | `TransportTuning` (`STREAM_RECEIVE_WINDOW`) |
-| Send window | 2 MB/connection default (4/8 MB opt-in) | `TransportTuning` (`SEND_WINDOW`) |
+| Deferred UDP sends (full retry-shard queue) | 16 shards x 256 deep | `UDP_RETRY_SHARDS`, `UDP_RETRY_DEPTH` |
+| Receive window (aggregate) | 4 MB/connection default; 16 MB opt-in (`receive_window_mb = 16`) | `TransportTuning`, `RECEIVE_WINDOW` |
+| Receive window (per stream) | 2 MB default; 8 MB opt-in (`stream_receive_window_mb = 8`) | `TransportTuning`, `STREAM_RECEIVE_WINDOW` |
+| Send window | 2 MB/connection default; 8 MB opt-in (`send_window_mb = 8`) | `TransportTuning`, `SEND_WINDOW` |
 | Initial RTT / PMTU ceiling | 190 ms / 1472 B | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
 | Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
@@ -3054,6 +3054,129 @@ v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
 in. No emulated or native run of the shipped pairs was performed — the verification
 above applies to the native release build, and a target that needs a loadable binary
 should be validated on the target.
+
+---
+
+### 2026-09 hardening pass 30 — reassembly retention accounting, session-holder fairness, DNS negative-entry guard, and hot-path ordering
+
+A two-round review of the three sources (one round per binary, plus a shared-library
+pass) confirmed eight defects; all are fixed here. No wire change: no frame,
+framing, ALPN or protocol-field byte moves, so mixed old/new pairs keep working.
+
+**1. Zero-copy reassembly voided its own memory bound.** `push_zero_copy` stores a
+`Bytes` slice of the whole received DATAGRAM, so a 16-byte final fragment still pins
+its ~284-byte frame — while `held` was charged only `chunk.len()`. A peer could hold
+`FRAG_MAX_PARTIALS` x 64 partials of tiny fragments with `held` exactly at
+`FRAG_MAX_HELD_BYTES` (the eviction test is a strict `>`), i.e. nothing evicted, while
+pinning an order of magnitude more memory. `Partial` now tracks `retained` separately
+from `bytes`; the aggregate bound is enforced over retained storage, the per-partial
+`MQP_FRAG_MAX_PAYLOAD` cap stays on payload. Pinned by
+`zero_copy_reassembly_is_bounded_by_retained_bytes`, which fails on the old
+accounting. As a side effect the per-reassembled-datagram `TargetAddr` clone is gone
+(the address is moved out of the consumed partial).
+
+**2. The session fair share counted idle TCP connections.** Pass 29's
+`fair_sess_cap()` divided the global budget by *live connections*, so a default
+client (four TCP slots + one dedicated UDP slot) diluted its own UDP connection to
+`8192 / 5 = 1638` sessions while the client and this README admitted
+`MAX_UDP_ASSOCS = 4032` — associations 1639+ got SOCKS success and then had every
+datagram silently dropped as `SESSION_FULL`, with the over-cap shard sweep also able
+to evict *live* sessions. The denominator is now `session_holders()`: only
+connections that currently hold at least one session are counted (maintained by
+`ShardedSessTable::note_empty_state`). `MAX_UDP_ASSOCS` moved into `lib.rs` next to
+the server's target and the server asserts the two are equal at compile time, so the
+pair cannot drift again.
+
+**3. The fair-cap reap ran once per refused datagram.** Past the cap, every further
+new-session datagram reached an unthrottled `sweep_all` — an O(sessions) walk over
+all eight shards, per packet, for a sweep that can only free sessions idle for
+180 s. Any peer could drive it with fabricated session ids. It now shares the
+per-worker 1/s throttle the global-pool failure path already used.
+
+**4. A client UDP association could be hijacked by one stray datagram.** The relay
+locked `entry.app` to the first packet's source *before* validating the SOCKS5
+framing, so any process on the control connection's IP could pin the association to
+itself with a single malformed packet: replies went to the attacker, the real app's
+datagrams were dropped as a changed source, and because dropped packets deliberately
+do not refresh the liveness stamp the association also died at 180 s. The RSV/FRAG +
+address frame is now validated before the lock, so only a well-formed request can
+claim the association.
+
+**5. The server fast path recorded reply-allowlist destinations after sending.**
+`forward_server_dgram` has always recorded before the send; the two fast-path sites
+did the opposite, so a reply that arrived inside that window (a local echo target, a
+LAN resolver) was dropped as `REFUSED`. Both now record first. The task-local
+`fast_last_dst` mirror is also cleared whenever the slow path runs, which records
+destinations itself — without that, an entry pushed by the slow path could fall out
+of the 8-entry ring while the mirror still claimed it was present.
+
+**6. A transient resolver failure poisoned a still-fresh positive DNS entry.**
+`resolve_all_cached`'s failure arm wrote a negative cache entry and a negative
+thread-local memo entry unconditionally. The positive probes on that path are
+`try_lock_read`, so a contended-but-valid entry reaches the upstream lookup; if that
+lookup then failed, `lookup_cached_fast` (memo first, one slot per key) refused the
+name for `DNS_NEG_TTL` — 10 s of dropped datagrams and "dns negative cached" TCP
+failures for a name whose cached address was still good. `record_negative` now
+declines to downgrade a fresh positive entry. Pinned by
+`transient_resolution_failure_does_not_poison_a_fresh_positive_entry`.
+
+**7. The 300 Mb/s window guard test proved nothing.** `STREAM_RECEIVE_WINDOW` /
+`RECEIVE_WINDOW` / `SEND_WINDOW` were read only by
+`tcp_windows_cover_the_300mb_s_bdp`; `build_transport_tuned` consumes
+`TransportTuning`, whose shipped default is the 2/4/2 MB low-latency preset. The
+guard therefore passed while constraining no window that could reach the wire, and
+the surrounding comment claimed the constants "supersede" the defaults. The test now
+drives `ClientConf::tuning()` with the exact opt-in values the sample configs
+document, checks they reproduce the constants and clear the BDP, and pins the shipped
+default as the low-latency preset; the comments now say "opt-in preset" throughout.
+
+**8. Diagnostic counts were recorded before the decision they describe.**
+`DgramFragmenter::send` counted `udp_stats::payload` before the size refusals (so
+refused payloads inflated `datagrams`/`bytes`/`max_payload` — and `max_payload` is
+documented as the empirical check on the 8 KiB cap) and `fragmented` before the send
+loop. Both now count accepted/actually-queued payloads. The retry-drop log detail
+also no longer says "send buffer full" for a full retry-shard queue.
+
+Also fixed: `DestMemo::expires` is written from the same coarse epoch its readers
+compare against; and the memo-TTL comments now state the real error bound (up to
+about one tick *late*, not "early only" — the deadline and the check sample the same
+lagging clock).
+
+New tests: `zero_copy_reassembly_is_bounded_by_retained_bytes`,
+`transient_resolution_failure_does_not_poison_a_fresh_positive_entry`,
+`fair_share_counts_session_holders_not_live_connections`, plus config-path assertions
+in `tcp_windows_cover_the_300mb_s_bdp`.
+
+**Known, deliberately unfixed: a dead-but-undetected slot connection is not failed
+over.** A connection blackholed after `pick_tcp` selected it still accepts
+`open_bi`/`write_all` locally, so the flow's header goes nowhere and the failure only
+surfaces at the reply pump — bounded by the 25 s dial-ACK budget, and normally sooner
+because the reconnect loop's silence watchdog force-closes the connection. A
+transparent retry is impossible after the optimistic SOCKS success reply has been
+sent, and marking the slot dead on an ACK timeout alone would stall later flows
+behind a reconnect when the connection is merely slow. A real fix needs a
+connection-health signal at *selection* time; noted at the call site.
+
+Verification: `cargo test --all-targets` **104/104** (55 lib + 28 client + 21 server)
+and **103/103** with `--no-default-features`; `cargo clippy --all-targets -- -D
+warnings` and `cargo fmt --check` clean on both feature sets. No native E2E or
+benchmark re-run: no success-path decision moved on the wire, and every fix is either
+accounting, creation-path-only, or a per-packet reorder with no semantic change.
+
+`dist/`: **rebuilt from this revision and statically checked.** All four CPU levels
+were cross-compiled with the documented `cargo zigbuild` recipe (static musl, x86-64,
+default feature set) into `dist/openwrt-x86_64/`: servers 4 355 024–4 383 768 B
+(v1 4 374 032, v2 4 355 024, v3 4 383 768, v4 4 380 568) and clients
+4 377 608–4 401 312 B (v1 4 391 896, v2 4 377 608, v3 4 401 312, v4 4 393 296) —
+**+960…+1 344 B** per server level and **−192…−448 B** per client level against the
+pass-29 recorded figures, the direction each side's changes predict. A second
+four-level build, run after `cargo clean -p myquic2` so no level could be reused from
+cache, came out byte-identical for all eight files. `file` confirms ELF 64-bit LSB
+x86-64, statically linked, stripped on all eight; `objdump -d` finds 283 `zmm` refs in
+the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
+3 978 → 25 420/26 834 from v1 to v3), so each `target-cpu` level really is compiled
+in. No emulated or native run of the shipped pairs was performed — a target that
+needs a loadable binary should be validated on the target.
 
 ---
 

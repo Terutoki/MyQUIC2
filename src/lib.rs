@@ -471,9 +471,17 @@ pub const UDP_RECV_SLACK: usize = 1;
 /// wait longer than a retransmit-free round trip.
 pub const FRAG_TIMEOUT_MS: u64 = 2_000;
 
-/// Reassembly memory bound per connection. A partial is at most
-/// [`MQP_FRAG_MAX_PAYLOAD`], and past this the oldest partial is evicted — so
-/// this is also what caps how many datagrams may be in flight at once.
+/// Reassembly memory bound per connection, counted over the bytes partials
+/// actually **retain** (pinned `Bytes` storage), past which the oldest partial
+/// is evicted — so this is also what caps how many datagrams may be in flight at
+/// once.
+///
+/// Retained, not payload, bytes: a zero-copy chunk is a slice of the whole
+/// received DATAGRAM, so a 16-byte final fragment still pins its ~284-byte frame
+/// (see [`DgramReassembler`]). At the protocol's 8 KiB payload ceiling a full
+/// partial retains roughly 8-9 KiB, i.e. on the order of 30 concurrent partials
+/// per connection — far above any real RTT's worth of unfragmented arrivals,
+/// while still bounding what a fragment flood can pin.
 pub const FRAG_MAX_HELD_BYTES: usize = 256 * 1024;
 
 /// Reassembly partial-count bound per connection.
@@ -819,6 +827,25 @@ pub const DEFAULT_QUIC_CONNS: usize = 4;
 /// one slot beyond this, so a client's worst case is `MAX_POOL_CONNS + 1`.
 pub const MAX_POOL_CONNS: usize = 8;
 
+/// Concurrent UDP associations one *client process* may admit.
+///
+/// Deliberately one number shared with the server's per-connection session
+/// target (`LOCAL_SESS_TARGET`; the server asserts the two are equal at compile
+/// time): a client's admission cap is only useful if it matches what the server
+/// will actually keep alive, and a mismatch is invisible to the application
+/// because UDP DATAGRAMs carry no back-channel.
+///
+/// It is a *budget*, not a guarantee. The server's real ceiling for one
+/// connection is its live **fair share**, `clamp(MAX_SESSIONS_GLOBAL / holders,
+/// 256, LOCAL_SESS_MAX)`, where `holders` counts the connections that currently
+/// hold at least one session (`fair_sess_cap()` in `myquic2-server.rs`). A lone
+/// client is the only holder, so the fair share (4096) sits above this cap and
+/// the client's own limit binds; a server shared by N session-holding
+/// connections gives each `8192 / N`, down to the 256 floor. Nothing on the wire
+/// tells the client which it got, so a deployment that shares a server must size
+/// its per-client capacity against the shared budget, not this number.
+pub const MAX_UDP_ASSOCS: usize = 4032;
+
 /// Runtime transport tuning resolved from optional TOML fields.
 /// Defaults are the low-latency preset for ~140 ms links (2/4/2 MB windows,
 /// ACK every 2nd, 5 ms delay): ~114 Mb/s @140 ms with minimal loaded queue.
@@ -1013,18 +1040,26 @@ pub const TARGET_BDP_BYTES: u64 = TARGET_LINK_BYTES_PER_SEC * 140 / 1000;
 
 // Flow control, not the congestion controller, is what caps single-stream
 // throughput on a high-RTT link: every window below is a hard ceiling of
-// `window / RTT`, applied before BBR's cwnd is consulted. The 2026-09 gaps-death
-// pass deliberately shrank them (2MB per stream / 8MB aggregate / 4MB send),
-// which capped one stream at ~114Mb/s at 140ms. These values supersede that for
-// the 300Mb/s target.
+// `window / RTT`, applied before BBR's cwnd is consulted.
 //
-// KNOWN COST of the re-widening: quinn kills a connection once a single stream's
+// **These are the opt-in 300Mb/s preset, not the shipped default.** The shipped
+// default is `TransportTuning::default()`'s low-latency 2/4/2 MB preset
+// (~114Mb/s at 140ms), documented in `config-*.toml` and the README limits
+// table; operators raise it with `stream_receive_window_mb = 8`,
+// `receive_window_mb = 16`, `send_window_mb = 8` (plus `ack_threshold = 8`,
+// `max_ack_delay_ms = 10`) on **both** sides. The constants exist so that opt-in
+// configuration has one definition and a guard test that actually exercises the
+// config path (`tcp_windows_cover_the_300mb_s_bdp`); an earlier revision of this
+// comment claimed they "supersede" the defaults, which no code read.
+//
+// KNOWN COST of the wide preset: quinn kills a connection once a single stream's
 // reassembly holds `MAX_CHUNKS = 1024` distinct spans. A larger window allows
 // more packets in flight per RTT (~6200 at 1350B, ~3700 at the 1472B PMTU
 // ceiling), so a burst-loss or reordering episode has more room than 2MB did to
-// approach that cliff. A clean path is unaffected; on a lossy one, step
-// `SEND_WINDOW` and `STREAM_RECEIVE_WINDOW` back to 4MB (=240Mb/s) rather than
-// reverting the ACK-frequency and PMTU work, which is loss-independent.
+// approach that cliff. A clean path is unaffected; on a lossy one, step this
+// preset's `SEND_WINDOW` and `STREAM_RECEIVE_WINDOW` back to 4MB (=240Mb/s)
+// rather than reverting the ACK-frequency and PMTU work, which is
+// loss-independent.
 
 /// Per-stream receive window. 8MB rather than the 5.25MB BDP: quinn only
 /// announces a `MAX_STREAM_DATA` once the advertised window is short by
@@ -1044,6 +1079,17 @@ pub const RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
 /// a high-RTT link this is a throughput ceiling of `SEND_WINDOW / RTT` for the
 /// write direction. See the flow-control note above for the 8MB tradeoff.
 pub const SEND_WINDOW: u64 = 8 * 1024 * 1024;
+
+const _: () = {
+    // The opt-in preset must be *reachable* through the config clamp
+    // (`clamp_window_mb`, 1..=64 MB), or the documentation would be pointing at
+    // values an operator cannot actually set. This is the link between the
+    // constants and the only code that consumes window sizes.
+    const MB: u64 = 1024 * 1024;
+    assert!(STREAM_RECEIVE_WINDOW / MB >= 1 && STREAM_RECEIVE_WINDOW / MB <= 64);
+    assert!(RECEIVE_WINDOW / MB >= 1 && RECEIVE_WINDOW / MB <= 64);
+    assert!(SEND_WINDOW / MB >= 1 && SEND_WINDOW / MB <= 64);
+};
 
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
     build_transport_tuned(congestion, keep_alive_secs, TransportTuning::default())
@@ -1560,10 +1606,17 @@ struct DnsMemoSlot {
     addr: Option<SocketAddr>,
     len: u8,
     key: [u8; MEMO_KEY_BYTES],
-    /// Same deadline in the [`coarse_millis`] epoch, so the per-packet hit path
-    /// compares two atomics instead of reading the clock: at most one tick
-    /// behind the true TTL, hence an entry can only look expired early, never
-    /// fresh late — a miss falls through to the shared cache, never a mis-serve.
+    /// Same deadline expressed in the [`coarse_millis`] epoch, so the per-packet
+    /// hit path compares two atomics instead of reading the clock.
+    ///
+    /// **Error bound, stated the right way round.** Both the deadline and the
+    /// check sample the same lagging clock, so what remains is the *difference*
+    /// between the lag at insert and the lag at check (each at most one tick) —
+    /// not "one tick early" as an earlier revision of this comment claimed. An
+    /// entry can therefore be served up to about one tick (~1 s) past its true
+    /// TTL. The key is still compared in full, so this is never a mis-serve of
+    /// another name's address; at worst a 60 s DNS answer is reused for one
+    /// extra second.
     expires_ms: u64,
 }
 
@@ -1705,10 +1758,13 @@ fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
 
 /// Translate an `Instant` deadline into the [`coarse_millis`] epoch.
 /// Paid once per memo insert (the miss path, which already holds locks); the
-/// per-packet hit path then compares without any clock read. Rounds the safe
-/// way: `coarse_millis` never runs ahead of `mono_millis`, so the translated
-/// deadline can only fire up to one tick early — an early miss falls through
-/// to the shared cache, never a stale serve.
+/// per-packet hit path then compares without any clock read.
+///
+/// The translation deliberately anchors on the coarse sample rather than the
+/// precise remainder alone, so the residual error is the *change* in the
+/// clock's lag between here and the check — bounded by one tick in either
+/// direction (see [`DnsMemoSlot::expires_ms`]), not the "early only" this used
+/// to claim.
 fn coarse_deadline(expires: Instant) -> u64 {
     let remain_ms = expires
         .saturating_duration_since(Instant::now())
@@ -2016,26 +2072,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                 memo_put(key, Some(a), now + DNS_CACHE_TTL);
             }
         }
-        Err(_) => {
-            {
-                let mut n = lock_write(dns_neg_cache_for(key));
-                // Bounded hold: evict one arbitrary entry instead of a full
-                // O(n) `retain` scan under the write lock. Expired entries
-                // are already treated as misses by the TTL check on read,
-                // so eager reaping buys nothing while stalling every packet
-                // path reader during a failing-domain flood. Per-shard cap
-                // keeps the process-wide total at `DNS_NEG_MAX`.
-                if n.len() >= DNS_NEG_MAX_SHARD {
-                    if let Some(k) = n.keys().next().cloned() {
-                        n.remove(&k);
-                    }
-                }
-                if n.len() < DNS_NEG_MAX_SHARD {
-                    n.insert(key.to_owned(), now);
-                }
-            }
-            memo_put(key, None, now + DNS_NEG_TTL);
-        }
+        Err(_) => record_negative(key, now),
     }
     let _ = entry.cell.set(r.clone());
     entry.notify.notify_waiters();
@@ -2044,6 +2081,54 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         Ok(v) => Ok(v),
         Err(msg) => anyhow::bail!("{msg}"),
     }
+}
+
+/// Whether `key` has a positive entry that is still inside [`DNS_CACHE_TTL`].
+///
+/// Non-blocking by construction: a contended shard reads as "not fresh", which
+/// only ever costs a redundant upstream lookup, never a wrong answer.
+fn positive_entry_is_fresh(key: &str) -> bool {
+    let Some(m) = try_lock_read(dns_cache_for(key)) else {
+        return false;
+    };
+    m.get(key).is_some_and(|(t, _)| t.elapsed() < DNS_CACHE_TTL)
+}
+
+/// Record that resolving `key` failed, so the packet paths can refuse it without
+/// spawning a resolver per datagram.
+///
+/// **Never downgrade a live positive answer.** The positive probes on the
+/// resolution path are `try_lock_read`, so a *contended* — but perfectly valid —
+/// entry makes the caller fall through to a real upstream lookup. If that
+/// lookup then fails (SERVFAIL, timeout, an overloaded resolver), recording a
+/// negative entry would shadow the valid answer: [`lookup_cached_fast`] consults
+/// the thread-local memo before anything else and a memo set holds one slot per
+/// key, so for `DNS_NEG_TTL` every datagram for that name is dropped as
+/// `REFUSED` and every TCP flow fails with "dns negative cached" — while the
+/// cached address was still good. The failure is still reported to the caller
+/// that performed it; it just does not poison the cache.
+fn record_negative(key: &str, now: Instant) {
+    if positive_entry_is_fresh(key) {
+        return;
+    }
+    {
+        let mut n = lock_write(dns_neg_cache_for(key));
+        // Bounded hold: evict one arbitrary entry instead of a full O(n)
+        // `retain` scan under the write lock. Expired entries are already
+        // treated as misses by the TTL check on read, so eager reaping buys
+        // nothing while stalling every packet path reader during a
+        // failing-domain flood. Per-shard cap keeps the process-wide total at
+        // `DNS_NEG_MAX`.
+        if n.len() >= DNS_NEG_MAX_SHARD {
+            if let Some(k) = n.keys().next().cloned() {
+                n.remove(&k);
+            }
+        }
+        if n.len() < DNS_NEG_MAX_SHARD {
+            n.insert(key.to_owned(), now);
+        }
+    }
+    memo_put(key, None, now + DNS_NEG_TTL);
 }
 
 /// Accept `IP:port` or `hostname:port` for the QUIC server address.
@@ -3103,10 +3188,14 @@ impl DgramFragmenter {
             };
         };
         let cap = limit.saturating_sub(DGRAM_PREFIX_LEN + header.len());
-        // Every outbound relayed payload passes through here, so this is the one
-        // place the activity counters need (see `udp_stats`).
-        udp_stats::payload(payload.len());
         if payload.len() <= cap {
+            // Counted only once the payload is actually accepted for sending.
+            // Counting it before the size refusals below made refused payloads
+            // inflate `datagrams`/`bytes`/`max_payload` — and `max_payload` is
+            // documented as the empirical check on the 8 KiB cap, so a peer (or
+            // an oversized app datagram) could move the very number that is
+            // supposed to describe delivered traffic.
+            udp_stats::payload(payload.len());
             let failed = match send_udp_datagram_with_header(conn, sess, &header, payload, limit) {
                 DatagramSend::Sent => None,
                 other => Some(other),
@@ -3142,7 +3231,6 @@ impl DgramFragmenter {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
-        udp_stats::fragmented(total);
         let mut frames = 0u8;
         for (i, part) in payload.chunks(chunk).enumerate() {
             let Some(body) =
@@ -3167,6 +3255,9 @@ impl DgramFragmenter {
                 }
             }
         }
+        // Counted with the frames actually queued, and only for a payload that
+        // was really split — `fragmented` itself ignores `frames <= 1`.
+        udp_stats::fragmented(frames);
         PayloadSend {
             frames,
             failed: None,
@@ -3180,7 +3271,15 @@ struct Partial {
     address: TargetAddr,
     chunks: Vec<Option<Bytes>>,
     got: u8,
+    /// Payload bytes held. Bounds the *assembled* datagram
+    /// ([`MQP_FRAG_MAX_PAYLOAD`]) and sizes `assemble`'s output buffer.
     bytes: usize,
+    /// Bytes actually pinned by the stored chunks. With
+    /// [`DgramReassembler::push_zero_copy`] a chunk is a `Bytes` slice of the
+    /// whole received DATAGRAM, so this is `>= bytes` — often much more, since a
+    /// 16-byte final chunk still pins its ~1.4 KiB frame. [`DgramReassembler`]
+    /// bounds *this*, not `bytes`; see the note on the reassembler.
+    retained: usize,
     first_ms: u64,
 }
 
@@ -3192,16 +3291,28 @@ impl Partial {
             chunks: vec![None; total as usize],
             got: 0,
             bytes: 0,
+            retained: 0,
             first_ms: now_ms,
         }
     }
 
-    fn assemble(self) -> Bytes {
-        let mut out = bytes::BytesMut::with_capacity(self.bytes);
-        for c in self.chunks.into_iter().flatten() {
+    /// Consume the partial into `(address, whole payload)`.
+    ///
+    /// The address is *moved* out rather than cloned: it is a `String` for a
+    /// domain target, so `p.address.clone()` was a heap allocation on every
+    /// reassembled datagram whose result was dropped immediately.
+    fn into_datagram(self) -> (TargetAddr, Bytes) {
+        let Self {
+            address,
+            chunks,
+            bytes,
+            ..
+        } = self;
+        let mut out = bytes::BytesMut::with_capacity(bytes);
+        for c in chunks.into_iter().flatten() {
             out.extend_from_slice(&c);
         }
-        out.freeze()
+        (address, out.freeze())
     }
 }
 
@@ -3214,11 +3325,23 @@ impl Partial {
 /// [`MQP_FRAG_MAX_PAYLOAD`] (a fragment whose chunk would push the partial past
 /// the protocol's payload ceiling discards the whole partial, so a peer cannot
 /// make this side relay a datagram the encoder on the other end would have
-/// refused), and in aggregate by [`FRAG_MAX_HELD_BYTES`], past which the oldest
-/// partial is evicted.
+/// refused), and in aggregate by [`FRAG_MAX_HELD_BYTES`] over the bytes the
+/// chunks actually **retain**, not merely their payload length.
+///
+/// **Retained vs payload bytes.** [`push_zero_copy`](Self::push_zero_copy)
+/// stores a `Bytes` slice of the whole received DATAGRAM, so a chunk pins the
+/// entire datagram allocation while contributing only `chunk.len()` payload
+/// bytes. Charging the payload length alone let a peer hold
+/// `FRAG_MAX_PARTIALS` x 64 partials of 16-byte chunks — `held` exactly at the
+/// cap, so nothing was ever evicted — while pinning on the order of 4 MiB per
+/// connection (each tiny chunk keeps its ~284-byte frame, and a quinn receive
+/// buffer may be larger still). The aggregate bound is therefore enforced over
+/// `retained`; the payload-length accounting is kept separately because it is
+/// what [`MQP_FRAG_MAX_PAYLOAD`] and the assembled buffer are about.
 #[derive(Default)]
 pub struct DgramReassembler {
     parts: HashMap<(u32, u16), Partial>,
+    /// Retained bytes across all partials — see [`Partial::retained`].
     held: usize,
     last_sweep_ms: u64,
 }
@@ -3228,6 +3351,9 @@ impl DgramReassembler {
         Self::default()
     }
 
+    /// Bytes the in-flight partials actually retain (pinned `Bytes` storage,
+    /// not payload length — see [`Partial::retained`]). This is the quantity
+    /// [`FRAG_MAX_HELD_BYTES`] bounds.
     pub fn held_bytes(&self) -> usize {
         self.held
     }
@@ -3251,7 +3377,9 @@ impl DgramReassembler {
     /// [`push_zero_copy`](Self::push_zero_copy) when the decoded frame still
     /// borrows from an owned datagram — the hot path does.
     pub fn push(&mut self, f: &FragmentRef<'_>, now_ms: u64) -> Option<(u32, TargetAddr, Bytes)> {
-        self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), now_ms)
+        // The copied chunk owns exactly its own bytes, so payload and retained
+        // length coincide on this path.
+        self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), f.chunk.len(), now_ms)
     }
 
     /// Zero-copy [`push`](Self::push): `parent` must be the exact `Bytes` `f`
@@ -3265,32 +3393,41 @@ impl DgramReassembler {
     /// pointer comparison against that offset — not a body compare — so the
     /// hot path stays O(1). A caller that passes a mismatched pair falls back
     /// to a copy rather than slicing the wrong bytes.
+    ///
+    /// A zero-copy chunk retains the whole `parent` allocation, so this path
+    /// charges `parent.len()` (not `f.chunk.len()`) against
+    /// [`FRAG_MAX_HELD_BYTES`] — see [`Partial::retained`].
     pub fn push_zero_copy(
         &mut self,
         parent: &Bytes,
         f: &FragmentRef<'_>,
         now_ms: u64,
     ) -> Option<(u32, TargetAddr, Bytes)> {
-        let chunk = if f.chunk.len() <= parent.len() {
+        let (chunk, retained) = if f.chunk.len() <= parent.len() {
             let start = parent.len() - f.chunk.len();
             // `f.chunk` is a subslice of the same allocation as `parent` at
             // exactly this offset iff the two pointers agree. `Bytes` is
             // immutable, so a match means the body compare would also match.
             if f.chunk.as_ptr() == parent.as_ptr().wrapping_add(start) {
-                parent.slice(start..)
+                (parent.slice(start..), parent.len())
             } else {
-                Bytes::copy_from_slice(f.chunk)
+                let copy = Bytes::copy_from_slice(f.chunk);
+                let len = copy.len();
+                (copy, len)
             }
         } else {
-            Bytes::copy_from_slice(f.chunk)
+            let copy = Bytes::copy_from_slice(f.chunk);
+            let len = copy.len();
+            (copy, len)
         };
-        self.push_with_chunk(f, chunk, now_ms)
+        self.push_with_chunk(f, chunk, retained, now_ms)
     }
 
     fn push_with_chunk(
         &mut self,
         f: &FragmentRef<'_>,
         chunk: Bytes,
+        retained: usize,
         now_ms: u64,
     ) -> Option<(u32, TargetAddr, Bytes)> {
         if f.total < 2 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total {
@@ -3309,14 +3446,14 @@ impl DgramReassembler {
         {
             return None;
         }
-        // The per-partial byte cap the module documents, actually enforced.
+        // The per-partial *payload* cap the module documents, actually enforced.
         // `total` is bounded by `MQP_FRAG_MAX_TOTAL`, but nothing bounds a
         // *chunk*: at the QUIC path MTU each fragment carries ~1.4 KiB, so a
         // 64-fragment partial assembles to ~91 KiB — far past the payload
         // ceiling this protocol states, and the caller relays whatever comes out
         // (`udp_try_send` would hand the kernel a 91 KiB datagram to
-        // IP-fragment). `held`'s aggregate bound does not catch it: one such
-        // partial sits well under `FRAG_MAX_HELD_BYTES`.
+        // IP-fragment). The aggregate retention bound is a different quantity
+        // and is enforced below.
         //
         // Discarded whole rather than truncated or partially kept: a prefix of a
         // datagram is not a short datagram, it is a *corrupt* one, and UDP above
@@ -3327,7 +3464,7 @@ impl DgramReassembler {
             let duplicate = p.chunks.get(f.idx as usize).is_some_and(Option::is_some);
             if !duplicate && p.bytes.saturating_add(chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
                 if let Some(p) = self.parts.remove(&key) {
-                    self.held = self.held.saturating_sub(p.bytes);
+                    self.held = self.held.saturating_sub(p.retained);
                     udp_stats::reassembly_evicted();
                 }
                 return None;
@@ -3342,7 +3479,7 @@ impl DgramReassembler {
                 // A wrapped id reused with a different shape: restart rather
                 // than splice two datagrams together. Release the old bytes
                 // first or `held` overcounts forever.
-                self.held = self.held.saturating_sub(entry.bytes);
+                self.held = self.held.saturating_sub(entry.retained);
                 *entry = Partial::new(f.total, &f.address, now_ms);
             } else if entry.got > 0
                 && (entry.address.as_ref() != f.address
@@ -3358,7 +3495,7 @@ impl DgramReassembler {
                 // indistinguishable without a wire generation marker, but that
                 // requires id reuse inside the 2s window plus exact
                 // interleaving, and at most drops or reorders UDP payloads).
-                self.held = self.held.saturating_sub(entry.bytes);
+                self.held = self.held.saturating_sub(entry.retained);
                 *entry = Partial::new(f.total, &f.address, now_ms);
             }
             let slot = &mut entry.chunks[f.idx as usize];
@@ -3366,15 +3503,17 @@ impl DgramReassembler {
                 *slot = Some(chunk);
                 entry.got += 1;
                 entry.bytes += f.chunk.len();
-                self.held = self.held.saturating_add(f.chunk.len());
+                entry.retained = entry.retained.saturating_add(retained);
+                self.held = self.held.saturating_add(retained);
             }
             entry.got == entry.total
         };
 
         if complete {
             let p = self.parts.remove(&key)?;
-            self.held = self.held.saturating_sub(p.bytes);
-            return Some((key.0, p.address.clone(), p.assemble()));
+            self.held = self.held.saturating_sub(p.retained);
+            let (address, whole) = p.into_datagram();
+            return Some((key.0, address, whole));
         }
         while self.held > FRAG_MAX_HELD_BYTES {
             if !self.evict_oldest() {
@@ -3395,7 +3534,7 @@ impl DgramReassembler {
         self.parts.retain(|_, p| {
             let live = now_ms.saturating_sub(p.first_ms) < FRAG_TIMEOUT_MS;
             if !live {
-                freed += p.bytes;
+                freed += p.retained;
                 expired += 1;
             }
             live
@@ -3416,7 +3555,7 @@ impl DgramReassembler {
             return false;
         };
         if let Some(p) = self.parts.remove(&key) {
-            self.held = self.held.saturating_sub(p.bytes);
+            self.held = self.held.saturating_sub(p.retained);
             udp_stats::reassembly_evicted();
         }
         true
@@ -3586,7 +3725,9 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                 udp_write::retried();
             } else {
                 let n = udp_write::dropped_no_permit();
-                warn_udp_write(UdpWriteDrop::Budget, n, || "send buffer full".to_string());
+                warn_udp_write(UdpWriteDrop::Budget, n, || {
+                    format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
+                });
             }
         }
         Err(e) => {
@@ -3622,7 +3763,9 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
                 udp_write::retried();
             } else {
                 let n = udp_write::dropped_no_permit();
-                warn_udp_write(UdpWriteDrop::Budget, n, || "send buffer full".to_string());
+                warn_udp_write(UdpWriteDrop::Budget, n, || {
+                    format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
+                });
             }
         }
         Err(e) => {
@@ -4542,6 +4685,63 @@ mod tests {
         assert!(neg2.is_none());
     }
 
+    /// A transient resolver failure must not downgrade a still-valid positive
+    /// answer into a negative one.
+    ///
+    /// The positive probes on the resolution path are `try_lock_read`, so a
+    /// contended-but-valid entry reaches the upstream lookup; if that lookup
+    /// fails, the old code wrote a negative cache entry *and* a negative
+    /// thread-local memo entry unconditionally. `lookup_cached_fast` consults
+    /// the memo first and one memo set holds one slot per key, so every datagram
+    /// for that name was then refused for `DNS_NEG_TTL` (10 s) and every TCP
+    /// flow failed with "dns negative cached" — while the cached address was
+    /// still good. `record_negative` is the gate; this pins both directions.
+    #[test]
+    fn transient_resolution_failure_does_not_poison_a_fresh_positive_entry() {
+        memo_reset();
+        let addr: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (host, port) = ("poison-guard.test", 19053u16);
+        dns_cache_seed(host, port, addr);
+        let mut kbuf = [0u8; DNS_KEY_BUF];
+        let key = dns_key(host, port, &mut kbuf).unwrap().to_owned();
+        assert!(
+            positive_entry_is_fresh(&key),
+            "test premise: positive is fresh"
+        );
+
+        // The failure the owner observed is recorded, but must not shadow the
+        // live positive answer.
+        record_negative(&key, Instant::now());
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Addr(addr),
+            "a fresh positive entry must survive a transient resolver failure"
+        );
+        assert!(
+            lock_read(dns_neg_cache_for(&key)).get(&key).is_none(),
+            "no negative entry may be written over a live positive one"
+        );
+        assert!(
+            memo_peek_both(&key).1.is_none(),
+            "no negative memo entry may shadow a live positive one"
+        );
+
+        // Positive control: with no fresh positive answer, the failure *is*
+        // recorded and the packet path refuses the name without a lookup.
+        let (miss_host, miss_port) = ("poison-guard-miss.test", 19054u16);
+        let mut kbuf2 = [0u8; DNS_KEY_BUF];
+        let miss_key = dns_key(miss_host, miss_port, &mut kbuf2)
+            .unwrap()
+            .to_owned();
+        assert!(!positive_entry_is_fresh(&miss_key));
+        record_negative(&miss_key, Instant::now());
+        assert_eq!(
+            lookup_cached_fast(miss_host, miss_port),
+            CachedLookup::Negative,
+            "an uncached failure must still be negatively cached"
+        );
+    }
+
     #[test]
     fn addr_roundtrip() {
         for a in [
@@ -5105,6 +5305,56 @@ mod tests {
         // A later *smaller* payload must not lower the mark.
         udp_stats::payload(64);
         assert!(udp_stats::snapshot().max_payload >= 1_472);
+    }
+
+    /// The aggregate reassembly bound must be charged over the bytes a chunk
+    /// actually *retains*, not its payload length.
+    ///
+    /// A zero-copy chunk is a slice of the whole received DATAGRAM, so a 16-byte
+    /// final fragment still pins its ~276-byte frame. Charging only
+    /// `chunk.len()` let a peer hold `FRAG_MAX_PARTIALS` partials of tiny
+    /// fragments with `held` at (or under) the cap — nothing evicted — while
+    /// pinning an order of magnitude more memory. This test would pass on the
+    /// payload-based accounting only if retention were free, which it is not:
+    /// with 8-byte chunks in 276-byte frames the payload sum stays tiny while
+    /// retention crosses the cap, so the eviction path must fire and
+    /// `inflight()` must stay below the number of partials fed.
+    #[test]
+    fn zero_copy_reassembly_is_bounded_by_retained_bytes() {
+        let addr = TargetAddr::Domain("a".repeat(255), 53);
+        let chunk = [0u8; 8];
+        let total = 64u8;
+        let mut r = DgramReassembler::new();
+        let mut completed = 0;
+        // Every partial is fed one fragment short of completion, so retention
+        // accumulates instead of being released on assembly.
+        for id in 0..24u16 {
+            for idx in 0..(total - 1) {
+                let body =
+                    encode_fragment(1, id, idx, total, &addr.as_ref(), &chunk, 4096).unwrap();
+                let f = decode_fragment(&body).unwrap();
+                if r.push_zero_copy(&body, &f, 0).is_some() {
+                    completed += 1;
+                }
+            }
+        }
+        assert_eq!(completed, 0, "each partial is one fragment short");
+        assert!(
+            r.held_bytes() <= FRAG_MAX_HELD_BYTES,
+            "retained bytes must stay inside the aggregate cap: {} B",
+            r.held_bytes()
+        );
+        assert!(
+            r.held_bytes() > MQP_FRAG_MAX_PAYLOAD,
+            "the retained figure must dwarf the payload sum, which is what makes \
+             the payload-based bound useless here: {} B",
+            r.held_bytes()
+        );
+        assert!(
+            r.inflight() < 24,
+            "the retained-byte bound must evict: {} partials in flight",
+            r.inflight()
+        );
     }
 
     #[test]
@@ -6021,16 +6271,21 @@ mod tests {
         );
     }
 
-    /// Window sizing invariant: every flow-control window must clear the BDP of
-    /// the link this build targets, or it -- not BBR's congestion window --
-    /// becomes the single-stream throughput ceiling.
+    /// Window sizing invariant: the documented **opt-in** 300Mb/s configuration
+    /// must actually produce flow-control windows that clear the BDP, or they —
+    /// not BBR's congestion window — become the single-stream throughput ceiling.
     ///
-    /// This is a constants check rather than a live measurement on purpose.
+    /// This is a config-path check rather than a live measurement on purpose:
     /// quinn exposes no window getters, and a loopback connection cannot detect
-    /// the regression it guards against: with a 2MB window the cushion is still
-    /// 1MB, which at a ~0.2ms loopback RTT is worth ~40Gb/s. Verified by
-    /// reverting `STREAM_RECEIVE_WINDOW` to 2MB -- the live variant of this test
-    /// passed. Only the constants carry the invariant, so only they are tested.
+    /// the regression it guards against (with a 2MB window the cushion is still
+    /// 1MB, worth ~40Gb/s at a ~0.2ms loopback RTT).
+    ///
+    /// **It used to assert only on the constants**, which `build_transport_tuned`
+    /// never reads — it consumes `TransportTuning`, whose default is the 2/4/2
+    /// low-latency preset. So the guard passed while proving nothing about any
+    /// window that could reach the wire. It now drives `ClientConf::tuning()`
+    /// with the exact values the sample configs document and checks both that
+    /// they reproduce the constants and that they clear the BDP.
     #[test]
     fn tcp_windows_cover_the_300mb_s_bdp() {
         // Relations between constants are asserted at compile time, so a future
@@ -6056,5 +6311,37 @@ mod tests {
         const _: () = assert!(SEND_WINDOW > 4 * 1024 * 1024);
         // Implied single-stream ceiling for the target RTT, in Mb/s.
         const _: () = assert!(STREAM_RECEIVE_WINDOW * 8 / 140 * 1000 / 1_000_000 >= 300);
+
+        // ...and the same invariant through the only path that reaches quinn:
+        // the config, as the sample configs document it on both sides.
+        let base = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
+            server_name = 'test.com'\nserver_cert_file = 'x'\n";
+        let c: ClientConf = toml::from_str(&format!(
+            "{base}stream_receive_window_mb = 8\nreceive_window_mb = 16\n\
+             send_window_mb = 8\nack_threshold = 8\nmax_ack_delay_ms = 10\n"
+        ))
+        .unwrap();
+        let t = c.tuning();
+        assert_eq!(
+            t.stream_receive_window, STREAM_RECEIVE_WINDOW,
+            "the documented 300Mb/s config must reproduce the stream window"
+        );
+        assert_eq!(t.receive_window, RECEIVE_WINDOW);
+        assert_eq!(t.send_window, SEND_WINDOW);
+        // The guarded invariant, on the values that actually go to
+        // `build_transport_tuned`.
+        assert!(
+            t.stream_receive_window - t.stream_receive_window / 8 > TARGET_BDP_BYTES,
+            "the advertised stream window must clear the BDP after quinn's cushion"
+        );
+        assert!(t.send_window >= TARGET_BDP_BYTES);
+        assert!(t.receive_window >= 2 * TARGET_BDP_BYTES);
+        // And the shipped default must stay the *low-latency* preset the README
+        // and the sample configs document, not silently drift into the opt-in.
+        let default_conf: ClientConf = toml::from_str(base).unwrap();
+        let d = default_conf.tuning();
+        assert_eq!(d.stream_receive_window, 2 * 1024 * 1024);
+        assert_eq!(d.receive_window, 4 * 1024 * 1024);
+        assert_eq!(d.send_window, 2 * 1024 * 1024);
     }
 }

@@ -47,16 +47,12 @@ const EGRESS_REFRESH_MS: u64 = 1000;
 /// peer can spawn unbounded tasks / relay sockets (each with 512 KB kernel
 /// buffers) and exhaust fds and memory on the proxy host.
 const MAX_SOCKS_CONNS: usize = 8192;
-/// Server-side live sessions one client connection can keep. The server's
-/// session table evicts as soon as a shard crosses `LOCAL_SESS_MAX / SESS_SHARDS`
-/// and settles back to `LOCAL_SESS_TARGET / SESS_SHARDS`, i.e.
-/// `LOCAL_SESS_TARGET = LOCAL_SESS_MAX - 64 = 4032` sessions per connection
-/// (`myquic2-server.rs`). A client that admits more concurrent associations than
-/// the server will keep alive loses live flows at the ceiling, so this cap is
-/// aligned to that target rather than to `LOCAL_SESS_MAX`: all of a client's UDP
-/// associations ride one egress connection (the dedicated UDP slot), so the
-/// per-connection target is exactly this client's ceiling.
-const MAX_UDP_ASSOCS: usize = 4032;
+// `MAX_UDP_ASSOCS` (the concurrent UDP-association cap) now lives in `lib.rs`
+// next to the server's per-connection session target, so the two can never drift
+// apart again: it is imported by `use myquic2::*`. It is a *budget* constant,
+// not a guarantee — see its docstring for the server-side fair share
+// (`clamp(MAX_SESSIONS_GLOBAL / session-holding connections, 256, 4096)`) that
+// this client cannot observe.
 
 fn socks_conn_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
@@ -1863,6 +1859,20 @@ async fn handle_socks(
             // path snapshot so loss-driven kills are diagnosable in one line.
             // Sampled: `stats()` takes the quinn lock, so an abort storm must
             // not pay it per flow.
+            //
+            // KNOWN LIMITATION (not a regression, deliberately left as-is): this
+            // flow is not retried on a sibling slot. A connection that blackholes
+            // *after* `pick_tcp` selected it still accepts `open_bi`/`write_all`
+            // locally, so the header goes nowhere and the failure surfaces here —
+            // bounded by `TCP_DIAL_ACK_TIMEOUT` or, sooner, by the reconnect
+            // loop's silence watchdog force-closing the connection. Retrying
+            // transparently is impossible after the optimistic SOCKS success
+            // reply has been sent, and marking the slot dead on an ACK timeout
+            // alone would stall every later flow behind a reconnect when the
+            // connection is merely slow. A real fix needs a connection-health
+            // signal at *selection* time (e.g. a published last-received stamp),
+            // which is not worth the misconfiguration risk against mismatched
+            // keepalive intervals yet.
             if tcp_abort_log_due() {
                 let st = conn.stats();
                 tracing::warn!(
@@ -2110,16 +2120,36 @@ async fn udp_associate_inner(
                 // every app datagram — the same cost the reply path already had
                 // removed for the same reason (see `AssocEntry::replied`).
                 let now = coarse_millis();
+                // Validate the SOCKS5 UDP framing *before* letting this packet
+                // claim the association. The relay port is reachable by any
+                // process on the control connection's IP, so locking on the first
+                // packet from any source let one unsolicited or malformed
+                // datagram — a single stray byte suffices — pin `entry.app` to
+                // the sender permanently: replies then went to that sender, the
+                // legitimate app's datagrams were dropped as a "changed source",
+                // and because dropped packets deliberately do not touch the
+                // liveness stamp the association also starved to death at 180 s.
+                // Only a well-formed RSV/FRAG + address frame may lock.
+                if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
+                    continue;
+                }
+                // Single decode: reuse header length for the payload offset.
+                let (addr, hdr_len) = match TargetAddrRef::decode(&buf[3..n]) {
+                    Ok((a, n)) => (a, n),
+                    Err(_) => continue,
+                };
+                let payload_off = 3 + hdr_len;
+                if payload_off > n { continue; }
+                let payload = &buf[payload_off..n];
                 if published_app != Some(app) {
-                    // Lock to the first app address: the relay port is reachable
-                    // by any local process, and IP-only pinning lets a different
-                    // socket on the same host (same IP, another port) take over
-                    // the association and steal its replies. A legitimate client
-                    // uses one UDP socket per association, so its source never
-                    // changes; a changed source is a hijack attempt, not a
-                    // rebinding, and is ignored instead of published — before
-                    // the liveness stamp below, so dropped packets cannot keep
-                    // a dead association alive.
+                    // Lock to the first app address: IP-only pinning would let a
+                    // different socket on the same host (same IP, another port)
+                    // take over the association and steal its replies. A
+                    // legitimate client uses one UDP socket per association, so
+                    // its source never changes; a changed source is a hijack
+                    // attempt, not a rebinding, and is ignored instead of
+                    // published — before the liveness stamp below, so dropped
+                    // packets cannot keep a dead association alive.
                     if let Some(first) = published_app {
                         tracing::debug!(
                             "udp assoc {sess}: datagram from {app} ignored (locked to {first})"
@@ -2133,17 +2163,6 @@ async fn udp_associate_inner(
                     activity_stamp = now;
                     entry.touch(now);
                 }
-                if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
-                    continue;
-                }
-                // Single decode: reuse header length for the payload offset.
-                let (addr, hdr_len) = match TargetAddrRef::decode(&buf[3..n]) {
-                    Ok((a, n)) => (a, n),
-                    Err(_) => continue,
-                };
-                let payload_off = 3 + hdr_len;
-                if payload_off > n { continue; }
-                let payload = &buf[payload_off..n];
                 // Shared egress: the common case is a thread-local memo hit
                 // (one generation load, zero Arc RMWs and zero quinn locks);
                 // the lock path runs only on a generation change or once the
