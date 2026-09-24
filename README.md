@@ -117,7 +117,7 @@ Its `dist/` artifacts are rebuilt from this revision and — unlike the pass-26 
 statically checked (`file` plus per-level `objdump`), though still not run under emulation
 or natively.
 
-The current pass is a second review-and-fix cycle on the same echo paths, confirmed
+The previous pass was a second review-and-fix cycle on the same echo paths, confirmed
 finding-by-finding through two rounds of code review before anything was touched: the
 TCP stream-head writes on both ends get a 5 s deadline (a stalled connection used to
 park the client before its SOCKS answer and the server's stream-task permit until the
@@ -129,6 +129,20 @@ on both 60 s `udp budget` lines — see
 [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap).
 Its `dist/` artifacts are rebuilt from this revision and statically checked the same way
 (`file` plus per-level `objdump`), again not run under emulation or natively.
+
+The current pass fixes six findings from another two-round review, all confirmed
+finding-by-finding with the second round tasked to falsify: the token no longer rides
+0-RTT early data (a bearer secret there is replayable inside the ticket window, and
+single-use tickets only narrow it), server-side target replies are validated against
+the session's recently-sent destinations, the client locks each association to its
+first app `(ip, port)`, the UDP DNS fast path scans the full cached address set like
+TCP does instead of refusing on a filtered first address, relay-buffer truncations
+are counted in `TOO_LARGE`, and new UDP sessions are refused past a live fair share
+of the process-wide budget so one connection cannot starve the rest — see
+[pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness).
+Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
+plus per-level `objdump`, plus a byte-identical second build), again not run under
+emulation or natively.
 
 ---
 
@@ -150,7 +164,7 @@ Its `dist/` artifacts are rebuilt from this revision and statically checked the 
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild) and [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap) and [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -166,7 +180,7 @@ Its `dist/` artifacts are rebuilt from this revision and statically checked the 
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
 | **Custom protocol** | MQP-2 binary framing: TCP costs **0 extra bytes** after the first header; UDP costs **+12 B (IPv4) / +24 B (IPv6)** per datagram, plus **+16 B per additional fragment** once a payload exceeds one QUIC DATAGRAM |
-| **0-RTT** | Session resumption with early data, verified end-to-end (`accepted=true`). The auth token rides early data and is automatically re-sent if the server rejects it |
+| **0-RTT** | Session resumption with early data, verified end-to-end (`accepted=true`). The auth token is sent at 1-RTT only — never in replayable early data — so resumption saves the handshake while the token cannot be replayed into a new connection |
 | **Reconnect** | Survives server restarts: ~15–20 s silent-path detection, backoff redial (200 ms → 5 s, decayed only after 5 s of stable connectivity), fail-fast old streams, UDP sessions self-heal |
 | **Dual-stack** | IPv4 + IPv6 everywhere: listeners, relays, dial-out; v4-mapped handling on BSD/macOS |
 | **Identity** | Client pins the exact Ed25519 server cert; optional `auth_token` (constant-time compare, ≤ 256 B) prevents open-relay abuse |
@@ -332,10 +346,14 @@ mismatch        : CONNECTION_CLOSE 0x01 "unauthorized"
   unauthenticated peer cannot dial anything.
 - No ACK exists: a wrong token surfaces as a closed connection. The client keeps
   backing off and logs the close reason.
-- **0-RTT**: the token is written into early data like any other stream. If the
-  server rejects early data (e.g. its session store restart), QUIC discards it with
-  the rest of 0-RTT; the client observes `accepted=false` and re-sends the token on
-  the established connection within one RTT — no auth timeout, no extra handshake.
+- **0-RTT**: the token is sent at 1-RTT only, after the handshake completes and
+  the connection is proven alive — never in early data. A bearer secret in
+  replayable early data would let anyone observing one handshake open new
+  authenticated connections by replaying it inside the ticket window
+  (rustls single-use tickets narrow that window but cannot close it: a replay
+  that arrives first wins). Resumption still saves a full handshake; only the
+  token waits for the non-replayable 1-RTT keys, at the cost of one RTT before
+  the server admits flows on a resumed connection.
 - Token length is capped at 256 B; empty on both sides disables the feature.
 
 ### Versioning
@@ -391,8 +409,9 @@ config sets `true` for LAN testing — turn it off on public exit nodes.
 **Replay.** 0-RTT early data is theoretically replayable; rustls's stateful,
 single-use session tickets bound it. The worst case is a duplicated outbound dial or
 UDP datagram (no traffic amplification). TCP application bytes ride the 1-RTT keys
-established by the handshake, so replay cannot duplicate an application request;
-only the auth token in early data is exposed to the theoretical replay window.
+established by the handshake, so replay cannot duplicate an application request.
+The auth token never enters early data at all (it is sent at 1-RTT only), so it is
+not exposed to even the theoretical replay window.
 
 **Denial-of-service bounds.** See [Resource Limits & Tuning](#resource-limits--tuning):
 connection/session caps, process-wide TCP dial and per-connection stream limits, DNS
@@ -400,11 +419,17 @@ slow-path limiter, bounded detached UDP sends, and a single 5 s deadline for
 unauthenticated connections (auth stream accept + token read share one budget).
 
 **What is *not* protected.** SOCKS5 ingress is no-auth (RFC 1929 is intentionally not
-implemented). The UDP relay accepts datagrams only from the SOCKS control
-connection's source IP, but not its port (RFC 1928 clients legitimately use a
-different socket), so a process on the same host can still race for the relay —
-run it on a trusted host / bind `socks_listen` to localhost when exposing UDP.
-UDP replies are not further source-validated (roadmap item).
+implemented). The UDP relay pins the app's source IP to the SOCKS control
+connection's peer and then locks the full `(ip, port)` on the first datagram: a
+legitimate client uses one UDP socket per association, so a changed source is
+treated as a hijack attempt and ignored. Run it on a trusted host / bind
+`socks_listen` to localhost when exposing UDP all the same — the lock cannot
+distinguish a NAT rebinding from an attacker, so a rebound client must re-associate.
+Server-side, every target reply is checked against the session's recently-sent
+destinations (an 8-entry allowlist per session) and dropped as `REFUSED` otherwise,
+so a forged reply to a discovered session port is not forwarded; sessions serving
+more than 8 concurrent distinct targets re-learn evicted ones on their next
+outbound datagram.
 
 ---
 
@@ -500,6 +525,7 @@ before every run):
 | 50 | Pass 26 — TCP/UDP echo hot-path audit. `cargo test --all-targets` **98/98** (53 lib + 28 client + 17 server; **97/97** with `--no-default-features`), clippy `-D warnings` + `cargo fmt --check` clean on both feature sets. Five fixes, one of them a silent-corruption defect: an abnormal pump end was announced to the *peer* as a clean FIN (`Drop for quinn::SendStream` calls `finish()`), so a truncated download looked complete one hop out; the pump now borrows its stream halves and resets/stops the abandoned one, gated on that direction's own completion. New regression tests: `abnormal_pump_end_resets_the_peer_stream_instead_of_finishing` (falsified against the old code — it panics with `the peer saw a clean FIN on an abandoned stream`), `a_partial_past_the_payload_cap_is_discarded_whole`, `coarse_millis_advances_without_traffic`, `the_coarse_epoch_is_rearmed_after_its_runtime_ends` and `too_large_refreshes_the_budget_without_discarding_the_handle`. Also: `TooLarge` no longer counted/logged as an egress loss nor allowed to flush the process-wide egress cache; the server's `fast_sock` is `Weak` (it was a second strong owner that outlived a swept session); the reassembler's documented per-partial `MQP_FRAG_MAX_PAYLOAD` cap is enforced (64 maximum-size fragments previously assembled ~91 KiB); per-datagram `mono_millis()` on three hot paths and per-*dropped*-datagram in the warn limiter replaced by `coarse_millis()`, a lazily armed 1 Hz epoch that advances with wall time (a count-based sampler freezes on trickle flows, which is why the earlier attempt was reverted) and re-arms itself if its runtime dies. Native-binary E2E (macOS loopback, the repo's `hotpath_bench`): `tcpecho` 64 KiB + 1 MiB byte-for-byte 0 mismatched; `udpsweep` 8/1200/1420/1430/2000/8000 B × 40 **6/6 verbatim**; `udpmulti` 16 × 400 = **6400/6400, 0.000 % loss** at 23 381 pps; `udpdomainswitch`/`udpipswitch` 100+100+100+100 **0 misrouted**; `bulk` 256 MiB at 105 MB/s; a 30 s mixed loop over ~30 epoch ticks with 0 failures. The session's only abort warning is the intentionally-truncated `bulk` flow, and the server's mirror line (`sending stopped by peer: error 4`) is the new propagation arriving; 0 UDP drops, 0 reassembly losses, `unknown_sess = 0`. `dist/` **was** rebuilt from this revision for all four CPU levels (static musl, x86-64, default features; clients 4 419 928–4 441 928 B, servers 4 345 120–4 373 048 B, +11 928–13 336 / +10 544–11 440 B per level vs pass 25) but, unlike every earlier pass that touched `dist/`, **no check of any kind was run on those bytes** — no `file`, no `objdump`, no reproducibility rebuild, no emulated or native run of the shipped pair; they are compiled, not tested | ⚠️ |
 | 51 | Pass 27 — hot-path review fixes. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Three changes, all on the relay hot paths: the connection pin is written back from a DNS-cache hit (pinned by the new `dns_hit_arms_the_pin_when_pin_and_memo_miss`); the c2s pump double-buffers its 32 KiB copy buffer so a frozen half gets one extra cycle to be ACK-released before its capacity is needed again; fragment reassembly stores `parent.slice(..)` instead of copying every chunk, guarded by an O(1) pointer suffix check with a copy fallback. `dist/` rebuilt for all four CPU levels (servers 4 348 224–4 375 064 B, clients 4 421 240–4 444 584 B; `file` confirms static musl + stripped, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). No native E2E or benchmark re-run: wire-compatible throughout, and the removed work is nanoseconds against this host's ~350 µs loopback datagram (same caveat as passes 13 and 15) | ✅ |
 | 52 | Pass 28 — bounded stream-head writes, refused-datagram accounting, SOCKS header size. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two review rounds confirmed four findings before any edit; two were dispositioned as non-issues (an unreachable fragment-branch, and malformed-frame drops staying uncounted per pass 26's documented decision). Changes: client MQP-2 stream-head write and server TCP-open ACK write each under a 5 s `timeout` (failure resets/tears the flow down before the optimistic SOCKS success, answering `0x04` on the client); `SOCKS_UDP_HDR_MAX` 22 → 262 (worst-case domain header); new batched `dgram_drops::REFUSED` wired through `bump`/`flush_locals`/`snapshot`/`since`/`lost()`, bumped at five policy-refusal sites (server negative cache, both SSRF arms, `sess == 0` — reclassified off `SESSION_FULL` — and the client's domain-reply refusals) and printed in both 60 s `udp budget` lines; `every_drop_counter_has_its_own_snapshot_field` extended to all seven counters (`lost() >= 7`). `dist/` rebuilt for all four CPU levels (servers 4 344 544–4 373 480 B, clients 4 379 536–4 403 000 B; `file` confirms static musl + stripped on all eight, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). Client levels come out 38 824–42 224 B *smaller* than the pass-27 recorded figures and server levels −3 680…+1 424 B, a code-size move this pass's additions do not by themselves explain — the recipe and feature set are unchanged, `Cargo.lock` is untouched, and the pre-rebuild `dist/` files already sat at ~4.39/4.36 MB rather than the pass-27 recorded sizes. No native E2E or benchmark re-run: wire-compatible throughout (timeout paths and counters only) | ✅ |
+| 53 | Pass 29 — replay-safe auth, reply-source validation, DNS parity, truncation counting, session fairness. `cargo test --all-targets` **102/102** (53 lib + 28 client + 21 server; **101/101** with `--no-default-features`: 52 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review (round two tasked to falsify; three candidates rejected): token sent at 1-RTT only, per-session reply allowlist, per-association app lock, full-set DNS fallback on the UDP fast path, `TOO_LARGE` on relay truncations, live fair-share session gate. New regression tests: `reply_allowlist_accepts_only_recorded_destinations`, `resolve_pin_withholds_a_filtered_cached_address`, `fair_share_splits_the_global_budget_across_live_connections`. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -553,7 +579,7 @@ Representative reconnect trace (client log after `kill -9` of the server):
 07:26:52.871 WARN QUIC close reason: timed out
 07:26:53.174 INFO QUIC connected to 127.0.0.1:8443         (server restarted at :40)
 07:26:53.175 DEBUG QUIC resumption: 0-RTT keys accepted=false  (stale ticket)
-07:26:53.176 server INFO new QUIC conn                     (token re-sent, auth passed)
+07:26:53.176 server INFO new QUIC conn                     (token sent at 1-RTT, auth passed)
 07:26:55     TCP echo OK / UDP echo OK
 ```
 
@@ -630,13 +656,26 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 28's 5 s stream-head write deadlines, the
-`SOCKS_UDP_HDR_MAX` domain-header fix, and the `REFUSED` policy-refusal counter and its
-five bump sites, on top of everything pass 27 shipped) with the
-default feature set, so the relay counters are **on** in these builds: static musl,
-x86-64, stripped, 4 344 544–4 373 480 B (servers: v1 4 359 840, v2 4 344 544,
-v3 4 373 480, v4 4 370 472) and 4 379 536–4 403 000 B (clients: v1 4 393 760,
-v2 4 379 536, v3 4 403 000, v4 4 395 048) each. Against the pass-27 *recorded* figures
+rebuilt from the current revision (pass 29's 1-RTT-only token, the reply-source
+allowlist, the app-address lock, the full-set DNS fallback, `TOO_LARGE` on relay
+truncations and the fair-share session gate, on top of everything pass 28 shipped)
+with the default feature set, so the relay counters are **on** in these builds:
+static musl, x86-64, stripped, 4 353 680–4 382 680 B (servers: v1 4 373 072,
+v2 4 353 680, v3 4 382 680, v4 4 379 288) and 4 378 056–4 401 504 B (clients:
+v1 4 392 280, v2 4 378 056, v3 4 401 504, v4 4 393 616) each. Against the pass-28
+*recorded* figures that is **+8 816…+13 232 B** per server level (allowlist, fair
+share, DNS fallback) and **−1 432…−1 496 B** per client level (the removed
+early-auth path outweighs the app lock and the truncation counter) — the direction
+each side's changes predict. A second four-level build came out byte-identical
+(`sha256` equal for all eight files). `file` confirms ELF 64-bit LSB x86-64,
+statically linked, stripped on all eight, and `objdump -d` finds 283 `zmm` refs in
+the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
+3 978 → 25 433/26 843 from v1 to v3), so each `target-cpu` level really is compiled
+in. What was **not** repeated is any emulated or native run of the shipped pairs —
+the verification below applies to the native release build, and a target that needs
+a loadable binary should be validated on the target. The pass-28 rebuild note it
+replaces is kept verbatim below (its "this pass" means pass 28). Against the pass-27
+*recorded* figures,
 the servers move −3 680…+1 424 B per level and the clients **−38 824…−42 224 B**; the
 client shrink is larger than this pass's additions can account for, the recipe and
 feature set are unchanged, `Cargo.lock` is untouched, and the pre-rebuild `dist/` files
@@ -846,11 +885,13 @@ the default filter is `info`.
   talking to the genuine server — it does **not** authenticate clients.
 - **Client identity (`auth_token`)**: the server has no client certs, so a
   non-empty `auth_token` is required to keep it from being an open relay. The
-  client opens a one-way uni stream immediately after the handshake and writes
-  the shared secret; the server refuses all streams and datagrams until it
+  client opens a one-way uni stream once the handshake completes and writes
+  the shared secret at 1-RTT (deliberately never in 0-RTT early data, which is
+  replayable — see above); the server refuses all streams and datagrams until it
   matches, then closes unauthorized connections. Set the same value in both
   configs. Empty token = feature disabled → only expose the port behind a
-  firewall. On 0-RTT rejection the client re-sends the token automatically.
+  firewall. A server restart falls back to a full handshake automatically, and the
+  client authenticates on it in the same way.
 - **Server** auto-generates the cert on first run: SAN = `server_name`,
   validity **500 years backdated 7 days**. The backdating is deliberate: routers
   without a battery clock (NTP not yet synced at boot) would otherwise fail with
@@ -863,8 +904,8 @@ the default filter is `info`.
   on both sides).
 - **0-RTT replay note**: early data can theoretically replay; worst case is a
   duplicated outbound dial (no amplification). Tickets live in memory on both ends —
-  either side restarting falls back to a 1-RTT full handshake automatically, and the
-  client re-authenticates in that case.
+  either side restarting falls back to a 1-RTT full handshake automatically. The
+  auth token is unaffected by all of this: it is only ever sent under 1-RTT keys.
 
 ---
 
@@ -879,7 +920,7 @@ All limits are constants in the sources; the table shows where to change them.
 | TLS session store (server, 0-RTT/resumption) | 8192 sessions | `server_tls_config` |
 | UDP sessions, process-wide | 8192 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
 | UDP session socket buffers | 512 KB send + 512 KB receive per session | `udp_socket_dual_small` |
-| UDP sessions per connection | 4096 (O(n) sweep above) | `LOCAL_SESS_MAX` |
+| UDP sessions per connection | 4096, subdivided by the live fair share `clamp(8192/active_conns, 256, 4096)` (new sessions refused past it with `SESSION_FULL`) | `LOCAL_SESS_MAX`, `fair_sess_cap()` |
 | Concurrent TCP dials, process-wide | 4096, 2 s permit wait (released after connect) | `dial_limiter` |
 | Concurrent bidi streams per connection | 1024 | `build_transport` |
 | Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset) | `MAX_STREAM_TASKS` |
@@ -923,7 +964,7 @@ Against RFC 1928 / RFC 1929:
 | Username/password (`0x02`) | ❌ intentionally absent |
 | `BIND` | ❌ replies `0x07` (FTP active mode; obsolete in practice) |
 | Error REPs (`0x01/0x04/0x05`…) | ⚠️ success is replied optimistically; a failed remote dial closes the TCP flow (the app reconnects) instead of returning `0x04`. A missing QUIC connection still fails the flow fast |
-| UDP source validation | ⚠️ relay learns the app address from the first packet; fine behind NAT/home use, tighten before public exposure |
+| UDP source validation | ✅ relay locks the app to the first `(ip, port)` seen (a changed source is dropped as a hijack attempt); server-side replies must come from a recently-sent destination (8-entry per-session allowlist, else `REFUSED`). A NAT-rebound client must re-associate |
 | Association lifetime | ⚠️ idle UDP associations are reaped after 180 s to bound sockets/tasks (RFC has no fixed lifetime) |
 
 ---
@@ -940,16 +981,17 @@ Against RFC 1928 / RFC 1929:
 - **Long outage / server restart**: ~15–20 s silent-path detection (15 s QUIC idle
   timeout, backed up by a `max(4×keepalive, 20 s)` no-inbound-traffic watchdog) →
   exponential redial (200 ms → 5 s, jittered). The backoff only decays after 5 s of
-  stable connectivity, so a misconfigured peer (e.g. wrong token) cannot cause a
-  redial storm. A stale 0-RTT ticket is rejected once and the token is re-sent on the
-  established connection (verified: server `kill -9` → reconnect → TCP+UDP ECHO pass).
+   stable connectivity, so a misconfigured peer (e.g. wrong token) cannot cause a
+   redial storm. A stale 0-RTT ticket is rejected once and the redial authenticates
+   on the established connection like any other dial (verified: server `kill -9` →
+   reconnect → TCP+UDP ECHO pass).
 - **A dial is not accepted until the connection is proven alive** (pass 7, reworked in
   pass 8, ported back to 0.11 in pass 10). quinn-0.11's `Connecting` future resolved `Ok`
   even for a connection that terminated instead of handshaking, so the 0-RTT path gates
-  on the `ZeroRttAccepted` future (true = early data kept; false = rejected or died)
-  plus `close_reason()`: a timeout or a closed connection fails the dial, a live
-  connection with rejected early data re-sends the token at 1-RTT, so a dead dial cannot
-  be published; `dial_once` bounds each attempt with `DIAL_ATTEMPT_TIMEOUT` (5 s)
+   on the `ZeroRttAccepted` future (true = early data kept; false = rejected or died)
+   plus `close_reason()`: a timeout or a closed connection fails the dial, a live
+   connection with rejected early data proceeds to 1-RTT auth all the same, so a dead
+   dial cannot be published; `dial_once` bounds each attempt with `DIAL_ATTEMPT_TIMEOUT` (5 s)
   instead of QUIC's ~15 s Initial-retransmission budget — so the first attempt after a
   restart succeeds instead of waiting out the previous one's timeout. Measured:
   server `kill -9` → detection ≈ 20 s → reconnect ≈ 0.3–0.4 s after the server is back
@@ -2923,6 +2965,96 @@ run of the shipped pairs was performed — the verification above applies to the
 release build, and a target that needs a loadable binary should be validated on the
 target.
 
+### 2026-09 hardening pass 29 — replay-safe auth, reply-source validation, DNS parity, truncation counting, and session fairness
+
+A two-round code review (the second round tasked to falsify each candidate; three
+were rejected as non-issues) confirmed six findings, all fixed here with no wire
+change — no frame, framing, ALPN or protocol-field change, so mixed old/new pairs
+keep working and the token's uni-stream format is byte-identical, only later.
+
+**1. The token rode 0-RTT early data.** A bearer secret in replayable early data
+lets anyone observing one handshake open new authenticated connections by replaying
+it inside the ticket window; rustls single-use tickets narrow that window but cannot
+close it (a replay that arrives first wins). `dial_once` no longer writes the token
+before the handshake decision: it awaits `ZeroRttAccepted` plus the liveness gate
+exactly as before, then sends the token once under the 1-RTT keys, which are never
+replayable. Resumption still saves the full handshake; only the token waits one RTT
+on a resumed connection. The server is untouched (`accept_uni` + 5 s budget accept
+a 1-RTT token exactly as they accepted an early one), and the `zero_rtt_probe`
+expectations are unchanged apart from the token timing.
+
+**2. Target replies were accepted from any source.** Each session socket is
+unconnected (`[::]:0`, one session legally serving many targets), so `recv_from`
+accepted packets from anyone reaching the ephemeral port and forwarded them as the
+target's answer — DNS spoofing and forged media for whoever discovers the port.
+`SessEntry` now carries a `recent` allowlist (an 8-entry ring of normalized
+destinations actually sent to); every outbound send records (the three
+`forward_server_dgram` sites directly, the two fast-path sites behind a
+task-local `(sess, dst)` change check so steady flows pay no table lock after the
+first datagram), and `sess_reader_task` drops anything unlisted as `REFUSED` —
+fail-closed including the empty list, since no legitimate reply can precede the
+session's first send. Eight covers the multi-target session tests with room;
+a session concurrently serving more distinct targets re-learns evicted ones on its
+next outbound datagram. Pinned by `reply_allowlist_accepts_only_recorded_destinations`.
+
+**3. The relay pinned only the app IP.** `expected_app_ip` plus a first-packet
+`published_app` update meant any socket on the same host (same IP, another port)
+could take over the association and steal its replies. The association now locks
+the full `(ip, port)` on the first datagram; a changed source is dropped as a
+hijack attempt instead of published. Cost: a NAT-rebound client must re-associate
+(the lock cannot tell a rebinding from an attacker).
+
+**4. The UDP DNS fast path served only the first address.** `lookup_cached_fast`
+(and the session/connection memos built on it) return the first cached address,
+while TCP resolves the full set and tries every candidate — so a name whose first
+address is SSRF-filtered killed UDP with `REFUSED` where TCP would have dialled
+the second address fine. `resolve_pin` now takes `allow_private` and withholds a
+filtered hit (memo or cache) without pinning it, falling through to
+`forward_server_dgram`, which scans the full cached set for the first allowed
+address before refusing. The resolver task's all-private and unresolvable arms,
+previously bare `return`s, now bump `REFUSED` too. Pinned by
+`resolve_pin_withholds_a_filtered_cached_address`.
+
+**5. Relay-buffer truncations were warned but never counted.** Both `n == buf.len()`
+arms (client association buffer, server session buffer) logged and `continue`d with
+no counter, contradicting the "every dropped datagram is counted" contract. Both
+now bump `TOO_LARGE` (the payload is past the protocol cap by construction) in
+addition to the warning. The server arm already did; the client arm is new.
+
+**6. One connection could starve the process-wide session budget.** `LOCAL_SESS_MAX`
+(4096) with `MAX_SESSIONS_GLOBAL` (8192) means two full connections fill the global
+pool and every later connection's sessions fail — a single busy or malicious client
+denies the rest. `handle_conn` now counts live connections (`ActiveConnGuard`) and
+`fair_sess_cap()` gives each connection `clamp(8192/active, 256, 4096)`; creation
+past the live share reaps only its own expired sessions first and then refuses with
+`SESSION_FULL`, and the over-cap shard sweep converges toward the live share
+instead of only the static maximum. The global semaphore still caps the true total;
+existing live sessions are never reaped for fairness, only new growth is gated.
+
+Verification: `cargo test --all-targets` **102/102** (53 lib + 28 client + 21 server)
+and **101/101** with `--no-default-features` (52 + 28 + 21);
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both
+feature sets. No native E2E or benchmark re-run: success-path data-plane movement is
+one task-local compare per fast-path packet (plus a table read only when the
+destination changes), one mutex probe per reply, and creation-path-only gates — no
+success-path decision moved, so the wire is unchanged and the suite plus the two
+review rounds are the applicable evidence (same rationale as passes 15–22).
+
+`dist/`: **rebuilt from this revision and statically checked.** All four CPU levels
+were cross-compiled with the documented `cargo zigbuild` recipe (static musl,
+x86-64, default feature set) and copied into `dist/openwrt-x86_64/`: servers
+4 373 072 / 4 353 680 / 4 382 680 / 4 379 288 B (v1–v4), clients 4 392 280 /
+4 378 056 / 4 401 504 / 4 393 616 B — i.e. +8 816…+13 232 B per server level and
+−1 432…−1 496 B per client level against the pass-28 recorded figures, the direction
+each side's changes predict. A second four-level build came out byte-identical
+(`sha256` equal for all eight files). `file` confirms ELF 64-bit LSB x86-64,
+statically linked, stripped on all eight; `objdump -d` finds 283 `zmm` refs in the
+v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
+3 978 → 25 433/26 843 from v1 to v3), so each `target-cpu` level really is compiled
+in. No emulated or native run of the shipped pairs was performed — the verification
+above applies to the native release build, and a target that needs a loadable binary
+should be validated on the target.
+
 ---
 
 ## Roadmap
@@ -2931,7 +3063,8 @@ target.
 - [x] Process-wide connection/session caps + receive-window bound
 - [x] 0-RTT-safe authentication and corrected reconnect/backoff behaviour
 - [ ] Mutual TLS as an alternative to the shared token
-- [ ] SOCKS error REPs + UDP source validation (strict-compliance mode)
+- [x] UDP source validation: per-association app `(ip, port)` lock on the client and a per-session reply allowlist on the server (pass 29; dropped replies count as `REFUSED`)
+- [ ] SOCKS error REPs in strict-compliance mode (success is still answered optimistically; a failed dial closes the flow)
 - [ ] Ticket-key persistence for 0-RTT across server restarts
 - [ ] Per-stream metrics endpoint (Prometheus) — BBR state, GSO batch size, sess table
 - [ ] `procd` init script for OpenWrt
