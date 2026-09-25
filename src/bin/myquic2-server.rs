@@ -64,10 +64,12 @@ struct RecentAddrs {
 }
 
 /// How many distinct destinations one session remembers for reply validation.
-/// 8 covers the multi-target session tests (2 alternating targets) with room;
+/// 16 covers the multi-target session tests (2 alternating targets) with room;
 /// a session talking to more distinct targets concurrently re-learns evicted
-/// ones on its next outbound datagram.
-const RECENT_DST_CAP: usize = 8;
+/// ones on its next outbound datagram. It was 8, which a session alternating
+/// over more than 8 targets could outrun: a reply from an evicted target was
+/// dropped as `REFUSED` until the session sent there again.
+const RECENT_DST_CAP: usize = 16;
 
 impl RecentAddrs {
     fn push(&mut self, dst: SocketAddr) {
@@ -416,13 +418,17 @@ const SESS_IDLE_MS: u64 = 180_000;
 /// Process-wide cap on concurrent TCP dials. Per-connection caps alone cannot
 /// bound fd usage when an unauthenticated peer can open many connections.
 const MAX_DIALS_GLOBAL: usize = 4096;
-/// Wall-clock budget for the post-handshake token exchange (accept the uni
-/// stream and read the token). `Incoming::accept()` is synchronous, so the
-/// handshake itself is bounded separately by [`HANDSHAKE_TIMEOUT`]; together
-/// they cap how long an unauthenticated peer can hold a connection permit.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Budget for completing the QUIC handshake after `Incoming::accept()` before
-/// the connection permit is reclaimed (0-RTT connections skip this wait).
+/// Wall-clock budget for the *whole* pre-auth phase of a connection that holds
+/// one of the [`MAX_UNAUTH_CONNECTIONS`] slots: the post-accept handshake wait
+/// and the token exchange share one deadline. They used to be independent
+/// (`HANDSHAKE_TIMEOUT` and then `AUTH_TIMEOUT`), so 256 slow peers could hold
+/// every pre-auth slot — and the receive-window memory behind each — for 15 s
+/// back to back; one deadline makes the same wave cost 5 s. That covers a
+/// 140 ms-RTT handshake plus the 1-RTT token with margin.
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for completing the QUIC handshake when **no** pre-auth slot is held
+/// (`auth_token` unset, so there is no memory budget to defend). With
+/// authentication enabled, [`PRE_AUTH_TIMEOUT`] bounds the handshake instead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn session_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -460,9 +466,10 @@ fn fair_sess_cap() -> usize {
 /// `get_or_create_sess`: at most one sweep per second across all workers and
 /// connections. Per-worker thread-local throttles let W workers run W sweeps
 /// per second (each O(sessions)) under a forged-session flood. A refused sweep
-/// still refuses the session (counted `SESSION_FULL`); the reap is deferred at
-/// most 1 s, and any sweep benefits every connection since all of them reap
-/// only expired sessions.
+/// still refuses the session, counted against the gate that refused it
+/// (`FAIR_SHARE` for the per-connection share, `SESSION_FULL` for the global
+/// pool); the reap is deferred at most 1 s, and any sweep benefits every
+/// connection since all of them reap only expired sessions.
 static FAIR_SWEEP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Claim the global sweep window for `now_ms`. Exactly one contender wins per
@@ -504,11 +511,15 @@ fn stream_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 /// configured shared secret before any other traffic. Empty = disabled.
 const AUTH_MAX_BYTES: usize = 256;
 
-async fn authenticate(conn: &quinn::Connection, expected: &[u8]) -> Result<()> {
+async fn authenticate(
+    conn: &quinn::Connection,
+    expected: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     if expected.is_empty() {
         return Ok(());
     }
-    let got = tokio::time::timeout(AUTH_TIMEOUT, async {
+    let got = tokio::time::timeout_at(deadline, async {
         let mut uni = conn.accept_uni().await?;
         uni.read_to_end(AUTH_MAX_BYTES)
             .await
@@ -702,6 +713,15 @@ async fn main() -> Result<()> {
         };
         let allow_private = c.allow_private;
         let auth_token = auth_token.clone();
+        // One deadline for the whole pre-auth phase while a slot is held (see
+        // `PRE_AUTH_TIMEOUT`); without a token there is no slot to free and the
+        // more generous handshake budget applies.
+        let handshake_budget = if pending.is_some() {
+            PRE_AUTH_TIMEOUT
+        } else {
+            HANDSHAKE_TIMEOUT
+        };
+        let deadline = tokio::time::Instant::now() + handshake_budget;
         // Accept + handshake per connection: never await a handshake inline, or
         // one slow/malicious client stalls every other new connection.
         tokio::spawn(async move {
@@ -717,39 +737,36 @@ async fn main() -> Result<()> {
                         // A dead client resolves false via the channel close,
                         // and the timeout backstops a stall; either way the
                         // close_reason check keeps a dead handle out.
-                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepted_fut).await {
+                        match tokio::time::timeout_at(deadline, accepted_fut).await {
                             Ok(_) if c.close_reason().is_none() => c,
                             Ok(_) => {
                                 warn!("client handshake failed: {:?}", c.close_reason());
                                 return;
                             }
                             Err(_) => {
-                                warn!("handshake timed out after {HANDSHAKE_TIMEOUT:?}");
+                                warn!("handshake timed out after {handshake_budget:?}");
                                 return;
                             }
                         }
                     }
-                    Err(connecting) => {
-                        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
-                        match tokio::time::timeout_at(deadline, connecting).await {
-                            Ok(Ok(c)) => c,
-                            Ok(Err(e)) => {
-                                warn!("accept err: {e:#}");
-                                return;
-                            }
-                            Err(_) => {
-                                warn!("handshake timed out after {HANDSHAKE_TIMEOUT:?}");
-                                return;
-                            }
+                    Err(connecting) => match tokio::time::timeout_at(deadline, connecting).await {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
+                            warn!("accept err: {e:#}");
+                            return;
                         }
-                    }
+                        Err(_) => {
+                            warn!("handshake timed out after {handshake_budget:?}");
+                            return;
+                        }
+                    },
                 },
                 Err(e) => {
                     warn!("accept err: {e:#}");
                     return;
                 }
             };
-            if let Err(e) = authenticate(&conn, &auth_token).await {
+            if let Err(e) = authenticate(&conn, &auth_token, deadline).await {
                 warn!("auth failed from {}: {e:#}", conn.remote_address());
                 conn.close(0x01u32.into(), b"unauthorized");
                 return;
@@ -815,11 +832,17 @@ fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             // The budget paths only: `too_large`/`buffer_full` have their own
             // rate-limited per-packet warning and would double-report here.
-            if dd.session_full > 0 || dd.dns_inflight > 0 || dd.dns_contention > 0 || dd.refused > 0
+            if dd.session_full > 0
+                || dd.fair_share > 0
+                || dd.dns_inflight > 0
+                || dd.dns_contention > 0
+                || dd.refused > 0
             {
                 info!(
-                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} refused (policy); totals too_large={} buffer_full={} session_full={} dns_inflight={} dns_contention={} refused={}",
-                    dd.session_full, dd.dns_inflight, dd.dns_contention, dd.refused, now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.dns_inflight, now_d.dns_contention, now_d.refused
+                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (connection fair share), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} refused (policy); totals too_large={} buffer_full={} session_full={} fair_share={} dns_inflight={} dns_contention={} refused={}",
+                    dd.session_full, dd.fair_share, dd.dns_inflight, dd.dns_contention, dd.refused,
+                    now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.fair_share,
+                    now_d.dns_inflight, now_d.dns_contention, now_d.refused
                 );
             }
             prev_d = now_d;
@@ -2312,11 +2335,11 @@ async fn get_or_create_sess(
             let n2 = ss.len();
             ss.store_len(n2, now2);
             if n2 >= fair_cap {
-                dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                dgram_drops::bump(&dgram_drops::FAIR_SHARE);
                 return None;
             }
         } else {
-            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+            dgram_drops::bump(&dgram_drops::FAIR_SHARE);
             return None;
         }
     }

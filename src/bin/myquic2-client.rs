@@ -1098,7 +1098,7 @@ async fn main() -> Result<()> {
     // payload's fragments all travel on the connection that carried them.
     // Each connection carries its own class: the interactive ports and the UDP
     // associations have connections no bulk flow can queue on.
-    let keep_alive_secs = c.keep_alive_secs.clamp(1, 3600);
+    let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
     let watchdog_silence = Duration::from_secs(keep_alive_secs.saturating_mul(4).max(20));
     for i in 0..pool.slots_total() {
         spawn_dispatcher(pool.slot(i), hub.clone());
@@ -1604,6 +1604,13 @@ async fn dial_once(
     auth_token: &str,
 ) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
+    // One deadline for the whole attempt, the auth stages included. The stages
+    // used to carry independent 5 s budgets, so a handshake that consumed its
+    // own 5 s and then stalled in `send_auth` (5 s open + 5 s write) held the
+    // slot for up to 15 s — contradicting this constant's documented promise
+    // and widening the window in which the pool still advertises the previous,
+    // dead connection. Every stage below now shares this instant.
+    let deadline = t0 + DIAL_ATTEMPT_TIMEOUT;
     let connecting = ep.connect(server, name)?;
     // 0-RTT: the token is deliberately NOT sent in early data. A bearer
     // secret in replayable early data lets anyone who observes one handshake
@@ -1623,7 +1630,7 @@ async fn dial_once(
     let conn = match connecting.into_0rtt() {
         Ok((conn, accepted_fut)) => {
             let token = auth_token.to_owned();
-            let accepted = match tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, accepted_fut).await {
+            let accepted = match tokio::time::timeout_at(deadline, accepted_fut).await {
                 Ok(a) => a,
                 Err(_) => anyhow::bail!("0-RTT offered but the handshake did not complete"),
             };
@@ -1635,12 +1642,12 @@ async fn dial_once(
             // handshake, so a captured token can never be replayed into a new
             // connection the way captured early data could.
             if !token.is_empty() {
-                send_auth(&conn, &token).await?;
+                send_auth(&conn, &token, deadline).await?;
             }
             conn
         }
         Err(connecting) => {
-            let conn = match tokio::time::timeout(DIAL_ATTEMPT_TIMEOUT, connecting).await {
+            let conn = match tokio::time::timeout_at(deadline, connecting).await {
                 Ok(r) => r?,
                 Err(_) => anyhow::bail!("handshake timed out after {DIAL_ATTEMPT_TIMEOUT:?}"),
             };
@@ -1649,7 +1656,7 @@ async fn dial_once(
             }
             info!("QUIC full handshake in {:?}", t0.elapsed());
             if !auth_token.is_empty() {
-                send_auth(&conn, auth_token).await?;
+                send_auth(&conn, auth_token, deadline).await?;
             }
             conn
         }
@@ -1660,23 +1667,29 @@ async fn dial_once(
     Ok(conn)
 }
 
-/// Open a uni stream and write the auth token into it (early data on 0-RTT).
+/// Open a uni stream and write the auth token into it (1-RTT only).
 ///
 /// Rejection is learned via the `ZeroRttAccepted` future, not from this handle.
-async fn send_auth_stream(conn: &quinn::Connection, token: &str) -> Result<quinn::SendStream> {
-    let mut uni = tokio::time::timeout(Duration::from_secs(5), conn.open_uni())
+/// `deadline` is the dial attempt's shared deadline: both stages time out
+/// against it, so auth can never extend an attempt beyond
+/// [`DIAL_ATTEMPT_TIMEOUT`].
+async fn send_auth_stream(
+    conn: &quinn::Connection,
+    token: &str,
+    deadline: tokio::time::Instant,
+) -> Result<quinn::SendStream> {
+    let mut uni = tokio::time::timeout_at(deadline, conn.open_uni())
         .await
         .context("auth stream open timed out")??;
-    // Bounded like the 5 s stream-head write on the TCP open path: without a
-    // deadline a stalled connection parks the dial attempt here until the QUIC
-    // idle timeout, blowing past DIAL_ATTEMPT_TIMEOUT. On timeout the error
-    // propagates out of `dial_once`, so the attempt fails and nothing is
+    // Bounded by the same attempt deadline: without one a stalled connection
+    // parks the dial attempt here until the QUIC idle timeout. On timeout the
+    // error propagates out of `dial_once`, so the attempt fails and nothing is
     // published. The token is ≤ 256 B (one small write); `finish()` stays
     // best-effort. A failed write must `reset` instead of merely dropping
     // `uni`: dropping sends a graceful FIN bearing whatever prefix of the
     // token got out, which the server reads as a credential mismatch, while
     // `reset` aborts the stream so no partial token is ever framed as final.
-    match tokio::time::timeout(Duration::from_secs(5), uni.write_all(token.as_bytes())).await {
+    match tokio::time::timeout_at(deadline, uni.write_all(token.as_bytes())).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             uni.reset(0u32.into()).ok();
@@ -1691,8 +1704,12 @@ async fn send_auth_stream(conn: &quinn::Connection, token: &str) -> Result<quinn
     Ok(uni)
 }
 
-async fn send_auth(conn: &quinn::Connection, token: &str) -> Result<()> {
-    send_auth_stream(conn, token).await.map(|_| ())
+async fn send_auth(
+    conn: &quinn::Connection,
+    token: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    send_auth_stream(conn, token, deadline).await.map(|_| ())
 }
 
 /// One UDP activity line per minute.
@@ -3926,10 +3943,15 @@ mod tests {
             "the dial attempt budget is unchanged"
         );
 
-        // The small-write happy path still works through the real code.
+        // The small-write happy path still works through the real code, with
+        // the deadline the dial passes in.
         let (conn, _client, _server) = real_connection().await;
-        send_auth_stream(&conn, "t")
-            .await
-            .expect("a small token write succeeds");
+        send_auth_stream(
+            &conn,
+            "t",
+            tokio::time::Instant::now() + DIAL_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .expect("a small token write succeeds");
     }
 }

@@ -188,6 +188,17 @@ datagram — see
 Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
 plus per-level `objdump`), again not run under emulation or natively.
 
+The newest pass is a fix-and-review cycle on seven confirmed findings from a
+three-round audit: a misspelled TOML key is now a hard error (it used to silently
+disable `auth_token`), the client dial and the server's pre-auth phase each got a
+single end-to-end deadline, fragmented payloads feed the relay counters and the
+`high-water payload` line, the reply allowlist holds 16 destinations,
+`keep_alive_secs` is capped at 300 s with a warning, and fair-share session
+refusals are counted apart from the global budget — see
+[pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters).
+Its `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
+for them (rebuilt on request, not tested).
+
 ---
 
 ## Table of Contents
@@ -208,7 +219,7 @@ plus per-level `objdump`), again not run under emulation or natively.
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -468,9 +479,9 @@ treated as a hijack attempt and ignored. Run it on a trusted host / bind
 `socks_listen` to localhost when exposing UDP all the same — the lock cannot
 distinguish a NAT rebinding from an attacker, so a rebound client must re-associate.
 Server-side, every target reply is checked against the session's recently-sent
-destinations (an 8-entry allowlist per session) and dropped as `REFUSED` otherwise,
+destinations (a 16-entry allowlist per session) and dropped as `REFUSED` otherwise,
 so a forged reply to a discovered session port is not forwarded; sessions serving
-more than 8 concurrent distinct targets re-learn evicted ones on their next
+more than 16 concurrent distinct targets re-learn evicted ones on their next
 outbound datagram.
 
 ---
@@ -571,6 +582,7 @@ before every run):
 | 54 | Pass 31 — per-direction stall, symmetric ACK reset, enum warn slots, fail-fast dial. `cargo test --all-targets` **104/104** (55 lib + 28 client + 21 server; **103/103** with `--no-default-features`: 54 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review plus an independent oracle re-verification (5 PASS / 1 FAIL; the FAIL — per-direction stall killing healthy half-idle flows — fixed as an AND gate with the shared stamp and re-verified PASS): per-direction pump stall stamps gated on shared-stamp expiry, server ACK failure resets like dial failures, `warn_datagram_drop` substring slots moved to `DatagramDropKind`, dial-ACK bound-address validation, `wait_conn` trusting `close_reason()` with exponential dispatcher backoff, fail-fast server dial permit with its own counters. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) | ✅ |
 | 55 | Pass 32 — sweep re-check, fair-shard trigger, memo guard, DNS contention, live atomicity, auth timeout, plus ten post-fix residuals. `cargo test --all-targets` **117/117** (60 lib + 30 client + 27 server; **116/116** with `--no-default-features`: 59 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round lock/sweep review (round two tasked to falsify; one finding split, four severities revised down): over-cap sweeper re-tests idleness via `take_idle` plus a stamp-equality `evict_ranked`, the shard trigger follows the live fair share (`shard_sweep_target`) with per-insert eviction bounded at 64, `sess_memo_forget` takes the exiting socket and clears only on `Weak::ptr_eq`, DNS contention gets its own `DNS_CONTENTION` counter with a `try_lock` fail-fast register, the client folds `live=false` into the `rcu` clear (`clear_if_and_mark_dead` with a retry tail), and the auth write is wrapped in the same 5 s timeout as the stream-head write. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) | ✅ |
 | 56 | Pass 33 — DNS negative fail-open and process-wide sweep throttle. `cargo test --all-targets` **118/118** (61 lib + 30 client + 27 server; **117/117** with `--no-default-features`: 60 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two fixes from a two-round review (round two tasked to falsify; two candidates rejected outright, two severities revised down): the positive-cache probe is tri-state (`PositiveState::Fresh/Absent/Unknown`) so a contended shard fails open instead of recording a negative entry that shadowed the live positive answer (and the recording thread's positive memo) for `DNS_NEG_TTL`, pinned by `contended_positive_probe_skips_negative_caching`; the over-cap reap takes at most one process-wide `sweep_all` per second (`claim_fair_sweep`) instead of one per worker per second, and the fair-share gate reads a 1 s cached session count (`len_cached`) instead of 8 shard locks per forged datagram. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) | ✅ |
+| 57 | Pass 34 — spelling-proof config, bounded holds, symmetric counters. `cargo test --all-targets` **121/121** (64 lib + 30 client + 27 server; **119/119** with `--no-default-features`: 62 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Seven fixes from a three-round review of the pass-33 tree (round 1 confirmation; round 2 falsification — twelve of nineteen initial candidates rejected or reduced to informational; round 3 final severity): `ServerConf`/`ClientConf` gained `deny_unknown_fields` and `load_toml` names the file (a misspelled `auth_token` used to silently disable authentication), pinned by `unknown_config_keys_are_rejected`; the client dial shares one `t0 + DIAL_ATTEMPT_TIMEOUT` deadline across the handshake and both auth stages; the server's pre-auth phase shares one `PRE_AUTH_TIMEOUT` (5 s) deadline for handshake+token while a no-token server keeps the 10 s handshake budget; `DgramFragmenter::send` counts `payload()` only after an accepted send and on the fragment path too, pinned through a real connection by `fragmented_send_counts_the_payload_and_the_high_water`; `RECENT_DST_CAP` 8 → 16; `keep_alive_secs` capped at 300 s with a warning on clamp, pinned by `keepalive_clamp_bounds_the_detection_window`; new `dgram_drops::FAIR_SHARE` separates fair-share session refusals from `SESSION_FULL`, and the server's 60 s `udp budget` line prints both. Round 2 falsified three pins by reverting each fix (the three tests fail, then pass again). Native-binary E2E: `tcpecho` 256 KiB byte-for-byte (`0 mismatched`), `udpsweep` 8/1430/8000 B 3/3 verbatim with the fragment path, 5 `new QUIC conn`, both processes report `high-water payload 8000 B` (impossible before this pass), a typo'd config exits `Error: parse …` naming `auth_tokn`, and `keep_alive_secs = 3600` logs the clamp with `watchdog silence_limit=1200s`. `dist/` **rebuilt, not verified** — see [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -701,24 +713,21 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 33's DNS negative-cache fail-open guard and
-the process-wide sweep throttle with cached session count — on top of everything
-pass 32 shipped) with the default feature set, so the
-relay counters are **on** in these builds: static musl, x86-64, stripped — servers
-4 355 688–4 383 920 B (v1 4 374 632, v2 4 355 688, v3 4 383 920, v4 4 381 040) and
-clients 4 378 880–4 402 712 B (v1 4 394 000, v2 4 378 880, v3 4 402 712, v4 4 394 824).
-Against the pass-32 *recorded* figures that is **+128…+448 B** per server level
-and **+0…+64 B** per client level — in line with the additions (a tri-state probe,
-two atomics per session table, one global throttle; the regression test is
-`#[cfg(test)]` and does not ship). The shipped eight come from a single build of
-the final tree (no byte-identical second build of it). `file` confirms ELF 64-bit LSB x86-64,
-statically linked, stripped on all eight, and `objdump -d` finds 283 `zmm` refs in
-the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
-3 978 → 25 395/26 855 from v1 to v3), so each `target-cpu` level really is
-compiled in. What was **not** repeated is any emulated or native run of the shipped
-pairs — the verification below applies to the native release build, and a target that
-needs a loadable binary should be validated on the target. The pass-30 rebuild note is
-kept verbatim below (its figures are pass 30's); pass-28/27/26 follow. Against the pass-27
+rebuilt from the current revision (pass 34 — on top of everything pass 33 shipped)
+with the default feature set, so the relay counters are **on** in these builds:
+static musl, x86-64, stripped — servers 4 371 696–4 395 080 B (v1 4 386 336,
+v2 4 371 696, v3 4 395 080, v4 4 392 392) and clients 4 390 808–4 412 224 B
+(v1 4 405 832, v2 4 390 808, v3 4 412 224, v4 4 404 976). Against the pass-33
+*recorded* figures that is **+9 512…+16 008 B** per level, in line with the
+additions (two `deny_unknown_fields` config types, one more batched counter with its
+snapshot field, the deadline plumbing and the reporter text; the regression tests are
+`#[cfg(test)]` and do not ship). Unlike every earlier pass, **nothing was verified
+for these bytes** — no `file`, no `objdump`, no reproducibility build, no emulation,
+no native run — on explicit instruction: they are compiled, not tested. What *was*
+run is the native release-build E2E recorded under
+[pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters).
+The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
+passes'). Against the pass-27
 *recorded* figures,
 the servers move −3 680…+1 424 B per level and the clients **−38 824…−42 224 B**; the
 client shrink is larger than this pass's additions can account for, the recipe and
@@ -833,7 +842,7 @@ key_file = "server-key.pem"   # Ed25519; a lone missing half is a hard error (ne
 server_name = "test.com"      # SAN for the self-signed cert + expected SNI
 congestion = "bbr"            # bbr | cubic (unknown values warn and fall back to bbr)
 gso = true                    # informational: quinn-udp auto-probes GSO/GRO
-keep_alive_secs = 5           # clamped to 1..3600; idle timeout = max(3x, 15s)
+keep_alive_secs = 5           # clamped to 1..300; idle timeout = max(3x, 15s)
 allow_private = true          # dial RFC1918/loopback targets; default is false!
 auth_token = ""                # shared secret ≤ 256 B; empty = disabled (firewall only).
                                # Set a private random value here and on the client.
@@ -852,7 +861,7 @@ server_name = "test.com"           # SNI; MUST match the cert SAN
 server_cert_file = "server-cert.pem"  # pinned server cert (copied out-of-band)
 congestion = "bbr"
 gso = true
-keep_alive_secs = 5           # clamped to 1..3600; idle = max(3x,15s), watchdog = max(4x,20s)
+keep_alive_secs = 5           # clamped to 1..300; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
 auth_token = ""                     # must match the server (empty on both = disabled)
 # Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, 4 TCP + 1 UDP connection):
@@ -960,11 +969,11 @@ All limits are constants in the sources; the table shows where to change them.
 | Resource | Limit | Where |
 |---|---|---|
 | Concurrent QUIC connections (server) | 4096 (new `Incoming` refused) | `MAX_CONNECTIONS` |
-| Concurrent *unauthenticated* connections | 256 (pre-auth slot, released after token check) | `MAX_UNAUTH_CONNECTIONS` |
+| Concurrent *unauthenticated* connections | 256 (pre-auth slot, released after token check; handshake and token share one 5 s deadline) | `MAX_UNAUTH_CONNECTIONS` |
 | TLS session store (server, 0-RTT/resumption) | 8192 sessions | `server_tls_config` |
 | UDP sessions, process-wide | 8192 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
 | UDP session socket buffers | 256 KB send + 256 KB receive per session | `SESS_SOCKET_BUF` |
-| UDP sessions per connection | live fair share `clamp(8192 / session-holding connections, 256, 4096)` (new sessions refused past it with `SESSION_FULL`) | `LOCAL_SESS_MAX`, `fair_sess_cap()` |
+| UDP sessions per connection | live fair share `clamp(8192 / session-holding connections, 256, 4096)` (new sessions refused past it with `FAIR_SHARE`; the global pool and DNS limiter use `SESSION_FULL`) | `LOCAL_SESS_MAX`, `fair_sess_cap()` |
 | Concurrent TCP dials, process-wide | 4096, 2 s permit wait (released after connect) | `dial_limiter` |
 | Concurrent bidi streams per connection | 1024 | `build_transport` |
 | Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset) | `MAX_STREAM_TASKS` |
@@ -977,8 +986,8 @@ All limits are constants in the sources; the table shows where to change them.
 | Send window | 2 MB/connection default; 8 MB opt-in (`send_window_mb = 8`) | `TransportTuning`, `SEND_WINDOW` |
 | Initial RTT / PMTU ceiling | 190 ms / 1472 B | `build_transport` |
 | DATAGRAM buffers | 1 MB each direction | `build_transport` |
-| Keepalive / idle / watchdog | clamp 1–3600 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
-| Server auth wait | 5 s per connection (one deadline for accept+read) | `authenticate()` |
+| Keepalive / idle / watchdog | clamp 1–300 s; idle `max(3×,15 s)`; watchdog `max(4×,20 s)` | `build_transport`, client |
+| Server auth wait | 5 s per connection (one deadline for handshake+token) | `PRE_AUTH_TIMEOUT` |
 | TCP stream idle reap | 300 s | `copy_tcp_quic_idle` call sites |
 | UDP association idle reap | 180 s (both directions; TCP control activity counts) | server sweeper / client interval |
 | DNS cache | 60 s positive (4096+512 slack), 10 s negative (4096) | `DNS_CACHE_*`, `DNS_NEG_MAX` |
@@ -1008,7 +1017,7 @@ Against RFC 1928 / RFC 1929:
 | Username/password (`0x02`) | ❌ intentionally absent |
 | `BIND` | ❌ replies `0x07` (FTP active mode; obsolete in practice) |
 | Error REPs (`0x01/0x04/0x05`…) | ⚠️ success is replied optimistically; a failed remote dial closes the TCP flow (the app reconnects) instead of returning `0x04`. A missing QUIC connection still fails the flow fast |
-| UDP source validation | ✅ relay locks the app to the first `(ip, port)` seen (a changed source is dropped as a hijack attempt); server-side replies must come from a recently-sent destination (8-entry per-session allowlist, else `REFUSED`). A NAT-rebound client must re-associate |
+| UDP source validation | ✅ relay locks the app to the first `(ip, port)` seen (a changed source is dropped as a hijack attempt); server-side replies must come from a recently-sent destination (16-entry per-session allowlist, else `REFUSED`). A NAT-rebound client must re-associate |
 | Association lifetime | ⚠️ idle UDP associations are reaped after 180 s to bound sockets/tasks (RFC has no fixed lifetime) |
 
 ---
@@ -3460,6 +3469,82 @@ pass-32 recorded figures, in line with the additions. `file` confirms ELF 64-bit
 LSB x86-64, statically linked, stripped on all eight; `objdump -d` finds 283 `zmm`
 refs in the v4 server and 235 in the v4 client with none in v1–v3 (`ymm` 3 978 →
 25 395/26 855 from v1 to v3). No emulated or native run of the shipped pairs.
+
+### 2026-09 hardening pass 34 — spelling-proof config, bounded holds, symmetric counters
+
+Seven fixes from a three-round review of the pass-33 tree (round 1 confirmed each
+finding against the code; round 2 was tasked to falsify, and twelve of the
+nineteen initial candidates were rejected or reduced to informational before any
+fix was written; round 3 fixed the final severity). No frame, framing, ALPN or
+protocol-field change, so mixed old/new pairs keep working.
+
+- **A misspelled config key is now a hard error.** `ServerConf`/`ClientConf` had
+  no `deny_unknown_fields`, so `auth_tokn = "…"` deserialized as the empty
+  `auth_token` default and silently *disabled* client authentication, and a
+  misspelled `allow_private` silently flipped the SSRF policy — with no diagnostic
+  at startup. Both structs now reject unknown keys and `load_toml` names the file
+  in the error. This is a deliberate behaviour change: a config that previously
+  "worked" with a typo now fails to start, naming the field and the accepted ones.
+  Pinned by `unknown_config_keys_are_rejected`.
+- **The dial attempt is bounded end to end.** `DIAL_ATTEMPT_TIMEOUT` (5 s) used to
+  wrap only the handshake, while the auth stages carried independent 5 s budgets
+  (`open_uni` + `write_all`), so one attempt could hold its slot for up to 15 s —
+  exactly the window in which the pool still advertises the previous, dead
+  connection. All stages now share one deadline (`timeout_at`), so an attempt
+  cannot outlive its budget.
+- **The pre-auth hold is one 5 s deadline.** An unauthenticated peer could hold
+  one of the 256 pre-auth slots for `HANDSHAKE_TIMEOUT` (10 s) *and then*
+  `AUTH_TIMEOUT` (5 s) back to back, so every pre-auth wave cost 15 s of slot and
+  receive-window pinning. `PRE_AUTH_TIMEOUT` (5 s) now covers accept→token as a
+  single budget when a slot is held; a server with no token keeps the 10 s
+  handshake budget. Slot release is unchanged (RAII on every exit path).
+- **Fragmented payloads feed the relay counters.** `DgramFragmenter::send`'s
+  fragment branch called only `fragmented()` and never `payload()`, so payloads
+  above one frame — the exact size class `MQP_FRAG_MAX_PAYLOAD` exists for — were
+  invisible in `datagrams`/`bytes`, and the `high-water payload` line (the
+  documented empirical check on the 8 KiB cap) could never exceed one frame. The
+  single-frame path counted *before* the send outcome was known, so size refusals
+  inflated the same numbers. `payload()` now runs only on an accepted send, on both
+  paths. Pinned by `fragmented_send_counts_the_payload_and_the_high_water` through
+  a real connection (verified to fail with the count removed); the E2E below shows
+  both processes reporting `high-water payload 8000 B`.
+- **The reply allowlist holds 16 destinations.** The 8-entry ring could be outrun
+  by one session alternating over more targets, and a reply from an evicted target
+  was dropped as `REFUSED` until the session sent there again; 16 doubles the
+  working set for 256 B/session.
+- **`keep_alive_secs` is capped at 300 s, and a clamp warns.** Idle is `3x` and
+  the client watchdog `4x` the keepalive, so the old 3600 clamp put silent-path
+  detection 3–4 *hours* out — a black hole on a router and a silent contradiction
+  of the documented 15–20 s detection. 300 s bounds the window at 15/20 minutes;
+  larger configured values are clamped **and warned about**. Pinned by
+  `keepalive_clamp_bounds_the_detection_window`.
+- **Fair-share refusals have their own counter.** A connection past its share of
+  the global session budget was counted as `SESSION_FULL` — a counter documented as
+  "the global pool is exhausted" — so "one busy client hit its cap" read as "the
+  host is out of capacity". The new `dgram_drops::FAIR_SHARE` takes the two
+  fair-share refusals; the global semaphore and the DNS slow-path limiter keep
+  `SESSION_FULL`, and the server's 60 s `udp budget` line prints both.
+  `every_drop_counter_has_its_own_snapshot_field` now covers ten fields.
+
+Verification: `cargo test --all-targets` **121/121** (64 lib + 30 client + 27
+server; **119/119** with `--no-default-features`: 62 + 30 + 27), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets.
+Round 2 also falsified three of the new pins by reverting each fix and confirming
+the test fails, then passes again once restored. Native-binary E2E (macOS loopback,
+the repo's own `hotpath_bench`): `tcpecho` 256 KiB byte-for-byte (`0 mismatched`),
+`udpsweep` 8/1430/8000 B **3/3 verified** with the fragment path included, 5 `new
+QUIC conn` (4 TCP + the dedicated UDP slot); a typo'd config exits with
+`Error: parse …` naming `auth_tokn`, and `keep_alive_secs = 3600` logs the clamp
+warning with `watchdog silence_limit=1200s`.
+
+`dist/`: **rebuilt from this revision** for all four CPU levels (static musl,
+x86-64, default feature set, the documented `cargo zigbuild` recipe) — servers
+4 371 696–4 395 080 B (v1 4 386 336, v2 4 371 696, v3 4 395 080, v4 4 392 392) and
+clients 4 390 808–4 412 224 B (v1 4 405 832, v2 4 390 808, v3 4 412 224,
+v4 4 404 976), i.e. **+9 512…+16 008 B per level** against the pass-33 recorded
+figures, in line with the additions. **No verification of any kind was run on these
+bytes** (no `file`, no `objdump`, no reproducibility build, no emulation, no native
+run): they are compiled, not tested.
 
 ---
 

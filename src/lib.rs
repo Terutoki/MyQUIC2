@@ -700,7 +700,14 @@ pub fn decode_fragment(b: &[u8]) -> Result<FragmentRef<'_>> {
 }
 
 // ---------------- Config files ----------------
+/// Unknown keys are a hard error (both config structs). A misspelled
+/// `auth_token` used to deserialize as the empty string via `#[serde(default)]`
+/// and silently *disable* client authentication, and a misspelled
+/// `allow_private` silently flipped the SSRF policy — with no diagnostic at
+/// startup. serde's error names the offending field and lists the accepted
+/// ones, so a typo fails the process instead of changing its security posture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConf {
     pub listen: String,      // e.g. 0.0.0.0:8443
     pub cert_file: String,   // server cert PEM (self-signed)
@@ -740,6 +747,7 @@ pub struct ServerConf {
     pub alpn: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConf {
     pub socks_listen: String,     // e.g. 127.0.0.1:1080
     pub server_addr: String,      // e.g. 127.0.0.1:8443
@@ -933,7 +941,10 @@ impl ClientConf {
 
 pub fn load_toml<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T> {
     let s = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
-    Ok(toml::from_str(&s)?)
+    // The path is in the context: with `deny_unknown_fields` a typo is a hard
+    // error, and "unknown field ... in config-client.toml" is what makes it
+    // actionable without the operator guessing which file was parsed.
+    toml::from_str(&s).with_context(|| format!("parse {path}"))
 }
 
 // ---------------- Self-signed cert (TLS1.3 + AES-128-GCM fastest) ----------------
@@ -1095,6 +1106,29 @@ pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::Tra
     build_transport_tuned(congestion, keep_alive_secs, TransportTuning::default())
 }
 
+/// Upper clamp for `keep_alive_secs`.
+///
+/// The idle timeout is `3 x keepalive` and the client's silence watchdog
+/// `4 x keepalive`, so an unbounded value (the clamp used to be 3600) put
+/// silent-path detection 3-4 *hours* out — a black hole on a router, and a
+/// silent contradiction of the documented ~15-20 s detection. 300 s bounds the
+/// window at 15/20 minutes while leaving every sane NAT keepalive alone; larger
+/// values are clamped **and warned about**, never obeyed silently.
+pub const KEEP_ALIVE_MAX_SECS: u64 = 300;
+
+/// One definition of the keepalive bound, testable without a `TransportConfig`
+/// getter (quinn exposes setters only). Warns on the clamp: it changes how fast
+/// a silent path is noticed, which is what setting the field asks about.
+fn clamp_keep_alive(keep_alive_secs: u64) -> u64 {
+    if keep_alive_secs > KEEP_ALIVE_MAX_SECS {
+        tracing::warn!(
+            "keep_alive_secs {keep_alive_secs} exceeds the {KEEP_ALIVE_MAX_SECS} s cap; \
+             clamped (silent-path detection scales 3-4x with it)"
+        );
+    }
+    keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS)
+}
+
 pub fn build_transport_tuned(
     congestion: &str,
     keep_alive_secs: u64,
@@ -1171,8 +1205,7 @@ pub fn build_transport_tuned(
     let mut mtud = quinn::MtuDiscoveryConfig::default();
     mtud.upper_bound(1472);
     t.mtu_discovery_config(Some(mtud));
-    // Clamp so absurd config values cannot overflow the QUIC VarInt timeout.
-    let keep_alive_secs = keep_alive_secs.clamp(1, 3600);
+    let keep_alive_secs = clamp_keep_alive(keep_alive_secs);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs)));
     // Idle timeout derives from keepalive so custom keep_alive_secs can never
     // self-kill a healthy connection: idle must stay well above the keepalive
@@ -2488,8 +2521,17 @@ pub mod dgram_drops {
     /// Send buffer full: dropped per UDP semantics (quinn `Blocked`).
     pub static BUFFER_FULL: AtomicU64 = AtomicU64::new(0);
     /// Session or DNS slow-path budget exhausted: dropped before a socket or
-    /// lookup was created (UDP semantics, fail-closed under flood).
+    /// lookup was created (UDP semantics, fail-closed under flood). This is the
+    /// *global* pool (or its DNS limiter); a connection that hit only its own
+    /// fair share of the pool is counted in `FAIR_SHARE` instead, so the two
+    /// readings cannot be confused in the 60 s line.
     pub static SESSION_FULL: AtomicU64 = AtomicU64::new(0);
+    /// The connection's own fair share of the session budget was reached while
+    /// the process-wide pool still had room. Split from `SESSION_FULL` because
+    /// the two mean different things to an operator: `SESSION_FULL` is "the host
+    /// is out of capacity", this is "one busy client hit its cap". A datagram
+    /// dropped here is still lost, so it counts in `lost()`.
+    pub static FAIR_SHARE: AtomicU64 = AtomicU64::new(0);
     /// The name's resolution was already in flight, so this datagram was
     /// dropped rather than queued behind it (single-flight delivers only the
     /// packet that spawned the resolver). Counted apart from `SESSION_FULL`
@@ -2541,6 +2583,7 @@ pub mod dgram_drops {
         pub too_large: u64,
         pub buffer_full: u64,
         pub session_full: u64,
+        pub fair_share: u64,
         pub dns_inflight: u64,
         pub dns_contention: u64,
         pub no_egress: u64,
@@ -2556,6 +2599,7 @@ pub mod dgram_drops {
                 too_large: d(self.too_large, prev.too_large),
                 buffer_full: d(self.buffer_full, prev.buffer_full),
                 session_full: d(self.session_full, prev.session_full),
+                fair_share: d(self.fair_share, prev.fair_share),
                 dns_inflight: d(self.dns_inflight, prev.dns_inflight),
                 dns_contention: d(self.dns_contention, prev.dns_contention),
                 no_egress: d(self.no_egress, prev.no_egress),
@@ -2578,6 +2622,7 @@ pub mod dgram_drops {
             self.too_large
                 .saturating_add(self.buffer_full)
                 .saturating_add(self.session_full)
+                .saturating_add(self.fair_share)
                 .saturating_add(self.dns_inflight)
                 .saturating_add(self.dns_contention)
                 .saturating_add(self.no_egress)
@@ -2589,13 +2634,14 @@ pub mod dgram_drops {
     /// Totals since process start.
     ///
     /// **Batching bound, stated because a line reading `0` is not proof of no
-    /// loss.** `too_large`, `buffer_full`, `session_full`, `dns_inflight`,
-    /// `unknown_sess` and `refused` accumulate in a thread-local cell and reach
-    /// they hit 64 or when `snapshot` runs *on that thread*. A reporter task runs
+    /// loss.** `too_large`, `buffer_full`, `session_full`, `fair_share`,
+    /// `dns_inflight`, `unknown_sess` and `refused` accumulate in a thread-local
+    /// cell and reach the global only when they hit 64 or when `snapshot` runs
+    /// *on that thread*. A reporter task runs
     /// on its own thread, so a loss under 64 drops on a worker thread is not
     /// "delayed to the next report" — it stays invisible until that thread drops
     /// 63 more, and a thread that exits takes its pending count with it. Treat
-    /// those six as flood indicators, and the per-packet `warn` lines (which
+    /// those seven as flood indicators, and the per-packet `warn` lines (which
     /// carry the total `bump` returned) as the immediate signal.
     ///
     /// `no_egress`, `egress_dead` and `dns_contention` are exempt by
@@ -2613,6 +2659,7 @@ pub mod dgram_drops {
             too_large: TOO_LARGE.load(Ordering::Relaxed),
             buffer_full: BUFFER_FULL.load(Ordering::Relaxed),
             session_full: SESSION_FULL.load(Ordering::Relaxed),
+            fair_share: FAIR_SHARE.load(Ordering::Relaxed),
             dns_inflight: DNS_INFLIGHT.load(Ordering::Relaxed),
             dns_contention: DNS_CONTENTION.load(Ordering::Relaxed),
             no_egress: NO_EGRESS.load(Ordering::Relaxed),
@@ -2641,6 +2688,12 @@ pub mod dgram_drops {
                 SESSION_FULL.fetch_add(v, Ordering::Relaxed);
             }
         });
+        L_FAIR_SHARE.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                FAIR_SHARE.fetch_add(v, Ordering::Relaxed);
+            }
+        });
         L_DNS_INFLIGHT.with(|c| {
             let v = c.replace(0);
             if v != 0 {
@@ -2665,6 +2718,7 @@ pub mod dgram_drops {
         static L_TOO_LARGE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_FAIR_SHARE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_UNKNOWN_SESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -2691,7 +2745,7 @@ pub mod dgram_drops {
         }
     }
 
-    /// `counter` must be one of this module's statics. Six of them batch per
+    /// `counter` must be one of this module's statics. Seven of them batch per
     /// thread (flushed at 64, or by a `snapshot` on the *same* thread), which is
     /// what keeps a flood off the shared cache lines; each of those needs its own
     /// arm here *and* its own `flush_locals` arm, or its count would sit in a
@@ -2718,6 +2772,8 @@ pub mod dgram_drops {
             batched(counter, &L_BUFFER_FULL)
         } else if std::ptr::eq(counter, &SESSION_FULL) {
             batched(counter, &L_SESSION_FULL)
+        } else if std::ptr::eq(counter, &FAIR_SHARE) {
+            batched(counter, &L_FAIR_SHARE)
         } else if std::ptr::eq(counter, &DNS_INFLIGHT) {
             batched(counter, &L_DNS_INFLIGHT)
         } else if std::ptr::eq(counter, &UNKNOWN_SESS) {
@@ -3346,15 +3402,17 @@ impl DgramFragmenter {
         };
         let cap = limit.saturating_sub(DGRAM_PREFIX_LEN + header.len());
         if payload.len() <= cap {
-            // Counted only once the payload is actually accepted for sending.
-            // Counting it before the size refusals below made refused payloads
-            // inflate `datagrams`/`bytes`/`max_payload` — and `max_payload` is
-            // documented as the empirical check on the 8 KiB cap, so a peer (or
-            // an oversized app datagram) could move the very number that is
-            // supposed to describe delivered traffic.
-            udp_stats::payload(payload.len());
             let failed = match send_udp_datagram_with_header(conn, sess, &header, payload, limit) {
-                DatagramSend::Sent => None,
+                DatagramSend::Sent => {
+                    // Counted only on an accepted send: counting before the
+                    // size refusals inflated `datagrams`/`bytes`/`max_payload`
+                    // with payloads that were never queued, and `max_payload` is
+                    // documented as the empirical check on the 8 KiB cap, so a
+                    // refused oversized datagram could move the very number that
+                    // is supposed to describe delivered traffic.
+                    udp_stats::payload(payload.len());
+                    None
+                }
                 other => Some(other),
             };
             return PayloadSend {
@@ -3422,8 +3480,13 @@ impl DgramFragmenter {
                 }
             }
         }
-        // Counted with the frames actually queued, and only for a payload that
-        // was really split — `fragmented` itself ignores `frames <= 1`.
+        // Both counters fire only for a payload whose every frame was queued —
+        // a partial send is not a delivered datagram, and the peer's reassembler
+        // times it out either way. `payload` used to be missing here entirely,
+        // so fragmented payloads were invisible in `datagrams`/`bytes` and,
+        // worse, in `max_payload`, which is exactly the size class the 8 KiB
+        // cap question is about. `fragmented` itself ignores `frames <= 1`.
+        udp_stats::payload(payload.len());
         udp_stats::fragmented(frames);
         PayloadSend {
             frames,
@@ -5155,7 +5218,7 @@ mod tests {
     }
 
     /// Every drop counter must reach its own named field in the snapshot: the
-    /// nine-field struct exists so the 60 s report cannot silently omit one, and
+    /// ten-field struct exists so the 60 s report cannot silently omit one, and
     /// the batching table (`bump` + `flush_locals`) is keyed on identity, so a
     /// counter missing one of the two arms would sit in a thread-local cell
     /// forever. One bump per counter, one field asserted per counter.
@@ -5166,6 +5229,7 @@ mod tests {
             &dgram_drops::TOO_LARGE,
             &dgram_drops::BUFFER_FULL,
             &dgram_drops::SESSION_FULL,
+            &dgram_drops::FAIR_SHARE,
             &dgram_drops::DNS_INFLIGHT,
             &dgram_drops::DNS_CONTENTION,
             &dgram_drops::NO_EGRESS,
@@ -5178,6 +5242,7 @@ mod tests {
         assert!(after.too_large > before.too_large, "too_large");
         assert!(after.buffer_full > before.buffer_full, "buffer_full");
         assert!(after.session_full > before.session_full, "session_full");
+        assert!(after.fair_share > before.fair_share, "fair_share");
         assert!(after.dns_inflight > before.dns_inflight, "dns_inflight");
         assert!(
             after.dns_contention > before.dns_contention,
@@ -5187,7 +5252,7 @@ mod tests {
         assert!(after.egress_dead > before.egress_dead, "egress_dead");
         assert!(after.refused > before.refused, "refused");
         let d = after.since(&before);
-        assert!(d.lost() >= 8, "every drop counts as loss: {d:?}");
+        assert!(d.lost() >= 9, "every drop counts as loss: {d:?}");
     }
 
     /// Hold one single-flight shard mutex from another thread, the way a miss
@@ -5745,6 +5810,57 @@ mod tests {
         // A later *smaller* payload must not lower the mark.
         udp_stats::payload(64);
         assert!(udp_stats::snapshot().max_payload >= 1_472);
+    }
+
+    /// The fragment path must feed the same counters as the single-frame path.
+    /// It used to call only `fragmented()`, so fragmented payloads — the exact
+    /// size class the 8 KiB cap question is about — were invisible in
+    /// `datagrams`/`bytes` and in the `high-water payload` line.
+    ///
+    /// Deliberately wired through a real connection and the real
+    /// `DgramFragmenter::send`: the direct `udp_stats::payload()` test above
+    /// cannot catch a caller that never calls it.
+    #[cfg(feature = "stats")]
+    #[tokio::test]
+    async fn fragmented_send_counts_the_payload_and_the_high_water() {
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            incoming.accept().unwrap().await.unwrap()
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let _server_conn = accept.await.unwrap();
+        let limit = conn.max_datagram_size().unwrap();
+        let payload = vec![0xABu8; 2_000];
+        assert!(payload.len() <= MQP_FRAG_MAX_PAYLOAD);
+        let addr = TargetAddr::Ip("93.184.216.34:53".parse().unwrap());
+
+        let before = udp_stats::snapshot();
+        let mut frag = DgramFragmenter::new();
+        let sent = frag.send(&conn, 7, &addr.as_ref(), &payload, limit);
+        assert!(
+            sent.complete(),
+            "a 2000 B payload must fragment cleanly: {sent:?}"
+        );
+        assert!(sent.fragmented(), "2000 B cannot fit one loopback frame");
+        // Lower bounds only: sibling tests drive the same counters on other
+        // threads (the same caveat `udp_stats_records_payloads_and_sessions`
+        // documents), but `bytes` can only have moved from a counted send.
+        let after = udp_stats::snapshot();
+        let d = after.since(&before);
+        assert!(
+            d.datagrams >= 1 && d.bytes >= payload.len() as u64,
+            "a fragmented payload must be counted: {d:?}"
+        );
+        assert!(
+            after.max_payload >= payload.len() as u64,
+            "the high-water mark must see fragmented payloads"
+        );
     }
 
     /// The aggregate reassembly bound must be charged over the bytes a chunk
@@ -6684,6 +6800,43 @@ mod tests {
         assert_eq!(normalize_alpn(Some("")), b"h3");
         assert_eq!(normalize_alpn(None), b"h3");
         assert_eq!(normalize_alpn(Some("h3")), b"h3");
+    }
+
+    /// A misspelled key must fail the parse instead of silently falling back.
+    /// `auth_tokn` used to deserialize as an empty `auth_token` and disable
+    /// client authentication with no diagnostic at all.
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let client = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
+            server_name = 'test.com'\nserver_cert_file = 'x'\n";
+        let err = toml::from_str::<ClientConf>(&format!("{client}auth_tokn = 'secret'\n"))
+            .expect_err("a typo must not silently disable auth");
+        assert!(err.to_string().contains("auth_tokn"), "{err}");
+        let ok: ClientConf = toml::from_str(&format!("{client}auth_token = 'secret'\n")).unwrap();
+        assert_eq!(ok.auth_token, "secret");
+
+        let server = "listen = '[::]:8443'\ncert_file = 'c'\nkey_file = 'k'\nserver_name = 's'\n";
+        let err = toml::from_str::<ServerConf>(&format!("{server}allow_priv = true\n"))
+            .expect_err("a typo must not silently flip the SSRF policy");
+        assert!(err.to_string().contains("allow_priv"), "{err}");
+    }
+
+    /// The keepalive clamp bounds the derived detection window: idle is `3x`
+    /// and the client watchdog `4x`, so the old 3600 clamp put silent-path
+    /// detection hours out. A sane value must pass through untouched.
+    #[test]
+    fn keepalive_clamp_bounds_the_detection_window() {
+        assert_eq!(clamp_keep_alive(3600), KEEP_ALIVE_MAX_SECS);
+        assert_eq!(
+            clamp_keep_alive(KEEP_ALIVE_MAX_SECS + 1),
+            KEEP_ALIVE_MAX_SECS
+        );
+        assert_eq!(clamp_keep_alive(17), 17);
+        assert_eq!(clamp_keep_alive(0), 1, "a zero keepalive cannot disable it");
+        assert!(
+            KEEP_ALIVE_MAX_SECS.saturating_mul(4) <= 1200,
+            "the watchdog must stay inside 20 minutes"
+        );
     }
 
     #[test]
