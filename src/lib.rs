@@ -2160,15 +2160,30 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     }
 }
 
-/// Whether `key` has a positive entry that is still inside [`DNS_CACHE_TTL`].
+/// Three-way positive-cache probe for [`record_negative`].
 ///
-/// Non-blocking by construction: a contended shard reads as "not fresh", which
-/// only ever costs a redundant upstream lookup, never a wrong answer.
-fn positive_entry_is_fresh(key: &str) -> bool {
+/// A contended shard is `Unknown`, not "absent": the entry behind it may be
+/// perfectly valid, and treating contention as absence let a failed lookup
+/// shadow a live positive answer (plus this thread's positive memo) with a
+/// negative one. Callers that only need a fast-path hint keep using
+/// `try_lock_read` miss semantics at their own call site; this helper exists
+/// so the *write* path can fail open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositiveState {
+    Fresh,
+    Absent,
+    Unknown,
+}
+
+fn positive_entry_state(key: &str) -> PositiveState {
     let Some(m) = try_lock_read(dns_cache_for(key)) else {
-        return false;
+        return PositiveState::Unknown;
     };
-    m.get(key).is_some_and(|(t, _)| t.elapsed() < DNS_CACHE_TTL)
+    if m.get(key).is_some_and(|(t, _)| t.elapsed() < DNS_CACHE_TTL) {
+        PositiveState::Fresh
+    } else {
+        PositiveState::Absent
+    }
 }
 
 /// Record that resolving `key` failed, so the packet paths can refuse it without
@@ -2185,8 +2200,16 @@ fn positive_entry_is_fresh(key: &str) -> bool {
 /// cached address was still good. The failure is still reported to the caller
 /// that performed it; it just does not poison the cache.
 fn record_negative(key: &str, now: Instant) {
-    if positive_entry_is_fresh(key) {
-        return;
+    match positive_entry_state(key) {
+        PositiveState::Fresh => return,
+        // Fail open: on a contended shard the positive entry may be perfectly
+        // valid. Recording a negative here would overwrite this thread's
+        // positive memo (which the fast path trusts over the global positive
+        // cache) and refuse the name for DNS_NEG_TTL while other threads keep
+        // serving the good address. The lost shedding is bounded by the
+        // slow-path limiter instead.
+        PositiveState::Unknown => return,
+        PositiveState::Absent => {}
     }
     {
         let mut n = lock_write(dns_neg_cache_for(key));
@@ -4914,7 +4937,7 @@ mod tests {
         let mut kbuf = [0u8; DNS_KEY_BUF];
         let key = dns_key(host, port, &mut kbuf).unwrap().to_owned();
         assert!(
-            positive_entry_is_fresh(&key),
+            matches!(positive_entry_state(&key), PositiveState::Fresh),
             "test premise: positive is fresh"
         );
 
@@ -4942,12 +4965,44 @@ mod tests {
         let miss_key = dns_key(miss_host, miss_port, &mut kbuf2)
             .unwrap()
             .to_owned();
-        assert!(!positive_entry_is_fresh(&miss_key));
+        assert!(matches!(
+            positive_entry_state(&miss_key),
+            PositiveState::Absent
+        ));
         record_negative(&miss_key, Instant::now());
         assert_eq!(
             lookup_cached_fast(miss_host, miss_port),
             CachedLookup::Negative,
             "an uncached failure must still be negatively cached"
+        );
+    }
+
+    #[test]
+    fn contended_positive_probe_skips_negative_caching() {
+        memo_reset();
+        let addr: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let (host, port) = ("contention-guard.test", 19055u16);
+        dns_cache_seed(host, port, addr);
+        let mut kbuf = [0u8; DNS_KEY_BUF];
+        let key = dns_key(host, port, &mut kbuf).unwrap().to_owned();
+        // Hold the positive shard: std RwLock is not reentrant, so the probe
+        // sees contention (not absence) while the guard lives.
+        let _guard = lock_write(dns_cache_for(&key));
+        assert!(matches!(positive_entry_state(&key), PositiveState::Unknown));
+        record_negative(&key, Instant::now());
+        drop(_guard);
+        assert!(
+            lock_read(dns_neg_cache_for(&key)).get(&key).is_none(),
+            "contention must not produce a negative entry"
+        );
+        assert!(
+            memo_peek_both(&key).1.is_none(),
+            "contention must not produce a negative memo entry"
+        );
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Addr(addr),
+            "the live positive answer must stay servable"
         );
     }
 

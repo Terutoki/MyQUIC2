@@ -234,6 +234,15 @@ struct ShardedSessTable {
     /// step by [`ShardedSessTable::note_empty_state`] on every insert/removal
     /// that can change emptiness.
     counted: std::sync::atomic::AtomicBool,
+    /// Cached [`ShardedSessTable::len`] plus its sample time (`mono_millis`
+    /// epoch). `len` takes all 8 shard read locks, and past the fair-share cap
+    /// every forged new-session datagram reaches it — an attacker-drivable
+    /// 8-lock amplifier. The cache serves readings up to 1 s old: a stale-high
+    /// value refuses for at most 1 s (counted, self-correcting), a stale-low
+    /// one admits over the share for at most 1 s (bounded by the global
+    /// semaphore plus the per-insert bounded eviction).
+    cached_len: std::sync::atomic::AtomicUsize,
+    cached_len_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ShardedSessTable {
@@ -243,6 +252,8 @@ impl ShardedSessTable {
                 .map(|_| std::sync::RwLock::new(HashMap::new()))
                 .collect(),
             counted: std::sync::atomic::AtomicBool::new(false),
+            cached_len: std::sync::atomic::AtomicUsize::new(0),
+            cached_len_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -283,6 +294,28 @@ impl ShardedSessTable {
     /// connection's share of the process-wide session budget.
     fn len(&self) -> usize {
         self.shards.iter().map(|sh| lock_read(sh).len()).sum()
+    }
+
+    /// `len` served from a 1 s cache (see `cached_len`). The writer stores the
+    /// count before its timestamp, the reader checks the timestamp first, so a
+    /// racing reader either takes the previous generation or re-measures —
+    /// never a torn pair beyond one stale generation, which the field contract
+    /// already bounds.
+    fn len_cached(&self, now_ms: u64) -> usize {
+        use std::sync::atomic::Ordering;
+        if now_ms.saturating_sub(self.cached_len_ms.load(Ordering::Relaxed)) < 1000 {
+            return self.cached_len.load(Ordering::Relaxed);
+        }
+        let n = self.len();
+        self.store_len(n, now_ms);
+        n
+    }
+
+    /// Publish a freshly measured `len` (call after a sweep actually ran).
+    fn store_len(&self, n: usize, now_ms: u64) {
+        use std::sync::atomic::Ordering;
+        self.cached_len.store(n, Ordering::Relaxed);
+        self.cached_len_ms.store(now_ms, Ordering::Relaxed);
     }
 
     fn drain_all(&self) -> Vec<SessEntry> {
@@ -421,6 +454,28 @@ fn fair_sess_cap() -> usize {
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
     (MAX_SESSIONS_GLOBAL / holders).clamp(256, LOCAL_SESS_MAX)
+}
+
+/// Process-wide throttle for the over-cap `sweep_all` reaps in
+/// `get_or_create_sess`: at most one sweep per second across all workers and
+/// connections. Per-worker thread-local throttles let W workers run W sweeps
+/// per second (each O(sessions)) under a forged-session flood. A refused sweep
+/// still refuses the session (counted `SESSION_FULL`); the reap is deferred at
+/// most 1 s, and any sweep benefits every connection since all of them reap
+/// only expired sessions.
+static FAIR_SWEEP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Claim the global sweep window for `now_ms`. Exactly one contender wins per
+/// second; losers skip the sweep (their session is still refused and counted).
+fn claim_fair_sweep(now_ms: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let last = FAIR_SWEEP_LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < 1000 {
+        return false;
+    }
+    FAIR_SWEEP_LAST_MS
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 fn dial_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -2244,29 +2299,19 @@ async fn get_or_create_sess(
     // amplifier any peer can drive with fabricated session ids, for a sweep
     // that can only ever free sessions that went idle >= SESS_IDLE_MS ago.
     let fair_cap = fair_sess_cap();
-    // Measured once: `len` takes all 8 shard read locks, and past the cap
-    // every further new-session datagram reaches this branch, so a second
-    // measurement per forged packet is pure lock traffic. Re-measure only
+    // Served from the 1 s `len` cache (see `cached_len`): past the cap every
+    // further new-session datagram reaches this branch, so a fresh 8-lock
+    // measurement per forged packet is pure lock traffic. Re-measured only
     // after a sweep actually ran (it may have freed sessions).
-    let n = ss.len();
-    if n >= fair_cap {
-        thread_local! {
-            static LAST_FAIR_SWEEP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        }
-        let now = mono_millis();
-        let due = LAST_FAIR_SWEEP_MS.with(|c| {
-            let last = c.get();
-            if now.saturating_sub(last) < 1000 {
-                false
-            } else {
-                c.set(now);
-                true
-            }
-        });
-        if due {
+    let now = mono_millis();
+    if ss.len_cached(now) >= fair_cap {
+        if claim_fair_sweep(now) {
             let evicted = ss.sweep_all(now);
             abort_evicted(evicted);
-            if ss.len() >= fair_cap {
+            let now2 = mono_millis();
+            let n2 = ss.len();
+            ss.store_len(n2, now2);
+            if n2 >= fair_cap {
                 dgram_drops::bump(&dgram_drops::SESSION_FULL);
                 return None;
             }
@@ -2280,22 +2325,10 @@ async fn get_or_create_sess(
     let permit = match session_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            // Throttled reap: per-worker 1/sec throttle (thread-local, no
-            // cross-core CAS herd) instead of one global atomic.
-            thread_local! {
-                static LAST_SWEEP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-            }
-            let now = mono_millis();
-            let due = LAST_SWEEP_MS.with(|c| {
-                let last = c.get();
-                if now.saturating_sub(last) < 1000 {
-                    false
-                } else {
-                    c.set(now);
-                    true
-                }
-            });
-            if !due {
+            // Throttled reap through the process-wide sweep window (see
+            // `FAIR_SWEEP_LAST_MS`): a per-worker throttle here let W workers
+            // run W full-table sweeps per second under permit pressure.
+            if !claim_fair_sweep(mono_millis()) {
                 dgram_drops::bump(&dgram_drops::SESSION_FULL);
                 return None;
             }

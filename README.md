@@ -175,6 +175,19 @@ the same 5 s deadline every other dial stage honors — see
 Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
 plus per-level `objdump`), again not run under emulation or natively.
 
+The current pass fixes two findings from another two-round review of the
+session/DNS paths — round two tasked to falsify (two more candidates rejected
+outright, two severities revised down before anything was touched): the DNS
+negative cache no longer shadows a live positive answer (a contended-shard probe
+is `Unknown`, not "absent", so a failed lookup fails open instead of refusing the
+name for 10 s on the recording thread), and the over-cap session reap is throttled
+process-wide to one sweep per second across all workers and connections, with the
+session count served from a 1 s cache instead of 8 shard locks per forged
+datagram — see
+[pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle).
+Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
+plus per-level `objdump`), again not run under emulation or natively.
+
 ---
 
 ## Table of Contents
@@ -195,7 +208,7 @@ plus per-level `objdump`), again not run under emulation or natively.
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -557,6 +570,7 @@ before every run):
 | 53 | Pass 29 — replay-safe auth, reply-source validation, DNS parity, truncation counting, session fairness. `cargo test --all-targets` **102/102** (53 lib + 28 client + 21 server; **101/101** with `--no-default-features`: 52 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review (round two tasked to falsify; three candidates rejected): token sent at 1-RTT only, per-session reply allowlist, per-association app lock, full-set DNS fallback on the UDP fast path, `TOO_LARGE` on relay truncations, live fair-share session gate. New regression tests: `reply_allowlist_accepts_only_recorded_destinations`, `resolve_pin_withholds_a_filtered_cached_address`, `fair_share_splits_the_global_budget_across_live_connections`. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness) | ✅ |
 | 54 | Pass 31 — per-direction stall, symmetric ACK reset, enum warn slots, fail-fast dial. `cargo test --all-targets` **104/104** (55 lib + 28 client + 21 server; **103/103** with `--no-default-features`: 54 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review plus an independent oracle re-verification (5 PASS / 1 FAIL; the FAIL — per-direction stall killing healthy half-idle flows — fixed as an AND gate with the shared stamp and re-verified PASS): per-direction pump stall stamps gated on shared-stamp expiry, server ACK failure resets like dial failures, `warn_datagram_drop` substring slots moved to `DatagramDropKind`, dial-ACK bound-address validation, `wait_conn` trusting `close_reason()` with exponential dispatcher backoff, fail-fast server dial permit with its own counters. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) | ✅ |
 | 55 | Pass 32 — sweep re-check, fair-shard trigger, memo guard, DNS contention, live atomicity, auth timeout, plus ten post-fix residuals. `cargo test --all-targets` **117/117** (60 lib + 30 client + 27 server; **116/116** with `--no-default-features`: 59 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round lock/sweep review (round two tasked to falsify; one finding split, four severities revised down): over-cap sweeper re-tests idleness via `take_idle` plus a stamp-equality `evict_ranked`, the shard trigger follows the live fair share (`shard_sweep_target`) with per-insert eviction bounded at 64, `sess_memo_forget` takes the exiting socket and clears only on `Weak::ptr_eq`, DNS contention gets its own `DNS_CONTENTION` counter with a `try_lock` fail-fast register, the client folds `live=false` into the `rcu` clear (`clear_if_and_mark_dead` with a retry tail), and the auth write is wrapped in the same 5 s timeout as the stream-head write. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) | ✅ |
+| 56 | Pass 33 — DNS negative fail-open and process-wide sweep throttle. `cargo test --all-targets` **118/118** (61 lib + 30 client + 27 server; **117/117** with `--no-default-features`: 60 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two fixes from a two-round review (round two tasked to falsify; two candidates rejected outright, two severities revised down): the positive-cache probe is tri-state (`PositiveState::Fresh/Absent/Unknown`) so a contended shard fails open instead of recording a negative entry that shadowed the live positive answer (and the recording thread's positive memo) for `DNS_NEG_TTL`, pinned by `contended_positive_probe_skips_negative_caching`; the over-cap reap takes at most one process-wide `sweep_all` per second (`claim_fair_sweep`) instead of one per worker per second, and the fair-share gate reads a 1 s cached session count (`len_cached`) instead of 8 shard locks per forged datagram. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -687,19 +701,17 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 32's sweep re-check with bounded eviction,
-the fair-shard trigger, the memo `Weak::ptr_eq` guard, the DNS contention counter
-with fail-fast register, the client's `live`-in-`rcu` clear, and the auth-write
-timeout — on top of everything pass 31 shipped) with the default feature set, so the
+rebuilt from the current revision (pass 33's DNS negative-cache fail-open guard and
+the process-wide sweep throttle with cached session count — on top of everything
+pass 32 shipped) with the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped — servers
-4 355 432–4 383 792 B (v1 4 374 184, v2 4 355 432, v3 4 383 792, v4 4 380 656) and
-clients 4 378 880–4 402 648 B (v1 4 394 000, v2 4 378 880, v3 4 402 648, v4 4 394 824).
-Against the pass-31 *recorded* figures that is **+2 512…+2 960 B** per server level
-and **+2 496…+2 816 B** per client level — growth in line with the additions (the
-sweep/evict helpers, the contention counter, the atomic clear helper, the retry
-wrapper and the timeout/reset paths). Two four-level builds ran this pass (pre-
-and post-residual trees); the shipped eight come from a single build of the final
-tree (no byte-identical second build of it). `file` confirms ELF 64-bit LSB x86-64,
+4 355 688–4 383 920 B (v1 4 374 632, v2 4 355 688, v3 4 383 920, v4 4 381 040) and
+clients 4 378 880–4 402 712 B (v1 4 394 000, v2 4 378 880, v3 4 402 712, v4 4 394 824).
+Against the pass-32 *recorded* figures that is **+128…+448 B** per server level
+and **+0…+64 B** per client level — in line with the additions (a tri-state probe,
+two atomics per session table, one global throttle; the regression test is
+`#[cfg(test)]` and does not ship). The shipped eight come from a single build of
+the final tree (no byte-identical second build of it). `file` confirms ELF 64-bit LSB x86-64,
 statically linked, stripped on all eight, and `objdump -d` finds 283 `zmm` refs in
 the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
 3 978 → 25 395/26 855 from v1 to v3), so each `target-cpu` level really is
@@ -3395,6 +3407,57 @@ against the pass-31 recorded figures, in line with the additions (two builds ran
 this pass, pre- and post-residual trees; the shipped eight are one build of the
 final tree, no byte-identical second build of it). `file` confirms ELF 64-bit LSB
 x86-64, statically linked, stripped on all eight; `objdump -d` finds 283 `zmm`
+refs in the v4 server and 235 in the v4 client with none in v1–v3 (`ymm` 3 978 →
+25 395/26 855 from v1 to v3). No emulated or native run of the shipped pairs.
+
+### 2026-09 hardening pass 33 — DNS negative fail-open and process-wide sweep throttle
+
+Two fixes from another two-round review of the session/DNS paths (round two tasked
+to falsify: two candidates rejected outright — the reply-allowlist cap and the
+spawn-path drop counter, both dispositioned as documented tradeoffs or already
+counted — and two severities revised down before anything was touched). No frame,
+framing, ALPN or protocol-field change, so mixed old/new pairs keep working.
+
+- **DNS negative cache fails open on contention.** `record_negative` gated on a
+  boolean "is the positive entry fresh", and a contended shard read as "not fresh"
+  — so a failed upstream lookup recorded a negative entry over a still-valid
+  positive one *and* overwrote the recording thread's positive memo (which the
+  fast path trusts over the global positive cache): ~1/workers of traffic for that
+  name refused for `DNS_NEG_TTL` while every other thread kept serving the good
+  address. The probe is now tri-state (`PositiveState::Fresh/Absent/Unknown`) and
+  the write path returns early on `Unknown`. The shedding lost under contention is
+  bounded by the 1024-entry slow-path limiter instead. Pinned by
+  `contended_positive_probe_skips_negative_caching`, which holds the positive shard
+  (non-reentrant, so the probe deterministically sees contention) and asserts no
+  negative entry and no negative memo are written — verified to fail against the
+  old gate.
+- **Over-cap session reap is throttled process-wide.** Past the fair-share cap,
+  every forged new-session datagram paid `ss.len()` (8 shard read locks) plus
+  `max_datagram_size()` (quinn's connection-state mutex), and each worker ran its
+  own 1/s `sweep_all` (O(sessions)) behind a thread-local throttle — W sweeps per
+  second under a forged-session flood, reachable by anyone on the default
+  open-relay config. One global CAS window (`claim_fair_sweep`) admits a single
+  sweep per second across all workers and connections (both the fair-share and the
+  permit-exhaustion branches share it; a refused sweep still refuses the session,
+  counted `SESSION_FULL`), and the gate reads a 1 s cached count (`len_cached`,
+  two atomics on the table) instead of re-locking all shards per packet. A
+  stale-high reading refuses for at most 1 s (counted, self-correcting); a
+  stale-low one admits over the share for at most 1 s (bounded by the global
+  semaphore plus the per-insert bounded eviction).
+
+Verification: `cargo test --all-targets` **118/118** (61 lib + 30 client + 27
+server; **117/117** with `--no-default-features`: 60 + 30 + 27),
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both
+feature sets.
+
+`dist/`: **rebuilt from this revision and statically checked.** All four CPU levels
+were cross-compiled with the documented `cargo zigbuild` recipe (static musl,
+x86-64, default feature set) into `dist/openwrt-x86_64/`: servers 4 355 688–
+4 383 920 B (v1 4 374 632, v2 4 355 688, v3 4 383 920, v4 4 381 040) and clients
+4 378 880–4 402 712 B (v1 4 394 000, v2 4 378 880, v3 4 402 712, v4 4 394 824) —
+**+128…+448 B** per server level and **+0…+64 B** per client level against the
+pass-32 recorded figures, in line with the additions. `file` confirms ELF 64-bit
+LSB x86-64, statically linked, stripped on all eight; `objdump -d` finds 283 `zmm`
 refs in the v4 server and 235 in the v4 client with none in v1–v3 (`ymm` 3 978 →
 25 395/26 855 from v1 to v3). No emulated or native run of the shipped pairs.
 
