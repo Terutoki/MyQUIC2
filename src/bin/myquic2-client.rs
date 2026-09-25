@@ -111,7 +111,18 @@ impl ConnSlot {
     /// single re-checked write: the closure runs again whenever a concurrent
     /// writer wins the swap, so a fresh connection installed during the clear is
     /// never blackholed. The closure is `FnMut` and its last run is the one whose
-    /// result is committed, so `cleared` reflects the committed decision.
+    /// result is committed, so `cleared` reflects the committed decision. The
+    /// `live` bit is folded into the same decision by
+    /// [`ConnSlot::clear_if_and_mark_dead`], whose store runs inside this
+    /// closure on the path that commits to `None` — a trailing
+    /// `live.store(false)` after `clear_if` returns would let a concurrent
+    /// `publish` of a different `stable_id` land between the decision and the
+    /// store and leave the fresh connection marked dead.
+    ///
+    /// Test-only: every production path uses `clear_if_and_mark_dead`. Kept
+    /// so the BUG-2 regression test can pin the old two-step's (C, false)
+    /// outcome against the helper.
+    #[cfg(test)]
     fn clear_if(&self, conn: &quinn::Connection) -> bool {
         let mut cleared = false;
         self.shared.rcu(|cur| {
@@ -129,6 +140,48 @@ impl ConnSlot {
         cleared
     }
 
+    /// Clear-if plus the `live = false` folded into the same atomic decision:
+    /// the store runs inside the `rcu` closure, only on the path that commits
+    /// to `None`, so a concurrent `publish` of a different `stable_id` can
+    /// never be marked dead by the gap the old `clear_if` +
+    /// `live.store(false)` sequence had (a publish landing between the decision
+    /// and the store). Returns true when this call is the one that cleared it;
+    /// the caller still owns the `bump_gen` on every committed swap.
+    ///
+    /// Retry note: `rcu` re-runs the closure when another writer wins the swap,
+    /// so a losing first run may have stored `false` before the re-run saw the
+    /// fresh connection. `marked && !cleared` detects exactly that tail and
+    /// restores `true` when the slot now holds a different connection; a slot
+    /// holding nothing (or still `conn`) keeps the `false` the clear committed.
+    fn clear_if_and_mark_dead(&self, conn: &quinn::Connection) -> bool {
+        let mut cleared = false;
+        let mut marked = false;
+        self.shared.rcu(|cur| {
+            if cur
+                .as_ref()
+                .is_some_and(|c| c.stable_id() == conn.stable_id())
+            {
+                cleared = true;
+                marked = true;
+                self.live.store(false, std::sync::atomic::Ordering::Relaxed);
+                None
+            } else {
+                cleared = false;
+                cur.clone()
+            }
+        });
+        if marked && !cleared {
+            let g = self.shared.load();
+            if g.as_ref()
+                .is_some_and(|c| c.stable_id() != conn.stable_id())
+            {
+                self.live.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            drop(g);
+        }
+        cleared
+    }
+
     /// Wait for a live connection, waking on a generation bump or the deadline.
     ///
     /// Authority is `close_reason()`; the maintained `live` bit is only a hint
@@ -140,7 +193,7 @@ impl ConnSlot {
     /// on. Cost is one quinn lock per `wait_conn` return (per TCP flow / per
     /// dispatcher generation, never per packet). Race window: `close_reason()`
     /// may flip right after this check; the TCP `open_bi` failure path
-    /// (`clear_if` + `live=false` + `bump_gen`) stays the authoritative
+    /// (`clear_if_and_mark_dead` + `bump_gen`) stays the authoritative
     /// self-heal, so a handle that dies in flight still heals in one flow.
     async fn wait_conn(
         &self,
@@ -1308,10 +1361,12 @@ fn dispatch_one(
                     // (`forward_server_dgram`) charges `DNS_INFLIGHT`, and an
                     // uncounted drop here showed up only as missing replies: a
                     // 40-datagram burst at one uncached name silently loses 39
-                    // of them, and under contention (`dns_is_inflight` reports
-                    // `true` when its shard mutex is busy, `lookup_cached_fast`
-                    // reports `Unknown` when its read lock is) that can be a
-                    // sustained loss with no counter and no log at all.
+                    // of them, and under contention that can be a sustained
+                    // loss with no counter and no log at all. `dns_is_inflight`
+                    // is true only while the name is actually registered; a
+                    // contended shard mutex reads as absent (false), so such a
+                    // lookup falls through to the limiter-bounded spawn below
+                    // instead of parking on the shard mutex.
                     if dns_is_inflight(h, p) {
                         dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
                         return;
@@ -1341,7 +1396,12 @@ fn dispatch_one(
                                 Some(s) => s,
                                 None => return,
                             },
-                            Err(_) => return,
+                            Err(e) => {
+                                if myquic2::is_dns_contended(&e) {
+                                    dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                }
+                                return;
+                            }
                         };
                         let mut pkt = bytes::BytesMut::with_capacity(256);
                         send_reply(&entry, dst, &payload, &mut pkt);
@@ -1475,8 +1535,19 @@ fn spawn_conn_loop(
                     if let Some(reason) = conn.close_reason() {
                         warn!("QUIC close reason: {reason}");
                     }
-                    slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
-                    if slot.clear_if(&conn) {
+                    // The clear and the `live = false` must commit together in
+                    // `clear_if_and_mark_dead`: the `open_bi` failure path is a
+                    // second writer on this slot, and this loop's own reconnect
+                    // may publish a fresh connection between this death and its
+                    // clear, so an unconditional `live.store(false)` first
+                    // would leave (fresh C, false) with no generation bump and
+                    // `wait_conn` would treat C as dead until C itself died.
+                    // Three states: holding D commits to None + live false
+                    // (the bump wakes waiters off the dead handle); holding a
+                    // fresh C clears nothing and leaves live true (no bump —
+                    // nothing changed); holding None means the `open_bi` path
+                    // already cleared and bumped, so there is nothing to do.
+                    if slot.clear_if_and_mark_dead(&conn) {
                         bump_gen(&slot.gen_tx);
                     }
                     if connected_at.elapsed() >= Duration::from_secs(5) {
@@ -1596,9 +1667,26 @@ async fn send_auth_stream(conn: &quinn::Connection, token: &str) -> Result<quinn
     let mut uni = tokio::time::timeout(Duration::from_secs(5), conn.open_uni())
         .await
         .context("auth stream open timed out")??;
-    uni.write_all(token.as_bytes())
-        .await
-        .context("auth write failed")?;
+    // Bounded like the 5 s stream-head write on the TCP open path: without a
+    // deadline a stalled connection parks the dial attempt here until the QUIC
+    // idle timeout, blowing past DIAL_ATTEMPT_TIMEOUT. On timeout the error
+    // propagates out of `dial_once`, so the attempt fails and nothing is
+    // published. The token is ≤ 256 B (one small write); `finish()` stays
+    // best-effort. A failed write must `reset` instead of merely dropping
+    // `uni`: dropping sends a graceful FIN bearing whatever prefix of the
+    // token got out, which the server reads as a credential mismatch, while
+    // `reset` aborts the stream so no partial token is ever framed as final.
+    match tokio::time::timeout(Duration::from_secs(5), uni.write_all(token.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            uni.reset(0u32.into()).ok();
+            return Err(e).context("auth write failed");
+        }
+        Err(e) => {
+            uni.reset(0u32.into()).ok();
+            return Err(e).context("auth write timed out");
+        }
+    }
     uni.finish().ok();
     Ok(uni)
 }
@@ -1817,11 +1905,12 @@ async fn handle_socks(
                 // Atomic read-then-clear with re-check: a reconnect may install
                 // a fresh connection between a read and a later clear, and
                 // clearing unconditionally would blackhole the new connection
-                // until it dies. `clear_if` matches on `stable_id` inside the
-                // `rcu` closure, so the re-check and the store cannot be split.
+                // until it dies. `clear_if_and_mark_dead` matches on
+                // `stable_id` and folds the `live = false` into the same `rcu`
+                // closure, so the decision, the store and the liveness bit
+                // cannot be split by a concurrent publish.
                 // Matches the reconnect loop's own clear path.
-                if slot.clear_if(&conn) {
-                    slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+                if slot.clear_if_and_mark_dead(&conn) {
                     bump_gen(&gen_tx);
                 }
                 write_socks_reply(&mut s, 0x04, bnd).await.ok();
@@ -3674,5 +3763,173 @@ mod tests {
                 .is_err(),
             "a dead slot must fail at the deadline, not hand out a dead handle"
         );
+    }
+
+    /// BUG-2: the `open_bi` failure path must never mark a freshly published
+    /// connection dead. The old two-step (`clear_if`, then a trailing
+    /// `live.store(false)`) let a concurrent `publish(C)` land between the
+    /// decision and the store, leaving `(shared == C, live == false)` until C
+    /// died. `clear_if_and_mark_dead` folds the store into the `rcu` closure,
+    /// so the interleaving has nowhere to land.
+    #[tokio::test]
+    async fn open_bi_failure_path_never_kills_a_fresh_connection() {
+        let (d, _e1, _s1) = real_connection().await;
+        let (c, _e2, _s2) = real_connection().await;
+        assert_ne!(
+            d.stable_id(),
+            c.stable_id(),
+            "the test needs two distinct connections"
+        );
+
+        // The old pattern, with the racing publish injected exactly between
+        // the decision and the trailing store: ends with the fresh connection
+        // marked dead. Pinned here so the regression stays visible.
+        let slot = ConnSlot::fresh();
+        slot.publish(&d);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(slot.clear_if(&d), "decision made while D was installed");
+        slot.publish(&c);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            slot.shared
+                .load()
+                .as_ref()
+                .is_some_and(|x| x.stable_id() == c.stable_id()),
+            "the racing publish won the slot"
+        );
+        assert!(
+            !slot.is_live(),
+            "old two-step marks the fresh connection dead"
+        );
+
+        // The atomic helper under the same race, both orders: the slot is
+        // never left holding C with live == false.
+        // Order 1: the clear commits before C is published.
+        let slot = ConnSlot::fresh();
+        slot.publish(&d);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(slot.clear_if_and_mark_dead(&d));
+        assert!(!slot.is_live());
+        assert!(slot.shared.load().as_ref().is_none());
+        slot.publish(&c);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            slot.is_live(),
+            "a connection published after the clear stays live"
+        );
+        assert!(slot
+            .shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id()));
+
+        // Order 2: C is already installed when the stale failure for D runs.
+        let slot = ConnSlot::fresh();
+        slot.publish(&d);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        slot.publish(&c);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !slot.clear_if_and_mark_dead(&d),
+            "stable_id mismatch clears nothing"
+        );
+        assert!(slot.is_live(), "the fresh connection is untouched");
+        assert!(slot
+            .shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id()));
+
+        // Teardown interleaving: the slot holds fresh C (live) while the
+        // teardown for dead D runs. The old unconditional store + `clear_if`
+        // ends at (C, false) with no generation bump, so `wait_conn` treats
+        // C as dead; the helper must never end at (C, false).
+        let slot = ConnSlot::fresh();
+        slot.publish(&c);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!slot.clear_if(&d), "D's teardown sees C and clears nothing");
+        assert!(slot
+            .shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id()));
+        assert!(
+            !slot.is_live(),
+            "old teardown leaves (C, false) with no wake"
+        );
+
+        let slot = ConnSlot::fresh();
+        slot.publish(&c);
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !slot.clear_if_and_mark_dead(&d),
+            "D's teardown sees C and clears nothing"
+        );
+        assert!(slot
+            .shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id()));
+        assert!(
+            slot.is_live(),
+            "a stale teardown must never mark the fresh connection dead"
+        );
+    }
+
+    /// BUG-6: the auth token write is bounded by the same 5 s deadline as the
+    /// stream open, so every dial attempt honours DIAL_ATTEMPT_TIMEOUT instead
+    /// of parking on a stalled connection until the QUIC idle timeout.
+    #[tokio::test]
+    async fn auth_write_fails_fast_on_a_stalled_stream() {
+        // A writer that never becomes writable, standing in for a stalled
+        // connection: the production wrapper shape
+        // `timeout(deadline, write_all)` must resolve as a timeout, not park.
+        struct Pending;
+        impl tokio::io::AsyncWrite for Pending {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let mut w = Pending;
+        let start = tokio::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_millis(50),
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"token"),
+        )
+        .await;
+        assert!(r.is_err(), "a stalled auth write must time out");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the bound fails fast instead of parking for the idle timeout"
+        );
+        assert_eq!(
+            DIAL_ATTEMPT_TIMEOUT,
+            Duration::from_secs(5),
+            "the dial attempt budget is unchanged"
+        );
+
+        // The small-write happy path still works through the real code.
+        let (conn, _client, _server) = real_connection().await;
+        send_auth_stream(&conn, "t")
+            .await
+            .expect("a small token write succeeds");
     }
 }

@@ -325,9 +325,12 @@ impl ShardedSessTable {
 /// this write-locked removal the client can touch the session — or the key can
 /// be recreated outright. Removing unconditionally destroyed a live session and
 /// aborted its freshly started reader (its socket, its destination memo and the
-/// replies in flight went with it). `sweep_local` gets the re-check for free by
-/// scanning and removing under one write guard; here the snapshot is reused and
-/// every key is re-tested against the same `now` before it is removed.
+/// replies in flight went with it). Every key is therefore re-tested against
+/// the same `now` before it is removed — and that re-test is needed on *both*
+/// sweep paths, not just this one: `sweep_local` scans and removes under one
+/// write guard, but a touch lands through the lock-free atomic stamp
+/// (`touch_session_throttled` takes no table lock), so it can land between the
+/// scan and the removal even with the write guard held.
 fn take_idle(w: &mut HashMap<u32, SessEntry>, keys: &[u32], now: u64) -> Vec<SessEntry> {
     let mut out = Vec::with_capacity(keys.len());
     for k in keys {
@@ -757,10 +760,11 @@ fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             // The budget paths only: `too_large`/`buffer_full` have their own
             // rate-limited per-packet warning and would double-report here.
-            if dd.session_full > 0 || dd.dns_inflight > 0 || dd.refused > 0 {
+            if dd.session_full > 0 || dd.dns_inflight > 0 || dd.dns_contention > 0 || dd.refused > 0
+            {
                 info!(
-                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (resolution in flight), {} refused (policy); totals too_large={} buffer_full={} session_full={} dns_inflight={} refused={}",
-                    dd.session_full, dd.dns_inflight, dd.refused, now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.dns_inflight, now_d.refused
+                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} refused (policy); totals too_large={} buffer_full={} session_full={} dns_inflight={} dns_contention={} refused={}",
+                    dd.session_full, dd.dns_inflight, dd.dns_contention, dd.refused, now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.dns_inflight, now_d.dns_contention, now_d.refused
                 );
             }
             prev_d = now_d;
@@ -1089,7 +1093,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             return;
                         }
                     };
-                    dns_n = match resolve_all_cached(h, *p).await {
+                    dns_n = match resolve_all_cached_with_contention_retry(h, *p).await {
                         Ok(v) => {
                             // `resolve_all_cached` sorts IPv4 first, so a flat
                             // prefix cut would starve IPv6 whenever upstream
@@ -1121,7 +1125,12 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                             }
                             n
                         }
-                        Err(_) => 0,
+                        Err(e) => {
+                            if is_dns_contended(&e) {
+                                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                            }
+                            0
+                        }
                     };
                     drop(permit);
                     &dns_cand[..dns_n]
@@ -1535,13 +1544,22 @@ async fn forward_server_dgram(
                         None
                     }
                     None => {
-                        if dns_is_inflight(h, p) {
-                            // Single-flight: the packet that spawned the resolver is
-                            // delivered by that task, this one has no owner. Counted so
-                            // the loss shows up in the 60 s budget line instead of
-                            // being invisible.
-                            dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-                            return None;
+                        match dns_inflight_status(h, p) {
+                            // Single-flight: the packet that spawned the
+                            // resolver is delivered by that task, this one has
+                            // no owner. Counted so the loss shows up in the
+                            // 60 s budget line instead of being invisible.
+                            DnsInflight::Inflight => {
+                                dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+                                return None;
+                            }
+                            // Contended shard mutex: nothing is known, so this
+                            // is not an inflight drop. Count it apart and fall
+                            // through to the spawn path below, not a return.
+                            DnsInflight::Contended => {
+                                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                            }
+                            DnsInflight::Absent => {}
                         }
                         if dns_slow_path_limiter().available_permits() == 0 {
                             dgram_drops::bump(&dgram_drops::SESSION_FULL);
@@ -1571,8 +1589,12 @@ async fn forward_server_dgram(
                                         return;
                                     }
                                 },
-                                Err(_) => {
-                                    dgram_drops::bump(&dgram_drops::REFUSED);
+                                Err(e) => {
+                                    if is_dns_contended(&e) {
+                                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                    } else {
+                                        dgram_drops::bump(&dgram_drops::REFUSED);
+                                    }
                                     return;
                                 }
                             };
@@ -1624,21 +1646,75 @@ async fn forward_server_dgram(
 /// client's `MAX_UDP_ASSOCS` is aligned to `LOCAL_SESS_TARGET`, so hitting the
 /// cap means every association is live. `target` is a parameter so the ranking
 /// is testable without 504 real sessions.
+///
+/// Upper bound on ranked (live-candidate) entries one `sweep_local` call
+/// removes. Expired entries are always reaped unbounded (aborting idle readers
+/// is not a storm); the bound only limits how many live readers one insert can
+/// abort. A live over-share is otherwise left alone while its sessions are
+/// active and converges only as they go idle — a quiescent live over-share is
+/// accepted, with the global semaphore capping the true total (the throttled
+/// `sweep_all` reaps expired sessions only, so it cannot converge live ones).
+const SWEEP_LOCAL_MAX_EVICT: usize = 64;
+
+/// Shard-sweep trigger and target from the live fair share, so the decision is
+/// unit-testable without a live QUIC connection: `Some(target)` when
+/// `shard_len` reaches the fair per-shard share, `None` otherwise.
+fn shard_sweep_target(shard_len: usize, fair_cap: usize) -> Option<usize> {
+    // Floored here so no future caller can inherit a zero share (and the
+    // trigger with it) from a tiny `fair_cap`; the production caller is
+    // already clamped via `fair_sess_cap`, this is defense in depth.
+    let fair_shard = (fair_cap / SESS_SHARDS).max(1);
+    if shard_len >= fair_shard {
+        Some(LOCAL_SESS_TARGET_SHARD.min(fair_shard))
+    } else {
+        None
+    }
+}
+
+/// Remove up to `over` ranked candidates that are *still* idle, skipping the
+/// live ones for a later insert or sweep.
+///
+/// The re-test is idleness against `now` — the same predicate as `take_idle`,
+/// not stamp equality: a touch stores through the coarse clock, so a touch in
+/// the same tick writes the identical value and equality is blind to it.
+fn evict_ranked(
+    w: &mut HashMap<u32, SessEntry>,
+    ranked: &[(u64, u32)],
+    over: usize,
+    now: u64,
+) -> Vec<SessEntry> {
+    let mut out = Vec::with_capacity(over);
+    for (_stamp, k) in ranked.iter().take(over) {
+        let idle = w.get(k).is_some_and(|e| {
+            now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
+        });
+        if idle {
+            if let Some(e) = w.remove(k) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
 fn sweep_local(w: &mut HashMap<u32, SessEntry>, target: usize) -> Vec<SessEntry> {
     let now = mono_millis();
-    let mut expired: Vec<u32> = Vec::new();
-    for (k, e) in w.iter() {
-        if now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS {
-            expired.push(*k);
-        }
-    }
-    let mut evicted: Vec<SessEntry> = Vec::with_capacity(expired.len());
-    for k in expired {
-        if let Some(e) = w.remove(&k) {
-            evicted.push(e);
-        }
-    }
-    let over = w.len().saturating_sub(target);
+    let expired: Vec<u32> = w
+        .iter()
+        .filter(|(_, e)| {
+            now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    // Same re-test as `sweep_all`: the touch lands lock-free after the scan,
+    // so an unconditional remove would evict a session that just went active.
+    // Expired entries go through unbounded — aborting idle readers is not a
+    // storm — while the 64 bound applies only to the ranked live candidates
+    // below, via the leftover allowance.
+    let mut evicted: Vec<SessEntry> = take_idle(w, &expired, now);
+    let over = w
+        .len()
+        .saturating_sub(target)
+        .min(SWEEP_LOCAL_MAX_EVICT.saturating_sub(evicted.len()));
     if over > 0 {
         let mut ranked: Vec<(u64, u32)> = w
             .iter()
@@ -1647,11 +1723,7 @@ fn sweep_local(w: &mut HashMap<u32, SessEntry>, target: usize) -> Vec<SessEntry>
         // Oldest stamp first; ties broken by key so the choice is deterministic.
         let nth = over.min(ranked.len()).saturating_sub(1);
         ranked.select_nth_unstable(nth);
-        for (_, k) in ranked.iter().take(over) {
-            if let Some(e) = w.remove(k) {
-                evicted.push(e);
-            }
-        }
+        evicted.extend(evict_ranked(w, &ranked, over, now));
     }
     evicted
 }
@@ -1801,17 +1873,25 @@ fn sess_memo_put(
     });
 }
 
-/// Drop the memo when it still points at `(conn, sess)`. Called by a reply
-/// reader as it exits, so the next inbound packet for that session recreates it
-/// instead of sending into a socket nobody reads.
-fn sess_memo_forget(conn: usize, sess: u32) {
+/// Drop the memo when it still points at this reader generation. Called by a
+/// reply reader as it exits, so the next inbound packet for that session
+/// recreates it instead of sending into a socket nobody reads.
+///
+/// The slot is cleared only when it still names the exiting reader's own
+/// socket (same allocation, via `Weak::ptr_eq`): a session recreated after
+/// this reader started carries a freshly bound socket, so clearing on
+/// `(conn, sess)` alone wiped the *new* session's memo when the old reader
+/// exited after the recreate. A false clear only costs one table slow path
+/// (the table re-put fills the memo again); a false keep would serve a dead
+/// socket, and the lookup already treats that as `Stale`.
+fn sess_memo_forget(conn: usize, sess: u32, sock: &Arc<tokio::net::UdpSocket>) {
     SESS_MEMO.with(|c| {
         let mut m = c.borrow_mut();
         let idx = sess_memo_idx(conn, sess);
-        if m[idx]
-            .as_ref()
-            .is_some_and(|x| x.conn == conn && x.sess == sess)
-        {
+        let expected = Arc::downgrade(sock);
+        if m[idx].as_ref().is_some_and(|x| {
+            x.conn == conn && x.sess == sess && std::sync::Weak::ptr_eq(&x.sock, &expected)
+        }) {
             m[idx] = None;
         }
     });
@@ -2050,7 +2130,7 @@ async fn sess_reader_task(
             DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
         }
     }
-    sess_memo_forget(conn_id, s);
+    sess_memo_forget(conn_id, s, &rs);
     {
         let sh = ss2.shard(s);
         let mut w = lock_write(sh);
@@ -2164,7 +2244,12 @@ async fn get_or_create_sess(
     // amplifier any peer can drive with fabricated session ids, for a sweep
     // that can only ever free sessions that went idle >= SESS_IDLE_MS ago.
     let fair_cap = fair_sess_cap();
-    if ss.len() >= fair_cap {
+    // Measured once: `len` takes all 8 shard read locks, and past the cap
+    // every further new-session datagram reaches this branch, so a second
+    // measurement per forged packet is pure lock traffic. Re-measure only
+    // after a sweep actually ran (it may have freed sessions).
+    let n = ss.len();
+    if n >= fair_cap {
         thread_local! {
             static LAST_FAIR_SWEEP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         }
@@ -2181,8 +2266,11 @@ async fn get_or_create_sess(
         if due {
             let evicted = ss.sweep_all(now);
             abort_evicted(evicted);
-        }
-        if ss.len() >= fair_cap {
+            if ss.len() >= fair_cap {
+                dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                return None;
+            }
+        } else {
             dgram_drops::bump(&dgram_drops::SESSION_FULL);
             return None;
         }
@@ -2275,11 +2363,13 @@ async fn get_or_create_sess(
         }
         // Per-connection cap is enforced on the owning shard; shards share the
         // cap evenly so no single shard lock ever scans the whole table. The
-        // target also respects the live fair share, so an over-cap shard
-        // converges toward it instead of only toward the static maximum.
-        let fair_shard = fair_sess_cap() / SESS_SHARDS;
-        if w.len() >= LOCAL_SESS_MAX / SESS_SHARDS {
-            swept = sweep_local(&mut w, LOCAL_SESS_TARGET_SHARD.min(fair_shard.max(1)));
+        // trigger and the target both follow the live fair share, so an
+        // over-share shard reaps its expired sessions toward it instead of
+        // waiting for the static maximum. Live over-share is left alone while
+        // active (see `SWEEP_LOCAL_MAX_EVICT`); the global semaphore caps the
+        // true total.
+        if let Some(target) = shard_sweep_target(w.len(), fair_sess_cap()) {
+            swept = sweep_local(&mut w, target);
         }
         let dead = h_pre.is_finished();
         w.insert(
@@ -2908,14 +2998,19 @@ mod tests {
     }
 
     /// Over the per-shard target, the sessions that go are the longest-idle
-    /// ones. Arbitrary (hash-order) eviction killed sessions that were active
-    /// milliseconds ago while sessions idle for minutes survived, and the case is
-    /// reachable rather than theoretical: the client's association cap is aligned
-    /// to the per-connection target, so crossing the cap means every session is
-    /// live. `sweep_local` takes the target as a parameter so this needs six
-    /// sessions instead of 504.
+    /// expired ones; live sessions are spared however far over target the
+    /// shard is (see `evict_ranked`). Arbitrary (hash-order) eviction killed
+    /// sessions that were active milliseconds ago while sessions idle for
+    /// minutes survived, and the case is reachable rather than theoretical:
+    /// the client's association cap is aligned to `LOCAL_SESS_TARGET`, so
+    /// crossing the cap means every session is live. `sweep_local` takes the
+    /// target as a parameter so the live part needs six sessions instead of
+    /// 504; the expired-order part uses synthetic stamps (a fast test process
+    /// is never 180 s old, so no wall-clock stamp reads expired).
     #[tokio::test]
     async fn over_cap_eviction_takes_the_longest_idle_first() {
+        use std::sync::atomic::Ordering;
+
         let mut m: HashMap<u32, SessEntry> = HashMap::new();
         // Keys 0..6 with ascending idle times: 0 is the oldest (most idle).
         for (k, idle) in [(0u32, 60_000u64), (1, 50_000), (2, 40_000), (3, 30_000)] {
@@ -2925,14 +3020,45 @@ mod tests {
         m.insert(4, capped_session(5));
         m.insert(5, capped_session(1));
 
+        // All live, over target: nothing goes. Headroom is reclaimed on
+        // expiry, never by killing an active session for it.
         let evicted = sweep_local(&mut m, 4);
-        assert_eq!(evicted.len(), 2, "the shard must come back to its target");
+        assert!(evicted.is_empty(), "live over-share is spared while active");
+        assert_eq!(m.len(), 6);
+
+        // Idle-first order among the expired, live skipped: synthetic `now`.
+        let now: u64 = 2_000_000;
+        m.get(&0)
+            .unwrap()
+            .last
+            .store(now - SESS_IDLE_MS - 60_000, Ordering::Relaxed);
+        m.get(&1)
+            .unwrap()
+            .last
+            .store(now - SESS_IDLE_MS - 10_000, Ordering::Relaxed);
+        m.get(&2)
+            .unwrap()
+            .last
+            .store(now - 40_000, Ordering::Relaxed);
+        m.get(&3)
+            .unwrap()
+            .last
+            .store(now - 30_000, Ordering::Relaxed);
+        m.get(&4).unwrap().last.store(now - 5, Ordering::Relaxed);
+        m.get(&5).unwrap().last.store(now - 1, Ordering::Relaxed);
+        let mut ranked: Vec<(u64, u32)> = m
+            .iter()
+            .map(|(k, e)| (e.last.load(Ordering::Relaxed), *k))
+            .collect();
+        ranked.sort_unstable();
+        let evicted = evict_ranked(&mut m, &ranked, 4, now);
+        assert_eq!(evicted.len(), 2, "only the expired go; live are skipped");
         let mut left: Vec<u32> = m.keys().copied().collect();
         left.sort_unstable();
         assert_eq!(
             left,
             vec![2, 3, 4, 5],
-            "the two longest-idle sessions go; the fresh ones stay"
+            "the two longest-idle sessions go; the live ones stay"
         );
 
         // At or under the target nothing is evicted, however idle it is: the
@@ -2943,6 +3069,194 @@ mod tests {
         }
         assert!(sweep_local(&mut m, 4).is_empty());
         assert_eq!(m.len(), 4);
+    }
+
+    /// Expired entries go through `take_idle` unbounded: 70 idle sessions are
+    /// all reaped in one call, because aborting idle readers is not a storm.
+    /// The old truncation reaped only the first 64 and left provably-dead
+    /// entries behind. Stamps and `now` are synthetic (see above).
+    #[tokio::test]
+    async fn sweep_local_reaps_all_expired_in_one_call() {
+        use std::sync::atomic::Ordering;
+
+        let now: u64 = 3_000_000;
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        for k in 0..70u32 {
+            m.insert(k, capped_session(1));
+            m.get(&k).unwrap().last.store(0, Ordering::Relaxed);
+        }
+        // The scan as `sweep_local` performs it: every session reads idle.
+        let keys: Vec<u32> = m
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.last.load(Ordering::Relaxed)) >= SESS_IDLE_MS)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(keys.len(), 70);
+        // The exact removal `sweep_local` runs on its expired set: no bound.
+        let evicted = take_idle(&mut m, &keys, now);
+        assert_eq!(evicted.len(), 70);
+        assert!(m.is_empty());
+    }
+
+    /// `sweep_local` must re-test each expired key with the same `now` before
+    /// removing it, exactly like `sweep_all` does through `take_idle`. The old
+    /// body removed the scanned keys unconditionally, so a session touched
+    /// after the scan — a touch lands lock-free, without the write guard —
+    /// was evicted and its freshly started reader aborted.
+    ///
+    /// Stamps are synthetic: `mono_millis` is process uptime, so a fast test
+    /// process can never be 180 s old and no wall-clock stamp reads expired.
+    /// `take_idle` is the exact removal `sweep_local` delegates its expired
+    /// path to, with the same `now` the scan used.
+    #[tokio::test]
+    async fn sweep_local_rechecks_idle_before_removing() {
+        use std::sync::atomic::Ordering;
+
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        m.insert(1, capped_session(1));
+        let last = m.get(&1).unwrap().last.clone();
+        // A sweep that starts well past the session's idle deadline.
+        let now: u64 = 1_000_000;
+        last.store(0, Ordering::Relaxed);
+        // The scan as `sweep_local` performs it: the session reads idle.
+        let keys: Vec<u32> = m
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.last.load(Ordering::Relaxed)) >= SESS_IDLE_MS)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(keys, vec![1]);
+        // The client's next datagram lands before the removal.
+        last.store(now, Ordering::Relaxed);
+        // Unconditional removal would evict it here; the re-test keeps it.
+        assert!(take_idle(&mut m, &keys, now).is_empty());
+        assert!(m.contains_key(&1));
+        // End to end: a just-touched session is never expired by `sweep_local`
+        // (its stamp is at/after the sweeper's instant, as a real touch is).
+        last.store(mono_millis(), Ordering::Relaxed);
+        assert!(sweep_local(&mut m, 4).is_empty());
+        assert!(m.contains_key(&1));
+    }
+
+    /// The over-cap ranking is a snapshot too: a session touched after it was
+    /// ranked must be skipped, not evicted — even when the touch stored the
+    /// identical stamp (a same-tick touch through the coarse clock), which is
+    /// why the re-test is idleness against `now` rather than stamp equality.
+    /// Stamps and `now` are explicit so the test never depends on the wall
+    /// clock; the equality re-test fails the same-stamp case below.
+    #[tokio::test]
+    async fn evict_ranked_skips_sessions_touched_after_ranking() {
+        use std::sync::atomic::Ordering;
+
+        let now: u64 = 1_000_000;
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        m.insert(0, capped_session(1));
+        m.insert(1, capped_session(1));
+        m.get(&0).unwrap().last.store(999_000, Ordering::Relaxed);
+        m.get(&1).unwrap().last.store(999_500, Ordering::Relaxed);
+        // Ranked oldest-first, as `sweep_local` does; both live at `now`.
+        let ranked: Vec<(u64, u32)> = vec![(999_000, 0), (999_500, 1)];
+        // The top victim is touched after the ranking but inside the same
+        // tick, so the stored value does not move — equality is blind to it.
+        m.get(&0).unwrap().last.store(999_000, Ordering::Relaxed);
+        assert!(
+            evict_ranked(&mut m, &ranked, 2, now).is_empty(),
+            "a same-stamp touch must still survive"
+        );
+        assert!(m.contains_key(&0));
+        assert!(m.contains_key(&1));
+        // Expired entries still go through the same ranking.
+        m.get(&0)
+            .unwrap()
+            .last
+            .store(now - SESS_IDLE_MS - 1, Ordering::Relaxed);
+        let ranked: Vec<(u64, u32)> = vec![(now - SESS_IDLE_MS - 1, 0), (999_500, 1)];
+        let evicted = evict_ranked(&mut m, &ranked, 2, now);
+        assert_eq!(evicted.len(), 1);
+        assert!(!m.contains_key(&0));
+        assert!(m.contains_key(&1));
+    }
+
+    /// Below the static per-shard ceiling the sweep must already fire once the
+    /// shard reaches its fair share: with 32 session holders the fair cap is
+    /// 256 (32 per shard), so a shard at 400 sweeps instead of waiting for 512.
+    #[test]
+    fn fair_shard_trigger_fires_below_the_static_shard_cap() {
+        assert_eq!(shard_sweep_target(400, 256), Some(32));
+        assert_eq!(shard_sweep_target(512, 256), Some(32));
+        assert_eq!(shard_sweep_target(31, 256), None);
+        // A lone holder keeps the static per-shard target.
+        assert_eq!(
+            shard_sweep_target(512, LOCAL_SESS_MAX),
+            Some(LOCAL_SESS_TARGET_SHARD)
+        );
+        assert_eq!(shard_sweep_target(511, LOCAL_SESS_MAX), None);
+        // Defense in depth: the floor lives inside the helper, so a tiny
+        // `fair_cap` can never produce a zero share (and a trigger on it).
+        assert_eq!(shard_sweep_target(0, 0), None);
+        assert_eq!(shard_sweep_target(1, 0), Some(1));
+        assert_eq!(shard_sweep_target(5, 7), Some(1));
+    }
+
+    /// One insert aborts at most the per-insert bound of ranked candidates —
+    /// and live ones are spared outright (see `evict_ranked`), so a shard of
+    /// 512 live sessions against a fair target of 32 loses none here. A
+    /// quiescent live over-share is accepted; the global semaphore caps the
+    /// true total.
+    #[tokio::test]
+    async fn fair_shard_eviction_is_bounded_per_insert() {
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        for k in 0..512u32 {
+            m.insert(k, capped_session(5));
+        }
+        let target = shard_sweep_target(512, 256).unwrap();
+        assert_eq!(target, 32);
+        let evicted = sweep_local(&mut m, target);
+        assert!(
+            evicted.len() <= SWEEP_LOCAL_MAX_EVICT,
+            "one sweep must not abort the whole over-share: {} > {}",
+            evicted.len(),
+            SWEEP_LOCAL_MAX_EVICT
+        );
+        assert_eq!(m.len() + evicted.len(), 512);
+    }
+
+    /// A reader that exits after its session was recreated must not clear the
+    /// new generation's memo. The old `forget` matched on `(conn, sess)` alone,
+    /// so the exiting old reader wiped the recreated session's entry and its
+    /// datagrams fell through to a table miss.
+    #[tokio::test]
+    async fn sess_memo_forget_never_wipes_a_recreated_memo() {
+        use std::sync::atomic::AtomicU64;
+
+        let old_sock = memo_sock();
+        let new_sock = memo_sock();
+        sess_memo_put(
+            9,
+            3,
+            old_sock.clone(),
+            Arc::new(AtomicU64::new(1)),
+            live_reader(),
+        );
+        // Same (conn, sess), new socket and reader: the recreated session.
+        sess_memo_put(
+            9,
+            3,
+            new_sock.clone(),
+            Arc::new(AtomicU64::new(2)),
+            live_reader(),
+        );
+        // The old reader exits after the recreate.
+        sess_memo_forget(9, 3, &old_sock);
+        match sess_memo_lookup(9, 3) {
+            SessHit::Fresh(s, _, _) => assert!(
+                Arc::ptr_eq(&s, &new_sock),
+                "the recreated memo must survive the old reader's forget"
+            ),
+            _ => panic!("the recreated memo must survive the old reader's forget"),
+        }
+        // The new generation's own forget still clears.
+        sess_memo_forget(9, 3, &new_sock);
+        assert!(matches!(sess_memo_lookup(9, 3), SessHit::Miss));
     }
 
     /// Session ids are allocated per client and every client hub counts from 1,
@@ -2967,9 +3281,9 @@ mod tests {
         }
         assert!(matches!(sess_memo_lookup(1, 8), SessHit::Miss));
 
-        sess_memo_forget(2, 7);
+        sess_memo_forget(2, 7, &a);
         assert!(matches!(sess_memo_lookup(1, 7), SessHit::Fresh(..)));
-        sess_memo_forget(1, 7);
+        sess_memo_forget(1, 7, &a);
         assert!(matches!(sess_memo_lookup(1, 7), SessHit::Miss));
 
         sess_memo_put(2, 7, b.clone(), last, live_reader());

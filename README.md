@@ -159,6 +159,22 @@ Its `dist/` artifacts are rebuilt from this revision and statically checked (`fi
 plus per-level `objdump`, plus a byte-identical second build), again not run under
 emulation or natively.
 
+The current pass fixes six findings from another two-round review — a lock/sweep
+audit of the session, DNS and pool paths, with the second round tasked to falsify
+(one finding split, four severities revised down before anything was touched): the
+over-cap sweeper re-checks idleness before removing (a lock-free touch landing
+between scan and removal no longer kills a live session), the per-shard sweep
+trigger follows the live fair share instead of the static 512 with per-insert
+eviction bounded at 64, the session-memo forget is guarded by socket identity so an
+old reader's exit cannot wipe a recreated session's memo, DNS shard-mutex
+contention is counted apart instead of reported as resolution-in-flight and the
+single-flight registration fails fast instead of parking, the client's `live` bit
+is folded into the same `rcu` decision as the slot clear, and the auth write gets
+the same 5 s deadline every other dial stage honors — see
+[pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout).
+Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
+plus per-level `objdump`), again not run under emulation or natively.
+
 ---
 
 ## Table of Contents
@@ -179,7 +195,7 @@ emulation or natively.
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -540,6 +556,7 @@ before every run):
 | 52 | Pass 28 — bounded stream-head writes, refused-datagram accounting, SOCKS header size. `cargo test --all-targets` **99/99** (53 lib + 28 client + 18 server; **98/98** with `--no-default-features`: 52 + 28 + 18), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two review rounds confirmed four findings before any edit; two were dispositioned as non-issues (an unreachable fragment-branch, and malformed-frame drops staying uncounted per pass 26's documented decision). Changes: client MQP-2 stream-head write and server TCP-open ACK write each under a 5 s `timeout` (failure resets/tears the flow down before the optimistic SOCKS success, answering `0x04` on the client); `SOCKS_UDP_HDR_MAX` 22 → 262 (worst-case domain header); new batched `dgram_drops::REFUSED` wired through `bump`/`flush_locals`/`snapshot`/`since`/`lost()`, bumped at five policy-refusal sites (server negative cache, both SSRF arms, `sess == 0` — reclassified off `SESSION_FULL` — and the client's domain-reply refusals) and printed in both 60 s `udp budget` lines; `every_drop_counter_has_its_own_snapshot_field` extended to all seven counters (`lost() >= 7`). `dist/` rebuilt for all four CPU levels (servers 4 344 544–4 373 480 B, clients 4 379 536–4 403 000 B; `file` confirms static musl + stripped on all eight, `objdump -d` finds 273/235 `zmm` refs in the v4 server/client and none in v1–v3). Client levels come out 38 824–42 224 B *smaller* than the pass-27 recorded figures and server levels −3 680…+1 424 B, a code-size move this pass's additions do not by themselves explain — the recipe and feature set are unchanged, `Cargo.lock` is untouched, and the pre-rebuild `dist/` files already sat at ~4.39/4.36 MB rather than the pass-27 recorded sizes. No native E2E or benchmark re-run: wire-compatible throughout (timeout paths and counters only) | ✅ |
 | 53 | Pass 29 — replay-safe auth, reply-source validation, DNS parity, truncation counting, session fairness. `cargo test --all-targets` **102/102** (53 lib + 28 client + 21 server; **101/101** with `--no-default-features`: 52 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review (round two tasked to falsify; three candidates rejected): token sent at 1-RTT only, per-session reply allowlist, per-association app lock, full-set DNS fallback on the UDP fast path, `TOO_LARGE` on relay truncations, live fair-share session gate. New regression tests: `reply_allowlist_accepts_only_recorded_destinations`, `resolve_pin_withholds_a_filtered_cached_address`, `fair_share_splits_the_global_budget_across_live_connections`. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness) | ✅ |
 | 54 | Pass 31 — per-direction stall, symmetric ACK reset, enum warn slots, fail-fast dial. `cargo test --all-targets` **104/104** (55 lib + 28 client + 21 server; **103/103** with `--no-default-features`: 54 + 28 + 21), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round review plus an independent oracle re-verification (5 PASS / 1 FAIL; the FAIL — per-direction stall killing healthy half-idle flows — fixed as an AND gate with the shared stamp and re-verified PASS): per-direction pump stall stamps gated on shared-stamp expiry, server ACK failure resets like dial failures, `warn_datagram_drop` substring slots moved to `DatagramDropKind`, dial-ACK bound-address validation, `wait_conn` trusting `close_reason()` with exponential dispatcher backoff, fail-fast server dial permit with its own counters. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) | ✅ |
+| 55 | Pass 32 — sweep re-check, fair-shard trigger, memo guard, DNS contention, live atomicity, auth timeout, plus ten post-fix residuals. `cargo test --all-targets` **117/117** (60 lib + 30 client + 27 server; **116/116** with `--no-default-features`: 59 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round lock/sweep review (round two tasked to falsify; one finding split, four severities revised down): over-cap sweeper re-tests idleness via `take_idle` plus a stamp-equality `evict_ranked`, the shard trigger follows the live fair share (`shard_sweep_target`) with per-insert eviction bounded at 64, `sess_memo_forget` takes the exiting socket and clears only on `Weak::ptr_eq`, DNS contention gets its own `DNS_CONTENTION` counter with a `try_lock` fail-fast register, the client folds `live=false` into the `rcu` clear (`clear_if_and_mark_dead` with a retry tail), and the auth write is wrapped in the same 5 s timeout as the stream-head write. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -670,23 +687,23 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 31's per-direction pump stall stamps, the
-symmetric ACK reset, the enum warn slots, the dial-ACK validation, the
-`close_reason()`-first `wait_conn` with dispatcher backoff, and the fail-fast dial
-permit — on top of everything pass 30 shipped) with the default feature set, so the
+rebuilt from the current revision (pass 32's sweep re-check with bounded eviction,
+the fair-shard trigger, the memo `Weak::ptr_eq` guard, the DNS contention counter
+with fail-fast register, the client's `live`-in-`rcu` clear, and the auth-write
+timeout — on top of everything pass 31 shipped) with the default feature set, so the
 relay counters are **on** in these builds: static musl, x86-64, stripped — servers
-4 352 472–4 381 280 B (v1 4 371 416, v2 4 352 472, v3 4 381 280, v4 4 378 016) and
-clients 4 376 320–4 399 960 B (v1 4 391 504, v2 4 376 320, v3 4 399 960, v4 4 392 008).
-Against the pass-30 *recorded* figures that is **−2 488…−2 616 B** per server level
-and **−392…−1 352 B** per client level — recorded as measured, not explained: the
-additions (stall stamps, enum, counters) predict growth, and LTO/inlining swings of
-this size have been seen before (see the pass-28 note below). Two independent
-four-level builds came out byte-identical (`cmp` equal for all eight files; the
-second ran after `cargo clean -p myquic2`, so no level could be reused from
-cache). `file` confirms ELF 64-bit LSB x86-64, statically linked, stripped on all
-eight, and `objdump -d` finds 283 `zmm` refs in the v4 server and 235 in the v4
-client with none in v1–v3 of either binary (`ymm` 3 978 → 25 397/26 835 from v1 to
-v3), so each `target-cpu` level really is compiled in. What was **not** repeated is any emulated or native run of the shipped
+4 355 432–4 383 792 B (v1 4 374 184, v2 4 355 432, v3 4 383 792, v4 4 380 656) and
+clients 4 378 880–4 402 648 B (v1 4 394 000, v2 4 378 880, v3 4 402 648, v4 4 394 824).
+Against the pass-31 *recorded* figures that is **+2 512…+2 960 B** per server level
+and **+2 496…+2 816 B** per client level — growth in line with the additions (the
+sweep/evict helpers, the contention counter, the atomic clear helper, the retry
+wrapper and the timeout/reset paths). Two four-level builds ran this pass (pre-
+and post-residual trees); the shipped eight come from a single build of the final
+tree (no byte-identical second build of it). `file` confirms ELF 64-bit LSB x86-64,
+statically linked, stripped on all eight, and `objdump -d` finds 283 `zmm` refs in
+the v4 server and 235 in the v4 client with none in v1–v3 of either binary (`ymm`
+3 978 → 25 395/26 855 from v1 to v3), so each `target-cpu` level really is
+compiled in. What was **not** repeated is any emulated or native run of the shipped
 pairs — the verification below applies to the native release build, and a target that
 needs a loadable binary should be validated on the target. The pass-30 rebuild note is
 kept verbatim below (its figures are pass 30's); pass-28/27/26 follow. Against the pass-27
@@ -3276,6 +3293,111 @@ in v1–v3 of either binary (`ymm` 3 978 → 25 397/26 835 from v1 to v3), so ea
 pairs was performed — a target that needs a loadable binary should be validated on
 the target.
 
+### 2026-09 hardening pass 32 — sweep re-check, fair-shard trigger, memo guard, DNS contention, live atomicity, and auth timeout
+
+A two-round review of the session, DNS and pool paths (the second round tasked to
+falsify) confirmed six findings; one was split and four were revised down before
+anything was touched. No wire change: no frame, framing, ALPN or protocol-field
+byte moves, so mixed old/new pairs keep working.
+
+**1. The over-cap sweeper killed sessions it had just seen go active.** `sweep_local`
+scanned for expired keys and removed them unconditionally — and the code comment
+claimed the single write guard gave the re-check for free. It does not: the touch
+lands through a lock-free atomic stamp (`touch_session_throttled` takes no table
+lock), so it can land between the scan and the removal with the guard held. Expired
+keys now go through the same `take_idle` re-test `sweep_all` uses, with the same
+`now`, and the ranked over-cap candidates go through a new `evict_ranked` helper
+that removes only when the stamp still equals its ranked stamp. The misleading
+comment is corrected to state the lock-free hazard.
+
+**2. The per-shard fair-share gate waited for the static cap, then evicted ~480 at
+once.** The trigger was `w.len() >= 512` instead of the fair per-shard share, so a
+shard 12x over its fair share swept nothing — and when it did fire with a small
+fair share, one insert aborted every reader on the shard. Both the trigger and the
+target now come from a pure helper, `shard_sweep_target(w.len(), fair_sess_cap())`,
+and one `sweep_local` call removes at most `SWEEP_LOCAL_MAX_EVICT = 64` entries
+(expired first, over-cap remainder after); the rest converges over later inserts
+and the throttled `sweep_all`. The aggregate fair path is untouched, and the
+idle-first `select_nth_unstable` ranking is kept.
+
+**3. The session-memo forget wiped a recreated session's memo.** The table removal
+was guarded by `Arc::ptr_eq`, but the adjacent memo clear matched on `(conn, sess)`
+alone, so an old reader exiting after a recreate erased the new memo. `forget` now
+takes the exiting reader's socket and clears only on `Weak::ptr_eq` — the same
+discipline as the table path. A missed clear costs one table slow path; a false
+clear is what was removed.
+
+**4. DNS shard-mutex contention was reported as resolution-in-flight, and the
+register path parked.** `dns_is_inflight` returned `true` on `WouldBlock`, so a
+contended mutex dropped datagrams as `DNS_INFLIGHT` without spawning any resolver,
+and `resolve_all_cached` registered under a blocking `lock_mutex`. The probe is now
+three-state (`DnsInflight::{Inflight, Absent, Contended}`; the old bool delegates
+to it, so unchanged callers get the fix), contention gets its own batched
+`dgram_drops::DNS_CONTENTION` counter with full snapshot/report wiring, the server
+falls through to the limiter-bounded spawn path on `Contended` instead of
+returning, and registration uses `try_lock_mutex` with a `DnsContended` fail-fast
+error. Owner/cancel semantics are untouched.
+
+**5. The client's `open_bi` failure path could mark a fresh connection dead.**
+`clear_if` was atomic via `rcu`, but the trailing `live.store(false)` ran after it
+returned — a concurrent `publish` of a different `stable_id` landing in between
+left `(shared == fresh, live == false)` until the fresh connection died. The new
+`clear_if_and_mark_dead` folds the store into the `rcu` closure on the path that
+commits to `None`, with a `marked && !cleared` tail that restores `true` when a
+losing first run stored `false` before retrying against the fresh connection. The
+single-writer teardown path is byte-identical.
+
+**6. The auth write had no deadline.** `open_uni` was bounded at 5 s but
+`write_all(token)` was not, so a stall there parked the slot's dial loop past
+`DIAL_ATTEMPT_TIMEOUT` to the QUIC idle timeout. It is wrapped in the same 5 s
+timeout as the TCP stream-head write; the error fails the attempt and nothing is
+published. Reachability is narrow (256 B always fits a fresh window) — a
+one-line omission fix.
+
+Falsified-and-downgraded during review (kept as documented, not shipped as P0):
+the mass-evict half of the fair-share finding (convergence toward a newly small
+fair share is intended, and it is idle-first — only the static trigger and the
+unbounded single-insert eviction shipped), the DNS "resolution suppression"
+(registration critical sections are microseconds, so starvation self-corrects per
+packet — only the misclassification and the parking shipped), and the memo/auth
+items (perf-only and narrow-window respectively, fixed opportunistically).
+
+Verification: `cargo test --all-targets` **117/117** (60 lib + 30 client + 27
+server) and **116/116** with `--no-default-features`; `cargo clippy --all-targets
+-- -D warnings` and `cargo fmt --check` clean on both feature sets. Thirteen new
+regression tests (five lib, two client, six server), each verified against the old
+logic. No native E2E or benchmark re-run: no success-path decision moved on the
+wire.
+
+Post-fix re-verification ran two more rounds on the fixed tree. Round-1 (confirm)
+returned 6/6 FIXED with no wiring omissions. Round-2 (falsify) returned ten
+findings, all closed in this revision: the teardown loop still used the old
+two-step — the exact blackhole through the unconverted path, now on the new helper
+(the P0); `evict_ranked` compared stamp equality, blind to same-tick touches (now
+an idleness re-test); expired entries were truncated to 64 alongside live ones
+(now unbounded expired, bound only on live); the convergence comment overclaimed
+`sweep_all` (corrected: quiescent live over-share is accepted, the semaphore caps
+the true total); the fair-cap gate measured `ss.len()` twice per packet (now once);
+the shard helper floors `max(1)` internally; the TCP path yields and retries once
+on contention instead of resetting a healthy flow; `DNS_CONTENTION` is direct-
+`fetch_add` exact like the egress counters; the client's resolver bump and the
+stale probe comment are fixed; and the auth error arm resets the stream instead of
+dropping a partial-token FIN. The tail-restore transient (stale-true, self-heals
+via `close_reason()`) was verified harmless and kept.
+
+`dist/`: **rebuilt from this revision and statically checked.** All four CPU levels
+were cross-compiled with the documented `cargo zigbuild` recipe (static musl,
+x86-64, default feature set) into `dist/openwrt-x86_64/`: servers 4 355 432–
+4 383 792 B (v1 4 374 184, v2 4 355 432, v3 4 383 792, v4 4 380 656) and clients
+4 378 880–4 402 648 B (v1 4 394 000, v2 4 378 880, v3 4 402 648, v4 4 394 824) —
+**+2 512…+2 960 B** per server level and **+2 496…+2 816 B** per client level
+against the pass-31 recorded figures, in line with the additions (two builds ran
+this pass, pre- and post-residual trees; the shipped eight are one build of the
+final tree, no byte-identical second build of it). `file` confirms ELF 64-bit LSB
+x86-64, statically linked, stripped on all eight; `objdump -d` finds 283 `zmm`
+refs in the v4 server and 235 in the v4 client with none in v1–v3 (`ymm` 3 978 →
+25 395/26 855 from v1 to v3). No emulated or native run of the shipped pairs.
+
 ---
 
 ## Roadmap
@@ -3317,6 +3439,11 @@ the target.
 - [x] Client inbound: dispatcher writes the relay socket directly; the per-association `mpsc` queue, its `Full` drop mode and the reply task are gone, with one connection-wide reassembler per dispatcher (pass 23)
 - [x] `udpmulti` / `udpraw` / `udpsweep` / `tcpecho` / `chan` bench modes + 8-socket `SO_REUSEPORT` echo target (pass 23)
 - [x] DNS memo widened to 128 slots / 2-way (31 % → 0 % penetration at 32 domains per thread) and the server's per-datagram domain re-resolution replaced by a name-keyed per-session destination memo (see the cache-substitution evaluation)
+- [x] Over-cap session sweeper re-checks idleness (`take_idle` + stamp-equality `evict_ranked`) so a lock-free touch between scan and removal no longer kills a live session (pass 32)
+- [x] Per-shard sweep trigger follows the live fair share (`shard_sweep_target`) with per-insert eviction bounded at 64 instead of aborting ~480 readers at once (pass 32)
+- [x] Session-memo forget guarded by socket identity (`Weak::ptr_eq`) so an old reader's exit cannot wipe a recreated session's memo (pass 32)
+- [x] DNS shard-mutex contention counted apart (`dgram_drops::DNS_CONTENTION`, three-state probe) with a `try_lock` fail-fast single-flight register instead of parking (pass 32)
+- [x] Client `live` bit folded into the `rcu` slot clear (`clear_if_and_mark_dead`) plus a 5 s auth-write deadline matching every other dial stage (pass 32)
 - [ ] Re-evaluate DATAGRAM-reader batching if a future quinn exposes a batch receive API
       (measured useless with quinn 0.11: avg batch 1.06, see pass 5)
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the

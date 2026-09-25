@@ -1457,7 +1457,21 @@ pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore
     LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1024)))
 }
 
-pub fn dns_is_inflight(host: &str, port: u16) -> bool {
+/// Three-way outcome of a single-flight probe. `Contended` is distinct from
+/// `Inflight`: the shard mutex was busy, so nothing is known — the resolution
+/// may or may not be in flight. Collapsing it into `true` dropped datagrams
+/// (charged to `DNS_INFLIGHT`) for what was only lock contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsInflight {
+    /// The name is registered in the single-flight table.
+    Inflight,
+    /// The name is not registered.
+    Absent,
+    /// The shard mutex was busy: unknown, never inflight.
+    Contended,
+}
+
+pub fn dns_inflight_status(host: &str, port: u16) -> DnsInflight {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -1467,11 +1481,22 @@ pub fn dns_is_inflight(host: &str, port: u16) -> bool {
             &owned
         }
     };
-    // Packet path: contended => pretend inflight so we skip spawning instead
-    // of parking the worker on the singleflight mutex during a miss storm.
-    try_lock_mutex(dns_inflight_for(key))
-        .map(|inf| inf.contains_key(key))
-        .unwrap_or(true)
+    // Packet path: contended reads as unknown so the caller falls through to
+    // the limiter-bounded spawn path instead of parking on the shard mutex.
+    match try_lock_mutex(dns_inflight_for(key)) {
+        Some(inf) => {
+            if inf.contains_key(key) {
+                DnsInflight::Inflight
+            } else {
+                DnsInflight::Absent
+            }
+        }
+        None => DnsInflight::Contended,
+    }
+}
+
+pub fn dns_is_inflight(host: &str, port: u16) -> bool {
+    dns_inflight_status(host, port) == DnsInflight::Inflight
 }
 
 pub fn mono_millis() -> u64 {
@@ -1947,6 +1972,52 @@ fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
     }
 }
 
+/// Single-flight registration hit a contended shard mutex. Distinct from a
+/// failed lookup: nothing is known (the resolution may or may not be in
+/// flight), so callers fail fast down the spawn path and count
+/// `dgram_drops::DNS_CONTENTION` instead of charging a budget or policy
+/// counter for what was only lock contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsContended;
+
+impl std::fmt::Display for DnsContended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dns single-flight shard contended")
+    }
+}
+
+impl std::error::Error for DnsContended {}
+
+/// Whether `err` is a [`DnsContended`] fail-fast from single-flight
+/// registration, as opposed to a genuine resolution failure.
+pub fn is_dns_contended(err: &anyhow::Error) -> bool {
+    err.is::<DnsContended>()
+}
+
+/// Resolve with one fail-fast retry on single-flight contention, for callers
+/// with no spawn fallback — the server TCP dial path only. UDP paths spawn a
+/// resolver task on contention and must not use this.
+///
+/// A `DnsContended` here would otherwise kill a healthy TCP flow over
+/// microseconds of shard-mutex hold time: the register critical section is one
+/// hash lookup plus insert (no I/O), so yielding once lets the holder drain
+/// and only a second *consecutive* contention fails the caller. The first
+/// contention is counted even when the retry succeeds — the mutex was
+/// genuinely busy, and the count is what makes a miss storm visible.
+pub async fn resolve_all_cached_with_contention_retry(
+    host: &str,
+    port: u16,
+) -> Result<Arc<[SocketAddr]>> {
+    match resolve_all_cached(host, port).await {
+        Err(e) if is_dns_contended(&e) => {
+            dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+            tokio::task::yield_now().await;
+            resolve_all_cached(host, port).await
+        }
+        r => r,
+    }
+}
+
 pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
     // Stack-built key: no allocation on the positive-cache fast path. The
     // fallback only triggers for hosts longer than the 255-byte wire limit.
@@ -1986,7 +2057,13 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     //    waiter re-claims it, so no waiter can sleep forever on a cell that
     //    nobody will ever fill.
     let entry = {
-        let mut inf = lock_mutex(dns_inflight_for(key));
+        // Fail fast: parking this task on the shard mutex during a miss storm
+        // would hold its slow-path permit (TCP) or stall the reply (spawned
+        // UDP) for what is only lock contention. The caller counts the
+        // `DnsContended` error as `DNS_CONTENTION` and takes the spawn path.
+        let Some(mut inf) = try_lock_mutex(dns_inflight_for(key)) else {
+            return Err(DnsContended.into());
+        };
         match inf.get(key) {
             Some(c) => c.clone(),
             None => {
@@ -2396,6 +2473,13 @@ pub mod dgram_drops {
     /// because charging relay loss to a budget counter is exactly the
     /// misreport that counter's note warns about.
     pub static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+    /// The single-flight shard mutex (probe or registration) was contended, so
+    /// nothing was known and the caller took the spawn path instead of waiting.
+    /// Counted apart from `DNS_INFLIGHT` (which means "another resolution owns
+    /// this name") because lock contention is not resolution in flight, and
+    /// apart from `SESSION_FULL` because no budget was exhausted. Batched like
+    /// the other flood-type counters: a miss storm contends every datagram.
+    pub static DNS_CONTENTION: AtomicU64 = AtomicU64::new(0);
     /// No usable egress connection at the moment the datagram was ready: the
     /// dedicated UDP connection had not come up yet, was reconnecting, or the
     /// single-flight refresh was already owned by another thread. The client
@@ -2426,7 +2510,7 @@ pub mod dgram_drops {
     pub static REFUSED: AtomicU64 = AtomicU64::new(0);
 
     /// Every drop counter in one read, so the 60 s report cannot silently omit
-    /// one. Named fields rather than a tuple: a 6-tuple read at two call sites
+    /// one. Named fields rather than a tuple: a 9-tuple read at two call sites
     /// is exactly the shape that pairs a socket with the wrong field elsewhere
     /// in this codebase (see the client's `SessEntry` note).
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2435,6 +2519,7 @@ pub mod dgram_drops {
         pub buffer_full: u64,
         pub session_full: u64,
         pub dns_inflight: u64,
+        pub dns_contention: u64,
         pub no_egress: u64,
         pub egress_dead: u64,
         pub unknown_sess: u64,
@@ -2449,6 +2534,7 @@ pub mod dgram_drops {
                 buffer_full: d(self.buffer_full, prev.buffer_full),
                 session_full: d(self.session_full, prev.session_full),
                 dns_inflight: d(self.dns_inflight, prev.dns_inflight),
+                dns_contention: d(self.dns_contention, prev.dns_contention),
                 no_egress: d(self.no_egress, prev.no_egress),
                 egress_dead: d(self.egress_dead, prev.egress_dead),
                 unknown_sess: d(self.unknown_sess, prev.unknown_sess),
@@ -2470,6 +2556,7 @@ pub mod dgram_drops {
                 .saturating_add(self.buffer_full)
                 .saturating_add(self.session_full)
                 .saturating_add(self.dns_inflight)
+                .saturating_add(self.dns_contention)
                 .saturating_add(self.no_egress)
                 .saturating_add(self.egress_dead)
                 .saturating_add(self.refused)
@@ -2485,15 +2572,18 @@ pub mod dgram_drops {
     /// on its own thread, so a loss under 64 drops on a worker thread is not
     /// "delayed to the next report" — it stays invisible until that thread drops
     /// 63 more, and a thread that exits takes its pending count with it. Treat
-    /// those five as flood indicators, and the per-packet `warn` lines (which
+    /// those six as flood indicators, and the per-packet `warn` lines (which
     /// carry the total `bump` returned) as the immediate signal.
     ///
-    /// `no_egress` and `egress_dead` are exempt by construction: they are counted
-    /// with a direct `fetch_add` (see `bump`), so a two-second fail-closed outage
-    /// that drops twenty datagrams shows up in the very next report. That is
-    /// deliberate — they describe a discrete state of the egress connection, not a
-    /// flood, and they are the numbers an operator uses to decide whether
-    /// `udp_fail_closed` is costing them anything.
+    /// `no_egress`, `egress_dead` and `dns_contention` are exempt by
+    /// construction: they are counted with a direct `fetch_add` (see `bump`),
+    /// so a two-second fail-closed outage that drops twenty datagrams — or a
+    /// short contention episode that never reaches 64 events on one thread —
+    /// shows up in the very next report. That is deliberate: the first two
+    /// describe a discrete state of the egress connection, not a flood, and
+    /// contention episodes are discrete too (the exact flaw batching had for
+    /// the egress counters). One RMW per *dropped* datagram (never per sent
+    /// datagram) is the right price for numbers that have to be true.
     pub fn snapshot() -> DropSnapshot {
         flush_locals();
         DropSnapshot {
@@ -2501,6 +2591,7 @@ pub mod dgram_drops {
             buffer_full: BUFFER_FULL.load(Ordering::Relaxed),
             session_full: SESSION_FULL.load(Ordering::Relaxed),
             dns_inflight: DNS_INFLIGHT.load(Ordering::Relaxed),
+            dns_contention: DNS_CONTENTION.load(Ordering::Relaxed),
             no_egress: NO_EGRESS.load(Ordering::Relaxed),
             egress_dead: EGRESS_DEAD.load(Ordering::Relaxed),
             unknown_sess: UNKNOWN_SESS.load(Ordering::Relaxed),
@@ -2583,8 +2674,8 @@ pub mod dgram_drops {
     /// arm here *and* its own `flush_locals` arm, or its count would sit in a
     /// thread-local cell and never reach the snapshot.
     ///
-    /// The two **egress** states deliberately do not batch and fall through to
-    /// the direct `fetch_add` below. A fail-closed outage is a discrete event
+    /// The two **egress** states and **contention** deliberately do not batch
+    /// and fall through to the direct `fetch_add` below. A fail-closed outage is a discrete event
     /// that lasts seconds, and batching let a short one hide in a worker thread's
     /// cell indefinitely: this thread only flushes at 64, and the reporter's
     /// `snapshot` flushes its own cells, not this thread's — so a 20-datagram
@@ -5009,7 +5100,7 @@ mod tests {
     }
 
     /// Every drop counter must reach its own named field in the snapshot: the
-    /// six-field struct exists so the 60 s report cannot silently omit one, and
+    /// nine-field struct exists so the 60 s report cannot silently omit one, and
     /// the batching table (`bump` + `flush_locals`) is keyed on identity, so a
     /// counter missing one of the two arms would sit in a thread-local cell
     /// forever. One bump per counter, one field asserted per counter.
@@ -5021,6 +5112,7 @@ mod tests {
             &dgram_drops::BUFFER_FULL,
             &dgram_drops::SESSION_FULL,
             &dgram_drops::DNS_INFLIGHT,
+            &dgram_drops::DNS_CONTENTION,
             &dgram_drops::NO_EGRESS,
             &dgram_drops::EGRESS_DEAD,
             &dgram_drops::REFUSED,
@@ -5032,17 +5124,192 @@ mod tests {
         assert!(after.buffer_full > before.buffer_full, "buffer_full");
         assert!(after.session_full > before.session_full, "session_full");
         assert!(after.dns_inflight > before.dns_inflight, "dns_inflight");
+        assert!(
+            after.dns_contention > before.dns_contention,
+            "dns_contention"
+        );
         assert!(after.no_egress > before.no_egress, "no_egress");
         assert!(after.egress_dead > before.egress_dead, "egress_dead");
         assert!(after.refused > before.refused, "refused");
         let d = after.since(&before);
-        assert!(d.lost() >= 7, "every drop counts as loss: {d:?}");
+        assert!(d.lost() >= 8, "every drop counts as loss: {d:?}");
+    }
+
+    /// Hold one single-flight shard mutex from another thread, the way a miss
+    /// storm does. Probing that name must read as unknown — never as inflight.
+    ///
+    /// The old probe returned `true` on `WouldBlock`, so a contended shard
+    /// dropped datagrams charged to `DNS_INFLIGHT` for what was only lock
+    /// contention; the `!dns_is_inflight` assertion below fails against it.
+    #[test]
+    fn contended_dns_mutex_is_unknown_not_inflight() {
+        let host = "status-contended-probe.invalid";
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let mut kbuf = [0u8; DNS_KEY_BUF];
+            let owned;
+            let key: &str = match dns_key(host, 53, &mut kbuf) {
+                Some(k) => k,
+                None => {
+                    owned = dns_key_owned(host, 53);
+                    &owned
+                }
+            };
+            let _guard = lock_mutex(dns_inflight_for(key));
+            locked_tx.send(()).expect("holder signals the lock");
+            release_rx.recv().expect("holder waits for release");
+        });
+        locked_rx.recv().expect("shard mutex is now held elsewhere");
+        assert_eq!(
+            dns_inflight_status(host, 53),
+            DnsInflight::Contended,
+            "a busy shard is unknown, not inflight"
+        );
+        assert!(
+            !dns_is_inflight(host, 53),
+            "contention must never read as inflight"
+        );
+        release_tx.send(()).expect("release the holder");
+        holder.join().expect("holder thread exits");
+        assert_eq!(
+            dns_inflight_status(host, 53),
+            DnsInflight::Absent,
+            "an unregistered name is absent once the shard is free"
+        );
+    }
+
+    /// Registration must fail fast with `DnsContended` when its shard mutex is
+    /// busy — never park the task on it. Against the old blocking register
+    /// this test times out instead of returning (the holder only releases
+    /// after the awaited call completes).
+    #[tokio::test]
+    async fn contended_register_fails_fast_as_contention() {
+        let host = "register-contended-probe.invalid";
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let mut kbuf = [0u8; DNS_KEY_BUF];
+            let owned;
+            let key: &str = match dns_key(host, 53, &mut kbuf) {
+                Some(k) => k,
+                None => {
+                    owned = dns_key_owned(host, 53);
+                    &owned
+                }
+            };
+            let _guard = lock_mutex(dns_inflight_for(key));
+            locked_tx.send(()).expect("holder signals the lock");
+            release_rx.recv().expect("holder waits for release");
+        });
+        locked_rx.recv().expect("shard mutex is now held elsewhere");
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resolve_all_cached(host, 53),
+        )
+        .await;
+        release_tx.send(()).expect("release the holder");
+        holder.join().expect("holder thread exits");
+        let err = r
+            .expect("register must fail fast, not park on the shard mutex")
+            .unwrap_err();
+        assert!(
+            is_dns_contended(&err),
+            "register contention must be Contended, got {err:#}"
+        );
+    }
+
+    /// The contention retry still fails fast when the shard stays busy: both
+    /// attempts hit `DnsContended` and the flow fails instead of parking. The
+    /// timeout proves neither attempt blocks; the error proves the retry does
+    /// not loop. A single contention event is counted even though nothing was
+    /// dropped — the mutex was genuinely busy, and the count is what makes a
+    /// miss storm visible.
+    #[tokio::test]
+    async fn contention_retry_fails_fast_when_shard_stays_busy() {
+        let host = "retry-still-contended-probe.invalid";
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let mut kbuf = [0u8; DNS_KEY_BUF];
+            let owned;
+            let key: &str = match dns_key(host, 53, &mut kbuf) {
+                Some(k) => k,
+                None => {
+                    owned = dns_key_owned(host, 53);
+                    &owned
+                }
+            };
+            let _guard = lock_mutex(dns_inflight_for(key));
+            locked_tx.send(()).expect("holder signals the lock");
+            release_rx.recv().expect("holder waits for release");
+        });
+        locked_rx.recv().expect("shard mutex is now held elsewhere");
+        let before = dgram_drops::snapshot();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resolve_all_cached_with_contention_retry(host, 53),
+        )
+        .await;
+        release_tx.send(()).expect("release the holder");
+        holder.join().expect("holder thread exits");
+        let err = r
+            .expect("retry must fail fast, not park on the shard mutex")
+            .unwrap_err();
+        assert!(
+            is_dns_contended(&err),
+            "sustained contention must stay Contended, got {err:#}"
+        );
+        let after = dgram_drops::snapshot();
+        assert!(
+            after.dns_contention > before.dns_contention,
+            "the first contention is counted even though the flow fails"
+        );
+    }
+
+    /// The retry wrapper is transparent off contention: a seeded name resolves
+    /// without ever touching the single-flight mutex.
+    #[tokio::test]
+    async fn contention_retry_preserves_the_uncontended_path() {
+        let host = "retry-uncontended-probe.invalid";
+        let addr: SocketAddr = "93.184.216.34:443".parse().expect("probe addr parses");
+        dns_cache_seed(host, 443, addr);
+        let v = resolve_all_cached_with_contention_retry(host, 443)
+            .await
+            .expect("a seeded name must resolve");
+        assert!(
+            v.contains(&addr),
+            "the seeded address must come back through the retry wrapper"
+        );
+    }
+
+    /// `DNS_CONTENTION` is exact like the egress counters: a short episode on
+    /// a thread that never reports must be in the very next snapshot. With the
+    /// old batching wiring the spawned thread's cell dies with it and the
+    /// delta below is zero, deterministically.
+    #[test]
+    fn contention_drops_are_exact_across_threads() {
+        let before = dgram_drops::snapshot();
+        std::thread::spawn(|| {
+            for _ in 0..20 {
+                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+            }
+        })
+        .join()
+        .expect("the drop thread must not panic");
+        let after = dgram_drops::snapshot();
+        assert!(
+            after.dns_contention >= before.dns_contention + 20,
+            "a 20-event contention episode must be in the next snapshot: {} -> {}",
+            before.dns_contention,
+            after.dns_contention
+        );
     }
 
     /// The two egress counters must be visible **immediately and from another
     /// thread**, which is the whole reason they do not batch.
     ///
-    /// Batching (six of the eight counters) keeps the count in the bumping
+    /// Batching (six of the nine counters) keeps the count in the bumping
     /// thread's cell until it reaches 64, and `snapshot` only flushes the thread
     /// it runs on — so a worker thread's short outage stays invisible until that
     /// thread drops 63 more, and a thread that exits takes its pending count with
