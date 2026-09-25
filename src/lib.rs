@@ -3011,19 +3011,22 @@ pub mod udp_stats {
     }
 
     /// A partial datagram was discarded because a fragment never arrived.
+    ///
+    /// Drop-path only (never per packet), so it stays live in the
+    /// `--no-default-features` build where the per-packet relay counters are
+    /// compiled out: this is the only signal for a fragment lost in transit.
     pub fn reassembly_expired() {
-        stats_only! {
-            REASSEMBLY_EXPIRED.fetch_add(1, Ordering::Relaxed);
-        }
+        REASSEMBLY_EXPIRED.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A partial datagram was discarded to stay inside [`MQP_FRAG_MAX_PAYLOAD`]
     /// (a peer sent fragments whose sum exceeds the protocol's payload ceiling)
     /// or [`FRAG_MAX_HELD_BYTES`] (the aggregate reassembly budget).
+    ///
+    /// Drop-path only, so it stays live without the `stats` feature — same
+    /// reason as [`reassembly_expired`].
     pub fn reassembly_evicted() {
-        stats_only! {
-            REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
-        }
+        REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
     }
 
     /// `(expired, evicted)` reassembly losses since process start. These are the
@@ -3282,7 +3285,11 @@ fn drop_warn_due(last: u64, now: u64) -> bool {
 /// gate made the *logging* itself the per-drop cost.
 fn claim_drop_warning(last: &std::sync::atomic::AtomicU64) -> bool {
     use std::sync::atomic::Ordering;
-    let now = mono_millis();
+    // The coarse epoch, not `mono_millis()`: this runs per *dropped* datagram,
+    // and a 10 s window does not need a precise clock (a warning can be up to
+    // one tick late). The vDSO `clock_gettime` here was per-drop cost on the
+    // very path that is already the exceptional one.
+    let now = coarse_millis();
     let prev = last.load(Ordering::Relaxed);
     drop_warn_due(prev, now)
         && last
@@ -3982,17 +3989,45 @@ async fn retry_one(req: &UdpRetry) -> Result<(), String> {
     }
 }
 
+/// How many retries one shard runs concurrently.
+///
+/// A single sequential worker made one wedged destination delay every later
+/// retry in the same shard — up to `UDP_RETRY_DEPTH` x [`UDP_RETRY_TIMEOUT`]
+/// ≈ 51 s of head-of-line blocking, during which the shard also refused every
+/// *new* retry, including ones for destinations that were perfectly writable.
+/// Sixteen in flight bound the cost of one slow destination to one slot while
+/// still bounding the tasks, sockets and payloads a shard can hold.
+const UDP_RETRY_INFLIGHT: usize = 16;
+
 fn spawn_retry_worker() -> tokio::sync::mpsc::Sender<UdpRetry> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
     tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            // `req` is dropped here whatever the outcome, which is what releases
-            // the last strong `Arc<UdpSocket>` on this path.
-            if let Err(reason) = retry_one(&req).await {
-                let n = udp_write::retry_failed();
-                warn_udp_write(UdpWriteDrop::RetryFailed, n, || reason);
+        let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                // Reap finished sends first, so a continuously busy queue can
+                // never grow the in-flight set past the bound.
+                Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
+                maybe = rx.recv() => {
+                    let Some(req) = maybe else { break };
+                    while inflight.len() >= UDP_RETRY_INFLIGHT {
+                        inflight.join_next().await;
+                    }
+                    inflight.spawn(async move {
+                        // `req` is dropped here whatever the outcome, which is
+                        // what releases the last strong `Arc<UdpSocket>`.
+                        if let Err(reason) = retry_one(&req).await {
+                            let n = udp_write::retry_failed();
+                            warn_udp_write(UdpWriteDrop::RetryFailed, n, || reason);
+                        }
+                    });
+                }
             }
         }
+        // Channel closed: the shard is being re-armed or its runtime is ending.
+        // The JoinSet drop aborts any send still in flight, so no retry (and no
+        // socket it holds) outlives its worker.
     });
     tx
 }
@@ -4907,6 +4942,62 @@ mod tests {
             delivered,
             "the re-armed shard must actually send the datagram it accepted"
         );
+    }
+
+    /// A burst larger than the in-flight bound must still be delivered: the
+    /// extra items exercise the worker's reap-and-wait path (a sequential drain
+    /// could pass this too, but nothing may be dropped or abandoned before its
+    /// send completes now that sends overlap).
+    ///
+    /// Drives its own worker (`spawn_retry_worker`) rather than the process-wide
+    /// shard: the shard is shared with the other retry tests, whose
+    /// current-thread runtimes come and go, and a worker on a runtime that is
+    /// dropped mid-queue legitimately loses its queue (the next submit re-arms
+    /// the shard — `retry_shard_is_rearmed_after_its_runtime_ends`). Sharing it
+    /// here would make this test flaky for a reason that is not under test.
+    #[tokio::test]
+    async fn retry_pool_delivers_a_burst_past_the_inflight_bound() {
+        // Both sockets are async and the wait is awaited: the worker runs on
+        // this test's current-thread runtime, so a blocking `recv` here would
+        // starve it and fail the test for its own harness's sake.
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tx = spawn_retry_worker();
+        let n = UDP_RETRY_INFLIGHT * 3;
+        for i in 0..n {
+            assert!(
+                tx.try_send(UdpRetry {
+                    sock: sock.clone(),
+                    dst,
+                    payload: Bytes::copy_from_slice(&[0xAB, i as u8]),
+                })
+                .is_ok(),
+                "retry {i} of {n} must be accepted (depth is {UDP_RETRY_DEPTH})"
+            );
+        }
+        let mut got = vec![false; n];
+        let mut seen = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut b = [0u8; 16];
+        while seen < n {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, listener.recv_from(&mut b)).await {
+                Ok(Ok((2, _))) if b[0] == 0xAB => {
+                    let i = b[1] as usize;
+                    if i < n && !got[i] {
+                        got[i] = true;
+                        seen += 1;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(seen, n, "every queued retry must come out: {seen}/{n}");
     }
 
     /// The retry deadline is what bounds the socket's retention.
@@ -5926,6 +6017,20 @@ mod tests {
         // A later *smaller* payload must not lower the mark.
         udp_stats::payload(64);
         assert!(udp_stats::snapshot().max_payload >= 1_472);
+    }
+
+    /// Reassembly losses must be observable in the build that compiles the
+    /// per-packet relay counters out: they are drop-path counters, and the
+    /// reassembly line is the only signal for a fragment lost in transit.
+    #[cfg(not(feature = "stats"))]
+    #[test]
+    fn reassembly_counters_are_live_without_the_stats_feature() {
+        let (expired, evicted) = udp_stats::reassembly_drops();
+        udp_stats::reassembly_expired();
+        udp_stats::reassembly_evicted();
+        let (expired2, evicted2) = udp_stats::reassembly_drops();
+        assert!(expired2 > expired, "an expiry must reach the snapshot");
+        assert!(evicted2 > evicted, "an eviction must reach the snapshot");
     }
 
     /// The fragment path must feed the same counters as the single-frame path.

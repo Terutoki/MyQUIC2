@@ -1920,33 +1920,33 @@ async fn handle_socks(
             return Err(e);
         }
     };
-    let (mut send, recv) = match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await
-    {
-        Ok(Ok((s, r))) => {
-            let prio = if pool.is_interactive(&target) { 10 } else { 0 };
-            let _ = s.set_priority(prio);
-            (s, r)
-        }
-        _ => {
-            if conn.close_reason().is_some() {
-                // Atomic read-then-clear with re-check: a reconnect may install
-                // a fresh connection between a read and a later clear, and
-                // clearing unconditionally would blackhole the new connection
-                // until it dies. `clear_if_and_mark_dead` matches on
-                // `stable_id` and folds the `live = false` into the same `rcu`
-                // closure, so the decision, the store and the liveness bit
-                // cannot be split by a concurrent publish.
-                // Matches the reconnect loop's own clear path.
-                if slot.clear_if_and_mark_dead(&conn) {
-                    bump_gen(&gen_tx);
-                }
-                write_socks_reply(&mut s, 0x04, bnd).await.ok();
-                anyhow::bail!("quic connection dead, retry");
+    let (mut send, mut recv) =
+        match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await {
+            Ok(Ok((s, r))) => {
+                let prio = if pool.is_interactive(&target) { 10 } else { 0 };
+                let _ = s.set_priority(prio);
+                (s, r)
             }
-            write_socks_reply(&mut s, 0x01, bnd).await.ok();
-            anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
-        }
-    };
+            _ => {
+                if conn.close_reason().is_some() {
+                    // Atomic read-then-clear with re-check: a reconnect may install
+                    // a fresh connection between a read and a later clear, and
+                    // clearing unconditionally would blackhole the new connection
+                    // until it dies. `clear_if_and_mark_dead` matches on
+                    // `stable_id` and folds the `live = false` into the same `rcu`
+                    // closure, so the decision, the store and the liveness bit
+                    // cannot be split by a concurrent publish.
+                    // Matches the reconnect loop's own clear path.
+                    if slot.clear_if_and_mark_dead(&conn) {
+                        bump_gen(&gen_tx);
+                    }
+                    write_socks_reply(&mut s, 0x04, bnd).await.ok();
+                    anyhow::bail!("quic connection dead, retry");
+                }
+                write_socks_reply(&mut s, 0x01, bnd).await.ok();
+                anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
+            }
+        };
     // The open header is deliberately its own write, flushed before any
     // application byte is read: a peer that waits for its first reply
     // (game login, banner protocols) must see the header within ~100ms
@@ -1967,6 +1967,7 @@ async fn handle_socks(
         .unwrap_or(false);
     if !hdr_sent {
         send.reset(0x04u32.into()).ok();
+        recv.stop(0x04u32.into()).ok();
         write_socks_reply(&mut s, 0x04, bnd).await.ok();
         anyhow::bail!("quic stream header write failed or timed out");
     }
@@ -1977,8 +1978,16 @@ async fn handle_socks(
     // BND.ADDR is unknown at this point, so report 0.0.0.0:0 (the conventional
     // "not available" value); the ACK is consumed by the reply direction and a
     // failed dial tears the TCP flow down instead of returning a SOCKS error.
+    // A failed reply write means the app is gone: reset/stop the stream so the
+    // peer reads an abort, not the clean FIN a dropped `SendStream` sends
+    // (quinn's `Drop` calls `finish()`), which would advertise a truncated
+    // flow as complete.
     let unknown = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    write_socks_reply(&mut s, 0x00, unknown).await?;
+    if let Err(e) = write_socks_reply(&mut s, 0x00, unknown).await {
+        send.reset(0x04u32.into()).ok();
+        recv.stop(0x04u32.into()).ok();
+        return Err(e);
+    }
     match copy_tcp_quic_acked(
         s,
         send,
@@ -2156,6 +2165,27 @@ async fn handle_udp_associate(
     udp_associate_inner(tcp, pool, hub.clone(), egress_shared, sess).await
 }
 
+/// Bind the UDP relay socket to the address BND will advertise, so every reply
+/// is sent *from* the address the app was told to expect. A wildcard bind lets
+/// the kernel pick the source by route to the app, which on a multi-homed host
+/// (a second LAN, a VPN interface) can differ from the address the app
+/// connected to; a source-validating app then drops every reply. The v4 form
+/// goes in as its v4-mapped equivalent so the socket stays dual-stack for the
+/// `map_for_dual` reply path; a bind failure (the peer-address fallback is not
+/// a local address) degrades to the wildcard rather than failing the
+/// association.
+fn bind_relay(relay_ip: std::net::IpAddr) -> Result<tokio::net::UdpSocket> {
+    let bind = map_for_dual(SocketAddr::new(relay_ip, 0)).to_string();
+    let raw = match udp_socket_dual_small(&bind) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("udp relay bind {bind} failed ({e:#}); falling back to the wildcard");
+            udp_socket_dual_small("[::]:0")?
+        }
+    };
+    Ok(tokio::net::UdpSocket::from_std(raw)?)
+}
+
 async fn udp_associate_inner(
     mut tcp: tokio::net::TcpStream,
     pool: ConnPool,
@@ -2163,8 +2193,6 @@ async fn udp_associate_inner(
     egress_shared: Arc<SharedEgress>,
     sess: u32,
 ) -> Result<()> {
-    let relay = tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0")?)?;
-    let relay_port = relay.local_addr()?.port();
     // BND.ADDR must be THIS proxy's address (the IP the app connected to), not
     // the app's own address: a LAN client sending datagrams to its own
     // IP:port would never reach the relay, breaking UDP off-host entirely.
@@ -2178,6 +2206,8 @@ async fn udp_associate_inner(
             .map(|p| unmap(p.ip()))
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
     };
+    let relay = bind_relay(relay_ip)?;
+    let relay_port = relay.local_addr()?.port();
     let relay_reply = SocketAddr::new(relay_ip, relay_port);
     let relay = Arc::new(relay);
     // Publish the association's reply endpoint *before* the app is told the relay
@@ -3134,6 +3164,27 @@ mod tests {
         assert!(
             e.refresh_global(&pool, now).is_none(),
             "a dead cached handle with no live slot must not be re-served"
+        );
+    }
+
+    /// The relay must be bound to the address BND advertises, so every reply is
+    /// sent from the source the app was told to expect. A wildcard bind (the
+    /// previous shape) lets the kernel pick the source by route to the app,
+    /// which a multi-homed host can resolve to a different local address; a
+    /// source-validating app then drops every reply.
+    #[tokio::test]
+    async fn relay_bind_pins_the_announced_address() {
+        let v4 = bind_relay(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        assert_eq!(
+            unmap(v4.local_addr().unwrap().ip()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "a v4 relay must be bound to its advertised address, not the wildcard"
+        );
+        let v6 = bind_relay(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)).unwrap();
+        assert_eq!(
+            v6.local_addr().unwrap().ip(),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            "a v6 relay must be bound to its advertised address, not the wildcard"
         );
     }
 

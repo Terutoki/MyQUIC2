@@ -199,7 +199,7 @@ refusals are counted apart from the global budget — see
 Its `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
 for them (rebuilt on request, not tested).
 
-The current pass is an outside-in audit of the data paths rather than a feature,
+The previous pass was an outside-in audit of the data paths rather than a feature,
 and it fixes nine findings: the client's QUIC bidi-stream credit is raised to cover
 its own admission cap (an admitted flow could stall 5 s in `open_bi()` and then
 answer `REP=0x01` while the process still had capacity), the server's reply
@@ -216,6 +216,20 @@ limit rather than claimed — see
 [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor).
 Its `dist/` artifacts **are** rebuilt from this revision, but nothing was
 verified for them (rebuilt on request, not tested).
+
+The current pass fixes five findings from an outside-in audit of the data paths:
+the client's UDP relay is now bound to the address BND advertises (a wildcard
+bind let a multi-homed host send replies from a different source than the app
+connected to, and a source-validating app dropped every one), the deferred-send
+pool drains a shard's retries with 16 in flight instead of sequentially, the
+drop-warning limiter uses the coarse epoch rather than a vDSO clock read per
+dropped datagram, the client resets the stream when the optimistic SOCKS reply
+cannot be written (a dropped stream would send a clean FIN for an aborted flow),
+and the reassembly expiry/eviction counters stay live in the
+`--no-default-features` build — see
+[pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene).
+Its `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
+for them (rebuilt on request, not tested).
 
 ---
 
@@ -237,7 +251,7 @@ verified for them (rebuilt on request, not tested).
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor) and [pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -744,23 +758,19 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 35 — on top of everything pass 34 shipped)
+rebuilt from the current revision (pass 36 — on top of everything pass 35 shipped)
 with the default feature set, so the relay counters are **on** in these builds:
-static musl, x86-64, stripped — servers 4 376 168–4 398 000 B (v1 4 391 048,
-v2 4 376 168, v3 4 398 000, v4 4 394 608) and clients 4 391 320–4 410 560 B
-(v1 4 406 536, v2 4 391 320, v3 4 410 560, v4 4 403 376). Against the pass-34
-*recorded* figures that is **+2 216…+4 712 B** per server level, in line with the
-additions (the `SESS_CREATE_FAILED` counter with its snapshot field and reporter
-text, the socket-failure warning helper, the IP-keyed reply allowlist and the
-fair-share floor), and **−1 664…+704 B** per client level (the stream-credit
-constant with its build-time assert and the reporter fields, offset by the
-`unpublish` simplification and codegen shifts) — recorded as measured, not
-explained; the regression tests are `#[cfg(test)]` and do not ship. Unlike every
-earlier pass, **nothing was verified for these bytes** — no `file`, no `objdump`,
-no reproducibility build, no emulation, no native run — on explicit instruction:
-they are compiled, not tested. What *was* run is the debug-build smoke recorded
-under
-[pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor),
+static musl, x86-64, stripped — servers 4 398 568–4 420 160 B (v1 4 409 112,
+v2 4 398 568, v3 4 420 160, v4 4 416 896) and clients 4 415 920–4 430 744 B
+(v1 4 430 688, v2 4 415 920, v3 4 430 744, v4 4 423 496). Against the pass-35
+*recorded* figures that is **+18 064…+22 400 B** per server level and
+**+20 120…+24 600 B** per client level — recorded as measured, not explained
+(the fixes touch the relay bind, the retry worker's `JoinSet` drain and the
+counter paths; the regression tests are `#[cfg(test)]` and do not ship). **Nothing
+was verified for these bytes** — no `file`, no `objdump`, no reproducibility
+build, no emulation, no native run — on explicit instruction: they are compiled,
+not tested. What *was* run is the native E2E recorded under
+[pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene),
 against the source these binaries compile.
 The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
 passes'). Against the pass-27
@@ -1016,7 +1026,7 @@ All limits are constants in the sources; the table shows where to change them.
 | Client SOCKS connections | 8192 (excess connections dropped; the pool advertises one stream credit per admitted flow) | `socks_conn_limiter` |
 | Client UDP associations | 4032 (excess replies REP=0x01) | `MAX_UDP_ASSOCS` (lib.rs; the server asserts its per-connection target equals it) |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
-| Deferred UDP sends (full retry-shard queue) | 16 shards x 256 deep | `UDP_RETRY_SHARDS`, `UDP_RETRY_DEPTH` |
+| Deferred UDP sends (full retry-shard queue) | 16 shards x 256 deep, 16 sends in flight per shard | `UDP_RETRY_SHARDS`, `UDP_RETRY_DEPTH`, `UDP_RETRY_INFLIGHT` |
 | Receive window (aggregate) | 4 MB/connection default; 16 MB opt-in (`receive_window_mb = 16`) | `TransportTuning`, `RECEIVE_WINDOW` |
 | Receive window (per stream) | 2 MB default; 8 MB opt-in (`stream_receive_window_mb = 8`) | `TransportTuning`, `STREAM_RECEIVE_WINDOW` |
 | Send window | 2 MB/connection default; 8 MB opt-in (`send_window_mb = 8`) | `TransportTuning`, `SEND_WINDOW` |
@@ -1049,7 +1059,7 @@ Against RFC 1928 / RFC 1929:
 | `CONNECT`, IPv4/domain/IPv6 | ✅ (curl-verified) |
 | BND.ADDR/BND.PORT for `CONNECT` | ⚠️ `0.0.0.0:0` (unknown): the success reply is sent before the remote dial completes to avoid an extra RTT; the MQP-2 ACK still carries the real bound address and is validated |
 | `UDP ASSOCIATE` + relay + TCP control held | ✅ (`FRAG≠0` dropped, as most implementations do) |
-| BND.ADDR for `UDP ASSOCIATE` | ✅ the proxy's own interface address + relay port (LAN clients work; no longer the app's own address) |
+| BND.ADDR for `UDP ASSOCIATE` | ✅ the proxy's own interface address + relay port, and the relay is bound to that address so replies are sent *from* it (LAN clients work; no longer the app's own address) |
 | Username/password (`0x02`) | ❌ intentionally absent |
 | `BIND` | ❌ replies `0x07` (FTP active mode; obsolete in practice) |
 | Error REPs (`0x01/0x04/0x05`…) | ⚠️ success is replied optimistically; a failed remote dial closes the TCP flow (the app reconnects) instead of returning `0x04`. A missing QUIC connection still fails the flow fast |
@@ -3703,6 +3713,81 @@ client level against the pass-34 *recorded* figures — recorded as measured, no
 explained. On explicit instruction **no verification of any kind was run on these
 bytes** (no `file`, no `objdump`, no reproducibility build, no emulation, no
 native run): they are compiled, not tested.
+
+### 2026-09 hardening pass 36 — UDP relay source pin, concurrent retry drain, drop-path hygiene
+
+Five findings from an outside-in audit of the data paths, each confirmed against
+the code before it was touched. No wire change: no frame, framing or ALPN value
+is touched, so mixed old/new pairs keep working — the relay bind and the retry
+drain are client-side only, the counters are shared.
+
+- **The UDP relay is bound to the address BND advertises.** The relay socket
+  used to bind `[::]:0` while the `UDP ASSOCIATE` reply advertised
+  `tcp.local_addr()`, so the *reply source address* was whatever the kernel
+  picked by route to the app. On a multi-homed host (a second LAN, a VPN
+  interface, several addresses on one NIC) that can differ from the advertised
+  address, and an app that validates the reply source — or a stateful NAT —
+  drops every reply, silently breaking UDP while TCP keeps working. The socket
+  is now bound to the mapped form of the announced address (`bind_relay`), so
+  the send source is pinned to it; a bind failure (only reachable through the
+  peer-address fallback, where the computed address is not local) degrades to
+  the previous wildcard behaviour. Pinned by
+  `relay_bind_pins_the_announced_address` and verified on a live association
+  with `lsof`: the relay fds read `127.0.0.1:<port>` (the announced BND), not
+  `*:<port>`, while the QUIC endpoint socket stays wildcard.
+- **The deferred-send pool drains a shard concurrently.** `WouldBlock` retries
+  are queued per shard and were sent one at a time, each under the 200 ms retry
+  deadline — so one destination that stayed unwritable delayed every later
+  retry in the same shard by up to `UDP_RETRY_DEPTH` x 200 ms ≈ 51 s, during
+  which the full queue refused (and dropped) every *new* retry, including ones
+  for destinations that were perfectly writable. The worker now keeps up to
+  `UDP_RETRY_INFLIGHT` (16) sends in flight via a `JoinSet`, reaping completed
+  sends first; the bound keeps the tasks, sockets and payloads one shard can
+  hold bounded. Pinned by
+  `retry_pool_delivers_a_burst_past_the_inflight_bound` (3x the bound, every
+  item delivered) plus the existing re-arm and deadline tests.
+- **Drop-warning rate limiting is clock-free.** `claim_drop_warning` reads the
+  coarse 1 s epoch now, which is what `warn_egress_drop`'s own note already
+  claimed; it took a vDSO `clock_gettime` per *dropped* datagram — the flood
+  path the limiter exists for. A 10 s window can be one tick late, which is
+  immaterial for a rate limit.
+- **The client resets the stream when the optimistic SOCKS reply cannot be
+  written.** If the app vanished before the success reply, `handle_socks`
+  returned with the `SendStream` still in scope and quinn's `Drop` calls
+  `finish()` — a clean FIN that tells the server a truncated flow completed
+  (pass 26 fixed the pump paths; this was the one pre-pump path left). The
+  failure now resets the send half and stops the recv half, and the stream-head
+  write-failure path stops the recv half symmetrically.
+- **Reassembly losses are observable without the `stats` feature.** The
+  expiry/eviction counters were `stats_only!`, so the extreme build reported
+  `(0, 0)` and the 60 s `udp reassembly` line never printed, contradicting the
+  feature's own documentation. They are drop-path counters (never per packet),
+  so they stay live in both builds now, and `Cargo.toml`'s feature note states
+  the precise split. Pinned by
+  `reassembly_counters_are_live_without_the_stats_feature`.
+
+Verification: `cargo test --all-targets` **123/123** (65 lib + 31 client + 27
+server) and **122/122** with `--no-default-features` (64 + 31 + 27), `cargo
+clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both
+feature sets, and three consecutive full-suite runs green on the default set.
+Native-binary E2E on the fixed build (macOS loopback, the repo's own
+`hotpath_bench`): 5 `new QUIC conn`, `tcpecho` 1 MiB **1 048 576/1 048 576
+bytes, 0 mismatched**, `udpsweep` 8/1200/1420/1430/2000/8000 B **20/20 verified
+at every size, 0 lost** (the last three sizes take the fragment path), and
+`udpmulti` 16 associations x 400 = 6 400 sent / 6 385 received (0.23 % loss,
+this host's UDP rate limit, not the tunnel), with the four relay fds observed
+bound to `127.0.0.1:<port>` during the associations. No benchmark run: the
+retry drain only changes behaviour under a wedged destination, which a loopback
+run cannot produce. `dist/` **was rebuilt from this revision** for all four CPU
+levels (static musl, x86-64, default feature set, the documented `cargo zigbuild`
+recipe; stripped): servers 4 398 568–4 420 160 B (v1 4 409 112, v2 4 398 568,
+v3 4 420 160, v4 4 416 896) and clients 4 415 920–4 430 744 B (v1 4 430 688,
+v2 4 415 920, v3 4 430 744, v4 4 423 496), i.e. **+18 064…+22 400 B** per server
+level and **+20 120…+24 600 B** per client level against the pass-35 *recorded*
+figures — recorded as measured, not explained. On explicit instruction **no
+verification of any kind was run on these bytes** (no `file`, no `objdump`, no
+reproducibility build, no emulation, no native run): they are compiled, not
+tested.
 
 ---
 
