@@ -279,9 +279,69 @@ fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     }
 }
 
+/// UDP egress class: which dedicated connection an association's datagrams ride.
+///
+/// The bulk connection carries large or steady flows (HTTP/3, WireGuard, big
+/// transfers); the interactive one carries latency-sensitive flows. Without the
+/// split every association shares one connection, and quinn drops the *newest*
+/// datagram when that connection's 1 MB DATAGRAM send buffer fills and lets
+/// every DATAGRAM jump the STREAM queue — so a bulk flow starves a
+/// latency-sensitive one with no isolation at all.
+///
+/// An association is classified once, from its first datagram, and keeps its
+/// class for life: switching mid-flow would move the server session to another
+/// connection and change the source port the target sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EgressClass {
+    /// An `interactive_ports` destination, or a first payload no larger than
+    /// [`UDP_INTERACTIVE_MAX`] (STUN/DTLS/RTP-sized media, DNS, games).
+    Interactive,
+    /// Everything else.
+    Bulk,
+}
+
+impl EgressClass {
+    /// Number of classes, i.e. how many dedicated UDP slots `udp_split` dials.
+    const COUNT: usize = 2;
+
+    /// Slot offset within the UDP range.
+    fn index(self) -> usize {
+        match self {
+            EgressClass::Interactive => 0,
+            EgressClass::Bulk => 1,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            EgressClass::Interactive => EgressClass::Bulk,
+            EgressClass::Bulk => EgressClass::Interactive,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            EgressClass::Interactive => "interactive",
+            EgressClass::Bulk => "bulk",
+        }
+    }
+}
+
+/// First-datagram payload size at or below which a UDP association is treated
+/// as interactive.
+///
+/// The motivating case is realtime media on *ephemeral* ports, which
+/// `interactive_ports` cannot name: a WebRTC association's first datagram is a
+/// STUN binding request (tens of bytes) or a DTLS ClientHello (a few hundred),
+/// while a bulk flow's first datagram is a full-size padded QUIC Initial
+/// (~1200 B or more). 512 B separates those while staying above the media-size
+/// range. A misclassified flow degrades to the pre-split behaviour — it shares
+/// its class's connection — so the worst case is never worse than before.
+const UDP_INTERACTIVE_MAX: usize = 512;
+
 /// The client's QUIC connection pool: `n` TCP slots indexed `0..n`, where
-/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`), plus one
-/// **dedicated UDP egress slot** at index `n`.
+/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`), plus one or two
+/// **dedicated UDP egress slots** past the TCP range.
 ///
 /// Slot 0 is the interactive connection: every port in `interactive_ports` rides
 /// it, and it is the sole TCP slot when `quic_conns == 1`. The other TCP slots
@@ -289,7 +349,7 @@ fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
 /// queue instead of all of it. quinn 0.11 has no per-stream priority, so separate
 /// congestion windows are the isolation mechanism.
 ///
-/// The UDP slot is *additional*, not carved out of the TCP range: making UDP
+/// The UDP slots are *additional*, not carved out of the TCP range: making UDP
 /// independent must not cost TCP a congestion window, and `quic_conns` keeps its
 /// documented meaning ("TCP pool size"). UDP and TCP on one connection is not a
 /// theoretical concern — quinn fills every packet with queued DATAGRAM frames
@@ -298,6 +358,11 @@ fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
 /// TCP streams on the same connection, and a bulk TCP flow makes every UDP
 /// datagram hit the 1 MiB datagram-send-buffer `Blocked` drop. One connection per
 /// class is the only isolation QUIC gives without stream priorities.
+///
+/// With `udp_split` (the default) there are **two** UDP slots, one per
+/// [`EgressClass`], so a bulk UDP flow's congestion window and DATAGRAM buffer
+/// cannot starve a latency-sensitive flow either; `udp_split = false` restores
+/// the single shared UDP slot and one fewer dial.
 ///
 /// The slots live in a plain `Arc<Vec<ConnSlot>>` indexed by slot number. The
 /// set is fixed at startup and never mutated, so a routing read is one indexed
@@ -309,30 +374,33 @@ struct ConnPool {
     rr: Arc<std::sync::atomic::AtomicUsize>,
     interactive_ports: Arc<std::collections::HashSet<u16>>,
     /// TCP slots: the routing range is `0..tcp_slots` (0 interactive, rest
-    /// bulk). Never includes the UDP slot.
+    /// bulk). Never includes the UDP slots.
     tcp_slots: usize,
-    /// Index of the dedicated UDP egress slot, one past the TCP range.
-    udp_slot: usize,
-    /// When set, UDP only ever uses `udp_slot`: if that connection is down the
-    /// datagram is dropped (counted in `dgram_drops::NO_EGRESS`) instead of
-    /// sharing a TCP connection's congestion window.
+    /// Whether UDP egress is split into one dedicated connection per
+    /// [`EgressClass`] (the default) or shares a single one.
+    udp_split: bool,
+    /// When set, UDP only ever uses its class's dedicated slot: if that
+    /// connection is down the datagram is dropped (counted in
+    /// `dgram_drops::NO_EGRESS`) instead of sharing a TCP connection's
+    /// congestion window.
     udp_fail_closed: bool,
 }
 
 impl ConnPool {
-    /// Build the process pool: `tcp + 1` fresh (unconnected) slots — `tcp` TCP
-    /// slots indexed `0..tcp`, then the dedicated UDP slot at index `tcp`.
+    /// Build the process pool: `tcp` TCP slots indexed `0..tcp`, then one
+    /// dedicated UDP slot per egress class (one with `udp_split` off).
     /// `tcp` is re-clamped here so no caller can build a pool wider than the
     /// stack liveness array the routing path uses to describe it.
-    fn new(n: usize, interactive_ports: Vec<u16>, udp_fail_closed: bool) -> Self {
+    fn new(n: usize, interactive_ports: Vec<u16>, udp_fail_closed: bool, udp_split: bool) -> Self {
         let tcp = n.clamp(1, MAX_POOL_CONNS);
-        let slots: Vec<ConnSlot> = (0..=tcp).map(|_| ConnSlot::fresh()).collect();
+        let udp_slots = if udp_split { EgressClass::COUNT } else { 1 };
+        let slots: Vec<ConnSlot> = (0..tcp + udp_slots).map(|_| ConnSlot::fresh()).collect();
         Self {
             slots: Arc::new(slots),
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
             tcp_slots: tcp,
-            udp_slot: tcp,
+            udp_split,
             udp_fail_closed,
         }
     }
@@ -342,16 +410,41 @@ impl ConnPool {
         self.tcp_slots
     }
 
-    /// Every slot, TCP first then the UDP egress slot: the range to walk when
+    /// Every slot, TCP first then the UDP egress slots: the range to walk when
     /// spawning per-slot tasks or scanning the registry.
     fn slots_total(&self) -> usize {
-        self.tcp_slots + 1
+        self.tcp_slots
+            + if self.udp_split {
+                EgressClass::COUNT
+            } else {
+                1
+            }
     }
 
-    /// The dedicated UDP egress slot. Equal to `tcp_slots`, i.e. outside every
-    /// TCP routing range by construction.
-    fn udp_slot(&self) -> usize {
-        self.udp_slot
+    /// The dedicated UDP egress slot for `class`. One past the TCP range (so
+    /// never a TCP routing target); with `udp_split` off both classes map to
+    /// the same slot.
+    fn udp_slot(&self, class: EgressClass) -> usize {
+        if self.udp_split {
+            self.tcp_slots + class.index()
+        } else {
+            self.tcp_slots
+        }
+    }
+
+    /// Egress class for a UDP association, from its first datagram: a known
+    /// interactive port or a small first payload is the interactive class,
+    /// everything else is bulk. See [`EgressClass`] and [`UDP_INTERACTIVE_MAX`].
+    fn udp_class(&self, addr: &TargetAddrRef<'_>, first_payload: usize) -> EgressClass {
+        let port = match *addr {
+            TargetAddrRef::Ip(s) => s.port(),
+            TargetAddrRef::Domain(_, p) => p,
+        };
+        if self.interactive_ports.contains(&port) || first_payload <= UDP_INTERACTIVE_MAX {
+            EgressClass::Interactive
+        } else {
+            EgressClass::Bulk
+        }
     }
 
     fn udp_fail_closed(&self) -> bool {
@@ -424,8 +517,8 @@ struct EgressMemo {
 }
 
 thread_local! {
-    static EGRESS_MEMO: std::cell::RefCell<Option<EgressMemo>> =
-        const { std::cell::RefCell::new(None) };
+    static EGRESS_MEMO: std::cell::RefCell<[Option<EgressMemo>; EgressClass::COUNT]> =
+        const { std::cell::RefCell::new([None, None]) };
 }
 
 /// The process-wide egress handle plus the freshness stamp it was published
@@ -441,28 +534,44 @@ struct EgressCache {
     slot: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SharedEgress {
     /// `ArcSwapOption` replaces the `RwLock` this used to be. The old code used
     /// `try_write` and treated a lost publish as "stamp 0" — a memo that could
     /// never be served as fresh, so the next packet retried the whole refresh.
     /// `ArcSwap::store` is lock-free and always commits, which deletes that
     /// whole failure mode: every publish lands and carries a real stamp.
-    cached: ArcSwapOption<EgressCache>,
+    ///
+    /// One element per [`EgressClass`] (index `class.index()`): the classes are
+    /// fully independent, so an interactive refresh can never publish onto the
+    /// bulk slot or vice versa.
+    cached: [ArcSwapOption<EgressCache>; EgressClass::COUNT],
     warned: std::sync::atomic::AtomicBool,
-    /// Single-flight refresh gate: only one association task pays the two
-    /// quinn locks (`close_reason` + `max_datagram_size`) per refresh window.
-    /// The rest fail fast (UDP drop semantics) instead of herding on the same
-    /// mutexes the moment the 1 s window expires on 4096 associations at once.
-    refreshing: std::sync::atomic::AtomicBool,
-    /// Bumped (Release) after every mutation of `cached` — the publish in
-    /// `refresh_global` and the clear in `invalidate`. With `ArcSwap` a mutation
-    /// can no longer be lost, so this is bumped exactly once per mutation and
-    /// never spuriously. The thread-local memo tags itself with the generation
-    /// observed *before* its cached read, so a mutation concurrent with an
-    /// acquire invalidates every thread's memo at once without a lock or a
-    /// per-thread scan.
-    generation: std::sync::atomic::AtomicU64,
+    /// Single-flight refresh gate, per class: only one association task pays
+    /// the two quinn locks (`close_reason` + `max_datagram_size`) per refresh
+    /// window. The rest fail fast (UDP drop semantics) instead of herding on
+    /// the same mutexes the moment the 1 s window expires on 4096 associations
+    /// at once.
+    refreshing: [std::sync::atomic::AtomicBool; EgressClass::COUNT],
+    /// Bumped (Release) after every mutation of that class's `cached` — the
+    /// publish in `refresh_global` and the clear in `invalidate`. With
+    /// `ArcSwap` a mutation can no longer be lost, so this is bumped exactly
+    /// once per mutation and never spuriously. The thread-local memo tags
+    /// itself with the generation observed *before* its cached read, so a
+    /// mutation concurrent with an acquire invalidates every thread's memo at
+    /// once without a lock or a per-thread scan.
+    generation: [std::sync::atomic::AtomicU64; EgressClass::COUNT],
+}
+
+impl Default for SharedEgress {
+    fn default() -> Self {
+        Self {
+            cached: std::array::from_fn(|_| ArcSwapOption::const_empty()),
+            warned: std::sync::atomic::AtomicBool::new(false),
+            refreshing: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+            generation: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
 }
 
 impl SharedEgress {
@@ -473,13 +582,14 @@ impl SharedEgress {
     /// quinn lock. A miss leaves the memo untouched; the caller re-acquires.
     fn with_fresh<R>(
         &self,
+        class: EgressClass,
         now_ms: u64,
         f: impl FnOnce(&quinn::Connection, usize) -> R,
     ) -> Option<R> {
-        let gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
-        EGRESS_MEMO.with(|slot| {
-            let memo = slot.borrow();
-            let entry = memo.as_ref()?;
+        let gen = self.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        EGRESS_MEMO.with(|slots| {
+            let memo = slots.borrow();
+            let entry = memo[class.index()].as_ref()?;
             if entry.gen == gen && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS {
                 Some(f(&entry.conn, entry.limit))
             } else {
@@ -492,9 +602,16 @@ impl SharedEgress {
     /// generation, not per packet). `gen` is the generation observed before the
     /// acquire's cached read, so a mutation racing the acquire cannot leave a
     /// stale memo entry behind.
-    fn memo_store(&self, gen: u64, conn: &quinn::Connection, limit: usize, stamp_ms: u64) {
-        EGRESS_MEMO.with(|slot| {
-            *slot.borrow_mut() = Some(EgressMemo {
+    fn memo_store(
+        &self,
+        class: EgressClass,
+        gen: u64,
+        conn: &quinn::Connection,
+        limit: usize,
+        stamp_ms: u64,
+    ) {
+        EGRESS_MEMO.with(|slots| {
+            slots.borrow_mut()[class.index()] = Some(EgressMemo {
                 gen,
                 conn: conn.clone(),
                 limit,
@@ -505,8 +622,8 @@ impl SharedEgress {
 
     /// Drop this thread's memo entry (releasing a stale `Connection` promptly
     /// when the cache has no usable handle at all).
-    fn memo_clear(&self) {
-        EGRESS_MEMO.with(|slot| *slot.borrow_mut() = None);
+    fn memo_clear(&self, class: EgressClass) {
+        EGRESS_MEMO.with(|slots| slots.borrow_mut()[class.index()] = None);
     }
 
     /// Resolve a usable `(connection, limit, stamp)` from the process-wide
@@ -514,34 +631,40 @@ impl SharedEgress {
     /// is expired. Returns `None` only when no handle is available, in which
     /// case the caller drops the datagram (UDP semantics) and counts it in
     /// `dgram_drops::NO_EGRESS`.
-    fn acquire(&self, pool: &ConnPool, now_ms: u64) -> Option<(quinn::Connection, usize, u64)> {
-        if let Some(c) = self.cached.load().as_ref() {
-            // A fail-closed pool only ever publishes the UDP slot (see
+    fn acquire(
+        &self,
+        pool: &ConnPool,
+        class: EgressClass,
+        now_ms: u64,
+    ) -> Option<(quinn::Connection, usize, u64)> {
+        let cached = &self.cached[class.index()];
+        if let Some(c) = cached.load().as_ref() {
+            // A fail-closed pool only ever publishes that class's UDP slot (see
             // `egress_order`), so this is an invariant check, not a filter.
             debug_assert!(
-                !pool.udp_fail_closed() || c.slot == pool.udp_slot(),
+                !pool.udp_fail_closed() || c.slot == pool.udp_slot(class),
                 "fail-closed egress must never cache a shared TCP slot"
             );
             if now_ms.saturating_sub(c.stamp_ms) < EGRESS_REFRESH_MS {
                 return Some((c.conn.clone(), c.limit, c.stamp_ms));
             }
         }
-        if let Some((c, m, stamp)) = self.refresh_global(pool, now_ms) {
+        if let Some((c, m, stamp)) = self.refresh_global(pool, class, now_ms) {
             return Some((c, m, stamp));
         }
         // Stale-while-revalidate: an expired (or contended) handle is reused
         // optimistically with no liveness check. A dead one surfaces as
         // `ConnectionLost` on send and invalidates the cache there, so the
         // expiry window costs zero quinn locks.
-        if let Some(c) = self.cached.load().as_ref() {
+        if let Some(c) = cached.load().as_ref() {
             return Some((c.conn.clone(), c.limit, c.stamp_ms));
         }
-        self.memo_clear();
+        self.memo_clear(class);
         None
     }
 
-    /// Slot scan order for the UDP egress: the dedicated UDP slot first, then
-    /// the interactive TCP slot, then the bulk TCP slots in index order.
+    /// Slot scan order for `class`: its own UDP slot first, then — fail-open
+    /// only — the other UDP class's slot, then the TCP slots.
     ///
     /// A fail-closed pool stops after the first entry, which is what makes UDP
     /// independent of TCP: when the dedicated connection is down the datagram is
@@ -552,15 +675,25 @@ impl SharedEgress {
     /// lose isolation than lose packets, via `udp_fail_closed = false`.
     ///
     /// Stack-array, not a `Vec`: this runs once per refresh window on the
-    /// single-flight winner, and `MAX_POOL_CONNS + 1` bounds it.
-    fn egress_order(&self, pool: &ConnPool) -> ([usize; MAX_POOL_CONNS + 1], usize) {
-        let mut order = [0usize; MAX_POOL_CONNS + 1];
-        let udp = pool.udp_slot();
-        order[0] = udp;
+    /// single-flight winner, and the pool's slot count bounds it.
+    fn egress_order(
+        &self,
+        pool: &ConnPool,
+        class: EgressClass,
+    ) -> ([usize; MAX_POOL_CONNS + EgressClass::COUNT], usize) {
+        let mut order = [0usize; MAX_POOL_CONNS + EgressClass::COUNT];
+        let own = pool.udp_slot(class);
+        order[0] = own;
         let mut k = 1;
         if !pool.udp_fail_closed() {
-            for i in 0..pool.slots_total() {
-                if i != udp {
+            // UDP-over-UDP beats UDP-over-TCP, so the other class comes first.
+            let other = pool.udp_slot(class.other());
+            if other != own {
+                order[k] = other;
+                k += 1;
+            }
+            for i in 0..pool.tcp_slots() {
+                if i != own {
                     order[k] = i;
                     k += 1;
                 }
@@ -569,21 +702,20 @@ impl SharedEgress {
         (order, k)
     }
 
-    /// Refresh `cached` under the single-flight gate. Returns the fresh handle
-    /// and the stamp to tag it with, which is always `now_ms`: `ArcSwap::store`
-    /// cannot lose, so there is no unpublished-handle case to keep cold.
+    /// Refresh `class`'s cache under its single-flight gate. Returns the fresh
+    /// handle and the stamp to tag it with, which is always `now_ms`:
+    /// `ArcSwap::store` cannot lose, so there is no unpublished-handle case to
+    /// keep cold.
     fn refresh_global(
         &self,
         pool: &ConnPool,
+        class: EgressClass,
         now_ms: u64,
     ) -> Option<(quinn::Connection, usize, u64)> {
         // Single-flight: a loser drops fast (UDP semantics) instead of paying
         // the quinn locks while a winner is already refreshing. The losing
         // datagram is counted in `dgram_drops::NO_EGRESS` by the caller.
-        if self
-            .refreshing
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.refreshing[class.index()].swap(true, std::sync::atomic::Ordering::AcqRel) {
             return None;
         }
         struct RefreshGuard<'a>(&'a std::sync::atomic::AtomicBool);
@@ -592,7 +724,8 @@ impl SharedEgress {
                 self.0.store(false, std::sync::atomic::Ordering::Release);
             }
         }
-        let _guard = RefreshGuard(&self.refreshing);
+        let _guard = RefreshGuard(&self.refreshing[class.index()]);
+        let cached = &self.cached[class.index()];
         // Stickiness first: while the cached connection is still usable, keep it
         // and only re-read its DATAGRAM budget (the path MTU can have changed
         // under it). Re-running the slot scan here instead is what used to move
@@ -600,19 +733,19 @@ impl SharedEgress {
         // slot recovered — a second target-side source-port change (and a new
         // server-side session) for a flow that had already failed over, i.e.
         // exactly the flap-back churn the docs promise not to do. A fail-closed
-        // pool can only have published the UDP slot, so stickiness cannot keep it
-        // on a TCP connection.
-        let current = self.cached.load();
+        // pool can only have published that class's UDP slot, so stickiness
+        // cannot keep it on a TCP connection.
+        let current = cached.load();
         if let Some(c) = current.as_ref() {
             if c.conn.close_reason().is_none() {
                 if let Some(m) = c.conn.max_datagram_size() {
-                    self.cached.store(Some(Arc::new(EgressCache {
+                    cached.store(Some(Arc::new(EgressCache {
                         conn: c.conn.clone(),
                         limit: m,
                         stamp_ms: now_ms,
                         slot: c.slot,
                     })));
-                    self.generation
+                    self.generation[class.index()]
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
                     return Some((c.conn.clone(), m, now_ms));
                 }
@@ -621,7 +754,7 @@ impl SharedEgress {
         drop(current);
         // The cached connection is gone (or lost DATAGRAM support): walk the
         // egress order above.
-        let (order, k) = self.egress_order(pool);
+        let (order, k) = self.egress_order(pool, class);
         for &i in &order[..k] {
             let Some(slot) = pool.slots.get(i) else {
                 continue;
@@ -634,13 +767,13 @@ impl SharedEgress {
                     Some(m) => {
                         // Lock-free publish: cannot lose, cannot park the
                         // executor, and always carries a real stamp.
-                        self.cached.store(Some(Arc::new(EgressCache {
+                        cached.store(Some(Arc::new(EgressCache {
                             conn: (**c).clone(),
                             limit: m,
                             stamp_ms: now_ms,
                             slot: i,
                         })));
-                        self.generation
+                        self.generation[class.index()]
                             .fetch_add(1, std::sync::atomic::Ordering::Release);
                         return Some(((**c).clone(), m, now_ms));
                     }
@@ -657,11 +790,10 @@ impl SharedEgress {
         None
     }
 
-    fn invalidate(&self) {
-        self.cached.store(None);
+    fn invalidate(&self, class: EgressClass) {
+        self.cached[class.index()].store(None);
         // The clear always lands, so the memo invalidation is never skipped.
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Re-read the live DATAGRAM budget on the cached handle, keeping it.
@@ -677,8 +809,9 @@ impl SharedEgress {
     /// A no-op when the budget has not actually moved, which is the case for
     /// every payload past `MQP_FRAG_MAX_PAYLOAD` (the fragmenter rejects those
     /// before quinn ever sees them, and its `limit` was already correct).
-    fn refresh_budget(&self) {
-        let current = self.cached.load();
+    fn refresh_budget(&self, class: EgressClass) {
+        let cached = &self.cached[class.index()];
+        let current = cached.load();
         let Some(c) = current.as_ref() else {
             return;
         };
@@ -688,14 +821,13 @@ impl SharedEgress {
         if m == c.limit {
             return;
         }
-        self.cached.store(Some(Arc::new(EgressCache {
+        cached.store(Some(Arc::new(EgressCache {
             conn: c.conn.clone(),
             limit: m,
             stamp_ms: coarse_millis(),
             slot: c.slot,
         })));
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1080,18 +1212,28 @@ async fn main() -> Result<()> {
 
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();
-    let pool = ConnPool::new(conns, c.interactive_port_list(), udp_fail_closed);
-    // One extra connection is dialed for UDP, so `quic_conns` keeps meaning
-    // "TCP pool size" and the dedicated UDP connection never takes a congestion
+    let udp_split = c.udp_split();
+    let pool = ConnPool::new(conns, c.interactive_port_list(), udp_fail_closed, udp_split);
+    // One extra connection per UDP egress class, so `quic_conns` keeps meaning
+    // "TCP pool size" and the dedicated UDP connections never take a congestion
     // window away from the bulk TCP class.
     info!(
-        "quic pool: {conns} TCP connection(s){} + 1 dedicated UDP connection (slot {}){}",
+        "quic pool: {conns} TCP connection(s){} + {} dedicated UDP connection(s) ({}){}",
         if conns > 1 {
             " (bulk round-robin + interactive pin)"
         } else {
             " (single connection: interactive and bulk share slot 0)"
         },
-        pool.udp_slot(),
+        if udp_split { 2 } else { 1 },
+        if udp_split {
+            format!(
+                "interactive slot {}, bulk slot {}",
+                pool.udp_slot(EgressClass::Interactive),
+                pool.udp_slot(EgressClass::Bulk)
+            )
+        } else {
+            format!("shared slot {}", pool.udp_slot(EgressClass::Interactive))
+        },
         if udp_fail_closed {
             ", UDP is fail-closed: dropped rather than shared while it reconnects"
         } else {
@@ -2251,6 +2393,11 @@ async fn udp_associate_inner(
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
     let mut published_app: Option<SocketAddr> = None;
+    // Egress class, fixed by the first datagram that reaches the send path and
+    // kept for the association's life (see [`EgressClass`]); until then every
+    // datagram would classify from itself, which cannot happen because the
+    // first send classifies before it goes out.
+    let mut class: Option<EgressClass> = None;
     loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
@@ -2346,7 +2493,18 @@ async fn udp_associate_inner(
                 // old `min(1350)` made every UDP payload above 1338 B vanish on
                 // a 1472 B path (see `dgram_payload_cap`). Payloads past a single
                 // frame are split by the fragmenter rather than dropped.
-                let sent = match egress_shared.with_fresh(now, |c, limit| {
+                // A first datagram may not be classified yet (an earlier one may
+                // have failed framing validation); the send path pins it.
+                let class = *class.get_or_insert_with(|| {
+                    let c = pool.udp_class(&addr, payload.len());
+                    tracing::debug!(
+                        "udp assoc {sess}: egress class {} (first payload {} B)",
+                        c.name(),
+                        payload.len()
+                    );
+                    c
+                });
+                let sent = match egress_shared.with_fresh(class, now, |c, limit| {
                     frag.send(c, sess, &addr, payload, limit)
                 }) {
                     Some(s) => s,
@@ -2355,17 +2513,16 @@ async fn udp_associate_inner(
                         // mutation concurrent with `acquire` then bumps past
                         // this tag, so the memo below is never served for a
                         // value the mutation replaced.
-                        let gen = egress_shared
-                            .generation
+                        let gen = egress_shared.generation[class.index()]
                             .load(std::sync::atomic::Ordering::Acquire);
-                        match egress_shared.acquire(&pool, now) {
+                        match egress_shared.acquire(&pool, class, now) {
                             Some((conn, limit, stamp)) => {
-                                egress_shared.memo_store(gen, &conn, limit, stamp);
+                                egress_shared.memo_store(class, gen, &conn, limit, stamp);
                                 frag.send(&conn, sess, &addr, payload, limit)
                             }
                             None => {
-                                // No isolated egress connection right now: the
-                                // dedicated UDP slot has not come up, is
+                                // No isolated egress connection right now: this
+                                // class's dedicated UDP slot has not come up, is
                                 // reconnecting, or another thread owns the
                                 // refresh gate. Counted *exactly* (this counter is
                                 // not batched) and warned once per
@@ -2381,11 +2538,11 @@ async fn udp_associate_inner(
                                     n,
                                     || {
                                         format!(
-                                            "; udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                                            "; class={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                                            class.name(),
                                             pool.udp_fail_closed(),
-                                            pool.slot(pool.udp_slot()).is_live(),
-                                            egress_shared
-                                                .refreshing
+                                            pool.slot(pool.udp_slot(class)).is_live(),
+                                            egress_shared.refreshing[class.index()]
                                                 .load(std::sync::atomic::Ordering::Relaxed),
                                         )
                                     },
@@ -2428,7 +2585,7 @@ async fn udp_associate_inner(
                         tracing::debug!(
                             "client datagram dropped: past the path's DATAGRAM budget"
                         );
-                        egress_shared.refresh_budget();
+                        egress_shared.refresh_budget(class);
                     }
                     DatagramSend::ConnectionLost => {
                         tracing::debug!("client egress stale, invalidating shared cache");
@@ -2436,9 +2593,9 @@ async fn udp_associate_inner(
                         dgram_drops::warn_egress_drop(
                             dgram_drops::EgressDrop::ConnectionLost,
                             n,
-                            || format!("; send outcome {outcome:?}, cached handle invalidated"),
+                            || format!("; class={}, send outcome {outcome:?}, cached handle invalidated", class.name()),
                         );
-                        egress_shared.invalidate();
+                        egress_shared.invalidate(class);
                     }
                     DatagramSend::Unsupported => {
                         tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
@@ -2749,17 +2906,26 @@ mod tests {
         assert_eq!(select_slot(true, 2, &[false; 4]), 0);
     }
 
-    /// The pool holds N distinct TCP slots plus the
-    /// dedicated UDP slot, bulk flows cycling through every *non-interactive* TCP
+    /// The pool holds N distinct TCP slots plus one dedicated UDP slot per
+    /// egress class, bulk flows cycling through every *non-interactive* TCP
     /// slot, the interactive port pinned to slot 0, and failover driven by the
     /// maintained liveness bits.
     #[test]
     fn pool_round_robins_bulk_over_every_non_interactive_slot() {
-        let pool = ConnPool::new(4, vec![53], true);
+        let pool = ConnPool::new(4, vec![53], true, true);
         assert_eq!(pool.tcp_slots(), 4, "every TCP slot is registered");
-        assert_eq!(pool.udp_slot(), 4, "UDP is one past the TCP range");
-        assert_eq!(pool.slots_total(), 5);
-        assert_eq!(pool.slots.len(), 5, "all five slots are installed");
+        assert_eq!(
+            pool.udp_slot(EgressClass::Interactive),
+            4,
+            "the interactive UDP class is one past the TCP range"
+        );
+        assert_eq!(
+            pool.udp_slot(EgressClass::Bulk),
+            5,
+            "the bulk UDP class gets its own slot"
+        );
+        assert_eq!(pool.slots_total(), 6);
+        assert_eq!(pool.slots.len(), 6, "all six slots are installed");
         assert!(
             !Arc::ptr_eq(&pool.slot(0).live, &pool.slot(1).live),
             "each index is its own slot, not one shared handle"
@@ -2824,7 +2990,7 @@ mod tests {
         assert_eq!(select_slot(true, 0, &live), 0);
         assert_eq!(select_slot(true, 0, &[false, true, false, true]), 1);
         // The pool-level form of the same case.
-        let pool = ConnPool::new(4, vec![], true);
+        let pool = ConnPool::new(4, vec![], true, true);
         for i in [0usize, 1, 3] {
             pool.slot(i)
                 .live
@@ -2845,14 +3011,15 @@ mod tests {
 
     /// A one-slot pool is the legacy single-TCP-connection mode: every flow,
     /// pinned or bulk, resolves to slot 0 no matter what the liveness bit says.
-    /// UDP still gets its own connection (slot 1), so even the legacy mode keeps
-    /// the two classes off one congestion window.
+    /// UDP still gets its own connection(s) past the TCP range, so even the
+    /// legacy mode keeps the classes off one congestion window.
     #[test]
     fn pool_of_one_slot_always_routes_to_slot_zero() {
-        let pool = ConnPool::new(1, vec![], true);
+        let pool = ConnPool::new(1, vec![], true, true);
         assert_eq!(pool.tcp_slots(), 1);
-        assert_eq!(pool.udp_slot(), 1);
-        assert_eq!(pool.slots_total(), 2);
+        assert_eq!(pool.udp_slot(EgressClass::Interactive), 1);
+        assert_eq!(pool.udp_slot(EgressClass::Bulk), 2);
+        assert_eq!(pool.slots_total(), 3);
         let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
         assert_eq!(pool.pick_tcp_index(&bulk), 0);
         assert_eq!(pool.pick_tcp_index(&bulk), 0);
@@ -2862,47 +3029,124 @@ mod tests {
         assert_eq!(pool.pick_tcp_index(&bulk), 0);
         // The constructor clamps, so a wider pool can never be built than the
         // routing path's stack liveness array can describe.
-        assert_eq!(ConnPool::new(999, vec![], true).tcp_slots(), MAX_POOL_CONNS);
-        assert_eq!(ConnPool::new(0, vec![], true).tcp_slots(), 1);
-        // Clamping holds for the physical registry too: `tcp + 1` slots.
         assert_eq!(
-            ConnPool::new(999, vec![], true).slots_total(),
+            ConnPool::new(999, vec![], true, true).tcp_slots(),
+            MAX_POOL_CONNS
+        );
+        assert_eq!(ConnPool::new(0, vec![], true, true).tcp_slots(), 1);
+        // Clamping holds for the physical registry too: `tcp + classes` slots
+        // with the split on, `tcp + 1` with it off.
+        assert_eq!(
+            ConnPool::new(999, vec![], true, true).slots_total(),
+            MAX_POOL_CONNS + EgressClass::COUNT
+        );
+        assert_eq!(
+            ConnPool::new(999, vec![], true, false).slots_total(),
             MAX_POOL_CONNS + 1
         );
     }
 
-    /// The dedicated UDP slot is outside every TCP range, and the fail-closed
-    /// policy keeps egress on it: a datagram is never handed a TCP slot's
-    /// connection, whatever the rest of the pool is doing.
+    /// The dedicated UDP slots are outside every TCP range, and the fail-closed
+    /// policy keeps each class on its own slot: a datagram is never handed a TCP
+    /// slot's connection, whatever the rest of the pool is doing.
     #[test]
     fn udp_egress_is_confined_to_the_dedicated_slot() {
-        let pool = ConnPool::new(4, vec![], true);
-        assert_eq!(pool.udp_slot(), 4);
-        assert!(pool.udp_slot() >= pool.tcp_slots());
-        // Bulk rotation can never reach the UDP slot, live or dead.
+        let pool = ConnPool::new(4, vec![], true, true);
+        assert_eq!(pool.udp_slot(EgressClass::Interactive), 4);
+        assert_eq!(pool.udp_slot(EgressClass::Bulk), 5);
+        assert!(pool.udp_slot(EgressClass::Interactive) >= pool.tcp_slots());
+        // Bulk rotation can never reach the UDP slots, live or dead.
         for rr in 0..16 {
             let i = select_slot(false, rr, &[true; 4]);
             assert!(i < pool.tcp_slots(), "rr={rr} picked {i}");
         }
-        // Fail-closed: exactly one candidate.
+        // Fail-closed: exactly one candidate, and it is the caller's class slot.
         let egress = SharedEgress::default();
-        let (order, k) = egress.egress_order(&pool);
-        assert_eq!(k, 1, "fail-closed egress has a single candidate");
-        assert_eq!(order[0], pool.udp_slot());
-        // Fallback allowed: UDP first, then interactive, then bulk — and the UDP
-        // slot appears exactly once.
-        let pool = ConnPool::new(4, vec![], false);
-        let (order, k) = egress.egress_order(&pool);
+        let (order, k) = egress.egress_order(&pool, EgressClass::Interactive);
+        assert_eq!((order[0], k), (4, 1), "interactive is confined to slot 4");
+        let (order, k) = egress.egress_order(&pool, EgressClass::Bulk);
+        assert_eq!((order[0], k), (5, 1), "bulk is confined to slot 5");
+        // Fallback allowed: own class, other class, then interactive TCP, then
+        // bulk TCP — and each UDP slot appears exactly once.
+        let pool = ConnPool::new(4, vec![], false, true);
+        let (order, k) = egress.egress_order(&pool, EgressClass::Interactive);
         assert_eq!(k, pool.slots_total());
-        assert_eq!(&order[..5], &[4, 0, 1, 2, 3]);
+        assert_eq!(&order[..6], &[4, 5, 0, 1, 2, 3]);
         assert_eq!(
-            order[..k].iter().filter(|&&i| i == pool.udp_slot()).count(),
+            order[..k]
+                .iter()
+                .filter(|&&i| i == pool.udp_slot(EgressClass::Interactive))
+                .count(),
             1
         );
+        let (order, _) = egress.egress_order(&pool, EgressClass::Bulk);
+        assert_eq!(&order[..6], &[5, 4, 0, 1, 2, 3]);
+        // The split off: both classes share the single slot, TCP after it.
+        let pool = ConnPool::new(4, vec![], false, false);
+        let (order, k) = egress.egress_order(&pool, EgressClass::Bulk);
+        assert_eq!(k, pool.slots_total());
+        assert_eq!(&order[..5], &[4, 0, 1, 2, 3]);
         // The one-slot legacy pool still separates the classes.
-        let pool = ConnPool::new(1, vec![], true);
-        let (order, k) = egress.egress_order(&pool);
-        assert_eq!((order[0], k), (1, 1));
+        let pool = ConnPool::new(1, vec![], true, true);
+        let (order, k) = egress.egress_order(&pool, EgressClass::Bulk);
+        assert_eq!((order[0], k), (2, 1));
+    }
+
+    /// The class split decision: a known interactive port is interactive
+    /// whatever the payload size, and an unknown port is interactive only when
+    /// the first datagram is small enough to be STUN/DTLS/RTP-sized media.
+    #[test]
+    fn udp_class_splits_by_port_and_first_payload() {
+        let pool = ConnPool::new(1, vec![53, 3478], true, true);
+        let ip = |port| TargetAddrRef::Ip(SocketAddr::from(([203, 0, 113, 7], port)));
+        // A known interactive port is interactive whatever the payload size.
+        assert_eq!(pool.udp_class(&ip(53), 1400), EgressClass::Interactive);
+        assert_eq!(pool.udp_class(&ip(3478), 1400), EgressClass::Interactive);
+        // An unknown port with a small first payload (STUN/DTLS/RTP-sized) is
+        // interactive; the same port with a full-size first payload is bulk.
+        assert_eq!(pool.udp_class(&ip(443), 100), EgressClass::Interactive);
+        assert_eq!(
+            pool.udp_class(&ip(443), UDP_INTERACTIVE_MAX),
+            EgressClass::Interactive
+        );
+        assert_eq!(
+            pool.udp_class(&ip(443), UDP_INTERACTIVE_MAX + 1),
+            EgressClass::Bulk
+        );
+        assert_eq!(pool.udp_class(&ip(443), 1200), EgressClass::Bulk);
+        // A domain target classifies by its port the same way.
+        assert_eq!(
+            pool.udp_class(&TargetAddrRef::Domain("example.com", 3478), 1200),
+            EgressClass::Interactive
+        );
+    }
+
+    /// The two classes never share a cached handle: a handle published for the
+    /// interactive class must not serve a fail-closed bulk association, or the
+    /// split would collapse back to one congestion window.
+    #[tokio::test]
+    async fn egress_classes_do_not_share_cached_handles() {
+        let (conn, _c, _s) = real_connection().await;
+        let pool = ConnPool::new(2, Vec::new(), true, true);
+        let e = SharedEgress::default();
+        let now = mono_millis();
+        let (ic, bc) = (EgressClass::Interactive, EgressClass::Bulk);
+        e.cached[ic.index()].store(Some(Arc::new(EgressCache {
+            conn: conn.clone(),
+            limit: 1200,
+            stamp_ms: now,
+            slot: pool.udp_slot(ic),
+        })));
+        // The interactive class serves its live handle ...
+        let got = e.acquire(&pool, ic, now).expect("interactive handle");
+        assert_eq!(got.0.stable_id(), conn.stable_id());
+        // ... while the bulk class, whose own slot has no connection, gets
+        // nothing — never the interactive handle.
+        assert!(
+            e.acquire(&pool, bc, now).is_none(),
+            "a fail-closed bulk class must not borrow the interactive handle"
+        );
+        assert!(e.cached[bc.index()].load().is_none());
     }
 
     /// Loopback QUIC endpoint pair through the same public TLS/transport
@@ -2942,40 +3186,45 @@ mod tests {
 
     /// The memo is served only while it is both current (generation matches)
     /// and fresh (stamp inside the window); `invalidate` bumps the generation
-    /// so every thread's memo misses without a scan.
+    /// so every thread's memo misses without a scan. The two classes are
+    /// independent: a bulk memo never serves an interactive lookup.
     #[tokio::test]
     async fn egress_memo_honours_generation_and_freshness() {
         let (conn, _client, _server) = real_connection().await;
         let e = SharedEgress::default();
+        let class = EgressClass::Interactive;
         let now = mono_millis();
-        e.cached.store(Some(Arc::new(EgressCache {
+        e.cached[class.index()].store(Some(Arc::new(EgressCache {
             conn: conn.clone(),
             limit: 1200,
             stamp_ms: now,
             slot: 0,
         })));
-        e.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let gen = e.generation.load(std::sync::atomic::Ordering::Acquire);
-        e.memo_store(gen, &conn, 1200, now);
-        assert_eq!(e.with_fresh(now, |_, limit| limit), Some(1200));
+        e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+        let gen = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        e.memo_store(class, gen, &conn, 1200, now);
+        assert_eq!(e.with_fresh(class, now, |_, limit| limit), Some(1200));
         assert!(
-            e.with_fresh(now + EGRESS_REFRESH_MS, |_, _| ()).is_none(),
+            e.with_fresh(EgressClass::Bulk, now, |_, _| ()).is_none(),
+            "a memo stored for one class must not serve the other"
+        );
+        assert!(
+            e.with_fresh(class, now + EGRESS_REFRESH_MS, |_, _| ())
+                .is_none(),
             "a stamp past the refresh window must miss"
         );
-        e.invalidate();
+        e.invalidate(class);
         assert!(
-            e.with_fresh(now, |_, _| ()).is_none(),
+            e.with_fresh(class, now, |_, _| ()).is_none(),
             "a successful invalidate bumps the generation and drops the memo"
         );
         // A memo tagged before a later bump is not served even while its stamp
         // is still inside the window.
-        let old_gen = e.generation.load(std::sync::atomic::Ordering::Acquire);
-        e.memo_store(old_gen, &conn, 1200, now);
-        assert!(e.with_fresh(now, |_, _| ()).is_some());
-        e.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        assert!(e.with_fresh(now, |_, _| ()).is_none());
+        let old_gen = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        e.memo_store(class, old_gen, &conn, 1200, now);
+        assert!(e.with_fresh(class, now, |_, _| ()).is_some());
+        e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+        assert!(e.with_fresh(class, now, |_, _| ()).is_none());
     }
 
     /// A `TooLarge` send refreshes the cached DATAGRAM budget instead of
@@ -2994,20 +3243,25 @@ mod tests {
             .max_datagram_size()
             .expect("both ends negotiate DATAGRAM");
         let e = SharedEgress::default();
+        let class = EgressClass::Interactive;
         // A deliberately stale, too-small budget, as if the path MTU had shrunk
         // under a memoized handle.
-        e.cached.store(Some(Arc::new(EgressCache {
+        e.cached[class.index()].store(Some(Arc::new(EgressCache {
             conn: conn.clone(),
             limit: live.saturating_sub(64).max(1),
             stamp_ms: mono_millis(),
             slot: 0,
         })));
-        let gen_before = e.generation.load(std::sync::atomic::Ordering::Acquire);
-        let cached_before = e.cached.load_full().expect("published above");
+        let gen_before = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        let cached_before = e.cached[class.index()]
+            .load_full()
+            .expect("published above");
 
-        e.refresh_budget();
+        e.refresh_budget(class);
 
-        let after = e.cached.load_full().expect("the handle must survive");
+        let after = e.cached[class.index()]
+            .load_full()
+            .expect("the handle must survive");
         assert_eq!(
             after.conn.stable_id(),
             cached_before.conn.stable_id(),
@@ -3019,7 +3273,7 @@ mod tests {
         );
         assert_eq!(after.slot, cached_before.slot);
         assert_eq!(
-            e.generation.load(std::sync::atomic::Ordering::Acquire),
+            e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire),
             gen_before + 1,
             "every thread's memo must be invalidated so the new budget is used"
         );
@@ -3027,19 +3281,19 @@ mod tests {
         // And it is a no-op once the budget already matches — the case for a
         // payload past MQP_FRAG_MAX_PAYLOAD, where the fragmenter rejects the
         // datagram before quinn ever sees it and nothing moved.
-        let gen_now = e.generation.load(std::sync::atomic::Ordering::Acquire);
-        e.refresh_budget();
+        let gen_now = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        e.refresh_budget(class);
         assert_eq!(
-            e.generation.load(std::sync::atomic::Ordering::Acquire),
+            e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire),
             gen_now,
             "an unchanged budget must not churn the generation"
         );
 
         // With no cached handle at all it must not resurrect one.
-        e.invalidate();
-        e.refresh_budget();
+        e.invalidate(class);
+        e.refresh_budget(class);
         assert!(
-            e.cached.load().is_none(),
+            e.cached[class.index()].load().is_none(),
             "refresh_budget never re-picks a connection; that is acquire's job"
         );
     }
@@ -3119,20 +3373,21 @@ mod tests {
     #[tokio::test]
     async fn egress_stays_on_its_connection_while_it_lives() {
         let (conn, _c, _s) = real_connection().await;
-        let pool = ConnPool::new(2, Vec::new(), true);
+        let pool = ConnPool::new(2, Vec::new(), true, true);
         let e = SharedEgress::default();
+        let class = EgressClass::Interactive;
         let now = mono_millis();
         // Cached, but past the freshness window, so a refresh is required. Slot
-        // 2 is this pool's dedicated UDP slot, which is what a fail-closed pool
-        // can legitimately hold.
-        e.cached.store(Some(Arc::new(EgressCache {
+        // 2 is this pool's interactive UDP slot, which is what a fail-closed
+        // pool can legitimately hold.
+        e.cached[class.index()].store(Some(Arc::new(EgressCache {
             conn: conn.clone(),
             limit: 1200,
             stamp_ms: now.saturating_sub(EGRESS_REFRESH_MS),
-            slot: pool.udp_slot(),
+            slot: pool.udp_slot(class),
         })));
         let (got, limit, stamp) = e
-            .refresh_global(&pool, now)
+            .refresh_global(&pool, class, now)
             .expect("a live cached connection must be reused, not re-picked");
         assert_eq!(
             got.stable_id(),
@@ -3145,7 +3400,10 @@ mod tests {
             "the DATAGRAM budget is re-read from the live path"
         );
         assert_eq!(
-            e.cached.load().as_ref().map(|c| c.conn.stable_id()),
+            e.cached[class.index()]
+                .load()
+                .as_ref()
+                .map(|c| c.conn.stable_id()),
             Some(conn.stable_id()),
             "the published handle must still be that same connection"
         );
@@ -3162,7 +3420,7 @@ mod tests {
         }
         assert!(conn.close_reason().is_some(), "close must be observable");
         assert!(
-            e.refresh_global(&pool, now).is_none(),
+            e.refresh_global(&pool, class, now).is_none(),
             "a dead cached handle with no live slot must not be re-served"
         );
     }

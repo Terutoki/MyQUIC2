@@ -31,6 +31,12 @@ quic_conns = 4
 # drops the datagram (counted in the 60s "udp budget" line) rather than sharing
 # a TCP connection; false restores the fallback onto the interactive connection.
 # udp_fail_closed = true
+# Split UDP egress into two dedicated connections by class (default true):
+# interactive_ports destinations and flows whose first datagram is <= 512 B
+# (STUN/DTLS/RTP-sized media, DNS, games) ride the interactive connection,
+# everything else the bulk one, so a bulk flow cannot starve a
+# latency-sensitive flow. false = one shared UDP connection (one fewer dial).
+# udp_split = true
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the

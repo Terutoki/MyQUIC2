@@ -217,7 +217,7 @@ limit rather than claimed — see
 Its `dist/` artifacts **are** rebuilt from this revision, but nothing was
 verified for them (rebuilt on request, not tested).
 
-The current pass fixes five findings from an outside-in audit of the data paths:
+The previous pass fixed five findings from an outside-in audit of the data paths:
 the client's UDP relay is now bound to the address BND advertises (a wildcard
 bind let a multi-homed host send replies from a different source than the app
 connected to, and a source-validating app dropped every one), the deferred-send
@@ -229,6 +229,20 @@ and the reassembly expiry/eviction counters stay live in the
 `--no-default-features` build — see
 [pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene).
 Its `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
+for them (rebuilt on request, not tested).
+
+The current pass closes the UDP-vs-UDP fairness gap pass 35 documented as a
+limitation: UDP egress is now split into **one dedicated connection per egress
+class** (interactive vs bulk, `udp_split`), an association is classified once
+from its first datagram (an `interactive_ports` destination or a ≤ 512 B first
+payload — STUN/DTLS/RTP-sized media — is interactive, everything else bulk) and
+keeps its class for life, so a bulk flow's congestion window and 1 MB DATAGRAM
+send buffer can no longer starve a latency-sensitive flow. The per-class egress
+caches, single-flight gates and generations are independent end to end, the
+fail-closed policy is enforced per class, and `udp_split = false` restores the
+single shared UDP connection — see
+[pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections). Its
+`dist/` artifacts **are** rebuilt from this revision, but nothing was verified
 for them (rebuilt on request, not tested).
 
 ---
@@ -251,7 +265,7 @@ for them (rebuilt on request, not tested).
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor) and [pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor) and [pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene) and [pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -262,7 +276,7 @@ for them (rebuilt on request, not tested).
 | Area | Detail |
 |---|---|
 | **Proxy ingress** | Standard SOCKS5: `CONNECT` (TCP) + `UDP ASSOCIATE`, IPv4 / domain / IPv6 targets. SOCKS itself is no-auth by design; the QUIC link can be protected with a token |
-| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, four **TCP** connections per client by default (`quic_conns`, clamped 1–8; bulk round-robin, interactive pinning, class-preserving failover) plus one dedicated UDP connection, so TCP and UDP never share a congestion window — `quic_conns = 1` restores a single shared TCP connection |
+| **Transport** | QUIC (quinn 0.11.12 / proto 0.11.18 from crates.io), TLS 1.3 only, four **TCP** connections per client by default (`quic_conns`, clamped 1–8; bulk round-robin, interactive pinning, class-preserving failover) plus **two classified UDP egress connections** (interactive vs bulk, so a bulk UDP flow cannot starve a latency-sensitive one; `udp_split = false` for one), so TCP and UDP never share a congestion window — `quic_conns = 1` restores a single shared TCP connection |
 | **Handshake path** | Per-incoming accept/handshake tasks — one slow client can never stall new connections |
 | **Congestion** | BBR by default (Cubic available as escape hatch), ECN + pacing on |
 | **Offload** | GSO/GRO auto-probed (`UDP_SEGMENT`); 4 MB QUIC socket buffers; 1 MB DATAGRAM send/receive buffers |
@@ -286,7 +300,7 @@ Single crate, three units sharing one protocol library:
 |---|---|---|
 | `myquic2` (lib) | `src/lib.rs` | MQP-2 codec (owned + borrowed forms), TOML config schema, TLS/cert helpers, QUIC transport builder, TCP↔QUIC bridge |
 | `myquic2-server` | `src/bin/myquic2-server.rs` | QUIC ingress → dials TCP/UDP targets; per-session UDP sockets; token auth; self-signed cert issuance |
-| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; fixed N-slot TCP connection pool (plain indexed `Vec`, 4 by default) plus a dedicated UDP egress slot, each with a reconnect loop + DATAGRAM dispatcher; per-association UDP relay; token auth |
+| `myquic2-client` | `src/bin/myquic2-client.rs` | SOCKS5 ingress → QUIC egress; fixed N-slot TCP connection pool (plain indexed `Vec`, 4 by default) plus classified UDP egress slots (interactive + bulk, one each by default), each with a reconnect loop + DATAGRAM dispatcher; per-association UDP relay; token auth |
 | `zero_rtt_probe` | `examples/zero_rtt_probe.rs` | End-to-end 0-RTT verification probe (with token support) |
 
 **Data-plane mapping:**
@@ -311,9 +325,9 @@ Single crate, three units sharing one protocol library:
 **Concurrency model:** Tokio multi-threaded runtime. The server spawns one task per
 incoming connection (handshake included), one DATAGRAM reader and one session sweeper
 per connection, and one lightweight reader task per UDP session. The client keeps a
-pool of QUIC connections (4 TCP by default, `quic_conns`, clamped 1–8, **plus one
-dedicated UDP egress connection**) sharing one Endpoint/UDP socket, each slot with
-its own reconnect loop and DATAGRAM dispatcher; one
+pool of QUIC connections (4 TCP by default, `quic_conns`, clamped 1–8, **plus one or
+two classified UDP egress connections**) sharing one Endpoint/UDP socket, each slot
+with its own reconnect loop and DATAGRAM dispatcher; one
 task per SOCKS connection and one association task per UDP association (the reply
 direction is written by the per-connection DATAGRAM dispatcher itself, not by a
 per-association reply task). Subscriptions
@@ -328,29 +342,36 @@ fixed write-once set, so the dependency is gone.)
 separate congestion windows are the isolation mechanism — and because
 `quinn-proto` fills every packet with queued DATAGRAM frames *before* STREAM frames,
 "separate congestion windows" is also the only way to stop a bulk UDP flow from
-starving the TCP streams that share its connection. The pool therefore has three
+starving the TCP streams that share its connection. The pool therefore has four
 classes of slot: slot 0 is the **interactive** connection (every port in
 `interactive_ports`, default DNS/NTP/STUN), slots `1..quic_conns` are the **bulk**
-class (bulk TCP round-robin), and slot `quic_conns` is the **dedicated UDP egress**
-connection — UDP is never one of the TCP slots. Class-preserving failover: a dead
-bulk preference fails over to another *bulk* slot, and only a pool with no live bulk
-slot at all shares slot 0; UDP is fail-closed by default (`udp_fail_closed`), i.e. a
-datagram with no isolated connection to go out on is dropped and counted in the 60 s
-`udp budget` line rather than queued behind TCP traffic. Returning TCP flows stick to
-their slot for life; UDP egress is sticky to its connection while it lives. Isolation
-holds while more than one connection is alive: with `quic_conns = 1` all *TCP* shares
-one cwnd (UDP still does not). The TCP open header is always its own write, never
-batched behind first application bytes, so server-first peers (game logins, banners)
-see it within ~100 ms.
+class (bulk TCP round-robin), and slots `quic_conns` and `quic_conns + 1` are the
+**classified UDP egress** connections — `interactive_ports` and small-first-datagram
+associations on one, everything else on the other, UDP never on a TCP slot.
+Class-preserving failover: a dead bulk preference fails over to another *bulk* slot,
+and only a pool with no live bulk slot at all shares slot 0; UDP is fail-closed by
+default (`udp_fail_closed`), i.e. a datagram with no isolated connection *of its
+class* to go out on is dropped and counted in the 60 s `udp budget` line rather than
+queued behind other traffic. Returning TCP flows stick to their slot for life; UDP
+egress is sticky to its class's connection while it lives. Isolation holds while more
+than one connection is alive: with `quic_conns = 1` all *TCP* shares one cwnd, and
+`udp_split = false` restores a single shared *UDP* connection. The TCP open header is
+always its own write, never batched behind first application bytes, so server-first
+peers (game logins, banners) see it within ~100 ms.
 
-**What the isolation does *not* cover:** UDP flows are isolated from TCP, not from
-each other. Every association shares the dedicated UDP connection — one congestion
-window, one 1 MB DATAGRAM send buffer — and full-buffer backpressure drops the
-newest datagram, so a high-rate UDP flow (bulk HTTP/3, a large transfer) can starve
-a latency-sensitive one (video, voice) that shares the tunnel. quinn 0.11 exposes no
-per-stream or per-datagram scheduler to fix that below the connection level; a
-deployment that needs UDP-vs-UDP fairness needs a second client process (or a second
-proxy) per class.
+**What the isolation does *not* cover:** UDP flows are isolated from TCP and from
+the *other UDP class*, not from each other within a class. Every association of
+one class shares that class's dedicated UDP connection — one congestion window,
+one 1 MB DATAGRAM send buffer — and full-buffer backpressure drops the newest
+datagram, so two associations of the same class can still starve each other (two
+bulk transfers, say); a bulk flow cannot starve an interactive one, because they
+ride different connections. Classification is a first-datagram heuristic, so a
+flow can land in the "wrong" class (a WireGuard tunnel's 148 B handshake lands
+interactive, then its data rides that connection) — it then shares that class's
+connection, exactly the pre-split behaviour for that pair. quinn 0.11 exposes no
+per-stream or per-datagram scheduler to fix fairness *within* a class, so a
+deployment that needs that needs a second client process (or a second proxy) per
+class.
 
 ---
 
@@ -758,19 +779,19 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 36 — on top of everything pass 35 shipped)
+rebuilt from the current revision (pass 37 — on top of everything pass 36 shipped)
 with the default feature set, so the relay counters are **on** in these builds:
 static musl, x86-64, stripped — servers 4 398 568–4 420 160 B (v1 4 409 112,
-v2 4 398 568, v3 4 420 160, v4 4 416 896) and clients 4 415 920–4 430 744 B
-(v1 4 430 688, v2 4 415 920, v3 4 430 744, v4 4 423 496). Against the pass-35
-*recorded* figures that is **+18 064…+22 400 B** per server level and
-**+20 120…+24 600 B** per client level — recorded as measured, not explained
-(the fixes touch the relay bind, the retry worker's `JoinSet` drain and the
-counter paths; the regression tests are `#[cfg(test)]` and do not ship). **Nothing
-was verified for these bytes** — no `file`, no `objdump`, no reproducibility
-build, no emulation, no native run — on explicit instruction: they are compiled,
-not tested. What *was* run is the native E2E recorded under
-[pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene),
+v2 4 398 568, v3 4 420 160, v4 4 416 896; byte-size unchanged from pass 36,
+content rebuilt) and clients 4 421 016–4 439 152 B (v1 4 435 784, v2 4 421 016,
+v3 4 439 152, v4 4 432 224), i.e. **+5 096…+8 728 B** per client level against
+the pass-36 *recorded* figures — recorded as measured, not explained (the
+`EgressClass` split, the per-class egress state and the classification log line;
+the regression tests are `#[cfg(test)]` and do not ship). **Nothing was verified
+for these bytes** — no `file`, no `objdump`, no reproducibility build, no
+emulation, no native run — on explicit instruction: they are compiled, not
+tested. What *was* run is the native E2E recorded under
+[pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections),
 against the source these binaries compile.
 The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
 passes'). Against the pass-27
@@ -910,9 +931,11 @@ gso = true
 keep_alive_secs = 5           # clamped to 1..300; idle = max(3x,15s), watchdog = max(4x,20s)
 reconnect_timeout_secs = 5    # new flows wait this long for a QUIC connection
 auth_token = ""                     # must match the server (empty on both = disabled)
-# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, 4 TCP + 1 UDP connection):
+# Optional tuning (defaults = 2/4/2 MB windows, ACK 2/5ms, 4 TCP + 2 UDP connections):
 # stream_receive_window_mb, receive_window_mb, send_window_mb,
-# ack_threshold, max_ack_delay_ms, quic_conns = 1..8 (1 = single TCP), udp_fail_closed, interactive_ports, alpn
+# ack_threshold, max_ack_delay_ms, quic_conns = 1..8 (1 = single TCP),
+# udp_split (default true; false = one shared UDP connection), udp_fail_closed,
+# interactive_ports, alpn
 ```
 
 Field notes:
@@ -937,15 +960,26 @@ Field notes:
   holds ~1/(n−1) of the queue, while `interactive_ports` (default 53/123/3478–3481)
   pin to slot 0. `1` restores the legacy single shared TCP connection; the cap
   bounds what a config typo can request, since every slot owns a dial loop, a
-  DATAGRAM dispatcher, keepalives and its own 0-RTT ticket state. One further
-  connection is always dialed for UDP (slot `quic_conns`), so a client's worst case
-  is 9 connections; UDP never shares a TCP connection's congestion window, and a
-  dead bulk slot fails over to another *bulk* slot before it will touch slot 0.
-- `udp_fail_closed` (default `true`) decides what UDP does while its dedicated
-  connection is reconnecting: drop the datagram — counted, and reported in the 60 s
-  `udp budget` line — rather than put it on a TCP connection. Set it to `false` to
-  restore the old fallback (interactive slot, then bulk slots), which keeps UDP
-  flowing at the cost of sharing a cwnd and a packet payload with TCP traffic.
+  DATAGRAM dispatcher, keepalives and its own 0-RTT ticket state. Further
+  connections are always dialed for UDP — one per egress class with `udp_split`
+  (slots `quic_conns` and `quic_conns + 1`), one with it off — so a client's worst
+  case is `quic_conns` + 2 (10 at the cap) and a default client dials 6; UDP never
+  shares a TCP connection's congestion window, and a dead bulk slot fails over to
+  another *bulk* slot before it will touch slot 0.
+- `udp_split` (default `true`) splits UDP egress into one dedicated connection per
+  class: destinations in `interactive_ports`, and associations whose first datagram
+  is ≤ 512 B (STUN/DTLS/RTP-sized media, DNS, games), ride the **interactive**
+  connection; everything else rides the **bulk** one. A bulk flow's congestion
+  window and 1 MB DATAGRAM send buffer therefore cannot starve a latency-sensitive
+  flow. The class is fixed by an association's first datagram and kept for life (a
+  switch would move the server session and change the source port the target sees).
+  `false` restores the single shared UDP connection and one fewer dial.
+- `udp_fail_closed` (default `true`) decides what UDP does while its class's
+  dedicated connection is reconnecting: drop the datagram — counted, and reported in
+  the 60 s `udp budget` line — rather than put it on a TCP connection. Set it to
+  `false` to restore the old fallback (the class's slot, then the other UDP class,
+  then the interactive slot, then the bulk slots), which keeps UDP flowing at the
+  cost of sharing a cwnd and a packet payload with other traffic.
 - `alpn` defaults to `h3` masquerade (label only); `myquic2/2` restores the
   versioned fail-closed handshake. Same value required on both sides.
 - Paths are resolved against the process CWD — use absolute paths on OpenWrt.
@@ -1025,6 +1059,7 @@ All limits are constants in the sources; the table shows where to change them.
 | Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset; the transport credit above is what the client may *open*) | `MAX_STREAM_TASKS` |
 | Client SOCKS connections | 8192 (excess connections dropped; the pool advertises one stream credit per admitted flow) | `socks_conn_limiter` |
 | Client UDP associations | 4032 (excess replies REP=0x01) | `MAX_UDP_ASSOCS` (lib.rs; the server asserts its per-connection target equals it) |
+| Client UDP egress connections | 1 per egress class with `udp_split` (2 default), 1 without; UDP never rides a TCP slot | `EgressClass`, `udp_split` |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (full retry-shard queue) | 16 shards x 256 deep, 16 sends in flight per shard | `UDP_RETRY_SHARDS`, `UDP_RETRY_DEPTH`, `UDP_RETRY_INFLIGHT` |
 | Receive window (aggregate) | 4 MB/connection default; 16 MB opt-in (`receive_window_mb = 16`) | `TransportTuning`, `RECEIVE_WINDOW` |
@@ -3788,6 +3823,75 @@ figures — recorded as measured, not explained. On explicit instruction **no
 verification of any kind was run on these bytes** (no `file`, no `objdump`, no
 reproducibility build, no emulation, no native run): they are compiled, not
 tested.
+
+### 2026-09 hardening pass 37 — classified UDP egress connections
+
+The fairness gap pass 35 documented as a limitation, closed: UDP egress is now
+split into one dedicated connection per **egress class**, so a bulk UDP flow can
+no longer starve a latency-sensitive one. Client-side only; no frame, framing,
+ALPN or protocol-field change, and the server sees only a higher connection count.
+
+- **Two UDP classes, two connections (`udp_split`, default on).** quinn fills
+  every packet with queued DATAGRAM frames *before* STREAM frames and drops the
+  *newest* datagram when a connection's 1 MB DATAGRAM send buffer fills, so
+  sharing one UDP connection means sharing one congestion window and one drop
+  decision. The pool now dials `quic_conns + 2` connections by default: slots
+  `quic_conns` and `quic_conns + 1` carry the interactive and bulk UDP classes,
+  and neither is ever a TCP slot. `udp_split = false` restores the previous
+  single shared UDP connection (`quic_conns + 1` dials).
+- **Classification is per association, from its first datagram, and sticky for
+  life.** A destination in `interactive_ports` (DNS/NTP/STUN/TURN by default) or
+  a first payload of at most `UDP_INTERACTIVE_MAX` (512 B — the STUN/DTLS/RTP
+  media size range) is interactive; everything else is bulk. Pinning once is a
+  correctness requirement, not an optimisation: switching mid-flow would move
+  the server-side session to another connection and change the source port the
+  target sees (and split one association's replies across two dispatchers).
+  Classification is logged once per association at debug level.
+- **The class state is independent end to end.** `SharedEgress` carries one
+  `ArcSwap` cache, one single-flight refresh gate and one generation per class
+  (and the thread-local memo is per class), so an interactive refresh can never
+  publish onto the bulk slot or invalidate the bulk memo — pinned by
+  `egress_classes_do_not_share_cached_handles` and the cross-class assertion in
+  `egress_memo_honours_generation_and_freshness`. `udp_fail_closed` is enforced
+  *per class*: an interactive datagram with no interactive connection is dropped
+  and counted (class named in the warning detail) rather than quietly borrowing
+  the bulk connection; with `udp_fail_closed = false` the fallback order is own
+  class → other UDP class → interactive TCP → bulk TCP (`egress_order`,
+  pinned by `udp_egress_is_confined_to_the_dedicated_slot`).
+- **The heuristic's worst case is the old behaviour.** A flow can be
+  misclassified (a WireGuard tunnel's 148 B handshake lands interactive, then its
+  bulk data rides that connection); it then shares its class's connection,
+  exactly what every association did before the split. Fairness *within* a class
+  is still not addressed — quinn 0.11 exposes no per-stream or per-datagram
+  scheduler — and the README says so.
+
+Verification: `cargo test --all-targets` **125/125** (65 lib + 33 client + 27
+server) and **124/124** with `--no-default-features` (64 + 33 + 27), `cargo
+clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both
+feature sets. New pins: `udp_class_splits_by_port_and_first_payload`,
+`egress_classes_do_not_share_cached_handles`, the per-class `egress_order` case
+in `udp_egress_is_confined_to_the_dedicated_slot`, and the updated pool/two-UDP
+layout assertions. Native-binary E2E on the fixed release build (macOS loopback,
+the repo's own `hotpath_bench`): the client logs `quic pool: 4 TCP connection(s)
+… + 2 dedicated UDP connection(s) (interactive slot 4, bulk slot 5)` and the
+server logs exactly **6** `new QUIC conn`; `tcpecho` 1 MiB **1 048 576/1 048 576
+bytes, 0 mismatched**; `udpsweep` 8/1200/1420/1430/2000/8000 B **20/20 verified
+at every size, 0 lost**, with the debug class lines showing the 8 B association
+classified **interactive** and the 1200–8000 B associations **bulk** (the sweep
+exercises both classes); the `udp_split = false` client logs `+ 1 dedicated UDP
+connection(s) (shared slot 4)`, the server accepts **5** connections, and the
+same sweep passes; no tunnel-attributable drops or errors in either log. No
+benchmark run: the split only changes behaviour when two UDP classes are active
+at once. `dist/` **was rebuilt from this revision** for all four CPU levels
+(static musl, x86-64, default feature set, the documented `cargo zigbuild`
+recipe; stripped): servers 4 398 568–4 420 160 B (v1 4 409 112, v2 4 398 568,
+v3 4 420 160, v4 4 416 896 — byte-size unchanged from pass 36, content rebuilt)
+and clients 4 421 016–4 439 152 B (v1 4 435 784, v2 4 421 016, v3 4 439 152,
+v4 4 432 224), i.e. **+5 096…+8 728 B** per client level against the pass-36
+*recorded* figures (the `EgressClass` split, the per-class egress state and the
+classification log). On explicit instruction **no verification of any kind was
+run on these bytes** (no `file`, no `objdump`, no reproducibility build, no
+emulation, no native run): they are compiled, not tested.
 
 ---
 

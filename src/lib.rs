@@ -799,6 +799,17 @@ pub struct ClientConf {
     /// cwnd with TCP traffic.
     #[serde(default)]
     pub udp_fail_closed: Option<bool>,
+    /// Whether UDP egress is split into one dedicated connection per egress
+    /// class (default `true`). Destinations in `interactive_ports`, and
+    /// associations whose first datagram is no larger than 512 B
+    /// (STUN/DTLS/RTP-sized media, DNS, games), ride the **interactive** UDP
+    /// connection; everything else rides the **bulk** one — so a bulk flow's
+    /// congestion window and 1 MB DATAGRAM send buffer cannot starve a
+    /// latency-sensitive flow. A client with the split dials `quic_conns + 2`
+    /// connections; `false` restores the single shared UDP connection
+    /// (`quic_conns + 1`).
+    #[serde(default)]
+    pub udp_split: Option<bool>,
     /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
@@ -825,17 +836,18 @@ fn d_5() -> u64 {
 /// connections sharing one Endpoint/UDP socket. Bulk TCP spreads round-robin
 /// across the three bulk slots while `interactive_ports` pin to the interactive
 /// slot, so one heavy flow cannot queue every other flow behind its cwnd.
-/// A fifth, separate connection carries UDP egress exclusively (see
-/// `ClientConf::udp_fail_closed`), so TCP and UDP never share a congestion
-/// window or a packet payload. Independent of the server, which accepts any
-/// number of them.
+/// Separate connections carry UDP egress per egress class (interactive and bulk,
+/// see `ClientConf::udp_split`), so TCP and UDP never share a congestion window
+/// or a packet payload. Independent of the server, which accepts any number of
+/// them.
 pub const DEFAULT_QUIC_CONNS: usize = 4;
 
 /// Hard cap on the client **TCP** connection pool. Every slot owns a QUIC
 /// connection (dial loop, DATAGRAM dispatcher, keepalives, its own 0-RTT ticket
 /// state), so this cap — not the config parser — is what bounds the per-client
-/// cost a `quic_conns` typo can request. The dedicated UDP egress connection is
-/// one slot beyond this, so a client's worst case is `MAX_POOL_CONNS + 1`.
+/// cost a `quic_conns` typo can request. The UDP egress slots are beyond this:
+/// a client's worst case is `MAX_POOL_CONNS + 2` with `udp_split` (the default)
+/// and `MAX_POOL_CONNS + 1` without it.
 pub const MAX_POOL_CONNS: usize = 8;
 
 /// Concurrent bidirectional streams one QUIC connection may carry.
@@ -955,6 +967,12 @@ impl ClientConf {
     /// counted, rather than queued behind TCP traffic on a shared connection.
     pub fn udp_fail_closed(&self) -> bool {
         self.udp_fail_closed.unwrap_or(true)
+    }
+
+    /// Whether UDP egress is split by egress class. Default `true`; see the
+    /// field's note for the classification and the connection count.
+    pub fn udp_split(&self) -> bool {
+        self.udp_split.unwrap_or(true)
     }
 
     pub fn alpn_bytes(&self) -> Vec<u8> {
@@ -2578,11 +2596,12 @@ pub mod dgram_drops {
     /// apart from `SESSION_FULL` because no budget was exhausted. Batched like
     /// the other flood-type counters: a miss storm contends every datagram.
     pub static DNS_CONTENTION: AtomicU64 = AtomicU64::new(0);
-    /// No usable egress connection at the moment the datagram was ready: the
-    /// dedicated UDP connection had not come up yet, was reconnecting, or the
-    /// single-flight refresh was already owned by another thread. The client
-    /// drops the datagram (UDP semantics) — before this counter existed that
-    /// loss was a bare `continue` with no counter and no log at all.
+    /// No usable egress connection at the moment the datagram was ready: its
+    /// egress class's dedicated UDP connection had not come up yet, was
+    /// reconnecting, or the class's single-flight refresh was already owned by
+    /// another thread. The client drops the datagram (UDP semantics) — before
+    /// this counter existed that loss was a bare `continue` with no counter and
+    /// no log at all.
     ///
     /// On the server there is no egress-connection choice, so a non-zero value
     /// here is client-only.
@@ -2847,9 +2866,9 @@ pub mod dgram_drops {
     /// silently merge two different faults into one rate limit.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum EgressDrop {
-        /// No usable egress connection at all: the dedicated UDP connection had
-        /// not come up, was reconnecting, or the single-flight refresh was owned
-        /// by another thread.
+        /// No usable egress connection at all: the datagram's egress class had
+        /// no dedicated connection up, or that class's single-flight refresh was
+        /// owned by another thread.
         NoConnection,
         /// The connection was gone at send time.
         ConnectionLost,
