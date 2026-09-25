@@ -472,25 +472,28 @@ pub const UDP_RECV_SLACK: usize = 1;
 pub const FRAG_TIMEOUT_MS: u64 = 2_000;
 
 /// Reassembly memory bound per connection, counted over the bytes partials
-/// actually **retain** (pinned `Bytes` storage), past which the oldest partial
-/// is evicted — so this is also what caps how many datagrams may be in flight at
-/// once.
+/// actually **retain**: pinned `Bytes` storage plus the slot table each partial
+/// owns, past which the oldest partial is evicted — so this is also what caps how
+/// many datagrams may be in flight at once.
 ///
 /// Retained, not payload, bytes: a zero-copy chunk is a slice of the whole
 /// received DATAGRAM, so a 16-byte final fragment still pins its ~284-byte frame
-/// (see [`DgramReassembler`]). At the protocol's 8 KiB payload ceiling a full
-/// partial retains roughly 8-9 KiB, i.e. on the order of 30 concurrent partials
-/// per connection — far above any real RTT's worth of unfragmented arrivals,
-/// while still bounding what a fragment flood can pin.
+/// (see [`DgramReassembler`]), and every partial owns a
+/// `vec![None; total]` slot table (`total x 32 B` = up to 2 KiB) that a peer can
+/// fill with empty chunks. At the protocol's 8 KiB payload ceiling a full
+/// partial costs roughly 10-11 KiB, i.e. on the order of 20-25 concurrent
+/// partials per connection — far above any real RTT's worth of unfragmented
+/// arrivals, while still bounding what a fragment flood can pin.
 pub const FRAG_MAX_HELD_BYTES: usize = 256 * 1024;
 
-/// Reassembly partial-count bound per connection.
+/// Reassembly partial-count bound per connection: a defense-in-depth backstop
+/// on top of [`FRAG_MAX_HELD_BYTES`], and the bound on the `min_by_key` eviction
+/// scan (at most 256 entries per eviction).
 ///
-/// `held` only accounts payload bytes, but each partial also owns a
-/// `vec![None; total]` slot table (up to 64 `Option<Bytes>` ≈ 2 KiB) plus a
-/// HashMap entry. Without a count cap a peer can force ~128 MiB of slot
-/// tables with 65k single-byte fragments while `held` barely moves. The count
-/// cap also bounds the `min_by_key` eviction scan to 256 entries per eviction.
+/// The byte bound already charges each partial's slot table, so a flood of
+/// never-completing partials is caught there first; this cap only matters if a
+/// future change makes the byte accounting miss a cost (e.g. the HashMap entry
+/// itself).
 pub const FRAG_MAX_PARTIALS: usize = 256;
 
 /// Build a UDP DATAGRAM body: type + sess + addr header + payload.
@@ -835,6 +838,25 @@ pub const DEFAULT_QUIC_CONNS: usize = 4;
 /// one slot beyond this, so a client's worst case is `MAX_POOL_CONNS + 1`.
 pub const MAX_POOL_CONNS: usize = 8;
 
+/// Concurrent bidirectional streams one QUIC connection may carry.
+///
+/// This is the credit each endpoint advertises, and `Connection::open_bi()`
+/// parks until the *peer's* credit allows — so it must cover the largest number
+/// of TCP flows that can land on a single connection. The client admits up to
+/// `MAX_SOCKS_CONNS` (8192) SOCKS connections process-wide and
+/// `interactive_ports` pinning can put every TCP flow on slot 0, hence 8192;
+/// every smaller value lets an *admitted* flow stall in `open_bi()` for the
+/// client's 5 s timeout and then answer SOCKS `REP=0x01` while the process still
+/// has stream-task capacity. The server's `MAX_STREAM_TASKS` process-wide task
+/// bound stays the overload backstop, exactly as before.
+///
+/// (An earlier revision hard-coded 1024 here, which was inconsistent with the
+/// client's 8192-connection admission cap: with the default four-connection
+/// pool only 4096 concurrent TCP flows could ever be open, and the 4097th+
+/// stalled before failing. The client bin asserts `MAX_SOCKS_CONNS <=
+/// MAX_BIDI_STREAMS_PER_CONN` so the two can never drift apart again.)
+pub const MAX_BIDI_STREAMS_PER_CONN: u32 = 8192;
+
 /// Concurrent UDP associations one *client process* may admit.
 ///
 /// Deliberately one number shared with the server's per-connection session
@@ -845,13 +867,14 @@ pub const MAX_POOL_CONNS: usize = 8;
 ///
 /// It is a *budget*, not a guarantee. The server's real ceiling for one
 /// connection is its live **fair share**, `clamp(MAX_SESSIONS_GLOBAL / holders,
-/// 256, LOCAL_SESS_MAX)`, where `holders` counts the connections that currently
-/// hold at least one session (`fair_sess_cap()` in `myquic2-server.rs`). A lone
-/// client is the only holder, so the fair share (4096) sits above this cap and
-/// the client's own limit binds; a server shared by N session-holding
-/// connections gives each `8192 / N`, down to the 256 floor. Nothing on the wire
-/// tells the client which it got, so a deployment that shares a server must size
-/// its per-client capacity against the shared budget, not this number.
+/// MIN_SESSION_SHARE, LOCAL_SESS_MAX)`, where `holders` counts the connections
+/// that currently hold at least one session (`fair_sess_cap()` in
+/// `myquic2-server.rs`). A lone client is the only holder, so the fair share
+/// (4096) sits above this cap and the client's own limit binds; a server shared
+/// by N session-holding connections gives each `8192 / N`, never below the 1024
+/// floor. Nothing on the wire tells the client which it got, so a deployment
+/// that shares a server must size its per-client capacity against the shared
+/// budget, not this number.
 pub const MAX_UDP_ASSOCS: usize = 4032;
 
 /// Runtime transport tuning resolved from optional TOML fields.
@@ -1161,8 +1184,10 @@ pub fn build_transport_tuned(
     // possible MQP-2 header, or a maximum-length domain target could never be
     // encoded at any path MTU.
     const _: () = assert!(DGRAM_MAX_WIRE > MQP_DGRAM_MAX);
-    // 1024 concurrent streams cover high-concurrency tests with margin.
-    t.max_concurrent_bidi_streams(1024u32.into());
+    // Bidi credit: must cover the client's whole admission cap, since
+    // interactive-port pinning can put every admitted TCP flow on one
+    // connection — see `MAX_BIDI_STREAMS_PER_CONN`.
+    t.max_concurrent_bidi_streams(MAX_BIDI_STREAMS_PER_CONN.into());
     t.max_concurrent_uni_streams(100u32.into());
     // Window sizing: every flow-control window must exceed the target BDP, or
     // it -- not the congestion controller -- becomes the throughput ceiling.
@@ -2405,6 +2430,14 @@ pub fn map_for_dual(addr: SocketAddr) -> SocketAddr {
 
 // ---------------- QUIC DATAGRAM send (never the drop-oldest path) ----------------
 /// DATAGRAM send/receive buffer per connection (see [`build_transport`]).
+///
+/// Shared by every session on the connection, and `send_datagram_wait`
+/// backpressure drops the *newest* datagram — so two UDP flows on one connection
+/// are not isolated from each other: a high-rate flow can starve a
+/// latency-sensitive one out of the buffer. Only UDP-vs-TCP isolation is
+/// structural (the client gives UDP its own connection, see `ConnPool` in the
+/// client bin); UDP-vs-UDP fairness would need per-session queues that DATAGRAM
+/// semantics deliberately do not provide.
 const DATAGRAM_BUFFER: usize = 1024 * 1024;
 
 /// Upper bound for one MQP-2 datagram on the wire: the largest address form
@@ -2573,9 +2606,19 @@ pub mod dgram_drops {
     /// resource event). Batched like the other flood-type counters: an app
     /// retrying a refused target is exactly the flood case batching exists for.
     pub static REFUSED: AtomicU64 = AtomicU64::new(0);
+    /// A new UDP session could not be set up: the kernel refused a session
+    /// socket (fd or memory exhaustion), or the freshly spawned reply reader
+    /// exited before the entry was published and the insert was rolled back.
+    /// The datagram is lost. Server-only, and counted apart from the budget
+    /// counters because this is a *host-resource* failure, not a cap the peer
+    /// hit — before this counter both paths were silent `.ok()?` returns, so
+    /// an fd-exhausted server looked idle. Batched like the other flood-type
+    /// counters (the flood case is exactly fd exhaustion); the call site also
+    /// emits one rate-limited warning.
+    pub static SESS_CREATE_FAILED: AtomicU64 = AtomicU64::new(0);
 
     /// Every drop counter in one read, so the 60 s report cannot silently omit
-    /// one. Named fields rather than a tuple: a 9-tuple read at two call sites
+    /// one. Named fields rather than a tuple: an 11-tuple read at two call sites
     /// is exactly the shape that pairs a socket with the wrong field elsewhere
     /// in this codebase (see the client's `SessEntry` note).
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2590,6 +2633,7 @@ pub mod dgram_drops {
         pub egress_dead: u64,
         pub unknown_sess: u64,
         pub refused: u64,
+        pub sess_create_failed: u64,
     }
 
     impl DropSnapshot {
@@ -2606,6 +2650,7 @@ pub mod dgram_drops {
                 egress_dead: d(self.egress_dead, prev.egress_dead),
                 unknown_sess: d(self.unknown_sess, prev.unknown_sess),
                 refused: d(self.refused, prev.refused),
+                sess_create_failed: d(self.sess_create_failed, prev.sess_create_failed),
             }
         }
 
@@ -2628,6 +2673,7 @@ pub mod dgram_drops {
                 .saturating_add(self.no_egress)
                 .saturating_add(self.egress_dead)
                 .saturating_add(self.refused)
+                .saturating_add(self.sess_create_failed)
         }
     }
 
@@ -2635,13 +2681,14 @@ pub mod dgram_drops {
     ///
     /// **Batching bound, stated because a line reading `0` is not proof of no
     /// loss.** `too_large`, `buffer_full`, `session_full`, `fair_share`,
-    /// `dns_inflight`, `unknown_sess` and `refused` accumulate in a thread-local
+    /// `dns_inflight`, `unknown_sess`, `refused` and `sess_create_failed`
+    /// accumulate in a thread-local
     /// cell and reach the global only when they hit 64 or when `snapshot` runs
     /// *on that thread*. A reporter task runs
     /// on its own thread, so a loss under 64 drops on a worker thread is not
     /// "delayed to the next report" — it stays invisible until that thread drops
     /// 63 more, and a thread that exits takes its pending count with it. Treat
-    /// those seven as flood indicators, and the per-packet `warn` lines (which
+    /// those eight as flood indicators, and the per-packet `warn` lines (which
     /// carry the total `bump` returned) as the immediate signal.
     ///
     /// `no_egress`, `egress_dead` and `dns_contention` are exempt by
@@ -2666,6 +2713,7 @@ pub mod dgram_drops {
             egress_dead: EGRESS_DEAD.load(Ordering::Relaxed),
             unknown_sess: UNKNOWN_SESS.load(Ordering::Relaxed),
             refused: REFUSED.load(Ordering::Relaxed),
+            sess_create_failed: SESS_CREATE_FAILED.load(Ordering::Relaxed),
         }
     }
 
@@ -2712,6 +2760,12 @@ pub mod dgram_drops {
                 REFUSED.fetch_add(v, Ordering::Relaxed);
             }
         });
+        L_SESS_CREATE_FAILED.with(|c| {
+            let v = c.replace(0);
+            if v != 0 {
+                SESS_CREATE_FAILED.fetch_add(v, Ordering::Relaxed);
+            }
+        });
     }
 
     thread_local! {
@@ -2722,6 +2776,7 @@ pub mod dgram_drops {
         static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_UNKNOWN_SESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_SESS_CREATE_FAILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     fn batched(
@@ -2745,7 +2800,7 @@ pub mod dgram_drops {
         }
     }
 
-    /// `counter` must be one of this module's statics. Seven of them batch per
+    /// `counter` must be one of this module's statics. Eight of them batch per
     /// thread (flushed at 64, or by a `snapshot` on the *same* thread), which is
     /// what keeps a flood off the shared cache lines; each of those needs its own
     /// arm here *and* its own `flush_locals` arm, or its count would sit in a
@@ -2780,6 +2835,8 @@ pub mod dgram_drops {
             batched(counter, &L_UNKNOWN_SESS)
         } else if std::ptr::eq(counter, &REFUSED) {
             batched(counter, &L_REFUSED)
+        } else if std::ptr::eq(counter, &SESS_CREATE_FAILED) {
+            batched(counter, &L_SESS_CREATE_FAILED)
         } else {
             counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
         }
@@ -2874,6 +2931,18 @@ pub mod udp_stats {
         static L_MAX_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
+    /// Thread-local flush thresholds. One shared atomic RMW per 256 datagrams
+    /// (and per 256 KiB) still keeps a flood off the cache line, while the 60 s
+    /// report stays honest for flows down to a few packets per second: at the
+    /// previous 1024/1 MiB a session worker below ~17 pps could sit under the
+    /// threshold for the whole reporting interval and the line read 0. The
+    /// remaining bound (a thread that exits with a pending count, or a report
+    /// thread other than the one that counted) is documented on `snapshot`.
+    #[cfg(feature = "stats")]
+    const FLUSH_DATAGRAMS: u64 = 256;
+    #[cfg(feature = "stats")]
+    const FLUSH_BYTES: u64 = 256 * 1024;
+
     #[cfg(feature = "stats")]
     fn flush_locals() {
         L_DATAGRAMS.with(|c| {
@@ -2898,7 +2967,7 @@ pub mod udp_stats {
             L_DATAGRAMS.with(|c| {
                 let v = c.get().wrapping_add(1);
                 c.set(v);
-                if v >= 1024 {
+                if v >= FLUSH_DATAGRAMS {
                     DATAGRAMS.fetch_add(v, Ordering::Relaxed);
                     c.set(0);
                 }
@@ -2906,7 +2975,7 @@ pub mod udp_stats {
             L_BYTES.with(|c| {
                 let v = c.get().wrapping_add(len as u64);
                 c.set(v);
-                if v >= 1_048_576 {
+                if v >= FLUSH_BYTES {
                     BYTES.fetch_add(v, Ordering::Relaxed);
                     c.set(0);
                 }
@@ -2967,6 +3036,15 @@ pub mod udp_stats {
         )
     }
 
+    /// Totals since process start.
+    ///
+    /// **Batching bound.** `datagrams` and `bytes` accumulate in a thread-local
+    /// cell (flushed at [`FLUSH_DATAGRAMS`] / [`FLUSH_BYTES`], or by a
+    /// `snapshot` on the *same* thread), and a reporter task runs on its own
+    /// thread — so a worker's pending count is visible at the next report only
+    /// once it crosses the threshold, and a thread that exits with a pending
+    /// count drops it. 256 datagrams bounds the worst-case undercount to ~15 s
+    /// at 17 pps, which is why the threshold is not the old 1024.
     pub fn snapshot() -> UdpSnapshot {
         #[cfg(feature = "stats")]
         flush_locals();
@@ -3066,11 +3144,16 @@ pub mod udp_write {
             }
         });
     }
+    /// One successful last-hop write.
+    ///
+    /// Batching matches [`crate::udp_stats::payload`]: one shared atomic RMW per
+    /// 256 sends, so the 60 s `udp write` line cannot dwell at zero for a
+    /// low-rate session.
     pub fn sent() {
         stats_only! {
             L_SENT.with(|c| {
                 let v = c.get().wrapping_add(1);
-                if v >= 1024 {
+                if v >= 256 {
                     SENT.fetch_add(v, Ordering::Relaxed);
                     c.set(0);
                 } else {
@@ -3110,6 +3193,9 @@ pub mod udp_write {
         return 1;
     }
 
+    /// Totals since process start. `sent` is thread-local batched (flushed at
+    /// 256 or by a `snapshot` on the same thread); the other counters are
+    /// direct `fetch_add` calls from the send paths.
     pub fn snapshot() -> UdpWriteSnapshot {
         #[cfg(feature = "stats")]
         flush_sent();
@@ -3504,7 +3590,8 @@ struct Partial {
     /// Payload bytes held. Bounds the *assembled* datagram
     /// ([`MQP_FRAG_MAX_PAYLOAD`]) and sizes `assemble`'s output buffer.
     bytes: usize,
-    /// Bytes actually pinned by the stored chunks. With
+    /// Bytes actually pinned by the stored chunks, **plus the slot table
+    /// itself** (see [`Partial::slot_table_bytes`]). With
     /// [`DgramReassembler::push_zero_copy`] a chunk is a `Bytes` slice of the
     /// whole received DATAGRAM, so this is `>= bytes` — often much more, since a
     /// 16-byte final chunk still pins its ~1.4 KiB frame. [`DgramReassembler`]
@@ -3524,6 +3611,14 @@ impl Partial {
             retained: 0,
             first_ms: now_ms,
         }
+    }
+
+    /// Bytes the `chunks` slot table itself occupies. Charged to `retained`
+    /// with the first stored chunk, so the aggregate `FRAG_MAX_HELD_BYTES`
+    /// budget covers a flood of never-completing partials instead of letting
+    /// 256 x `total` empty slots sit outside every byte bound.
+    fn slot_table_bytes(total: u8) -> usize {
+        total as usize * std::mem::size_of::<Option<Bytes>>()
     }
 
     /// Consume the partial into `(address, whole payload)`.
@@ -3567,7 +3662,10 @@ impl Partial {
 /// connection (each tiny chunk keeps its ~284-byte frame, and a quinn receive
 /// buffer may be larger still). The aggregate bound is therefore enforced over
 /// `retained`; the payload-length accounting is kept separately because it is
-/// what [`MQP_FRAG_MAX_PAYLOAD`] and the assembled buffer are about.
+/// what [`MQP_FRAG_MAX_PAYLOAD`] and the assembled buffer are about. The same
+/// bound also carries each partial's slot table, so empty chunks — which pin
+/// nearly nothing themselves — cannot keep 256 x 2 KiB of slot table outside
+/// every byte budget.
 #[derive(Default)]
 pub struct DgramReassembler {
     parts: HashMap<(u32, u16), Partial>,
@@ -3581,9 +3679,10 @@ impl DgramReassembler {
         Self::default()
     }
 
-    /// Bytes the in-flight partials actually retain (pinned `Bytes` storage,
-    /// not payload length — see [`Partial::retained`]). This is the quantity
-    /// [`FRAG_MAX_HELD_BYTES`] bounds.
+    /// Bytes the in-flight partials actually retain (pinned `Bytes` storage plus
+    /// each partial's slot table, not payload length — see
+    /// [`Partial::retained`]). This is the quantity [`FRAG_MAX_HELD_BYTES`]
+    /// bounds.
     pub fn held_bytes(&self) -> usize {
         self.held
     }
@@ -3733,8 +3832,20 @@ impl DgramReassembler {
                 *slot = Some(chunk);
                 entry.got += 1;
                 entry.bytes += f.chunk.len();
-                entry.retained = entry.retained.saturating_add(retained);
-                self.held = self.held.saturating_add(retained);
+                // The slot table is charged with the first stored chunk, once
+                // per partial: every removal path subtracts `retained`, so
+                // charging it here keeps `held` balanced for the partial's whole
+                // life without touching the creation sites.
+                let table = if entry.got == 1 {
+                    Partial::slot_table_bytes(entry.total)
+                } else {
+                    0
+                };
+                entry.retained = entry
+                    .retained
+                    .saturating_add(retained)
+                    .saturating_add(table);
+                self.held = self.held.saturating_add(retained).saturating_add(table);
             }
             entry.got == entry.total
         };
@@ -5235,6 +5346,7 @@ mod tests {
             &dgram_drops::NO_EGRESS,
             &dgram_drops::EGRESS_DEAD,
             &dgram_drops::REFUSED,
+            &dgram_drops::SESS_CREATE_FAILED,
         ] {
             dgram_drops::bump(c);
         }
@@ -5251,8 +5363,12 @@ mod tests {
         assert!(after.no_egress > before.no_egress, "no_egress");
         assert!(after.egress_dead > before.egress_dead, "egress_dead");
         assert!(after.refused > before.refused, "refused");
+        assert!(
+            after.sess_create_failed > before.sess_create_failed,
+            "sess_create_failed"
+        );
         let d = after.since(&before);
-        assert!(d.lost() >= 9, "every drop counts as loss: {d:?}");
+        assert!(d.lost() >= 10, "every drop counts as loss: {d:?}");
     }
 
     /// Hold one single-flight shard mutex from another thread, the way a miss
@@ -6072,24 +6188,40 @@ mod tests {
     }
 
     #[test]
-    fn partial_count_cap_bounds_slot_table_memory() {
+    fn slot_tables_are_charged_to_the_aggregate_byte_budget() {
         let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
-        // Small first-fragment chunks (700 B): 306 of them hold ~214 KiB,
-        // under FRAG_MAX_HELD_BYTES, so only the count cap can bind. (With
-        // 4000 B chunks the byte cap binds first at ~65 partials, which is a
-        // different bound than the one pinned here.)
-        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(7000), 700);
-        assert_eq!(frames.len(), 10);
+        // Empty chunks pin nearly nothing themselves, which is exactly why the
+        // slot table has to be charged: before this, `held` stayed tiny while
+        // FRAG_MAX_PARTIALS x 64 x 32 B of table sat outside every byte bound.
+        let one = encode_fragment(1, 0, 0, 64, &addr.as_ref(), &[], 1200).unwrap();
+        let fr = decode_fragment(&one).unwrap();
+        assert!(fr.chunk.is_empty());
+        let mut r = DgramReassembler::new();
+        assert!(r.push(&fr, 0).is_none());
+        assert_eq!(
+            r.held_bytes(),
+            Partial::slot_table_bytes(64),
+            "a partial whose chunk is empty still costs its slot table"
+        );
+        assert_eq!(r.inflight(), 1);
+
+        // A flood of full-width, never-completing partials must therefore be
+        // evicted by the *byte* bound, not merely parked under the count cap.
         let mut r = DgramReassembler::new();
         for id in 0..(FRAG_MAX_PARTIALS as u16 + 50) {
-            let mut f = decode_fragment(&frames[0]).unwrap();
-            f.id = id;
+            let body = encode_fragment(1, id, 0, 64, &addr.as_ref(), &[], 1200).unwrap();
+            let f = decode_fragment(&body).unwrap();
             assert!(r.push(&f, 0).is_none());
         }
-        assert_eq!(
-            r.inflight(),
-            FRAG_MAX_PARTIALS,
-            "inflight partials must never exceed the count cap"
+        assert!(
+            r.held_bytes() <= FRAG_MAX_HELD_BYTES,
+            "held {} B exceeds the {FRAG_MAX_HELD_BYTES} B cap",
+            r.held_bytes()
+        );
+        assert!(
+            r.inflight() < FRAG_MAX_PARTIALS,
+            "the byte bound must bind before the count cap: {} partials",
+            r.inflight()
         );
     }
 
@@ -6129,10 +6261,13 @@ mod tests {
         let held_before = r.held_bytes();
         assert!(held_before > 0);
         // Different shape forces a restart: held must drop the old bytes and
-        // count only the new fragment, never accumulate both.
+        // count only the new fragment (payload + its slot table), never
+        // accumulate both.
         assert!(r.push(&decode_fragment(&other[0]).unwrap(), 0).is_none());
         let f0 = decode_fragment(&other[0]).unwrap();
-        assert_eq!(r.held_bytes(), f0.chunk.len());
+        let table = Partial::slot_table_bytes(f0.total);
+        assert!(table > 0, "the slot table is charged, not free");
+        assert_eq!(r.held_bytes(), f0.chunk.len() + table);
     }
 
     /// Half-close propagation between two pumps: when the app shuts down its

@@ -188,7 +188,7 @@ datagram — see
 Its `dist/` artifacts are rebuilt from this revision and statically checked (`file`
 plus per-level `objdump`), again not run under emulation or natively.
 
-The newest pass is a fix-and-review cycle on seven confirmed findings from a
+The previous pass was a fix-and-review cycle on seven confirmed findings from a
 three-round audit: a misspelled TOML key is now a hard error (it used to silently
 disable `auth_token`), the client dial and the server's pre-auth phase each got a
 single end-to-end deadline, fragmented payloads feed the relay counters and the
@@ -198,6 +198,24 @@ refusals are counted apart from the global budget — see
 [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters).
 Its `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
 for them (rebuilt on request, not tested).
+
+The current pass is an outside-in audit of the data paths rather than a feature,
+and it fixes nine findings: the client's QUIC bidi-stream credit is raised to cover
+its own admission cap (an admitted flow could stall 5 s in `open_bi()` and then
+answer `REP=0x01` while the process still had capacity), the server's reply
+allowlist matches the **host** rather than the exact `(ip, port)` (so a server that
+answers from a different port — TFTP, redirected game/voice flows — is no longer
+filtered), the per-connection fair-share floor rises 256 → 1024 (32 mostly-idle
+connections could otherwise drag every other client to 1/16 of its session cap),
+a failed session setup is counted instead of silently dropped, reassembly charges
+each partial's slot table to the aggregate byte budget, the client's 60 s
+`udp budget` line prints `dns_contention` instead of an all-zero line, the relay
+counter batching tightens to 256 packets / 256 KiB, `UdpHub::unpublish` stops
+cloning the shard map for a no-op, and UDP-vs-UDP fairness is documented as a
+limit rather than claimed — see
+[pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor).
+Its `dist/` artifacts **are** rebuilt from this revision, but nothing was
+verified for them (rebuilt on request, not tested).
 
 ---
 
@@ -219,7 +237,7 @@ for them (rebuilt on request, not tested).
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -282,7 +300,9 @@ per connection, and one lightweight reader task per UDP session. The client keep
 pool of QUIC connections (4 TCP by default, `quic_conns`, clamped 1–8, **plus one
 dedicated UDP egress connection**) sharing one Endpoint/UDP socket, each slot with
 its own reconnect loop and DATAGRAM dispatcher; one
-task per SOCKS connection and one relay + reply task per UDP association. Subscriptions
+task per SOCKS connection and one association task per UDP association (the reply
+direction is written by the per-connection DATAGRAM dispatcher itself, not by a
+per-association reply task). Subscriptions
 die with their association, so stale tasks can never steal another session's packets.
 The pool's slot registry is a plain `Arc<Vec<ConnSlot>>` indexed by slot number:
 slots are installed once at startup and never removed, so picking a slot for a
@@ -308,6 +328,15 @@ holds while more than one connection is alive: with `quic_conns = 1` all *TCP* s
 one cwnd (UDP still does not). The TCP open header is always its own write, never
 batched behind first application bytes, so server-first peers (game logins, banners)
 see it within ~100 ms.
+
+**What the isolation does *not* cover:** UDP flows are isolated from TCP, not from
+each other. Every association shares the dedicated UDP connection — one congestion
+window, one 1 MB DATAGRAM send buffer — and full-buffer backpressure drops the
+newest datagram, so a high-rate UDP flow (bulk HTTP/3, a large transfer) can starve
+a latency-sensitive one (video, voice) that shares the tunnel. quinn 0.11 exposes no
+per-stream or per-datagram scheduler to fix that below the connection level; a
+deployment that needs UDP-vs-UDP fairness needs a second client process (or a second
+proxy) per class.
 
 ---
 
@@ -478,11 +507,12 @@ legitimate client uses one UDP socket per association, so a changed source is
 treated as a hijack attempt and ignored. Run it on a trusted host / bind
 `socks_listen` to localhost when exposing UDP all the same — the lock cannot
 distinguish a NAT rebinding from an attacker, so a rebound client must re-associate.
-Server-side, every target reply is checked against the session's recently-sent
-destinations (a 16-entry allowlist per session) and dropped as `REFUSED` otherwise,
-so a forged reply to a discovered session port is not forwarded; sessions serving
-more than 16 concurrent distinct targets re-learn evicted ones on their next
-outbound datagram.
+Server-side, every target reply is checked against the hosts the session recently sent
+to (a 16-entry IP allowlist per session) and dropped as `REFUSED` otherwise, so a
+forged reply to a discovered session port is not forwarded; the queried *port* is
+deliberately not part of the key, so a server that answers from a different port (TFTP
+and several game/voice stacks) is not filtered. Sessions serving more than 16
+concurrent distinct hosts re-learn evicted ones on their next outbound datagram.
 
 ---
 
@@ -583,6 +613,7 @@ before every run):
 | 55 | Pass 32 — sweep re-check, fair-shard trigger, memo guard, DNS contention, live atomicity, auth timeout, plus ten post-fix residuals. `cargo test --all-targets` **117/117** (60 lib + 30 client + 27 server; **116/116** with `--no-default-features`: 59 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Six fixes from a two-round lock/sweep review (round two tasked to falsify; one finding split, four severities revised down): over-cap sweeper re-tests idleness via `take_idle` plus a stamp-equality `evict_ranked`, the shard trigger follows the live fair share (`shard_sweep_target`) with per-insert eviction bounded at 64, `sess_memo_forget` takes the exiting socket and clears only on `Weak::ptr_eq`, DNS contention gets its own `DNS_CONTENTION` counter with a `try_lock` fail-fast register, the client folds `live=false` into the `rcu` clear (`clear_if_and_mark_dead` with a retry tail), and the auth write is wrapped in the same 5 s timeout as the stream-head write. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) | ✅ |
 | 56 | Pass 33 — DNS negative fail-open and process-wide sweep throttle. `cargo test --all-targets` **118/118** (61 lib + 30 client + 27 server; **117/117** with `--no-default-features`: 60 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Two fixes from a two-round review (round two tasked to falsify; two candidates rejected outright, two severities revised down): the positive-cache probe is tri-state (`PositiveState::Fresh/Absent/Unknown`) so a contended shard fails open instead of recording a negative entry that shadowed the live positive answer (and the recording thread's positive memo) for `DNS_NEG_TTL`, pinned by `contended_positive_probe_skips_negative_caching`; the over-cap reap takes at most one process-wide `sweep_all` per second (`claim_fair_sweep`) instead of one per worker per second, and the fair-share gate reads a 1 s cached session count (`len_cached`) instead of 8 shard locks per forged datagram. No native E2E or benchmark re-run: no frame, framing, ALPN or protocol-field change (mixed old/new pairs keep working); `dist/` rebuilt from this revision and statically checked as recorded under [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) | ✅ |
 | 57 | Pass 34 — spelling-proof config, bounded holds, symmetric counters. `cargo test --all-targets` **121/121** (64 lib + 30 client + 27 server; **119/119** with `--no-default-features`: 62 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Seven fixes from a three-round review of the pass-33 tree (round 1 confirmation; round 2 falsification — twelve of nineteen initial candidates rejected or reduced to informational; round 3 final severity): `ServerConf`/`ClientConf` gained `deny_unknown_fields` and `load_toml` names the file (a misspelled `auth_token` used to silently disable authentication), pinned by `unknown_config_keys_are_rejected`; the client dial shares one `t0 + DIAL_ATTEMPT_TIMEOUT` deadline across the handshake and both auth stages; the server's pre-auth phase shares one `PRE_AUTH_TIMEOUT` (5 s) deadline for handshake+token while a no-token server keeps the 10 s handshake budget; `DgramFragmenter::send` counts `payload()` only after an accepted send and on the fragment path too, pinned through a real connection by `fragmented_send_counts_the_payload_and_the_high_water`; `RECENT_DST_CAP` 8 → 16; `keep_alive_secs` capped at 300 s with a warning on clamp, pinned by `keepalive_clamp_bounds_the_detection_window`; new `dgram_drops::FAIR_SHARE` separates fair-share session refusals from `SESSION_FULL`, and the server's 60 s `udp budget` line prints both. Round 2 falsified three pins by reverting each fix (the three tests fail, then pass again). Native-binary E2E: `tcpecho` 256 KiB byte-for-byte (`0 mismatched`), `udpsweep` 8/1430/8000 B 3/3 verbatim with the fragment path, 5 `new QUIC conn`, both processes report `high-water payload 8000 B` (impossible before this pass), a typo'd config exits `Error: parse …` naming `auth_tokn`, and `keep_alive_secs = 3600` logs the clamp with `watchdog silence_limit=1200s`. `dist/` **rebuilt, not verified** — see [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) | ✅ |
+| 58 | Pass 35 — stream credit matches admission, host-level reply allowlist, session-share floor. `cargo test --all-targets` **121/121** (64 lib + 30 client + 27 server; **119/119** with `--no-default-features`: 62 + 30 + 27), `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on both feature sets. Nine fixes from an audit of the data paths: `MAX_BIDI_STREAMS_PER_CONN` 1024 → 8192 (with a client-bin `const _: () = assert!(MAX_SOCKS_CONNS as u32 <= MAX_BIDI_STREAMS_PER_CONN)`), so no admitted flow can stall in `open_bi()`; the reply allowlist compares normalized destination **IPs** instead of exact `(ip, port)` pairs, pinned by the renamed `reply_allowlist_matches_the_host_not_the_queried_port` (another port on a queried host accepted, an unqueried host refused); `MIN_SESSION_SHARE` 256 → 1024 with the floor pinned at the value level; new `dgram_drops::SESS_CREATE_FAILED` counts both socket-creation failures and the immediately-dead-reader rollback, with `warn_sess_create_failed` on its own rate-limit slot, and `every_drop_counter_has_its_own_snapshot_field` now covers ten counters; the reassembler charges each partial's slot table to `FRAG_MAX_HELD_BYTES`, pinned by `slot_tables_are_charged_to_the_aggregate_byte_budget` and `restart_releases_the_old_bytes_from_held`; the client's 60 s `udp budget` line prints `dns_contention`; relay counter batching 1024/1 MiB → 256/256 KiB with the per-thread bound documented on `udp_stats`/`udp_write` snapshots; `UdpHub::unpublish` no longer clones the shard map for an absent key; UDP-vs-UDP fairness documented as a limitation. Native-binary smoke on the debug build (macOS loopback, the repo's own `hotpath_bench`): 5 `new QUIC conn` (4 TCP + the dedicated UDP slot), `tcpecho` 256 KiB 262 144/262 144 bytes 0 mismatched, `udpsweep` 8/1430/8000 B **20/20 verified at every size, 0 lost** (fragment path included), a same-IP/different-port UDP responder now delivers 20/20 (the exact-pair rule dropped all of them before this pass) while a different-IP responder is still refused (0/4), and the client bin's known-flaky `dispatch_*` loopback tests were checked against the unmodified tree (1/12 failures there, same order as here — pre-existing timing sensitivity, not a regression). No benchmark run; `dist/` **rebuilt from this revision, not verified** — see [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor) | ✅ |
 
 Round-robin *distribution* is pinned by the unit tests rather than by the E2E
 harness: `slot_routing_table` (the n = 1 / n = 2 truth table plus all four n = 4
@@ -713,19 +744,24 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 34 — on top of everything pass 33 shipped)
+rebuilt from the current revision (pass 35 — on top of everything pass 34 shipped)
 with the default feature set, so the relay counters are **on** in these builds:
-static musl, x86-64, stripped — servers 4 371 696–4 395 080 B (v1 4 386 336,
-v2 4 371 696, v3 4 395 080, v4 4 392 392) and clients 4 390 808–4 412 224 B
-(v1 4 405 832, v2 4 390 808, v3 4 412 224, v4 4 404 976). Against the pass-33
-*recorded* figures that is **+9 512…+16 008 B** per level, in line with the
-additions (two `deny_unknown_fields` config types, one more batched counter with its
-snapshot field, the deadline plumbing and the reporter text; the regression tests are
-`#[cfg(test)]` and do not ship). Unlike every earlier pass, **nothing was verified
-for these bytes** — no `file`, no `objdump`, no reproducibility build, no emulation,
-no native run — on explicit instruction: they are compiled, not tested. What *was*
-run is the native release-build E2E recorded under
-[pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters).
+static musl, x86-64, stripped — servers 4 376 168–4 398 000 B (v1 4 391 048,
+v2 4 376 168, v3 4 398 000, v4 4 394 608) and clients 4 391 320–4 410 560 B
+(v1 4 406 536, v2 4 391 320, v3 4 410 560, v4 4 403 376). Against the pass-34
+*recorded* figures that is **+2 216…+4 712 B** per server level, in line with the
+additions (the `SESS_CREATE_FAILED` counter with its snapshot field and reporter
+text, the socket-failure warning helper, the IP-keyed reply allowlist and the
+fair-share floor), and **−1 664…+704 B** per client level (the stream-credit
+constant with its build-time assert and the reporter fields, offset by the
+`unpublish` simplification and codegen shifts) — recorded as measured, not
+explained; the regression tests are `#[cfg(test)]` and do not ship. Unlike every
+earlier pass, **nothing was verified for these bytes** — no `file`, no `objdump`,
+no reproducibility build, no emulation, no native run — on explicit instruction:
+they are compiled, not tested. What *was* run is the debug-build smoke recorded
+under
+[pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor),
+against the source these binaries compile.
 The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
 passes'). Against the pass-27
 *recorded* figures,
@@ -973,11 +1009,11 @@ All limits are constants in the sources; the table shows where to change them.
 | TLS session store (server, 0-RTT/resumption) | 8192 sessions | `server_tls_config` |
 | UDP sessions, process-wide | 8192 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
 | UDP session socket buffers | 256 KB send + 256 KB receive per session | `SESS_SOCKET_BUF` |
-| UDP sessions per connection | live fair share `clamp(8192 / session-holding connections, 256, 4096)` (new sessions refused past it with `FAIR_SHARE`; the global pool and DNS limiter use `SESSION_FULL`) | `LOCAL_SESS_MAX`, `fair_sess_cap()` |
-| Concurrent TCP dials, process-wide | 4096, 2 s permit wait (released after connect) | `dial_limiter` |
-| Concurrent bidi streams per connection | 1024 | `build_transport` |
-| Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset) | `MAX_STREAM_TASKS` |
-| Client SOCKS connections | 8192 (excess connections dropped) | `socks_conn_limiter` |
+| UDP sessions per connection | live fair share `clamp(8192 / session-holding connections, 1024, 4096)` (new sessions refused past it with `FAIR_SHARE`; the global pool and DNS limiter use `SESSION_FULL`) | `LOCAL_SESS_MAX`, `MIN_SESSION_SHARE`, `fair_sess_cap()` |
+| Concurrent TCP dials, process-wide | 4096, fail-fast permit (released after connect; excess dials reset the stream) | `dial_limiter` |
+| Concurrent bidi streams per connection | 8192 (must cover `MAX_SOCKS_CONNS`, since interactive pinning can put every admitted TCP flow on one connection) | `MAX_BIDI_STREAMS_PER_CONN` |
+| Concurrent TCP stream tasks (server, process-wide) | 16384 (excess streams reset; the transport credit above is what the client may *open*) | `MAX_STREAM_TASKS` |
+| Client SOCKS connections | 8192 (excess connections dropped; the pool advertises one stream credit per admitted flow) | `socks_conn_limiter` |
 | Client UDP associations | 4032 (excess replies REP=0x01) | `MAX_UDP_ASSOCS` (lib.rs; the server asserts its per-connection target equals it) |
 | DNS slow-path lookups (TCP + UDP) | 1024, 5 s each, single-flight | `dns_slow_path_limiter` |
 | Deferred UDP sends (full retry-shard queue) | 16 shards x 256 deep | `UDP_RETRY_SHARDS`, `UDP_RETRY_DEPTH` |
@@ -991,7 +1027,7 @@ All limits are constants in the sources; the table shows where to change them.
 | TCP stream idle reap | 300 s | `copy_tcp_quic_idle` call sites |
 | UDP association idle reap | 180 s (both directions; TCP control activity counts) | server sweeper / client interval |
 | DNS cache | 60 s positive (4096+512 slack), 10 s negative (4096) | `DNS_CACHE_*`, `DNS_NEG_MAX` |
-| Client TCP dial ACK budget | 25 s (5 s header + 3 s DNS permit + 5 s DNS + 2 s dial permit + 4 s connect + scheduling margin) | `TCP_DIAL_ACK_TIMEOUT` |
+| Client TCP dial ACK budget | 25 s (5 s header + 5 s DNS + 4 s connect + 5 s ACK, with the DNS/dial permits failing fast rather than queueing) | `TCP_DIAL_ACK_TIMEOUT` |
 
 Kernel-side tuning: raise `net.core.wmem_max` / `net.core.rmem_max` so the 4 MB
 (QUIC socket) and 256 KB (per-session) socket buffers are not silently clamped; the
@@ -1017,7 +1053,7 @@ Against RFC 1928 / RFC 1929:
 | Username/password (`0x02`) | ❌ intentionally absent |
 | `BIND` | ❌ replies `0x07` (FTP active mode; obsolete in practice) |
 | Error REPs (`0x01/0x04/0x05`…) | ⚠️ success is replied optimistically; a failed remote dial closes the TCP flow (the app reconnects) instead of returning `0x04`. A missing QUIC connection still fails the flow fast |
-| UDP source validation | ✅ relay locks the app to the first `(ip, port)` seen (a changed source is dropped as a hijack attempt); server-side replies must come from a recently-sent destination (16-entry per-session allowlist, else `REFUSED`). A NAT-rebound client must re-associate |
+| UDP source validation | ✅ relay locks the app to the first `(ip, port)` seen (a changed source is dropped as a hijack attempt); server-side replies must come from a host the session recently sent to (16-entry per-session IP allowlist, else `REFUSED`; the queried port is not part of the key, so TFTP-style replies from a fresh port get through). A NAT-rebound client must re-associate |
 | Association lifetime | ⚠️ idle UDP associations are reaped after 180 s to bound sockets/tasks (RFC has no fixed lifetime) |
 
 ---
@@ -3546,6 +3582,128 @@ figures, in line with the additions. **No verification of any kind was run on th
 bytes** (no `file`, no `objdump`, no reproducibility build, no emulation, no native
 run): they are compiled, not tested.
 
+### 2026-09 hardening pass 35 — stream credit matches admission, host-level reply allowlist, session-share floor
+
+Nine fixes from an outside-in audit of the data paths, each confirmed against the
+code before it was touched. No frame, framing or ALPN change (the QUIC stream
+credit is a transport parameter, not a wire format), so mixed old/new pairs keep
+working — with two caveats: the new stream credit only exists once **both** ends
+run this revision, and the reply-allowlist change is **server-side only**, so a new
+server alone changes reply admission.
+
+- **The client's stream credit now covers its own admission cap.**
+  `max_concurrent_bidi_streams` was hard-coded to 1024 while `MAX_SOCKS_CONNS`
+  admits 8192 SOCKS connections, and a QUIC endpoint may only *open* as many
+  streams as the **peer** advertises. With the default four-connection pool that
+  capped the process at 4096 concurrent TCP flows (1024 with `quic_conns = 1`), and
+  because `interactive_ports` pinning can put every one of those flows on slot 0,
+  a per-slot credit smaller than the admission cap is exactly the wrong shape: the
+  4097th flow parked in `Connection::open_bi()` for the client's 5 s timeout and
+  then answered SOCKS `REP=0x01`, even though the process still had stream-task
+  capacity. `MAX_BIDI_STREAMS_PER_CONN` (8192) is now the one definition used by
+  `build_transport_tuned`, and the client bin asserts
+  `MAX_SOCKS_CONNS <= MAX_BIDI_STREAMS_PER_CONN` so the two cannot drift apart
+  again. The server's `MAX_STREAM_TASKS` (16384, excess streams reset) remains the
+  process-wide overload backstop — the credit is what a client may *open*, not what
+  the server promises to run.
+- **The reply allowlist matches the host, not the queried port.** Pass 29
+  introduced a per-session allowlist of recently-sent destinations checked
+  against every inbound reply, but it stored and compared the exact `(ip, port)`
+  pair — which silently broke every protocol whose server answers from a different
+  port: TFTP (the server replies from a fresh ephemeral port by design),
+  game/voice stacks that redirect the client to a second port, service discovery
+  that answers from a different port on the same host. `RecentAddrs` now stores
+  normalized destination **IPs** and accepts a reply when its source IP is one of
+  them. The anti-spoofing property survives: an off-path attacker must still
+  spoof a host this session actually talked to, and the target's IP is the hard
+  half of that guess (its port is public knowledge anyway), while a legitimate
+  peer on that host is no longer filtered. The pass-29 test is renamed
+  `reply_allowlist_matches_the_host_not_the_queried_port` and now pins both
+  directions: another port on a queried host is accepted, an unqueried host is
+  still refused.
+- **The fair-share floor rises from 256 to 1024.** The divisor counts session
+  *holders*, and becoming one is trivially cheap — a single UDP datagram plus a
+  <180 s keepalive. 32 such mostly-idle connections used to drag every other
+  client's per-connection session cap to `8192 / 32 = 256`, a 16x availability hit
+  for the cost of 32 connections. `MIN_SESSION_SHARE` is now 1024 (1/8 of the
+  global pool): past 8 holders the global semaphore binds first and refusals are
+  counted `SESSION_FULL`, which is the honest capacity signal rather than a share
+  nobody can reach. The existing fair-share test now pins the floor at the value
+  level (`>= 1024`) so a silent regression to 256 fails.
+- **A failed session setup is counted, not swallowed.** `get_or_create_sess`'s
+  two socket-creation failures were bare `.ok()?` returns, and a freshly spawned
+  reply reader that exited before its entry was published rolled the insert back
+  with no counter at all — an fd- or memory-exhausted server looked idle from the
+  log. New `dgram_drops::SESS_CREATE_FAILED` is wired through `bump`,
+  `flush_locals`, `snapshot`, `since` and `lost()`, the two syscall failures and
+  the rollback each bump it, a dedicated rate-limited warning
+  (`warn_sess_create_failed`, its own slot so an fd storm cannot silence the
+  connection-limit warning) names the cause, and the server's 60 s `udp budget`
+  line prints the count and the total.
+- **Reassembly charges each partial's slot table to the byte budget.** A partial
+  owns a `vec![None; total]` slot table (up to 64 x 32 B ≈ 2 KiB), and because the
+  aggregate `FRAG_MAX_HELD_BYTES` counted only pinned chunk storage, a peer could
+  park 256 partials of **empty** chunks — ~512 KiB per connection — while `held`
+  barely moved. The table is now charged with the first stored chunk, so the
+  aggregate bound catches a never-completing flood and `FRAG_MAX_PARTIALS` becomes
+  a defense-in-depth backstop rather than the only line of defence. Pinned by
+  `slot_tables_are_charged_to_the_aggregate_byte_budget` (empty-chunk partial costs
+  its table; a full-width flood is evicted by bytes) and the updated
+  `restart_releases_the_old_bytes_from_held`.
+- **The client's 60 s `udp budget` line can no longer print all zeros.** Its
+  trigger is `dd.lost() > 0`, which includes `dns_contention`, but the format
+  string omitted that field (and the totals), so a contention-only interval logged
+  an all-zero budget line and hid the actual cause — the same class of
+  misreporting the server's line had already been fixed for.
+  `dns_contention` now appears in both the per-interval and the totals sections,
+  matching the server.
+- **Relay counter batching tightens from 1024/1 MiB to 256/256 KiB.** A session
+  worker below ~17 pps could sit under the old threshold for a whole 60 s
+  reporting interval and print `0 datagram(s)` for a live flow; at 256 the
+  worst-case undercount window is ~15 s at 17 pps, for one shared atomic RMW per
+  256 packets (never per packet). `udp_stats::snapshot` and `udp_write::snapshot`
+  now document the remaining per-thread bound, which only `dgram_drops` carried
+  before, and `udp_write::sent`'s doc states its 256 threshold.
+- **`UdpHub::unpublish` stops cloning the shard map for a no-op.** When the key
+  was absent the `rcu` closure cloned the whole `HashMap` and had arc-swap wrap
+  it in a fresh `Arc`; it now returns the loaded handle (one refcount bump) and
+  only clones when there is a removal to publish.
+- **UDP-vs-UDP fairness is documented as a limit, not claimed.** Every
+  association shares the dedicated UDP connection, its congestion window and its
+  1 MB DATAGRAM send buffer, and full-buffer backpressure drops the newest
+  datagram — so a high-rate UDP flow can starve a latency-sensitive one, while
+  only UDP-vs-TCP isolation is structural. The Architecture section and the
+  `DATAGRAM_BUFFER` doc now say so explicitly.
+
+Verification: `cargo test --all-targets` **121/121** (64 lib + 30 client + 27
+server) and **119/119** with `--no-default-features` (62 + 30 + 27), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on **both** feature
+sets. New/updated pins: `slot_tables_are_charged_to_the_aggregate_byte_budget`,
+`restart_releases_the_old_bytes_from_held`,
+`reply_allowlist_matches_the_host_not_the_queried_port`,
+`fair_share_counts_session_holders_not_live_connections` (value-level floor),
+`every_drop_counter_has_its_own_snapshot_field` (now ten counters,
+`sess_create_failed` included). Native-binary smoke on the debug build (macOS
+loopback, the repo's own `hotpath_bench`): 5 `new QUIC conn` (4 TCP + the
+dedicated UDP slot), `tcpecho` 256 KiB **262 144/262 144 bytes, 0 mismatched**,
+`udpsweep` 8/1430/8000 B **20/20 verified at every size, 0 lost** (the 1430/8000
+sizes take the fragment path), and a targeted reply-allowlist check: a UDP target
+that answers from a **fresh port on the queried IP** now delivers (20/20 received,
+0 before this pass because the exact-pair rule dropped every reply), while a
+target whose reply comes from a **different IP** is still refused (0/4). No
+benchmark run: the wider stream credit is a connection-level parameter whose
+effect only appears with thousands of concurrent flows.
+
+`dist/` **was rebuilt from this revision** for all four CPU levels (static musl,
+x86-64, default feature set, the documented `cargo zigbuild` recipe) — servers
+4 376 168–4 398 000 B (v1 4 391 048, v2 4 376 168, v3 4 398 000, v4 4 394 608) and
+clients 4 391 320–4 410 560 B (v1 4 406 536, v2 4 391 320, v3 4 410 560,
+v4 4 403 376), i.e. **+2 216…+4 712 B** per server level and **−1 664…+704 B** per
+client level against the pass-34 *recorded* figures — recorded as measured, not
+explained. On explicit instruction **no verification of any kind was run on these
+bytes** (no `file`, no `objdump`, no reproducibility build, no emulation, no
+native run): they are compiled, not tested.
+
 ---
 
 ## Roadmap
@@ -3554,7 +3712,7 @@ run): they are compiled, not tested.
 - [x] Process-wide connection/session caps + receive-window bound
 - [x] 0-RTT-safe authentication and corrected reconnect/backoff behaviour
 - [ ] Mutual TLS as an alternative to the shared token
-- [x] UDP source validation: per-association app `(ip, port)` lock on the client and a per-session reply allowlist on the server (pass 29; dropped replies count as `REFUSED`)
+- [x] UDP source validation: per-association app `(ip, port)` lock on the client and a per-session reply allowlist on the server (pass 29; dropped replies count as `REFUSED`; the server key is host-level — IP, not port — since pass 35, so TFTP-style replies from a fresh port get through)
 - [ ] SOCKS error REPs in strict-compliance mode (success is still answered optimistically; a failed dial closes the flow)
 - [ ] Ticket-key persistence for 0-RTT across server restarts
 - [ ] Per-stream metrics endpoint (Prometheus) — BBR state, GSO batch size, sess table

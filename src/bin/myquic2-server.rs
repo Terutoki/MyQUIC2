@@ -38,50 +38,60 @@ struct SessEntry {
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// Per-session destination memo — see [`DestMemo`].
     dest: DestMemo,
-    /// Destinations this session actually sent to (normalized: unmapped IP +
-    /// port), consulted by the reply reader to drop forged replies. A session
-    /// may legally serve several targets (one association, many datagrams), so
-    /// this is a small allowlist rather than a single pin; past
-    /// [`RECENT_DST_CAP`] the oldest entry is evicted and a reply from it is
-    /// dropped until the session sends there again.
+    /// Destination IPs this session actually sent to, consulted by the reply
+    /// reader to drop forged replies. A session may legally serve several
+    /// targets (one association, many datagrams), so this is a small allowlist
+    /// rather than a single pin; past [`RECENT_DST_CAP`] the oldest entry is
+    /// evicted and a reply from it is dropped until the session sends there
+    /// again.
     recent: Arc<std::sync::Mutex<RecentAddrs>>,
 }
 
-/// Destinations a session recently sent to, for reply-source validation.
+/// Destination IPs a session has recently sent to, for reply-source validation.
 ///
-/// The session socket is unconnected (one session may serve many targets), so
-/// `recv_from` accepts packets from any source. Without this list, anyone who
-/// discovers the ephemeral session port can inject replies the client will
-/// trust (DNS spoofing, forged media). A reply is accepted only when its
-/// normalized source is in this list; anything else is dropped and counted as
-/// `REFUSED`.
+/// The match is on the **IP only**, not the full `(ip, port)` pair. An earlier
+/// revision required the exact pair and thereby broke every protocol whose
+/// server answers from a different port than it was queried on: TFTP is the
+/// canonical case (the server replies from a fresh ephemeral port by design),
+/// and game/voice stacks that redirect to a second port fail the same way. The
+/// IP-only rule keeps the property that matters — an off-path attacker must
+/// still spoof an address this session actually sent to, and the target's IP is
+/// the hard half of that guess — while no longer filtering a legitimate peer on
+/// that host.
+///
+/// A session may legally serve several targets (one association, many
+/// datagrams), so this is a small allowlist rather than a single pin; past
+/// [`RECENT_DST_CAP`] the oldest entry is evicted and a reply from it is dropped
+/// until the session sends there again. Entries are normalized (IPv4 mappings
+/// stripped) on both sides of the comparison.
 #[derive(Debug, Default)]
 struct RecentAddrs {
-    /// Ring of the last [`RECENT_DST_CAP`] destinations sent to.
-    slots: [Option<SocketAddr>; RECENT_DST_CAP],
+    /// Ring of the last [`RECENT_DST_CAP`] destination IPs sent to.
+    slots: [Option<IpAddr>; RECENT_DST_CAP],
     /// Next write position.
     pos: usize,
 }
 
-/// How many distinct destinations one session remembers for reply validation.
-/// 16 covers the multi-target session tests (2 alternating targets) with room;
-/// a session talking to more distinct targets concurrently re-learns evicted
-/// ones on its next outbound datagram. It was 8, which a session alternating
-/// over more than 8 targets could outrun: a reply from an evicted target was
-/// dropped as `REFUSED` until the session sent there again.
+/// How many distinct destination IPs one session remembers for reply
+/// validation. 16 covers the multi-target session tests (2 alternating targets)
+/// with room; a session talking to more distinct hosts concurrently re-learns
+/// evicted ones on its next outbound datagram. It was 8, which a session
+/// alternating over more than 8 hosts could outrun: a reply from an evicted
+/// host was dropped as `REFUSED` until the session sent there again.
 const RECENT_DST_CAP: usize = 16;
 
 impl RecentAddrs {
     fn push(&mut self, dst: SocketAddr) {
-        if self.slots.contains(&Some(dst)) {
+        let ip = unmap(dst.ip());
+        if self.slots.contains(&Some(ip)) {
             return;
         }
-        self.slots[self.pos % RECENT_DST_CAP] = Some(dst);
+        self.slots[self.pos % RECENT_DST_CAP] = Some(ip);
         self.pos = self.pos.wrapping_add(1);
     }
 
     fn contains(&self, src: &SocketAddr) -> bool {
-        self.slots.contains(&Some(*src))
+        self.slots.contains(&Some(unmap(src.ip())))
     }
 
     fn is_empty(&self) -> bool {
@@ -453,14 +463,26 @@ fn session_holders() -> &'static std::sync::atomic::AtomicUsize {
 /// process-wide budget across the connections that are *using* it — whichever
 /// is smaller. Without the share term, two connections at `LOCAL_SESS_MAX` fill
 /// `MAX_SESSIONS_GLOBAL` and every later connection's sessions fail, so one
-/// busy client starves the rest. The floor keeps a many-connection host
-/// usable; the global semaphore still caps the true total.
+/// busy client starves the rest.
+///
+/// The floor is [`MIN_SESSION_SHARE`], not 256. The divisor counts *holders*,
+/// and it is trivially cheap to become one: 32 connections that each send a
+/// single UDP datagram and then a keepalive every <180 s used to drag every
+/// other client's per-connection cap down to `8192 / 32 = 256` — a 16x
+/// availability hit bought with 32 mostly-idle connections. At 1024 (1/8 of the
+/// global budget) the same gossip still cannot take a legitimate client below
+/// an eighth of the pool, and beyond 8 holders the global semaphore becomes the
+/// binding constraint (first-come, counted `SESSION_FULL`), which is the honest
+/// capacity signal rather than a share nobody can reach.
 fn fair_sess_cap() -> usize {
     let holders = session_holders()
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
-    (MAX_SESSIONS_GLOBAL / holders).clamp(256, LOCAL_SESS_MAX)
+    (MAX_SESSIONS_GLOBAL / holders).clamp(MIN_SESSION_SHARE, LOCAL_SESS_MAX)
 }
+
+/// Lower bound for [`fair_sess_cap`] — see its note on why this is not 256.
+const MIN_SESSION_SHARE: usize = 1024;
 
 /// Process-wide throttle for the over-cap `sweep_all` reaps in
 /// `get_or_create_sess`: at most one sweep per second across all workers and
@@ -497,9 +519,11 @@ static DIAL_PERMIT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static DIAL_CONNECT_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Process-wide cap on concurrently handled QUIC bidi streams. The transport's
-/// per-connection stream limit alone allows 1024 x 4096 = ~4M live stream tasks,
-/// each holding a 5s header timer while queued on the DNS/dial limiters; this
-/// bounds the worst case to a fixed number of tasks.
+/// per-connection stream credit ([`MAX_BIDI_STREAMS_PER_CONN`], now 8192 so one
+/// admitted client can never stall in `open_bi`) times the connection cap is far
+/// more live stream tasks than any host wants, each holding a 5s header timer
+/// while queued on the DNS/dial limiters; this bounds the worst case to a fixed
+/// number of tasks, and excess streams are reset by the accept loop.
 const MAX_STREAM_TASKS: usize = 16_384;
 
 fn stream_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -552,6 +576,21 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Rate limit for "refusing new connection" logs under a flood.
 fn warn_once_per_sec() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = mono_millis();
+    let prev = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000 {
+        return false;
+    }
+    LAST.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Rate limit for session-socket setup failures (fd or memory exhaustion).
+/// A separate slot from [`warn_once_per_sec`] on purpose: an fd-exhaustion
+/// storm must not silence the connection-limit warning, and vice versa.
+fn warn_sess_create_failed() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = mono_millis();
@@ -836,13 +875,25 @@ fn spawn_udp_reporter() {
                 || dd.fair_share > 0
                 || dd.dns_inflight > 0
                 || dd.dns_contention > 0
+                || dd.sess_create_failed > 0
                 || dd.refused > 0
             {
                 info!(
-                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (connection fair share), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} refused (policy); totals too_large={} buffer_full={} session_full={} fair_share={} dns_inflight={} dns_contention={} refused={}",
-                    dd.session_full, dd.fair_share, dd.dns_inflight, dd.dns_contention, dd.refused,
-                    now_d.too_large, now_d.buffer_full, now_d.session_full, now_d.fair_share,
-                    now_d.dns_inflight, now_d.dns_contention, now_d.refused
+                    "udp budget (60s): {} dropped (session/DNS cap), {} dropped (connection fair share), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} dropped (session setup failed), {} refused (policy); totals too_large={} buffer_full={} session_full={} fair_share={} dns_inflight={} dns_contention={} sess_create_failed={} refused={}",
+                    dd.session_full,
+                    dd.fair_share,
+                    dd.dns_inflight,
+                    dd.dns_contention,
+                    dd.sess_create_failed,
+                    dd.refused,
+                    now_d.too_large,
+                    now_d.buffer_full,
+                    now_d.session_full,
+                    now_d.fair_share,
+                    now_d.dns_inflight,
+                    now_d.dns_contention,
+                    now_d.sess_create_failed,
+                    now_d.refused
                 );
             }
             prev_d = now_d;
@@ -2096,16 +2147,10 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
     }
 }
 
-/// Normalize a destination for the reply allowlist: strip any IPv4 mapping
-/// so the stored form compares equal to the normalized reply source.
-fn normalize_dst(dst: SocketAddr) -> SocketAddr {
-    SocketAddr::new(unmap(dst.ip()), dst.port())
-}
-
 /// Record that session `s` sent to `dst`. Best effort: a vanished session is
-/// simply not updated and its next datagram recreates it.
+/// simply not updated and its next datagram recreates it. Normalization lives
+/// in [`RecentAddrs`] itself, so both sides of the comparison agree.
 fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
-    let dst = normalize_dst(dst);
     let sh = ss.shard(s);
     if let Some(e) = lock_read(sh).get(&s) {
         if let Ok(mut r) = e.recent.lock() {
@@ -2185,7 +2230,9 @@ async fn sess_reader_task(
         let src = SocketAddr::new(unmap(src.ip()), src.port());
         // Reply-source validation: the socket is unconnected, so any source
         // that reaches the ephemeral port would otherwise be forwarded as the
-        // target's answer. Drop anything the session never sent to.
+        // target's answer. Drop anything sent from a host this session never
+        // sent to (see `RecentAddrs`: the port is deliberately not part of the
+        // key, so a server answering from a different port still gets through).
         let allowed = recent
             .lock()
             .map(|r| !r.is_empty() && r.contains(&src))
@@ -2368,8 +2415,28 @@ async fn get_or_create_sess(
     };
     // Create the socket outside the write lock: socket()/setsockopt()/bind()
     // are syscalls and must not stall the datagram reader for every session.
-    let raw = udp_socket_dual_small("[::]:0").ok()?;
-    let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).ok()?);
+    // Both syscall failures are resource events the operator has to see, so
+    // neither is allowed to return silently.
+    let raw = match udp_socket_dual_small("[::]:0") {
+        Ok(s) => s,
+        Err(e) => {
+            let n = dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
+            if warn_sess_create_failed() {
+                warn!("udp session socket not created ({n} so far): {e:#}");
+            }
+            return None;
+        }
+    };
+    let sock = match tokio::net::UdpSocket::from_std(raw) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            let n = dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
+            if warn_sess_create_failed() {
+                warn!("udp session socket not registered ({n} so far): {e}");
+            }
+            return None;
+        }
+    };
     let c2_pre = cd.clone();
     let rs_pre = sock.clone();
     let ss_pre = ss.clone();
@@ -2388,7 +2455,7 @@ async fn get_or_create_sess(
     let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();
     let mut swept: Vec<SessEntry> = Vec::new();
-    let (inserted, memo_data) = {
+    let (inserted, memo_data, reader_died) = {
         let sh = ss.shard(s);
         // Blocks for the same reason the read path does: a losing `try_lock_write`
         // used to abort the freshly spawned reader, release the global permit and
@@ -2450,11 +2517,12 @@ async fn get_or_create_sess(
             if let Some(e) = w.remove(&s) {
                 e.reader.abort();
             }
-            (false, None)
+            (false, None, true)
         } else {
             (
                 true,
                 Some((sock.clone(), last_pre.clone(), reader_abort.clone())),
+                false,
             )
         }
     };
@@ -2465,6 +2533,16 @@ async fn get_or_create_sess(
     ss.note_empty_state();
     if let Some((msock, mlast, mabort)) = memo_data {
         sess_memo_put(conn_id, s, msock, mlast, mabort);
+    }
+    if reader_died {
+        // The freshly spawned reply reader exited before the entry was
+        // published (e.g. the session socket failed on first use). The datagram
+        // is dropped; count it instead of leaving an operator with a session
+        // that silently never comes up.
+        let n = dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
+        if warn_sess_create_failed() {
+            warn!("udp session {s} reader exited before publish ({n} so far)");
+        }
     }
     abort_evicted(stale_dead);
     abort_evicted(swept);
@@ -2973,16 +3051,31 @@ mod tests {
     }
 
     #[test]
-    fn reply_allowlist_accepts_only_recorded_destinations() {
+    fn reply_allowlist_matches_the_host_not_the_queried_port() {
         let mut r = RecentAddrs::default();
         assert!(r.is_empty());
         let a: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let b: SocketAddr = "1.1.1.1:443".parse().unwrap();
         r.push(a);
         assert!(!r.is_empty());
-        assert!(r.contains(&a));
-        assert!(!r.contains(&b));
+        assert!(r.contains(&a), "the queried destination itself is allowed");
+        // The whole point of the IP-only key: a server that answers from a
+        // different port (TFTP's ephemeral reply port, redirected game/voice
+        // flows) must not be filtered.
+        assert!(
+            r.contains(&"93.184.216.34:53".parse().unwrap()),
+            "a reply from another port on a queried host is legitimate"
+        );
+        assert!(
+            !r.contains(&b),
+            "a host this session never sent to must stay refused"
+        );
         r.push(a);
+        assert_eq!(
+            r.slots.iter().flatten().count(),
+            1,
+            "re-pushing the same host must not consume another slot"
+        );
         r.push(b);
         assert!(r.contains(&a) && r.contains(&b));
         for i in 0..RECENT_DST_CAP {
@@ -3022,8 +3115,17 @@ mod tests {
         );
         session_holders().store(2, Ordering::Relaxed);
         assert_eq!(fair_sess_cap(), MAX_SESSIONS_GLOBAL / 2);
+        // The floor is what a cheap dilution attack runs into: past 8 holders
+        // every connection keeps MIN_SESSION_SHARE and the global semaphore
+        // becomes the binding constraint.
+        session_holders().store(8, Ordering::Relaxed);
+        assert_eq!(fair_sess_cap(), MIN_SESSION_SHARE);
         session_holders().store(64, Ordering::Relaxed);
-        assert_eq!(fair_sess_cap(), 256);
+        assert_eq!(fair_sess_cap(), MIN_SESSION_SHARE);
+        assert!(
+            fair_sess_cap() >= 1024,
+            "the old 256 floor let 32 single-session connections starve everyone"
+        );
 
         // A table is counted only while non-empty.
         session_holders().store(prev, Ordering::Relaxed);

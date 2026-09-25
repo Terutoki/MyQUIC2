@@ -47,11 +47,17 @@ const EGRESS_REFRESH_MS: u64 = 1000;
 /// peer can spawn unbounded tasks / relay sockets (each with 512 KB kernel
 /// buffers) and exhaust fds and memory on the proxy host.
 const MAX_SOCKS_CONNS: usize = 8192;
+/// The admission cap above is only useful if the QUIC pool can actually carry
+/// that many concurrent TCP flows without parking them in `open_bi()`; the
+/// transport advertises `MAX_BIDI_STREAMS_PER_CONN` per connection, and pinned
+/// flows can all land on one connection. Fail the build if either constant is
+/// changed without the other.
+const _: () = assert!(MAX_SOCKS_CONNS as u32 <= MAX_BIDI_STREAMS_PER_CONN);
 // `MAX_UDP_ASSOCS` (the concurrent UDP-association cap) now lives in `lib.rs`
 // next to the server's per-connection session target, so the two can never drift
 // apart again: it is imported by `use myquic2::*`. It is a *budget* constant,
 // not a guarantee — see its docstring for the server-side fair share
-// (`clamp(MAX_SESSIONS_GLOBAL / session-holding connections, 256, 4096)`) that
+// (`clamp(MAX_SESSIONS_GLOBAL / session-holding connections, 1024, 4096)`) that
 // this client cannot observe.
 
 fn socks_conn_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -995,14 +1001,16 @@ impl UdpHub {
     /// Removes a published entry without touching the process-wide count. Split
     /// from [`Self::release`] so the slot accounting stays paired with
     /// `alloc_sess` alone and cannot be driven negative by a stray removal.
+    /// An absent key returns the loaded handle unchanged (one refcount bump)
+    /// instead of cloning the whole shard map for a no-op.
     fn unpublish(&self, s: u32) {
         self.shard(s).rcu(|m| {
             if !m.contains_key(&s) {
-                return (**m).clone();
+                return Arc::clone(m);
             }
             let mut next = (**m).clone();
             next.remove(&s);
-            next
+            Arc::new(next)
         });
     }
 
@@ -1769,10 +1777,11 @@ fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             if dd.lost() > 0 {
                 info!(
-                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (resolution in flight), {} dropped (DNS/session cap), {} refused (policy); totals too_large={} buffer_full={} no_egress={} egress_dead={} dns_inflight={} session_full={} refused={}",
+                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} dropped (DNS/session cap), {} refused (policy); totals too_large={} buffer_full={} no_egress={} egress_dead={} dns_inflight={} dns_contention={} session_full={} refused={}",
                     dd.no_egress,
                     dd.egress_dead,
                     dd.dns_inflight,
+                    dd.dns_contention,
                     dd.session_full,
                     dd.refused,
                     now_d.too_large,
@@ -1780,6 +1789,7 @@ fn spawn_udp_reporter() {
                     now_d.no_egress,
                     now_d.egress_dead,
                     now_d.dns_inflight,
+                    now_d.dns_contention,
                     now_d.session_full,
                     now_d.refused
                 );
