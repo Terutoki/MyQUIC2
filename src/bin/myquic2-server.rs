@@ -2514,9 +2514,13 @@ async fn get_or_create_sess(
         // over-share shard reaps its expired sessions toward it instead of
         // waiting for the static maximum. Live over-share is left alone while
         // active (see `SWEEP_LOCAL_MAX_EVICT`); the global semaphore caps the
-        // true total.
+        // true total. Gated on the process-wide sweep window: without it every
+        // forged new-session datagram runs an O(shard) rank under this write
+        // lock, a CPU amplifier any peer can drive.
         if let Some(target) = shard_sweep_target(w.len(), fair_sess_cap()) {
-            swept = sweep_local(&mut w, target);
+            if claim_fair_sweep(mono_millis()) {
+                swept = sweep_local(&mut w, target);
+            }
         }
         let dead = h_pre.is_finished();
         w.insert(

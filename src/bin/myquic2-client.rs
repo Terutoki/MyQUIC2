@@ -817,9 +817,13 @@ impl SharedEgress {
     /// before quinn ever sees them, and its `limit` was already correct).
     fn refresh_budget(&self, class: EgressClass) {
         const BUDGET_PROBE_INTERVAL_MS: u64 = 100;
-        let now = coarse_millis();
+        // Precise clock for the throttle: `coarse_millis` advances in 1 s
+        // steps, so a 100 ms interval measured on it is really 0~1 s and a
+        // PMTU shrink keeps dropping on a stale budget for up to a second.
+        // `mono_millis` is a vDSO read paid only on the `TooLarge` path.
+        let now = mono_millis();
         let probed = &self.budget_probed_ms[class.index()];
-        // Zero means never probed: the coarse epoch counts from process start,
+        // Zero means never probed: the mono epoch counts from process start,
         // so a small `now` must not read as "probed 0 ms ago".
         let last = probed.load(std::sync::atomic::Ordering::Relaxed);
         if last != 0 && now.saturating_sub(last) < BUDGET_PROBE_INTERVAL_MS {

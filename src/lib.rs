@@ -2724,29 +2724,10 @@ pub mod dgram_drops {
         }
     }
 
-    /// Totals since process start.
-    ///
-    /// **Batching bound, stated because a line reading `0` is not proof of no
-    /// loss.** `too_large`, `buffer_full`, `session_full`, `fair_share`,
-    /// `dns_inflight`, `unknown_sess`, `refused` and `sess_create_failed`
-    /// accumulate in a thread-local
-    /// cell and reach the global only when they hit 64 or when `snapshot` runs
-    /// *on that thread*. A reporter task runs
-    /// on its own thread, so a loss under 64 drops on a worker thread is not
-    /// "delayed to the next report" — it stays invisible until that thread drops
-    /// 63 more, and a thread that exits takes its pending count with it. Treat
-    /// those eight as flood indicators, and the per-packet `warn` lines (which
-    /// carry the total `bump` returned) as the immediate signal.
-    ///
-    /// `no_egress`, `egress_dead` and `dns_contention` are exempt by
-    /// construction: they are counted with a direct `fetch_add` (see `bump`),
-    /// so a two-second fail-closed outage that drops twenty datagrams — or a
-    /// short contention episode that never reaches 64 events on one thread —
-    /// shows up in the very next report. That is deliberate: the first two
-    /// describe a discrete state of the egress connection, not a flood, and
-    /// contention episodes are discrete too (the exact flaw batching had for
-    /// the egress counters). One RMW per *dropped* datagram (never per sent
-    /// datagram) is the right price for numbers that have to be true.
+    /// Totals since process start. Every counter is a direct `fetch_add`
+    /// (see `bump`), so the next report shows every drop including a
+    /// short low-rate episode. One RMW per *dropped* datagram (never per
+    /// sent datagram) is the price for numbers that have to be true.
     pub fn snapshot() -> DropSnapshot {
         flush_locals();
         DropSnapshot {
@@ -2826,6 +2807,7 @@ pub mod dgram_drops {
         static L_SESS_CREATE_FAILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
+    #[allow(dead_code)]
     fn batched(
         counter: &AtomicU64,
         local: &'static std::thread::LocalKey<std::cell::Cell<u64>>,
@@ -2847,46 +2829,15 @@ pub mod dgram_drops {
         }
     }
 
-    /// `counter` must be one of this module's statics. Eight of them batch per
-    /// thread (flushed at 64, or by a `snapshot` on the *same* thread), which is
-    /// what keeps a flood off the shared cache lines; each of those needs its own
-    /// arm here *and* its own `flush_locals` arm, or its count would sit in a
-    /// thread-local cell and never reach the snapshot.
-    ///
-    /// The two **egress** states and **contention** deliberately do not batch
-    /// and fall through to the direct `fetch_add` below. A fail-closed outage is a discrete event
-    /// that lasts seconds, and batching let a short one hide in a worker thread's
-    /// cell indefinitely: this thread only flushes at 64, and the reporter's
-    /// `snapshot` flushes its own cells, not this thread's — so a 20-datagram
-    /// outage could go unreported forever, and a thread that exits takes its
-    /// pending count with it. One RMW per *dropped* datagram (never per sent
-    /// datagram) is the right price for a number that has to be true;
-    /// `egress_drops_are_exact_across_threads` pins it.
-    ///
-    /// `UNKNOWN_SESS` *does* batch, and is the one counter that may: its trigger
-    /// is a peer still answering a session this side already closed, so a burst
-    /// of it is the flood case batching exists for, and the number is a
-    /// diagnostic rather than a loss an operator has to act on.
+    /// `counter` must be one of this module's statics. All counters use a
+    /// direct `fetch_add`: one RMW per *dropped* datagram (never per sent
+    /// datagram) is the price for numbers the 60 s report can trust. Batching
+    /// hid short outages in a worker thread's cell indefinitely (the reporter's
+    /// `snapshot` only flushes its own cells, and a thread exit drops its
+    /// pending count), so a low-rate `REFUSED`/`SESSION_FULL` could read 0;
+    /// `egress_drops_are_exact_across_threads` pins the exactness.
     pub fn bump(counter: &AtomicU64) -> u64 {
-        if std::ptr::eq(counter, &TOO_LARGE) {
-            batched(counter, &L_TOO_LARGE)
-        } else if std::ptr::eq(counter, &BUFFER_FULL) {
-            batched(counter, &L_BUFFER_FULL)
-        } else if std::ptr::eq(counter, &SESSION_FULL) {
-            batched(counter, &L_SESSION_FULL)
-        } else if std::ptr::eq(counter, &FAIR_SHARE) {
-            batched(counter, &L_FAIR_SHARE)
-        } else if std::ptr::eq(counter, &DNS_INFLIGHT) {
-            batched(counter, &L_DNS_INFLIGHT)
-        } else if std::ptr::eq(counter, &UNKNOWN_SESS) {
-            batched(counter, &L_UNKNOWN_SESS)
-        } else if std::ptr::eq(counter, &REFUSED) {
-            batched(counter, &L_REFUSED)
-        } else if std::ptr::eq(counter, &SESS_CREATE_FAILED) {
-            batched(counter, &L_SESS_CREATE_FAILED)
-        } else {
-            counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
-        }
+        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
     }
 
     /// Which egress state a warning is about. An enum rather than a reason
