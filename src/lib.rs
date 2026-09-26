@@ -2016,6 +2016,34 @@ pub fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
     memo_put(key, Some(addr), now + DNS_CACHE_TTL);
 }
 
+/// Seed the positive DNS cache with a full multi-record set, first record
+/// first. Same test-only purpose as [`dns_cache_seed`]: the fast probe serves
+/// only the first address, so a filtered-first multi-record name cannot be
+/// exercised without seeding more than one.
+#[doc(hidden)]
+pub fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
+    let Some(first) = addrs.first().copied() else {
+        return;
+    };
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = dns_key_owned(host, port);
+            &owned
+        }
+    };
+    let now = Instant::now();
+    {
+        let mut m = lock_write(dns_cache_for(key));
+        m.insert(key.to_owned(), (now, Arc::from(addrs)));
+        evict_if_needed(&mut m);
+    }
+    lock_write(dns_neg_cache_for(key)).remove(key);
+    memo_put(key, Some(first), now + DNS_CACHE_TTL);
+}
+
 const DNS_CACHE_MAX: usize = 4096;
 /// Per-shard positive-cache cap: shards share the process-wide total evenly,
 /// so the aggregate bound stays `DNS_CACHE_MAX` while no single write lock

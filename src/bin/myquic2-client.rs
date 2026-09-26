@@ -561,6 +561,11 @@ struct SharedEgress {
     /// mutation concurrent with an acquire invalidates every thread's memo at
     /// once without a lock or a per-thread scan.
     generation: [std::sync::atomic::AtomicU64; EgressClass::COUNT],
+    /// Last `TooLarge` budget re-read per class (coarse epoch). The re-read
+    /// takes quinn's connection-state lock, so a PMTU shrink must not cost
+    /// one lock per oversized datagram for the whole memo window: at most one
+    /// re-read per interval, the rest keep the last known budget.
+    budget_probed_ms: [std::sync::atomic::AtomicU64; EgressClass::COUNT],
 }
 
 impl Default for SharedEgress {
@@ -570,6 +575,7 @@ impl Default for SharedEgress {
             warned: std::sync::atomic::AtomicBool::new(false),
             refreshing: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
             generation: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            budget_probed_ms: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -810,6 +816,16 @@ impl SharedEgress {
     /// every payload past `MQP_FRAG_MAX_PAYLOAD` (the fragmenter rejects those
     /// before quinn ever sees them, and its `limit` was already correct).
     fn refresh_budget(&self, class: EgressClass) {
+        const BUDGET_PROBE_INTERVAL_MS: u64 = 100;
+        let now = coarse_millis();
+        let probed = &self.budget_probed_ms[class.index()];
+        // Zero means never probed: the coarse epoch counts from process start,
+        // so a small `now` must not read as "probed 0 ms ago".
+        let last = probed.load(std::sync::atomic::Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < BUDGET_PROBE_INTERVAL_MS {
+            return;
+        }
+        probed.store(now, std::sync::atomic::Ordering::Relaxed);
         let cached = &self.cached[class.index()];
         let current = cached.load();
         let Some(c) = current.as_ref() else {

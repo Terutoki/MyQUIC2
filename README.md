@@ -231,7 +231,7 @@ and the reassembly expiry/eviction counters stay live in the
 Its `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
 for them (rebuilt on request, not tested).
 
-The current pass closes the UDP-vs-UDP fairness gap pass 35 documented as a
+The previous pass closes the UDP-vs-UDP fairness gap pass 35 documented as a
 limitation: UDP egress is now split into **one dedicated connection per egress
 class** (interactive vs bulk, `udp_split`), an association is classified once
 from its first datagram (an `interactive_ports` destination or a ≤ 512 B first
@@ -244,6 +244,22 @@ single shared UDP connection — see
 [pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections). Its
 `dist/` artifacts **are** rebuilt from this revision, but nothing was verified
 for them (rebuilt on request, not tested).
+
+The current pass fixes two confirmed findings from an outside-in review of the
+echo paths plus three review-driven hygiene items, all verified finding-by-finding
+through three rounds of code review before anything was touched (seven more
+candidates rejected or revised down): the server's domain fast path falls back to
+the full cached address set when the first record is SSRF-filtered (a filtered
+first record used to bypass the connection pin and force every packet through the
+slow path for the rest of the DNS TTL), the client's `TooLarge` budget re-read is
+rate-limited to one quinn lock per 100 ms per egress class (a PMTU shrink used to
+cost one lock per oversized datagram), the per-session reply allowlist uses the
+poison-recovering lock helper like every other table in the codebase, and the
+session-count cache pairs `Release` stores with `Acquire` loads — see
+[pass 38](#2026-09-hardening-pass-38--resolve_pin-dns-parity-egress-budget-backoff-and-a-verified-rebuild).
+Its `dist/` artifacts **are** rebuilt from this revision and statically checked
+(`file` plus per-level `objdump`, plus a byte-identical forced rebuild), again not
+run under emulation or natively.
 
 ---
 
@@ -265,7 +281,7 @@ for them (rebuilt on request, not tested).
 - [OpenWrt Deployment](#openwrt-deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
-- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor) and [pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene) and [pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections)
+- [Hardening Notes (this revision)](#hardening-notes-this-revision) — includes [pass 5](#2026-09-hardening-pass-5), [pass 8](#2026-09-hardening-pass-8--quinn-crates-moved-to-upstream-main), [pass 9](#2026-09-hardening-pass-9--tcp-windows-re-sized-for-300-mbs-at-140-ms), [pass 13](#2026-09-hardening-pass-13--zero-copy-tcp-pump-optional-counters-per-flow-vecs), [pass 14](#2026-09-hardening-pass-14--session-memo-correctness-and-hot-path-locks), [pass 15](#2026-09-hardening-pass-15--batched-pump-sharded-counters-shared-egress), [pass 16](#2026-09-hardening-pass-16--single-flight-egress-sharded-tables-pooled-pump), [pass 17](#2026-09-hardening-pass-17--shard-cap-per-session-touch-stale-egress), [pass 18](#2026-09-hardening-pass-18--non-blocking-egress-publish-trickle-flow-liveness), [pass 19](#2026-09-hardening-pass-19--touch-regression-memo-gc-budget-counters), [pass 20](#2026-09-hardening-pass-20--sharded-dns-cancel-proof), [pass 21](#2026-09-hardening-pass-21--no-park-locks-optimistic-egress), [pass 22](#2026-09-hardening-pass-22--lock-free-egress-memo-direct-mapped-dispatch), [pass 24](#2026-09-hardening-pass-24--post-audit-fixes-memo-ownership-sweeper-race-pin-deadline) and [pass 25](#2026-09-hardening-pass-25--dedicated-udp-egress-class-preserving-failover-retry-deadline), [pass 26](#2026-09-hardening-pass-26--independent-hot-path-audit-of-the-tcpudp-echo-paths), [pass 27](#2026-09-hardening-pass-27--hot-path-review-fixes-and-a-verified-openwrt-rebuild), [pass 28](#2026-09-hardening-pass-28--bounded-stream-head-writes-refused-datagram-accounting-and-the-socks-header-cap), [pass 29](#2026-09-hardening-pass-29--replay-safe-auth-reply-source-validation-dns-parity-truncation-counting-and-session-fairness), [pass 30](#2026-09-hardening-pass-30--reassembly-retention-accounting-session-holder-fairness-dns-negative-entry-guard-and-hot-path-ordering) and [pass 31](#2026-09-hardening-pass-31--per-direction-stall-symmetric-ack-reset-enum-warn-slots-and-fail-fast-dial) and [pass 32](#2026-09-hardening-pass-32--sweep-recheck-fair-shard-trigger-memo-guard-dns-contention-live-atomicity-auth-timeout) and [pass 33](#2026-09-hardening-pass-33--dns-negative-fail-open-and-process-wide-sweep-throttle) and [pass 34](#2026-09-hardening-pass-34--spelling-proof-config-bounded-holds-symmetric-counters) and [pass 35](#2026-09-hardening-pass-35--stream-credit-matches-admission-host-level-reply-allowlist-session-share-floor) and [pass 36](#2026-09-hardening-pass-36--udp-relay-source-pin-concurrent-retry-drain-drop-path-hygiene) and [pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections) and [pass 38](#2026-09-hardening-pass-38--resolve_pin-dns-parity-egress-budget-backoff-and-a-verified-rebuild)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -779,20 +795,27 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 37 — on top of everything pass 36 shipped)
+rebuilt from the current revision (pass 38 — on top of everything pass 37 shipped)
 with the default feature set, so the relay counters are **on** in these builds:
-static musl, x86-64, stripped — servers 4 398 568–4 420 160 B (v1 4 409 112,
-v2 4 398 568, v3 4 420 160, v4 4 416 896; byte-size unchanged from pass 36,
-content rebuilt) and clients 4 421 016–4 439 152 B (v1 4 435 784, v2 4 421 016,
-v3 4 439 152, v4 4 432 224), i.e. **+5 096…+8 728 B** per client level against
-the pass-36 *recorded* figures — recorded as measured, not explained (the
-`EgressClass` split, the per-class egress state and the classification log line;
-the regression tests are `#[cfg(test)]` and do not ship). **Nothing was verified
-for these bytes** — no `file`, no `objdump`, no reproducibility build, no
-emulation, no native run — on explicit instruction: they are compiled, not
-tested. What *was* run is the native E2E recorded under
-[pass 37](#2026-09-hardening-pass-37--classified-udp-egress-connections),
-against the source these binaries compile.
+static musl, x86-64, stripped — servers 4 400 952–4 424 592 B (v1 4 408 432,
+v2 4 400 952, v3 4 424 592, v4 4 421 456) and clients 4 423 288–4 436 112 B
+(v1 4 438 312, v2 4 423 288, v3 4 436 112, v4 4 434 112), i.e. **−680…+4 560 B**
+per server level and **−3 040…+2 528 B** per client level against the pass-37
+*recorded* figures — recorded as measured, not explained (the `resolve_pin`
+full-set fallback, the per-class budget-probe stamp and the lock-helper swaps;
+the new regression test is `#[cfg(test)]` and does not ship; the recipe and
+feature set are unchanged and `Cargo.lock` is untouched, while per-level codegen
+shifts account for the mixed signs). The builds **were** statically checked:
+`file` confirms ELF 64-bit LSB x86-64, statically linked, stripped on all eight
+artifacts, and `objdump -d` finds 278 `zmm` refs in the v4 server and 240 in the
+v4 client with none in v1–v3 of either binary (`ymm` 3 978 → 25 088 server and
+3 978 → 26 528 client from v1 to v3), so each `target-cpu` level really is
+compiled in; a second four-level build from `touch`ed sources came out
+byte-identical (`sha256` equal for all eight files). What was **not** repeated is
+any emulated or native run of the shipped pairs — the verification recorded
+under [pass 38](#2026-09-hardening-pass-38--resolve_pin-dns-parity-egress-budget-backoff-and-a-verified-rebuild)
+applies to the native release build, and a target that needs a loadable binary
+should be validated on the target.
 The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
 passes'). Against the pass-27
 *recorded* figures,
@@ -3895,6 +3918,66 @@ emulation, no native run): they are compiled, not tested.
 
 ---
 
+### 2026-09 hardening pass 38 — resolve_pin DNS parity, egress budget backoff, and a verified rebuild
+
+A review-and-fix cycle on the echo paths rather than a new feature: two confirmed
+findings from an outside-in review plus three review-driven hygiene items, all
+verified finding-by-finding through three rounds of code review before anything
+was touched (seven more candidates rejected or revised down to informational).
+No frame, framing, ALPN or protocol-field change, so mixed old/new pairs keep
+working.
+
+- **The domain fast path matches the slow path's DNS filtering.** `resolve_pin`
+  serves the first cached address only; when that record was SSRF-filtered it
+  returned `None` without consulting the full cached set, while
+  `forward_server_dgram` scans the whole set for an allowed address. A name whose
+  first record is private therefore never armed the connection pin and paid the
+  slow path on every packet for the rest of the DNS TTL. Both filtered branches
+  (session-memo hit and DNS-cache hit) now fall back to `lookup_cached_all_fast`
+  and arm the pin on the fallback address — pinned by the new
+  `resolve_pin_falls_back_when_first_record_filtered` (filtered-first two-record
+  name resolves to the public address, arms the pin, and answers the next
+  datagram from the pin). Contention/expired entries still return `None` into the
+  existing `DNS_INFLIGHT`/`DNS_CONTENTION`/spawn handling, and the fast path
+  still counts nothing itself, so no drop is double-counted. The multi-record
+  seed helper `dns_cache_seed_set` is test-only (`#[doc(hidden)]`, like the
+  existing `dns_cache_seed`).
+- **The `TooLarge` budget re-read is rate-limited.** `SharedEgress::refresh_budget`
+  re-read `max_datagram_size()` — quinn's connection-state lock — on every
+  oversized datagram, so a PMTU shrink cost one lock per packet for the whole
+  memo window. A per-class `budget_probed_ms` stamp bounds it to one re-read per
+  100 ms; the rest keep the last known budget. The zero value means never-probed
+  (the coarse epoch counts from process start, so a small `now` must not read as
+  "probed 0 ms ago") — the existing
+  `too_large_refreshes_the_budget_without_discarding_the_handle` caught the first
+  version of this gate and pins the corrected one.
+- **Three hygiene items.** The per-session reply allowlist uses the
+  poison-recovering `lock_mutex` helper like every other table in the codebase
+  (`remember_dst` and the reply reader; same semantics unpoisoned); the
+  session-count cache pairs `Release` stores with `Acquire` loads
+  (`len_cached`/`store_len`); the rest of the review's medium candidates (per-
+  session ticker convergence, `evict_oldest` scan bound, per-packet DNS spawn
+  bound, holder-count precision) were verified as already-bounded and left
+  untouched.
+
+Verification: `cargo test --all-targets` **126/126** (65 lib + 33 client + 28
+server; **125/125** with `--no-default-features`: 64 + 33 + 28), `cargo clippy
+--all-targets -- -D warnings` and `cargo fmt --check` clean on both feature
+sets. `dist/` **was rebuilt from this revision** for all four CPU levels
+(static musl, x86-64, default feature set, the documented `cargo zigbuild`
+recipe; stripped): servers 4 400 952–4 424 592 B (v1 4 408 432, v2 4 400 952,
+v3 4 424 592, v4 4 421 456) and clients 4 423 288–4 436 112 B (v1 4 438 312,
+v2 4 423 288, v3 4 436 112, v4 4 434 112). Statically checked: `file` confirms
+ELF 64-bit LSB x86-64, statically linked, stripped on all eight; `objdump -d`
+finds 278 `zmm` refs in the v4 server and 240 in the v4 client with none in
+v1–v3 (`ymm` 3 978 → 25 088 server, 3 978 → 26 528 client, v1 → v3); a forced
+second four-level build (from `touch`ed sources, so a real recompile, not a
+cache hit) came out byte-identical (`sha256` equal for all eight). Not run under
+emulation or natively — wire-compatible throughout (fast-path resolution,
+backoff timing and counters only).
+
+---
+
 ## Roadmap
 
 - [x] Optional client authentication (`auth_token`)
@@ -3944,6 +4027,12 @@ emulation, no native run): they are compiled, not tested.
 - [x] Track quinn `main` (0.12) instead of the crates.io 0.11.x line, picking up the
       upstream DATAGRAM accounting fix (pass 8; superseded — back on crates.io
       0.11.18, which backports it, see pass 10)
+- [x] Domain fast path falls back to the full cached address set when the first
+      record is SSRF-filtered, arming the connection pin like the slow path (pass 38)
+- [x] `TooLarge` DATAGRAM-budget re-read rate-limited to one quinn lock per 100 ms
+      per egress class (pass 38)
+- [x] Per-session reply allowlist uses the poison-recovering lock helper; session-count
+      cache uses `Release`/`Acquire` ordering (pass 38)
 
 ---
 

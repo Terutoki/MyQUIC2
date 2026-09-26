@@ -315,8 +315,8 @@ impl ShardedSessTable {
     /// already bounds.
     fn len_cached(&self, now_ms: u64) -> usize {
         use std::sync::atomic::Ordering;
-        if now_ms.saturating_sub(self.cached_len_ms.load(Ordering::Relaxed)) < 1000 {
-            return self.cached_len.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(self.cached_len_ms.load(Ordering::Acquire)) < 1000 {
+            return self.cached_len.load(Ordering::Acquire);
         }
         let n = self.len();
         self.store_len(n, now_ms);
@@ -326,8 +326,8 @@ impl ShardedSessTable {
     /// Publish a freshly measured `len` (call after a sweep actually ran).
     fn store_len(&self, n: usize, now_ms: u64) {
         use std::sync::atomic::Ordering;
-        self.cached_len.store(n, Ordering::Relaxed);
-        self.cached_len_ms.store(now_ms, Ordering::Relaxed);
+        self.cached_len.store(n, Ordering::Release);
+        self.cached_len_ms.store(now_ms, Ordering::Release);
     }
 
     fn drain_all(&self) -> Vec<SessEntry> {
@@ -1561,8 +1561,11 @@ fn resolve_pin(
         }
     }
     if let Some(dst) = sess_dest_lookup(ss, now, s, h, p) {
-        // A filtered memo hit is unusable: the name may still resolve to an
-        // allowed address, which only the full-set lookup below can find.
+        // A filtered memo hit is unusable as-is, but the name may still
+        // resolve to an allowed address in the full cached set (multi-record
+        // names whose first address is private). Scan it here so the pin can
+        // still arm on the fast path instead of forcing every packet through
+        // the slow path for the rest of the DNS TTL.
         if allow_private || is_global_ip_cached(dst.ip()) {
             // Adopt the session's memo so the next datagram is a pure compare with
             // no table read at all -- for the memo's remaining life, never longer.
@@ -1575,15 +1578,39 @@ fn resolve_pin(
             });
             return Some(dst);
         }
+        if let Some(d2) = lookup_cached_all_fast(h, p).as_ref().and_then(|v| {
+            v.iter()
+                .copied()
+                .find(|a| allow_private || is_global_ip_cached(a.ip()))
+        }) {
+            *pin = Some(ConnPin {
+                sess: s,
+                host: h.to_owned(),
+                port: p,
+                addr: d2,
+                expires: now + DEST_PIN_TTL_MS,
+            });
+            return Some(d2);
+        }
         return None;
     }
     match lookup_cached_fast(h, p) {
         CachedLookup::Addr(dst) => {
             // The fast cache serves the first address only; a filtered first
-            // address is unusable even when a later one would be allowed.
-            if !allow_private && !is_global_ip_cached(dst.ip()) {
-                return None;
-            }
+            // address falls back to the full cached set before giving up, so
+            // the pin arms the same way the slow path (`forward_server_dgram`)
+            // would resolve it. Without this a name whose first record is
+            // private never pinned and every packet paid the slow path.
+            let usable = if !allow_private && !is_global_ip_cached(dst.ip()) {
+                lookup_cached_all_fast(h, p).as_ref().and_then(|v| {
+                    v.iter()
+                        .copied()
+                        .find(|a| allow_private || is_global_ip_cached(a.ip()))
+                })
+            } else {
+                Some(dst)
+            };
+            let addr = usable?;
             // Adopt the DNS hit into the connection pin. Without this the pin
             // was only ever written from `sess_dest_lookup`, and a fast-path
             // success skips `forward_server_dgram` → `sess_dest_store` entirely:
@@ -1596,10 +1623,10 @@ fn resolve_pin(
                 sess: s,
                 host: h.to_owned(),
                 port: p,
-                addr: dst,
+                addr,
                 expires: now + DEST_PIN_TTL_MS,
             });
-            Some(dst)
+            Some(addr)
         }
         CachedLookup::Negative | CachedLookup::Unknown => None,
     }
@@ -2153,9 +2180,7 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
 fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
     let sh = ss.shard(s);
     if let Some(e) = lock_read(sh).get(&s) {
-        if let Ok(mut r) = e.recent.lock() {
-            r.push(dst);
-        }
+        lock_mutex(&e.recent).push(dst);
     }
 }
 
@@ -2233,10 +2258,9 @@ async fn sess_reader_task(
         // target's answer. Drop anything sent from a host this session never
         // sent to (see `RecentAddrs`: the port is deliberately not part of the
         // key, so a server answering from a different port still gets through).
-        let allowed = recent
-            .lock()
-            .map(|r| !r.is_empty() && r.contains(&src))
-            .unwrap_or(false);
+        let r = lock_mutex(&recent);
+        let allowed = !r.is_empty() && r.contains(&src);
+        drop(r);
         if !allowed {
             dgram_drops::bump(&dgram_drops::REFUSED);
             continue;
@@ -2947,6 +2971,29 @@ mod tests {
             resolve_pin(&ss, &mut pin, 7, 7, host, port, true),
             Some(private),
             "allow_private must still serve it"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pin_falls_back_when_first_record_filtered() {
+        let private: SocketAddr = "10.9.9.9:443".parse().unwrap();
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let host = "filtered-first-multi.test";
+        let port = 18446u16;
+        dns_cache_seed_set(host, port, &[private, public]);
+        let (ss, _sock) = sess_with_dest(None);
+        let mut pin: Option<ConnPin> = None;
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, host, port, false),
+            Some(public),
+            "a filtered first record must fall back to the full set, like the slow path"
+        );
+        let armed = pin.as_ref().expect("the fallback hit must arm the pin");
+        assert_eq!(armed.addr, public);
+        assert_eq!(
+            resolve_pin(&ss, &mut pin, 7, 7, host, port, false),
+            Some(public),
+            "the armed pin must answer the next datagram with no table read"
         );
     }
 
