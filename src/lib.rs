@@ -1385,7 +1385,11 @@ fn dns_cache_for(key: &str) -> &'static std::sync::RwLock<HashMap<DnsCacheKey, D
     &dns_caches()[dns_shard(key)]
 }
 
-const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Positive DNS cache TTL, in milliseconds. The `Duration` below is derived from
+/// it so the two can never drift, and callers that arm their own deadline from a
+/// cache hit clamp against the entry's *remaining* life measured in these units.
+pub const DNS_CACHE_TTL_MS: u64 = 60_000;
+const DNS_CACHE_TTL: Duration = Duration::from_millis(DNS_CACHE_TTL_MS);
 const DNS_NEG_TTL: Duration = Duration::from_secs(10);
 /// Soft cap for the negative cache; past this the table is reaped instead of
 /// growing without bound under a failing-domain flood.
@@ -1719,12 +1723,44 @@ struct DnsMemoSlot {
     /// another name's address; at worst a 60 s DNS answer is reused for one
     /// extra second.
     expires_ms: u64,
+    /// [`NEG_EPOCH`] when this slot was written, for negative entries only (0
+    /// for a positive). A negative memo is private to the thread that recorded
+    /// the failure, so a *successful* resolution on another worker — which
+    /// clears the global negative entry and writes a positive elsewhere — could
+    /// not reach it: the recording worker kept refusing a name that resolved
+    /// again for the rest of `DNS_NEG_TTL` (10 s). The tag makes the memo obey
+    /// the same rule the global cache does — a *lookup* hit on a negative entry
+    /// is honoured only while its epoch is current, so any "this name resolves
+    /// now" mutation invalidates every thread's stale negative at once for one
+    /// relaxed load, on the negative path only.
+    neg_epoch: u64,
 }
 
 /// Keys longer than this are not memoized (see [`DnsMemoSlot`]).
 const MEMO_KEY_BYTES: usize = 64;
 const MEMO_SETS: usize = 64;
 const MEMO_WAYS: usize = 2;
+
+/// Epoch of the process-wide negative DNS cache's *good* verdicts.
+///
+/// Bumped whenever a name's negative entry is removed because it resolved again
+/// (or a seeding helper rewrote it). A thread-local negative memo is only
+/// trusted while the epoch it was written at is still current — see
+/// [`DnsMemoSlot::neg_epoch`]. One relaxed load on the negative-hit path, and
+/// the bump itself only on the rare "resolution succeeded after a failure" path.
+static NEG_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current [`NEG_EPOCH`].
+#[inline]
+fn neg_epoch() -> u64 {
+    NEG_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record that some name's negative entry was dropped because it resolves now.
+#[inline]
+fn bump_neg_epoch() {
+    NEG_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 impl DnsMemoSlot {
     const EMPTY: Self = Self {
@@ -1734,6 +1770,7 @@ impl DnsMemoSlot {
         len: 0,
         key: [0; MEMO_KEY_BYTES],
         expires_ms: 0,
+        neg_epoch: 0,
     };
 
     /// A slot for `key`, or `None` when it is too long to store inline.
@@ -1748,6 +1785,9 @@ impl DnsMemoSlot {
         s.len = key.len() as u8;
         s.key[..key.len()].copy_from_slice(key.as_bytes());
         s.expires_ms = coarse_deadline(expires);
+        // Only a negative slot needs the tag: a positive hit is never
+        // invalidated by the epoch (its own deadline bounds it).
+        s.neg_epoch = if addr.is_none() { neg_epoch() } else { 0 };
         Some(s)
     }
 
@@ -1799,6 +1839,8 @@ fn dns_memo_set(hash: u64) -> usize {
 struct MemoHit {
     addr: Option<SocketAddr>,
     expires_ms: u64,
+    /// See [`DnsMemoSlot::neg_epoch`]; 0 for a positive hit.
+    neg_epoch: u64,
 }
 
 /// Probe both ways of our key's set, returning the positive and negative hits
@@ -1816,6 +1858,7 @@ fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
                 let hit = MemoHit {
                     addr: s.addr,
                     expires_ms: s.expires_ms,
+                    neg_epoch: s.neg_epoch,
                 };
                 return if s.addr.is_none() {
                     (None, Some(hit))
@@ -1892,6 +1935,23 @@ pub enum CachedLookup {
 /// memo hit path, no precise clock read (the deadline is compared in the coarse
 /// epoch) — it never touches a lock at all.
 pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
+    lookup_cached_fast_with_ttl(host, port).0
+}
+
+/// [`lookup_cached_fast`] plus the remaining life of what it returned.
+///
+/// `ttl_ms` is how much longer the answer may be used before it must be looked
+/// up again: the *remaining* lifetime of the cache entry (or of this thread's
+/// memo of it — the memo is written with the entry's own deadline, so the two
+/// agree) for a positive hit, and 0 for a miss or a negative hit.
+///
+/// Callers that arm their **own** deadline from a cache hit must clamp with it.
+/// The server's connection pin and per-session destination memo both used to
+/// take a fresh `DEST_PIN_TTL_MS` (30 s) from whatever the lookup returned, so a
+/// pin armed at 59.9 s into a 60 s entry served that address for another 30 s —
+/// 90 s after the resolution, contradicting their own documented bound
+/// ("deliberately shorter than the DNS cache TTL").
+pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64) {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -1911,14 +1971,22 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
         if let Some(m) = pos {
             if now < m.expires_ms {
                 return match m.addr {
-                    Some(a) => CachedLookup::Addr(a),
-                    None => CachedLookup::Unknown,
+                    Some(a) => (CachedLookup::Addr(a), m.expires_ms - now),
+                    None => (CachedLookup::Unknown, 0),
                 };
             }
         }
         if let Some(m) = neg {
-            if now < m.expires_ms {
-                return CachedLookup::Negative;
+            // The epoch check is what keeps a negative memo coherent with a
+            // resolution that succeeded on another worker: the memo is
+            // thread-private, so the global negative entry's removal cannot
+            // reach it. Without the tag the recording worker kept answering
+            // `Negative` — REFUSED datagrams, `dns negative cached` TCP
+            // failures — for the rest of `DNS_NEG_TTL` while the cache held a
+            // valid address. A stale tag simply falls through to the global
+            // caches below, which are the authority either way.
+            if now < m.expires_ms && m.neg_epoch == neg_epoch() {
+                return (CachedLookup::Negative, 0);
             }
         }
     }
@@ -1927,7 +1995,7 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     let now = Instant::now();
     {
         let Some(m) = try_lock_read(dns_cache_for(key)) else {
-            return CachedLookup::Unknown;
+            return (CachedLookup::Unknown, 0);
         };
         if let Some((t, v)) = m.get(key) {
             // Expiry is anchored to the global entry's insertion time, so the
@@ -1936,24 +2004,27 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
             if now < expires {
                 if let Some(a) = v.first().copied() {
                     memo_put(key, Some(a), expires);
-                    return CachedLookup::Addr(a);
+                    return (
+                        CachedLookup::Addr(a),
+                        expires.saturating_duration_since(now).as_millis() as u64,
+                    );
                 }
             }
         }
     }
     {
         let Some(n) = try_lock_read(dns_neg_cache_for(key)) else {
-            return CachedLookup::Unknown;
+            return (CachedLookup::Unknown, 0);
         };
         if let Some(t) = n.get(key) {
             let expires = *t + DNS_NEG_TTL;
             if now < expires {
                 memo_put(key, None, expires);
-                return CachedLookup::Negative;
+                return (CachedLookup::Negative, 0);
             }
         }
     }
-    CachedLookup::Unknown
+    (CachedLookup::Unknown, 0)
 }
 
 /// Back-compat helper returning only the positive form.
@@ -1973,6 +2044,15 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 /// lock or expired entry) — so the caller stays off the async path whenever the
 /// answer is already in memory.
 pub fn lookup_cached_all_fast(host: &str, port: u16) -> Option<Arc<[SocketAddr]>> {
+    lookup_cached_all_fast_with_ttl(host, port).map(|(v, _)| v)
+}
+
+/// [`lookup_cached_all_fast`] plus the remaining life of the set it returned.
+///
+/// Same contract as [`lookup_cached_fast_with_ttl`]: a caller that arms its own
+/// deadline from a cached set must clamp against `ttl_ms`, or a set read at the
+/// end of its life is re-used for the caller's whole (longer) TTL.
+pub fn lookup_cached_all_fast_with_ttl(host: &str, port: u16) -> Option<(Arc<[SocketAddr]>, u64)> {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -1984,8 +2064,13 @@ pub fn lookup_cached_all_fast(host: &str, port: u16) -> Option<Arc<[SocketAddr]>
     };
     let m = try_lock_read(dns_cache_for(key))?;
     let (t, v) = m.get(key)?;
-    if t.elapsed() < DNS_CACHE_TTL {
-        Some(v.clone())
+    let expires = *t + DNS_CACHE_TTL;
+    let now = Instant::now();
+    if now < expires {
+        Some((
+            v.clone(),
+            expires.saturating_duration_since(now).as_millis() as u64,
+        ))
     } else {
         None
     }
@@ -1997,6 +2082,17 @@ pub fn lookup_cached_all_fast(host: &str, port: u16) -> Option<Arc<[SocketAddr]>
 /// resolver; production always warms the cache through `resolve_all_cached`.
 #[doc(hidden)]
 pub fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
+    dns_cache_seed_aged(host, port, addr, Duration::ZERO);
+}
+
+/// [`dns_cache_seed`] with an explicit entry age, so a test can drive the
+/// "almost expired" case that `lookup_cached_fast_with_ttl` exists for.
+///
+/// `age` is subtracted from the entry's insertion instant (and from the memo's
+/// deadline), i.e. the remaining life is `DNS_CACHE_TTL - age` — the input a TTL
+/// clamp has to react to.
+#[doc(hidden)]
+pub fn dns_cache_seed_aged(host: &str, port: u16, addr: SocketAddr, age: Duration) {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -2007,13 +2103,33 @@ pub fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
         }
     };
     let now = Instant::now();
+    let inserted = now.checked_sub(age).unwrap_or(now);
     {
         let mut m = lock_write(dns_cache_for(key));
-        m.insert(key.to_owned(), (now, Arc::from([addr])));
+        m.insert(key.to_owned(), (inserted, Arc::from([addr])));
         evict_if_needed(&mut m);
     }
-    lock_write(dns_neg_cache_for(key)).remove(key);
-    memo_put(key, Some(addr), now + DNS_CACHE_TTL);
+    clear_negative(key);
+    memo_put(key, Some(addr), inserted + DNS_CACHE_TTL);
+}
+
+/// Seed the negative DNS cache as if `host:port` had just failed to resolve.
+///
+/// Same test-only purpose as [`dns_cache_seed`], for the other verdict: without
+/// it a negative *memo* entry can only be produced by a real (network) resolver
+/// failure, so the memo's coherence rules would be untestable.
+#[doc(hidden)]
+pub fn dns_neg_cache_seed(host: &str, port: u16) {
+    let mut kbuf = [0u8; DNS_KEY_BUF];
+    let owned;
+    let key: &str = match dns_key(host, port, &mut kbuf) {
+        Some(k) => k,
+        None => {
+            owned = dns_key_owned(host, port);
+            &owned
+        }
+    };
+    record_negative(key, Instant::now());
 }
 
 /// Seed the positive DNS cache with a full multi-record set, first record
@@ -2040,7 +2156,7 @@ pub fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
         m.insert(key.to_owned(), (now, Arc::from(addrs)));
         evict_if_needed(&mut m);
     }
-    lock_write(dns_neg_cache_for(key)).remove(key);
+    clear_negative(key);
     memo_put(key, Some(first), now + DNS_CACHE_TTL);
 }
 
@@ -2248,7 +2364,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                 m.insert(key.to_owned(), (now, v.clone()));
                 evict_if_needed(&mut m);
             }
-            lock_write(dns_neg_cache_for(key)).remove(key);
+            clear_negative(key);
             if let Some(a) = v.first().copied() {
                 memo_put(key, Some(a), now + DNS_CACHE_TTL);
             }
@@ -2287,6 +2403,18 @@ fn positive_entry_state(key: &str) -> PositiveState {
         PositiveState::Fresh
     } else {
         PositiveState::Absent
+    }
+}
+
+/// Drop `key`'s negative cache entry because the name resolves now.
+///
+/// The single place that turns a "does not resolve" verdict into a good one, so
+/// it is also the single place that has to invalidate the thread-local negative
+/// memos derived from it (see [`bump_neg_epoch`]).
+fn clear_negative(key: &str) {
+    let removed = { lock_write(dns_neg_cache_for(key)).remove(key).is_some() };
+    if removed {
+        bump_neg_epoch();
     }
 }
 
@@ -2425,6 +2553,22 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || v.is_unspecified()
                 || ((s[0] & 0xfe00) == 0xfc00)
                 || ((s[0] & 0xffc0) == 0xfe80)
+                // fe00::/9 is IANA "Reserved by IETF" and falls *between* the
+                // two rules above (fc00::/7 ends at fdff::, fe80::/10 starts at
+                // fe80::), so a denylist that names only those two let it
+                // through: `is_global_ip("fe00::1")` was true. The mask also
+                // covers fe80::/10, fec0::/10 and ff00::/8, which are denied
+                // below/already.
+                || ((s[0] & 0xfe00) == 0xfe00)
+                // 2001::/23 is IANA's IETF Protocol Assignments block, which is
+                // by definition not global unicast: the RIR allocations start at
+                // 2001:0200::/23. Denying the whole block closes every unlisted
+                // sub-block (Teredo, benchmarking, AMT, AS112, ORCHID, the LISP
+                // EID block 2001:5::/32, Drone ID) instead of requiring one arm
+                // per RFC; the specific entries below are kept for their
+                // citations. `2001:4860::/32` and every later RIR block are
+                // unaffected.
+                || (s[0] == 0x2001 && s[1] <= 0x01ff)
                 || (s[0] == 0x2001 && s[1] == 0x0db8)
                 || (s[0] == 0x0064 && s[1] == 0xff9b)
                 || s[0] == 0x2002
@@ -5180,6 +5324,55 @@ mod tests {
         assert!(neg2.is_none());
     }
 
+    /// A negative *memo* entry must not outlive the global negative entry it was
+    /// derived from.
+    ///
+    /// The memo is thread-private, and `resolve_all_cached`'s success path can
+    /// only clear the global entry plus the resolving thread's own memo — so a
+    /// name that failed on one worker and then resolved on another stayed
+    /// refused on the failing worker for the rest of `DNS_NEG_TTL`: every
+    /// datagram for it dropped as `REFUSED`, every TCP flow failing with
+    /// "dns negative cached", while the cache held a valid address. Two real
+    /// threads drive the hole (it is cross-thread by construction), and the
+    /// negative memo is produced by [`dns_neg_cache_seed`] rather than a live
+    /// resolver failure so the test needs no network.
+    #[test]
+    fn a_resolution_invalidates_another_threads_negative_memo() {
+        let (host, port) = ("neg-memo-coherence.test", 19056u16);
+        let addr: SocketAddr = "93.184.216.34:19056".parse().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+
+        let w = std::thread::spawn(move || {
+            // Premise: nothing is known about this name on this thread.
+            assert_eq!(lookup_cached_fast(host, port), CachedLookup::Unknown);
+            dns_neg_cache_seed(host, port);
+            assert_eq!(
+                lookup_cached_fast(host, port),
+                CachedLookup::Negative,
+                "the recording worker must see its own negative memo"
+            );
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            lookup_cached_fast(host, port)
+        });
+
+        ready_rx.recv().unwrap();
+        // Another worker resolves the same name successfully.
+        dns_cache_seed(host, port, addr);
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Addr(addr),
+            "a fresh positive entry answers on a thread with no stale memo"
+        );
+        go_tx.send(()).unwrap();
+        assert_eq!(
+            w.join().unwrap(),
+            CachedLookup::Addr(addr),
+            "a successful resolution must invalidate another thread's negative memo"
+        );
+    }
+
     /// A transient resolver failure must not downgrade a still-valid positive
     /// answer into a negative one.
     ///
@@ -5303,6 +5496,72 @@ mod tests {
         assert!(!is_global_ip("2620:4f:8000::1".parse().unwrap()));
         // Still globally routable.
         assert!(is_global_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    /// Two IPv6 ranges that a per-RFC denylist kept missing.
+    ///
+    /// `fe00::/9` is IANA "Reserved by IETF" and sits exactly between the
+    /// `fc00::/7` and `fe80::/10` rules, so a denylist naming only those two
+    /// returned `true` for `fe00::1`. `2001::/23` is the IETF Protocol
+    /// Assignments block, not global unicast — the old code denied only the
+    /// sub-blocks someone had already written an RFC citation for, so
+    /// `2001:5::/32` (the LISP EID block) and the reserved remainder passed.
+    #[test]
+    fn global_ip_filter_rejects_fe00_and_the_2001_ietf_block() {
+        for ip in ["fe00::1", "fe01::1", "fe7f:ffff::1"] {
+            assert!(
+                !is_global_ip(ip.parse().unwrap()),
+                "{ip} is Reserved by IETF, not global"
+            );
+        }
+        for ip in ["2001:0::1", "2001:5::1", "2001:1ff::1"] {
+            assert!(
+                !is_global_ip(ip.parse().unwrap()),
+                "{ip} is inside the IETF Protocol Assignments block"
+            );
+        }
+        // The block boundary is exact: 2001:0200::/23 is the first RIR
+        // allocation and must stay dialable, while the last address of the
+        // IETF block must not.
+        assert!(!is_global_ip("2001:1ff:ffff::1".parse().unwrap()));
+        assert!(is_global_ip("2001:200::1".parse().unwrap()));
+        assert!(is_global_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    /// The TTL-exposing lookups must report the *remaining* life, not the full
+    /// TTL: that remainder is what an adopting caller (the server's connection
+    /// pin and session destination memo) has to clamp against.
+    #[test]
+    fn lookup_ttl_reports_the_entries_remaining_life() {
+        memo_reset();
+        let addr: SocketAddr = "93.184.216.34:19057".parse().unwrap();
+        let (host, port) = ("ttl-report.test", 19057u16);
+        dns_cache_seed(host, port, addr);
+        let (hit, ttl) = lookup_cached_fast_with_ttl(host, port);
+        assert_eq!(hit, CachedLookup::Addr(addr));
+        assert!(
+            ttl > DNS_CACHE_TTL_MS - 2_000 && ttl <= DNS_CACHE_TTL_MS,
+            "a fresh entry reports its full life, got {ttl} ms"
+        );
+
+        // 59.5 s into a 60 s TTL: half a second of life is all an adopting
+        // caller may use.
+        let (aged, aged_port) = ("ttl-report-aged.test", 19058u16);
+        dns_cache_seed_aged(aged, aged_port, addr, Duration::from_millis(59_500));
+        let (hit2, ttl2) = lookup_cached_fast_with_ttl(aged, aged_port);
+        assert_eq!(hit2, CachedLookup::Addr(addr));
+        assert!(
+            ttl2 <= 1_500,
+            "an aged entry must report only its remainder, got {ttl2} ms"
+        );
+
+        // The full-set form carries it too, and a miss reports none.
+        let set = lookup_cached_all_fast_with_ttl(aged, aged_port).expect("cached set");
+        assert!(set.1 <= 1_500, "set life {} ms", set.1);
+        assert_eq!(
+            lookup_cached_fast_with_ttl("ttl-report-miss.test", 19059).1,
+            0
+        );
     }
 
     #[test]

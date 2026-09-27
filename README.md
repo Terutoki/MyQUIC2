@@ -810,27 +810,37 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from the current revision (pass 39 — on top of everything pass 38 shipped)
-with the default feature set, so the relay counters are **on** in these builds:
-static musl, x86-64, stripped — servers 4 399 608–4 423 120 B (v1 4 407 088,
-v2 4 399 608, v3 4 423 120, v4 4 420 240) and clients 4 421 816–4 436 840 B
-(v1 4 436 840, v2 4 421 816, v3 4 434 640, v4 4 432 640), i.e. **−1 216…−1 472 B**
-per server level and **−1 472 B** per client level against the pass-38
-*recorded* figures — recorded as measured, not explained (the eight batched
-drop-counter arms are gone — every `dgram_drops::bump` is a direct `fetch_add` —
-plus the mono-clock probe stamp and the sweep-window gate; the touched regression
-tests are `#[cfg(test)]` and do not ship; the recipe and feature set are unchanged
-and `Cargo.lock` is untouched, while per-level codegen shifts account for the
-residual spread). The builds **were** statically checked:
-`file` confirms ELF 64-bit LSB x86-64, statically linked, stripped on all eight
-artifacts, and `objdump -d` finds 278 `zmm` refs in the v4 server and 240 in the
-v4 client with none in v1–v3 of either binary (`ymm` 3 978 → 25 088 server and
-3 978 → 26 528 client from v1 to v3), so each `target-cpu` level really is
-compiled in. What was **not** repeated is a byte-identical second build or any
-emulated or native run of the shipped pairs — the verification recorded
-under [pass 39](#2026-09-hardening-pass-39--exact-drop-counters-throttled-shard-sweep-and-precise-budget-probe)
-applies to the native release build, and a target that needs a loadable binary
-should be validated on the target.
+rebuilt from this revision (pass 44, i.e. on top of the pass-40…43 fixes) with the
+default feature set, so the relay counters are **on** in these builds: static musl,
+x86-64, stripped — servers 4 393 896–4 416 688 B (v1 4 401 632, v2 4 393 896,
+v3 4 416 688, v4 4 413 872) and clients 4 423 096–4 438 312 B (v1 4 438 312,
+v2 4 423 096, v3 4 436 240, v4 4 434 176). Against the pass-39 *recorded* figures
+that is **−5 456…−6 432 B** per server level and **+1 280…+1 600 B** per client
+level. The direction is accounted for rather than asserted: the servers shrink
+because pass 43 deleted the inert per-shard over-cap trim (`evict_ranked` plus its
+O(shard) rank and `select_nth_unstable`) and pass 42 replaced `ConnPin`'s heap
+`String` with an inline buffer, while the clients grow because they link the
+library changes from passes 40–41 (the TTL-exposing DNS lookups, the epoch-tagged
+negative memo, the two new `is_global_ip` masks) — the client binary's own edits
+this round are `#[cfg(test)]` and do not ship. The recipe, `target-cpu` flags and
+feature set are unchanged and `Cargo.lock` is untouched; the per-level codegen
+spread accounts for the residual differences. The builds **were** statically
+checked: `file` confirms ELF 64-bit LSB x86-64, statically linked, stripped on all
+eight artifacts, and `objdump -d` finds 278 `zmm` refs in the v4 server and 240 in
+the v4 client with none in v1–v3 of either binary (`ymm` 3 978 / 3 971 / 25 134 /
+24 330 server and 3 978 / 3 971 / 26 534 / 25 580 client for v1→v4), so each
+`target-cpu` level really is compiled in. The shipped pair was then **run**, not
+just inspected: inside Podman's amd64 runtime on Apple Silicon, the **dist v1**
+server+client brought the tunnel up and passed TCP ECHO 1 MiB byte-for-byte, the
+UDP sweep at 8 / 1200 / 1420 / 2000 / 8000 B (the last two through `type=0x05`
+fragments) at 0 % loss, and the two-target switch check at 100 alpha / 100 beta and
+100 IP / 100 domain with **0 misrouted**; the emulated CPU runs the v3 server
+(clean startup) while the v4 server dies with exit 132 (`Illegal instruction`)
+before printing its listen line, which is the expected consequence of an AVX512
+level on a CPU without AVX512 and the dynamic counterpart of the static `zmm`
+counts. What was **not** repeated is a byte-identical second build, and these are
+still x86-64 binaries that should be validated on the actual target before a fleet
+rollout.
 The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
 passes'). Against the pass-27
 *recorded* figures,
@@ -4041,6 +4051,351 @@ build and no emulated or native run of the shipped pairs.
 
 ---
 
+### 2026-09 hardening pass 40 — an exact fair-share bound, an epoch for two stale-cache holes, and a completed IPv6 filter
+
+Four defects plus one red test, all found by reading the hot paths against their
+own invariants and each confirmed by a regression test that fails on the
+unmodified tree. No frame, framing, ALPN or protocol-field change, so mixed
+old/new pairs keep working.
+
+- **The connection fair-share gate was a frozen sample, so one connection could
+  take the whole session pool** (`src/bin/myquic2-server.rs`). `len_cached`
+  served `cached_len` for up to a second and **an insert never touched it**, so
+  every new-session datagram inside a window compared the count from before the
+  window opened. With `MAX_SESSIONS_GLOBAL = 8192`, one unauthenticated peer
+  (the shipped config has an empty `auth_token`) could insert thousands of
+  sessions per second, take every global permit, and keep them forever by
+  touching each session every <180 s — `sweep_all` reaps only idle ones, and the
+  per-shard over-cap trim cannot help (see the next note). Every other client
+  then failed with `SESSION_FULL`/`FAIR_SHARE`. The gate now uses
+  `len_upper_bound`: the sample **plus every insert since it**, re-measured
+  exactly once the bound reaches the share, so the value is never wrong in the
+  admitting direction and the exact measurement still happens once per second (as
+  before) rather than per packet.
+- **A negative DNS memo outlived the global verdict it came from**
+  (`src/lib.rs`). The thread-local memo is consulted before the global caches and
+  a successful resolution can only clear the *global* negative entry plus the
+  resolving thread's own memo — so a name that failed on worker W and then
+  resolved on worker V stayed `REFUSED` on W for the rest of `DNS_NEG_TTL`
+  (10 s): every datagram for it dropped, every TCP flow failing with
+  "dns negative cached", while the cache held a valid address. Negative memo
+  slots now carry a `NEG_EPOCH` tag, bumped by the one helper that removes a
+  negative entry because the name resolves (`clear_negative`); a memo hit is
+  honoured only while its tag is current, which costs one relaxed load on the
+  negative path and nothing on the positive one.
+- **The server's reply-allowlist mirror could go stale and silently kill one
+  direction** (`src/bin/myquic2-server.rs`). The datagram reader keeps a
+  task-local mirror of the session's `RecentAddrs` ring so a steady flow does not
+  take the shard read lock plus the allowlist mutex per packet — but one writer
+  of that ring is *not* the reader: the DNS resolver task `forward_server_dgram`
+  spawns pushes its resolved address from its own task. `RECENT_DST_CAP` (16) of
+  those evict a destination the mirror still claims is present, and the mirror
+  then suppressed the re-record, so that target's replies were dropped as forged
+  until both the 30 s pin and the 60 s DNS entry expired: uplink fine, downlink
+  dead, no counter. The session now carries a `recent_epoch` that every
+  `remember_dst` moves, and `mirror_record` re-records whenever it has moved —
+  one relaxed load per datagram, and the epoch also covers any future
+  out-of-band writer by construction.
+- **The IPv6 SSRF filter had two holes** (`src/lib.rs`). `is_global_ip` denied
+  `fc00::/7` and `fe80::/10` but not `fe00::/9` — IANA "Reserved by IETF", which
+  sits exactly between them — so `is_global_ip("fe00::1")` was `true`; and it
+  denied only the `2001::/23` sub-blocks someone had written an RFC citation
+  for, so the LISP EID block (`2001:5::/32`, RFC 7954) and the reserved
+  remainder passed. Both are closed: the `fe00::/9` mask, and the whole
+  `2001::/23` IETF Protocol Assignments block (the RIR allocations start at
+  `2001:0200::/23`, which stays dialable). Exploiting either needs a route that
+  no ordinary network has, so the impact was filter completeness rather than a
+  demonstrated internal reach — but the function's contract is "globally
+  routable", and every other reserved block was already denied.
+
+One more finding was in the test suite rather than the product, and is fixed
+here:
+
+- **The `--no-default-features` suite is no longer red, and the failure was not a
+  flake.** `dispatch_collision_reprobes_and_delivers_both` (in the client bin)
+  asserted that the two replies to *one* association arrive in the order they
+  were dispatched, and under `--no-default-features` they do not — the client bin
+  was red on every run, which pass 39 recorded as a "loopback-timing flake". It
+  is not timing: the first write on a fresh tokio UDP socket reports
+  `WouldBlock` (no cached writable readiness, see `udp_try_send`), so those
+  datagrams go through the detached retry pool, whose shard keeps up to
+  `UDP_RETRY_INFLIGHT` (16) sends in flight concurrently — two datagrams to the
+  same destination can complete in either order. Instrumented directly: `a1`
+  received `["3", "1"]` and `a2` received exactly `["2"]`, i.e. **both replies
+  were delivered, to the right sockets, just reordered** — which UDP permits and
+  this best-effort hop never promised. The test now asserts delivery (the
+  property it exists for) and says in place why order is not part of the
+  contract; the suite is green on both feature sets, so a future real
+  dispatcher regression can actually be seen.
+
+Three further findings are recorded rather than fixed, because each is a
+deliberate tradeoff once stated plainly:
+
+- The per-shard over-cap trim is **inert by construction**. `sweep_local` calls
+  `evict_ranked` immediately after `take_idle`, which has already removed every
+  entry at least `SESS_IDLE_MS` behind the same `now`, and `evict_ranked`
+  re-tests exactly that predicate — a lock-free touch can only move an entry *out*
+  of the expired set. The ranked block is therefore an O(shard) collect plus
+  `select_nth_unstable` under the shard write lock, once per unthrottled sweep,
+  with an empty result by construction. A live over-share is accepted (the exact
+  bound is now the fair-share gate above), and the code, its tests and
+  `SWEEP_LOCAL_MAX_EVICT` are kept with a note saying so rather than deleted,
+  since the ranking is what an over-cap policy would have to use.
+- **The pin and session-destination TTLs restarted from "now" at every
+  adoption.** `DEST_PIN_TTL_MS` (30 s) is documented as "deliberately shorter
+  than the DNS cache TTL (60 s)", and it is — as a *duration*. But a pin armed
+  from a DNS entry that is 59.9 s old lived another 30 s, so an address could be
+  served 90 s after the resolution. Recorded here, **fixed in
+  [pass 41](#2026-09-hardening-pass-41--the-pin-and-session-memo-follow-the-dns-remaining-life)**.
+- **Two heap `String` allocations per domain datagram** on the server's pin
+  re-arm (`ConnPin.host`, plus the reader's post-slow-path re-arm for the same
+  name). Only a pin *miss* pays it, i.e. an interleaved multi-target session, and
+  the repo's own cost rule (pass 26/`Honest cost accounting`) rejects changes
+  whose measured effect is ≪1 % of the ~350 µs/datagram loopback budget: fixing
+  it means a `PortKey`-style inline name or skipping the reader's redundant
+  re-arm, both larger than the effect justifies on their own.
+
+Verification: `cargo test --all-targets` exits 0 and is green on **both**
+feature sets (67 lib + 33 client + 30 server on default; 66 + 33 + 30 with
+`--no-default-features`, whose pre-existing single failure is now fixed),
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on
+both. Each of the four product fixes has a test that fails on the unmodified tree
+(reverting the individual change was checked by hand for all four:
+`the_fair_share_gate_counts_inserts_since_the_sample`,
+`a_resolution_invalidates_another_threads_negative_memo`,
+`the_allowlist_mirror_re_records_after_a_foreign_push`,
+`global_ip_filter_rejects_fe00_and_the_2001_ietf_block`). End-to-end on
+loopback with the release binaries re-verified after the changes: `tcpecho`
+byte-exact at 1 KiB / 1 MiB / 16 MiB, `udpsweep` byte-exact at every size from
+1 B to 8192 B (fragmented), `udpmulti` 4000/4000 (0.000 % loss) and
+`udpdomainmulti` 1997/2000 with the only drops being the 3 documented
+resolution-in-flight ones; no `REFUSED`, no size/buffer drops, no session-cap
+drops. `dist/` was not rebuilt by this pass; the four-level rebuild recorded in
+the cross-compile section covers the whole pass-40…44 revision.
+
+---
+
+### 2026-09 hardening pass 41 — the pin and session memo follow the DNS entry's remaining life
+
+The first item pass 40 recorded instead of fixing, now fixed. No frame, framing,
+ALPN or protocol-field change.
+
+**The defect.** `DEST_PIN_TTL_MS` (30 s) is documented as *"deliberately shorter
+than the DNS cache TTL (60 s): DNS answers can change while the cache entry is
+still live, so this bounds how long a session can keep sending to an address the
+name no longer resolves to"* — and as a duration it is. But every arming site
+took a fresh 30 s **from adoption**, while both sources of the address know their
+own deadline: `CachedLookup::Addr(SocketAddr)` and `sess_dest_lookup` returned the
+address and dropped the entry's remaining life. A pin armed at 59.5 s into a 60 s
+entry therefore served that address until 89.5 s after the resolution — 30 s past
+the TTL every other layer respects, and past the code's own stated bound.
+
+**The fix.** The lookups now expose the remainder and every adoption clamps with
+it:
+
+- `lookup_cached_fast_with_ttl` / `lookup_cached_all_fast_with_ttl` return the
+  hit **plus the remaining life of the cache entry** (or of this thread's memo of
+  it, which is written with the entry's own deadline, so the two agree). The
+  existing non-TTL functions are one-line wrappers, so no call site that does not
+  arm a deadline changed.
+- `sess_dest_lookup_ttl` does the same for the per-session destination memo, and
+  `sess_dest_lookup` remains as the test-facing wrapper.
+- `pin_life_ms(remaining) = DEST_PIN_TTL_MS.min(remaining)` is applied at every
+  arming site: the three in `resolve_pin`, the store in `sess_dest_store`, the
+  `DestMemo` of a brand-new session, and the reader's post-slow-path re-arm (for
+  which `forward_server_dgram` now returns `Some((addr, life_ms))`).
+- A *fresh* resolution — the task `forward_server_dgram` spawns — passes
+  `DNS_CACHE_TTL_MS` (60 s), where the 30 s pin still wins, so that path behaves
+  exactly as before. An IP-literal target has no entry behind it either.
+- `DNS_CACHE_TTL_MS` is now the single definition the `Duration` derives from, so
+  the clamp and the cache can never disagree.
+
+**Verification.** Three new tests, each checked to fail with the clamp disabled
+(`pin_life_ms` returning the old constant):
+`lookup_ttl_reports_the_entries_remaining_life` (an entry seeded 59.5 s old
+reports ≤ 1.5 s, a fresh one reports its full TTL, a miss reports 0),
+`a_pin_never_outlives_the_cache_entry_it_was_armed_from` and
+`the_session_memo_follows_its_sources_remaining_life` (memo and the pin adopted
+from it). `cargo test --all-targets` exits 0 on both feature sets (68 lib +
+33 client + 32 server on default; 67 + 33 + 32 with `--no-default-features`),
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on
+both, and the loopback end-to-end suite was re-run against the rebuilt release
+binaries: `tcpecho` byte-exact at 8 MiB, `udpsweep` byte-exact 64 B–8192 B,
+`udpmulti` 2400/2400 (0.000 % loss), `udpdomainmulti` 1597/1600 and `udpdomain`
+94/100 — the only losses being the documented resolution-in-flight drops on
+uncached names, with no `REFUSED`, size or session-cap drops logged.
+
+---
+
+### 2026-09 hardening pass 42 — the connection pin allocates nothing, plus a peer-input panic audit
+
+The second item pass 40 recorded instead of fixing. No frame, framing, ALPN or
+protocol-field change.
+
+- **`ConnPin.host` was a `String`, so arming the connection pin allocated.**
+  That is the pin *miss* path, which an interleaved multi-target session hits on
+  **every datagram** — and the datagram reader re-armed the same name once more
+  after each slow path, so the one structure this module keeps cheap paid two
+  malloc/free pairs per packet on a path documented as allocation-free. The name
+  is now stored inline (`[u8; 255]` + `u8` length, the MQ-P wire maximum) through
+  `pin_arm`, which allocates nothing and copies at most 255 bytes; `pin_is_for`
+  is the full-key compare. A name that somehow did not fit is **refused, not
+  truncated** (a truncated key could match another name and mis-route the flow) —
+  unreachable today, since the wire decoder refuses a domain over 255 bytes and
+  an IP target's name is empty, so that is defence in depth rather than policy.
+  The struct lives on the datagram reader's stack, one per connection.
+- **Peer-input panic audit (no findings, recorded because it was checked).**
+  A panic in a long-lived reader task is not a clean failure: the per-connection
+  dispatcher and the session readers are spawned once and loop forever, so an
+  unwind takes that side of the relay down silently until a reconnect. Audited
+  every `unwrap`/`expect`/`panic!` and every slice index reachable from a
+  peer-supplied buffer in `lib.rs`, `myquic2-server.rs` and `myquic2-client.rs`:
+  the only remaining ones are config-derived (`VarInt` conversions, a
+  `127.0.0.1` literal, a `pool slots are installed at startup` invariant) or sit
+  behind an explicit length check (`decode_datagram_ref`, `decode_fragment`,
+  `TargetAddrRef::decode`, `decode_bnd_addr`, `dns_key`). The random-input
+  property run from pass 40 (300 000 mutated datagrams/fragments through
+  `decode_datagram_ref`/`decode_fragment`/`decode_baddr`/`TargetAddrRef::decode`
+  and the zero-copy reassembler) also produced no panic, so no fix was needed —
+  this pass changes only the pin representation.
+
+Verification: `the_pin_holds_the_wire_max_name_inline` pins the round-trip at the
+255-byte wire maximum, the refusal past it, and the empty name an IP target gets;
+the existing pin/TTL/memo tests all still pass. `cargo test --all-targets` exits
+0 on both feature sets (68 lib + 33 client + 33 server on default; 67 + 33 + 33
+with `--no-default-features`), `cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` clean on both. End-to-end against the rebuilt release
+binaries: `tcpecho` byte-exact at 8 MiB, `udpsweep` byte-exact 64 B–8192 B,
+`udpmulti` 12800/12800 (0.000 % loss), `udpdomainmulti` 1597/1600 (the
+documented resolution-in-flight drops), and — the check that matters for this
+change — `udpdomainswitch`, which cycles two targets inside one association and
+verifies each reply's tag: **alpha 500/500, beta 500/500, IP-vs-domain 500/500,
+misrouted 0**, i.e. the allocation-free pin still routes every switch to the
+right address.
+
+---
+
+### 2026-09 hardening pass 43 — the inert over-cap trim is gone, and a restart-recovery probe
+
+The last item pass 40 recorded. No frame, framing, ALPN or protocol-field change.
+
+- **Deleted the per-shard over-cap trim.** `sweep_local` reaped the shard's
+  expired sessions through `take_idle` and then ranked the survivors and asked
+  `evict_ranked` to remove up to 64 of them — with the *identical* idleness
+  predicate and the same `now`, so after `take_idle` nothing could satisfy it. It
+  was an O(shard) collect plus `select_nth_unstable` under the shard **write**
+  lock, once per unthrottled sweep, whose result was empty by construction; the
+  `SWEEP_LOCAL_MAX_EVICT` bound and `LOCAL_SESS_TARGET_SHARD` described a cap
+  that was never enforced. The trigger is now the predicate it always was
+  (`shard_over_share`), the sweep reaps expired sessions only, and a live
+  over-share is left alone *by construction and by statement* — the resource
+  bound is the connection-level fair-share gate from pass 40, and a client whose
+  sessions are all live is the documented normal case. Two tests whose subject no
+  longer exists were removed; the two that encoded the real behaviour were
+  rewritten to assert it directly (`a_live_over_share_shard_loses_nothing_to_the_sweep`,
+  `fair_shard_trigger_fires_below_the_static_shard_cap`).
+- **Restart-recovery probe (pass, plus one honest limitation recorded).** With
+  the release binaries on loopback: 200/200 UDP and a 64 KiB TCP echo, then
+  `kill -9` on the server, a UDP burst during the outage, then the server
+  restarted. The client reconnected (6 slots, generation bumps, `QUIC connection
+  lost, reconnecting...`) and **200/200 UDP and 1 MiB TCP byte-exact** followed on
+  the new connection. The limitation the outage window exposed is inherent rather
+  than fixable here: datagrams handed to a connection whose peer is already gone
+  but whose death quinn has not yet observed (a blackhole, not a FIN) are accepted
+  locally, so the 60 s line reports them as *sent* — a loss with no counter
+  behind it, exactly like the TCP blackhole case the client documents at
+  `pick_tcp`. The fail-closed counters (`NO_EGRESS`, `EGRESS_DEAD`) cover the
+  *detected* states, and detection is bounded by the keepalive/watchdog window
+  (5 s keepalive → 20 s silence limit here), which is why the burst landed inside
+  it. No code change: counting an undetectable loss would need transport-level
+  delivery feedback that QUIC DATAGRAM deliberately does not provide.
+
+- **Token-authentication probe (pass).** With `auth_token` set on both sides,
+  TCP and UDP flows pass byte-exact; with a *mismatched* token the server logs
+  `auth token mismatch`, closes with code 1, and the client's flows fail closed
+  (`closed by peer: unauthorized`, SOCKS answered with an error rather than a
+  hang, reconnect backoff capped); with the client's token *empty* against an
+  auth-enabled server the server's pre-auth deadline fires
+  (`auth timeout: deadline has elapsed`) and the flow is aborted cleanly. After
+  every one of those ~30 failed connection attempts plus the reconnect storms,
+  the fd counts were flat (server 12, each client 12), i.e. no socket or permit
+  leak on the refusal paths.
+
+- **No throughput regression from passes 40–43.** Measured on the same host and
+  the same loopback setup that produced the earlier figures in this session: TCP
+  `bulk 4 64` 103 MB/s (was 97 MB/s), `udpmulti` 32 associations × 1500
+  datagrams 48 000/48 000 at 23 858 pps (was 22 085–22 681 pps), and the raw
+  loopback control `udpraw` at 75 372 pps — i.e. the tunnel still runs at ~32 %
+  of the harness/kernel ceiling, and the per-packet work this pass deleted
+  (allocations, the dead rank) is inside noise, as expected.
+
+Verification: `cargo test --all-targets` exits 0 on both feature sets (68 lib +
+33 client + 31 server on default; 67 + 33 + 31 with `--no-default-features` —
+two tests for the deleted machinery are gone, no coverage was dropped),
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean on
+both, and the loopback end-to-end suite passes unchanged on the rebuilt release
+binaries (`tcpecho` byte-exact, `udpsweep` byte-exact 64 B–8192 B, `udpmulti`
+0.000 % loss, `udpdomainswitch` misrouted 0).
+
+---
+
+### 2026-09 hardening pass 44 — randomized ingress-parsing tests (no product findings)
+
+The two parsers that a hostile peer reaches first are now fuzzed in-tree. Both
+runs are green, i.e. this pass found **no product defect** — recording the
+coverage because that is the interesting result, not the diff.
+
+- **Client SOCKS5 address readers** (`socks_reader_survives_random_and_truncated_ingress`):
+  1 500 mutated frames across both readers, biased onto every `atyp` (including
+  invalid ones) and with the declared domain length set to what actually follows,
+  served over a real loopback socket whose write half is then closed — so every
+  truncated form reaches the reader as EOF instead of parking it. Each case must
+  finish inside a 2 s bound (a reader that parks holds the accepted connection's
+  task and its permit until the negotiation deadline) and every *accepted*
+  address must still be encodable. This is the parser a local peer — or a buggy
+  SOCKS client — drives with arbitrary bytes.
+- **Client full negotiation** (`negotiate_survives_random_and_truncated_requests`):
+  800 cases that first send a greeting the reader accepts, then a randomized
+  request (random CMD, sometimes a non-zero RSV, random address body, truncated
+  one time in three), so the CMD dispatch, the reserved-byte check and both
+  address readers are all reached; the serving peer drains the method-selection
+  and error replies so the client's writes cannot block. Same 2 s bound.
+- **Server stream-header framing** (`mqp_hdr_len_agrees_with_the_encoder_for_random_addresses`):
+  20 000 random addresses (all four wire forms, every port, every domain length
+  1–255) encoded with the library encoder, asserting that the length the stream
+  reader collects (`mqp_hdr_len`) equals the encoding's length *and* that
+  `TargetAddr::decode` consumes exactly that many bytes. The existing test pinned
+  four fixed forms; if the declared length and the decoder ever disagree, the
+  server splits the stream at the wrong offset and misparses every following byte
+  of that flow — a silent cross-flow corruption, which is why the invariant is
+  worth driving differentially over the whole input space.
+
+Three harness mistakes were found and fixed while writing these (an awaited ack
+the reader never sends, an encodability assertion applied to the lenient reader's
+intentional `0.0.0.0:0` placeholder, and a borrow error); none was a product bug,
+which is why this pass carries tests and no source change.
+
+Verification: `cargo test --all-targets` exits 0 on both feature sets (68 lib +
+35 client + 32 server on default; 67 + 35 + 32 with `--no-default-features`) and
+**also in `--release`**, where `debug_assert`s are compiled out and arithmetic
+wraps instead of panicking — the same 68 + 35 + 32, i.e. the suite does not
+depend on debug-only behaviour. `cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` clean on both. With the randomized parsers in the suite, the
+ingress surface is now
+covered by property tests end to end: SOCKS5 negotiation and address readers,
+MQP-2 stream framing, the DATAGRAM and fragment decoders (pass 40's 300 000-case
+run), and the zero-copy reassembler.
+
+The **`dist/` OpenWrt artifacts were rebuilt from this revision** (all four CPU
+levels, static musl, stripped, default feature set), statically checked with
+`file`/`objdump` and then actually **run**: the v1 pair passed TCP ECHO 1 MiB and
+the fragmented UDP sweep at 0 % loss with 0 misroutes inside Podman's amd64
+emulation, while the v4 server dies with `Illegal instruction` on the
+AVX512-less emulated CPU — see the cross-compile section for the sizes and the
+full result.
+
+---
+
 ## Roadmap
 
 - [x] Optional client authentication (`auth_token`)
@@ -4096,6 +4451,30 @@ build and no emulated or native run of the shipped pairs.
       per egress class (pass 38)
 - [x] Per-session reply allowlist uses the poison-recovering lock helper; session-count
       cache uses `Release`/`Acquire` ordering (pass 38)
+- [x] Fair-share gate counts every insert since its sample (`len_upper_bound`), so one
+      connection can no longer take the whole global session pool inside one window (pass 40)
+- [x] Negative DNS memo entries are epoch-tagged, so a resolution on another worker
+      invalidates a stale negative instead of refusing the name for 10 s (pass 40)
+- [x] Reply-allowlist mirror is validated against a per-session epoch that every
+      `remember_dst` moves, including the out-of-band resolver-task push (pass 40)
+- [x] `is_global_ip` denies `fe00::/9` and the whole `2001::/23` IETF Protocol
+      Assignments block (pass 40)
+- [x] Clamp the connection pin and session destination memo to the DNS entry's
+      *remaining* life instead of a fresh `DEST_PIN_TTL_MS`, so a pin armed at
+      59.9 s into a 60 s entry cannot serve the address for another 30 s (pass 41)
+- [x] Replace the server's `ConnPin.host: String` with an inline name, removing two
+      heap allocations per domain datagram on the interleaved-target path (pass 42)
+- [x] Delete the inert per-shard over-cap trim and its machinery (`evict_ranked`,
+      `SWEEP_LOCAL_MAX_EVICT`, `LOCAL_SESS_TARGET_SHARD`); the trigger is the fair-share
+      predicate and the sweep reaps expired sessions only (pass 43)
+- [x] Randomized/property tests for the ingress parsing surface: SOCKS5
+      negotiation + address readers, MQP-2 stream framing (pass 44)
+- [ ] Record that a datagram queued to a blackholed-but-not-yet-detected egress
+      connection is reported as sent (loss without a counter, bounded by the
+      keepalive/watchdog detection window); needs transport-level feedback to fix
+      (pass 43)
+- [x] `--no-default-features` suite fully green: the collision test now asserts
+      delivery instead of UDP ordering across the detached retry pool (pass 40)
 
 ---
 

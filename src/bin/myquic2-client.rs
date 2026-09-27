@@ -2775,6 +2775,89 @@ mod tests {
         r
     }
 
+    /// Like [`feed`], but closes the write half once the bytes are out, so a
+    /// frame that asks for more than it supplies reaches the reader as EOF
+    /// instead of parking it (the real caller bounds the whole negotiation with
+    /// one deadline; this proves the reader cannot outlive a closed peer at all).
+    async fn feed_truncated(bytes: &[u8], lenient: bool) -> Result<TargetAddr> {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let payload = bytes.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut t, _) = l.accept().await.unwrap();
+            let _ = t.write_all(&payload).await;
+            // FIN: a frame that wants more than it was given must surface as EOF
+            // rather than parking the reader. (Nothing is read back — this path
+            // never replies — so the task ends here and drops the socket.)
+            let _ = t.shutdown().await;
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r = if lenient {
+            read_socks_addr_lenient(&mut c)
+                .await
+                .map(|()| TargetAddr::Ip(std::net::SocketAddr::from(([0, 0, 0, 0], 0))))
+        } else {
+            read_socks_addr(&mut c).await
+        };
+        assert!(server.await.is_ok(), "the writer task must not panic");
+        r
+    }
+
+    /// Randomized ingress fuzz for the SOCKS5 address readers.
+    ///
+    /// This is the one parser a hostile (or buggy) local peer drives with
+    /// arbitrary bytes, and the reader runs inside the accepted connection's
+    /// task: a panic there kills the flow, and a read that parks on a short frame
+    /// holds the task and its permit until the negotiation deadline. Every
+    /// mutated stream — including every truncation of every form — must either
+    /// complete with an encodable address or fail, within the timeout.
+    #[tokio::test]
+    async fn socks_reader_survives_random_and_truncated_ingress() {
+        for case in 0..1_500u64 {
+            let mut x = case.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let n = (case as usize * 7919) % 48;
+            let mut b = Vec::with_capacity(n);
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b.push(x as u8);
+            }
+            if !b.is_empty() {
+                // Bias the atyp so every branch of both readers is reached.
+                b[0] = [0x01u8, 0x02, 0x03, 0x04, 0x00][(case % 5) as usize];
+            }
+            if b.len() >= 2 && b[0] == 0x03 {
+                // Declare exactly what follows (sometimes short, sometimes long):
+                // the reader must consume only what it was given.
+                b[1] = (b.len() - 2).min(255) as u8;
+            }
+            let lenient = case % 2 == 0;
+            let out =
+                match tokio::time::timeout(Duration::from_secs(2), feed_truncated(&b, lenient))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => panic!(
+                        "SOCKS reader parked on a {} B frame (case {case}, lenient={lenient})",
+                        b.len()
+                    ),
+                };
+            // The strict reader decodes a target the caller will put on the wire,
+            // so an accepted one must be encodable. (The lenient form returns the
+            // placeholder below on purpose: it parses the ignored ASSOCIATE outer
+            // address, which is never encoded.)
+            if let Ok(addr) = out {
+                if !lenient {
+                    assert!(
+                        addr.as_ref().header().is_ok(),
+                        "an accepted address must be encodable (case {case}): {addr:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn socks_reader_decodes_v4_v6_and_domain() {
         assert_eq!(
@@ -2818,7 +2901,75 @@ mod tests {
         assert!(feed(&[0x01, 0, 0, 0, 0, 0, 0], true).await.is_ok());
     }
 
+    /// Serve `bytes`, drain whatever the negotiation writes back, and hand the
+    /// client half a FIN once they are out — so a truncated request surfaces as
+    /// EOF rather than parking the reader.
+    async fn negotiate_feed(bytes: &[u8]) -> Result<SocksRequest> {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let payload = bytes.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut t, _) = l.accept().await.unwrap();
+            let _ = t.write_all(&payload).await;
+            let _ = t.shutdown().await;
+            // Drain the method-selection / error replies so the client's writes
+            // never block, and exit when the client closes its half.
+            let mut sink = [0u8; 256];
+            while let Ok(n) = t.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r = negotiate(&mut c).await;
+        drop(c);
+        assert!(server.await.is_ok(), "the serving task must not panic");
+        r
+    }
+
+    /// Randomized fuzz for the **whole** negotiation: an accepted greeting is
+    /// followed by a randomized request, so the CMD dispatch, the reserved-byte
+    /// check and both address readers are all reached with hostile bytes — and
+    /// every frame is also tried truncated, which must fail rather than park the
+    /// connection task until its deadline.
+    #[tokio::test]
+    async fn negotiate_survives_random_and_truncated_requests() {
+        for case in 0..800u64 {
+            let mut x = case.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1;
+            // A greeting the reader accepts, so the request path is what runs.
+            let mut b = vec![0x05u8, 0x01, 0x00];
+            let cmd = [0x01u8, 0x03, 0x02, 0x00][(case % 4) as usize];
+            let rsv = if case % 7 == 0 { 0x01 } else { 0x00 };
+            b.extend_from_slice(&[0x05, cmd, rsv]);
+            let n = (case as usize * 104_729) % 24;
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b.push(x as u8);
+            }
+            if case % 3 == 0 {
+                if let Some(a) = b.get_mut(6) {
+                    *a = [0x01u8, 0x03, 0x04, 0x05][(case % 4) as usize];
+                }
+                if b.get(6) == Some(&0x03) {
+                    let declared = b.len().saturating_sub(8).min(255) as u8;
+                    if let Some(l) = b.get_mut(7) {
+                        *l = declared;
+                    }
+                }
+            }
+            match tokio::time::timeout(Duration::from_secs(2), negotiate_feed(&b)).await {
+                Ok(_) => {}
+                Err(_) => panic!("negotiate parked on a {} B request (case {case})", b.len()),
+            }
+        }
+    }
+
     /// The whole negotiation is a linear read of greeting + request; the tests
+    /// pin the two request forms and a version mismatch, so the single-deadline
+    /// refactor cannot change which bytes are consumed.    /// The whole negotiation is a linear read of greeting + request; the tests
     /// pin the two request forms and a version mismatch, so the single-deadline
     /// refactor cannot change which bytes are consumed.
     #[tokio::test]
@@ -3926,9 +4077,28 @@ mod tests {
             dispatch_one(&mut cache, &hub, s, dgram(s, want), &mut reasm, &mut pkt);
         }
         let f = |v: Vec<u8>| v[REPLY_HDR_V4..].to_vec();
-        assert_eq!(f(recv_reply(&a1.app).await.unwrap()), b"1");
+        // Delivery, not order, is the property under test — and the collision
+        // re-probe is what it is about: both replies for `s1` must reach `a1`,
+        // and `s2`'s must reach `a2`.
+        //
+        // Order is deliberately NOT asserted between the two replies to one
+        // association. The first write on a fresh tokio UDP socket reports
+        // `WouldBlock` (no cached writable readiness — see `udp_try_send`), so
+        // these datagrams go through the detached retry pool, whose shard keeps
+        // up to `UDP_RETRY_INFLIGHT` sends in flight at once; two datagrams to
+        // the same destination can therefore complete in either order. UDP
+        // permits reordering and that hop is best-effort by contract, so an
+        // order assertion here left the client bin red under
+        // `--no-default-features` (where the per-packet stats calls are compiled
+        // out and the timing shifts) for a reason that has nothing to do with
+        // the dispatcher — a red suite that hides real regressions.
+        let mut replies = [
+            f(recv_reply(&a1.app).await.unwrap()),
+            f(recv_reply(&a1.app).await.unwrap()),
+        ];
+        replies.sort();
+        assert_eq!(replies, [b"1".to_vec(), b"3".to_vec()]);
         assert_eq!(f(recv_reply(&a2.app).await.unwrap()), b"2");
-        assert_eq!(f(recv_reply(&a1.app).await.unwrap()), b"3");
     }
 
     /// Phase 3 moved fragment reassembly out of the per-association reply task
