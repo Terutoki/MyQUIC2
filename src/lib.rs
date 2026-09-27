@@ -287,15 +287,28 @@ pub fn normalize_alpn(configured: Option<&str>) -> Vec<u8> {
 
 /// MQP-2 TCP open acknowledgement (server -> client).
 ///
-/// `status u8 (0x00) | atyp u8 | addr | port u16 BE` — the bound address is
-/// the server-side socket it dialed the target from, so the client can put the
-/// real BND.ADDR/BND.PORT into its SOCKS5 success reply (RFC 1928).
+/// `magic [0x4D, 0x51] ("MQ") | status u8 (0x00) | atyp u8 | addr | port u16 BE`
+/// — the bound address is the server-side socket it dialed the target from, so
+/// the client can put the real BND.ADDR/BND.PORT into its SOCKS5 success reply
+/// (RFC 1928).
 ///
-/// Both sides must run the same version: the client MUST wait for exactly
-/// this byte and fail the flow otherwise. There is intentionally NO silent
-/// fallback for old peers — falling back would let the first application
-/// byte be mistaken for (or polluted by) the ACK (see B1).
+/// The magic prefix is the fail-closed version-skew guard (B1): the client MUST
+/// wait for exactly these bytes and fail the flow otherwise. A peer that sends
+/// raw application bytes first (a pre-magic server) can never have them mistaken
+/// for the ACK — even a `0x00`-led app prefix fails the magic check and tears
+/// the flow down with RST instead of stripping 8/20 B silently with a clean
+/// FIN. There is intentionally NO silent fallback for old peers. The wire form
+/// changed, so **both sides must be upgraded together**; same-version pairs are
+/// unaffected (the default `h3` ALPN still masquerades the handshake as before).
 pub const MQP_TCP_ACK: u8 = 0x00;
+
+/// Two-byte magic opening every MQP-2 TCP-open ACK. ASCII "MQ" (MyQUIC): not a
+/// valid legacy-ACK status (`0x00`) in either position, so a legacy `0x00`-led
+/// app prefix fails closed here instead of parsing as the ACK.
+pub const MQP_TCP_ACK_MAGIC: [u8; 2] = [0x4D, 0x51];
+
+/// Largest wire length of the TCP-open ACK: magic + status + largest bnd form.
+pub const MAX_TCP_ACK_LEN: usize = 2 + 1 + MAX_BND_LEN;
 
 /// Wire cap for the connection-auth token: the server reads at most this many
 /// bytes, so a longer configured token can never authenticate and must be
@@ -366,6 +379,20 @@ pub fn decode_bnd_addr(b: &[u8]) -> Result<(SocketAddr, usize)> {
         }
         a => anyhow::bail!("bad bnd atyp {a}"),
     }
+}
+
+/// Encode a full TCP-open ACK (`magic | status | atyp | addr | port`) into
+/// `out`, which must hold [`MAX_TCP_ACK_LEN`] bytes. Returns the bytes
+/// written (10 for IPv4, 22 for IPv6). The single constructor the server uses,
+/// so the reader below and the writer cannot drift.
+///
+/// # Panics
+/// Panics if `out` is shorter than [`MAX_TCP_ACK_LEN`].
+pub fn encode_tcp_ack_into(addr: SocketAddr, out: &mut [u8]) -> usize {
+    assert!(out.len() >= MAX_TCP_ACK_LEN, "ack buffer too small");
+    out[0..2].copy_from_slice(&MQP_TCP_ACK_MAGIC);
+    out[2] = MQP_TCP_ACK;
+    3 + encode_bnd_addr_into(addr, &mut out[3..])
 }
 
 /// MQP-2 datagram frame type: the first byte of every DATAGRAM body (TCP-open
@@ -4541,15 +4568,19 @@ pub fn tcp_listener_dual(bind: &str) -> Result<std::net::TcpListener> {
     Ok(s.into())
 }
 
-/// Consume the MQP-2 TCP-open ACK (`0x00 | atyp | addr | port`). A non-zero
-/// status, a malformed address, or a stream reset (dial refused/timeout) is an
-/// error. Used by the optimistic client reply path, which has already answered
-/// SOCKS before this runs.
+/// Consume the MQP-2 TCP-open ACK (`magic | 0x00 | atyp | addr | port`). The
+/// magic is checked first: raw application bytes from a pre-magic peer fail
+/// here (never parsed as the ACK), as do a non-zero status, a malformed
+/// address, or a stream reset (dial refused/timeout). Used by the optimistic
+/// client reply path, which has already answered SOCKS before this runs.
 async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
-    let mut status = [0u8; 1];
-    recv.read_exact(&mut status).await.context("ack read")?;
-    if status[0] != MQP_TCP_ACK {
-        anyhow::bail!("bad mqp ack {:#x}", status[0]);
+    let mut head = [0u8; 3];
+    recv.read_exact(&mut head).await.context("ack head read")?;
+    if head[0..2] != MQP_TCP_ACK_MAGIC {
+        anyhow::bail!("bad mqp ack magic {:02x}{:02x}", head[0], head[1]);
+    }
+    if head[2] != MQP_TCP_ACK {
+        anyhow::bail!("bad mqp ack {:#x}", head[2]);
     }
     let mut buf = [0u8; 19];
     recv.read_exact(&mut buf[..1]).await.context("bnd atyp")?;
@@ -6013,6 +6044,51 @@ mod tests {
         );
     }
 
+    /// A unique-domain flood must fail fast on the slow-path limiter: with the
+    /// budget exhausted `try_acquire_owned` returns `Err` synchronously (it can
+    /// never park the caller), the excess is counted as `SESSION_FULL` — the
+    /// same counter both relay paths bump on that arm — and the contention
+    /// counter stays a distinct field. No other lib test holds this limiter
+    /// (only the binaries take it, in their own test processes), and nothing
+    /// is awaited while the permits are held, so the drain lasts microseconds.
+    #[test]
+    fn dns_limiter_exhaustion_fails_fast_and_counts_session_full() {
+        let lim = dns_slow_path_limiter();
+        let mut held = Vec::new();
+        while lim.available_permits() > 0 {
+            match lim.clone().try_acquire_owned() {
+                Ok(p) => held.push(p),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            lim.available_permits(),
+            0,
+            "the flood budget must be exhaustible"
+        );
+        assert!(
+            lim.clone().try_acquire_owned().is_err(),
+            "excess misses must fail fast, never park"
+        );
+        let before = dgram_drops::snapshot();
+        dgram_drops::bump(&dgram_drops::SESSION_FULL);
+        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+        let after = dgram_drops::snapshot();
+        assert!(
+            after.session_full > before.session_full,
+            "exhaustion must be counted as SESSION_FULL"
+        );
+        assert!(
+            after.dns_contention > before.dns_contention,
+            "contention must stay a distinct counted field"
+        );
+        drop(held);
+        assert!(
+            lim.available_permits() > 0,
+            "the budget must recover when permits release"
+        );
+    }
+
     /// The two egress counters must be visible **immediately and from another
     /// thread**, which is the whole reason they do not batch.
     ///
@@ -7207,6 +7283,85 @@ mod tests {
             assert_eq!(n, v.len(), "length mismatch for {a}");
             assert_eq!(&buf[..n], &v[..], "encoding mismatch for {a}");
         }
+    }
+
+    /// L1 version-skew pin: the dial ACK opens with a magic no legacy
+    /// `0x00`-led app prefix can carry, so a peer that sends raw application
+    /// bytes first (a pre-magic server) fails the ACK gate instead of having
+    /// 8/20 B silently stripped with a clean FIN. A valid ACK still parses.
+    #[tokio::test]
+    async fn tcp_dial_ack_rejects_a_zero_led_app_prefix() {
+        async fn ack_result_for(wire: Vec<u8>) -> bool {
+            let (client, server) = endpoint_pair().await;
+            let server_addr = server.local_addr().unwrap();
+            let accept = tokio::spawn(async move {
+                let incoming = server.accept().await.unwrap();
+                let conn = incoming.await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                // Ping first: a locally-opened stream is invisible to the peer
+                // until its first STREAM frame arrives, so `accept_bi` above
+                // only fires after the client's write below.
+                let mut ping = [0u8; 4];
+                recv.read_exact(&mut ping).await.unwrap();
+                send.write_all(&wire).await.unwrap();
+                send.finish().ok();
+                // Hold the connection open until the client confirms its read:
+                // exiting here drops the endpoint, whose close can otherwise
+                // overtake the queued ACK on loopback.
+                let mut done = [0u8; 2];
+                recv.read_exact(&mut done).await.unwrap();
+            });
+            let conn = client
+                .connect(server_addr, "test.com")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            // Production always writes the MQP target header before reading
+            // the ACK; the ping here plays that role for the test stream.
+            send.write_all(b"ping").await.unwrap();
+            let result = read_mqp_ack(&mut recv).await;
+            send.write_all(b"ok").await.unwrap();
+            accept.await.unwrap();
+            result.is_ok()
+        }
+
+        // Same-version writer and reader agree, both families.
+        for bnd in [
+            "192.0.2.7:1234".parse::<SocketAddr>().unwrap(),
+            "[2001:db8::1]:443".parse::<SocketAddr>().unwrap(),
+        ] {
+            let mut ack = [0u8; MAX_TCP_ACK_LEN];
+            let n = encode_tcp_ack_into(bnd, &mut ack);
+            assert!(
+                ack_result_for(ack[..n].to_vec()).await,
+                "valid ACK for {bnd} must be accepted"
+            );
+        }
+        // Legacy-shaped app prefixes: the old 8 B (v4) and 20 B (v6) forms a
+        // pre-magic peer's first bytes could take. Both must fail the gate —
+        // accepting either would strip app bytes and finish clean.
+        let mut legacy_v4 = vec![0x00u8, 0x01, 127, 0, 0, 1, 0x1f, 0x90];
+        assert!(
+            !ack_result_for(legacy_v4.clone()).await,
+            "leading-0x00 app bytes must not parse as ACK"
+        );
+        let mut legacy_v6 = vec![0x00u8, 0x04];
+        legacy_v6.extend_from_slice(&[0u8; 16]);
+        legacy_v6.extend_from_slice(&[0x01, 0xbb]);
+        assert!(
+            !ack_result_for(legacy_v6).await,
+            "leading-0x00 v6 app bytes must not parse as ACK"
+        );
+        // Right magic, wrong status: a refused dial is still an error, never
+        // an ACK.
+        legacy_v4[0] = MQP_TCP_ACK_MAGIC[0];
+        legacy_v4[1] = MQP_TCP_ACK_MAGIC[1];
+        legacy_v4[2] = 0x01;
+        assert!(
+            !ack_result_for(legacy_v4).await,
+            "non-zero ACK status must be rejected"
+        );
     }
 
     /// The fixed-buffer header encoder must be byte-identical to the `Vec` one

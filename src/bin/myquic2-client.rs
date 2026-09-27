@@ -104,6 +104,19 @@ impl ConnSlot {
         self.live.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Synchronous dead-handle probe for the routing path: true when the slot
+    /// currently publishes a connection whose `close_reason()` is populated.
+    /// This is the stale-true window — QUIC died but the conn loop has not yet
+    /// run `clear_if_and_mark_dead` + `bump_gen` — where the maintained `live`
+    /// bit still reads true. One quinn state-lock acquisition, no await, no
+    /// `std` lock held; `wait_conn` stays the authority that fails a flow.
+    fn holds_dead_handle(&self) -> bool {
+        let g = self.shared.load();
+        let dead = g.as_ref().is_some_and(|c| c.close_reason().is_some());
+        drop(g);
+        dead
+    }
+
     /// Publish `conn` as this slot's connection.
     fn publish(&self, conn: &quinn::Connection) {
         self.shared.store(Some(Arc::new(conn.clone())));
@@ -506,7 +519,25 @@ impl ConnPool {
         } else {
             self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
-        select_slot(pinned, rr, &live[..n])
+        let preferred = select_slot(pinned, rr, &live[..n]);
+        // L2 stale-live failover: `live` is only a hint, so a slot whose QUIC
+        // connection died in the window before the conn loop clears the bit
+        // still reads true and `select_slot` keeps preferring it. `wait_conn`
+        // would then sit on that slot's generation until the reconnect timeout
+        // even with live bulk siblings available. Confirm the preference with
+        // `close_reason()` and, when it holds a dead handle, re-pick once with
+        // the same `rr` and that slot overlaid dead — class rules unchanged,
+        // and an all-dead pool keeps the preference for the bounded stall.
+        if live[preferred]
+            && self
+                .slots
+                .get(preferred)
+                .is_some_and(ConnSlot::holds_dead_handle)
+        {
+            live[preferred] = false;
+            return select_slot(pinned, rr, &live[..n]);
+        }
+        preferred
     }
 
     /// Pick the slot for a new TCP flow. Returning flows stick to their slot
@@ -1563,14 +1594,20 @@ fn dispatch_one(
                     // uncounted drop here showed up only as missing replies: a
                     // 40-datagram burst at one uncached name silently loses 39
                     // of them, and under contention that can be a sustained
-                    // loss with no counter and no log at all. `dns_is_inflight`
-                    // is true only while the name is actually registered; a
-                    // contended shard mutex reads as absent (false), so such a
-                    // lookup falls through to the limiter-bounded spawn below
-                    // instead of parking on the shard mutex.
-                    if dns_is_inflight(h, p) {
-                        dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-                        return;
+                    // loss with no counter and no log at all. A contended
+                    // shard mutex is unknown, never inflight: it is counted
+                    // apart as `DNS_CONTENTION` and falls through to the
+                    // limiter-bounded spawn below instead of parking on the
+                    // shard mutex (same tri-state contract as the server).
+                    match dns_inflight_status(h, p) {
+                        DnsInflight::Inflight => {
+                            dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+                            return;
+                        }
+                        DnsInflight::Contended => {
+                            dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                        }
+                        DnsInflight::Absent => {}
                     }
                     if dns_slow_path_limiter().available_permits() == 0 {
                         dgram_drops::bump(&dgram_drops::SESSION_FULL);
@@ -2387,6 +2424,60 @@ fn bind_relay(relay_ip: std::net::IpAddr) -> Result<tokio::net::UdpSocket> {
     Ok(tokio::net::UdpSocket::from_std(raw)?)
 }
 
+/// Userspace receive buffer per association: one full-protocol-cap datagram
+/// plus the worst-case SOCKS5 header in front of it and the
+/// truncation-detection slack byte.
+const ASSOC_RECV_BUF_LEN: usize = UDP_RECV_MAX + SOCKS_UDP_HDR_MAX + UDP_RECV_SLACK;
+
+/// Compile-time userspace bound: one relay buffer per association, so the
+/// live set can never exceed the assoc cap times it (~34 MiB worst case).
+const _: () = assert!(ASSOC_RECV_BUF_LEN == UDP_RECV_MAX + SOCKS_UDP_HDR_MAX + UDP_RECV_SLACK);
+const _: () = assert!(
+    MAX_UDP_ASSOCS * ASSOC_RECV_BUF_LEN <= 40 * 1024 * 1024,
+    "4032 x ~8.5 KiB must stay a bounded worst case"
+);
+
+/// Idle association buffers retained per worker thread. Same contract as the
+/// server's `SESS_BUF_POOL`: the live set is bounded by `MAX_UDP_ASSOCS`, only
+/// moved-not-shared byte buffers are pooled (never sockets, hub slots or
+/// tasks), and past this depth buffers drop as before.
+const ASSOC_BUF_POOL_DEPTH: usize = 8;
+
+thread_local! {
+    static ASSOC_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn assoc_recv_buf() -> Vec<u8> {
+    ASSOC_BUF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        while let Some(buf) = p.pop() {
+            if buf.len() == ASSOC_RECV_BUF_LEN {
+                return buf;
+            }
+        }
+        vec![0u8; ASSOC_RECV_BUF_LEN]
+    })
+}
+
+fn assoc_recycle_buf(buf: Vec<u8>) {
+    if buf.len() != ASSOC_RECV_BUF_LEN {
+        return;
+    }
+    ASSOC_BUF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < ASSOC_BUF_POOL_DEPTH {
+            p.push(buf);
+        }
+    })
+}
+
+#[cfg(test)]
+fn assoc_buf_pool_len() -> usize {
+    ASSOC_BUF_POOL.with(|p| p.borrow().len())
+}
+
 async fn udp_associate_inner(
     mut tcp: tokio::net::TcpStream,
     pool: ConnPool,
@@ -2441,7 +2532,8 @@ async fn udp_associate_inner(
     // the protocol can carry, or the kernel truncates it before the fragmenter
     // ever sees it. The SOCKS5 header sits in front of the payload, so the
     // buffer covers both (`n == buf.len()` below reports a truncation).
-    let mut buf = vec![0u8; UDP_RECV_MAX + SOCKS_UDP_HDR_MAX + UDP_RECV_SLACK];
+    // Pooled (see `assoc_recv_buf`): same length, so that check is unchanged.
+    let mut buf = assoc_recv_buf();
     // One id counter per association: `(sess, id)` is the receiver's key.
     let mut frag = DgramFragmenter::new();
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
@@ -2720,6 +2812,10 @@ async fn udp_associate_inner(
             }
         }
     }
+    // Every exit above breaks to here, so the buffer is recycled exactly once
+    // per association lifetime, however it ended (idle reap, control close,
+    // socket error).
+    assoc_recycle_buf(buf);
     Ok(())
 }
 
@@ -3217,6 +3313,95 @@ mod tests {
         assert_eq!(hits[2], 0, "the dead bulk slot is never selected");
         assert!(hits[1] > 0 && hits[3] > 0, "both live bulk slots are used");
         assert!(rr0 < pool.rr.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// L2 stale-live regression: a bulk preference whose QUIC connection died
+    /// in the window before the conn loop clears the `live` bit (stale-true)
+    /// must re-pick to a live bulk sibling instead of stalling the reconnect
+    /// timeout on the dead slot. Without the `close_reason()` confirm in
+    /// `pick_tcp_index`, the stale-true preference is kept and `wait_conn`
+    /// sits on its generation until the deadline.
+    #[tokio::test]
+    async fn stale_true_preference_repicks_to_a_live_bulk_sibling() {
+        let pool = ConnPool::new(4, vec![], true, true);
+        let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+        // One live connection per bulk slot; slot 1's is closed but its bit
+        // stays true, i.e. the flap window between QUIC death and the clear.
+        // Built inline (not via `real_connection`): that helper drops the
+        // server-side handle, whose close then races the assertions. Every
+        // handle here is retained so only the deliberately closed slot probes
+        // dead.
+        let mut conns = Vec::new();
+        let mut _held = Vec::new();
+        for i in 1..4usize {
+            let certified =
+                rcgen::generate_simple_self_signed(vec!["test.com".to_string()]).unwrap();
+            let alpn = normalize_alpn(None);
+            let server_tls = server_tls_config(
+                certified.cert.der().clone(),
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    certified.signing_key.serialize_der().into(),
+                ),
+                &alpn,
+            )
+            .unwrap();
+            let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+            let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+            scfg.transport_config(build_transport("bbr", 5));
+            let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client_tls = client_tls_config(certified.cert.der().clone(), &alpn).unwrap();
+            let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+            let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
+            ccfg.transport_config(build_transport("bbr", 5));
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            client.set_default_client_config(ccfg);
+            let accept = async {
+                let incoming = server.accept().await.unwrap();
+                incoming.accept().unwrap().await.unwrap()
+            };
+            let (c, s) = tokio::join!(client.connect(server_addr, "test.com").unwrap(), accept);
+            let (c, s): (quinn::Connection, quinn::Connection) = (c.unwrap(), s);
+            pool.slot(i).publish(&c);
+            pool.slot(i)
+                .live
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            conns.push(c);
+            _held.push((s, client, server));
+        }
+        conns[0].close(0u32.into(), b"test");
+        assert!(
+            pool.slot(1).holds_dead_handle(),
+            "the closed slot must probe dead"
+        );
+        assert!(
+            !pool.slot(2).holds_dead_handle() && !pool.slot(3).holds_dead_handle(),
+            "the siblings must probe live"
+        );
+        // Force the round-robin preference onto the stale-true slot 1.
+        pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+        let idx = pool.pick_tcp_index(&bulk);
+        assert_ne!(idx, 1, "a stale-true dead preference must not be kept");
+        assert!(
+            idx == 2 || idx == 3,
+            "failover stays in the bulk class, got slot {idx}"
+        );
+        assert_ne!(idx, 0, "bulk never falls back to the interactive slot");
+        // A fresh flow must be servable without waiting out a timeout: the
+        // re-picked slot hands out its live connection immediately.
+        let slot = pool.slot(idx);
+        let mut gen_rx = slot.gen_rx.clone();
+        let got = tokio::time::timeout(
+            Duration::from_millis(200),
+            slot.wait_conn(&mut gen_rx, Duration::from_millis(200)),
+        )
+        .await
+        .expect("re-picked slot must not stall")
+        .expect("re-picked slot holds a live connection");
+        assert!(
+            got.close_reason().is_none(),
+            "the re-picked handle must be live"
+        );
     }
 
     /// A one-slot pool is the legacy single-TCP-connection mode: every flow,
@@ -4540,5 +4725,98 @@ mod tests {
             "the restore must wake a reader, or it sleeps out its deadline \
              with a live connection published"
         );
+    }
+
+    /// Association churn holds the cap without leaking slots: alloc/publish/
+    /// release cycles (the `SessReservation` pairing in production) return the
+    /// hub to empty, filling to the cap admits exactly `MAX_UDP_ASSOCS`, and
+    /// one more allocation is refused.
+    #[tokio::test]
+    async fn hub_churn_holds_the_assoc_cap_without_leaking_slots() {
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 512;
+        let hub = UdpHub::new();
+        let relay = Arc::new(
+            tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+        );
+        let entry = Arc::new(AssocEntry::new(relay));
+        for _ in 0..N {
+            let s = hub.alloc_sess().expect("churn must not exhaust the cap");
+            hub.publish(s, entry.clone());
+            assert!(hub.entry(s).is_some());
+            hub.release(s);
+            assert!(hub.entry(s).is_none());
+        }
+        assert_eq!(hub.len.load(Ordering::Relaxed), 0);
+
+        let mut ids = Vec::new();
+        while let Some(s) = hub.alloc_sess() {
+            hub.publish(s, entry.clone());
+            ids.push(s);
+        }
+        assert_eq!(ids.len(), MAX_UDP_ASSOCS, "the cap must be exact");
+        assert!(hub.alloc_sess().is_none(), "past the cap is refused");
+        for s in ids {
+            hub.release(s);
+        }
+        assert_eq!(hub.len.load(Ordering::Relaxed), 0);
+    }
+
+    /// Teardown is RAII-paired: dropping the guards clears the liveness bit
+    /// (so dispatchers stop writing into the socket) and releases the hub
+    /// slot (so the cap cannot leak one association at a time).
+    #[tokio::test]
+    async fn teardown_guards_pair_alive_bit_with_slot_release() {
+        use std::sync::atomic::Ordering;
+
+        let hub = UdpHub::new();
+        let s = hub.alloc_sess().unwrap();
+        let relay = Arc::new(
+            tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+        );
+        let entry = Arc::new(AssocEntry::new(relay));
+        hub.publish(s, entry.clone());
+        {
+            let _alive = AliveGuard(entry.clone());
+            let _reservation = SessReservation { hub: &hub, sess: s };
+            assert!(entry.is_alive());
+        }
+        assert!(
+            !entry.is_alive(),
+            "AliveGuard must clear on every exit path"
+        );
+        assert!(hub.entry(s).is_none(), "release must unpublish");
+        assert_eq!(
+            hub.len.load(Ordering::Relaxed),
+            0,
+            "release must free the slot"
+        );
+    }
+
+    /// The assoc recv-buf pool is bounded and exactly sized: whatever churn
+    /// pushes in, at most `ASSOC_BUF_POOL_DEPTH` buffers idle per thread, each
+    /// one a valid association buffer.
+    #[test]
+    fn assoc_recv_buf_pool_is_bounded_and_exactly_sized() {
+        let mut bufs = Vec::new();
+        for _ in 0..ASSOC_BUF_POOL_DEPTH + 4 {
+            bufs.push(assoc_recv_buf());
+        }
+        for b in &bufs {
+            assert_eq!(b.len(), ASSOC_RECV_BUF_LEN);
+        }
+        for b in bufs {
+            assoc_recycle_buf(b);
+        }
+        assert!(
+            assoc_buf_pool_len() <= ASSOC_BUF_POOL_DEPTH,
+            "the pool must drop past its depth, not grow with churn"
+        );
+        assoc_recycle_buf(vec![0u8; 16]);
+        assert!(assoc_buf_pool_len() <= ASSOC_BUF_POOL_DEPTH);
+        let b = assoc_recv_buf();
+        assert_eq!(b.len(), ASSOC_RECV_BUF_LEN);
+        assoc_recycle_buf(b);
     }
 }

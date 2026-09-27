@@ -810,27 +810,39 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from this revision (pass 45, on top of the reassembly, fragment-id, expiry
-and admission fixes) with the default feature set, so the relay counters are **on**
-in these builds: static musl, x86-64, stripped — servers 4 417 152–4 439 960 B
-(v1 4 425 464, v2 4 417 152, v3 4 437 976, v4 4 439 960) and clients
-4 424 936–4 440 408 B (v1 4 440 408, v2 4 424 936, v3 4 437 968, v4 4 435 904),
-i.e. **+21 288…+26 088 B** per server level and **+1 728…+2 096 B** per client level
-against the pass-44 artifacts. The growth is accounted for rather than asserted: the
-admission logging, the per-connection stream-share accounting and the lock-free
-reply allowlist land in both binaries, and the guard/expiry-tick/chunk-ownership
-code in the library they link; none of it adds per-packet work on the relay paths.
+rebuilt from this revision (L1 fail-closed TCP ACK gate + L2 stale-live re-pick +
+P1 pooled recv buffers + P4 DNS miss-storm hardening, on top of the pass-45 tree)
+with the default feature set, so the relay counters are **on**
+in these builds: static musl, x86-64, stripped — servers 4 417 488–4 441 080 B
+(v1 4 425 608, v2 4 417 488, v3 4 438 968, v4 4 441 080) and clients
+4 426 232–4 443 536 B (v1 4 441 576, v2 4 426 232, v3 4 443 536, v4 4 441 536),
+i.e. **+144…+1 120 B** per server level and **+1 168…+5 632 B** per client level
+against the previous `dist/` artifacts. The growth is accounted for rather than asserted:
+the 2-byte ACK magic + shared encoder, the `close_reason()` confirm in the TCP pick
+path, the thread-local recv-buffer pools (server + client) and the DNS limiter test
+land in both binaries; none of it adds per-packet work on the steady relay paths
+(the confirm is per TCP flow, the pools remove per-session malloc).
 The recipe, `target-cpu` flags and feature set are unchanged and `Cargo.lock` is
 untouched. The builds **were** statically checked: `file` confirms ELF 64-bit LSB
 x86-64, statically linked, stripped on all eight artifacts, and the `target-cpu`
 levels were verified rather than assumed — `objdump -d` finds 278 `zmm` refs in the
 v4 server and 240 in the v4 client with none in v1–v3 of either binary (`ymm`
-3 978 / 3 971 / 25 148 / 24 312 server and 3 978 / 3 971 / 26 531 / 25 577 client
+3 978 / 3 971 / 25 146 / 24 310 server and 3 978 / 3 971 / 26 533 / 25 579 client
 for v1→v4, so the AVX2 step lands at v3 and the AVX512 step at v4).
-Reproducibility was measured three times over: two independent four-level builds
-produced eight byte-identical artifacts (`sha256` equal for all eight), and the
-final rebuild of the committed source reproduced the same eight hashes once more.
-The shipped pair was then **run**, not just inspected: inside Podman's amd64 runtime
+`cargo fmt --check` is clean on the built tree. What was **not** repeated is any
+emulated or native run of the shipped pairs, nor a byte-identical second build —
+the verification below applies to the native release build (`cargo test`
+targeted: L1 ACK-magic, L2 re-pick, pool bounds, churn caps, DNS limiter;
+`cargo clippy --all-targets -- -D warnings` clean), and a target that needs a
+loadable binary should be validated on the target before a fleet rollout.
+> ⚠️ **Wire break (L1): upgrade both sides together.** The TCP-open ACK gained a
+> 2-byte `MQ` magic prefix (10 B IPv4 / 22 B IPv6 on the wire) so a `0x00`-led
+> application prefix can never parse as an ACK. Old and new binaries fail closed
+> against each other (RST, never silent truncation) — like the `myquic2/2` ALPN
+> bump, this is a lockstep upgrade, independent of the `h3`/`myquic2/2` setting.
+The previous (pass-45) shipped pair was **run**, not just inspected — kept here as
+the last emulated evidence for this recipe (the current rebuild above is statically
+checked only): inside Podman's amd64 runtime
 on Apple Silicon the dist **v1** server+client brought the tunnel up (6 accepts, 6
 connects, 0 dial failures) and passed TCP ECHO 1 MiB byte-for-byte (0 mismatched),
 the UDP sweep at 8 / 1200 / 1420 / 1430 / 2000 / 8000 B × 200 datagrams (the last two
@@ -870,9 +882,14 @@ of the clients, and the egress drop accounting that followed added 4 888–5 144
 while shaving 128–192 B off the servers (the library no longer keeps per-thread batching
 cells for those two counters). The
 earlier growth was the client 4 992–5 120 B and the server 6 432–6 512 B per level (the
-retry pool's `ArcSwap` shard table plus the memo path changes). Three upgrade notes, all
+retry pool's `ArcSwap` shard table plus the memo path changes). Four upgrade notes, all
 requiring **both** sides to be replaced together (plus two notes below that need no
 binary change):
+
+- A binary built before this revision speaks the old TCP-open ACK (no `MQ` magic):
+  against a new peer the handshake completes but every TCP flow fails closed with
+  RST (never silent truncation, in either direction). Upgrade client and server
+  together; same-version pairs are unaffected.
 
 - A binary built before pass 9 carries the old 2/8/4 MB windows and caps a single
   stream at ~114 Mb/s; a mixed pair is limited by whichever end is older, since a

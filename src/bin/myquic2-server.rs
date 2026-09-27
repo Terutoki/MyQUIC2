@@ -522,7 +522,9 @@ const MAX_UNAUTH_CONNECTIONS: usize = 256;
 /// Process-wide UDP session cap. Each session owns a kernel socket with a
 /// `SESS_SOCKET_BUF` send buffer and the same again for receive (see
 /// `udp_socket_dual_small`), i.e. 256 KiB per direction, so 8192 sessions bound
-/// the kernel side to ~4 GiB worst case instead of ~32 GiB.
+/// the kernel side to ~4 GiB worst case instead of ~32 GiB. These are caps,
+/// not reservations: the kernel only accounts for what is actually queued,
+/// but the cap is what a burst can pin.
 ///
 /// (This said "512KB send + 512KB receive … ~8GB" until `SESS_SOCKET_BUF` was
 /// halved from 512 KiB to 256 KiB; `lib.rs`'s own note on that constant was
@@ -1623,12 +1625,11 @@ async fn handle_conn(
             let bnd = tcp
                 .local_addr()
                 .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            // Fixed-size stack buffer: the ACK is at most 1 + 1 + 16 + 2 bytes
-            // (v6 form), so the per-stream `Vec` this used to allocate bought
-            // nothing.
-            let mut ack = [0u8; 20];
-            ack[0] = MQP_TCP_ACK;
-            let n = 1 + encode_bnd_addr_into(bnd, &mut ack[1..]);
+            // Fixed-size stack buffer: the ACK is at most magic + status + the
+            // v6 bnd form (`MAX_TCP_ACK_LEN`), so the per-stream `Vec` this
+            // used to allocate bought nothing.
+            let mut ack = [0u8; MAX_TCP_ACK_LEN];
+            let n = encode_tcp_ack_into(bnd, &mut ack);
             // Bounded: a stalled stream must not pin this task and its
             // stream-task permit until connection death; the client tears the
             // flow down on a missing ACK, so a slow write here buys nothing.
@@ -2554,6 +2555,74 @@ fn mirror_record(
     }
 }
 
+/// Userspace receive buffer per session reader: one full-protocol-cap datagram
+/// plus the truncation-detection slack byte (`n == buf.len()` means the kernel
+/// truncated, so the length is load-bearing).
+const SESS_RECV_BUF_LEN: usize = UDP_RECV_MAX + UDP_RECV_SLACK;
+
+/// Compile-time userspace bound: one reader buffer per session, so the live
+/// set can never exceed the session cap times it (~67 MiB worst case).
+const _: () = assert!(SESS_RECV_BUF_LEN == UDP_RECV_MAX + UDP_RECV_SLACK);
+const _: () = assert!(
+    MAX_SESSIONS_GLOBAL * SESS_RECV_BUF_LEN <= 70 * 1024 * 1024,
+    "8192 x 8 KiB must stay a bounded worst case"
+);
+
+/// Idle session-reader buffers retained per worker thread.
+///
+/// Each *live* reader holds its buffer for life, so the live set is already
+/// bounded by `MAX_SESSIONS_GLOBAL` (`SESS_RECV_BUF_LEN` each, ~67 MiB worst
+/// case) and sockets stay strictly per-session — pooled here are only the
+/// userspace byte buffers, never sockets, tasks or permits. What churn
+/// multiplies is allocator traffic: every create zeroes 8 KiB and every
+/// teardown frees it. This pool recycles the freed buffers (moved, never
+/// shared) up to this depth per thread; beyond it they drop as before.
+/// Thread-local because the buffers are exclusive `&mut` scratch — sharing
+/// them across threads would need a lock on the per-reply path.
+const SESS_BUF_POOL_DEPTH: usize = 8;
+
+thread_local! {
+    static SESS_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Take a session-reader buffer, recycled when one is idle.
+fn sess_recv_buf() -> Vec<u8> {
+    SESS_BUF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        while let Some(buf) = p.pop() {
+            if buf.len() == SESS_RECV_BUF_LEN {
+                return buf;
+            }
+        }
+        vec![0u8; SESS_RECV_BUF_LEN]
+    })
+}
+
+/// Return a session-reader buffer for reuse. Wrong-sized buffers (none exist
+/// in the tree today; this is defence in depth) are dropped, and past the
+/// depth the buffer drops as before — so the pool itself is bounded.
+fn sess_recycle_buf(buf: Vec<u8>) {
+    if buf.len() != SESS_RECV_BUF_LEN {
+        return;
+    }
+    // No re-zeroing: `recv_from` overwrites the prefix on the next use and
+    // only `buf[..n]` is ever read, so stale tail bytes are never observed.
+    // All sessions live in this process, so there is no cross-tenant leak.
+    SESS_BUF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < SESS_BUF_POOL_DEPTH {
+            p.push(buf);
+        }
+    })
+}
+
+#[cfg(test)]
+fn sess_buf_pool_len() -> usize {
+    SESS_BUF_POOL.with(|p| p.borrow().len())
+}
+
 async fn sess_reader_task(
     conn_id: usize,
     s: u32,
@@ -2565,7 +2634,9 @@ async fn sess_reader_task(
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut buf = vec![0u8; UDP_RECV_MAX + UDP_RECV_SLACK];
+    // Pooled (see `sess_recv_buf`): same length as the old per-session `vec!`,
+    // so the `n == buf.len()` truncation check below is unchanged.
+    let mut buf = sess_recv_buf();
     let mut frag = DgramFragmenter::new();
     let mut limit = c2.max_datagram_size().unwrap_or(0);
     let mut last_touch = 0u64;
@@ -2653,6 +2724,10 @@ async fn sess_reader_task(
             DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
         }
     }
+    // Every exit above breaks to here, so the buffer is recycled exactly once
+    // per reader lifetime, however the task ended (idle reap, abort-adjacent
+    // error, lost DATAGRAM support).
+    sess_recycle_buf(buf);
     sess_memo_forget(conn_id, s, &rs);
     {
         let sh = ss2.shard(s);
@@ -2970,6 +3045,10 @@ async fn get_or_create_sess(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that mutate the process-global session-holder
+    /// count, so their exact reads cannot race each other.
+    static HOLDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn hdr(atyp: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![atyp];
@@ -3744,6 +3823,7 @@ mod tests {
     #[tokio::test]
     async fn fair_share_counts_session_holders_not_live_connections() {
         use std::sync::atomic::Ordering;
+        let _holder_guard = HOLDER_TEST_LOCK.lock().unwrap();
         let prev = session_holders().load(Ordering::Relaxed);
         // The client cap and the server's static per-connection target are one
         // number, shared through `lib.rs`.
@@ -4363,5 +4443,132 @@ mod tests {
         assert_eq!(is_global_ip_cached(a), is_global_ip(a));
         assert_eq!(is_global_ip_cached(b), is_global_ip(b));
         assert_eq!(is_global_ip_cached(a), is_global_ip(a));
+    }
+
+    /// Churn holds the caps: creating and tearing down 1024 sessions leaves
+    /// the table empty, every global permit released, the holder count
+    /// restored, and no live session swept.
+    ///
+    /// The holder assertions are exact because this test and
+    /// `fair_share_counts_session_holders_not_live_connections` serialize on
+    /// `HOLDER_TEST_LOCK`: both mutate the process-global holder count, and
+    /// exact reads would otherwise race each other.
+    #[tokio::test]
+    async fn session_churn_holds_caps_without_leaking() {
+        use std::sync::atomic::Ordering;
+
+        let _holder_guard = HOLDER_TEST_LOCK.lock().unwrap();
+        const N: usize = 1024;
+        let holders_before = session_holders().load(Ordering::Relaxed);
+        let permits_before = session_limiter().available_permits();
+        let ss = Arc::new(ShardedSessTable::new());
+        for s in 1..=N as u32 {
+            ss.shard(s).write().unwrap().insert(s, capped_session(0));
+            ss.note_insert();
+        }
+        ss.note_empty_state();
+        assert_eq!(ss.len(), N, "every churned session must be in the table");
+        assert_eq!(
+            session_holders().load(Ordering::Relaxed),
+            holders_before + 1,
+            "one non-empty table joins the fair-share denominator exactly once"
+        );
+        // Outstanding permits can only exceed this test's N (other tests hold
+        // permits concurrently), never fall short of it — so the race-proof
+        // form counts outstanding, not remaining.
+        assert!(
+            MAX_SESSIONS_GLOBAL - session_limiter().available_permits() >= N,
+            "each session pins one global permit"
+        );
+
+        // A sweep over a churned-but-live table reaps nothing: the only set it
+        // may remove is the expired one.
+        let swept = ss.sweep_all(mono_millis());
+        assert!(
+            swept.is_empty(),
+            "a sweep must not reap live sessions: {} evicted",
+            swept.len()
+        );
+        assert_eq!(ss.len(), N);
+
+        // Teardown mirrors `conn.closed()`: drain plus abort every reader, so
+        // no task, socket or permit outlives the connection.
+        let drained = ss.drain_all();
+        assert_eq!(drained.len(), N);
+        abort_evicted(drained);
+        assert_eq!(ss.len(), 0);
+        assert_eq!(
+            session_holders().load(Ordering::Relaxed),
+            holders_before,
+            "draining the last session leaves the denominator"
+        );
+        // The exact holder reads above are done: release the serialization
+        // guard before the quiescent permit wait below, which awaits.
+        drop(_holder_guard);
+        // Other tests hold permits concurrently, so balance is asserted
+        // quiescently: every test releases what it took, and this test's N
+        // are among them.
+        for _ in 0..200 {
+            if session_limiter().available_permits() >= permits_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            session_limiter().available_permits() >= permits_before,
+            "all churned permits must be released"
+        );
+    }
+
+    /// The recv-buf pool is bounded and exactly sized: whatever churn pushes
+    /// in, at most `SESS_BUF_POOL_DEPTH` buffers idle per thread, each one a
+    /// valid reader buffer.
+    #[test]
+    fn sess_recv_buf_pool_is_bounded_and_exactly_sized() {
+        let mut bufs = Vec::new();
+        for _ in 0..SESS_BUF_POOL_DEPTH + 4 {
+            bufs.push(sess_recv_buf());
+        }
+        for b in &bufs {
+            assert_eq!(b.len(), SESS_RECV_BUF_LEN);
+        }
+        for b in bufs {
+            sess_recycle_buf(b);
+        }
+        assert!(
+            sess_buf_pool_len() <= SESS_BUF_POOL_DEPTH,
+            "the pool must drop past its depth, not grow with churn"
+        );
+        // Wrong-sized buffers are dropped, never pooled.
+        sess_recycle_buf(vec![0u8; 16]);
+        assert!(sess_buf_pool_len() <= SESS_BUF_POOL_DEPTH);
+        // A recycled buffer comes back at the exact reader length, so the
+        // `n == buf.len()` truncation check holds for reused buffers too.
+        let b = sess_recv_buf();
+        assert_eq!(b.len(), SESS_RECV_BUF_LEN);
+        sess_recycle_buf(b);
+    }
+
+    /// The over-cap reap runs at most once per second process-wide, however
+    /// many workers contend for it — otherwise every forged new-session
+    /// datagram buys an O(sessions) table walk.
+    #[test]
+    fn fair_sweep_window_admits_one_sweep_per_second() {
+        use std::sync::atomic::Ordering;
+
+        // Synthetic stamps, not `mono_millis`: that clock is process uptime,
+        // and a young test binary is not yet a second old, so a relative
+        // window off it would never read expired. Nothing else in the test
+        // build touches this static, and the window is restored below.
+        let now = 10_000_000u64;
+        FAIR_SWEEP_LAST_MS.store(now - 2000, Ordering::Relaxed);
+        assert!(claim_fair_sweep(now), "an expired window must be claimable");
+        assert!(
+            !claim_fair_sweep(now),
+            "the same instant must not claim twice"
+        );
+        assert!(!claim_fair_sweep(now + 999));
+        assert!(claim_fair_sweep(now + 1000));
+        FAIR_SWEEP_LAST_MS.store(0, Ordering::Relaxed);
     }
 }
