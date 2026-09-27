@@ -212,6 +212,12 @@ fn tcp(socks: &str, target: &str, n: usize, conc: usize) {
     let (host, port) = split_host(target);
     let done = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
+    // Flows that actually got a reply. The client answers SOCKS *optimistically*
+    // (before the server-side dial result), so `done` alone counts a flow whose
+    // target was unreachable and whose stream was reset — a proxy that is
+    // completely broken still prints a high `flows/s`. `ok` is the number that
+    // means what the metric claims, and an empty `ok` fails the run.
+    let ok = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
     let mut workers = Vec::new();
     let per = n.div_ceil(conc);
@@ -220,16 +226,22 @@ fn tcp(socks: &str, target: &str, n: usize, conc: usize) {
         let host = host.clone();
         let done = done.clone();
         let bytes = bytes.clone();
+        let ok = ok.clone();
         workers.push(std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             for _ in 0..per {
                 if let Ok(mut s) = socks_connect(&socks, &host, port) {
+                    let mut replied = false;
                     if s.write_all(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_ok() {
                         if let Ok(k) = s.read(&mut buf) {
                             bytes.fetch_add(k as u64, Ordering::Relaxed);
+                            replied = k > 0;
                         }
                     }
                     done.fetch_add(1, Ordering::Relaxed);
+                    if replied {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }));
@@ -240,11 +252,20 @@ fn tcp(socks: &str, target: &str, n: usize, conc: usize) {
     let dt = t0.elapsed();
     let d = done.load(Ordering::Relaxed);
     let b = bytes.load(Ordering::Relaxed);
+    let o = ok.load(Ordering::Relaxed);
     println!(
-        "tcp flows={d} conc={conc} wall={:.3}s flows/s={:.0} reply_bytes={b}",
+        "tcp flows={d} ok={o} conc={conc} wall={:.3}s flows/s={:.0} reply_bytes={b}{}",
         dt.as_secs_f64(),
-        d as f64 / dt.as_secs_f64()
+        d as f64 / dt.as_secs_f64(),
+        if d > 0 && o == 0 {
+            "  FAIL: no flow got a reply (proxy down, target unreachable, or every dial refused)"
+        } else {
+            ""
+        }
     );
+    if d > 0 && o == 0 {
+        std::process::exit(1);
+    }
 }
 
 fn split_host(target: &str) -> (String, u16) {
@@ -583,10 +604,19 @@ fn tcpecho(socks: &str, target: &str, bytes: usize) {
         match s.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(k) => {
-                for (j, b) in buf[..k].iter().enumerate() {
+                // A pump that *duplicates* data makes a single read return more
+                // than the stream was asked for, which is exactly the case this
+                // check exists to report — indexing `payload[got + j]` would
+                // panic on it instead (and exit 101 before any size/mode runs).
+                // Compare what was expected and count the excess as mismatches.
+                let expected = (bytes - got).min(k);
+                for (j, b) in buf[..expected].iter().enumerate() {
                     if *b != payload[got + j] {
                         mismatch += 1;
                     }
+                }
+                if k > expected {
+                    mismatch += k - expected;
                 }
                 got += k;
             }
@@ -994,12 +1024,17 @@ fn bulk(socks: &str, target: &str, mb: usize, conc: usize) {
     let (host, port) = split_host(target);
     let want = mb * 1024 * 1024;
     let total = Arc::new(AtomicU64::new(0));
+    // Threads that read their whole `want`. Without this the mode happily
+    // reports a throughput for a *truncated* transfer (a reset flow, a target
+    // that stopped early), so the number cannot be compared across revisions.
+    let complete = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
     let mut ws = Vec::new();
     for _ in 0..conc {
         let socks = socks.to_string();
         let host = host.clone();
         let total = total.clone();
+        let complete = complete.clone();
         ws.push(std::thread::spawn(move || {
             let mut s = match socks_connect(&socks, &host, port) {
                 Ok(s) => s,
@@ -1017,6 +1052,12 @@ fn bulk(socks: &str, target: &str, mb: usize, conc: usize) {
                     }
                 }
             }
+            // `got >= want`, not `==`: the loop stops after the read that
+            // crosses `want`, so a healthy transfer overshoots by up to one
+            // read's worth of already-buffered bytes.
+            if got >= want {
+                complete.fetch_add(1, Ordering::Relaxed);
+            }
         }));
     }
     for w in ws {
@@ -1024,9 +1065,20 @@ fn bulk(socks: &str, target: &str, mb: usize, conc: usize) {
     }
     let dt = t0.elapsed();
     let b = total.load(Ordering::Relaxed);
+    let c = complete.load(Ordering::Relaxed);
+    let want_total = want as u64 * conc as u64;
     println!(
-        "bulk conc={conc} bytes={b} wall={:.3}s throughput={:.0} MB/s",
+        "bulk conc={conc} bytes={b}/{want_total} complete={c}/{conc} wall={:.3}s throughput={:.0} MB/s{}",
         dt.as_secs_f64(),
-        b as f64 / dt.as_secs_f64() / 1e6
+        b as f64 / dt.as_secs_f64() / 1e6,
+        if b < want_total {
+            "  SHORT: the transfer was truncated, so this throughput is not comparable"
+        } else {
+            ""
+        }
     );
+    if b == 0 {
+        // Nothing was carried at all: the path is broken, not slow.
+        std::process::exit(1);
+    }
 }

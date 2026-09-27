@@ -44,7 +44,16 @@ struct SessEntry {
     /// rather than a single pin; past [`RECENT_DST_CAP`] the oldest entry is
     /// evicted and a reply from it is dropped until the session sends there
     /// again.
-    recent: Arc<std::sync::Mutex<RecentAddrs>>,
+    ///
+    /// A clone-on-write snapshot behind an [`arc_swap::ArcSwap`], not a mutex:
+    /// the reply reader validates **every** inbound datagram against it, the
+    /// outbound path pushes into it, and those are two different tasks of the
+    /// same session — so a mutex there made the download hot path and the upload
+    /// hot path ping-pong one cache line. Readers now take a hazard-pointer
+    /// snapshot (no lock), and writers publish a new 136-byte snapshot through
+    /// `rcu`, which also means two concurrent pushes can no longer lose each
+    /// other's insert.
+    recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
     /// Bumped by every [`remember_dst`] for this session — including the push a
     /// spawned DNS resolver task makes from *its own* task
     /// (`forward_server_dgram`), which is the case the datagram reader cannot
@@ -74,7 +83,7 @@ struct SessEntry {
 /// [`RECENT_DST_CAP`] the oldest entry is evicted and a reply from it is dropped
 /// until the session sends there again. Entries are normalized (IPv4 mappings
 /// stripped) on both sides of the comparison.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct RecentAddrs {
     /// Ring of the last [`RECENT_DST_CAP`] destination IPs sent to.
     slots: [Option<IpAddr>; RECENT_DST_CAP],
@@ -629,6 +638,76 @@ static DIAL_CONNECT_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// number of tasks, and excess streams are reset by the accept loop.
 const MAX_STREAM_TASKS: usize = 16_384;
 
+/// Lower bound on one connection's share of [`MAX_STREAM_TASKS`].
+///
+/// Two connections can open [`MAX_BIDI_STREAMS_PER_CONN`] = 8192 streams each —
+/// more than the whole process-wide pool — so without a per-connection share the
+/// first two peers to arrive consume every stream-task permit and every other
+/// client's CONNECT is reset (the reset is a *stream* failure, after the client
+/// already answered SOCKS optimistically, so the app sees a broken flow with no
+/// server-side counter behind it). The share is `MAX_STREAM_TASKS` divided by the
+/// admitted connection count, floored here: becoming a connection is cheap, so a
+/// crowd of mostly-idle peers must not push a real client down to a handful of
+/// flows. At 1024 the floor is also what makes the divisor's precision secondary
+/// — above 16 admitted connections the global semaphore is the binding
+/// constraint, exactly as it is for UDP sessions ([`MIN_SESSION_SHARE`]).
+const MIN_STREAM_SHARE: usize = 1024;
+
+/// Stream-task permits refused by the *per-connection* share rather than by the
+/// process-wide pool. Split out because the two mean different things: the global
+/// pool being empty is "the host is at capacity", this is "one peer took its
+/// share and then some".
+static STREAM_SHARE_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One stream's admission reservation: decrements its connection's held-stream
+/// count on every exit path, including the `reset` early returns and unwinding.
+struct StreamShareGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for StreamShareGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// One connection's share of the process-wide stream-task pool.
+///
+/// `admitted` is the number of connections currently admitted (the accept loop
+/// holds one permit each). The `MIN_STREAM_SHARE` floor is what keeps the
+/// divisor's precision secondary: past 16 admitted connections the global
+/// semaphore is the binding constraint, exactly as it is for UDP sessions.
+/// Pure so the arithmetic — and the floor that makes it safe — is testable
+/// without a live connection.
+fn stream_share(admitted: usize) -> usize {
+    (MAX_STREAM_TASKS / admitted.max(1)).clamp(MIN_STREAM_SHARE, MAX_BIDI_STREAMS_PER_CONN as usize)
+}
+
+/// Rate limit for the per-connection stream-share refusal line (1/s, with a
+/// suppressed count, like the other per-flow abort logs).
+fn warn_stream_share_refused() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    let now = mono_millis();
+    let prev = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 1000 {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if LAST
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let n = SUPPRESSED.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            tracing::warn!("tcp stream-share refusals suppressed in the last window: {n}");
+        }
+        true
+    } else {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
 fn stream_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_STREAM_TASKS)))
@@ -732,6 +811,28 @@ fn tcp_abort_log_due() -> bool {
     }
 }
 
+/// Connection cap actually admitted, i.e. `conn_cap` bounded by the optional
+/// peer-memory budget.
+///
+/// `per_conn_bytes` is [`per_connection_memory_bytes`] for this server's
+/// effective transport tuning, so raising the windows admits proportionally
+/// fewer connections instead of silently multiplying the memory ceiling. A
+/// budget too small for even one connection clamps to one rather than zero: an
+/// endpoint that admits nothing cannot be diagnosed from the outside.
+///
+/// Pure so the arithmetic is testable without a live endpoint.
+fn admission_cap(conn_cap: usize, budget_mb: Option<u64>, per_conn_bytes: u64) -> usize {
+    let by_count = conn_cap.max(1);
+    match budget_mb {
+        None => by_count,
+        Some(mb) => {
+            let budget = mb.clamp(1, 1 << 20).saturating_mul(1024 * 1024);
+            let by_memory = (budget / per_conn_bytes.max(1)).max(1);
+            by_count.min(usize::try_from(by_memory).unwrap_or(usize::MAX))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -785,10 +886,11 @@ async fn main() -> Result<()> {
     }
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    let tuning = c.tuning();
     scfg.transport_config(build_transport_tuned(
         &c.congestion,
         c.keep_alive_secs,
-        c.tuning(),
+        tuning,
     ));
     // Dual-stack QUIC socket: explicit V6ONLY=0 so [::] also serves IPv4-mapped clients.
     let rt = Arc::new(quinn::TokioRuntime);
@@ -806,15 +908,79 @@ async fn main() -> Result<()> {
     if !c.gso {
         warn!("gso=false requested: quinn still uses GRO/GSO if kernel supports; set only affects logging");
     }
-    if !c.auth_token.is_empty() {
-        info!("client token authentication enabled");
-    } else {
-        warn!("auth_token is empty: the QUIC endpoint accepts any peer (rely on firewall/network isolation)");
-    }
     let auth_token = Arc::new(c.auth_token.clone().into_bytes());
     let auth_enabled = !auth_token.is_empty();
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS));
+    // Admission: a connection *count* cap plus — when configured — a
+    // peer-pinnable *memory* cap. Both are needed and neither is redundant: a
+    // count alone cannot bound memory (each admitted connection may hold its
+    // receive window, its send budget and both DATAGRAM buffers, all of which a
+    // peer controls), while a memory bound alone cannot bound fds/tasks.
+    let conn_cap = c
+        .max_connections
+        .unwrap_or(if auth_enabled {
+            MAX_CONNECTIONS
+        } else {
+            // With no token every peer is unauthenticated, so the pre-auth budget
+            // *is* the connection budget: the shipped default must not admit
+            // `MAX_CONNECTIONS` x windows of pinnable memory just because the
+            // pre-auth slot is only held during the handshake.
+            MAX_UNAUTH_CONNECTIONS
+        })
+        .clamp(1, MAX_CONNECTIONS);
+    let per_conn_bytes = per_connection_memory_bytes(&tuning);
+    let cap = admission_cap(conn_cap, c.max_peer_memory_mb, per_conn_bytes);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(cap));
+    let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS.min(cap)));
+    let worst_mib = (per_conn_bytes as u128 * cap as u128) / (1024 * 1024);
+    info!(
+        "admission: up to {cap} connection(s); worst case {worst_mib} MiB pinned \
+         ({per_conn_bytes} B/connection, auth={}, configured cap={conn_cap}{})",
+        if auth_enabled { "on" } else { "off" },
+        match c.max_peer_memory_mb {
+            Some(mb) => format!(", memory budget {mb} MiB"),
+            None => String::new(),
+        }
+    );
+    if worst_mib > 1024 {
+        warn!(
+            "admission: worst case {worst_mib} MiB of peer-pinnable memory at {cap} \
+             connection(s); set max_peer_memory_mb (e.g. 128) on a host with less RAM than that"
+        );
+    }
+    if !auth_enabled
+        && c.max_connections
+            .is_some_and(|n| n > MAX_UNAUTH_CONNECTIONS)
+    {
+        warn!(
+            "max_connections={conn_cap} on a tokenless endpoint: every admitted peer is \
+             unauthenticated, and each one may pin {per_conn_bytes} B of this host's memory"
+        );
+    }
+    if let Some(mb) = c.max_peer_memory_mb {
+        if cap < conn_cap {
+            info!(
+                "memory budget {mb} MiB binds the connection cap: {cap} of {conn_cap} \
+                 admitted (raise max_peer_memory_mb or lower the windows to admit more)"
+            );
+        }
+    }
+    if !auth_enabled {
+        warn!("auth_token is empty: the QUIC endpoint accepts any peer (rely on firewall/network isolation)");
+        // Spell out the shipped-default combination, because each half looks
+        // benign alone: with no token `allow_private` lets any peer make this
+        // host dial its own loopback/LAN (the router's admin UI included), and
+        // the admission budget is the tokenless one above.
+        if c.allow_private && !listen.ip().is_loopback() {
+            warn!(
+                "open-proxy posture: auth_token is empty AND allow_private = true AND \
+                 listen = {listen} (not loopback) — any host that can reach this port gets \
+                 an unauthenticated proxy into loopback/LAN targets; set auth_token, bind \
+                 loopback, or firewall the port"
+            );
+        }
+    } else {
+        info!("client token authentication enabled");
+    }
     spawn_udp_reporter();
     loop {
         let incoming = match ep.accept().await {
@@ -828,7 +994,7 @@ async fn main() -> Result<()> {
             Ok(p) => p,
             Err(_) => {
                 if warn_once_per_sec() {
-                    warn!("connection limit {MAX_CONNECTIONS} reached; refusing new connection");
+                    warn!("connection limit {cap} reached; refusing new connection");
                 }
                 drop(incoming); // implicit refuse
                 continue;
@@ -855,6 +1021,9 @@ async fn main() -> Result<()> {
         };
         let allow_private = c.allow_private;
         let auth_token = auth_token.clone();
+        // Read by `handle_conn` to size this connection's share of the
+        // process-wide stream-task pool (a clone per accepted connection).
+        let conn_limit_for_conn = conn_limit.clone();
         // One deadline for the whole pre-auth phase while a slot is held (see
         // `PRE_AUTH_TIMEOUT`); without a token there is no slot to free and the
         // more generous handshake budget applies.
@@ -916,7 +1085,7 @@ async fn main() -> Result<()> {
             // Authentication done: free the pre-auth slot so other new peers
             // can handshake while this connection lives on.
             drop(pending);
-            if let Err(e) = handle_conn(conn, allow_private).await {
+            if let Err(e) = handle_conn(conn, allow_private, conn_limit_for_conn, cap).await {
                 warn!("conn end: {e:#}");
             }
         });
@@ -1006,7 +1175,12 @@ fn spawn_udp_reporter() {
     });
 }
 
-async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()> {
+async fn handle_conn(
+    conn: quinn::Connection,
+    allow_private: bool,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    conn_cap: usize,
+) -> Result<()> {
     info!("new QUIC conn from {}", conn.remote_address());
     let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
@@ -1061,6 +1235,13 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // Large app datagrams arrive as MQP-2 fragments; reassemble before they
         // reach a target socket, so the target sees the datagram the app sent.
         let mut reasm = DgramReassembler::new();
+        // The reassembler can only expire state it is asked about, and `push` is
+        // reached only when a fragment arrives — so a peer that sends fragments
+        // and then goes quiet (its connection stays alive on keepalives) would pin
+        // its partials for the connection's lifetime. This tick is what makes
+        // `FRAG_TIMEOUT_MS` a real deadline.
+        let mut reasm_tick = tokio::time::interval(Duration::from_millis(FRAG_SWEEP_INTERVAL_MS));
+        reasm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Per-connection fast path: the thread-local memo is shared by every
         // connection on this worker, so a burst to one session still pays two
         // RefCell scans per packet. This slot lives in the reader task itself.
@@ -1096,9 +1277,15 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
         // flows pay nothing after the first datagram).
         let mut fast_last_dst: Option<(u32, SocketAddr, u64)> = None;
         loop {
-            let d: Bytes = match reader.as_mut().await {
-                Ok(d) => d,
-                Err(_) => break,
+            let d: Bytes = tokio::select! {
+                r = reader.as_mut() => match r {
+                    Ok(d) => d,
+                    Err(_) => break,
+                },
+                _ = reasm_tick.tick() => {
+                    reasm.expire(mono_millis());
+                    continue;
+                }
             };
             // `d` is already owned (from `read_datagram`), so payload slices borrow
             // it directly: one refcount bump per slice, no extra clone per packet.
@@ -1107,7 +1294,7 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 let Ok(f) = decode_fragment(&d) else {
                     continue;
                 };
-                let Some((s, a, whole)) = reasm.push_zero_copy(&d, &f, coarse_millis()) else {
+                let Some((s, a, whole)) = reasm.push(&f, mono_millis()) else {
                     continue;
                 };
                 udp_stats::payload(whole.len());
@@ -1273,11 +1460,39 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
     // Concurrent streams are already capped by the transport; dials are bounded
     // process-wide (not per connection) so many connections cannot exhaust fds
     // together.
+    //
+    // The *stream-task* pool is process-wide too, and one connection may open
+    // `MAX_BIDI_STREAMS_PER_CONN` (8192) streams — more than the whole pool — so
+    // each connection also has to stay inside its own share of it. Without this,
+    // the first two peers to arrive hold every permit while their flows sit idle
+    // (a permit is held for the flow's lifetime, and a stream that never sends
+    // its header still holds one for the 5 s header timeout, so the treadmill is
+    // cheap), and every other client's CONNECT is reset after its SOCKS success
+    // reply — with nothing logged server-side.
+    let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         let (mut send, mut recv) = match conn.accept_bi().await {
             Ok(x) => x,
             Err(_) => break,
         };
+        // Admitted connections (the accept loop holds one permit each). The
+        // denominator is this endpoint's actual cap, which the admission budget
+        // may have lowered, not `MAX_CONNECTIONS`.
+        let admitted = conn_cap
+            .saturating_sub(conn_limit.available_permits())
+            .max(1);
+        let share = stream_share(admitted);
+        if streams_held.load(std::sync::atomic::Ordering::Relaxed) >= share {
+            let n = STREAM_SHARE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if warn_stream_share_refused() {
+                warn!(
+                    "tcp stream share reached ({share} of {MAX_STREAM_TASKS} across \
+                     {admitted} connection(s), {n} refused so far); resetting the stream"
+                );
+            }
+            send.reset(0x05u32.into()).ok();
+            continue;
+        }
         let stream_permit = match stream_task_limiter().clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -1286,9 +1501,12 @@ async fn handle_conn(conn: quinn::Connection, allow_private: bool) -> Result<()>
                 continue;
             }
         };
+        streams_held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let stream_share_guard = StreamShareGuard(streams_held.clone());
         let stat_conn = conn.clone();
         tokio::spawn(async move {
             let _stream_permit = stream_permit;
+            let _stream_share_guard = stream_share_guard;
             let target: TargetAddr = match tokio::time::timeout(
                 Duration::from_secs(5),
                 read_mqp_target(&mut recv),
@@ -2272,10 +2490,34 @@ fn pin_life_ms(remaining_ms: u64) -> u64 {
 /// The session's allowlist epoch moves with the push, whether it lands from the
 /// datagram reader's own task or from a spawned resolver task that the reader
 /// cannot see; that is what `fast_last_dst` is validated against.
+///
+/// The push itself is a lock-free `rcu` publish: the reply reader loads a
+/// snapshot for every datagram, so writers must not take a lock the readers
+/// would have to contend with, and `rcu`'s retry makes two concurrent pushes
+/// both land (a load-clone-store would drop one, and a dropped allowlist entry
+/// is a silently refused reply).
 fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
     let sh = ss.shard(s);
     if let Some(e) = lock_read(sh).get(&s) {
-        lock_mutex(&e.recent).push(dst);
+        let ip = unmap(dst.ip());
+        // Fast exit for the steady flow (one already-known destination): no
+        // clone, no allocation, no CAS — just the epoch move below. A concurrent
+        // push that evicts this very entry out of a full ring can slip between
+        // this check and the skip, which costs at most one refused reply batch:
+        // the epoch below still moves, so the reader's mirror re-records the
+        // destination on its next outbound datagram.
+        if !e.recent.load().slots.contains(&Some(ip)) {
+            e.recent.rcu(|cur| {
+                if cur.slots.contains(&Some(ip)) {
+                    // Another writer got there first; keep its snapshot.
+                    Arc::clone(cur)
+                } else {
+                    let mut next = (**cur).clone();
+                    next.push(dst);
+                    Arc::new(next)
+                }
+            });
+        }
         e.recent_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -2319,7 +2561,7 @@ async fn sess_reader_task(
     ss2: SessTable,
     c2: quinn::Connection,
     last2: Arc<std::sync::atomic::AtomicU64>,
-    recent: Arc<std::sync::Mutex<RecentAddrs>>,
+    recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2386,7 +2628,11 @@ async fn sess_reader_task(
         // target's answer. Drop anything sent from a host this session never
         // sent to (see `RecentAddrs`: the port is deliberately not part of the
         // key, so a server answering from a different port still gets through).
-        let r = lock_mutex(&recent);
+        // Lock-free snapshot: the outbound path pushes into the same allowlist
+        // from another task, so a lock here was the only per-reply mutex on the
+        // download path (and the only place the two directions shared a cache
+        // line). `load` is a hazard-pointer read, not a refcount RMW.
+        let r = recent.load();
         let allowed = !r.is_empty() && r.contains(&src);
         drop(r);
         if !allowed {
@@ -2598,8 +2844,8 @@ async fn get_or_create_sess(
     let rs_pre = sock.clone();
     let ss_pre = ss.clone();
     let last_pre = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
-    let recent_pre: Arc<std::sync::Mutex<RecentAddrs>> =
-        Arc::new(std::sync::Mutex::new(RecentAddrs::default()));
+    let recent_pre: Arc<arc_swap::ArcSwap<RecentAddrs>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default()));
     let recent_epoch: Arc<std::sync::atomic::AtomicU64> =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     let h_pre = tokio::spawn(sess_reader_task(
@@ -2885,7 +3131,7 @@ mod tests {
                     addr: a,
                     expires: mono_millis() + DEST_PIN_TTL_MS,
                 }),
-                recent: Arc::new(std::sync::Mutex::new(RecentAddrs::default())),
+                recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
                 recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
@@ -3332,7 +3578,7 @@ mod tests {
             )),
             _permit: session_limiter().clone().try_acquire_owned().unwrap(),
             dest: DestMemo::NONE,
-            recent: Arc::new(std::sync::Mutex::new(RecentAddrs::default())),
+            recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
             recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -3343,8 +3589,7 @@ mod tests {
         let Some(e) = sh.get(&s) else {
             return false;
         };
-        let found = lock_mutex(&e.recent).contains(&dst);
-        found
+        e.recent.load().contains(&dst)
     }
 
     /// The reader's task-local mirror of the reply allowlist must be validated
@@ -3440,6 +3685,49 @@ mod tests {
         assert!(
             r.slots.iter().flatten().count() <= RECENT_DST_CAP,
             "the allowlist must stay bounded"
+        );
+    }
+
+    /// The allowlist is a clone-on-write snapshot: the reply task loads it for
+    /// every inbound datagram while the outbound path pushes into it from a
+    /// different task, so two concurrent pushes must **both** land (a
+    /// load-clone-store would drop one, and a dropped entry silently refuses
+    /// that target's replies) and the ring must still evict the oldest entry
+    /// past [`RECENT_DST_CAP`].
+    #[tokio::test]
+    async fn allowlist_pushes_are_lock_free_and_both_land() {
+        let (ss, _sock) = sess_with_dest(None);
+        let s = 7u32;
+        let a: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:53".parse().unwrap();
+
+        let (t1, t2) = {
+            let (x, y) = (ss.clone(), ss.clone());
+            (
+                std::thread::spawn(move || remember_dst(&x, s, a)),
+                std::thread::spawn(move || remember_dst(&y, s, b)),
+            )
+        };
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert!(allowlist_contains(&ss, s, a), "concurrent push A landed");
+        assert!(allowlist_contains(&ss, s, b), "concurrent push B landed");
+
+        // Past the cap the oldest entries are evicted, newest survive.
+        for i in 0..RECENT_DST_CAP as u8 {
+            remember_dst(&ss, s, SocketAddr::from(([10, 1, 0, i], 9)));
+        }
+        assert!(
+            !allowlist_contains(&ss, s, a) && !allowlist_contains(&ss, s, b),
+            "the ring evicted the two oldest destinations"
+        );
+        assert!(
+            allowlist_contains(
+                &ss,
+                s,
+                SocketAddr::from(([10, 1, 0, RECENT_DST_CAP as u8 - 1], 9))
+            ),
+            "the newest destination is admitted"
         );
     }
 
@@ -3765,6 +4053,75 @@ mod tests {
         assert!(shard_over_share(1, 0));
         assert!(shard_over_share(1, 7));
         assert!(!shard_over_share(0, 7));
+    }
+
+    /// The admission cap must be a real memory bound: raising the transport
+    /// windows has to admit fewer connections, a budget too small for one
+    /// connection still admits one (so the endpoint is diagnosable), and no
+    /// configuration may exceed the hard connection cap.
+    #[test]
+    fn admission_cap_bounds_connections_by_memory() {
+        let per_conn = per_connection_memory_bytes(&TransportTuning::default());
+        assert_eq!(
+            per_conn,
+            8 * 1024 * 1024,
+            "2/4/2 MB windows + 2 x 1 MB packets"
+        );
+
+        // No budget: the count cap stands, clamped to the hard cap.
+        assert_eq!(
+            admission_cap(MAX_CONNECTIONS, None, per_conn),
+            MAX_CONNECTIONS
+        );
+        assert_eq!(admission_cap(1, None, per_conn), 1);
+
+        // A 512 MiB budget / 8 MiB per connection = 64 connections.
+        assert_eq!(admission_cap(MAX_CONNECTIONS, Some(512), per_conn), 64);
+        // Raising the windows must lower the admitted count for the same budget.
+        let wide = TransportTuning {
+            receive_window: 16 * 1024 * 1024,
+            send_window: 8 * 1024 * 1024,
+            stream_receive_window: 8 * 1024 * 1024,
+            ..TransportTuning::default()
+        };
+        let per_conn_wide = per_connection_memory_bytes(&wide);
+        assert!(per_conn_wide > per_conn);
+        assert!(
+            admission_cap(MAX_CONNECTIONS, Some(512), per_conn_wide)
+                < admission_cap(MAX_CONNECTIONS, Some(512), per_conn),
+            "the same budget must admit fewer wide-window connections"
+        );
+        // Count cap still wins when it is the smaller of the two.
+        assert_eq!(admission_cap(8, Some(512), per_conn), 8);
+        // A budget too small for even one connection admits exactly one.
+        assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn), 1);
+        // No division by zero for a degenerate per-connection figure: the
+        // divisor floors at one byte, so the count cap still binds.
+        assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), 0), MAX_CONNECTIONS);
+    }
+
+    /// One connection's stream-task share must be bounded by the pool, floored
+    /// so a crowd of peers cannot cut a real client down to a handful of flows,
+    /// and never above what a connection can even open.
+    #[test]
+    fn one_connection_cannot_hold_the_whole_stream_pool() {
+        // A lone connection is capped by the transport credit, not the pool:
+        // 8192 streams is what it can open, and the pool is larger.
+        assert_eq!(stream_share(1), MAX_BIDI_STREAMS_PER_CONN as usize);
+        // Two connections each asking for the whole pool: half each.
+        assert_eq!(stream_share(2), MAX_STREAM_TASKS / 2);
+        // Four: a quarter each, so the pool cannot be consumed by four peers.
+        assert_eq!(stream_share(4), MAX_STREAM_TASKS / 4);
+        assert!(stream_share(4) * 4 <= MAX_STREAM_TASKS + MIN_STREAM_SHARE);
+        // Beyond 16 admitted connections the floor takes over, so a crowd of
+        // mostly-idle peers cannot starve a real client.
+        assert_eq!(stream_share(16), MIN_STREAM_SHARE);
+        assert_eq!(stream_share(64), MIN_STREAM_SHARE);
+        assert_eq!(stream_share(MAX_CONNECTIONS), MIN_STREAM_SHARE);
+        // A zero divisor (no admission accounting yet) must not divide by zero.
+        assert_eq!(stream_share(0), MAX_BIDI_STREAMS_PER_CONN as usize);
+        // The floor is never above the per-connection maximum.
+        assert!(MIN_STREAM_SHARE <= MAX_BIDI_STREAMS_PER_CONN as usize);
     }
 
     /// The shard sweep never kills a *live* session, however far over the fair

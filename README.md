@@ -961,6 +961,14 @@ keep_alive_secs = 5           # clamped to 1..300; idle timeout = max(3x, 15s)
 allow_private = true          # dial RFC1918/loopback targets; default is false!
 auth_token = ""                # shared secret ≤ 256 B; empty = disabled (firewall only).
                                # Set a private random value here and on the client.
+# Admission (optional). Unset max_connections = 4096 with a token, 256 without
+# one: a tokenless endpoint admits every peer, so its connection budget *is* the
+# pre-auth budget. max_peer_memory_mb additionally caps the peer-pinnable memory
+# the admitted connections may represent, so raising the windows admits fewer
+# connections instead of multiplying the ceiling. Both defaults are logged at
+# startup, with the worst-case footprint.
+# max_connections = 4096
+# max_peer_memory_mb = 512
 # Optional tuning, mirrors the client (download capped by receiver window,
 # upload by sender window — change both sides together):
 # stream_receive_window_mb = 2, receive_window_mb = 4, send_window_mb = 2,
@@ -1096,8 +1104,9 @@ All limits are constants in the sources; the table shows where to change them.
 
 | Resource | Limit | Where |
 |---|---|---|
-| Concurrent QUIC connections (server) | 4096 (new `Incoming` refused) | `MAX_CONNECTIONS` |
-| Concurrent *unauthenticated* connections | 256 (pre-auth slot, released after token check; handshake and token share one 5 s deadline) | `MAX_UNAUTH_CONNECTIONS` |
+| Concurrent QUIC connections (server) | 4096 with a token, **256 without one** (a tokenless endpoint admits every peer, so its connection budget is the pre-auth budget); `max_connections` overrides, clamped to 4096 | `MAX_CONNECTIONS`, `MAX_UNAUTH_CONNECTIONS`, `ServerConf::max_connections` |
+| Peer-pinnable memory (server, all admitted connections) | `connections x (receive window + send budget + 2 x 1 MB DATAGRAM buffers)` = 8 MB/connection under the default 2/4/2 MB windows, i.e. 2 GiB at the tokenless 256-connection cap and 32 GiB at 4096; `max_peer_memory_mb` bounds it explicitly (`budget / 8 MB` connections) and both are logged at startup | `per_connection_memory_bytes`, `ServerConf::max_peer_memory_mb` |
+| Concurrent *unauthenticated* connections (handshake phase) | 256 (pre-auth slot, released after token check; handshake and token share one 5 s deadline) | `MAX_UNAUTH_CONNECTIONS` |
 | TLS session store (server, 0-RTT/resumption) | 8192 sessions | `server_tls_config` |
 | UDP sessions, process-wide | 8192 permits (fail closed) | `MAX_SESSIONS_GLOBAL` |
 | UDP session socket buffers | 256 KB send + 256 KB receive per session | `SESS_SOCKET_BUF` |
@@ -4393,6 +4402,125 @@ the fragmented UDP sweep at 0 % loss with 0 misroutes inside Podman's amd64
 emulation, while the v4 server dies with `Illegal instruction` on the
 AVX512-less emulated CPU — see the cross-compile section for the sizes and the
 full result.
+
+### 2026-09 hardening pass 45 — reassembly memory accounting, fragment-id reuse, partial expiry, stream-pool fairness
+
+Five independent read-only audits (lib data path, lib TCP pump, lib DNS, server,
+client) were consolidated, every claim re-verified against the product code *and*
+the vendored `quinn`/`quinn-proto`/`bytes`/`arc-swap` sources, and the confirmed
+defects fixed. No wire, framing, ALPN or protocol-field change; mixed old/new
+peers keep working.
+
+- **CRITICAL — the reassembly byte budget was fiction.** Every stored fragment
+  chunk was a `Bytes` slice of the whole received DATAGRAM, charged at the
+  *frame's* length. That frame is itself a narrow slice of quinn's per-`recvmsg`
+  receive batch (`max_udp_payload_size x gro_segments` — up to 64 x 1472 B ≈
+  92 KiB, because quinn-udp enables `UDP_GRO` on Linux), and `Bytes` cannot
+  report a slice's backing allocation. A 20-byte fragment therefore pinned up to
+  ~92 KiB while `held_bytes()` read 20 B, so `FRAG_MAX_HELD_BYTES` (256 KiB) and
+  every number derived from it bounded nothing; ordinary fragmented UDP traffic
+  was inflated the same way. Chunks are now **owned copies** (`push` is the only
+  entry point; `push_zero_copy` is gone), the charge is exact, and the slot-table
+  charge is unchanged. Test: `retained_bytes_are_exact_and_bounded`.
+- **HIGH — a partial could live forever.** `push` was the only path that expired
+  state, so a peer that sent fragments and then stopped sending datagrams (its
+  connection held open by keepalives) pinned its partials — and their bytes —
+  for the connection's lifetime; `FRAG_TIMEOUT_MS = 2 s` was a promise nothing
+  kept. Both datagram readers now drive `DgramReassembler::expire` from a
+  `FRAG_SWEEP_INTERVAL_MS = 500 ms` tick, and the fragment timestamps are precise
+  (`mono_millis`) rather than coarse-sampled. Test:
+  `expire_drops_partials_without_a_following_fragment`.
+- **HIGH — silent datagram corruption on 16-bit fragment-id reuse.** A stale
+  fragment that lands on an *empty* slot completes a partial out of two
+  generations, and the delivered mixture goes to the **older** generation's
+  target. Reachable at ≳22k fragmented payloads/s on one sending context (the id
+  space wraps inside the 2-3 s reassembly window), i.e. ~300 Mbit/s of 1.5 KB
+  datagrams; the receiver's "different bytes at a filled slot" restart cannot
+  detect it. `DgramFragmenter` now refuses to fragment while a wrap is inside
+  `FRAG_ID_SAFE_WINDOW_MS` (counted and warned as a size drop) — a hard ceiling
+  of `65_536 / 3 s ≈ 21k` fragmented payloads/s per session/association, above
+  which oversized datagrams are dropped rather than spliced. Tests:
+  `fragment_id_reuse_is_blocked_inside_the_reassembly_window`,
+  `fragmenter_refuses_a_reused_id_inside_the_window`.
+- **HIGH — one peer could take the whole TCP stream pool.** `MAX_STREAM_TASKS`
+  (16384) is process-wide and a permit is held for a flow's entire life (a stream
+  that never sends its header still holds one for the 5 s header timeout), while
+  one connection may open 8192 streams — so two peers could consume every permit
+  and every other client's CONNECT was reset with no counter anywhere. The pool
+  now has a per-connection share (`stream_share`: `MAX_STREAM_TASKS` divided by
+  the admitted connection count, floored at `MIN_STREAM_SHARE = 1024`), refusals
+  are counted (`STREAM_SHARE_REFUSED`) and warn once per second, and
+  `StreamShareGuard` returns the share on every exit path. Test:
+  `one_connection_cannot_hold_the_whole_stream_pool`.
+- **MEDIUM — the TCP download pump pinned quinn receive buffers.** `read_chunks`
+  writes only `batch[..n]` and never clears the rest (quinn's `poll_read_chunks`),
+  and those leftovers are slices of receive buffers the assembler has already
+  dropped from its own accounting — so a burst-then-trickle flow kept up to
+  `COPY_BATCH - 1` of them for the flow's lifetime. The tail is now cleared
+  explicitly.
+- **MEDIUM — a lost race could silence an egress slot for 10 s.** When
+  `clear_if_and_mark_dead`'s CAS lost to a concurrent `publish`, the retry tail
+  restored `live = true` **without** bumping the generation, while a reader woken
+  by the publish's own bump could have observed the transient `false` — such a
+  reader then slept out its whole `wait_conn` deadline (10 s of stalled inbound
+  DATAGRAMs on that slot, or a spurious `REP=0x04` for a TCP flow) with a live
+  connection published. The restore now bumps (`restore_live_if_replaced`). Test:
+  `restoring_live_after_a_lost_race_wakes_readers`.
+- **MEDIUM — UDP association churn paid O(shard) copy-on-write.** `HUB_SHARDS`
+  is 32 → 256, so a full house is ~16 entries per shard instead of ~126: each
+  `publish`/`unpublish` clone (one refcount RMW per entry, on the same cache
+  lines the dispatcher CASes per reply) is 8x smaller, with no read-path cost.
+- **MEDIUM — the server's reply path took a mutex per inbound datagram.** The
+  per-session reply allowlist was `Mutex<RecentAddrs>`, shared between the
+  session's reply reader (a `contains` per reply) and the outbound path
+  (`remember_dst`), so the two directions of one session ping-ponged one cache
+  line on the download hot path. It is now a clone-on-write
+  `ArcSwap<RecentAddrs>` snapshot: the reader takes a hazard-pointer load (no
+  lock, no refcount RMW), writers publish through `rcu` — which also means two
+  concurrent pushes can no longer lose each other's insert (a lost allowlist
+  entry is a silently refused reply). Test:
+  `allowlist_pushes_are_lock_free_and_both_land`.
+- **Observability / benches.** The server warns loudly about the shipped
+  open-proxy combination (empty token + `allow_private` + non-loopback listen,
+  where the pre-auth memory cap does not apply); `hotpath_bench tcp` reports
+  `ok=` (flows that actually got a reply — the client answers SOCKS
+  optimistically, so `flows/s` alone counts dead flows) and fails when none did;
+  `bulk` reports `bytes/want` and `complete=n/conc` and flags a truncated
+  transfer; `tcpecho`'s integrity check no longer panics with an index error on
+  the duplicated-data case it exists to detect; `udp_write`'s
+  `--no-default-features` totals read 0 as documented instead of a literal 1.
+- **HIGH — the shipped tokenless default had no memory-based admission bound.**
+  The only memory bound on a handshaking peer was `MAX_UNAUTH_CONNECTIONS`
+  (256), and it applied *only when a token was configured* — so the shipped
+  config (empty token) admitted `MAX_CONNECTIONS` (4096) peers, each of which may
+  pin its receive window, its send budget and both DATAGRAM buffers
+  (`per_connection_memory_bytes` = 8 MB under the default 2/4/2 MB windows, i.e.
+  a 32 GiB ceiling, against a router's few hundred MB). The connection budget for
+  a tokenless endpoint is now the pre-auth budget (256), and two knobs make the
+  posture explicit: `max_connections` (clamped to 4096; raising it tokenless
+  warns) and `max_peer_memory_mb`, which bounds
+  `connections x per_connection_memory_bytes(tuning)` — so raising the transport
+  windows admits proportionally fewer connections instead of silently
+  multiplying the ceiling. The derived cap, the per-connection figure and the
+  worst-case footprint are logged at startup, and a worst case above 1 GiB warns.
+  Tests: `admission_cap_bounds_connections_by_memory`,
+  `per_connection_memory_tracks_the_windows`.
+- **Kept wire-compatible on purpose.** A 32-bit fragment id (or a per-payload
+  generation byte) would remove the id-reuse ceiling entirely, but it is a
+  framing change: with the default `h3` ALPN there is no negotiated version, so
+  a mixed old/new pair would silently drop *all* large UDP instead of failing
+  closed. The guard costs nothing below ~21k fragmented payloads/s per
+  session/association (≈245 Mbit/s of 1.4 KB datagrams, ≈1.4 Gbit/s of 8 KB
+  ones — for scale, the `udpmulti` runs below are ~3.2k/s per association), so
+  the wide-id frame stays a future, explicitly versioned change.
+- **Verified:** `cargo test --all-targets` green on both feature sets (72 + 36 +
+  35 default, 71 + 36 + 35 without `stats`), `cargo clippy --all-targets
+  -- -D warnings` and `cargo fmt --check` clean on both. End-to-end on loopback
+  with the release binaries: TCP echo byte-exact at 8 MiB (44 MB/s), the UDP
+  sweep at 200/1200/1420/2000/8000 B at 0 % loss (the last two through type=0x05
+  fragments), `udpdomainswitch` 75/75 + 75/75 with 0 misrouted, `udpmulti`
+  8 associations x 1500 x 8 KiB at 0.000 % loss (26k pps), and bulk download
+  85 MB/s with `complete=4/4`.
 
 ---
 

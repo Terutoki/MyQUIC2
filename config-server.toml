@@ -10,6 +10,17 @@ allow_private = true
 # Shared secret clients must present (set on both sides).
 # Leave empty to disable auth (then rely on firewall/network isolation).
 auth_token = ""
+# Admission. Unset max_connections = 4096 with a token above, 256 without one:
+# a tokenless endpoint admits every peer, so its connection budget *is* the
+# pre-auth budget. Clamped to 1..=4096; raising it tokenless is warned about.
+# max_connections = 4096
+# Optional cap, in MiB, on the peer-pinnable memory the admitted connections may
+# represent: the connection cap is then also limited to
+# budget / (receive window + send budget + both DATAGRAM buffers) = budget / 8 MiB
+# with the default 2/4/2 MB windows. Raising the windows therefore admits fewer
+# connections instead of multiplying the memory ceiling. The worst case
+# (connections x per-connection figure) is logged at startup either way.
+# max_peer_memory_mb = 512
 # Default 2/4/2 MB matches code defaults; must mirror the client (download
 # capped by receiver, upload by sender, so change both sides together).
 # Omit all five to use defaults; 4/8/4 MB for ~240 Mb/s, 8/16/8 MB for 300 Mb/s peak.

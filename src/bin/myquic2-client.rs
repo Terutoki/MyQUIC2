@@ -177,15 +177,34 @@ impl ConnSlot {
             }
         });
         if marked && !cleared {
-            let g = self.shared.load();
-            if g.as_ref()
-                .is_some_and(|c| c.stable_id() != conn.stable_id())
-            {
-                self.live.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            drop(g);
+            self.restore_live_if_replaced(conn.stable_id());
         }
         cleared
+    }
+
+    /// Undo the transient `live = false` of a clear whose CAS lost to a
+    /// concurrent publish, and wake the waiters.
+    ///
+    /// The bump is not optional. A reader (`wait_conn`) wakes only on a
+    /// generation bump or its deadline, and the reader that consumed the
+    /// *publish's* own bump can go on to observe the `false` this clear stored
+    /// before losing its race — so a restore that does not bump leaves a live
+    /// connection unusable until that reader's whole timeout (10 s for a
+    /// dispatcher: every inbound datagram on that egress connection stalls
+    /// silently; the flow timeout for a TCP caller, whose SOCKS reply is then a
+    /// spurious `REP=0x04`). A redundant bump only costs one re-check.
+    ///
+    /// Returns true when the slot holds a connection other than
+    /// `dead_stable_id`, i.e. when the bit was actually restored.
+    fn restore_live_if_replaced(&self, dead_stable_id: usize) -> bool {
+        let g = self.shared.load();
+        let restored = g.as_ref().is_some_and(|c| c.stable_id() != dead_stable_id);
+        if restored {
+            self.live.store(true, std::sync::atomic::Ordering::Relaxed);
+            bump_gen(&self.gen_tx);
+        }
+        drop(g);
+        restored
     }
 
     /// Wait for a live connection, waking on a generation bump or the deadline.
@@ -542,9 +561,13 @@ struct SharedEgress {
     /// `ArcSwap::store` is lock-free and always commits, which deletes that
     /// whole failure mode: every publish lands and carries a real stamp.
     ///
-    /// One element per [`EgressClass`] (index `class.index()`): the classes are
-    /// fully independent, so an interactive refresh can never publish onto the
-    /// bulk slot or vice versa.
+    /// One element per [`EgressClass`] (index `class.index()`): the classes have
+    /// separate caches and separate single-flight gates, so a refresh for one
+    /// class can never *write* the other's slot. They can still end up holding
+    /// the same connection: with `udp_fail_closed = false` the slot scan falls
+    /// back to the other class's UDP connection (and then to the TCP slots), and
+    /// stickiness then keeps it there while that connection lives — see
+    /// [`SharedEgress::egress_order`].
     cached: [ArcSwapOption<EgressCache>; EgressClass::COUNT],
     warned: std::sync::atomic::AtomicBool,
     /// Single-flight refresh gate, per class: only one association task pays
@@ -856,7 +879,14 @@ impl SharedEgress {
 /// die with their association, so no immortal task can steal another's packets.
 /// The table is sharded because the dispatcher reads it for every inbound
 /// DATAGRAM: a single RwLock there is a cross-core cache-line bottleneck.
-const HUB_SHARDS: usize = 32;
+///
+/// Sized so a *write* stays cheap: a shard is a clone-on-publish map, and each
+/// `publish`/`unpublish` clones the whole shard (one refcount RMW per entry, and
+/// those counters share cache lines with the dispatcher's per-reply
+/// `Weak::upgrade`). At `MAX_UDP_ASSOCS = 4032` a full house is ~16 entries per
+/// shard here, versus ~126 at 32 shards; the read path pays nothing for the
+/// extra shards (a shard is one `ArcSwap` and a modulo).
+const HUB_SHARDS: usize = 256;
 
 /// One live UDP association, as the dispatchers see it.
 ///
@@ -1384,9 +1414,10 @@ fn tcp_abort_log_due() -> bool {
 /// than `DISPATCH_CACHE` live associations collide by pigeonhole. Sized at 4096
 /// (`MAX_UDP_ASSOCS` 4032 rounded up to a power of two) so a full house averages
 /// one id per slot instead of four: round-robin hit rate goes from ~2% to ~37%
-/// under churn, 100% for a fresh consecutive window. Costs ~96 KiB per
-/// dispatcher (a slot is one id plus one `Weak`) — noise against the 512 KiB of
-/// kernel socket caps each association already carries.
+/// under churn, 100% for a fresh consecutive window. Costs 64 KiB per
+/// dispatcher (`DispatchSlot` is a `u32` plus an `Option<Weak>`, 16 B with
+/// padding, x 4096) — noise against the 512 KiB of kernel socket caps each
+/// association already carries.
 /// Must be a power of two (the index is a mask).
 const DISPATCH_CACHE: usize = 4096;
 
@@ -1490,7 +1521,7 @@ fn dispatch_one(
         let Ok(f) = decode_fragment(&d) else {
             return;
         };
-        let Some((_, a, whole)) = reasm.push_zero_copy(&d, &f, coarse_millis()) else {
+        let Some((_, a, whole)) = reasm.push(&f, mono_millis()) else {
             return;
         };
         udp_stats::payload(whole.len());
@@ -1608,6 +1639,13 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             // keeps its own, which is correct because a payload's fragments all
             // travel on the connection that carried them.
             let mut reasm = DgramReassembler::new();
+            // `push` only runs when a fragment arrives, so a peer that sends
+            // fragments and then goes quiet would pin its partials for the
+            // connection's lifetime; this tick is what makes `FRAG_TIMEOUT_MS` a
+            // real deadline (see `DgramReassembler::expire`).
+            let mut reasm_tick =
+                tokio::time::interval(Duration::from_millis(FRAG_SWEEP_INTERVAL_MS));
+            reasm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut pkt = bytes::BytesMut::with_capacity(256);
             let mut reader_failed = false;
             loop {
@@ -1623,6 +1661,7 @@ fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         dispatch_one(&mut cache, &hub, sess, d, &mut reasm, &mut pkt);
                     }
                     _ = gen.changed() => break,
+                    _ = reasm_tick.tick() => { reasm.expire(mono_millis()); }
                 }
             }
             if reader_failed {
@@ -4462,5 +4501,44 @@ mod tests {
         )
         .await
         .expect("a small token write succeeds");
+    }
+
+    /// A clear that lost its CAS race must restore `live` **and** wake readers.
+    ///
+    /// `wait_conn` wakes only on a generation bump or its deadline, and the
+    /// reader that consumed the publish's own bump can go on to observe the
+    /// transient `false` the losing clear run stored. Restoring the bit without
+    /// bumping therefore leaves a live, published connection unusable until that
+    /// reader's whole timeout (10 s for a dispatcher — every inbound datagram on
+    /// that egress connection stalls — or a spurious `REP=0x04` for a TCP flow).
+    #[tokio::test]
+    async fn restoring_live_after_a_lost_race_wakes_readers() {
+        let (c, _e1, _s1) = real_connection().await;
+        let slot = ConnSlot::fresh();
+        slot.publish(&c);
+        let mut gen_rx = slot.gen_rx.clone();
+
+        // Not replaced: nothing to restore, and nothing may be woken.
+        slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!slot.restore_live_if_replaced(c.stable_id()));
+        assert!(!slot.is_live());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), gen_rx.changed())
+                .await
+                .is_err(),
+            "an unchanged slot must not bump the generation"
+        );
+
+        // Replaced by a different connection (the lost-race outcome): restore
+        // the bit and wake the waiters that already consumed the publish bump.
+        assert!(slot.restore_live_if_replaced(usize::MAX));
+        assert!(slot.is_live());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), gen_rx.changed())
+                .await
+                .is_ok(),
+            "the restore must wake a reader, or it sleeps out its deadline \
+             with a live connection published"
+        );
     }
 }

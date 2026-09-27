@@ -469,21 +469,50 @@ pub const UDP_RECV_SLACK: usize = 1;
 /// How long a partial reassembly is held before it is discarded. A datagram
 /// missing a fragment is undeliverable, and UDP gives the peer no reason to
 /// wait longer than a retransmit-free round trip.
+///
+/// This is a real deadline only because both datagram readers drive
+/// [`DgramReassembler::expire`] from a [`FRAG_SWEEP_INTERVAL_MS`] tick.
 pub const FRAG_TIMEOUT_MS: u64 = 2_000;
 
+/// Cadence of the readers' reassembly-expiry tick.
+///
+/// The reassembler cannot expire itself: `push` is only reached when a fragment
+/// *arrives*, so a peer that stops sending datagrams (keeping its connection
+/// alive on keepalives) would hold its partials forever. Both datagram readers
+/// therefore tick this often and call [`DgramReassembler::expire`], which bounds
+/// a partial's life to `FRAG_TIMEOUT_MS + FRAG_SWEEP_INTERVAL_MS`.
+pub const FRAG_SWEEP_INTERVAL_MS: u64 = 500;
+
+/// How long a sending context must wait after exhausting the 16-bit fragment id
+/// space before it may reuse an id.
+///
+/// Must cover the receiver's *whole* partial lifetime (a partial expires at
+/// `FRAG_TIMEOUT_MS`, but only when a sweep runs: up to one
+/// `FRAG_SWEEP_INTERVAL_MS` later) with margin, or a fragment of the newer
+/// generation can land in the older generation's partial and splice two
+/// datagrams together — which the receiver cannot detect without a wire
+/// generation marker, and which delivers the mix to the older target. See
+/// [`DgramFragmenter::send`].
+pub const FRAG_ID_SAFE_WINDOW_MS: u64 = FRAG_TIMEOUT_MS + FRAG_SWEEP_INTERVAL_MS + 500;
+
+const _: () = assert!(
+    FRAG_ID_SAFE_WINDOW_MS > FRAG_TIMEOUT_MS + FRAG_SWEEP_INTERVAL_MS,
+    "the id-reuse window must outlast the partial lifetime it protects"
+);
+
 /// Reassembly memory bound per connection, counted over the bytes partials
-/// actually **retain**: pinned `Bytes` storage plus the slot table each partial
+/// actually **retain**: the owned chunk bytes plus the slot table each partial
 /// owns, past which the oldest partial is evicted — so this is also what caps how
 /// many datagrams may be in flight at once.
 ///
-/// Retained, not payload, bytes: a zero-copy chunk is a slice of the whole
-/// received DATAGRAM, so a 16-byte final fragment still pins its ~284-byte frame
-/// (see [`DgramReassembler`]), and every partial owns a
-/// `vec![None; total]` slot table (`total x 32 B` = up to 2 KiB) that a peer can
-/// fill with empty chunks. At the protocol's 8 KiB payload ceiling a full
-/// partial costs roughly 10-11 KiB, i.e. on the order of 20-25 concurrent
-/// partials per connection — far above any real RTT's worth of unfragmented
-/// arrivals, while still bounding what a fragment flood can pin.
+/// Retained, not payload, bytes: every partial owns a `vec![None; total]` slot
+/// table (`total x 32 B` = up to 2 KiB) that a peer can fill with empty chunks,
+/// and each stored chunk is an owned copy of exactly its own length (see
+/// `DgramReassembler::push` for why the chunks are not aliases of the received
+/// datagram). At the protocol's 8 KiB payload ceiling a full partial costs
+/// roughly 10-11 KiB, i.e. on the order of 20-25 concurrent partials per
+/// connection — far above any real RTT's worth of unfragmented arrivals, while
+/// still bounding what a fragment flood can pin.
 pub const FRAG_MAX_HELD_BYTES: usize = 256 * 1024;
 
 /// Reassembly partial-count bound per connection: a defense-in-depth backstop
@@ -729,6 +758,26 @@ pub struct ServerConf {
     /// isolation / firewall).
     #[serde(default)]
     pub auth_token: String,
+    /// Maximum concurrent QUIC connections admitted by this process.
+    ///
+    /// Unset means: `MAX_CONNECTIONS` (4096) when `auth_token` is set, and
+    /// `MAX_UNAUTH_CONNECTIONS` (256) when it is not. That asymmetry is the
+    /// point — with no token *every* peer is unauthenticated, so the connection
+    /// budget is the pre-auth budget and the memory a peer can pin has to be
+    /// bounded accordingly (each connection may hold its receive window, its
+    /// send budget and both DATAGRAM buffers; see
+    /// [`per_connection_memory_bytes`]). Clamped to `1..=MAX_CONNECTIONS`;
+    /// raising it on a tokenless endpoint is warned about at startup.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Optional cap, in MiB, on the peer-pinnable memory the admitted
+    /// connections may represent: the connection cap is additionally limited to
+    /// `budget / per_connection_memory_bytes(tuning())`, so raising the transport
+    /// windows automatically admits fewer connections rather than quietly
+    /// multiplying the memory ceiling. Unset keeps the connection cap as the only
+    /// bound; the worst case is logged at startup either way.
+    #[serde(default)]
+    pub max_peer_memory_mb: Option<u64>,
     // ---- Transport tuning (all optional; None = low-latency default) ----
     // Larger windows trade loaded latency for peak throughput: 4/8/4 MB
     // reaches ~240 Mb/s @140 ms and 8/16/8 MB reaches ~300 Mb/s, against the
@@ -918,6 +967,29 @@ impl Default for TransportTuning {
 fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
     let mb = v.unwrap_or(def_mb).clamp(1, 64);
     mb * 1024 * 1024
+}
+
+/// Worst-case peer-pinnable memory one admitted connection can represent under
+/// `tuning`, in bytes.
+///
+/// Deliberately conservative and simple, because it feeds an *admission* bound:
+///
+/// - `receive_window`: unread inbound stream data quinn buffers for us (the
+///   connection window caps the sum over all of that connection's streams);
+/// - `send_window`: queued outbound stream data a peer that stops reading can
+///   make us hold before our writers block;
+/// - both DATAGRAM buffers: not flow-controlled at all, so a flood fills them
+///   whatever the application does.
+///
+/// Per-stream windows are not added: they are bounded by the connection window.
+/// The result is a ceiling, not a reservation — quinn allocates on demand — which
+/// is exactly what "how many connections may this host admit" has to be based
+/// on. See [`ServerConf::max_peer_memory_mb`].
+pub fn per_connection_memory_bytes(tuning: &TransportTuning) -> u64 {
+    tuning
+        .receive_window
+        .saturating_add(tuning.send_window)
+        .saturating_add(2 * DATAGRAM_BUFFER as u64)
 }
 
 impl ServerConf {
@@ -3307,35 +3379,38 @@ pub mod udp_write {
             });
         }
     }
+    // Without the `stats` feature every total reads zero, as documented: these
+    // are counts, and a literal 1 made every drop warning claim "1 so far" no
+    // matter how many had happened.
     pub fn retried() -> u64 {
         #[cfg(feature = "stats")]
         return bump(&RETRIED);
         #[cfg(not(feature = "stats"))]
-        return 1;
+        return 0;
     }
     pub fn dropped_no_permit() -> u64 {
         #[cfg(feature = "stats")]
         return bump(&DROPPED_NO_PERMIT);
         #[cfg(not(feature = "stats"))]
-        return 1;
+        return 0;
     }
     pub fn failed() -> u64 {
         #[cfg(feature = "stats")]
         return bump(&FAILED);
         #[cfg(not(feature = "stats"))]
-        return 1;
+        return 0;
     }
     pub fn no_app() -> u64 {
         #[cfg(feature = "stats")]
         return bump(&NO_APP);
         #[cfg(not(feature = "stats"))]
-        return 1;
+        return 0;
     }
     pub fn retry_failed() -> u64 {
         #[cfg(feature = "stats")]
         return bump(&RETRY_FAILED);
         #[cfg(not(feature = "stats"))]
-        return 1;
+        return 0;
     }
 
     /// Totals since process start. `sent` is thread-local batched (flushed at
@@ -3604,6 +3679,18 @@ impl PayloadSend {
 #[derive(Debug, Default)]
 pub struct DgramFragmenter {
     next_id: u16,
+    /// [`mono_millis`] when `next_id` wrapped (0 = it never has). See
+    /// [`FRAG_ID_SAFE_WINDOW_MS`].
+    last_wrap_ms: u64,
+}
+
+/// Whether handing out a fresh fragment id would risk colliding with a partial
+/// the receiver may still hold — see [`FRAG_ID_SAFE_WINDOW_MS`].
+///
+/// Split out of [`DgramFragmenter::send`] so the window logic is testable
+/// without a live connection; `now_ms` is the [`mono_millis`] epoch.
+fn frag_id_reuse_blocked(last_wrap_ms: u64, now_ms: u64) -> bool {
+    last_wrap_ms != 0 && now_ms.saturating_sub(last_wrap_ms) < FRAG_ID_SAFE_WINDOW_MS
 }
 
 impl DgramFragmenter {
@@ -3682,9 +3769,44 @@ impl DgramFragmenter {
                 failed: Some(DatagramSend::TooLarge),
             };
         }
+        // The 16-bit id must not be reused while the receiver can still hold a
+        // partial for it: an id that comes around again feeds a second payload's
+        // fragments into the first payload's partial, and a fragment landing on
+        // an *empty* slot completes a spliced datagram that is delivered to the
+        // older generation's target (see the note on the restart heuristic in
+        // `DgramReassembler::push_with_chunk`). Refusing to fragment while the
+        // whole id space has been consumed faster than the receiver forgets is
+        // the only wire-compatible way to rule that out. The cost is a hard
+        // ceiling of `65_536 / FRAG_ID_SAFE_WINDOW_MS` fragmented payloads per
+        // second per sending context (~21k/s at the shipped 3 s window, i.e.
+        // ~30 MB/s of 1.4 KB payloads or ~170 MB/s of 8 KB payloads); above it
+        // oversized payloads are dropped and counted instead of corrupted.
+        if frag_id_reuse_blocked(self.last_wrap_ms, mono_millis()) {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "fragment id would be reused inside the reassembly window",
+                n,
+                || {
+                    format!(
+                        "; more than {} fragmented payloads/s on one session/association \
+                         would wrap the 16-bit fragment id while the receiver can still \
+                         hold a partial; refusing to fragment rather than splicing",
+                        65_536 / FRAG_ID_SAFE_WINDOW_MS
+                    )
+                },
+            );
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        }
         let total = total_usize as u8;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.last_wrap_ms = mono_millis();
+        }
 
         let mut frames = 0u8;
         for (i, part) in payload.chunks(chunk).enumerate() {
@@ -3739,12 +3861,11 @@ struct Partial {
     /// Payload bytes held. Bounds the *assembled* datagram
     /// ([`MQP_FRAG_MAX_PAYLOAD`]) and sizes `assemble`'s output buffer.
     bytes: usize,
-    /// Bytes actually pinned by the stored chunks, **plus the slot table
-    /// itself** (see [`Partial::slot_table_bytes`]). With
-    /// [`DgramReassembler::push_zero_copy`] a chunk is a `Bytes` slice of the
-    /// whole received DATAGRAM, so this is `>= bytes` — often much more, since a
-    /// 16-byte final chunk still pins its ~1.4 KiB frame. [`DgramReassembler`]
-    /// bounds *this*, not `bytes`; see the note on the reassembler.
+    /// Bytes actually retained by the stored chunks, **plus the slot table
+    /// itself** (see [`Partial::slot_table_bytes`]). Every stored chunk is an
+    /// owned copy of exactly its own length (see `DgramReassembler::push`), so
+    /// this is `bytes` once a chunk exists, and both are what
+    /// [`DgramReassembler`] bounds against [`FRAG_MAX_HELD_BYTES`].
     retained: usize,
     first_ms: u64,
 }
@@ -3800,21 +3921,21 @@ impl Partial {
 /// the protocol's payload ceiling discards the whole partial, so a peer cannot
 /// make this side relay a datagram the encoder on the other end would have
 /// refused), and in aggregate by [`FRAG_MAX_HELD_BYTES`] over the bytes the
-/// chunks actually **retain**, not merely their payload length.
+/// partials actually retain.
 ///
-/// **Retained vs payload bytes.** [`push_zero_copy`](Self::push_zero_copy)
-/// stores a `Bytes` slice of the whole received DATAGRAM, so a chunk pins the
-/// entire datagram allocation while contributing only `chunk.len()` payload
-/// bytes. Charging the payload length alone let a peer hold
-/// `FRAG_MAX_PARTIALS` x 64 partials of 16-byte chunks — `held` exactly at the
-/// cap, so nothing was ever evicted — while pinning on the order of 4 MiB per
-/// connection (each tiny chunk keeps its ~284-byte frame, and a quinn receive
-/// buffer may be larger still). The aggregate bound is therefore enforced over
-/// `retained`; the payload-length accounting is kept separately because it is
-/// what [`MQP_FRAG_MAX_PAYLOAD`] and the assembled buffer are about. The same
-/// bound also carries each partial's slot table, so empty chunks — which pin
-/// nearly nothing themselves — cannot keep 256 x 2 KiB of slot table outside
-/// every byte budget.
+/// **Retained bytes are exact.** Each stored chunk is an owned copy of exactly
+/// its own length, plus the partial's slot table; both are charged to `held`.
+/// An earlier revision kept the received datagram's `Bytes` slice instead
+/// (a refcount bump, no copy) and charged the *frame's* length for it — but the
+/// frame is a narrow slice of quinn's per-`recvmsg` receive batch (up to
+/// ~92 KiB with GRO), so a 20 B fragment could pin ~92 KiB while the budget read
+/// 20 B. `Bytes` cannot report a slice's backing allocation, so the only exact
+/// accounting is to own the chunk; see [`DgramReassembler::push`].
+///
+/// **Expiry is tick-driven.** [`expire`](Self::expire) must be called by a
+/// caller that owns a clock tick: `push` is reached only when a fragment
+/// arrives, so without it a peer that stops sending datagrams pins its partials
+/// for the connection's lifetime.
 #[derive(Default)]
 pub struct DgramReassembler {
     parts: HashMap<(u32, u16), Partial>,
@@ -3828,10 +3949,9 @@ impl DgramReassembler {
         Self::default()
     }
 
-    /// Bytes the in-flight partials actually retain (pinned `Bytes` storage plus
-    /// each partial's slot table, not payload length — see
-    /// [`Partial::retained`]). This is the quantity [`FRAG_MAX_HELD_BYTES`]
-    /// bounds.
+    /// Bytes the in-flight partials retain (the owned chunk bytes plus each
+    /// partial's slot table, not payload length — see [`Partial::retained`]).
+    /// This is the quantity [`FRAG_MAX_HELD_BYTES`] bounds.
     pub fn held_bytes(&self) -> usize {
         self.held
     }
@@ -3851,61 +3971,27 @@ impl DgramReassembler {
     /// freed on completion, and suppressing them would cost a window of
     /// completed ids for no semantic gain.
     ///
-    /// This form copies `f.chunk` into a fresh `Bytes`. Prefer
-    /// [`push_zero_copy`](Self::push_zero_copy) when the decoded frame still
-    /// borrows from an owned datagram — the hot path does.
+    /// The chunk is **copied**, deliberately, and this is the only entry point.
+    ///
+    /// There used to be a zero-copy variant that stored `parent.slice(..)` of
+    /// the datagram the frame was decoded from. That is unsound as a *memory
+    /// bound*: `Connection::read_datagram` hands out a narrow slice of quinn's
+    /// per-`recvmsg` receive batch (`max_udp_payload_size x gro_segments`, i.e.
+    /// up to 64 x 1472 B = ~92 KiB on Linux, where quinn-udp enables `UDP_GRO`),
+    /// and `Bytes` cannot report the size of the allocation behind a slice. The
+    /// charge was therefore the *frame's* length while the pin was the whole
+    /// batch, so a 20 B fragment could hold ~92 KiB of RSS against a budget that
+    /// read as 20 B — the aggregate bound, `held_bytes()` and every number
+    /// derived from them were fiction. Owning the chunk makes the charge exact
+    /// (one small allocation per fragment) and keeps the bound real.
     pub fn push(&mut self, f: &FragmentRef<'_>, now_ms: u64) -> Option<(u32, TargetAddr, Bytes)> {
-        // The copied chunk owns exactly its own bytes, so payload and retained
-        // length coincide on this path.
-        self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), f.chunk.len(), now_ms)
-    }
-
-    /// Zero-copy [`push`](Self::push): `parent` must be the exact `Bytes` `f`
-    /// was decoded from, so the stored chunk is `parent.slice(..)` — a refcount
-    /// bump — instead of `Bytes::copy_from_slice` (a full copy of every
-    /// fragment body).
-    ///
-    /// [`decode_fragment`] always slices the chunk out to the *end* of the
-    /// frame, so the start offset is `parent.len() - f.chunk.len()`. The
-    /// "is this chunk really the suffix of `parent`?" check is a single
-    /// pointer comparison against that offset — not a body compare — so the
-    /// hot path stays O(1). A caller that passes a mismatched pair falls back
-    /// to a copy rather than slicing the wrong bytes.
-    ///
-    /// A zero-copy chunk retains the whole `parent` allocation, so this path
-    /// charges `parent.len()` (not `f.chunk.len()`) against
-    /// [`FRAG_MAX_HELD_BYTES`] — see [`Partial::retained`].
-    pub fn push_zero_copy(
-        &mut self,
-        parent: &Bytes,
-        f: &FragmentRef<'_>,
-        now_ms: u64,
-    ) -> Option<(u32, TargetAddr, Bytes)> {
-        let (chunk, retained) = if f.chunk.len() <= parent.len() {
-            let start = parent.len() - f.chunk.len();
-            // `f.chunk` is a subslice of the same allocation as `parent` at
-            // exactly this offset iff the two pointers agree. `Bytes` is
-            // immutable, so a match means the body compare would also match.
-            if f.chunk.as_ptr() == parent.as_ptr().wrapping_add(start) {
-                (parent.slice(start..), parent.len())
-            } else {
-                let copy = Bytes::copy_from_slice(f.chunk);
-                let len = copy.len();
-                (copy, len)
-            }
-        } else {
-            let copy = Bytes::copy_from_slice(f.chunk);
-            let len = copy.len();
-            (copy, len)
-        };
-        self.push_with_chunk(f, chunk, retained, now_ms)
+        self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), now_ms)
     }
 
     fn push_with_chunk(
         &mut self,
         f: &FragmentRef<'_>,
         chunk: Bytes,
-        retained: usize,
         now_ms: u64,
     ) -> Option<(u32, TargetAddr, Bytes)> {
         if f.total < 2 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total {
@@ -3968,19 +4054,30 @@ impl DgramReassembler {
                 // Same shape but a different generation: the address changed,
                 // or this index already holds different bytes. An identical
                 // chunk is a plain replay and stays ignored below; a differing
-                // one is a fast id reuse, so restart rather than splice (a
-                // stale fragment landing on an *empty* slot stays
-                // indistinguishable without a wire generation marker, but that
-                // requires id reuse inside the 2s window plus exact
-                // interleaving, and at most drops or reorders UDP payloads).
+                // one is a fast id reuse, so restart rather than splice.
+                //
+                // This heuristic cannot see a stale fragment that lands on an
+                // *empty* slot, and such a fragment does not merely "drop or
+                // reorder" a payload: if generation A's early chunks and
+                // generation B's later chunks together cover every index, the
+                // partial completes and a spliced datagram is delivered — to
+                // **A's** target, whose address the partial was created with.
+                // That needs the same `(sess, id, total, address)` twice inside
+                // one reassembly window, which a sender can now only produce by
+                // wrapping the 16-bit id at ~22k fragmented payloads/s; the
+                // sender refuses to do that (see `FRAG_ID_SAFE_WINDOW_MS` and
+                // `DgramFragmenter::send`), so the splice is unreachable from a
+                // conforming peer and remains a wire-format limit that a
+                // hand-rolled sender could still exploit against itself.
                 self.held = self.held.saturating_sub(entry.retained);
                 *entry = Partial::new(f.total, &f.address, now_ms);
             }
             let slot = &mut entry.chunks[f.idx as usize];
             if slot.is_none() {
+                let len = chunk.len();
                 *slot = Some(chunk);
                 entry.got += 1;
-                entry.bytes += f.chunk.len();
+                entry.bytes += len;
                 // The slot table is charged with the first stored chunk, once
                 // per partial: every removal path subtracts `retained`, so
                 // charging it here keeps `held` balanced for the partial's whole
@@ -3990,11 +4087,8 @@ impl DgramReassembler {
                 } else {
                     0
                 };
-                entry.retained = entry
-                    .retained
-                    .saturating_add(retained)
-                    .saturating_add(table);
-                self.held = self.held.saturating_add(retained).saturating_add(table);
+                entry.retained = entry.retained.saturating_add(len).saturating_add(table);
+                self.held = self.held.saturating_add(len).saturating_add(table);
             }
             entry.got == entry.total
         };
@@ -4014,10 +4108,28 @@ impl DgramReassembler {
     }
 
     /// Drop partials whose first fragment is older than [`FRAG_TIMEOUT_MS`].
+    ///
+    /// Throttled to one sweep per second; [`expire`](Self::expire) is the
+    /// unthrottled form for a clock tick.
     fn maybe_sweep(&mut self, now_ms: u64) {
         if self.last_sweep_ms != 0 && now_ms.saturating_sub(self.last_sweep_ms) < 1_000 {
             return;
         }
+        self.expire(now_ms);
+    }
+
+    /// Drop every partial whose first fragment is older than
+    /// [`FRAG_TIMEOUT_MS`], regardless of the sweep throttle.
+    ///
+    /// A caller that owns a clock tick **must** call this even when no fragment
+    /// is arriving. `push` is the only other path that can expire state, so a
+    /// peer that sends its fragments and then stops sending datagrams — while
+    /// its QUIC connection stays alive on keepalives — would otherwise pin its
+    /// partials (and every byte they retain) for the connection's lifetime, and
+    /// [`FRAG_TIMEOUT_MS`] would be a promise the code does not keep. Both
+    /// datagram readers drive this from a
+    /// [`FRAG_SWEEP_INTERVAL_MS`](crate::FRAG_SWEEP_INTERVAL_MS) tick.
+    pub fn expire(&mut self, now_ms: u64) {
         self.last_sweep_ms = now_ms;
         let mut freed = 0usize;
         let mut expired = 0u64;
@@ -4844,6 +4956,17 @@ async fn copy_tcp_quic_inner(
                 };
                 if n == 0 {
                     continue;
+                }
+                // quinn writes only `batch[..n]`; every entry above it still holds
+                // the *previous* call's chunk, and those are slices of quinn
+                // receive buffers the assembler has already dropped from its own
+                // accounting (see `Assembler::read`). Leaving them there pins
+                // those allocations for the flow's lifetime — a burst-then-trickle
+                // flow (any bulk download that settles, a WebSocket, ssh) leaves up
+                // to `COPY_BATCH - 1` of them — so the tail is cleared explicitly
+                // instead of waiting for a later call to overwrite it.
+                for stale in batch[n..].iter_mut() {
+                    *stale = Bytes::new();
                 }
                 let mut batch_bytes = 0usize;
                 for b in batch.iter().take(n) {
@@ -6341,33 +6464,50 @@ mod tests {
         );
     }
 
-    /// The aggregate reassembly bound must be charged over the bytes a chunk
-    /// actually *retains*, not its payload length.
+    /// `held_bytes` must be the *exact* memory a partial retains, and the
+    /// aggregate cap must bound it.
     ///
-    /// A zero-copy chunk is a slice of the whole received DATAGRAM, so a 16-byte
-    /// final fragment still pins its ~276-byte frame. Charging only
-    /// `chunk.len()` let a peer hold `FRAG_MAX_PARTIALS` partials of tiny
-    /// fragments with `held` at (or under) the cap — nothing evicted — while
-    /// pinning an order of magnitude more memory. This test would pass on the
-    /// payload-based accounting only if retention were free, which it is not:
-    /// with 8-byte chunks in 276-byte frames the payload sum stays tiny while
-    /// retention crosses the cap, so the eviction path must fire and
-    /// `inflight()` must stay below the number of partials fed.
+    /// Retention used to be the received datagram's `Bytes` slice charged at the
+    /// frame's length. That is not a bound at all: the frame is a slice of
+    /// quinn's per-`recvmsg` receive batch (up to ~92 KiB with GRO), so a chunk
+    /// could pin ~92 KiB while `held_bytes()` read 20 B. Chunks are owned copies
+    /// now, so the retained figure is checkable exactly — chunk bytes plus the
+    /// slot table — and the cap really bounds what a flood can pin.
     #[test]
-    fn zero_copy_reassembly_is_bounded_by_retained_bytes() {
+    fn retained_bytes_are_exact_and_bounded() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let mut r = DgramReassembler::new();
+        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(6000), 4000);
+        assert_eq!(frames.len(), 2, "6000 B over 4000 B chunks");
+        let f0 = decode_fragment(&frames[0]).unwrap();
+        assert!(r.push(&f0, 0).is_none());
+        assert_eq!(
+            r.held_bytes(),
+            f0.chunk.len() + Partial::slot_table_bytes(f0.total),
+            "retained must be exactly the owned chunk plus its slot table"
+        );
+        // Completion gives every byte back.
+        assert!(r.push(&decode_fragment(&frames[1]).unwrap(), 0).is_some());
+        assert_eq!(r.held_bytes(), 0);
+        assert_eq!(r.inflight(), 0);
+
+        // A flood of never-completing full-width partials is still bounded, and
+        // the bound still evicts rather than merely reporting a number. With
+        // exact accounting each such partial costs its 63 stored fragments plus
+        // a 64-slot table (2 KiB), so 200 of them (~500 KiB) must be trimmed to
+        // the 256 KiB cap — and the count cap (256) is not what does it.
         let addr = TargetAddr::Domain("a".repeat(255), 53);
         let chunk = [0u8; 8];
         let total = 64u8;
+        let fed = 200u16;
         let mut r = DgramReassembler::new();
         let mut completed = 0;
-        // Every partial is fed one fragment short of completion, so retention
-        // accumulates instead of being released on assembly.
-        for id in 0..24u16 {
+        for id in 0..fed {
             for idx in 0..(total - 1) {
                 let body =
                     encode_fragment(1, id, idx, total, &addr.as_ref(), &chunk, 4096).unwrap();
                 let f = decode_fragment(&body).unwrap();
-                if r.push_zero_copy(&body, &f, 0).is_some() {
+                if r.push(&f, 0).is_some() {
                     completed += 1;
                 }
             }
@@ -6379,15 +6519,103 @@ mod tests {
             r.held_bytes()
         );
         assert!(
-            r.held_bytes() > MQP_FRAG_MAX_PAYLOAD,
-            "the retained figure must dwarf the payload sum, which is what makes \
-             the payload-based bound useless here: {} B",
-            r.held_bytes()
-        );
-        assert!(
-            r.inflight() < 24,
-            "the retained-byte bound must evict: {} partials in flight",
+            r.inflight() < fed as usize,
+            "the byte bound must evict full-width partials: {} of {fed} in flight",
             r.inflight()
+        );
+        assert!(r.inflight() > 0, "the newest partials stay");
+    }
+
+    /// A partial must expire on a clock tick, with no fragment arriving.
+    ///
+    /// `push` is the only other path that expires state, so without a tick a
+    /// peer that sends fragments and then goes quiet (keeping its connection
+    /// alive on keepalives) pins its partials — and every byte they retain —
+    /// for the connection's lifetime.
+    #[test]
+    fn expire_drops_partials_without_a_following_fragment() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(6000), 4000);
+        let mut r = DgramReassembler::new();
+        assert!(r
+            .push(&decode_fragment(&frames[0]).unwrap(), 1_000)
+            .is_none());
+        assert_eq!(r.inflight(), 1);
+        assert!(r.held_bytes() > 0);
+
+        // Still inside the window: nothing may be dropped.
+        r.expire(1_000 + FRAG_TIMEOUT_MS - 1);
+        assert_eq!(r.inflight(), 1, "a live partial survives the tick");
+
+        r.expire(1_000 + FRAG_TIMEOUT_MS);
+        assert_eq!(r.inflight(), 0, "the tick expires it with no push at all");
+        assert_eq!(r.held_bytes(), 0, "and gives its bytes back");
+    }
+
+    /// The sender must refuse to reuse a fragment id while the receiver can
+    /// still hold a partial for it, because reuse is what lets two datagrams
+    /// splice (see `same_shape_id_reuse_restarts_instead_of_splicing` for the
+    /// case the receiver *can* detect, and `push_with_chunk` for the case it
+    /// cannot).
+    #[test]
+    fn fragment_id_reuse_is_blocked_inside_the_reassembly_window() {
+        // Never wrapped: nothing to guard.
+        assert!(!frag_id_reuse_blocked(0, 1_000_000));
+        // Wrapped just now: blocked.
+        assert!(frag_id_reuse_blocked(10_000, 10_000));
+        assert!(frag_id_reuse_blocked(
+            10_000,
+            10_000 + FRAG_ID_SAFE_WINDOW_MS - 1
+        ));
+        // The receiver has had its whole window plus a sweep by now.
+        assert!(!frag_id_reuse_blocked(
+            10_000,
+            10_000 + FRAG_ID_SAFE_WINDOW_MS
+        ));
+        // The window must outlast the partial lifetime it protects; that
+        // invariant is asserted at the constant itself.
+    }
+
+    /// The guard is wired into `send`, not merely available as a predicate: a
+    /// context whose id space just wrapped must refuse the oversized payload
+    /// (counted as a size drop) and resume once the window has passed.
+    #[tokio::test]
+    async fn fragmenter_refuses_a_reused_id_inside_the_window() {
+        let (client, server) = endpoint_pair().await;
+        let server_addr = server.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            incoming.accept().unwrap().await.unwrap()
+        });
+        let conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let _sconn = accept.await.unwrap();
+
+        let addr = TargetAddr::Ip("9.9.9.9:53".parse().unwrap());
+        // Use the live DATAGRAM budget: a hard-coded limit above it would be
+        // refused by the encoder for the wrong reason.
+        let limit = conn.max_datagram_size().expect("DATAGRAM negotiated");
+        let payload = pattern(limit + 200);
+        let mut frag = DgramFragmenter::new();
+
+        let before = dgram_drops::snapshot();
+        frag.last_wrap_ms = mono_millis();
+        let refused = frag.send(&conn, 1, &addr.as_ref(), &payload, limit);
+        assert_eq!(refused.frames, 0);
+        assert_eq!(refused.failed, Some(DatagramSend::TooLarge));
+        assert!(
+            dgram_drops::snapshot().too_large > before.too_large,
+            "a refusal that loses an oversized payload must be counted"
+        );
+
+        frag.last_wrap_ms = mono_millis().saturating_sub(FRAG_ID_SAFE_WINDOW_MS);
+        let sent = frag.send(&conn, 1, &addr.as_ref(), &payload, limit);
+        assert!(
+            sent.complete() && sent.frames > 1,
+            "fragmenting resumes once the receiver cannot still hold the id: {sent:?}"
         );
     }
 
@@ -6856,7 +7084,7 @@ mod tests {
             while let Ok(d) = conn.read_datagram().await {
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else { continue };
-                    if let Some(x) = reasm.push_zero_copy(&d, &f, mono_millis()) {
+                    if let Some(x) = reasm.push(&f, mono_millis()) {
                         out.push(x);
                     }
                 } else {
@@ -7333,6 +7561,40 @@ mod tests {
         assert!(
             KEEP_ALIVE_MAX_SECS.saturating_mul(4) <= 1200,
             "the watchdog must stay inside 20 minutes"
+        );
+    }
+
+    /// The admission bound multiplies this figure by the admitted connection
+    /// count, so it has to track the configured windows rather than restate a
+    /// constant: a deployment that raises the windows must see the per-connection
+    /// ceiling rise with them.
+    #[test]
+    fn per_connection_memory_tracks_the_windows() {
+        let d = per_connection_memory_bytes(&TransportTuning::default());
+        // 4 MB receive + 2 MB send + 2 x 1 MB DATAGRAM buffers.
+        assert_eq!(
+            d,
+            4 * 1024 * 1024 + 2 * 1024 * 1024 + 2 * DATAGRAM_BUFFER as u64
+        );
+        let wide = TransportTuning {
+            receive_window: 16 * 1024 * 1024,
+            send_window: 8 * 1024 * 1024,
+            ..TransportTuning::default()
+        };
+        assert_eq!(per_connection_memory_bytes(&wide) - d, 18 * 1024 * 1024);
+        // The per-stream window is bounded by the connection window and must not
+        // be charged twice.
+        let narrow_streams = TransportTuning {
+            stream_receive_window: 1024 * 1024,
+            ..TransportTuning::default()
+        };
+        assert_eq!(per_connection_memory_bytes(&narrow_streams), d);
+        // A full house of the shipped defaults is the number the README's limits
+        // table has to agree with.
+        assert_eq!(
+            d * 4096 / (1024 * 1024 * 1024),
+            32,
+            "4096 x 8 MB is the 32 GiB worst case documented for the default windows"
         );
     }
 
