@@ -810,37 +810,45 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from this revision (pass 44, i.e. on top of the pass-40…43 fixes) with the
-default feature set, so the relay counters are **on** in these builds: static musl,
-x86-64, stripped — servers 4 393 896–4 416 688 B (v1 4 401 632, v2 4 393 896,
-v3 4 416 688, v4 4 413 872) and clients 4 423 096–4 438 312 B (v1 4 438 312,
-v2 4 423 096, v3 4 436 240, v4 4 434 176). Against the pass-39 *recorded* figures
-that is **−5 456…−6 432 B** per server level and **+1 280…+1 600 B** per client
-level. The direction is accounted for rather than asserted: the servers shrink
-because pass 43 deleted the inert per-shard over-cap trim (`evict_ranked` plus its
-O(shard) rank and `select_nth_unstable`) and pass 42 replaced `ConnPin`'s heap
-`String` with an inline buffer, while the clients grow because they link the
-library changes from passes 40–41 (the TTL-exposing DNS lookups, the epoch-tagged
-negative memo, the two new `is_global_ip` masks) — the client binary's own edits
-this round are `#[cfg(test)]` and do not ship. The recipe, `target-cpu` flags and
-feature set are unchanged and `Cargo.lock` is untouched; the per-level codegen
-spread accounts for the residual differences. The builds **were** statically
-checked: `file` confirms ELF 64-bit LSB x86-64, statically linked, stripped on all
-eight artifacts, and `objdump -d` finds 278 `zmm` refs in the v4 server and 240 in
-the v4 client with none in v1–v3 of either binary (`ymm` 3 978 / 3 971 / 25 134 /
-24 330 server and 3 978 / 3 971 / 26 534 / 25 580 client for v1→v4), so each
-`target-cpu` level really is compiled in. The shipped pair was then **run**, not
-just inspected: inside Podman's amd64 runtime on Apple Silicon, the **dist v1**
-server+client brought the tunnel up and passed TCP ECHO 1 MiB byte-for-byte, the
-UDP sweep at 8 / 1200 / 1420 / 2000 / 8000 B (the last two through `type=0x05`
-fragments) at 0 % loss, and the two-target switch check at 100 alpha / 100 beta and
-100 IP / 100 domain with **0 misrouted**; the emulated CPU runs the v3 server
-(clean startup) while the v4 server dies with exit 132 (`Illegal instruction`)
-before printing its listen line, which is the expected consequence of an AVX512
-level on a CPU without AVX512 and the dynamic counterpart of the static `zmm`
-counts. What was **not** repeated is a byte-identical second build, and these are
-still x86-64 binaries that should be validated on the actual target before a fleet
-rollout.
+rebuilt from this revision (pass 45, on top of the reassembly, fragment-id, expiry
+and admission fixes) with the default feature set, so the relay counters are **on**
+in these builds: static musl, x86-64, stripped — servers 4 417 152–4 439 960 B
+(v1 4 425 464, v2 4 417 152, v3 4 437 976, v4 4 439 960) and clients
+4 424 936–4 440 408 B (v1 4 440 408, v2 4 424 936, v3 4 437 968, v4 4 435 904),
+i.e. **+21 288…+26 088 B** per server level and **+1 728…+2 096 B** per client level
+against the pass-44 artifacts. The growth is accounted for rather than asserted: the
+admission logging, the per-connection stream-share accounting and the lock-free
+reply allowlist land in both binaries, and the guard/expiry-tick/chunk-ownership
+code in the library they link; none of it adds per-packet work on the relay paths.
+The recipe, `target-cpu` flags and feature set are unchanged and `Cargo.lock` is
+untouched. The builds **were** statically checked: `file` confirms ELF 64-bit LSB
+x86-64, statically linked, stripped on all eight artifacts, and the `target-cpu`
+levels were verified rather than assumed — `objdump -d` finds 278 `zmm` refs in the
+v4 server and 240 in the v4 client with none in v1–v3 of either binary (`ymm`
+3 978 / 3 971 / 25 148 / 24 312 server and 3 978 / 3 971 / 26 531 / 25 577 client
+for v1→v4, so the AVX2 step lands at v3 and the AVX512 step at v4).
+Reproducibility was measured three times over: two independent four-level builds
+produced eight byte-identical artifacts (`sha256` equal for all eight), and the
+final rebuild of the committed source reproduced the same eight hashes once more.
+The shipped pair was then **run**, not just inspected: inside Podman's amd64 runtime
+on Apple Silicon the dist **v1** server+client brought the tunnel up (6 accepts, 6
+connects, 0 dial failures) and passed TCP ECHO 1 MiB byte-for-byte (0 mismatched),
+the UDP sweep at 8 / 1200 / 1420 / 1430 / 2000 / 8000 B × 200 datagrams (the last two
+through `type=0x05` fragments), `udpdomainswitch` 50 alpha + 50 beta and
+`udpipswitch` 50 IP + 50 domain with **0 misrouted**, `udpmulti` 4 associations ×
+300 at **0.000 % loss**, and 40 TCP flows (all 40 with replies). One caveat is
+recorded rather than smoothed over: in some emulated runs the 6-fragment **8000 B**
+size lost 3–4 of 200 datagrams, while the smaller sizes and TCP were always clean.
+An A/B build with the pre-pass-45 behaviour (the expiry tick disabled, i.e. partials
+living up to ~3 s instead of the tick-enforced ~2 s) showed the same intermittent
+loss at that size on the same emulated host, so it is an artifact of qemu amd64
+emulation on a 2 GiB VM rather than of the tightened fragment deadline; natively the
+identical sweep passes 300/300 at every size including 8000 B. The emulated CPU
+levels behave as documented: the v3 server starts cleanly and the v4 server dies
+with exit 132 (`Illegal instruction`) before printing its listen line, the dynamic
+counterpart of the static `zmm` counts. What was **not** repeated is a native run of
+the v3 pair, and these are still x86-64 binaries that should be validated on the
+actual target before a fleet rollout.
 The pass-30/28/27/26 rebuild notes are kept verbatim below (their figures are those
 passes'). Against the pass-27
 *recorded* figures,
@@ -4505,6 +4513,27 @@ peers keep working.
   worst-case footprint are logged at startup, and a worst case above 1 GiB warns.
   Tests: `admission_cap_bounds_connections_by_memory`,
   `per_connection_memory_tracks_the_windows`.
+- **dist/ rebuilt from this revision.** All four CPU levels, static musl,
+  stripped, default feature set: servers 4 417 152–4 439 960 B and clients
+  4 424 936–4 440 408 B (+21 288…+26 088 / +1 728…+2 096 B per level vs pass 44,
+  accounted for by the admission logging, the stream-share accounting, the
+  lock-free reply allowlist and the library's guard/expiry/ownership code — no new
+  per-packet work). Verified: `file` (ELF 64-bit x86-64, statically linked,
+  stripped) on all eight; `objdump -d` finds 278/240 `zmm` refs in the v4
+  server/client and none in v1–v3 (`ymm` 3 978 / 3 971 / 25 148 / 24 312 server,
+  3 978 / 3 971 / 26 531 / 25 577 client), so each `target-cpu` level is compiled
+  in; two independent four-level builds are byte-identical (`sha256`) and the
+  rebuild of the committed source reproduced the same eight hashes. The dist **v1**
+  pair was run under Podman amd64 emulation (Apple Silicon): 6 accepts / 6
+  connects / 0 dial failures, TCP ECHO 1 MiB byte-for-byte, the UDP sweep at
+  8 / 1200 / 1420 / 1430 / 2000 / 8000 B × 200 (fragment path included),
+  `udpdomainswitch`/`udpipswitch` 50+50 / 50+50 with 0 misrouted, `udpmulti`
+  4 × 300 at 0.000 % loss and 40/40 TCP flows; v3 starts cleanly, v4 dies with
+  exit 132 as expected on the AVX512-less emulated CPU. Recorded caveat: in some
+  emulated runs the 6-fragment 8000 B size lost 3–4 of 200 datagrams, and an A/B
+  build with the expiry tick disabled (pre-pass-45 sweep timing) lost the same way
+  on that host, so it is qemu/VM scheduling rather than the tightened deadline —
+  natively the same sweep is 300/300 at 0 % loss.
 - **Kept wire-compatible on purpose.** A 32-bit fragment id (or a per-payload
   generation byte) would remove the id-reuse ceiling entirely, but it is a
   framing change: with the default `h3` ALPN there is no negotiated version, so
