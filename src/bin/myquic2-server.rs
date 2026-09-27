@@ -542,14 +542,18 @@ const SESS_IDLE_MS: u64 = 180_000;
 /// Process-wide cap on concurrent TCP dials. Per-connection caps alone cannot
 /// bound fd usage when an unauthenticated peer can open many connections.
 const MAX_DIALS_GLOBAL: usize = 4096;
-/// Wall-clock budget for the *whole* pre-auth phase of a connection that holds
-/// one of the [`MAX_UNAUTH_CONNECTIONS`] slots: the post-accept handshake wait
-/// and the token exchange share one deadline. They used to be independent
-/// (`HANDSHAKE_TIMEOUT` and then `AUTH_TIMEOUT`), so 256 slow peers could hold
-/// every pre-auth slot — and the receive-window memory behind each — for 15 s
-/// back to back; one deadline makes the same wave cost 5 s. That covers a
-/// 140 ms-RTT handshake plus the 1-RTT token with margin.
+/// Wall-clock budget for the handshake wait of a connection that holds
+/// one of the [`MAX_UNAUTH_CONNECTIONS`] slots. The token exchange gets its
+/// own fresh [`AUTH_TIMEOUT`] deadline re-armed after the handshake completes,
+/// so a slow handshake cannot consume the authentication budget and fail a
+/// healthy client with `unauthorized`. Without re-arming, one 5 s deadline for
+/// both phases let handshake latency starve the token read.
 const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fresh budget for the token exchange (`accept_uni` + token read) once the
+/// handshake has completed. Re-armed from handshake completion — no extra RTT,
+/// only a deadline re-arm — and the pre-auth slot stays held until
+/// `authenticate` returns.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for completing the QUIC handshake when **no** pre-auth slot is held
 /// (`auth_token` unset, so there is no memory budget to defend). With
 /// authentication enabled, [`PRE_AUTH_TIMEOUT`] bounds the handshake instead.
@@ -635,9 +639,10 @@ static DIAL_CONNECT_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Process-wide cap on concurrently handled QUIC bidi streams. The transport's
 /// per-connection stream credit ([`MAX_BIDI_STREAMS_PER_CONN`], now 8192 so one
 /// admitted client can never stall in `open_bi`) times the connection cap is far
-/// more live stream tasks than any host wants, each holding a 5s header timer
-/// while queued on the DNS/dial limiters; this bounds the worst case to a fixed
-/// number of tasks, and excess streams are reset by the accept loop.
+/// more live stream tasks than any host wants; this bounds the worst case to a
+/// fixed number of tasks, and excess streams are reset by the accept loop. The
+/// permit covers the dial/auth work only — the 5 s header read runs before it
+/// is acquired, so trickle headers cannot exhaust the pool.
 const MAX_STREAM_TASKS: usize = 16_384;
 
 /// Lower bound on one connection's share of [`MAX_STREAM_TASKS`].
@@ -1026,9 +1031,11 @@ async fn main() -> Result<()> {
         // Read by `handle_conn` to size this connection's share of the
         // process-wide stream-task pool (a clone per accepted connection).
         let conn_limit_for_conn = conn_limit.clone();
-        // One deadline for the whole pre-auth phase while a slot is held (see
+        // One deadline for the handshake while a slot is held (see
         // `PRE_AUTH_TIMEOUT`); without a token there is no slot to free and the
-        // more generous handshake budget applies.
+        // more generous handshake budget applies. The token exchange below gets
+        // a fresh `AUTH_TIMEOUT` deadline re-armed after the handshake, so a
+        // slow handshake cannot starve it.
         let handshake_budget = if pending.is_some() {
             PRE_AUTH_TIMEOUT
         } else {
@@ -1079,7 +1086,13 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
-            if let Err(e) = authenticate(&conn, &auth_token, deadline).await {
+            if let Err(e) = authenticate(
+                &conn,
+                &auth_token,
+                tokio::time::Instant::now() + AUTH_TIMEOUT,
+            )
+            .await
+            {
                 warn!("auth failed from {}: {e:#}", conn.remote_address());
                 conn.close(0x01u32.into(), b"unauthorized");
                 return;
@@ -1467,13 +1480,14 @@ async fn handle_conn(
     // `MAX_BIDI_STREAMS_PER_CONN` (8192) streams — more than the whole pool — so
     // each connection also has to stay inside its own share of it. Without this,
     // the first two peers to arrive hold every permit while their flows sit idle
-    // (a permit is held for the flow's lifetime, and a stream that never sends
-    // its header still holds one for the 5 s header timeout, so the treadmill is
-    // cheap), and every other client's CONNECT is reset after its SOCKS success
-    // reply — with nothing logged server-side.
+    // and every other client's CONNECT is reset after its SOCKS success
+    // reply — with nothing logged server-side. The 5 s header read runs before
+    // either pool is touched (see `handle_tcp_stream`), so a stream that never
+    // sends its header parks only its own task for the budget instead of a
+    // permit plus a share slot, and the trickle treadmill is no longer cheap.
     let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
+        let (send, recv) = match conn.accept_bi().await {
             Ok(x) => x,
             Err(_) => break,
         };
@@ -1484,185 +1498,208 @@ async fn handle_conn(
             .saturating_sub(conn_limit.available_permits())
             .max(1);
         let share = stream_share(admitted);
-        if streams_held.load(std::sync::atomic::Ordering::Relaxed) >= share {
-            let n = STREAM_SHARE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if warn_stream_share_refused() {
-                warn!(
-                    "tcp stream share reached ({share} of {MAX_STREAM_TASKS} across \
-                     {admitted} connection(s), {n} refused so far); resetting the stream"
-                );
-            }
-            send.reset(0x05u32.into()).ok();
-            continue;
-        }
-        let stream_permit = match stream_task_limiter().clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                // Fail the stream immediately instead of queueing unbounded work.
-                send.reset(0x05u32.into()).ok();
-                continue;
-            }
-        };
-        streams_held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let stream_share_guard = StreamShareGuard(streams_held.clone());
         let stat_conn = conn.clone();
-        tokio::spawn(async move {
-            let _stream_permit = stream_permit;
-            let _stream_share_guard = stream_share_guard;
-            let target: TargetAddr = match tokio::time::timeout(
-                Duration::from_secs(5),
-                read_mqp_target(&mut recv),
-            )
-            .await
-            {
-                Ok(Ok(t)) => t,
-                _ => {
-                    send.reset(0x01u32.into()).ok();
-                    return;
-                }
-            };
-            // Candidate addresses for the dial. Both branches produce a plain
-            // `&[SocketAddr]`: the IP-literal path (the dominant case) borrows
-            // the decoded target and allocates nothing, while the domain path
-            // resolves into a local buffer whose scope covers the dial.
-            let ip_cand;
-            let mut dns_cand = [SocketAddr::from(([0, 0, 0, 0], 0)); 8];
-            let dns_n;
-            let cands: &[SocketAddr] = match &target {
-                TargetAddr::Ip(s) => {
-                    ip_cand = *s;
-                    std::slice::from_ref(&ip_cand)
-                }
-                TargetAddr::Domain(h, p) => {
-                    // Fail fast when the global slow-path budget is exhausted
-                    // instead of parking this stream task (and its
-                    // stream-task permit) in a 3s queue: a unique-domain
-                    // flood would otherwise hold up to MAX_STREAM_TASKS
-                    // permits while IP-literal flows starve behind them.
-                    // Matches the UDP path's try_acquire; the client retries.
-                    let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            send.reset(0x04u32.into()).ok();
-                            return;
-                        }
-                    };
-                    dns_n = match resolve_all_cached_with_contention_retry(h, *p).await {
-                        Ok(v) => {
-                            // `resolve_all_cached` sorts IPv4 first, so a flat
-                            // prefix cut would starve IPv6 whenever upstream
-                            // returns more than 8 v4 records. Alternate
-                            // families instead, keeping v4 preference while
-                            // guaranteeing v6 gets tried.
-                            let mut n = 0;
-                            let mut v4 = v.iter().filter(|a| a.is_ipv4());
-                            let mut v6 = v.iter().filter(|a| !a.is_ipv4());
-                            // Alternate families so v6 is never starved, but
-                            // keep filling from whichever family still has
-                            // records until the 8-slot buffer is full (a
-                            // v4-only answer must still yield up to 8).
-                            let mut want_v4 = true;
-                            while n < dns_cand.len() {
-                                let next = if want_v4 {
-                                    v4.next().or_else(|| v6.next())
-                                } else {
-                                    v6.next().or_else(|| v4.next())
-                                };
-                                match next {
-                                    Some(a) => {
-                                        dns_cand[n] = *a;
-                                        n += 1;
-                                    }
-                                    None => break,
-                                }
-                                want_v4 = !want_v4;
-                            }
-                            n
-                        }
-                        Err(e) => {
-                            if is_dns_contended(&e) {
-                                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-                            }
-                            0
-                        }
-                    };
-                    drop(permit);
-                    &dns_cand[..dns_n]
-                }
-            };
-            // Hold the global dial permit only for the connect phase; the copy
-            // phase is bounded by the transport's stream limit instead.
-            // Fail fast instead of parking this stream task (and its
-            // stream-task permit) in a DIAL_PERMIT_WAIT queue: a dial flood
-            // would otherwise hold up to MAX_STREAM_TASKS permits while
-            // later flows starve behind them. Matches the stream_task_limiter
-            // and dns_slow_path_limiter try_acquire paths; the client retries.
-            let _dial_permit = match dial_limiter().clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    let n =
-                        DIAL_PERMIT_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::debug!("tcp dial permit refused ({n} so far)");
-                    send.reset(0x04u32.into()).ok();
-                    return;
-                }
-            };
-            let tcp = match dial_happy_eyeballs(cands, allow_private).await {
-                Some(t) => t,
-                None => {
-                    let n =
-                        DIAL_CONNECT_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::debug!("tcp dial failed ({n} so far)");
-                    send.reset(0x04u32.into()).ok();
-                    return;
-                }
-            };
-            drop(_dial_permit);
-            let _ = tcp.set_nodelay(true);
-            // MQP-2: report the bound address of the dialed socket so the
-            // client can answer SOCKS with the real BND.ADDR/PORT (RFC 1928)
-            // instead of a placeholder.
-            let bnd = tcp
-                .local_addr()
-                .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            // Fixed-size stack buffer: the ACK is at most magic + status + the
-            // v6 bnd form (`MAX_TCP_ACK_LEN`), so the per-stream `Vec` this
-            // used to allocate bought nothing.
-            let mut ack = [0u8; MAX_TCP_ACK_LEN];
-            let n = encode_tcp_ack_into(bnd, &mut ack);
-            // Bounded: a stalled stream must not pin this task and its
-            // stream-task permit until connection death; the client tears the
-            // flow down on a missing ACK, so a slow write here buys nothing.
-            // Reset symmetrically with the dial-failure paths above so the
-            // client fails fast instead of waiting out its 25s ACK timeout.
-            let ack_sent = tokio::time::timeout(Duration::from_secs(5), send.write_all(&ack[..n]))
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
-            if !ack_sent {
-                send.reset(0x04u32.into()).ok();
-                return;
-            }
-            match copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await {
-                Ok((up, down)) => {
-                    tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
-                }
-                Err(e) => {
-                    if tcp_abort_log_due() {
-                        let st = stat_conn.stats();
-                        tracing::warn!(
-                            "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
-                            st.path.rtt,
-                            st.path.cwnd,
-                            st.path.lost_packets,
-                            st.path.sent_packets,
-                        );
-                    }
-                }
-            }
-        });
+        // One task per accepted stream, bounded by the transport's
+        // per-connection stream credit — never by the pools below. The task
+        // reads the header before touching either pool.
+        tokio::spawn(handle_tcp_stream(
+            send,
+            recv,
+            streams_held.clone(),
+            share,
+            admitted,
+            allow_private,
+            stat_conn,
+        ));
     }
     Ok(())
+}
+
+/// One accepted TCP bidi stream: header first, admission second, dial last.
+///
+/// The 5 s header read runs *before* the per-connection share check and the
+/// process-wide stream-task permit, and holds neither: a stream that trickles
+/// one byte per 4.9 s parks only its own task for the budget instead of a
+/// `MAX_STREAM_TASKS` permit plus a share slot, so a slowloris treadmill can
+/// no longer exhaust the pool. Spawning is still bounded — one task per
+/// accepted stream, capped by the transport's per-connection stream credit —
+/// and the share/permit are taken fail-fast (`try_acquire`, `0x05` reset) once
+/// the header is in, so they bound only the dial/auth work.
+async fn handle_tcp_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    streams_held: Arc<std::sync::atomic::AtomicUsize>,
+    share: usize,
+    admitted: usize,
+    allow_private: bool,
+    stat_conn: quinn::Connection,
+) {
+    let target: TargetAddr =
+        match tokio::time::timeout(Duration::from_secs(5), read_mqp_target(&mut recv)).await {
+            Ok(Ok(t)) => t,
+            _ => {
+                send.reset(0x01u32.into()).ok();
+                return;
+            }
+        };
+    if streams_held.load(std::sync::atomic::Ordering::Relaxed) >= share {
+        let n = STREAM_SHARE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if warn_stream_share_refused() {
+            warn!(
+                "tcp stream share reached ({share} of {MAX_STREAM_TASKS} across \
+                 {admitted} connection(s), {n} refused so far); resetting the stream"
+            );
+        }
+        send.reset(0x05u32.into()).ok();
+        return;
+    }
+    let _stream_permit = match stream_task_limiter().clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            // Fail the stream immediately instead of queueing unbounded work.
+            send.reset(0x05u32.into()).ok();
+            return;
+        }
+    };
+    streams_held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let _stream_share_guard = StreamShareGuard(streams_held);
+    // Candidate addresses for the dial. Both branches produce a plain
+    // `&[SocketAddr]`: the IP-literal path (the dominant case) borrows
+    // the decoded target and allocates nothing, while the domain path
+    // resolves into a local buffer whose scope covers the dial.
+    let ip_cand;
+    let mut dns_cand = [SocketAddr::from(([0, 0, 0, 0], 0)); 8];
+    let dns_n;
+    let cands: &[SocketAddr] = match &target {
+        TargetAddr::Ip(s) => {
+            ip_cand = *s;
+            std::slice::from_ref(&ip_cand)
+        }
+        TargetAddr::Domain(h, p) => {
+            // Fail fast when the global slow-path budget is exhausted
+            // instead of parking this stream task (and its
+            // stream-task permit) in a 3s queue: a unique-domain
+            // flood would otherwise hold up to MAX_STREAM_TASKS
+            // permits while IP-literal flows starve behind them.
+            // Matches the UDP path's try_acquire; the client retries.
+            let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    send.reset(0x04u32.into()).ok();
+                    return;
+                }
+            };
+            dns_n = match resolve_all_cached_with_contention_retry(h, *p).await {
+                Ok(v) => {
+                    // `resolve_all_cached` sorts IPv4 first, so a flat
+                    // prefix cut would starve IPv6 whenever upstream
+                    // returns more than 8 v4 records. Alternate
+                    // families instead, keeping v4 preference while
+                    // guaranteeing v6 gets tried.
+                    let mut n = 0;
+                    let mut v4 = v.iter().filter(|a| a.is_ipv4());
+                    let mut v6 = v.iter().filter(|a| !a.is_ipv4());
+                    // Alternate families so v6 is never starved, but
+                    // keep filling from whichever family still has
+                    // records until the 8-slot buffer is full (a
+                    // v4-only answer must still yield up to 8).
+                    let mut want_v4 = true;
+                    while n < dns_cand.len() {
+                        let next = if want_v4 {
+                            v4.next().or_else(|| v6.next())
+                        } else {
+                            v6.next().or_else(|| v4.next())
+                        };
+                        match next {
+                            Some(a) => {
+                                dns_cand[n] = *a;
+                                n += 1;
+                            }
+                            None => break,
+                        }
+                        want_v4 = !want_v4;
+                    }
+                    n
+                }
+                Err(e) => {
+                    if is_dns_contended(&e) {
+                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                    }
+                    0
+                }
+            };
+            drop(permit);
+            &dns_cand[..dns_n]
+        }
+    };
+    // Hold the global dial permit only for the connect phase; the copy
+    // phase is bounded by the transport's stream limit instead.
+    // Fail fast instead of parking this stream task (and its
+    // stream-task permit) in a DIAL_PERMIT_WAIT queue: a dial flood
+    // would otherwise hold up to MAX_STREAM_TASKS permits while
+    // later flows starve behind them. Matches the stream_task_limiter
+    // and dns_slow_path_limiter try_acquire paths; the client retries.
+    let _dial_permit = match dial_limiter().clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let n = DIAL_PERMIT_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::debug!("tcp dial permit refused ({n} so far)");
+            send.reset(0x04u32.into()).ok();
+            return;
+        }
+    };
+    let tcp = match dial_happy_eyeballs(cands, allow_private).await {
+        Some(t) => t,
+        None => {
+            let n = DIAL_CONNECT_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::debug!("tcp dial failed ({n} so far)");
+            send.reset(0x04u32.into()).ok();
+            return;
+        }
+    };
+    drop(_dial_permit);
+    let _ = tcp.set_nodelay(true);
+    // MQP-2: report the bound address of the dialed socket so the
+    // client can answer SOCKS with the real BND.ADDR/PORT (RFC 1928)
+    // instead of a placeholder.
+    let bnd = tcp
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+    // Fixed-size stack buffer: the ACK is at most magic + status + the
+    // v6 bnd form (`MAX_TCP_ACK_LEN`), so the per-stream `Vec` this
+    // used to allocate bought nothing.
+    let mut ack = [0u8; MAX_TCP_ACK_LEN];
+    let n = encode_tcp_ack_into(bnd, &mut ack);
+    // Bounded: a stalled stream must not pin this task and its
+    // stream-task permit until connection death; the client tears the
+    // flow down on a missing ACK, so a slow write here buys nothing.
+    // Reset symmetrically with the dial-failure paths above so the
+    // client fails fast instead of waiting out its 25s ACK timeout.
+    let ack_sent = tokio::time::timeout(Duration::from_secs(5), send.write_all(&ack[..n]))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !ack_sent {
+        send.reset(0x04u32.into()).ok();
+        return;
+    }
+    match copy_tcp_quic_idle(tcp, send, recv, Duration::from_secs(300)).await {
+        Ok((up, down)) => {
+            tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
+        }
+        Err(e) => {
+            if tcp_abort_log_due() {
+                let st = stat_conn.stats();
+                tracing::warn!(
+                    "tcp {target:?} aborted: {e:#} (rtt={:?} cwnd={} lost={}/{} pkts)",
+                    st.path.rtt,
+                    st.path.cwnd,
+                    st.path.lost_packets,
+                    st.path.sent_packets,
+                );
+            }
+        }
+    }
 }
 
 /// Byte length of the complete MQP-2 TCP header for a given `atyp`: how much
@@ -2035,10 +2072,12 @@ async fn forward_server_dgram(
                             }
                             DnsInflight::Absent => {}
                         }
-                        if dns_slow_path_limiter().available_permits() == 0 {
-                            dgram_drops::bump(&dgram_drops::SESSION_FULL);
-                            return None;
-                        }
+                        // Fail fast on the slow-path budget with exactly one bump
+                        // per refusal: `try_acquire_owned` is the only check,
+                        // so a permit freed between a probe and the acquire is
+                        // still usable and an exhausted budget is counted once
+                        // (a separate `available_permits() == 0` pre-check both
+                        // dropped usable permits and double-counted the race).
                         let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
@@ -2082,7 +2121,20 @@ async fn forward_server_dgram(
                             .await
                             {
                                 Some(v) => v,
-                                None => return,
+                                // `get_or_create_sess` already bumps the
+                                // specific budget counter for every resource
+                                // refusal (FAIR_SHARE / SESSION_FULL /
+                                // SESS_CREATE_FAILED); the only silent None is
+                                // the no-DATAGRAM path, counted here so the
+                                // spawned datagram never vanishes from the 60 s
+                                // budget line. Guarded (not unconditional) so a
+                                // refusal is never bumped twice.
+                                None => {
+                                    if cd.max_datagram_size().is_none() {
+                                        dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
+                                    }
+                                    return;
+                                }
                             };
                             remember_dst(&ss, s, dst);
                             udp_try_send(&sock, map_for_dual(dst), payload);
@@ -2432,21 +2484,29 @@ fn touch_memo_idx(conn: usize, sess: u32) -> usize {
 
 /// Refresh `last` at most once per [`TOUCH_INTERVAL_MS`], using a thread-local
 /// copy of the last refresh time.
+///
+/// Single clock for liveness: the throttle gate runs on the cheap
+/// [`coarse_millis`] epoch (one relaxed load per datagram), but the value
+/// stored into `last` is [`mono_millis`]. Every other writer of `last`
+/// (session creation) and every reader (`sweep_all`, `take_idle`,
+/// `sweep_local`, the reader idle tick) already uses the mono epoch, so
+/// storing the 1 s-quantized coarse sample here made the sweep subtract a
+/// stamp up to one tick older than the true touch — reaping a live session up
+/// to ~1 s before its 180 s budget ran out. The precise read costs one vDSO
+/// call and runs only when the touch is actually due (at most once per
+/// second per session), so the per-packet cost stays one coarse read.
 fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     const TOUCH_INTERVAL_MS: u64 = 1000;
-    // The coarse epoch, not `mono_millis()`: this runs on *every* inbound
-    // datagram and only ever compares against a 1 s throttle and a 180 s
-    // deadline. The `TouchMemo` note below explains why the clock read cannot
-    // simply be sampled by packet count — the replacement is a time source that
-    // advances on its own, which is what `coarse_millis` is.
-    let now = coarse_millis();
+    // Throttle gate only: cheap, advances on its own (unlike a packet-count
+    // sampler, which froze `last` on trickle flows — see `TouchMemo`).
+    let gate = coarse_millis();
     let due = TOUCH_MEMO.with(|c| {
         let mut c = c.borrow_mut();
         let idx = touch_memo_idx(conn, sess);
         match c[idx].as_mut() {
             Some(e) if e.conn == conn && e.sess == sess => {
-                if now.saturating_sub(e.ms) >= TOUCH_INTERVAL_MS {
-                    e.ms = now;
+                if gate.saturating_sub(e.ms) >= TOUCH_INTERVAL_MS {
+                    e.ms = gate;
                     true
                 } else {
                     false
@@ -2456,14 +2516,14 @@ fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::Ato
                 c[idx] = Some(TouchMemo {
                     conn,
                     sess,
-                    ms: now,
+                    ms: gate,
                 });
                 true
             }
         }
     });
     if due {
-        last.store(now, std::sync::atomic::Ordering::Relaxed);
+        last.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2665,12 +2725,13 @@ async fn sess_reader_task(
                 continue;
             }
         };
-        // Coarse epoch: per *reply datagram*, and both consumers are second
-        // scale (the 1 s liveness touch and the 10 s PMTU refresh).
+        // Coarse epoch gates the per-reply intervals (the 1 s liveness touch
+        // and the 10 s PMTU refresh); the liveness value itself is the mono
+        // epoch, matching `touch_session_throttled` and every sweep reader.
         let now = coarse_millis();
         if now.saturating_sub(last_touch) >= 1000 {
             last_touch = now;
-            last2.store(now, std::sync::atomic::Ordering::Relaxed);
+            last2.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
         }
         // Active sessions track PMTU growth without waiting for the 60 s idle
         // tick: at most one quinn lock per session per 10 s, and only while the
@@ -2997,11 +3058,6 @@ async fn get_or_create_sess(
                 recent_epoch: recent_epoch.clone(),
             },
         );
-        udp_stats::session();
-        // Counted for the fair-share bound (see `len_upper_bound`): this is the
-        // insert the sample cannot see, and the gate must not keep reading the
-        // number that was true when the window opened.
-        ss.note_insert();
         if dead || w.get(&s).map(|e| e.reader.is_finished()).unwrap_or(false) {
             if let Some(e) = w.remove(&s) {
                 e.reader.abort();
@@ -3015,6 +3071,10 @@ async fn get_or_create_sess(
             )
         }
     };
+    if inserted {
+        udp_stats::session();
+        ss.note_insert();
+    }
     // This connection may have just become a session holder: join the fair-share
     // denominator. Called after the write guard is dropped (see
     // `note_empty_state`), and on the `dead` branch too, where the insert was
@@ -3914,6 +3974,24 @@ mod tests {
         assert_eq!(ss.len_upper_bound(now + 2_000, LOCAL_SESS_MAX), 8);
     }
 
+    #[tokio::test]
+    async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
+        let ss = ShardedSessTable::new();
+        let now = mono_millis();
+        assert_eq!(ss.len_upper_bound(now, LOCAL_SESS_MAX), 0);
+        ss.shard(7).write().unwrap().insert(7, capped_session(0));
+        ss.shard(7).write().unwrap().remove(&7);
+        assert_eq!(
+            ss.len_upper_bound(now, LOCAL_SESS_MAX),
+            0,
+            "a rolled-back insert must not inflate the fair-share bound"
+        );
+        ss.shard(7).write().unwrap().insert(7, capped_session(0));
+        ss.note_insert();
+        assert_eq!(ss.len_upper_bound(now, LOCAL_SESS_MAX), 1);
+        ss.shard(7).write().unwrap().remove(&7);
+    }
+
     /// Expired entries go through `take_idle` unbounded: 70 idle sessions are
     /// all reaped in one call, because aborting idle readers is not a storm.
     /// The old truncation reaped only the first 64 and left provably-dead
@@ -3978,6 +4056,75 @@ mod tests {
         last.store(mono_millis(), Ordering::Relaxed);
         assert!(sweep_local(&mut m).is_empty());
         assert!(m.contains_key(&1));
+    }
+
+    /// `touch_session_throttled` must store the mono epoch into `last`, not
+    /// the 1 s-quantized coarse sample it uses as its throttle gate: every
+    /// sweep reader subtracts `last` from a mono `now`, so a coarse stamp
+    /// reads up to one tick older than the true touch and reaps a live
+    /// session up to ~1 s before its 180 s budget runs out.
+    ///
+    /// The test waits until the coarse cursor visibly lags mono (>= 300 ms —
+    /// the 1 s ticker guarantees this within one tick), then touches with a
+    /// key no other test can hold so the store is unconditional. Against the
+    /// old store the stamp would lag by that same >= 300 ms; a mono store
+    /// reads fresh within microseconds.
+    #[tokio::test]
+    async fn touch_stores_mono_millis_not_the_coarse_gate() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Arm the epoch, then wait for a measurable lag between the two clocks.
+        let _ = coarse_millis();
+        let mut waited = 0;
+        while mono_millis().saturating_sub(coarse_millis()) < 300 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+            assert!(waited < 200, "the 1 s ticker must advance the cursor");
+        }
+        let lag = mono_millis().saturating_sub(coarse_millis());
+        assert!(lag >= 300, "need a visible coarse lag to test against");
+
+        // A key no other test uses: memo miss means the touch is due and the
+        // store is unconditional.
+        let last = Arc::new(AtomicU64::new(0));
+        touch_session_throttled(usize::MAX - 7, u32::MAX - 7, &last);
+        let stored = last.load(Ordering::Relaxed);
+        let mono_after = mono_millis();
+        assert!(stored != 0, "a memo-miss touch must store");
+        assert!(
+            stored <= mono_after,
+            "the stamp cannot run ahead of the clock"
+        );
+        assert!(
+            mono_after.saturating_sub(stored) < 300,
+            "the touch stamp must be a fresh mono sample, not the coarse gate \
+             lagging {lag} ms behind (stored={stored} mono={mono_after})"
+        );
+
+        // Sweep math is exact to the ms on a touched stamp: a session idle
+        // just under the budget survives, one exactly at it does not.
+        // Synthetic stamps: mono is process uptime, so a fast test process
+        // can never be 180 s old and no wall-clock stamp reads expired.
+        let now: u64 = 1_000_000;
+        let mut m: HashMap<u32, SessEntry> = HashMap::new();
+        m.insert(1, capped_session(1));
+        m.get(&1)
+            .unwrap()
+            .last
+            .store(now.saturating_sub(SESS_IDLE_MS - 500), Ordering::Relaxed);
+        assert!(
+            take_idle(&mut m, &[1], now).is_empty(),
+            "500 ms under budget must survive the sweep"
+        );
+        m.get(&1)
+            .unwrap()
+            .last
+            .store(now.saturating_sub(SESS_IDLE_MS), Ordering::Relaxed);
+        assert_eq!(
+            take_idle(&mut m, &[1], now).len(),
+            1,
+            "exactly at budget must reap"
+        );
     }
 
     /// The pin stores its name **inline**: arming must round-trip the longest
@@ -4202,6 +4349,173 @@ mod tests {
         assert_eq!(stream_share(0), MAX_BIDI_STREAMS_PER_CONN as usize);
         // The floor is never above the per-connection maximum.
         assert!(MIN_STREAM_SHARE <= MAX_BIDI_STREAMS_PER_CONN as usize);
+    }
+
+    /// Live loopback QUIC pair driving the production transport config, so the
+    /// stream-admission tests below run `handle_tcp_stream` against real
+    /// streams instead of a mock.
+    async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["test.com".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut scfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        scfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        server_cfg.transport_config(build_transport("bbr", 5));
+        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates({
+                let mut r = rustls::RootCertStore::empty();
+                r.add(cert.der().clone()).unwrap();
+                r
+            })
+            .with_no_client_auth();
+        ccfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
+        let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
+        let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
+        ccfg.transport_config(build_transport("bbr", 5));
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(ccfg);
+
+        let server_addr = server.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            incoming.await.unwrap()
+        });
+        let client_conn = client
+            .connect(server_addr, "test.com")
+            .unwrap()
+            .await
+            .unwrap();
+        let server_conn = accept.await.unwrap();
+        (client_conn, server_conn)
+    }
+
+    async fn read_reset_code(recv: &mut quinn::RecvStream) -> u64 {
+        match recv.read_chunk(64 * 1024, true).await {
+            Err(quinn::ReadError::Reset(code)) => code.into_inner(),
+            Err(e) => panic!("expected a stream reset, got {e:?}"),
+            Ok(_) => panic!("expected a stream reset, got bytes"),
+        }
+    }
+
+    /// H7 pin: a stream that never sends its header must wait out the 5 s
+    /// header budget holding NO stream-task permit. With every permit drained,
+    /// the old order (permit before header) reset `0x05` immediately without
+    /// reading; the new order reads first and resets `0x01` on the header
+    /// timeout. Either the code or the elapsed time falsifies a regression.
+    #[tokio::test]
+    async fn header_wait_holds_no_stream_task_permit() {
+        // Drain the process-wide pool. No other test in this binary touches
+        // `stream_task_limiter`, so this cannot starve parallel tests.
+        let _drained = stream_task_limiter()
+            .clone()
+            .acquire_many_owned(MAX_STREAM_TASKS as u32)
+            .await
+            .unwrap();
+        assert_eq!(stream_task_limiter().available_permits(), 0);
+
+        let (client_conn, server_conn) = stream_test_pair().await;
+        let (mut _cli_send, mut cli_recv) = client_conn.open_bi().await.unwrap();
+        let (srv_send, srv_recv) = server_conn.accept_bi().await.unwrap();
+
+        let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t0 = std::time::Instant::now();
+        // No header bytes are ever sent: the 5 s budget must elapse first.
+        handle_tcp_stream(
+            srv_send,
+            srv_recv,
+            streams_held.clone(),
+            MAX_STREAM_TASKS,
+            1,
+            true,
+            server_conn.clone(),
+        )
+        .await;
+        let waited = t0.elapsed();
+        assert!(
+            waited >= Duration::from_millis(4500),
+            "the header budget must elapse before admission is even attempted, waited {waited:?}"
+        );
+        assert_eq!(
+            read_reset_code(&mut cli_recv).await,
+            0x01,
+            "a header timeout resets 0x01 even with zero permits (old order reset 0x05 immediately)"
+        );
+        assert_eq!(
+            streams_held.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a header-less stream must never take a share slot"
+        );
+        client_conn.close(0u32.into(), b"done");
+        server_conn.close(0u32.into(), b"done");
+    }
+
+    /// The other half of the H7 pin: with the header already in, an exhausted
+    /// pool must still refuse fail-fast with `0x05` — no dial attempted, no
+    /// wait, no share slot taken. The target is loopback so even a leaked
+    /// permit could not dial anywhere surprising.
+    #[tokio::test]
+    async fn admission_after_header_still_fails_fast() {
+        let _drained = stream_task_limiter()
+            .clone()
+            .acquire_many_owned(MAX_STREAM_TASKS as u32)
+            .await
+            .unwrap();
+
+        let (client_conn, server_conn) = stream_test_pair().await;
+        let (mut cli_send, mut cli_recv) = client_conn.open_bi().await.unwrap();
+        // Valid IP-literal header for 127.0.0.1:9 (discard): decoding must
+        // succeed so the stream reaches admission, where the drained pool
+        // refuses it before any dial.
+        cli_send
+            .write_all(&[0x01, 127, 0, 0, 1, 0, 9])
+            .await
+            .unwrap();
+        let (srv_send, srv_recv) = server_conn.accept_bi().await.unwrap();
+
+        let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t0 = std::time::Instant::now();
+        handle_tcp_stream(
+            srv_send,
+            srv_recv,
+            streams_held.clone(),
+            MAX_STREAM_TASKS,
+            1,
+            true,
+            server_conn.clone(),
+        )
+        .await;
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_secs(4),
+            "admission with the header in must fail fast, took {took:?}"
+        );
+        assert_eq!(
+            read_reset_code(&mut cli_recv).await,
+            0x05,
+            "an exhausted pool after a good header resets 0x05"
+        );
+        assert_eq!(
+            streams_held.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a refused stream must never take a share slot"
+        );
+        client_conn.close(0u32.into(), b"done");
+        server_conn.close(0u32.into(), b"done");
     }
 
     /// The shard sweep never kills a *live* session, however far over the fair

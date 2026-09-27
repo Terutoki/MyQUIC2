@@ -810,29 +810,37 @@ done
 
 Prebuilt artifacts live in [`dist/openwrt-x86_64/`](dist/openwrt-x86_64/)
 (`*-v1` … `*-v4` for both binaries, plus sample configs). The shipped binaries were
-rebuilt from this revision (L1 fail-closed TCP ACK gate + L2 stale-live re-pick +
-P1 pooled recv buffers + P4 DNS miss-storm hardening, on top of the pass-45 tree)
+rebuilt from this revision (H1 fragment id-reuse tombstones + H3 stale-egress
+`close_reason` gate + H5 split handshake/token deadlines + H7 header-before-permit
+stream split + H2 mono-epoch liveness stores + H9 single-gate DNS accounting with
+guarded no-DATAGRAM count + H11 post-rollback session counters, on top of the
+L1/L2/P1/P4 tree)
 with the default feature set, so the relay counters are **on**
-in these builds: static musl, x86-64, stripped — servers 4 417 488–4 441 080 B
-(v1 4 425 608, v2 4 417 488, v3 4 438 968, v4 4 441 080) and clients
-4 426 232–4 443 536 B (v1 4 441 576, v2 4 426 232, v3 4 443 536, v4 4 441 536),
-i.e. **+144…+1 120 B** per server level and **+1 168…+5 632 B** per client level
+in these builds: static musl, x86-64, stripped — servers 4 423 888–4 447 864 B
+(v1 4 432 520, v2 4 423 888, v3 4 446 200, v4 4 447 864) and clients
+4 432 184–4 449 616 B (v1 4 447 656, v2 4 432 184, v3 4 449 616, v4 4 448 128),
+i.e. **+6 400…+7 232 B** per server level and **+5 952…+6 592 B** per client level
 against the previous `dist/` artifacts. The growth is accounted for rather than asserted:
-the 2-byte ACK magic + shared encoder, the `close_reason()` confirm in the TCP pick
-path, the thread-local recv-buffer pools (server + client) and the DNS limiter test
-land in both binaries; none of it adds per-packet work on the steady relay paths
-(the confirm is per TCP flow, the pools remove per-session malloc).
+the tombstone struct plus its replay tests, the egress liveness gate plus its
+invalidation test, the `AUTH_TIMEOUT` re-arm, the `handle_tcp_stream` header-first
+split, the mono-epoch stores, the DNS accounting branches and the moved session
+counters land in both binaries; none of it adds per-packet work on the steady relay paths
+(the tombstone check is one HashMap lookup plus at most one chunk memcmp per fragment,
+the egress gate runs at most once per refresh window, the mono read runs at most once
+per second per session).
 The recipe, `target-cpu` flags and feature set are unchanged and `Cargo.lock` is
 untouched. The builds **were** statically checked: `file` confirms ELF 64-bit LSB
 x86-64, statically linked, stripped on all eight artifacts, and the `target-cpu`
-levels were verified rather than assumed — `objdump -d` finds 278 `zmm` refs in the
-v4 server and 240 in the v4 client with none in v1–v3 of either binary (`ymm`
-3 978 / 3 971 / 25 146 / 24 310 server and 3 978 / 3 971 / 26 533 / 25 579 client
+levels were verified rather than assumed — `objdump -d` finds 283 `zmm` refs in the
+v4 server and 245 in the v4 client with none in v1–v3 of either binary (`ymm`
+3 978 / 3 971 / 25 177 / 24 379 server and 3 978 / 3 971 / 26 568 / 25 652 client
 for v1→v4, so the AVX2 step lands at v3 and the AVX512 step at v4).
 `cargo fmt --check` is clean on the built tree. What was **not** repeated is any
 emulated or native run of the shipped pairs, nor a byte-identical second build —
-the verification below applies to the native release build (`cargo test`
-targeted: L1 ACK-magic, L2 re-pick, pool bounds, churn caps, DNS limiter;
+the verification below applies to the native build (`cargo check --all-targets`
+clean; per-fix `cargo test --all-targets` / `cargo clippy --all-targets --
+-D warnings` green at fix time for H1/H3/H5/H7/H2/H9/H11, with the full parallel
+suite known to hang on loopback-timing flakes;
 `cargo clippy --all-targets -- -D warnings` clean), and a target that needs a
 loadable binary should be validated on the target before a fleet rollout.
 > ⚠️ **Wire break (L1): upgrade both sides together.** The TCP-open ACK gained a

@@ -713,11 +713,17 @@ impl SharedEgress {
             return Some((c, m, stamp));
         }
         // Stale-while-revalidate: an expired (or contended) handle is reused
-        // optimistically with no liveness check. A dead one surfaces as
-        // `ConnectionLost` on send and invalidates the cache there, so the
-        // expiry window costs zero quinn locks.
+        // optimistically, but only after one cheap liveness gate
+        // (`close_reason`, the same check the refresh stickiness path uses):
+        // a dead handle is invalidated here so the caller counts NO_EGRESS
+        // instead of sending a packet that can never arrive (the kill-9
+        // restart blackholed the whole expiry window before this gate). The
+        // loser path therefore costs at most one quinn lock and never parks.
         if let Some(c) = cached.load().as_ref() {
-            return Some((c.conn.clone(), c.limit, c.stamp_ms));
+            if c.conn.close_reason().is_none() {
+                return Some((c.conn.clone(), c.limit, c.stamp_ms));
+            }
+            self.invalidate(class);
         }
         self.memo_clear(class);
         None
@@ -2633,9 +2639,9 @@ async fn udp_associate_inner(
                 // the lock path runs only on a generation change or once the
                 // memo's stamp expires, and the single-flight winner still
                 // pays close_reason/max_datagram_size at most once per refresh
-                // window. Stale handles are reused optimistically with no
-                // liveness check: a dead one surfaces as ConnectionLost on
-                // send and invalidates the cache there.
+                // window. Stale handles are reused optimistically behind one
+                // cheap `close_reason` gate: a dead one is invalidated and
+                // counted as NO_EGRESS instead of being sent.
                 //
                 // `limit` is the connection's live `max_datagram_size()`: the
                 // real DATAGRAM budget for the discovered path MTU, with the
@@ -3542,6 +3548,66 @@ mod tests {
             "a fail-closed bulk class must not borrow the interactive handle"
         );
         assert!(e.cached[bc.index()].load().is_none());
+    }
+
+    /// The loser path of `acquire` gates an expired handle on one cheap
+    /// `close_reason` check: a live handle is still reused (zero-window
+    /// blackhole fix must not cost a drop), while a dead one is invalidated
+    /// so the caller counts NO_EGRESS instead of sending into a dead
+    /// connection for the whole refresh window (the kill-9 restart case).
+    /// The refresh gate is held so both probes take the loser path.
+    #[tokio::test]
+    async fn expired_dead_handle_is_invalidated_not_served() {
+        let (conn, _c, _s) = real_connection().await;
+        let pool = ConnPool::new(2, Vec::new(), true, true);
+        let e = SharedEgress::default();
+        let class = EgressClass::Interactive;
+        let now = mono_millis();
+        // Probe past the refresh window: a stamp of `now` read at
+        // `now + EGRESS_REFRESH_MS` is exactly expired. (Computing the stamp
+        // as `now - EGRESS_REFRESH_MS` saturates to 0 on a fast test clock
+        // and reads back as fresh.)
+        let expired_now = now + EGRESS_REFRESH_MS;
+        e.cached[class.index()].store(Some(Arc::new(EgressCache {
+            conn: conn.clone(),
+            limit: 1200,
+            stamp_ms: now,
+            slot: pool.udp_slot(class),
+        })));
+        e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Hold the single-flight gate: `refresh_global` returns None, so
+        // `acquire` must decide on the loser path alone.
+        e.refreshing[class.index()].store(true, std::sync::atomic::Ordering::Release);
+
+        // Live expired handle: reused, cache kept.
+        let got = e
+            .acquire(&pool, class, expired_now)
+            .expect("a live expired handle must still be served");
+        assert_eq!(got.0.stable_id(), conn.stable_id());
+        assert!(e.cached[class.index()].load().is_some());
+
+        // Dead expired handle: dropped, cache invalidated (generation bumped
+        // so every thread's memo misses), never handed out for a doomed send.
+        conn.close(0u32.into(), b"test");
+        assert!(
+            conn.close_reason().is_some(),
+            "the test's closed handle must probe dead"
+        );
+        let gen_before = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            e.acquire(&pool, class, expired_now).is_none(),
+            "a dead expired handle must not be served"
+        );
+        assert!(
+            e.cached[class.index()].load().is_none(),
+            "the dead handle must be invalidated"
+        );
+        assert_eq!(
+            e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire),
+            gen_before + 1,
+            "invalidation must bump the generation so memos miss"
+        );
+        e.refreshing[class.index()].store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Loopback QUIC endpoint pair through the same public TLS/transport

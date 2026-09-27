@@ -3938,6 +3938,53 @@ impl Partial {
     }
 }
 
+/// The chunks of a generation the reassembler has already let go of — either
+/// delivered whole ([`DgramReassembler::push`] completing a partial) or
+/// discarded by an id-reuse restart — kept for one [`FRAG_TIMEOUT_MS`] window
+/// so a stale replay of that generation cannot mix into the *next* generation
+/// on the same `(sess, id)`.
+///
+/// The restart heuristic in `push_with_chunk` can only see a stale fragment
+/// that lands on an *occupied* slot (or carries a different address/total). A
+/// replay of the old generation that lands on an *empty* slot of the new
+/// generation's live partial is byte-for-byte indistinguishable from a
+/// legitimate out-of-order fragment — unless the receiver remembers what the
+/// old generation held at that index. That is what this stores: the old
+/// generation's per-index chunks, compared by exact bytes on every push (one
+/// `HashMap` lookup plus at most one chunk `memcmp`, i.e. O(1) per fragment).
+///
+/// Only the most recent generation per key is kept: a conforming sender
+/// cannot reuse an id inside the window at all (see
+/// [`FRAG_ID_SAFE_WINDOW_MS`]), so a second reuse inside one window is either
+/// a replay or a non-conforming peer, and failing closed (dropping the replay)
+/// is the safe disposition either way. The residual the tombstone cannot see
+/// is a stale chunk the receiver *never stored* (an index the old generation
+/// never delivered here); that shape is unreachable from a conforming peer
+/// and stays documented at the restart heuristic rather than solved.
+///
+/// `retained` mirrors [`Partial::retained`] (owned chunk bytes plus the slot
+/// table) and is charged to the same `held` budget, so every removal path —
+/// expiry, count-cap eviction, byte-cap eviction, overwrite — must subtract
+/// it, exactly like a live partial.
+struct Tombstone {
+    total: u8,
+    address: TargetAddr,
+    chunks: Vec<Option<Bytes>>,
+    at_ms: u64,
+    retained: usize,
+}
+
+impl Tombstone {
+    fn retained_of(total: u8, chunks: &[Option<Bytes>]) -> usize {
+        chunks
+            .iter()
+            .flatten()
+            .map(Bytes::len)
+            .sum::<usize>()
+            .saturating_add(Partial::slot_table_bytes(total))
+    }
+}
+
 /// Reassembles [`MQP_DGRAM_FRAG`] frames into whole UDP payloads.
 ///
 /// Keyed by `(sess, id)`. Because every fragment carries the address header,
@@ -3959,6 +4006,17 @@ impl Partial {
 /// 20 B. `Bytes` cannot report a slice's backing allocation, so the only exact
 /// accounting is to own the chunk; see [`DgramReassembler::push`].
 ///
+/// **Id reuse across generations.** Besides the live partials, the reassembler
+/// keeps one [`Tombstone`] per recently completed or restarted `(sess, id)`
+/// (see above). A fragment whose bytes match the remembered generation at its
+/// index — same `total` and address — is a stale replay and is refused before
+/// it can occupy an empty slot of the next generation's partial and splice
+/// two datagrams together. A fragment that differs is the new generation and
+/// is stored normally; a new generation whose chunk happens to be
+/// byte-identical to the old one at some index is refused too (fail closed —
+/// unreachable from a conforming sender, which never reuses an id inside the
+/// window).
+///
 /// **Expiry is tick-driven.** [`expire`](Self::expire) must be called by a
 /// caller that owns a clock tick: `push` is reached only when a fragment
 /// arrives, so without it a peer that stops sending datagrams pins its partials
@@ -3966,7 +4024,12 @@ impl Partial {
 #[derive(Default)]
 pub struct DgramReassembler {
     parts: HashMap<(u32, u16), Partial>,
-    /// Retained bytes across all partials — see [`Partial::retained`].
+    /// Recently completed or restarted generations by `(sess, id)` — see
+    /// [`Tombstone`]. Never awaited, never delivered; consulted on every push
+    /// and reaped by [`expire`](Self::expire) after [`FRAG_TIMEOUT_MS`].
+    recent: HashMap<(u32, u16), Tombstone>,
+    /// Retained bytes across all partials *and* tombstones — see
+    /// [`Partial::retained`] and [`Tombstone`].
     held: usize,
     last_sweep_ms: u64,
 }
@@ -3976,8 +4039,9 @@ impl DgramReassembler {
         Self::default()
     }
 
-    /// Bytes the in-flight partials retain (the owned chunk bytes plus each
-    /// partial's slot table, not payload length — see [`Partial::retained`]).
+    /// Bytes the in-flight partials *and* the id-reuse tombstones retain
+    /// (the owned chunk bytes plus each slot table, not payload length — see
+    /// [`Partial::retained`]).
     /// This is the quantity [`FRAG_MAX_HELD_BYTES`] bounds.
     pub fn held_bytes(&self) -> usize {
         self.held
@@ -4012,7 +4076,60 @@ impl DgramReassembler {
     /// derived from them were fiction. Owning the chunk makes the charge exact
     /// (one small allocation per fragment) and keeps the bound real.
     pub fn push(&mut self, f: &FragmentRef<'_>, now_ms: u64) -> Option<(u32, TargetAddr, Bytes)> {
+        if self.is_stale_replay(f, now_ms) {
+            return None;
+        }
         self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), now_ms)
+    }
+
+    /// Whether `f` is a replay of the generation this `(sess, id)` tombstone
+    /// remembers: same shape and address, and byte-identical to what the old
+    /// generation held at this index. Pure lookup, no mutation — O(1).
+    fn is_stale_replay(&self, f: &FragmentRef<'_>, now_ms: u64) -> bool {
+        let Some(t) = self.recent.get(&(f.sess, f.id)) else {
+            return false;
+        };
+        if now_ms.saturating_sub(t.at_ms) >= FRAG_TIMEOUT_MS {
+            return false;
+        }
+        if t.total != f.total || t.address.as_ref() != f.address {
+            return false;
+        }
+        t.chunks
+            .get(f.idx as usize)
+            .is_some_and(|old| old.as_ref().is_some_and(|old| old.as_ref() == f.chunk))
+    }
+
+    /// File one generation's chunks as the `(sess, id)` tombstone, replacing
+    /// any older one for the key. Charged to `held` like a live partial, so
+    /// the count cap and the aggregate byte cap are enforced here — evicting
+    /// tombstones only, never a live partial, which keeps this path's
+    /// disposition identical to the pre-tombstone code when memory is tight.
+    fn remember(
+        &mut self,
+        key: (u32, u16),
+        total: u8,
+        address: TargetAddr,
+        chunks: Vec<Option<Bytes>>,
+        now_ms: u64,
+    ) {
+        let retained = Tombstone::retained_of(total, &chunks);
+        if let Some(old) = self.recent.remove(&key) {
+            self.held = self.held.saturating_sub(old.retained);
+        }
+        self.held = self.held.saturating_add(retained);
+        self.recent.insert(
+            key,
+            Tombstone {
+                total,
+                address,
+                chunks,
+                at_ms: now_ms,
+                retained,
+            },
+        );
+        while self.recent.len() > FRAG_MAX_PARTIALS && self.evict_oldest_tombstone() {}
+        while self.held > FRAG_MAX_HELD_BYTES && self.evict_oldest_tombstone() {}
     }
 
     fn push_with_chunk(
@@ -4062,43 +4179,54 @@ impl DgramReassembler {
             }
         }
         let complete = {
+            // A restart needs the old partial *moved out* (its chunks become
+            // the tombstone), which cannot happen through the entry borrow
+            // held across a `remember` call — so the decision is read first
+            // through a shared lookup, and the removal below owns the value.
+            let restart = match self.parts.get(&key) {
+                None => false,
+                Some(p) => {
+                    if p.total != f.total {
+                        true
+                    } else {
+                        p.got > 0
+                            && (p.address.as_ref() != f.address
+                                || p.chunks[f.idx as usize]
+                                    .as_ref()
+                                    .is_some_and(|old| old.as_ref() != f.chunk))
+                    }
+                }
+            };
+            if restart {
+                if let Some(old) = self.parts.remove(&key) {
+                    self.held = self.held.saturating_sub(old.retained);
+                    let total = old.total;
+                    self.remember(key, total, old.address, old.chunks, now_ms);
+                }
+            }
             let entry = self
                 .parts
                 .entry(key)
                 .or_insert_with(|| Partial::new(f.total, &f.address, now_ms));
-            if entry.total != f.total {
-                // A wrapped id reused with a different shape: restart rather
-                // than splice two datagrams together. Release the old bytes
-                // first or `held` overcounts forever.
-                self.held = self.held.saturating_sub(entry.retained);
-                *entry = Partial::new(f.total, &f.address, now_ms);
-            } else if entry.got > 0
-                && (entry.address.as_ref() != f.address
-                    || entry.chunks[f.idx as usize]
-                        .as_ref()
-                        .is_some_and(|old| old.as_ref() != f.chunk))
-            {
-                // Same shape but a different generation: the address changed,
-                // or this index already holds different bytes. An identical
-                // chunk is a plain replay and stays ignored below; a differing
-                // one is a fast id reuse, so restart rather than splice.
-                //
-                // This heuristic cannot see a stale fragment that lands on an
-                // *empty* slot, and such a fragment does not merely "drop or
-                // reorder" a payload: if generation A's early chunks and
-                // generation B's later chunks together cover every index, the
-                // partial completes and a spliced datagram is delivered — to
-                // **A's** target, whose address the partial was created with.
-                // That needs the same `(sess, id, total, address)` twice inside
-                // one reassembly window, which a sender can now only produce by
-                // wrapping the 16-bit id at ~22k fragmented payloads/s; the
-                // sender refuses to do that (see `FRAG_ID_SAFE_WINDOW_MS` and
-                // `DgramFragmenter::send`), so the splice is unreachable from a
-                // conforming peer and remains a wire-format limit that a
-                // hand-rolled sender could still exploit against itself.
-                self.held = self.held.saturating_sub(entry.retained);
-                *entry = Partial::new(f.total, &f.address, now_ms);
-            }
+            // A wrapped id reused with a different shape, or the same shape
+            // but a different generation (the address changed, or this index
+            // already holds different bytes — an identical chunk is a plain
+            // replay and stays ignored below): the removal above already
+            // restarted rather than splice, and filed the old generation as
+            // the key's tombstone so its replays cannot occupy the new
+            // partial's empty slots either.
+            //
+            // The heuristic still cannot see a stale fragment the receiver
+            // *never stored* (an index the old generation never delivered
+            // here): with the same `(sess, id, total, address)` it fills an
+            // empty slot exactly like a legitimate out-of-order fragment, and
+            // a completed mix would deliver to the older target. That needs
+            // the same key twice inside one reassembly window with no
+            // occupied-slot overlap at all, which a sender can now only
+            // produce by wrapping the 16-bit id at ~22k fragmented
+            // payloads/s; the sender refuses to do that (see
+            // `FRAG_ID_SAFE_WINDOW_MS` and `DgramFragmenter::send`), so the
+            // residue is unreachable from a conforming peer.
             let slot = &mut entry.chunks[f.idx as usize];
             if slot.is_none() {
                 let len = chunk.len();
@@ -4123,7 +4251,16 @@ impl DgramReassembler {
         if complete {
             let p = self.parts.remove(&key)?;
             self.held = self.held.saturating_sub(p.retained);
+            // File the delivered generation before its chunks are consumed:
+            // the clones are refcount bumps, not copies, and the tombstone
+            // keeps stale replays of this payload out of the next generation
+            // on the key. `remember` charges the bytes to `held`, so the
+            // aggregate bound still covers them.
+            let tomb_total = p.total;
+            let tomb_chunks = p.chunks.clone();
+            let tomb_addr = p.address.clone();
             let (address, whole) = p.into_datagram();
+            self.remember(key, tomb_total, tomb_addr, tomb_chunks, now_ms);
             return Some((key.0, address, whole));
         }
         while self.held > FRAG_MAX_HELD_BYTES {
@@ -4172,6 +4309,36 @@ impl DgramReassembler {
             udp_stats::reassembly_expired();
         }
         self.held = self.held.saturating_sub(freed);
+        // Tombstones age out on the same window: past it the old generation
+        // is forgotten everywhere, so an id reuse is a fresh generation by
+        // definition. Every removal subtracts `retained`, keeping `held`
+        // exact.
+        let mut tomb_freed = 0usize;
+        self.recent.retain(|_, t| {
+            let live = now_ms.saturating_sub(t.at_ms) < FRAG_TIMEOUT_MS;
+            if !live {
+                tomb_freed += t.retained;
+            }
+            live
+        });
+        self.held = self.held.saturating_sub(tomb_freed);
+    }
+
+    /// Drop the oldest tombstone, giving its bytes back to `held`. Tombstones
+    /// only — a live partial is never sacrificed for a remembered one.
+    fn evict_oldest_tombstone(&mut self) -> bool {
+        let Some(key) = self
+            .recent
+            .iter()
+            .min_by_key(|(_, t)| t.at_ms)
+            .map(|(k, _)| *k)
+        else {
+            return false;
+        };
+        if let Some(t) = self.recent.remove(&key) {
+            self.held = self.held.saturating_sub(t.retained);
+        }
+        true
     }
 
     fn evict_oldest(&mut self) -> bool {
@@ -6562,10 +6729,18 @@ mod tests {
             f0.chunk.len() + Partial::slot_table_bytes(f0.total),
             "retained must be exactly the owned chunk plus its slot table"
         );
-        // Completion gives every byte back.
+        // Completion files the delivered generation as the key's tombstone,
+        // so `held` keeps exactly the payload plus its slot table — still
+        // bounded, still accounted — and the tick releases it with the window.
         assert!(r.push(&decode_fragment(&frames[1]).unwrap(), 0).is_some());
-        assert_eq!(r.held_bytes(), 0);
         assert_eq!(r.inflight(), 0);
+        let f1 = decode_fragment(&frames[1]).unwrap();
+        assert_eq!(
+            r.held_bytes(),
+            f0.chunk.len() + f1.chunk.len() + Partial::slot_table_bytes(f1.total),
+        );
+        r.expire(FRAG_TIMEOUT_MS);
+        assert_eq!(r.held_bytes(), 0, "the tombstone ages out with the window");
 
         // A flood of never-completing full-width partials is still bounded, and
         // the bound still evicts rather than merely reporting a number. With
@@ -6715,7 +6890,11 @@ mod tests {
             assert_eq!(got_addr, addr);
             assert_eq!(&whole[..], &payload[..], "order {order:?} must reassemble");
             assert_eq!(r.inflight(), 0, "the partial is released on completion");
-            assert_eq!(r.held_bytes(), 0);
+            assert_eq!(
+                r.held_bytes(),
+                payload.len() + Partial::slot_table_bytes(4),
+                "completion files the delivered generation against the budget"
+            );
         }
     }
 
@@ -6891,29 +7070,159 @@ mod tests {
         );
     }
 
+    /// A live partial restarted by an id reuse files the old generation, so
+    /// a stale replay of it cannot occupy the new partial's empty slots.
+    ///
+    /// The generations below differ in *every* chunk: after the restart on
+    /// index 0, the replay of A's index 1 matches the filed generation and
+    /// is refused, and B completes with only its own fragments. (A form that
+    /// differs in one chunk alone never reaches the tombstone — the
+    /// occupied-slot check restarts on the differing index and the shared
+    /// chunks are byte-identical either way, so mixing them is harmless.)
     #[test]
     fn same_shape_id_reuse_restarts_instead_of_splicing() {
         let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
         let first = pattern(3000);
-        let frames_a = frag_frames(9, 1, &addr.as_ref(), &first, 1400);
-        assert_eq!(frames_a.len(), 3);
         let mut second = pattern(3000);
-        second[0] ^= 0xff;
+        for b in second.iter_mut() {
+            *b ^= 0xFF;
+        }
         assert_ne!(second, first);
+        let frames_a = frag_frames(9, 1, &addr.as_ref(), &first, 1400);
         let frames_b = frag_frames(9, 1, &addr.as_ref(), &second, 1400);
-        assert_eq!(frames_b.len(), 3);
+        assert_eq!((frames_a.len(), frames_b.len()), (3, 3));
 
         let mut r = DgramReassembler::new();
         assert!(r.push(&decode_fragment(&frames_a[0]).unwrap(), 0).is_none());
         assert!(r.push(&decode_fragment(&frames_a[1]).unwrap(), 0).is_none());
         // Same (sess, id, total, idx) with different bytes: a fast reuse, not
-        // a replay. The old partial must be discarded, so the stale third
-        // fragment of generation A no longer completes anything.
+        // a replay. The old partial is discarded and filed as the key's
+        // tombstone, so the stale prefix of generation A no longer completes
+        // anything.
         assert!(r.push(&decode_fragment(&frames_b[0]).unwrap(), 0).is_none());
-        assert!(r.push(&decode_fragment(&frames_a[2]).unwrap(), 0).is_none());
-        let done = r.push(&decode_fragment(&frames_b[1]).unwrap(), 0);
+        assert_eq!(r.inflight(), 1);
+        // A stale replay of A's index 1 lands on an empty slot of B's live
+        // partial — the exact shape the occupied-slot check cannot see. It
+        // matches the filed generation and is refused: nothing completes,
+        // nothing restarts, nothing is retained.
+        let held_before = r.held_bytes();
+        assert!(r.push(&decode_fragment(&frames_a[1]).unwrap(), 0).is_none());
+        assert_eq!(
+            r.inflight(),
+            1,
+            "the replay must leave the live partial alone"
+        );
+        assert_eq!(
+            r.held_bytes(),
+            held_before,
+            "a refused replay retains nothing"
+        );
+        assert!(r.push(&decode_fragment(&frames_b[1]).unwrap(), 0).is_none());
+        let done = r.push(&decode_fragment(&frames_b[2]).unwrap(), 0);
         let (_, _, whole) = done.expect("generation B completes with its own fragments");
         assert_eq!(&whole[..], &second[..], "must not splice A and B together");
+        assert_eq!(r.inflight(), 0);
+    }
+
+    /// H1: a stale generation's suffix on the *empty* slots of the next
+    /// generation's live partial must not splice — same total, same address,
+    /// no occupied-slot overlap for the restart heuristic to see.
+    ///
+    /// Generation A completes whole (filed as the key's tombstone), then B
+    /// reuses `(sess, id)` with a different payload. Without the tombstone,
+    /// the stale replay of A's last chunk fills B's last empty slot and the
+    /// reassembler delivers `[B0, B1, A2]` to A's target; with it, the replay
+    /// is refused and B completes with only its own fragments. The second
+    /// half covers the same shape through the restart path instead of a
+    /// completion.
+    #[test]
+    fn fragment_empty_slot_reuse_does_not_splice() {
+        fn flipped(payload: &[u8]) -> Vec<u8> {
+            payload.iter().map(|b| b ^ 0xFF).collect()
+        }
+        let addr = TargetAddr::Ip("10.9.8.7:53".parse().unwrap());
+        let first = pattern(3000);
+        let second = flipped(&first);
+        let frames_a = frag_frames(11, 5, &addr.as_ref(), &first, 1400);
+        let frames_b = frag_frames(11, 5, &addr.as_ref(), &second, 1400);
+        assert_eq!((frames_a.len(), frames_b.len()), (3, 3));
+
+        let mut r = DgramReassembler::new();
+        // Generation A completes whole and is delivered verbatim.
+        let mut done = None;
+        for fr in &frames_a {
+            done = r.push(&decode_fragment(fr).unwrap(), 1_000);
+        }
+        let (_, _, whole) = done.expect("generation A completes");
+        assert_eq!(&whole[..], &first[..]);
+        assert_eq!(r.inflight(), 0);
+
+        // Generation B starts on the reused id: its prefix goes live.
+        assert!(r
+            .push(&decode_fragment(&frames_b[0]).unwrap(), 1_000)
+            .is_none());
+        assert!(r
+            .push(&decode_fragment(&frames_b[1]).unwrap(), 1_000)
+            .is_none());
+        assert_eq!(r.inflight(), 1);
+        let held_before = r.held_bytes();
+
+        // A stale replay of A's suffix lands on B's last empty slot. This is
+        // the splice: stored, it would complete `[B0, B1, A2]`.
+        assert!(r
+            .push(&decode_fragment(&frames_a[2]).unwrap(), 1_000)
+            .is_none());
+        assert_eq!(
+            r.inflight(),
+            1,
+            "the replay must neither complete nor restart the live partial"
+        );
+        assert_eq!(
+            r.held_bytes(),
+            held_before,
+            "a refused replay retains nothing"
+        );
+
+        // B's own suffix completes a pure generation-B datagram.
+        let done = r.push(&decode_fragment(&frames_b[2]).unwrap(), 1_000);
+        let (_, _, whole) = done.expect("generation B completes with its own fragments");
+        assert_eq!(&whole[..], &second[..], "must not splice A and B together");
+        assert_eq!(r.inflight(), 0);
+
+        // Completion files the delivered generation against the aggregate
+        // budget — exactly the payload plus its slot table...
+        assert_eq!(r.held_bytes(), second.len() + Partial::slot_table_bytes(3));
+        // ...and the tick releases it with the window.
+        r.expire(1_000 + FRAG_TIMEOUT_MS);
+        assert_eq!(r.held_bytes(), 0);
+
+        // Restart path: C's prefix goes live, D restarts it, and a stale
+        // replay of C's prefix on D's empty slot is refused the same way.
+        let third = pattern(3000);
+        let fourth = flipped(&third);
+        let frames_c = frag_frames(12, 5, &addr.as_ref(), &third, 1400);
+        let frames_d = frag_frames(12, 5, &addr.as_ref(), &fourth, 1400);
+        assert!(r
+            .push(&decode_fragment(&frames_c[0]).unwrap(), 1_000)
+            .is_none());
+        assert!(r
+            .push(&decode_fragment(&frames_c[1]).unwrap(), 1_000)
+            .is_none());
+        assert!(r
+            .push(&decode_fragment(&frames_d[0]).unwrap(), 1_000)
+            .is_none());
+        let held_before = r.held_bytes();
+        assert!(r
+            .push(&decode_fragment(&frames_c[1]).unwrap(), 1_000)
+            .is_none());
+        assert_eq!(r.inflight(), 1);
+        assert_eq!(r.held_bytes(), held_before);
+        assert!(r
+            .push(&decode_fragment(&frames_d[1]).unwrap(), 1_000)
+            .is_none());
+        let done = r.push(&decode_fragment(&frames_d[2]).unwrap(), 1_000);
+        let (_, _, whole) = done.expect("generation D completes with its own fragments");
+        assert_eq!(&whole[..], &fourth[..], "must not splice C and D together");
         assert_eq!(r.inflight(), 0);
     }
 
@@ -6926,14 +7235,17 @@ mod tests {
         assert!(r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none());
         let held_before = r.held_bytes();
         assert!(held_before > 0);
-        // Different shape forces a restart: held must drop the old bytes and
-        // count only the new fragment (payload + its slot table), never
-        // accumulate both.
+        // Different shape forces a restart: held must drop the old bytes from
+        // the live partial and file them as the key's tombstone, counting the
+        // new fragment (payload + its slot table) plus the filed generation —
+        // never accumulating either twice.
         assert!(r.push(&decode_fragment(&other[0]).unwrap(), 0).is_none());
         let f0 = decode_fragment(&other[0]).unwrap();
         let table = Partial::slot_table_bytes(f0.total);
         assert!(table > 0, "the slot table is charged, not free");
-        assert_eq!(r.held_bytes(), f0.chunk.len() + table);
+        let old = decode_fragment(&frames[0]).unwrap();
+        let tomb = old.chunk.len() + Partial::slot_table_bytes(old.total);
+        assert_eq!(r.held_bytes(), f0.chunk.len() + table + tomb);
     }
 
     /// Half-close propagation between two pumps: when the app shuts down its
