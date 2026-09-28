@@ -12,11 +12,11 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "myquic2-server"
-path = "src/bin/myquic2-server.rs"
+path = "src/bin/myquic2-server/main.rs"
 
 [[bin]]
 name = "myquic2-client"
-path = "src/bin/myquic2-client.rs"
+path = "src/bin/myquic2-client/main.rs"
 
 [features]
 default = ["stats"]

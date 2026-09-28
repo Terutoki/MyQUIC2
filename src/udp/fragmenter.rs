@@ -1,0 +1,205 @@
+//! MQP-2 UDP 分片发送器：逐行搬运自 `src/lib.rs`（零改动抽取，`lib.rs` 未碰）。
+//!
+//! 搬运区间（以符号为准）：
+//! - `DgramFragmenter`：lib.rs:1059-1070（含 1059-1063 文档与 1064 derive）
+//! - `frag_id_reuse_blocked`：lib.rs:1072-1079
+//! - `impl DgramFragmenter`（含 `send` 全套）：lib.rs:1081-1238
+//!
+//! 接线：`mqp`（`TargetAddrRef`/`FRAG_PREFIX_LEN`/`FRAG_ID_SAFE_WINDOW_MS`/
+//! `MQP_FRAG_MAX_PAYLOAD`/`MQP_FRAG_MAX_TOTAL`/`DGRAM_PREFIX_LEN`/
+//! `encode_fragment_with_header`）、`time`（`mono_millis`）、
+//! `stats`（`dgram_drops::*`、`udp_stats::*`、`warn_datagram_drop`、
+//! `DatagramDropKind`）、同目录 `send`（`DatagramSend`、`send_udp_datagram_with_header`、
+//! `send_encoded`）均经 `crate::` / `super::` 路径引用。
+
+use super::send::{send_encoded, send_udp_datagram_with_header, DatagramSend, PayloadSend};
+use crate::mono_millis;
+use crate::mqp::addr::TargetAddrRef;
+use crate::mqp::datagram::DGRAM_PREFIX_LEN;
+use crate::mqp::fragment::{
+    encode_fragment_with_header, FRAG_ID_SAFE_WINDOW_MS, FRAG_PREFIX_LEN, MQP_FRAG_MAX_PAYLOAD,
+    MQP_FRAG_MAX_TOTAL,
+};
+use crate::stats::{warn_datagram_drop, DatagramDropKind};
+use crate::{dgram_drops, udp_stats};
+
+/// Splits oversized UDP payloads across [`MQP_DGRAM_FRAG`] frames.
+///
+/// One instance per sending context (a SOCKS association on the client, a UDP
+/// session on the server), so `id` is unique within the `(sess, id)` key the
+/// receiver reassembles on.
+#[derive(Debug, Default)]
+pub struct DgramFragmenter {
+    pub(crate) next_id: u16,
+    /// [`mono_millis`] when `next_id` wrapped (0 = it never has). See
+    /// [`FRAG_ID_SAFE_WINDOW_MS`].
+    pub(crate) last_wrap_ms: u64,
+}
+
+/// Whether handing out a fresh fragment id would risk colliding with a partial
+/// the receiver may still hold — see [`FRAG_ID_SAFE_WINDOW_MS`].
+///
+/// Split out of [`DgramFragmenter::send`] so the window logic is testable
+/// without a live connection; `now_ms` is the [`mono_millis`] epoch.
+pub(crate) fn frag_id_reuse_blocked(last_wrap_ms: u64, now_ms: u64) -> bool {
+    last_wrap_ms != 0 && now_ms.saturating_sub(last_wrap_ms) < FRAG_ID_SAFE_WINDOW_MS
+}
+
+impl DgramFragmenter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Encode and send `payload`, fragmenting only when it does not fit one
+    /// DATAGRAM. The unfragmented path is byte-identical to the pre-fragmentation
+    /// wire format, so small packets pay nothing for this.
+    pub fn send(
+        &mut self,
+        conn: &quinn::Connection,
+        sess: u32,
+        address: &TargetAddrRef<'_>,
+        payload: &[u8],
+        limit: usize,
+    ) -> PayloadSend {
+        let Ok(header) = address.header() else {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "bad address header",
+                n,
+                String::new,
+            );
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        };
+        let cap = limit.saturating_sub(DGRAM_PREFIX_LEN + header.len());
+        if payload.len() <= cap {
+            let failed = match send_udp_datagram_with_header(conn, sess, &header, payload, limit) {
+                DatagramSend::Sent => {
+                    // Counted only on an accepted send: counting before the
+                    // size refusals inflated `datagrams`/`bytes`/`max_payload`
+                    // with payloads that were never queued, and `max_payload` is
+                    // documented as the empirical check on the 8 KiB cap, so a
+                    // refused oversized datagram could move the very number that
+                    // is supposed to describe delivered traffic.
+                    udp_stats::payload(payload.len());
+                    None
+                }
+                other => Some(other),
+            };
+            return PayloadSend {
+                frames: u8::from(failed.is_none()),
+                failed,
+            };
+        }
+
+        let chunk = limit.saturating_sub(FRAG_PREFIX_LEN + header.len());
+        // One fragment must carry something, and the reassembled result must
+        // stay inside both the protocol's payload cap and the u8 fragment count.
+        let total_usize = if chunk == 0 {
+            usize::MAX
+        } else {
+            payload.len().div_ceil(chunk)
+        };
+        if total_usize > MQP_FRAG_MAX_TOTAL as usize || payload.len() > MQP_FRAG_MAX_PAYLOAD {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "payload above the MQP-2 fragmentation limit",
+                n,
+                || {
+                    format!(
+                        "; {} B exceeds the {MQP_FRAG_MAX_PAYLOAD} B reassembly cap",
+                        payload.len()
+                    )
+                },
+            );
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        }
+        // The 16-bit id must not be reused while the receiver can still hold a
+        // partial for it: an id that comes around again feeds a second payload's
+        // fragments into the first payload's partial, and a fragment landing on
+        // an *empty* slot completes a spliced datagram that is delivered to the
+        // older generation's target (see the note on the restart heuristic in
+        // `DgramReassembler::push_with_chunk`). Refusing to fragment while the
+        // whole id space has been consumed faster than the receiver forgets is
+        // the only wire-compatible way to rule that out. The cost is a hard
+        // ceiling of `65_536 / FRAG_ID_SAFE_WINDOW_MS` fragmented payloads per
+        // second per sending context (~21k/s at the shipped 3 s window, i.e.
+        // ~30 MB/s of 1.4 KB payloads or ~170 MB/s of 8 KB payloads); above it
+        // oversized payloads are dropped and counted instead of corrupted.
+        if frag_id_reuse_blocked(self.last_wrap_ms, mono_millis()) {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "fragment id would be reused inside the reassembly window",
+                n,
+                || {
+                    format!(
+                        "; more than {} fragmented payloads/s on one session/association \
+                         would wrap the 16-bit fragment id while the receiver can still \
+                         hold a partial; refusing to fragment rather than splicing",
+                        65_536 / FRAG_ID_SAFE_WINDOW_MS
+                    )
+                },
+            );
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        }
+        let total = total_usize as u8;
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.last_wrap_ms = mono_millis();
+        }
+
+        let mut frames = 0u8;
+        for (i, part) in payload.chunks(chunk).enumerate() {
+            let Some(body) =
+                encode_fragment_with_header(sess, id, i as u8, total, &header, part, limit)
+            else {
+                // Only reachable if `chunk` and the encoder disagree; report it
+                // rather than send a payload that can never reassemble.
+                let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+                warn_datagram_drop(
+                    DatagramDropKind::Large,
+                    "fragment does not fit the path budget",
+                    n,
+                    String::new,
+                );
+                return PayloadSend {
+                    frames,
+                    failed: Some(DatagramSend::TooLarge),
+                };
+            };
+            match send_encoded(conn, body) {
+                DatagramSend::Sent => frames += 1,
+                other => {
+                    return PayloadSend {
+                        frames,
+                        failed: Some(other),
+                    }
+                }
+            }
+        }
+        // Both counters fire only for a payload whose every frame was queued —
+        // a partial send is not a delivered datagram, and the peer's reassembler
+        // times it out either way. `payload` used to be missing here entirely,
+        // so fragmented payloads were invisible in `datagrams`/`bytes` and,
+        // worse, in `max_payload`, which is exactly the size class the 8 KiB
+        // cap question is about. `fragmented` itself ignores `frames <= 1`.
+        udp_stats::payload(payload.len());
+        udp_stats::fragmented(frames);
+        PayloadSend {
+            frames,
+            failed: None,
+        }
+    }
+}
