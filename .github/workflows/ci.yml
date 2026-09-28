@@ -1,0 +1,155 @@
+name: CI
+
+# Runs on every pushed commit (all branches) and on every pull request.
+#   1. rustfmt / clippy / tests verify the commit (both feature sets)
+#   2. x86_64 Linux release binaries are built and uploaded as workflow
+#      artifacts: static musl (OpenWrt / any x86_64 Linux) and glibc gnu.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: no-default-features
+            flags: --no-default-features
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: clippy-${{ matrix.name }}
+      - name: cargo clippy
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: no-default-features
+            flags: --no-default-features
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: test-${{ matrix.name }}
+      - run: cargo test --all-targets ${{ matrix.flags }}
+
+  build-musl:
+    name: Build x86_64-unknown-linux-musl (static)
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: build-musl
+      - name: Build static binaries
+        run: |
+          cargo zigbuild --release \
+            --target x86_64-unknown-linux-musl \
+            --bin myquic2-server --bin myquic2-client
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "myquic2") | .version')
+          name="myquic2-${version}-${GITHUB_SHA::7}-x86_64-unknown-linux-musl"
+          mkdir -p "pkg/${name}" artifacts
+          cp target/x86_64-unknown-linux-musl/release/myquic2-server "pkg/${name}/"
+          cp target/x86_64-unknown-linux-musl/release/myquic2-client "pkg/${name}/"
+          cp dist/openwrt-x86_64/config-server.toml.sample "pkg/${name}/"
+          cp dist/openwrt-x86_64/config-client.toml.sample "pkg/${name}/"
+          tar -C pkg -czf "artifacts/${name}.tar.gz" "${name}"
+          ls -lh artifacts
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: myquic2-x86_64-unknown-linux-musl
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  build-gnu:
+    name: Build x86_64-unknown-linux-gnu
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: build-gnu
+      - name: Build release binaries
+        run: |
+          cargo build --release \
+            --target x86_64-unknown-linux-gnu \
+            --bin myquic2-server --bin myquic2-client
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "myquic2") | .version')
+          name="myquic2-${version}-${GITHUB_SHA::7}-x86_64-unknown-linux-gnu"
+          mkdir -p "pkg/${name}" artifacts
+          cp target/x86_64-unknown-linux-gnu/release/myquic2-server "pkg/${name}/"
+          cp target/x86_64-unknown-linux-gnu/release/myquic2-client "pkg/${name}/"
+          cp dist/openwrt-x86_64/config-server.toml.sample "pkg/${name}/"
+          cp dist/openwrt-x86_64/config-client.toml.sample "pkg/${name}/"
+          tar -C pkg -czf "artifacts/${name}.tar.gz" "${name}"
+          ls -lh artifacts
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: myquic2-x86_64-unknown-linux-gnu
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
