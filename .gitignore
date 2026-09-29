@@ -1,6 +1,10 @@
 # build artifacts
 /target/
 
+# prebuilt release binaries (CI rebuilds them; keep only *.toml.sample tracked)
+dist/openwrt-x86_64/myquic2-client-*
+dist/openwrt-x86_64/myquic2-server-*
+
 # AI agent workspace (local only, not part of the deliverable)
 .omo/
 

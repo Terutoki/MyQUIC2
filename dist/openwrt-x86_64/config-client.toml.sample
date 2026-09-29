@@ -1,0 +1,42 @@
+# MyQUIC2 client config
+socks_listen = "[::]:1080"
+server_addr = "127.0.0.1:8443"
+server_name = "test.com"
+server_cert_file = "server-cert.pem"
+congestion = "bbr"
+gso = true
+keep_alive_secs = 5
+reconnect_timeout_secs = 5
+# Must match the server's auth_token (empty on both sides = no auth).
+# Set a private random shared secret here and on the server.
+# Empty on BOTH sides disables auth (firewall isolation only).
+auth_token = ""
+# Latency-first preset for a 200M/140ms link (W_total ~= BDP): 2/4/2 MB
+# windows + 4 TCP connections (plus the dedicated UDP connection). Single-thread
+# caps at ~114M; multi-thread still fills 200M with loaded ping ~= 150-160ms.
+stream_receive_window_mb = 2
+receive_window_mb = 4
+send_window_mb = 2
+ack_threshold = 2
+max_ack_delay_ms = 5
+# Transport tuning (all optional; omit = 2/4/2 MB windows, ACK 2/5ms).
+# For ~240 Mb/s use 4/8/4 MB; for 300 Mb/s peak use 8/16/8 MB at ~4x loaded latency; ack_threshold=8 +
+# max_ack_delay_ms=10 saves reverse-path CPU at coarser RTT feedback.
+# Connection isolation (optional; omit = 4 TCP connections, the code default).
+# quic_conns=4 spreads bulk TCP round-robin across three bulk cwnds while
+# interactive_ports pin to the first, so probes skip bulk queues. UDP is never
+# one of these slots: it gets its own dedicated connection (slot quic_conns), so
+# a UDP flow and a TCP flow never share a congestion window or a packet.
+# 1 restores the legacy single shared TCP connection (UDP stays separate);
+# clamped to 1..=8, so a client dials at most 9 connections.
+quic_conns = 4
+# UDP egress policy when its dedicated connection is down. true (default) drops
+# the datagram (counted in the "udp budget" 60s line) instead of sharing a TCP
+# connection; false restores the pre-separation fallback onto the interactive
+# connection and then the bulk slots.
+# udp_fail_closed = true
+# interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
+# ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
+# (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the
+# versioned identifier; set the same value on both sides.
+# alpn = "h3"
