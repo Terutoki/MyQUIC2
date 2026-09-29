@@ -877,6 +877,186 @@ async fn too_large_refreshes_the_budget_without_discarding_the_handle() {
     );
 }
 
+/// Serializes the slow-path counter tests below. The drop counters are
+/// process-wide and `bump` is exact, so two such tests racing would move
+/// each other's deltas. No other client test bumps these counters: every
+/// existing dispatch test uses IP targets, which never reach the DNS arms.
+static DNS_SLOW_PATH_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A well-formed MQP-2 datagram for `sess` naming a domain target. Production
+/// replies are always IP-form, so this is the defensive slow path
+/// (`dispatch_one`'s `Domain` arm): negative cache, tri-state probe,
+/// limiter-bounded spawn.
+fn dgram_domain(sess: u32, host: &str, port: u16, payload: &[u8]) -> Bytes {
+    encode_datagram(sess, &TargetAddr::Domain(host.into(), port), payload).unwrap()
+}
+
+/// P1-4 slow-path budget lock, REFUSED arm: a negatively-cached name is
+/// refused synchronously — no resolver spawn, no reply — and counted exactly
+/// once, on `REFUSED` only.
+#[tokio::test]
+async fn dispatch_negative_cached_domain_counts_refused_exactly_once() {
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (host, port) = ("p14-dispatch-refused.invalid", 19531u16);
+    dns_neg_cache_seed(host, port);
+    assert_eq!(
+        lookup_cached_fast(host, port),
+        CachedLookup::Negative,
+        "premise: the name is negatively cached"
+    );
+    let hub = UdpHub::new();
+    let a = test_assoc().await;
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, a.entry.clone());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    let before = dgram_drops::snapshot();
+    dispatch_one(
+        &mut cache,
+        &hub,
+        sess,
+        dgram_domain(sess, host, port, b"q"),
+        &mut reasm,
+        &mut pkt,
+    );
+    assert!(
+        no_reply(&a.app).await,
+        "a negatively-cached name must be refused, never relayed"
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(d.refused, 1, "one refused datagram counts exactly once");
+    assert_eq!(d.dns_inflight, 0, "no resolution was in flight");
+    assert_eq!(d.dns_contention, 0, "no shard was contended");
+    assert_eq!(d.session_full, 0, "no budget was spent");
+    hub.release(sess);
+}
+
+/// P1-4 slow-path budget lock, SESSION_FULL arm: a 40-burst at one uncached
+/// name with the 1024-permit budget exhausted counts every datagram exactly
+/// once on `SESSION_FULL` — the countable loss budget. The dispatcher's
+/// double guard (`available_permits` probe plus `try_acquire_owned`) still
+/// charges one count per datagram: the probe returns early, so the acquire
+/// never double-bumps the race it just observed.
+#[tokio::test]
+async fn dispatch_limiter_exhaustion_counts_session_full_exactly_once_per_drop() {
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (host, port) = ("p14-dispatch-budget.invalid", 19532u16);
+    assert_eq!(
+        lookup_cached_fast(host, port),
+        CachedLookup::Unknown,
+        "premise: the name is uncached"
+    );
+    // Drain the slow-path budget the way a miss storm does. No other client
+    // test holds this limiter, and nothing is awaited while drained.
+    let lim = dns_slow_path_limiter();
+    let mut held = Vec::new();
+    while lim.available_permits() > 0 {
+        match lim.clone().try_acquire_owned() {
+            Ok(p) => held.push(p),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(lim.available_permits(), 0, "the budget must be exhaustible");
+    let hub = UdpHub::new();
+    let a = test_assoc().await;
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, a.entry.clone());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    let before = dgram_drops::snapshot();
+    for _ in 0..40 {
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram_domain(sess, host, port, b"q"),
+            &mut reasm,
+            &mut pkt,
+        );
+    }
+    assert!(
+        no_reply(&a.app).await,
+        "budget-exhausted datagrams must be dropped, never relayed"
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.session_full, 40,
+        "a 40-burst over budget counts every datagram exactly once"
+    );
+    assert_eq!(d.dns_inflight, 0, "nothing was registered inflight");
+    assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");
+    assert_eq!(d.refused, 0, "budget loss is not policy refusal");
+    drop(held);
+    assert!(
+        lim.available_permits() > 0,
+        "the budget must recover when permits release"
+    );
+    hub.release(sess);
+}
+
+/// P1-4 slow-path budget lock, spawn arm: an uncached name with budget
+/// available leaves the synchronous scope uncounted — the caller owns
+/// nothing, records no pin, delivers nothing — and the spawned task owns the
+/// resolution to completion. This is the "no reader awaits DNS" half: the
+/// only `resolve_all_cached` in `dispatch_one` runs inside `tokio::spawn`.
+#[tokio::test]
+async fn dispatch_uncached_domain_spawns_without_a_sync_bump() {
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (host, port) = ("p14-dispatch-spawn.invalid", 19533u16);
+    assert_eq!(
+        lookup_cached_fast(host, port),
+        CachedLookup::Unknown,
+        "premise: the name is uncached"
+    );
+    let hub = UdpHub::new();
+    let a = test_assoc().await;
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, a.entry.clone());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    let before = dgram_drops::snapshot();
+    dispatch_one(
+        &mut cache,
+        &hub,
+        sess,
+        dgram_domain(sess, host, port, b"q"),
+        &mut reasm,
+        &mut pkt,
+    );
+    assert!(
+        no_reply(&a.app).await,
+        "the caller delivers nothing; the spawned task owns this datagram"
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(d.refused, 0, "uncached is not refusal");
+    assert_eq!(
+        d.dns_inflight, 0,
+        "the first miss spawns, it is not inflight"
+    );
+    assert_eq!(d.dns_contention, 0, "no shard was contended");
+    assert_eq!(d.session_full, 0, "budget was available");
+    // The spawn owned the resolution: an unresolvable name settles as a
+    // negative cache entry (the client spawn bumps nothing on a plain
+    // failure), so the next datagram refuses without spawning again.
+    let mut settled = CachedLookup::Unknown;
+    for _ in 0..100 {
+        settled = lookup_cached_fast(host, port);
+        if settled == CachedLookup::Negative {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        settled,
+        CachedLookup::Negative,
+        "the spawned task must drive the resolution to a cached verdict"
+    );
+    hub.release(sess);
+}
+
 fn empty_dispatch_cache() -> [DispatchSlot; DISPATCH_CACHE] {
     std::array::from_fn(|_| DispatchSlot {
         sess: u32::MAX,

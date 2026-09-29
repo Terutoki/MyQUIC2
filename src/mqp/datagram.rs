@@ -112,3 +112,54 @@ pub fn decode_datagram_ref(b: &[u8]) -> Result<(u32, TargetAddrRef<'_>, &[u8])> 
     let (a, n) = TargetAddrRef::decode(&b[DGRAM_PREFIX_LEN..])?;
     Ok((sess, a, &b[DGRAM_PREFIX_LEN + n..]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mqp::addr::TargetAddrRef;
+
+    /// P0-1 pin: `encode_datagram_with_header` (pre-measured `AddrHeader`,
+    /// single `header()` call on the relay path) must stay byte-identical to
+    /// `encode_datagram_ref_with_limit`, including the over-limit `None`.
+    #[test]
+    fn encode_with_header_byte_identical() {
+        let addrs = [
+            TargetAddr::Ip("1.2.3.4:80".parse().unwrap()),
+            TargetAddr::Ip("[2001:db8::1]:443".parse().unwrap()),
+            TargetAddr::Domain("example.com".into(), 53),
+            TargetAddr::Domain("a".repeat(255), 65535),
+        ];
+        for a in &addrs {
+            let r = a.as_ref();
+            let h = r.header().unwrap();
+            for (sess, payload, limit) in [
+                (7, &b""[..], 4096),
+                (7, &b"x"[..], 4096),
+                (9, &[0xabu8; 1200][..], 4096),
+            ] {
+                assert_eq!(
+                    encode_datagram_with_header(sess, &h, payload, limit),
+                    encode_datagram_ref_with_limit(sess, &r, payload, limit),
+                );
+            }
+            // Boundary: exact-fit encodes, one byte more is `None` on both.
+            let cap = 1350usize.saturating_sub(DGRAM_PREFIX_LEN + h.len());
+            let fit = vec![0u8; cap];
+            assert_eq!(
+                encode_datagram_with_header(1, &h, &fit, 1350),
+                encode_datagram_ref_with_limit(1, &r, &fit, 1350)
+            );
+            let over = vec![0u8; cap + 1];
+            assert!(encode_datagram_with_header(1, &h, &over, 1350).is_none());
+            assert!(encode_datagram_ref_with_limit(1, &r, &over, 1350).is_none());
+        }
+        let scoped = TargetAddrRef::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            1,
+            0,
+            3,
+        )));
+        assert!(scoped.header().is_err());
+        assert!(encode_datagram_ref_with_limit(0, &scoped, b"x", 4096).is_none());
+    }
+}

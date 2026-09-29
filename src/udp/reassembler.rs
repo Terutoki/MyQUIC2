@@ -513,3 +513,320 @@ impl DgramReassembler {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mqp::fragment::{decode_fragment, encode_fragment};
+
+    fn v4() -> TargetAddr {
+        TargetAddr::Ip("1.2.3.4:53".parse().unwrap())
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The P0-2 lock-in invariant: `held` is exactly the owned chunk bytes
+    /// plus the slot tables, summed over live partials *and* tombstones.
+    /// A slice-storing or mis-charging change breaks this on the op that
+    /// introduces it, because every removal path must subtract `retained`.
+    fn assert_held_exact(r: &DgramReassembler) {
+        let mut expect = 0usize;
+        for p in r.parts.values() {
+            let sum: usize = p.chunks.iter().flatten().map(Bytes::len).sum();
+            assert_eq!(p.bytes, sum, "payload bytes must equal stored chunk bytes");
+            let want = if p.got == 0 {
+                0
+            } else {
+                sum.saturating_add(Partial::slot_table_bytes(p.total))
+            };
+            assert_eq!(
+                p.retained, want,
+                "partial retained must be owned chunks plus its slot table"
+            );
+            expect = expect.saturating_add(p.retained);
+        }
+        for t in r.recent.values() {
+            assert_eq!(
+                t.retained,
+                Tombstone::retained_of(t.total, &t.chunks),
+                "tombstone retained must be owned chunks plus its slot table"
+            );
+            expect = expect.saturating_add(t.retained);
+        }
+        assert_eq!(
+            r.held, expect,
+            "held must equal the sum over partials+tombstones"
+        );
+        assert_eq!(r.held_bytes(), expect);
+    }
+
+    fn push_bytes(r: &mut DgramReassembler, body: &Bytes, now_ms: u64) -> bool {
+        let f = decode_fragment(body).unwrap();
+        let done = r.push(&f, now_ms).is_some();
+        assert_held_exact(r);
+        done
+    }
+
+    /// P0-2 lock-in: `held_bytes() == sum(owned chunks + slot tables)` after
+    /// every op — insert, duplicate, restart/overwrite, completion (tombstone
+    /// file), refused replay, expiry of both kinds, count-cap eviction,
+    /// tombstone-first byte-cap eviction, over-cap discard, malformed input.
+    #[test]
+    fn held_bytes_equal_sum_of_owned_chunks_plus_slot_tables_on_every_op() {
+        let addr = v4();
+        let aref = addr.as_ref();
+        let mut r = DgramReassembler::new();
+        assert_held_exact(&r);
+
+        // Insert + duplicate (duplicate retains nothing new).
+        let frames: Vec<Bytes> = pattern(3000)
+            .chunks(1400)
+            .enumerate()
+            .map(|(i, c)| encode_fragment(1, 7, i as u8, 3, &aref, c, 64 * 1024).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 3);
+        assert!(!push_bytes(&mut r, &frames[0], 1_000));
+        let held_after_first = r.held_bytes();
+        assert!(!push_bytes(&mut r, &frames[0], 1_000));
+        assert_eq!(r.held_bytes(), held_after_first);
+        assert!(!push_bytes(&mut r, &frames[1], 1_000));
+
+        // Overwrite with a different generation on an occupied slot: the old
+        // partial is removed and filed as the tombstone, the new one charged.
+        let mut other_payload = pattern(3000);
+        for b in other_payload.iter_mut() {
+            *b ^= 0xFF;
+        }
+        let others: Vec<Bytes> = other_payload
+            .chunks(1400)
+            .enumerate()
+            .map(|(i, c)| encode_fragment(1, 7, i as u8, 3, &aref, c, 64 * 1024).unwrap())
+            .collect();
+        assert!(!push_bytes(&mut r, &others[0], 1_000));
+
+        // Completion files the delivered generation as the tombstone.
+        assert!(!push_bytes(&mut r, &others[1], 1_000));
+        assert!(push_bytes(&mut r, &others[2], 1_000));
+        assert_eq!(r.inflight(), 0);
+
+        let held_before = r.held_bytes();
+        let replay_of_filed_generation = &others[0];
+        assert!(!push_bytes(&mut r, replay_of_filed_generation, 1_000));
+        assert_eq!(r.held_bytes(), held_before);
+        assert_eq!(r.inflight(), 0);
+
+        // Expiry drops the live partial, then the tombstone with the window.
+        assert!(!push_bytes(&mut r, &frames[0], 1_000));
+        r.expire(1_000 + FRAG_TIMEOUT_MS);
+        assert_held_exact(&r);
+        assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), 0, "tombstone ages out with the window");
+
+        // Eviction flood: ~1.5 KiB per partial, so the byte cap binds before
+        // the count cap; both bounds must hold with `held` still exact.
+        for id in 0..(FRAG_MAX_PARTIALS as u16 + 40) {
+            let body = encode_fragment(1, id, 0, 4, &aref, &[9u8; 1400], 64 * 1024).unwrap();
+            assert!(!push_bytes(&mut r, &body, 2_000));
+        }
+        assert!(r.held_bytes() <= FRAG_MAX_HELD_BYTES);
+        assert!(r.inflight() <= FRAG_MAX_PARTIALS);
+
+        // Tombstone-first byte-cap eviction: fill the budget with completed
+        // generations, then overflow with live partials.
+        let mut r = DgramReassembler::new();
+        let big = pattern(7800);
+        for id in 0..40u32 {
+            let fs: Vec<Bytes> = big
+                .chunks(1300)
+                .enumerate()
+                .map(|(i, c)| {
+                    encode_fragment(7, id as u16, i as u8, 6, &aref, c, 64 * 1024).unwrap()
+                })
+                .collect();
+            assert_eq!(fs.len(), 6);
+            let mut done = false;
+            for f in &fs {
+                done = push_bytes(&mut r, f, 3_000);
+            }
+            assert!(done);
+        }
+        for id in 1000..1020u32 {
+            let fs: Vec<Bytes> = big
+                .chunks(1300)
+                .enumerate()
+                .map(|(i, c)| {
+                    encode_fragment(7, id as u16, i as u8, 6, &aref, c, 64 * 1024).unwrap()
+                })
+                .collect();
+            for f in fs.iter().take(3) {
+                assert!(!push_bytes(&mut r, f, 3_000));
+            }
+        }
+        assert!(r.held_bytes() <= FRAG_MAX_HELD_BYTES);
+
+        // Over-payload-cap discard releases the whole partial.
+        let mut r = DgramReassembler::new();
+        let over: Vec<Bytes> = pattern(11_200)
+            .chunks(1400)
+            .enumerate()
+            .map(|(i, c)| encode_fragment(1, 21, i as u8, 8, &aref, c, 64 * 1024).unwrap())
+            .collect();
+        assert_eq!(over.len(), 8);
+        for f in &over {
+            assert!(!push_bytes(&mut r, f, 4_000));
+        }
+        assert!(r.held_bytes() <= MQP_FRAG_MAX_PAYLOAD);
+        assert_eq!(
+            r.inflight(),
+            1,
+            "the post-discard tail starts a new partial"
+        );
+
+        // Malformed input allocates no state.
+        let mut bad = decode_fragment(&over[0]).unwrap();
+        bad.total = 1;
+        assert!(r.push(&bad, 4_000).is_none());
+        assert_held_exact(&r);
+        assert_eq!(r.inflight(), 1);
+
+        r.expire(4_000 + FRAG_TIMEOUT_MS);
+        assert_held_exact(&r);
+        assert_eq!(r.held_bytes(), 0);
+    }
+
+    /// P0-2 lock-in, anti-splice: a stale replay that lands on an *empty*
+    /// slot of the next generation is byte-identical to a legitimate
+    /// out-of-order fragment, so only the tombstone (`is_stale_replay`) can
+    /// refuse it. Without the tombstone the replay completes `[B0, B1, A2]`.
+    #[test]
+    fn stale_replay_on_empty_slot_is_refused_via_is_stale_replay() {
+        let addr = v4();
+        let aref = addr.as_ref();
+        let first = pattern(3000);
+        let second: Vec<u8> = first.iter().map(|b| b ^ 0xFF).collect();
+        let mk = |id: u16, payload: &[u8]| -> Vec<Bytes> {
+            payload
+                .chunks(1400)
+                .enumerate()
+                .map(|(i, c)| encode_fragment(5, id, i as u8, 3, &aref, c, 64 * 1024).unwrap())
+                .collect()
+        };
+        let frames_a = mk(11, &first);
+        let frames_b = mk(11, &second);
+        assert_eq!((frames_a.len(), frames_b.len()), (3, 3));
+
+        let mut r = DgramReassembler::new();
+        for f in &frames_a {
+            let done = push_bytes(&mut r, f, 1_000);
+            if *f != *frames_a.last().unwrap() {
+                assert!(!done);
+            }
+        }
+        assert_eq!(r.inflight(), 0, "generation A completes");
+        assert!(!push_bytes(&mut r, &frames_b[0], 1_000));
+        assert!(!push_bytes(&mut r, &frames_b[1], 1_000));
+        assert_eq!(r.inflight(), 1);
+
+        // The replay matches the filed generation at its index: stale.
+        let stale = decode_fragment(&frames_a[2]).unwrap();
+        assert!(
+            r.is_stale_replay(&stale, 1_000),
+            "a replay of the filed generation at its index is stale"
+        );
+        // The new generation's own suffix at the same index differs: fresh.
+        let fresh = decode_fragment(&frames_b[2]).unwrap();
+        assert!(
+            !r.is_stale_replay(&fresh, 1_000),
+            "the new generation's own chunk must not look stale"
+        );
+        // Past the window the same bytes are a fresh generation by definition.
+        assert!(
+            !r.is_stale_replay(&stale, 1_000 + FRAG_TIMEOUT_MS),
+            "the tombstone ages out with the window"
+        );
+
+        let held_before = r.held_bytes();
+        assert!(r.push(&stale, 1_000).is_none());
+        assert_held_exact(&r);
+        assert_eq!(r.inflight(), 1, "the replay restarts nothing");
+        assert_eq!(
+            r.held_bytes(),
+            held_before,
+            "a refused replay retains nothing"
+        );
+
+        let done = r
+            .push(&fresh, 1_000)
+            .expect("B completes with its own suffix");
+        assert_held_exact(&r);
+        assert_eq!(&done.2[..], &second[..], "must not splice A and B together");
+        assert_eq!(r.inflight(), 0);
+    }
+
+    /// P0-2 lock-in, GRO pin: the frame handed to `push` is a narrow slice
+    /// of quinn's per-`recvmsg` batch (up to 64 x 1472 B ≈ 92 KiB with GRO),
+    /// and `Bytes` cannot report the backing allocation — so storing
+    /// `parent.slice(..)` pins ~92 KiB while the budget reads 20 B. The chunk
+    /// must be an owned copy (`Bytes::copy_from_slice` at `push`): 20 B in,
+    /// 20 B charged, and the payload survives the parent being clobbered.
+    #[test]
+    fn twenty_byte_fragment_must_not_pin_ninety_two_kib_batch() {
+        // One GRO batch worth of backing bytes; the fragment is a 20 B window.
+        let mut batch = vec![0xABu8; 64 * 1472];
+        let off = 1000usize;
+        let want_first: Vec<u8> = (0..20).map(|i| (i % 251) as u8).collect();
+        batch[off..off + 20].copy_from_slice(&want_first);
+
+        let addr = v4();
+        let aref = addr.as_ref();
+        let total = 2u8;
+        let mut r = DgramReassembler::new();
+        {
+            let f = FragmentRef {
+                sess: 1,
+                id: 9,
+                idx: 0,
+                total,
+                address: aref,
+                chunk: &batch[off..off + 20],
+            };
+            assert!(r.push(&f, 1_000).is_none());
+        }
+        assert_held_exact(&r);
+        assert_eq!(
+            r.held_bytes(),
+            20 + Partial::slot_table_bytes(total),
+            "a 20 B fragment charges 20 B plus its slot table, never the 92 KiB batch"
+        );
+
+        // Clobber the whole batch the way the next `recvmsg` reuses its buffer.
+        // An owned chunk is unaffected; a stored slice would now be garbage.
+        batch.fill(0xFF);
+
+        let second = vec![0xCDu8; 20];
+        let f1 = FragmentRef {
+            sess: 1,
+            id: 9,
+            idx: 1,
+            total,
+            address: aref,
+            chunk: &second,
+        };
+        let (_, _, whole) = r.push(&f1, 1_000).expect("pair completes");
+        assert_held_exact(&r);
+        let mut want = want_first.clone();
+        want.extend_from_slice(&second);
+        assert_eq!(
+            &whole[..],
+            &want[..],
+            "the stored chunk must be an owned copy, not a slice of the batch"
+        );
+        assert_eq!(
+            r.held_bytes(),
+            40 + Partial::slot_table_bytes(total),
+            "completion files exactly the payload plus its slot table"
+        );
+    }
+}

@@ -308,3 +308,295 @@ fn warn_udp_write(kind: UdpWriteDrop, total: u64, detail: impl FnOnce() -> Strin
     let detail = detail();
     tracing::warn!("udp write dropped ({reason}): {total} so far; {detail}");
 }
+
+/// P1-3 contract lock for the relay `try_send` path (`udp_try_send` /
+/// `udp_try_send_slice`).
+///
+/// Locked semantics (see the item docs above):
+/// - `Ok` → `sent` (both variants; the slice variant borrows on this path).
+/// - `WouldBlock` → detached retry queue; the slice variant copies into an
+///   owned `Bytes` **only** on this path; a full shard (depth 256) drops under
+///   `dropped_no_permit` + one `Budget` warning (newest-drop UDP semantics).
+/// - any other error → `failed`.
+/// - one detached retry runs under the 200 ms deadline; at most 16 in flight
+///   per shard; shards are selected by destination ip+port; a shard whose
+///   worker died with its runtime is re-armed via `ArcSwap`.
+///
+/// NOTE (bench only): `sendmmsg`/GSO batching is measurement-only. The
+/// default relay path stays per-packet `try_send_to`; no `UDP_SEGMENT`
+/// options, no blocking `send_to().await` on the hot path, no per-packet
+/// spawn.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Serialises the counter-sensitive tests below. The `udp_write` totals
+    /// are process-wide atomics (`sent` is thread-local batched and flushed
+    /// by `snapshot` on the calling thread), so two tests taking
+    /// before/after deltas concurrently could each observe the other's bump.
+    /// No test outside this module touches these counters; holding this lock
+    /// over the synchronous snapshot→send→snapshot section makes every delta
+    /// exact. The lock is never held across an `.await`.
+    static CONTRACT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn constants_lock_200ms_16_256() {
+        assert_eq!(
+            UDP_RETRY_TIMEOUT,
+            Duration::from_millis(200),
+            "retry deadline is a retention bound, not a retry policy"
+        );
+        assert_eq!(
+            UDP_RETRY_INFLIGHT, 16,
+            "in-flight bound per shard must stay 16"
+        );
+        assert_eq!(UDP_RETRY_DEPTH, 256, "shard depth must stay 256");
+        assert_eq!(
+            UDP_RETRY_SHARDS, 16,
+            "shard count must stay 16 (inflight<=16/shard)"
+        );
+    }
+
+    /// First send on a socket books exactly one outcome and delivers.
+    ///
+    /// A freshly registered socket may report `WouldBlock` without the
+    /// syscall ever running (no cached writable readiness), so the first
+    /// send can legally land on either `sent` or `retried`; what is locked
+    /// is that it lands on exactly one of them — never both, never dropped,
+    /// never failed — and the datagram arrives (directly or via the detached
+    /// retry worker).
+    #[tokio::test]
+    async fn ok_path_counts_sent_and_delivers() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // Prime writable readiness: a fresh socket may report `WouldBlock`
+        // before its first readiness edge, so drive one async send first and
+        // drain it. The measured send below then takes the `Ok` arm.
+        sock.send_to(b"prime", dst).await.unwrap();
+        let mut b = [0u8; 32];
+        let (pn, _) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+        assert_eq!(&b[..pn], b"prime");
+        let d = {
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            let before = udp_write::snapshot();
+            udp_try_send(&sock, dst, Bytes::from_static(b"p1-3-ok"));
+            udp_write::snapshot().since(&before)
+        };
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("primed send must arrive directly")
+            .unwrap();
+        assert_eq!(&b[..n], b"p1-3-ok");
+        #[cfg(feature = "stats")]
+        {
+            assert_eq!(d.sent, 1, "primed Ok must count exactly one sent: {d:?}");
+            assert_eq!(d.retried, 0, "primed Ok must not book a retry: {d:?}");
+            assert_eq!(
+                d.dropped_no_permit, 0,
+                "a live loopback send must not drop: {d:?}"
+            );
+            assert_eq!(d.failed, 0, "a live loopback send must not fail: {d:?}");
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            assert!(d.clean(), "no-stats build reports zeros: {d:?}");
+        }
+    }
+
+    /// Borrowed fast path delivers the same bytes with the same exactly-once
+    /// booking; the owned `Bytes` copy is paid only on `WouldBlock`.
+    #[tokio::test]
+    async fn slice_ok_path_borrows_and_delivers() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // Prime readiness as above so the measured slice send takes `Ok`.
+        sock.send_to(b"prime", dst).await.unwrap();
+        let mut b = [0u8; 32];
+        tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+        let payload = [0x5Au8; 24];
+        #[cfg_attr(not(feature = "stats"), allow(unused_variables))]
+        let d = {
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            let before = udp_write::snapshot();
+            udp_try_send_slice(&sock, dst, &payload);
+            udp_write::snapshot().since(&before)
+        };
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("primed slice send must arrive directly")
+            .unwrap();
+        assert_eq!(&b[..n], &payload[..]);
+        #[cfg(feature = "stats")]
+        {
+            assert_eq!(
+                d.sent, 1,
+                "primed slice Ok must count exactly one sent: {d:?}"
+            );
+            assert_eq!(d.retried, 0, "primed slice Ok must not book a retry: {d:?}");
+            assert_eq!(
+                d.dropped_no_permit, 0,
+                "a live loopback send must not drop: {d:?}"
+            );
+        }
+    }
+
+    /// `WouldBlock` submit vs. full-shard drop are mutually exclusive outcomes:
+    /// one datagram books exactly one of `retried` / `dropped_no_permit`,
+    /// never both (no double-count).
+    ///
+    /// The full shard is modelled with an isolated `mpsc` channel at exactly
+    /// `UDP_RETRY_DEPTH`: the production queue is drained by a detached worker,
+    /// so filling the shared global shard deterministically would be racy and
+    /// would steal budget from parallel tests. What is under lock here is the
+    /// contract the production branch implements: `try_send` accepted →
+    /// `retried`, `try_send` refused → `dropped_no_permit` (Budget, warn once).
+    #[test]
+    fn wouldblock_submit_vs_full_shard_drop_exactly_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            let (tx, rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
+            std::mem::forget(rx);
+            for _ in 0..UDP_RETRY_DEPTH {
+                tx.try_send(UdpRetry {
+                    sock: sock.clone(),
+                    dst,
+                    payload: Bytes::from_static(b"x"),
+                })
+                .expect("shard depth 256 must accept 256 queued retries");
+            }
+            assert!(
+                tx.try_send(UdpRetry {
+                    sock: sock.clone(),
+                    dst,
+                    payload: Bytes::from_static(b"x"),
+                })
+                .is_err(),
+                "a full 256-deep shard must refuse the newest datagram"
+            );
+        });
+
+        // Exactly-once booking: each outcome bumps exactly its own counter.
+        #[cfg(feature = "stats")]
+        {
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            let before = udp_write::snapshot();
+            udp_write::retried();
+            let d = udp_write::snapshot().since(&before);
+            assert_eq!(d.retried, 1, "submit must book exactly one retried: {d:?}");
+            assert_eq!(
+                d.dropped_no_permit, 0,
+                "submit must not also book a drop: {d:?}"
+            );
+            let before = udp_write::snapshot();
+            udp_write::dropped_no_permit();
+            let d = udp_write::snapshot().since(&before);
+            assert_eq!(
+                d.dropped_no_permit, 1,
+                "full shard must book exactly one drop: {d:?}"
+            );
+            assert_eq!(d.retried, 0, "drop must not also book a retry: {d:?}");
+        }
+    }
+
+    /// Shards are selected by destination ip+port: port-only sharding would
+    /// collapse DNS(:53)/HTTPS(:443) workloads into one shard and reintroduce
+    /// the head-of-line blocking the pool was created to remove.
+    #[tokio::test]
+    async fn shard_selected_by_ip_plus_port() {
+        use std::ptr::eq as same;
+        // Same destination always lands on the same shard.
+        let a: SocketAddr = "10.0.0.1:53".parse().unwrap();
+        assert!(same(retry_shard_for(&a), retry_shard_for(&a)));
+        // Same port, different first octets must spread: proves the IP feeds
+        // the hash. (The `% 16` shard index only sees the hash's low bits,
+        // which carry the first octet on little-endian, so last-octet-only
+        // sweeps legitimately collide; first-octet sweeps must not.)
+        let same_port: Vec<SocketAddr> = (10u8..26)
+            .map(|o| format!("{o}.0.0.1:53").parse().unwrap())
+            .collect();
+        let spread_ip = same_port
+            .windows(2)
+            .any(|w| !same(retry_shard_for(&w[0]), retry_shard_for(&w[1])));
+        assert!(
+            spread_ip,
+            "different IPs on :53 must not all collapse into one shard"
+        );
+        // Same IP, different ports must spread: proves the port feeds the hash.
+        let same_ip: Vec<SocketAddr> = [53u16, 443, 123, 3478, 5000, 8000, 9000, 10000]
+            .iter()
+            .map(|p| format!("10.0.0.99:{p}").parse().unwrap())
+            .collect();
+        let spread_port = same_ip
+            .windows(2)
+            .any(|w| !same(retry_shard_for(&w[0]), retry_shard_for(&w[1])));
+        assert!(
+            spread_port,
+            "different ports on one IP must not all collapse into one shard"
+        );
+        // V6 selection is deterministic and in range.
+        let v6a: SocketAddr = "[::1]:53".parse().unwrap();
+        assert!(same(retry_shard_for(&v6a), retry_shard_for(&v6a)));
+        // Every probed destination maps to a valid shard.
+        for addr in same_port.iter().chain(same_ip.iter()).chain([v6a].iter()) {
+            let idx = retry_shards()
+                .iter()
+                .position(|s| same(s, retry_shard_for(addr)))
+                .unwrap();
+            assert!(idx < UDP_RETRY_SHARDS, "shard index {idx} out of range");
+        }
+    }
+
+    /// The 200 ms deadline — not the kernel — ends a parked retry, which is
+    /// what bounds the strong `Arc<UdpSocket>` retention and releases the
+    /// shard slot on a bounded schedule.
+    #[tokio::test]
+    async fn retry_deadline_bounds_a_parked_retry() {
+        let start = Instant::now();
+        assert!(
+            under_retry_deadline(std::future::pending::<()>())
+                .await
+                .is_err(),
+            "a send that never completes must be abandoned by the deadline"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= UDP_RETRY_TIMEOUT && waited < UDP_RETRY_TIMEOUT * 20,
+            "the wait must be the 200 ms deadline, not open-ended: {waited:?}"
+        );
+        // A ready send is untouched by the deadline.
+        assert_eq!(under_retry_deadline(async { 7u8 }).await, Ok(7));
+    }
+
+    /// `drop_warn_due` gives the Budget warning its warn-once-per-window
+    /// behaviour: first drop warns unconditionally, floods are silenced.
+    #[test]
+    fn budget_warning_fires_once_per_window() {
+        use crate::stats::{drop_warn_due, NEVER_WARNED};
+        assert!(
+            drop_warn_due(NEVER_WARNED, 0),
+            "first Budget drop must warn"
+        );
+        assert!(
+            !drop_warn_due(1_000, 1_000 + 9_999),
+            "Budget flood inside the window must stay silent"
+        );
+        assert!(
+            drop_warn_due(1_000, 1_000 + 10_000),
+            "Budget drop after the window must warn again"
+        );
+    }
+}

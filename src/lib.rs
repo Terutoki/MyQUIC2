@@ -912,6 +912,7 @@ mod tests {
     /// forever. One bump per counter, one field asserted per counter.
     #[test]
     fn every_drop_counter_has_its_own_snapshot_field() {
+        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
         let before = dgram_drops::snapshot();
         for c in [
             &dgram_drops::TOO_LARGE,
@@ -1039,7 +1040,11 @@ mod tests {
     /// dropped — the mutex was genuinely busy, and the count is what makes a
     /// miss storm visible.
     #[tokio::test]
+    // Test-only serializing mutex, held across a fail-fast future that never
+    // parks on it (the holder releases as soon as the contended call returns).
+    #[allow(clippy::await_holding_lock)]
     async fn contention_retry_fails_fast_when_shard_stays_busy() {
+        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
         let host = "retry-still-contended-probe.invalid";
         let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -1102,6 +1107,7 @@ mod tests {
     /// delta below is zero, deterministically.
     #[test]
     fn contention_drops_are_exact_across_threads() {
+        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
         let before = dgram_drops::snapshot();
         std::thread::spawn(|| {
             for _ in 0..20 {
@@ -1128,6 +1134,7 @@ mod tests {
     /// is awaited while the permits are held, so the drain lasts microseconds.
     #[test]
     fn dns_limiter_exhaustion_fails_fast_and_counts_session_full() {
+        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
         let lim = dns_slow_path_limiter();
         let mut held = Vec::new();
         while lim.available_permits() > 0 {
@@ -1161,6 +1168,130 @@ mod tests {
         assert!(
             lim.available_permits() > 0,
             "the budget must recover when permits release"
+        );
+    }
+
+    /// Serializes the tests that assert exact slow-path counter deltas. The
+    /// drop counters are process-wide and `bump` is exact (no batching), so
+    /// two such tests racing would move each other's deltas; every test that
+    /// bumps `REFUSED` / `DNS_INFLIGHT` / `DNS_CONTENTION` / `SESSION_FULL`
+    /// holds this while it measures.
+    static SLOW_PATH_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// P1-4 slow-path budget lock: each drop arm owns exactly one counter and
+    /// every arm counts as loss in the 60 s budget line.
+    ///
+    /// One bump per arm must move exactly one snapshot field by exactly one:
+    /// a doubled bump (or two arms sharing a counter) would double-count one
+    /// burst datagram in the budget the reporter prints. The dispatch-level
+    /// tests pin that each relay path bumps once per refused datagram; this
+    /// pins the counters themselves.
+    #[test]
+    fn slow_path_budget_arms_fire_exactly_once() {
+        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
+        let before = dgram_drops::snapshot();
+        dgram_drops::bump(&dgram_drops::REFUSED);
+        dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+        dgram_drops::bump(&dgram_drops::SESSION_FULL);
+        let d = dgram_drops::snapshot().since(&before);
+        assert_eq!(d.refused, 1, "REFUSED (negative cache / policy) fires once");
+        assert_eq!(d.dns_inflight, 1, "DNS_INFLIGHT (single-flight) fires once");
+        assert_eq!(
+            d.dns_contention, 1,
+            "DNS_CONTENTION (shard contention) fires once"
+        );
+        assert_eq!(
+            d.session_full, 1,
+            "SESSION_FULL (slow-path budget) fires once"
+        );
+        assert_eq!(d.lost(), 4, "every slow-path drop is budget loss: {d:?}");
+    }
+
+    /// P1-4 slow-path budget lock: the tri-state probe maps to exactly one
+    /// counter, and contention is never charged as inflight.
+    ///
+    /// `forward_server_dgram` (server) and `dispatch_one` (client) share one
+    /// contract over `dns_inflight_status`: `Inflight` counts `DNS_INFLIGHT`
+    /// and returns, `Contended` counts `DNS_CONTENTION` and falls through to
+    /// the limiter-bounded spawn, `Absent` spawns with no count. This drives
+    /// the same probe through both contended states and asserts the counting
+    /// half of that contract exactly once per arm.
+    #[test]
+    fn dns_slow_path_probe_counts_contention_apart_from_inflight_exactly_once() {
+        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
+        let host = "p14-probe-distinction.invalid";
+        // Baseline: unregistered and uncontended is Absent (no counter arm).
+        assert_eq!(dns_inflight_status(host, 53), DnsInflight::Absent);
+        assert!(!dns_is_inflight(host, 53));
+        // Register a fake owner the way `resolve_all_cached` does, so the
+        // probe reads Inflight while a resolution owns the name.
+        let mut kbuf = [0u8; DNS_KEY_BUF];
+        let key_owned = dns_key(host, 53, &mut kbuf).unwrap().to_owned();
+        let entry = std::sync::Arc::new(crate::dns::inflight::DnsInflightEntry {
+            key: key_owned.clone(),
+            cell: tokio::sync::OnceCell::new(),
+            notify: tokio::sync::Notify::new(),
+            owner: std::sync::atomic::AtomicBool::new(true),
+        });
+        {
+            let mut inf = lock_mutex(dns_inflight_for(&key_owned));
+            inf.insert(key_owned.clone(), entry);
+        }
+        assert_eq!(dns_inflight_status(host, 53), DnsInflight::Inflight);
+        assert!(dns_is_inflight(host, 53));
+        // The Inflight arm, verbatim: one datagram, one DNS_INFLIGHT.
+        let before = dgram_drops::snapshot();
+        match dns_inflight_status(host, 53) {
+            DnsInflight::Inflight => {
+                dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+            }
+            DnsInflight::Contended => {
+                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+            }
+            DnsInflight::Absent => {}
+        }
+        let d = dgram_drops::snapshot().since(&before);
+        assert_eq!(d.dns_inflight, 1, "one inflight drop counts exactly once");
+        assert_eq!(
+            d.dns_contention, 0,
+            "inflight must never touch the contention counter"
+        );
+        // Release the name, then hold the shard the way a miss storm does:
+        // the same probe must read Contended (unknown), never Inflight.
+        {
+            let mut inf = lock_mutex(dns_inflight_for(&key_owned));
+            inf.remove(&key_owned);
+        }
+        let _held = lock_mutex(dns_inflight_for(&key_owned));
+        assert_eq!(
+            dns_inflight_status(host, 53),
+            DnsInflight::Contended,
+            "a busy shard is unknown, not inflight"
+        );
+        assert!(
+            !dns_is_inflight(host, 53),
+            "contention must never read as inflight"
+        );
+        // The Contended arm, verbatim: one datagram, one DNS_CONTENTION.
+        let before = dgram_drops::snapshot();
+        match dns_inflight_status(host, 53) {
+            DnsInflight::Inflight => {
+                dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+            }
+            DnsInflight::Contended => {
+                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+            }
+            DnsInflight::Absent => {}
+        }
+        let d = dgram_drops::snapshot().since(&before);
+        assert_eq!(
+            d.dns_contention, 1,
+            "one contended drop counts exactly once"
+        );
+        assert_eq!(
+            d.dns_inflight, 0,
+            "contention must never touch the inflight counter"
         );
     }
 
