@@ -244,15 +244,14 @@ pub(crate) fn take_idle(w: &mut HashMap<u32, SessEntry>, keys: &[u32], now: u64)
 }
 /// Process-wide UDP session cap. Each session owns a kernel socket with a
 /// `SESS_SOCKET_BUF` send buffer and the same again for receive (see
-/// `udp_socket_dual_small`), i.e. 256 KiB per direction, so 8192 sessions bound
-/// the kernel side to ~4 GiB worst case instead of ~32 GiB. These are caps,
+/// `udp_socket_dual_small`), i.e. 128 KiB per direction, so 8192 sessions bound
+/// the kernel side to ~2 GiB worst case instead of ~4 GiB. These are caps,
 /// not reservations: the kernel only accounts for what is actually queued,
 /// but the cap is what a burst can pin.
 ///
-/// (This said "512KB send + 512KB receive … ~8GB" until `SESS_SOCKET_BUF` was
-/// halved from 512 KiB to 256 KiB; `lib.rs`'s own note on that constant was
-/// updated at the time and this one was not, so the number an operator would
-/// size a router against was double the real bound.)
+/// (This note has tracked `SESS_SOCKET_BUF` through its reductions — 512 KiB
+/// → 256 KiB → 128 KiB — so the operator-facing bound always matches the
+/// constant.)
 pub(crate) const MAX_SESSIONS_GLOBAL: usize = 8192;
 pub(crate) const LOCAL_SESS_MAX: usize = 4096;
 pub(crate) const LOCAL_SESS_TARGET: usize = LOCAL_SESS_MAX - 64;
