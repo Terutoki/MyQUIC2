@@ -64,6 +64,12 @@ async fn main() -> Result<()> {
             c.congestion
         );
     }
+    info!(
+        "udp batch backend: {} (sendmmsg={}, recvmmsg={}); GSO/GRO are auto-probed by quinn-udp",
+        batch_backend(),
+        sendmmsg_available(),
+        recvmmsg_available()
+    );
     let tls = client_tls_config(load_cert_der(&c.server_cert_file)?, &c.alpn_bytes())?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(Arc::new(quic_client));

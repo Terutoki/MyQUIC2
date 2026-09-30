@@ -57,6 +57,12 @@ async fn main() -> Result<()> {
             c.congestion
         );
     }
+    info!(
+        "udp batch backend: {} (sendmmsg={}, recvmmsg={}); GSO/GRO are auto-probed by quinn-udp",
+        batch_backend(),
+        sendmmsg_available(),
+        recvmmsg_available()
+    );
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
 
     if is_placeholder_token(&c.auth_token) {
