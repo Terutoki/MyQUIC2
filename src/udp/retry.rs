@@ -271,6 +271,60 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
     }
 }
 
+/// Batch-send already-encoded frames for one destination.
+///
+/// Up to [`LAST_HOP_DRAIN`](super::batch::LAST_HOP_DRAIN) frames share a single
+/// `sendmmsg` syscall on Linux; everywhere else (macOS, `ENOSYS` kernels) this
+/// is one `try_send_to` per frame. Either way each frame keeps exactly-once
+/// accounting: delivered frames count `sent`, and every unsent frame rejoins
+/// the per-frame [`udp_try_send_slice`] path below, so `WouldBlock` still
+/// queues into the detached-retry pool (with the owned copy paid only there),
+/// a full shard still drops under `dropped_no_permit` + one `Budget` warning,
+/// and hard errors still count `failed`. Never blocks, never spawns: an
+/// `EAGAIN` or short send stops the fast path at the first unsent frame.
+///
+/// Callers stage consecutive same-destination replies of one drain burst here
+/// (client dispatcher, server accept-target sends); batching therefore changes
+/// the syscall count, never the per-datagram outcome.
+pub fn udp_try_send_grouped(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, frames: &[&[u8]]) {
+    use super::batch::{record_send_group, sendmmsg_available, LAST_HOP_DRAIN};
+    if frames.is_empty() {
+        return;
+    }
+    let n = frames.len().min(LAST_HOP_DRAIN);
+    #[cfg(target_os = "linux")]
+    {
+        if sendmmsg_available() {
+            use std::os::unix::io::AsRawFd;
+            let (sent, _) = super::batch::sendmmsg_frames(sock.as_raw_fd(), &dst, &frames[..n]);
+            record_send_group(n, 1);
+            for _ in &frames[..sent] {
+                udp_write::sent();
+            }
+            // Remainder (short send or EAGAIN) rejoins the per-frame path so
+            // each keeps its own WouldBlock -> retry treatment.
+            for f in &frames[sent..n] {
+                udp_try_send_slice(sock, dst, f);
+            }
+            // Frames past the bound belong to the next burst, not this one:
+            // sending them here would grow the syscall's iovec unbounded.
+            for f in &frames[n..] {
+                udp_try_send_slice(sock, dst, f);
+            }
+            return;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = sendmmsg_available;
+    record_send_group(n, n as u64);
+    for f in &frames[..n] {
+        udp_try_send_slice(sock, dst, f);
+    }
+    for f in &frames[n..] {
+        udp_try_send_slice(sock, dst, f);
+    }
+}
+
 /// Which last-hop write fault a warning is about.
 ///
 /// An enum rather than the substring-matched reason string this used to take,
@@ -321,11 +375,16 @@ fn warn_udp_write(kind: UdpWriteDrop, total: u64, detail: impl FnOnce() -> Strin
 /// - one detached retry runs under the 200 ms deadline; at most 16 in flight
 ///   per shard; shards are selected by destination ip+port; a shard whose
 ///   worker died with its runtime is re-armed via `ArcSwap`.
+/// - `udp_try_send_grouped` shares one `sendmmsg` per same-destination burst
+///   (Linux only; portable one-`try_send_to`-per-frame fallback elsewhere,
+///   bounded by `LAST_HOP_DRAIN` = 32). Per-frame outcomes are identical to
+///   the slice variant above; a short send or `EAGAIN` rejoins the per-frame
+///   path, so batching changes the syscall count, never the outcome.
 ///
-/// NOTE (bench only): `sendmmsg`/GSO batching is measurement-only. The
-/// default relay path stays per-packet `try_send_to`; no `UDP_SEGMENT`
-/// options, no blocking `send_to().await` on the hot path, no per-packet
-/// spawn.
+/// NOTE (last-hop batching, production): grouped sends are on the hot path
+/// for same-destination reply bursts. Still no `UDP_SEGMENT` options
+/// (quinn-udp owns GSO), no blocking `send_to().await` on the hot path, no
+/// per-packet spawn.
 #[cfg(test)]
 mod contract_tests {
     use super::*;
@@ -510,6 +569,107 @@ mod contract_tests {
             );
             assert_eq!(d.retried, 0, "drop must not also book a retry: {d:?}");
         }
+    }
+
+    /// Grouped same-destination send delivers every frame with exactly-once
+    /// booking per frame: N frames book N `sent` (primed socket takes the
+    /// `Ok` arm for each), all N arrive, and the batch bound only caps the
+    /// fast path — frames past 32 still go out through the per-frame path.
+    #[tokio::test]
+    async fn grouped_send_delivers_all_frames_with_exact_accounting() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sock.send_to(b"prime", dst).await.unwrap();
+        let mut b = [0u8; 32];
+        tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+        const N: usize = 10;
+        let frames: Vec<[u8; 8]> = (0..N).map(|i| [i as u8; 8]).collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        #[cfg_attr(not(feature = "stats"), allow(unused_variables))]
+        let d = {
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            let before = udp_write::snapshot();
+            udp_try_send_grouped(&sock, dst, &refs);
+            udp_write::snapshot().since(&before)
+        };
+        let mut got = [false; N];
+        let mut seen = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while seen < N {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, listener.recv_from(&mut b)).await {
+                Ok(Ok((8, _))) => {
+                    let i = b[0] as usize;
+                    if i < N && !got[i] && b[..8] == frames[i] {
+                        got[i] = true;
+                        seen += 1;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(seen, N, "every grouped frame must arrive: {seen}/{N}");
+        #[cfg(feature = "stats")]
+        {
+            // Primed loopback takes `Ok` per frame on either backend (sendmmsg
+            // counts `sent` per delivered frame, fallback per try_send_to).
+            assert_eq!(d.sent, N as u64, "N frames must book N sent: {d:?}");
+            assert_eq!(d.retried, 0, "primed group must not book retries: {d:?}");
+            assert_eq!(d.dropped_no_permit, 0, "live loopback must not drop: {d:?}");
+            assert_eq!(d.failed, 0, "live loopback must not fail: {d:?}");
+        }
+    }
+
+    /// Empty groups are a no-op (no counters move, no syscall), and groups
+    /// past the 32-frame bound still deliver every frame via the per-frame
+    /// tail rather than truncating the burst.
+    #[tokio::test]
+    async fn grouped_send_empty_is_noop_and_oversize_delivers() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sock.send_to(b"prime", dst).await.unwrap();
+        let mut b = [0u8; 64];
+        tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+        {
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            let before = udp_write::snapshot();
+            udp_try_send_grouped(&sock, dst, &[]);
+            let d = udp_write::snapshot().since(&before);
+            assert_eq!(d.sent, 0, "empty group must book nothing: {d:?}");
+            assert!(d.clean(), "empty group must book nothing: {d:?}");
+        }
+        const N: usize = 40;
+        let frames: Vec<[u8; 4]> = (0..N).map(|i| [i as u8; 4]).collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        udp_try_send_grouped(&sock, dst, &refs);
+        let mut seen = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while seen < N {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, listener.recv_from(&mut b)).await {
+                Ok(Ok(_)) => seen += 1,
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            seen, N,
+            "frames past the bound must still go out: {seen}/{N}"
+        );
     }
 
     /// Shards are selected by destination ip+port: port-only sharding would

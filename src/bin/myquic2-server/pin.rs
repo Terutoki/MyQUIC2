@@ -292,6 +292,34 @@ pub(crate) fn is_global_ip_cached(ip: IpAddr) -> bool {
     })
 }
 
+/// SSRF verdict for the connection reader's last fast-path destination.
+///
+/// `is_global_ip_cached` is already thread-local memoized, but a steady
+/// single-target flow still paid its `RefCell` borrow plus hash-and-compare
+/// on every datagram. This one-entry pin skips even that: a datagram for the
+/// same `(session, dst)` reuses the verdict outright. It is keyed on the full
+/// `SocketAddr` conservatively (a port change re-derives, which is always
+/// safe), cleared wherever the allowlist mirror is, and — like the memo it
+/// shadows — pure over the IP, so caching it changes no security outcome.
+pub(crate) fn fast_allow_cached(
+    cache: &mut Option<(u32, SocketAddr, bool)>,
+    allow_private: bool,
+    s: u32,
+    dst: SocketAddr,
+) -> bool {
+    if allow_private {
+        return true;
+    }
+    if let Some((cs, cd, v)) = *cache {
+        if cs == s && cd == dst {
+            return v;
+        }
+    }
+    let v = is_global_ip_cached(dst.ip());
+    *cache = Some((s, dst, v));
+    v
+}
+
 /// The target a datagram names, as `(host, port)`. An IP target reports an
 /// empty host: it has no name that could rotate to another address, so there is
 /// nothing for a pin to re-check. A domain name is never empty on the wire

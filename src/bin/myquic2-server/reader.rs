@@ -64,6 +64,23 @@ pub(crate) fn sess_recycle_buf(buf: Vec<u8>) {
     })
 }
 
+/// Minimum gap between live DATAGRAM-budget re-reads after a `TooLarge` send
+/// verdict on this reader task. Mirrors the client's
+/// `BUDGET_PROBE_INTERVAL_MS` (100 ms): without it a PMTU shrink costs one
+/// quinn connection-state lock per oversized reply for the whole window, i.e.
+/// a re-probe storm on exactly the mutex the steady path takes once per frame.
+/// Inside the window the reader keeps the last known budget and the datagram
+/// is dropped with size accounting (UDP semantics).
+pub(crate) const READER_BUDGET_PROBE_INTERVAL_MS: u64 = 100;
+
+/// Whether a `TooLarge` verdict may re-read the live budget now. Pure so the
+/// throttle is testable without a live connection; `now_ms` is the
+/// [`mono_millis`] epoch. Zero means never probed: the mono epoch counts from
+/// process start, so a small `now` must not read as "probed 0 ms ago".
+pub(crate) fn too_large_probe_due(last_probe_ms: u64, now_ms: u64) -> bool {
+    last_probe_ms == 0 || now_ms.saturating_sub(last_probe_ms) >= READER_BUDGET_PROBE_INTERVAL_MS
+}
+
 #[cfg(test)]
 pub(crate) fn sess_buf_pool_len() -> usize {
     SESS_BUF_POOL.with(|p| p.borrow().len())
@@ -87,7 +104,11 @@ pub(crate) async fn sess_reader_task(
     let mut limit = c2.max_datagram_size().unwrap_or(0);
     let mut last_touch = 0u64;
     let mut last_limit_refresh = coarse_millis();
-    loop {
+    // Last live-budget re-read caused by a `TooLarge` verdict (mono epoch, 0 =
+    // never). Gates the re-probe so a PMTU shrink cannot cost one quinn lock
+    // per oversized reply; see `READER_BUDGET_PROBE_INTERVAL_MS`.
+    let mut last_too_large_probe_ms = 0u64;
+    'session: loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
                 Ok(x) => x,
@@ -111,65 +132,117 @@ pub(crate) async fn sess_reader_task(
                 continue;
             }
         };
-        // Coarse epoch gates the per-reply intervals (the 1 s liveness touch
-        // and the 10 s PMTU refresh); the liveness value itself is the mono
-        // epoch, matching `touch_session_throttled` and every sweep reader.
-        let now = coarse_millis();
-        if now.saturating_sub(last_touch) >= 1000 {
-            last_touch = now;
-            last2.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
-        }
-        // Active sessions track PMTU growth without waiting for the 60 s idle
-        // tick: at most one quinn lock per session per 10 s, and only while the
-        // session is actually receiving replies.
-        if now.saturating_sub(last_limit_refresh) >= 10_000 {
-            last_limit_refresh = now;
-            match c2.max_datagram_size() {
-                Some(m) => limit = m,
-                None => break,
+        // Bounded reply drain (mirrors the client relay loops): the awaited
+        // head plus up to `LAST_HOP_DRAIN - 1` more via `try_recv_from`, so
+        // one wakeup moves up to 32 replies instead of one reply per wakeup.
+        // Tokio keeps recv readiness set until a `WouldBlock`, so the
+        // remainder is picked up on the next poll; nothing queues in
+        // userspace. Every drained datagram runs the same body as the head
+        // (truncation check, allowlist, fragmenter send). A drained error
+        // ends the burst, not the session: the head already proved the socket
+        // live this poll.
+        let mut drained = 1usize;
+        let mut pending: Option<(usize, SocketAddr)> = Some((n, src));
+        loop {
+            let (n, src) = match pending.take() {
+                Some(x) => x,
+                None => {
+                    if drained >= LAST_HOP_DRAIN {
+                        break;
+                    }
+                    match rs.try_recv_from(&mut buf) {
+                        Ok(x) => {
+                            drained += 1;
+                            x
+                        }
+                        Err(_) => break,
+                    }
+                }
+            };
+            // N=1 CONTRACT (server reply path): a datagram sent through the cached
+            // `limit` pays exactly one quinn take per frame — the
+            // `SendDatagram::poll` lock inside `try_send_datagram`. Auxiliary takes
+            // are all throttled off this path: the 60 s idle tick re-reads the
+            // budget at most once per tick, active sessions refresh PMTU at most
+            // once per 10 s, `TooLarge` re-probes at most once per
+            // `READER_BUDGET_PROBE_INTERVAL_MS`, and `Unsupported`/`ConnectionLost`
+            // break the reader instead of re-acquiring (DATAGRAM support is
+            // negotiated at the handshake, so a re-check could never find a better
+            // budget — only spend another take per datagram).
+            // Coarse epoch gates the per-reply intervals (the 1 s liveness touch
+            // and the 10 s PMTU refresh); the liveness value itself is the mono
+            // epoch, matching `touch_session_throttled` and every sweep reader.
+            let now = coarse_millis();
+            if now.saturating_sub(last_touch) >= 1000 {
+                last_touch = now;
+                last2.store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
             }
-        }
-        if n == buf.len() {
-            warn!(
-                "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
+            // Active sessions track PMTU growth without waiting for the 60 s idle
+            // tick: at most one quinn lock per session per 10 s, and only while the
+            // session is actually receiving replies.
+            if now.saturating_sub(last_limit_refresh) >= 10_000 {
+                last_limit_refresh = now;
+                match c2.max_datagram_size() {
+                    Some(m) => limit = m,
+                    None => break 'session,
+                }
+            }
+            if n == buf.len() {
+                warn!(
+                    "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
                  raise MQP_FRAG_MAX_PAYLOAD to carry it"
-            );
-            dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            continue;
-        }
-        if limit == 0 {
-            break;
-        }
-        let src = SocketAddr::new(unmap(src.ip()), src.port());
-        // Reply-source validation: the socket is unconnected, so any source
-        // that reaches the ephemeral port would otherwise be forwarded as the
-        // target's answer. Drop anything sent from a host this session never
-        // sent to (see `RecentAddrs`: the port is deliberately not part of the
-        // key, so a server answering from a different port still gets through).
-        // Lock-free snapshot: the outbound path pushes into the same allowlist
-        // from another task, so a lock here was the only per-reply mutex on the
-        // download path (and the only place the two directions shared a cache
-        // line). `load` is a hazard-pointer read, not a refcount RMW.
-        let r = recent.load();
-        let allowed = !r.is_empty() && r.contains(&src);
-        drop(r);
-        if !allowed {
-            dgram_drops::bump(&dgram_drops::REFUSED);
-            continue;
-        }
-        let ta = TargetAddr::Ip(src);
-        let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
-        if sent.fragmented() {
-            tracing::debug!("udp session {s}: {} B sent as {} fragments", n, sent.frames);
-        }
-        match sent.outcome() {
-            DatagramSend::Sent => {}
-            DatagramSend::Blocked => {}
-            DatagramSend::TooLarge => {
-                limit = c2.max_datagram_size().unwrap_or(0);
+                );
+                dgram_drops::bump(&dgram_drops::TOO_LARGE);
+                continue;
             }
-            DatagramSend::Unsupported | DatagramSend::ConnectionLost => break,
+            if limit == 0 {
+                break 'session;
+            }
+            let src = SocketAddr::new(unmap(src.ip()), src.port());
+            // Reply-source validation: the socket is unconnected, so any source
+            // that reaches the ephemeral port would otherwise be forwarded as the
+            // target's answer. Drop anything sent from a host this session never
+            // sent to (see `RecentAddrs`: the port is deliberately not part of the
+            // key, so a server answering from a different port still gets through).
+            // Lock-free snapshot: the outbound path pushes into the same allowlist
+            // from another task, so a lock here was the only per-reply mutex on the
+            // download path (and the only place the two directions shared a cache
+            // line). `load` is a hazard-pointer read, not a refcount RMW.
+            let r = recent.load();
+            let allowed = !r.is_empty() && r.contains(&src);
+            drop(r);
+            if !allowed {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                continue;
+            }
+            let ta = TargetAddr::Ip(src);
+            let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
+            if sent.fragmented() {
+                tracing::debug!("udp session {s}: {} B sent as {} fragments", n, sent.frames);
+            }
+            match sent.outcome() {
+                DatagramSend::Sent => {}
+                DatagramSend::Blocked => {}
+                DatagramSend::TooLarge => {
+                    // Size verdict, never a connection fault: keep the reader and
+                    // the cached budget, re-reading the live budget at most once
+                    // per probe interval. Unthrottled, every oversized reply in a
+                    // PMTU-shrink window took quinn's connection-state lock on top
+                    // of the one per-frame take the send itself already paid.
+                    // `.max(1)`: the zero stamp means "never probed" (see
+                    // `too_large_probe_due`), and the mono epoch counts from
+                    // process start, so a verdict inside the first millisecond
+                    // must still arm the throttle.
+                    let now_probe = mono_millis().max(1);
+                    if too_large_probe_due(last_too_large_probe_ms, now_probe) {
+                        last_too_large_probe_ms = now_probe;
+                        limit = c2.max_datagram_size().unwrap_or(0);
+                    }
+                }
+                DatagramSend::Unsupported | DatagramSend::ConnectionLost => break 'session,
+            }
         }
+        record_drain_batch(drained);
     }
     // Every exit above breaks to here, so the buffer is recycled exactly once
     // per reader lifetime, however the task ended (idle reap, abort-adjacent

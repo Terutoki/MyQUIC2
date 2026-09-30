@@ -12,10 +12,10 @@
 //! `DatagramDropKind`）、同目录 `send`（`DatagramSend`、`send_udp_datagram_with_header`、
 //! `send_encoded`）均经 `crate::` / `super::` 路径引用。
 
-use super::send::{send_encoded, send_udp_datagram_with_header, DatagramSend, PayloadSend};
+use super::send::{send_encoded, send_udp_datagram_with_prefix, DatagramSend, PayloadSend};
 use crate::mono_millis;
 use crate::mqp::addr::TargetAddrRef;
-use crate::mqp::datagram::DGRAM_PREFIX_LEN;
+use crate::mqp::datagram::{DgramPrefixCache, DGRAM_PREFIX_LEN};
 use crate::mqp::fragment::{
     encode_fragment_with_header, FRAG_ID_SAFE_WINDOW_MS, FRAG_PREFIX_LEN, MQP_FRAG_MAX_PAYLOAD,
     MQP_FRAG_MAX_TOTAL,
@@ -34,6 +34,11 @@ pub struct DgramFragmenter {
     /// [`mono_millis`] when `next_id` wrapped (0 = it never has). See
     /// [`FRAG_ID_SAFE_WINDOW_MS`].
     pub(crate) last_wrap_ms: u64,
+    /// Pre-encoded `type | sess | addr` prefix for the steady destination, so
+    /// the N=1 fast path below skips the `header()` validation + re-encode on
+    /// every packet. Keyed by `(sess, dst)` and invalidated on any change; the
+    /// fragment path underneath keeps its own validation untouched.
+    prefix_cache: DgramPrefixCache,
 }
 
 /// Whether handing out a fresh fragment id would risk colliding with a partial
@@ -61,22 +66,40 @@ impl DgramFragmenter {
         payload: &[u8],
         limit: usize,
     ) -> PayloadSend {
-        let Ok(header) = address.header() else {
-            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            warn_datagram_drop(
-                DatagramDropKind::Large,
-                "bad address header",
-                n,
-                String::new,
-            );
-            return PayloadSend {
-                frames: 0,
-                failed: Some(DatagramSend::TooLarge),
-            };
+        // N=1 fast path: serve the steady destination from the pre-encoded
+        // prefix (no `header()` validation, no re-encode). A refused address
+        // reports exactly like the old `header().is_err()` branch below.
+        // The small prefix is copied to the stack (12 B steady-state IPv4) so
+        // the cache borrow ends before the send.
+        let mut prefix_buf = [0u8; DgramPrefixCache::PREFIX_MAX];
+        let prefix_len = match self.prefix_cache.prefix_for(sess, address) {
+            Some(p) => {
+                let n = p.len();
+                prefix_buf[..n].copy_from_slice(p);
+                n
+            }
+            None => {
+                let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+                warn_datagram_drop(
+                    DatagramDropKind::Large,
+                    "bad address header",
+                    n,
+                    String::new,
+                );
+                return PayloadSend {
+                    frames: 0,
+                    failed: Some(DatagramSend::TooLarge),
+                };
+            }
         };
-        let cap = limit.saturating_sub(DGRAM_PREFIX_LEN + header.len());
+        let cap = limit.saturating_sub(prefix_len);
         if payload.len() <= cap {
-            let failed = match send_udp_datagram_with_header(conn, sess, &header, payload, limit) {
+            let failed = match send_udp_datagram_with_prefix(
+                conn,
+                &prefix_buf[..prefix_len],
+                payload,
+                limit,
+            ) {
                 DatagramSend::Sent => {
                     // Counted only on an accepted send: counting before the
                     // size refusals inflated `datagrams`/`bytes`/`max_payload`
@@ -94,6 +117,26 @@ impl DgramFragmenter {
                 failed,
             };
         }
+
+        // Fragment path below: `payload.len() > cap` was proven above, and the
+        // cached prefix length agrees with a fresh validation by construction,
+        // so this re-validation only serves the fragment encoder's `header`.
+        // (Unreachable when the address is refused: the fast path already
+        // returned `TooLarge` for it with identical accounting.)
+        let Ok(header) = address.header() else {
+            let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            warn_datagram_drop(
+                DatagramDropKind::Large,
+                "bad address header",
+                n,
+                String::new,
+            );
+            return PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            };
+        };
+        debug_assert_eq!(cap, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len()));
 
         let chunk = limit.saturating_sub(FRAG_PREFIX_LEN + header.len());
         // One fragment must carry something, and the reassembled result must

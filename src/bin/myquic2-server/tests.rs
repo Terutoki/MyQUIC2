@@ -1787,3 +1787,26 @@ fn fair_sweep_window_admits_one_sweep_per_second() {
     assert!(claim_fair_sweep(now + 1000));
     FAIR_SWEEP_LAST_MS.store(0, Ordering::Relaxed);
 }
+
+/// The `TooLarge` re-probe throttle: one live-budget re-read per probe window
+/// per reader, so a PMTU shrink cannot cost one quinn state-lock per oversized
+/// reply on top of the per-frame send take. Zero means never probed (mono
+/// epoch counts from process start). Pure and Thundering-free by construction:
+/// the reader task owns the stamp, so no atomics and no cross-task traffic.
+#[test]
+fn too_large_probe_throttle_admits_one_reread_per_window() {
+    assert!(too_large_probe_due(0, 0));
+    assert!(too_large_probe_due(0, 5));
+    assert!(!too_large_probe_due(
+        1_000,
+        1_000 + READER_BUDGET_PROBE_INTERVAL_MS - 1
+    ));
+    assert!(too_large_probe_due(
+        1_000,
+        1_000 + READER_BUDGET_PROBE_INTERVAL_MS
+    ));
+    assert!(too_large_probe_due(
+        1_000,
+        1_000 + READER_BUDGET_PROBE_INTERVAL_MS + 1
+    ));
+}

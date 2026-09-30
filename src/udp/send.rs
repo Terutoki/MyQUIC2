@@ -18,7 +18,9 @@ use bytes::Bytes;
 
 use crate::dgram_drops;
 use crate::mqp::addr::{AddrHeader, TargetAddrRef};
-use crate::mqp::datagram::{encode_datagram_with_header, DGRAM_PREFIX_LEN};
+use crate::mqp::datagram::{
+    encode_datagram_with_header, encode_datagram_with_prefix, DGRAM_PREFIX_LEN,
+};
 use crate::stats::{budget_detail, warn_datagram_drop, DatagramDropKind};
 
 // ---------------- QUIC DATAGRAM send (never the drop-oldest path) ----------------
@@ -58,7 +60,23 @@ pub enum DatagramSend {
 /// Primitive behind [`try_send_datagram`]: `send_datagram_wait` takes quinn's
 /// connection-state mutex on every poll, so the non-blocking variant has to be
 /// able to ask once without parking a task.
-fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
+///
+/// N=1 AUDIT (quinn 0.11.12 `connection.rs`, verified against the registry
+/// source): `send_datagram` takes the state lock exactly once
+/// (`state.lock("send_datagram")`, `datagrams().send(data, true)`), and
+/// `SendDatagram::poll` — the only thing `poll_once` below drives — takes it
+/// exactly once per poll (`state.lock("SendDatagram::poll")`,
+/// `datagrams().send(data, false)`). Both are therefore 1 take per frame; the
+/// irreducible per-frame mutex lives inside quinn and cannot be removed from
+/// here. This wrapper keeps `send_datagram_wait` (not `send_datagram`) because
+/// only the wait variant reports a full buffer as `Blocked`: `send_datagram`
+/// silently evicts the oldest queued datagram and returns `Ok`, which would
+/// erase the per-connection newest-drop accounting (see below, send.rs:88-97).
+/// Shared with the last-hop drain loops: `read_datagram` is likewise
+/// cancel-safe (a buffered datagram is returned before its first await point),
+/// so the dispatchers drain up to 31 already-buffered datagrams per wakeup
+/// through this instead of one wakeup per datagram.
+pub fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
     let mut fut = std::pin::pin!(fut);
     let waker = Waker::noop();
     let mut cx = TaskContext::from_waker(waker);
@@ -150,6 +168,31 @@ pub(crate) fn send_udp_datagram_with_header(
             "payload exceeds the path budget",
             n,
             || budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + header.len())),
+        );
+        return DatagramSend::TooLarge;
+    };
+    send_encoded(conn, d)
+}
+
+/// N=1 fast-path twin of [`send_udp_datagram_with_header`]: `prefix` is the
+/// [`DgramPrefixCache`](crate::mqp::datagram::DgramPrefixCache) `type | sess |
+/// addr` bytes, so no header validation or re-encode happens here. Drop
+/// accounting is identical to the slow path (same counters, same messages, same
+/// `TooLarge` semantics); only the encoder differs, and it is byte-identical.
+pub(crate) fn send_udp_datagram_with_prefix(
+    conn: &quinn::Connection,
+    prefix: &[u8],
+    payload: &[u8],
+    limit: usize,
+) -> DatagramSend {
+    let hdr_len = prefix.len().saturating_sub(DGRAM_PREFIX_LEN);
+    let Some(d) = encode_datagram_with_prefix(prefix, payload, limit) else {
+        let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        warn_datagram_drop(
+            DatagramDropKind::Large,
+            "payload exceeds the path budget",
+            n,
+            || budget_detail(limit, limit.saturating_sub(DGRAM_PREFIX_LEN + hdr_len)),
         );
         return DatagramSend::TooLarge;
     };

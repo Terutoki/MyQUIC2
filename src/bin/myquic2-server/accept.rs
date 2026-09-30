@@ -106,6 +106,39 @@ pub(crate) fn admission_cap(conn_cap: usize, budget_mb: Option<u64>, per_conn_by
         }
     }
 }
+/// One deferred target send of a drain burst: the session socket, the
+/// destination (already normalized by `map_for_dual`), and the owned payload.
+pub(crate) struct StagedSend {
+    pub(crate) sock: Arc<tokio::net::UdpSocket>,
+    pub(crate) dst: SocketAddr,
+    pub(crate) payload: Bytes,
+}
+
+/// Flush staged target sends grouped by consecutive `(sock, dst)` runs.
+///
+/// One `sendmmsg` per run on Linux (one `try_send_to` per frame on the
+/// portable fallback); runs flush in encounter order, so a flow's datagrams
+/// keep their staging order on the wire. Staging is bounded by
+/// [`LAST_HOP_DRAIN`] and cleared per burst, so the queue can never grow
+/// unbounded. Each frame keeps exactly-once accounting through
+/// [`udp_try_send_grouped`].
+pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
+    let mut i = 0;
+    while i < staged.len() {
+        let mut j = i + 1;
+        while j < staged.len()
+            && Arc::ptr_eq(&staged[j].sock, &staged[i].sock)
+            && staged[j].dst == staged[i].dst
+        {
+            j += 1;
+        }
+        let refs: Vec<&[u8]> = staged[i..j].iter().map(|s| &s.payload[..]).collect();
+        udp_try_send_grouped(&staged[i].sock, staged[i].dst, &refs);
+        i = j;
+    }
+    staged.clear();
+}
+
 pub(crate) async fn handle_conn(
     conn: quinn::Connection,
     allow_private: bool,
@@ -176,6 +209,15 @@ pub(crate) async fn handle_conn(
         // Per-connection fast path: the thread-local memo is shared by every
         // connection on this worker, so a burst to one session still pays two
         // RefCell scans per packet. This slot lives in the reader task itself.
+        //
+        // N=1 NOTE: a fast-path hit takes zero quinn locks before the send —
+        // no `close_reason`, no `max_datagram_size`. Liveness is the reader
+        // task's `AbortHandle` (one atomic load) plus the socket `Weak`
+        // upgrade, and the budget is the reader's cached `limit`. The send
+        // itself then pays the single irreducible `SendDatagram::poll` take.
+        // The slow path (`forward_server_dgram` → `get_or_create_sess`) takes
+        // at most one `max_datagram_size` per new session (creation only, off
+        // the memo), never per packet.
         let mut fast_sess: u32 = u32::MAX;
         // **Weak**, exactly like [`SessMemo::sock`], and for the same reason: a
         // strong handle here is a second owner of the session's socket, and it
@@ -207,8 +249,18 @@ pub(crate) async fn handle_conn(
         // only when the destination actually changed (steady single-target
         // flows pay nothing after the first datagram).
         let mut fast_last_dst: Option<(u32, SocketAddr, u64)> = None;
+        // SSRF verdict for the last fast-path destination (see
+        // `fast_allow_cached`): steady single-target flows skip the
+        // re-derivation after the first datagram, exactly like the allowlist
+        // record above. Cleared wherever that mirror is.
+        let mut fast_allow: Option<(u32, SocketAddr, bool)> = None;
+        // Target sends staged for the current drain burst, flushed grouped per
+        // `(sock, dst)` run by `flush_staged_sends` (one `sendmmsg` per 32 on
+        // Linux, one `try_send_to` per frame elsewhere). Bounded by
+        // `LAST_HOP_DRAIN`, cleared per burst.
+        let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
         loop {
-            let d: Bytes = tokio::select! {
+            let head: Bytes = tokio::select! {
                 r = reader.as_mut() => match r {
                     Ok(d) => d,
                     Err(_) => break,
@@ -218,170 +270,235 @@ pub(crate) async fn handle_conn(
                     continue;
                 }
             };
-            // `d` is already owned (from `read_datagram`), so payload slices borrow
-            // it directly: one refcount bump per slice, no extra clone per packet.
-            // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
-            if d.first() == Some(&MQP_DGRAM_FRAG) {
-                let Ok(f) = decode_fragment(&d) else {
-                    continue;
-                };
-                let Some((s, a, whole)) = reasm.push(&f, mono_millis()) else {
-                    continue;
-                };
-                udp_stats::payload(whole.len());
-                // One resolution for this datagram: the session's own pin, else
-                // the DNS cache. A domain target whose session is already pinned
-                // never reaches `forward_server_dgram` at all.
-                let want = match a.as_ref() {
-                    TargetAddrRef::Ip(dst) => Some(dst),
-                    TargetAddrRef::Domain(h, p) => {
-                        resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p, allow_private)
+            // Bounded drain (mirrors the client dispatcher): the awaited head
+            // plus up to `LAST_HOP_DRAIN - 1` already-buffered datagrams via
+            // `poll_once` (`read_datagram` is cancel-safe: a buffered datagram
+            // returns before its first await point, and a Pending probe parks
+            // nothing). One wakeup moves up to 32 datagrams; the fast path
+            // stages its target send and the burst flushes grouped per
+            // `(sock, dst)` run. A drained connection error flushes what was
+            // staged and then exits.
+            let mut drained = 1usize;
+            let mut closed = false;
+            let mut pending: Option<Bytes> = Some(head);
+            'burst: loop {
+                let d = match pending.take() {
+                    Some(d) => d,
+                    None => {
+                        if drained >= LAST_HOP_DRAIN {
+                            break 'burst;
+                        }
+                        match poll_once(reader.as_mut()) {
+                            Some(Ok(d)) => {
+                                drained += 1;
+                                d
+                            }
+                            Some(Err(_)) => {
+                                closed = true;
+                                break 'burst;
+                            }
+                            None => break 'burst,
+                        }
                     }
                 };
-                if let Some(dst) = want {
-                    let mut fast_hit = false;
-                    if s == fast_sess {
-                        if let (Some(sock), Some(last), Some(ab)) =
-                            (fast_sock.as_ref(), fast_last.as_ref(), fast_abort.as_ref())
-                        {
-                            if !ab.is_finished() && (allow_private || is_global_ip_cached(dst.ip()))
+                // `d` is already owned (from `read_datagram`), so payload slices borrow
+                // it directly: one refcount bump per slice, no extra clone per packet.
+                // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
+                if d.first() == Some(&MQP_DGRAM_FRAG) {
+                    let Ok(f) = decode_fragment(&d) else {
+                        continue;
+                    };
+                    let Some((s, a, whole)) = reasm.push(&f, mono_millis()) else {
+                        continue;
+                    };
+                    udp_stats::payload(whole.len());
+                    // One resolution for this datagram: the session's own pin, else
+                    // the DNS cache. A domain target whose session is already pinned
+                    // never reaches `forward_server_dgram` at all.
+                    let want = match a.as_ref() {
+                        TargetAddrRef::Ip(dst) => Some(dst),
+                        TargetAddrRef::Domain(h, p) => {
+                            resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p, allow_private)
+                        }
+                    };
+                    if let Some(dst) = want {
+                        let mut fast_hit = false;
+                        if s == fast_sess {
+                            if let (Some(sock), Some(last), Some(ab)) =
+                                (fast_sock.as_ref(), fast_last.as_ref(), fast_abort.as_ref())
                             {
-                                // A failed upgrade means the session exited since
-                                // the handle check; treat it as a miss so the slow
-                                // path rebuilds the slot, and note that it is the
-                                // *only* signal that releases the socket — see
-                                // `fast_sock`.
-                                if let Some(sock) = sock.upgrade() {
-                                    touch_session_throttled(conn_id, s, last);
-                                    // Record *before* the send: the reply reader
-                                    // validates the source against this
-                                    // allowlist, and a failable fast path (a
-                                    // local echo target, a LAN DNS resolver)
-                                    // can answer inside the window between the
-                                    // two calls. `forward_server_dgram` has
-                                    // always ordered it this way.
-                                    mirror_record(
-                                        &ss,
-                                        &mut fast_last_dst,
-                                        s,
-                                        dst,
-                                        fast_epoch.as_deref(),
-                                    );
-                                    udp_try_send(&sock, map_for_dual(dst), whole.clone());
-                                    fast_hit = true;
+                                if !ab.is_finished()
+                                    && fast_allow_cached(&mut fast_allow, allow_private, s, dst)
+                                {
+                                    // A failed upgrade means the session exited since
+                                    // the handle check; treat it as a miss so the slow
+                                    // path rebuilds the slot, and note that it is the
+                                    // *only* signal that releases the socket — see
+                                    // `fast_sock`.
+                                    if let Some(sock) = sock.upgrade() {
+                                        touch_session_throttled(conn_id, s, last);
+                                        // Record *before* the send: the reply reader
+                                        // validates the source against this
+                                        // allowlist, and a failable fast path (a
+                                        // local echo target, a LAN DNS resolver)
+                                        // can answer inside the window between the
+                                        // two calls. `forward_server_dgram` has
+                                        // always ordered it this way.
+                                        mirror_record(
+                                            &ss,
+                                            &mut fast_last_dst,
+                                            s,
+                                            dst,
+                                            fast_epoch.as_deref(),
+                                        );
+                                        staged.push(StagedSend {
+                                            sock,
+                                            dst: map_for_dual(dst),
+                                            payload: whole.clone(),
+                                        });
+                                        fast_hit = true;
+                                    }
                                 }
                             }
                         }
-                    }
-                    if fast_hit {
-                        continue;
-                    }
-                }
-                // The slow path records destinations itself, so this task-local
-                // mirror of the allowlist can no longer describe it: clear it so
-                // the next fast-path send re-records. Without this a destination
-                // pushed by the slow path can fall out of `RecentAddrs` (8
-                // entries) while `fast_last_dst` still claims it is present, and
-                // that destination's replies are dropped as REFUSED until it is
-                // sent to again.
-                fast_last_dst = None;
-                let used =
-                    forward_server_dgram(&ss, &cd, conn_id, s, a.as_ref(), whole, allow_private)
-                        .await;
-                if let Some((dst, life)) = used {
-                    match sess_memo_lookup(conn_id, s) {
-                        SessHit::Fresh(sock, last, ab, epoch) => {
-                            fast_sess = s;
-                            fast_sock = Some(Arc::downgrade(&sock));
-                            fast_last = Some(last);
-                            fast_abort = Some(ab);
-                            fast_epoch = Some(epoch.clone());
-                            let (ph, pp) = target_name(a.as_ref());
-                            pin_arm(&mut fast_pin, s, ph, pp, dst, life);
-                        }
-                        SessHit::Stale | SessHit::Miss => {
-                            fast_sess = u32::MAX;
-                            fast_sock = None;
-                            fast_last = None;
-                            fast_abort = None;
-                            fast_epoch = None;
-                            fast_pin = None;
-                            fast_last_dst = None;
+                        if fast_hit {
+                            continue;
                         }
                     }
-                }
-            } else {
-                let Ok((s, a, p)) = decode_datagram_ref(&d) else {
-                    continue;
-                };
-                let want = match a {
-                    TargetAddrRef::Ip(dst) => Some(dst),
-                    TargetAddrRef::Domain(h, p) => {
-                        resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p, allow_private)
-                    }
-                };
-                if let Some(dst) = want {
-                    let mut fast_hit = false;
-                    if s == fast_sess {
-                        if let (Some(sock), Some(last), Some(ab)) =
-                            (fast_sock.as_ref(), fast_last.as_ref(), fast_abort.as_ref())
-                        {
-                            if !ab.is_finished() && (allow_private || is_global_ip_cached(dst.ip()))
-                            {
-                                // See the fragment branch above, and `fast_sock`.
-                                if let Some(sock) = sock.upgrade() {
-                                    let off = d.len() - p.len();
-                                    udp_stats::payload(p.len());
-                                    touch_session_throttled(conn_id, s, last);
-                                    // Record before the send — see the fragment
-                                    // branch above.
-                                    mirror_record(
-                                        &ss,
-                                        &mut fast_last_dst,
-                                        s,
-                                        dst,
-                                        fast_epoch.as_deref(),
-                                    );
-                                    udp_try_send(&sock, map_for_dual(dst), d.slice(off..));
-                                    fast_hit = true;
-                                }
+                    // The slow path records destinations itself, so this task-local
+                    // mirror of the allowlist can no longer describe it: clear it so
+                    // the next fast-path send re-records. Without this a destination
+                    // pushed by the slow path can fall out of `RecentAddrs` (8
+                    // entries) while `fast_last_dst` still claims it is present, and
+                    // that destination's replies are dropped as REFUSED until it is
+                    // sent to again.
+                    fast_last_dst = None;
+                    fast_allow = None;
+                    // Flush staged fast-path sends before the slow path's own
+                    // (immediate) send, so a flow's datagrams keep their staging
+                    // order on the wire.
+                    flush_staged_sends(&mut staged);
+                    let used = forward_server_dgram(
+                        &ss,
+                        &cd,
+                        conn_id,
+                        s,
+                        a.as_ref(),
+                        whole,
+                        allow_private,
+                    )
+                    .await;
+                    if let Some((dst, life)) = used {
+                        match sess_memo_lookup(conn_id, s) {
+                            SessHit::Fresh(sock, last, ab, epoch) => {
+                                fast_sess = s;
+                                fast_sock = Some(Arc::downgrade(&sock));
+                                fast_last = Some(last);
+                                fast_abort = Some(ab);
+                                fast_epoch = Some(epoch.clone());
+                                let (ph, pp) = target_name(a.as_ref());
+                                pin_arm(&mut fast_pin, s, ph, pp, dst, life);
+                            }
+                            SessHit::Stale | SessHit::Miss => {
+                                fast_sess = u32::MAX;
+                                fast_sock = None;
+                                fast_last = None;
+                                fast_abort = None;
+                                fast_epoch = None;
+                                fast_pin = None;
+                                fast_last_dst = None;
+                                fast_allow = None;
                             }
                         }
                     }
-                    if fast_hit {
+                } else {
+                    let Ok((s, a, p)) = decode_datagram_ref(&d) else {
                         continue;
+                    };
+                    let want = match a {
+                        TargetAddrRef::Ip(dst) => Some(dst),
+                        TargetAddrRef::Domain(h, p) => {
+                            resolve_pin(&ss, &mut fast_pin, fast_sess, s, h, p, allow_private)
+                        }
+                    };
+                    if let Some(dst) = want {
+                        let mut fast_hit = false;
+                        if s == fast_sess {
+                            if let (Some(sock), Some(last), Some(ab)) =
+                                (fast_sock.as_ref(), fast_last.as_ref(), fast_abort.as_ref())
+                            {
+                                if !ab.is_finished()
+                                    && fast_allow_cached(&mut fast_allow, allow_private, s, dst)
+                                {
+                                    // See the fragment branch above, and `fast_sock`.
+                                    if let Some(sock) = sock.upgrade() {
+                                        let off = d.len() - p.len();
+                                        udp_stats::payload(p.len());
+                                        touch_session_throttled(conn_id, s, last);
+                                        // Record before the send — see the fragment
+                                        // branch above.
+                                        mirror_record(
+                                            &ss,
+                                            &mut fast_last_dst,
+                                            s,
+                                            dst,
+                                            fast_epoch.as_deref(),
+                                        );
+                                        staged.push(StagedSend {
+                                            sock,
+                                            dst: map_for_dual(dst),
+                                            payload: d.slice(off..),
+                                        });
+                                        fast_hit = true;
+                                    }
+                                }
+                            }
+                        }
+                        if fast_hit {
+                            continue;
+                        }
+                    }
+                    // Keep the allowlist mirror honest across the slow path — see
+                    // the fragment branch above.
+                    fast_last_dst = None;
+                    fast_allow = None;
+                    // See the fragment branch: flush staged sends before the slow
+                    // path's immediate send to keep per-flow order.
+                    flush_staged_sends(&mut staged);
+                    let off = d.len() - p.len();
+                    let payload = d.slice(off..);
+                    udp_stats::payload(payload.len());
+                    let used =
+                        forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
+                    if let Some((dst, life)) = used {
+                        match sess_memo_lookup(conn_id, s) {
+                            SessHit::Fresh(sock, last, ab, epoch) => {
+                                fast_sess = s;
+                                fast_sock = Some(Arc::downgrade(&sock));
+                                fast_last = Some(last);
+                                fast_abort = Some(ab);
+                                fast_epoch = Some(epoch.clone());
+                                let (ph, pp) = target_name(a);
+                                pin_arm(&mut fast_pin, s, ph, pp, dst, life);
+                            }
+                            SessHit::Stale | SessHit::Miss => {
+                                fast_sess = u32::MAX;
+                                fast_sock = None;
+                                fast_last = None;
+                                fast_abort = None;
+                                fast_epoch = None;
+                                fast_pin = None;
+                                fast_last_dst = None;
+                                fast_allow = None;
+                            }
+                        }
                     }
                 }
-                // Keep the allowlist mirror honest across the slow path — see
-                // the fragment branch above.
-                fast_last_dst = None;
-                let off = d.len() - p.len();
-                let payload = d.slice(off..);
-                udp_stats::payload(payload.len());
-                let used =
-                    forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
-                if let Some((dst, life)) = used {
-                    match sess_memo_lookup(conn_id, s) {
-                        SessHit::Fresh(sock, last, ab, epoch) => {
-                            fast_sess = s;
-                            fast_sock = Some(Arc::downgrade(&sock));
-                            fast_last = Some(last);
-                            fast_abort = Some(ab);
-                            fast_epoch = Some(epoch.clone());
-                            let (ph, pp) = target_name(a);
-                            pin_arm(&mut fast_pin, s, ph, pp, dst, life);
-                        }
-                        SessHit::Stale | SessHit::Miss => {
-                            fast_sess = u32::MAX;
-                            fast_sock = None;
-                            fast_last = None;
-                            fast_abort = None;
-                            fast_epoch = None;
-                            fast_pin = None;
-                            fast_last_dst = None;
-                        }
-                    }
-                }
+            }
+            flush_staged_sends(&mut staged);
+            record_drain_batch(drained);
+            if closed {
+                break;
             }
         }
         Ok::<(), anyhow::Error>(())

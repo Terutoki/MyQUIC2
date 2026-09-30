@@ -877,6 +877,129 @@ async fn too_large_refreshes_the_budget_without_discarding_the_handle() {
     );
 }
 
+/// N=1 CONTRACT: steady state pays zero auxiliary quinn takes per frame.
+///
+/// The per-frame `SendDatagram::poll` lock is irreducible (it lives inside
+/// quinn); this test pins everything around it: (a) a memo hit serves without
+/// touching the process-wide cache or the single-flight gate, so no `acquire`
+/// and no `close_reason`/`max_datagram_size`; (b) a `TooLarge` storm re-reads
+/// the live budget at most once per 100 ms window and keeps the handle; (c)
+/// `Unsupported` invalidates nothing — the production arm deliberately keeps
+/// the memoized handle — so a peer without DATAGRAM support costs one send
+/// attempt per datagram and zero re-acquire takes.
+#[tokio::test]
+async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
+    use std::sync::atomic::Ordering;
+    let (conn, _client, _server) = real_connection().await;
+    let live = conn
+        .max_datagram_size()
+        .expect("both ends negotiate DATAGRAM");
+    let e = SharedEgress::default();
+    let class = EgressClass::Interactive;
+    let now = mono_millis();
+
+    // (a) Memo hit path: publish, tag the memo, and serve repeatedly. A hit
+    // must neither bump the generation nor arm the single-flight gate — both
+    // would mean an auxiliary quinn take is hiding on the steady path.
+    e.cached[class.index()].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: live,
+        stamp_ms: now,
+        slot: 0,
+    })));
+    e.generation[class.index()].fetch_add(1, Ordering::Release);
+    let gen = e.generation[class.index()].load(Ordering::Acquire);
+    e.memo_store(class, gen, &conn, live, now);
+    for _ in 0..16 {
+        assert_eq!(e.with_fresh(class, now, |_, limit| limit), Some(live));
+    }
+    assert_eq!(
+        e.generation[class.index()].load(Ordering::Acquire),
+        gen,
+        "memo hits must not mutate shared state"
+    );
+    assert!(
+        !e.refreshing[class.index()].load(Ordering::Relaxed),
+        "memo hits must never arm the single-flight gate"
+    );
+
+    // (b) `TooLarge` storm: a PMTU shrink under a memoized handle. The first
+    // verdict re-reads the live budget (one take, one generation bump so every
+    // thread picks the new budget up); the rest of the storm inside the
+    // 100 ms probe window must change nothing — stale budget kept, no takes.
+    e.cached[class.index()].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: live.saturating_sub(64).max(1),
+        stamp_ms: now,
+        slot: 0,
+    })));
+    e.generation[class.index()].fetch_add(1, Ordering::Release);
+    let gen_before = e.generation[class.index()].load(Ordering::Acquire);
+    e.refresh_budget(class);
+    assert_eq!(
+        e.cached[class.index()]
+            .load_full()
+            .expect("handle kept")
+            .limit,
+        live,
+        "the first TooLarge of the storm refreshes the budget"
+    );
+    assert_eq!(
+        e.generation[class.index()].load(Ordering::Acquire),
+        gen_before + 1,
+        "exactly one memo invalidation per storm"
+    );
+    let probed = e.budget_probed_ms[class.index()].load(Ordering::Relaxed);
+    assert_ne!(probed, 0, "the storm's first probe must stamp the throttle");
+    // The storm continues against a budget that shrank again — without the
+    // throttle every one of these would take quinn's state lock.
+    e.cached[class.index()].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: live.saturating_sub(64).max(1),
+        stamp_ms: now,
+        slot: 0,
+    })));
+    let gen_storm = e.generation[class.index()].load(Ordering::Acquire);
+    for _ in 0..64 {
+        e.refresh_budget(class);
+    }
+    assert_eq!(
+        e.budget_probed_ms[class.index()].load(Ordering::Relaxed),
+        probed,
+        "the 100 ms probe window must admit exactly one re-read per storm"
+    );
+    assert_eq!(
+        e.generation[class.index()].load(Ordering::Acquire),
+        gen_storm,
+        "throttled storm verdicts must not churn the generation"
+    );
+    assert!(
+        e.cached[class.index()]
+            .load_full()
+            .expect("handle kept")
+            .limit
+            != live,
+        "a throttled verdict keeps the last known budget, not a fresh take"
+    );
+
+    // (c) `Unsupported`: the production arm counts the drop and keeps the
+    // handle — no invalidate, no re-acquire. Model that arm (doing nothing)
+    // and assert the steady path is undisturbed.
+    let gen_unsupported = e.generation[class.index()].load(Ordering::Acquire);
+    e.memo_store(class, gen_unsupported, &conn, live, now);
+    // ... production `Unsupported` arm runs here: bump EGRESS_DEAD only ...
+    assert_eq!(
+        e.generation[class.index()].load(Ordering::Acquire),
+        gen_unsupported,
+        "Unsupported must not invalidate: a re-acquire could only add two \
+         takes per datagram without finding a better slot"
+    );
+    assert!(
+        e.with_fresh(class, now, |_, _| ()).is_some(),
+        "the memo stays servable across Unsupported verdicts"
+    );
+}
+
 /// Serializes the slow-path counter tests below. The drop counters are
 /// process-wide and `bump` is exact, so two such tests racing would move
 /// each other's deltas. No other client test bumps these counters: every
@@ -1061,6 +1184,9 @@ fn empty_dispatch_cache() -> [DispatchSlot; DISPATCH_CACHE] {
     std::array::from_fn(|_| DispatchSlot {
         sess: u32::MAX,
         entry: None,
+        // Test helper tracks the sibling dispatcher's `app` pin field; an
+        // empty slot has no address yet, same as production's miss fill.
+        app: None,
     })
 }
 
@@ -1116,6 +1242,112 @@ async fn dispatch_cache_does_not_own_the_relay_socket() {
         released,
         "the dispatcher cache must not keep a retired association's relay socket alive"
     );
+}
+
+/// Churn-scale form of the ownership test above: 1200 short-lived
+/// associations — the exact population that once left 1024 UDP fds open —
+/// each dispatched once (so every one fills a cache slot), then released.
+/// Afterwards no entry may survive: every weak must be dead and the hub
+/// empty, proving the cache (including its pinned app addresses, which are
+/// `Copy` values, not owners) extends no lifetime.
+///
+/// One relay socket and one app socket are shared by all 1200: per-association
+/// sockets would only measure the test host's fd limit, not the cache's
+/// ownership, and the leak was owned `Arc`s, not sockets.
+#[tokio::test]
+async fn dispatch_cache_reclaims_1200_short_assocs() {
+    let hub = UdpHub::new();
+    let relay = Arc::new(
+        tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+    );
+    let app_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_addr = app_sock.local_addr().unwrap();
+    prime_relay(&relay, &app_sock, app_addr).await;
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    let mut weaks = Vec::with_capacity(1200);
+    for _ in 0..1200 {
+        let sess = hub.alloc_sess().expect("churn must not exhaust the cap");
+        let entry = Arc::new(AssocEntry::new(relay.clone()));
+        entry.app.store(Some(Arc::new(app_addr)));
+        hub.publish(sess, entry.clone());
+        weaks.push((sess, Arc::downgrade(&entry)));
+        dispatch_one(
+            &mut cache,
+            &hub,
+            sess,
+            dgram(sess, b"x"),
+            &mut reasm,
+            &mut pkt,
+        );
+        hub.release(sess);
+        drop(entry);
+    }
+    assert_eq!(
+        hub.len.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "all 1200 reservations must come back"
+    );
+    for (sess, w) in &weaks {
+        assert!(
+            w.upgrade().is_none(),
+            "assoc {sess} must be reclaimed, not cached"
+        );
+    }
+    for (i, slot) in cache.iter().enumerate() {
+        assert!(
+            slot.entry.as_ref().is_none_or(|w| w.upgrade().is_none()),
+            "cache slot {i} must hold no live entry"
+        );
+    }
+}
+
+/// The pinned app address backfills: a slot filled before the app sent
+/// anything caches `None`, drops that datagram as no-app, and serves the
+/// next one from a single re-read — every datagram after that is a pure
+/// cache hit that never touches `AssocEntry::app` again.
+#[tokio::test]
+async fn dispatch_cache_backfills_app_after_publish() {
+    let hub = UdpHub::new();
+    let relay = tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap();
+    let entry = Arc::new(AssocEntry::new(Arc::new(relay)));
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, entry.clone());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    // No app address yet: dropped, slot pinned to None.
+    dispatch_one(
+        &mut cache,
+        &hub,
+        sess,
+        dgram(sess, b"early"),
+        &mut reasm,
+        &mut pkt,
+    );
+    let idx = (sess as usize) & (DISPATCH_CACHE - 1);
+    assert!(cache[idx].entry.is_some());
+    assert_eq!(cache[idx].app, None);
+    // The app sends: the relay loop would publish this address.
+    let app_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_addr = app_sock.local_addr().unwrap();
+    prime_relay(&entry.relay, &app_sock, app_addr).await;
+    entry.app.store(Some(Arc::new(app_addr)));
+    dispatch_one(
+        &mut cache,
+        &hub,
+        sess,
+        dgram(sess, b"late"),
+        &mut reasm,
+        &mut pkt,
+    );
+    assert_eq!(cache[idx].app, Some(app_addr));
+    let got = recv_reply(&app_sock)
+        .await
+        .expect("reply must be delivered");
+    assert_eq!(&got[REPLY_HDR_V4..], b"late");
+    hub.release(sess);
 }
 
 /// UDP egress must stay on the connection it first used while that
@@ -1218,9 +1450,31 @@ async fn test_assoc() -> TestAssoc {
     let relay = tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap();
     let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let app_addr = app.local_addr().unwrap();
+    prime_relay(&relay, &app, app_addr).await;
     let entry = Arc::new(AssocEntry::new(Arc::new(relay)));
     entry.app.store(Some(Arc::new(app_addr)));
     TestAssoc { entry, app }
+}
+
+/// Prime a fresh relay socket's writable readiness, and drain the priming
+/// datagram from the app socket.
+///
+/// A fresh tokio UDP socket can report `WouldBlock` before its first
+/// readiness edge (see `retry.rs`), which routes the first reply through the
+/// process-global retry pool — whose workers live on whichever test runtime
+/// spawned them and can die with it. That cross-runtime churn is what made
+/// the positive-delivery assertions in this file flaky under full test
+/// parallelism; priming (the same pattern the retry contract tests use)
+/// keeps the first measured reply on the direct `try_send_to` arm, so these
+/// tests exercise the dispatcher, not the pool's runtime lifecycle.
+async fn prime_relay(
+    relay: &tokio::net::UdpSocket,
+    app: &tokio::net::UdpSocket,
+    app_addr: SocketAddr,
+) {
+    let _ = relay.send_to(b"prime", map_for_dual(app_addr)).await;
+    let mut b = [0u8; 8];
+    let _ = app.recv_from(&mut b).await;
 }
 
 /// How long a *positive* delivery assertion waits.

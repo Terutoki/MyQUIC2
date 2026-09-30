@@ -33,6 +33,14 @@
 //!                                 removing only shows up once several
 //!                                 associations run in parallel (see the
 //!                                 hardening passes' "run-to-run noise" notes).
+//!   `udpps <socks> <host:port> <secs> [payload]`
+//!                                 N=1 soak: one UDP ASSOCIATE, one relay
+//!                                 socket, fixed `payload`-byte payload
+//!                                 (64-200 B, default 128) blasted for `secs`
+//!                                 seconds (default 60). Reports
+//!                                 sent_pps/recv_pps/loss%. This is the
+//!                                 single-association ceiling the 100k pps N=1
+//!                                 small-packet target is measured against.
 //!
 //!   `chan <n> [depth]`
 //!                                 per-datagram cost of the client's inbound
@@ -102,6 +110,12 @@ fn main() {
             args[4].parse().unwrap(),
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
         ),
+        Some("udpps") => udpps(
+            &args[2],
+            &args[3],
+            args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128),
+        ),
         Some("chan") => chan(
             args[2].parse().unwrap(),
             args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256),
@@ -128,7 +142,7 @@ fn main() {
         ),
         _ => {
             eprintln!(
-                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpsweep|tcpecho|chan|server|reply|bulk> ..."
+                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpps|udpsweep|tcpecho|chan|server|reply|bulk> ..."
             );
             std::process::exit(2);
         }
@@ -930,6 +944,123 @@ fn udpmulti(socks: &str, target: &str, assocs: usize, n: usize, batch: usize) {
             100.0 * (s - r) as f64 / s as f64
         }
     );
+}
+
+/// N=1 soak: one UDP ASSOCIATE, one relay socket, fixed small payload blasted
+/// for `secs` wall seconds. Sender and receiver run on two threads sharing the
+/// one socket (cloned fd) so the send rate is not gated by the reply RTT; both
+/// sides count through the same AtomicU64 style as `udp`/`udpmulti`.
+/// Baseline 2026-09-30, macOS loopback, release, 4TCP+2UDP, 8-thread echo:
+///   udpraw control (no proxy, 1000 B): 20000/20000 in 0.273s = 73129 pps, 0% loss
+///   udp windowed via proxy (batch=64): 20000/20000 in 0.745s = 26847 pps, 0% loss
+///   udpps 5s/128 B via proxy:  offered 96485 pps, goodput 2586 pps, loss 96.9%
+///   udpps 60s/128 B via proxy: offered 105350 pps, goodput 370 pps, loss 99.6%
+/// Reading: the sender sustains >100k pps offered, the paced single-assoc
+/// ceiling is ~27k pps, and unthrottled blast collapses (buffers/BBR give up
+/// long before 100k). The N=1 100k target needs paced send + deeper
+/// buffers/windows, not a faster blast.
+fn udpps(socks: &str, target: &str, secs: u64, payload: usize) {
+    if secs == 0 {
+        eprintln!("udpps: secs must be > 0");
+        std::process::exit(2);
+    }
+    if !(64..=200).contains(&payload) {
+        eprintln!("udpps: payload must be 64-200 (got {payload})");
+        std::process::exit(2);
+    }
+    let (host, port) = split_host(target);
+    let (_control, relay) = match socks_associate(socks) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("udpps: associate {e}");
+            std::process::exit(1);
+        }
+    };
+    let u = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("udpps: bind {e}");
+            std::process::exit(1);
+        }
+    };
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let pkt = udp_request(&host, port, payload);
+    let secs_d = Duration::from_secs(secs);
+    let deadline = Instant::now() + secs_d;
+    let sent = Arc::new(AtomicU64::new(0));
+    let send_errs = Arc::new(AtomicU64::new(0));
+    let sender = {
+        let tx = u.try_clone().expect("udpps: clone relay socket");
+        let sent = sent.clone();
+        let send_errs = send_errs.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            let mut e = 0u64;
+            while Instant::now() < deadline {
+                match tx.send_to(&pkt, relay) {
+                    Ok(_) => n += 1,
+                    Err(_) => e += 1,
+                }
+            }
+            sent.fetch_add(n, Ordering::Relaxed);
+            send_errs.fetch_add(e, Ordering::Relaxed);
+        })
+    };
+    // Receiver runs here until the send deadline plus a drain grace so
+    // in-flight replies are counted rather than truncated by the stop time.
+    let t0 = Instant::now();
+    let mut recv = 0u64;
+    let mut buf = vec![0u8; 2048];
+    let drain_end = deadline + Duration::from_secs(2);
+    while Instant::now() < drain_end {
+        match u.recv_from(&mut buf) {
+            Ok(_) => recv += 1,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        if Instant::now() >= drain_end {
+            break;
+        }
+    }
+    let _ = sender.join();
+    // Final short drain on the now-idle socket: the sender is done, so any
+    // datagram still in the kernel queue belongs to this run.
+    u.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    while u.recv_from(&mut buf).is_ok() {
+        recv += 1;
+    }
+    let dt = t0.elapsed();
+    let s = sent.load(Ordering::Relaxed);
+    let se = send_errs.load(Ordering::Relaxed);
+    let wall = dt.as_secs_f64();
+    // `sent` was produced during exactly the `secs` send window (the sender
+    // stops at the deadline while the wall also covers the drain grace), so
+    // sent_pps is over `secs` and recv_pps over the wall that carried replies.
+    let sent_pps = s as f64 / secs as f64;
+    let recv_pps = recv as f64 / wall;
+    let loss = if s == 0 {
+        0.0
+    } else {
+        100.0 * s.saturating_sub(recv) as f64 / s as f64
+    };
+    println!(
+        "udpps socks={socks} target={target} payload={payload} secs={secs} \
+         sent={s} recv={recv} send_errs={se} wall={wall:.3}s \
+         sent_pps={sent_pps:.0} recv_pps={recv_pps:.0} loss={loss:.3}%"
+    );
+    if s == 0 {
+        eprintln!("udpps FAIL: nothing sent (associate down or send path broken)");
+        std::process::exit(1);
+    }
+    if recv > s {
+        eprintln!("udpps FAIL: accounting mismatch recv={recv} > sent={s}");
+        std::process::exit(1);
+    }
 }
 
 /// TCP echo target: echoes every byte it reads back verbatim. Unlike the reply

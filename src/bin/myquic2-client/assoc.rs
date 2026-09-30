@@ -178,15 +178,37 @@ pub(crate) async fn udp_associate_inner(
     // datagram would classify from itself, which cannot happen because the
     // first send classifies before it goes out.
     let mut class: Option<EgressClass> = None;
-    loop {
+    'assoc: loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
-                let (n, app) = match r {
-                    Ok(x) => x,
+                // Bounded ingress drain: the awaited head plus up to
+                // `LAST_HOP_DRAIN - 1` more via `try_recv_from`, so one
+                // readiness event moves up to 32 app datagrams instead of one
+                // wakeup per datagram. Tokio keeps readiness set until a
+                // `WouldBlock`, so the remainder is picked up on the next
+                // poll; nothing queues in userspace (no HOL). `continue`
+                // below advances the drain — the same packet-skip as before;
+                // only the head error ends the association.
+                let mut pending = match r {
+                    Ok(x) => Some(x),
                     // A transient socket error must end this association only;
                     // the wrapper still removes the hub subscription.
-                    Err(_) => break,
+                    Err(_) => break 'assoc,
                 };
+                let mut drained = 0usize;
+                for _ in 0..LAST_HOP_DRAIN {
+                    let (n, app) = match pending.take() {
+                        Some(x) => x,
+                        None => match relay.try_recv_from(&mut buf) {
+                            Ok(x) => x,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            // A drained-packet error ends the burst, not the
+                            // association: the head already proved the socket
+                            // live this poll.
+                            Err(_) => break,
+                        },
+                    };
+                    drained += 1;
                 if n == buf.len() {
                     // The kernel truncates a datagram larger than the buffer and
                     // reports only the buffer length, so the excess is already
@@ -395,6 +417,8 @@ pub(crate) async fn udp_associate_inner(
                         // warning class above keeps the cause visible.
                     }
                 }
+                }
+                record_drain_batch(drained);
             }
             _ = tcp.readable() => {
                 let mut closed = false;
@@ -426,7 +450,7 @@ pub(crate) async fn udp_associate_inner(
                         .store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
                 }
                 if closed {
-                    break;
+                    break 'assoc;
                 }
             }
             _ = idle_tick.tick() => {
@@ -436,7 +460,7 @@ pub(crate) async fn udp_associate_inner(
                 // a receive-only flow is not reaped out from under the app and
                 // the per-reply path stays clock-free.
                 if entry.idle_since_tick(mono_millis(), ASSOC_IDLE_MS) {
-                    break;
+                    break 'assoc;
                 }
             }
         }
@@ -485,21 +509,31 @@ pub(crate) fn send_reply_addr(
     // datagram — for a signal whose only consumer compares it against 180 s.
     entry.mark_replied();
     pkt.truncate(0);
-    pkt.extend_from_slice(&[0, 0, 0]);
+    encode_reply(pkt, dst, payload);
+    udp_try_send_slice(&entry.relay, map_for_dual(app), &pkt[..]);
+}
+
+/// Encode one SOCKS5 UDP reply frame (RSV/FRAG + source address + payload).
+///
+/// Split out of [`send_reply_addr`] so the dispatcher's grouped flush shares
+/// the single encoder: one wire format, no drift between the immediate and
+/// the batched path. Generic over `BufMut` so both the `BytesMut` scratch
+/// and the flush arena use it.
+pub(crate) fn encode_reply<B: bytes::BufMut>(pkt: &mut B, dst: SocketAddr, payload: &[u8]) {
+    pkt.put_slice(&[0, 0, 0]);
     // The destination of a reply is always the source address the server
-    // reported, which is IP-form; encode it straight into the scratch buffer.
+    // reported, which is IP-form; encode it straight into the caller's buffer.
     match dst {
         SocketAddr::V4(a) => {
-            pkt.extend_from_slice(&[0x01]);
-            pkt.extend_from_slice(&a.ip().octets());
-            pkt.extend_from_slice(&a.port().to_be_bytes());
+            pkt.put_slice(&[0x01]);
+            pkt.put_slice(&a.ip().octets());
+            pkt.put_slice(&a.port().to_be_bytes());
         }
         SocketAddr::V6(a) => {
-            pkt.extend_from_slice(&[0x04]);
-            pkt.extend_from_slice(&a.ip().octets());
-            pkt.extend_from_slice(&a.port().to_be_bytes());
+            pkt.put_slice(&[0x04]);
+            pkt.put_slice(&a.ip().octets());
+            pkt.put_slice(&a.port().to_be_bytes());
         }
     }
-    pkt.extend_from_slice(payload);
-    udp_try_send_slice(&entry.relay, map_for_dual(app), &pkt[..]);
+    pkt.put_slice(payload);
 }

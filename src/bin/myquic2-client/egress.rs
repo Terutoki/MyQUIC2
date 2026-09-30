@@ -94,6 +94,17 @@ impl SharedEgress {
     /// `f` runs synchronously against the borrowed handle, so the hot path
     /// costs one generation load and one `RefCell` borrow — no Arc RMW, no
     /// quinn lock. A miss leaves the memo untouched; the caller re-acquires.
+    ///
+    /// N=1 CONTRACT (client egress): a memo hit followed by `frag.send` pays
+    /// exactly one quinn take per frame — the `SendDatagram::poll` lock inside
+    /// `try_send_datagram`. The 1 s memo (`EGRESS_REFRESH_MS`), the per-class
+    /// single-flight gate, and the 100 ms `refresh_budget` probe exist to keep
+    /// every auxiliary take (`close_reason` / `max_datagram_size`) off this
+    /// path: refresh winner only, once per window; losers fail fast or reuse
+    /// the stale handle behind one liveness gate; `TooLarge` re-probes at most
+    /// once per 100 ms; `Unsupported` never re-acquires (the condition is
+    /// static for the connection's life, so a re-acquire could only add two
+    /// takes per datagram without finding a better slot).
     pub(crate) fn with_fresh<R>(
         &self,
         class: EgressClass,
@@ -335,7 +346,10 @@ impl SharedEgress {
         // steps, so a 100 ms interval measured on it is really 0~1 s and a
         // PMTU shrink keeps dropping on a stale budget for up to a second.
         // `mono_millis` is a vDSO read paid only on the `TooLarge` path.
-        let now = mono_millis();
+        // `.max(1)`: the zero stamp means "never probed", and the mono epoch
+        // counts from process start, so a verdict inside the first millisecond
+        // must still arm the throttle instead of probing once per datagram.
+        let now = mono_millis().max(1);
         let probed = &self.budget_probed_ms[class.index()];
         // Zero means never probed: the mono epoch counts from process start,
         // so a small `now` must not read as "probed 0 ms ago".
