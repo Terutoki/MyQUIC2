@@ -164,6 +164,19 @@ pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::Udp
     if s.set_recv_buffer_size(buf).is_err() {
         tracing::debug!("udp recv buffer {buf} unavailable (raise net.core.rmem_max)");
     }
+    // Linux caps a plain SO_*BUF request at net.core.{r,w}mem_max (OpenWrt
+    // ships ~208 KiB). When that happened and the process holds
+    // CAP_NET_ADMIN — the norm for an OpenWrt service running as root — retry
+    // through SO_*BUFFFORCE, which ignores the sysctl. Best-effort: without
+    // the capability the retry fails EPERM and the clamp warning below still
+    // names the sysctl to raise.
+    #[cfg(target_os = "linux")]
+    {
+        let short = |actual: Option<usize>| actual.is_some_and(|a| a < buf);
+        if short(s.send_buffer_size().ok()) || short(s.recv_buffer_size().ok()) {
+            force_udp_buffers(&s, buf);
+        }
+    }
     // Linux/macOS silently clamp to net.core.{w,r}mem_max; surface the real
     // value once per process — these calls run for every UDP session socket,
     // so warning per socket would flood the log on routers with default
@@ -195,7 +208,36 @@ fn warn_buf_clamped(which: &str, actual: usize, want: usize) {
     };
     if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
-            "udp {which} buffer clamped to {actual} (< {want}); raise net.core.{sysctl}; further buffer warnings suppressed"
+            "udp {which} buffer clamped to {actual} (< {want}); raise net.core.{sysctl} or grant CAP_NET_ADMIN (SO_*BUFFFORCE); further buffer warnings suppressed"
+        );
+    }
+}
+
+/// Best-effort `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE`: like the plain buffer
+/// options, but not clamped by `net.core.{w,r}mem_max`. Requires
+/// `CAP_NET_ADMIN`; an EPERM is ignored and the caller's clamp warning still
+/// fires.
+#[cfg(target_os = "linux")]
+fn force_udp_buffers(s: &socket2::Socket, bytes: usize) {
+    use std::os::unix::io::AsRawFd;
+    let v: libc::c_int = bytes.min(libc::c_int::MAX as usize) as libc::c_int;
+    let len = std::mem::size_of_val(&v) as libc::socklen_t;
+    // SAFETY: `s` owns a live UDP socket fd, and `&v` points at a valid c_int
+    // for the duration of each call.
+    unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUFFORCE,
+            &v as *const _ as *const libc::c_void,
+            len,
+        );
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            &v as *const _ as *const libc::c_void,
+            len,
         );
     }
 }

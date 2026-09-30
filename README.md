@@ -161,6 +161,7 @@ Auth                           uni stream (type 0x02) carrying the token (sent a
 - **Modern congestion control**: BBR by default (Cubic as an escape hatch), ECN + adaptive PMTU, and GSO/GRO batched I/O — a single connection can saturate the link.
 - **Built for high latency**: default transport parameters are tuned for long-haul links and prioritize low queued latency.
 - **Connection-level isolation**: TCP, interactive UDP and bulk UDP each keep their own congestion window — no bandwidth fights, no queuing behind each other.
+- **Socket buffers that hold on Linux**: the QUIC endpoint asks for 4 MB and session sockets 256 KiB of `SO_RCVBUF`/`SO_SNDBUF`; where `net.core.{r,w}mem_max` clamps that (OpenWrt ships ~208 KiB), the service retries with `SO_*BUFFFORCE` whenever it holds `CAP_NET_ADMIN` — root-run OpenWrt included — so burst headroom survives stock sysctls; a clamp warning names the sysctl otherwise.
 - **Tunable ceiling**: widen the transport windows on both ends to match your link's BDP and push throughput higher; pure TOML, no rebuild required.
 
 ---
