@@ -35,6 +35,12 @@ use crate::{
     accept::*, auth::*, forward::*, memo::*, pin::*, reader::*, reporter::*, table::*, tcp::*,
 };
 
+// The shipped static / OpenWrt binaries link musl, whose allocator measured
+// well behind glibc on the UDP soak; mimalloc closes part of that gap.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()

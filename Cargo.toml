@@ -52,6 +52,13 @@ toml = "1"
 serde = { version = "1", features = ["derive"] }
 arc-swap = "1"
 
+# mimalloc for musl targets only. The shipped static / OpenWrt binaries link
+# musl, whose allocator measured ~22% behind glibc on the closed-loop UDP soak
+# (149k vs 190k pps on the aarch64 test VM); mimalloc recovers about half the
+# gap (+15%) and measured neutral on glibc, which keeps the system allocator.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = true
