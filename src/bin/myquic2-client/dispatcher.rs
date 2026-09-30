@@ -14,7 +14,7 @@ use super::*;
 /// one id per slot instead of four: round-robin hit rate goes from ~2% to ~37%
 /// under churn, 100% for a fresh consecutive window. Costs 64 KiB per
 /// dispatcher (`DispatchSlot` is a `u32` plus an `Option<Weak>`, 16 B with
-/// padding, x 4096) — noise against the ~256 KiB of kernel socket caps each
+/// padding, x 4096) — noise against the ~128 KiB of kernel socket caps each
 /// association already carries.
 /// Must be a power of two (the index is a mask).
 pub(crate) const DISPATCH_CACHE: usize = 4096;
@@ -29,7 +29,7 @@ pub(crate) const DISPATCH_CACHE: usize = 4096;
 /// outlives every association, so a strong reference here made the cache the
 /// relay socket's *last* owner once `UdpHub::release` dropped the hub's and the
 /// association task exited: up to `DISPATCH_CACHE` dead relay sockets — an fd
-/// plus its 2 x 128 KiB kernel buffers each — stayed open until a session id
+/// plus its 2 x 64 KiB kernel buffers each — stayed open until a session id
 /// colliding on the same index happened to arrive (or the connection was
 /// redialed, which rebuilds the cache). Measured before the fix: 1200
 /// short-lived associations left **1024** UDP fds open in the client, which on a

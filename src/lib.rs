@@ -133,16 +133,15 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
 /// These are *caps*, not reservations: the kernel only accounts for what is
 /// actually queued, but the cap is what a burst can pin. One association moves
 /// a single DATAGRAM flow that is already rate-limited by the QUIC congestion
-/// window and drained in ≤32-datagram bursts. 128 KiB is the measured floor
-/// for that shape: the kernel charges ~2 KiB of skb overhead per small
-/// datagram, so 16 KiB and 64 KiB buffers held fewer packets than an
-/// association's opening burst and dropped a fixed number of packets per
-/// association in the aarch64 burst test, while 128 KiB measured zero loss.
-/// It also keeps the kernel side of a full house to ~2 GiB worst case
-/// (8192 server sessions x 256 KiB across both directions) instead of the
-/// ~4 GiB a 256 KiB cap allowed. Raise it per host only if drops at a full
-/// socket buffer show up in the drop warnings.
-pub const SESS_SOCKET_BUF: usize = 128 * 1024;
+/// window and drained in ≤32-datagram bursts. The kernel charges ~2 KiB of
+/// skb overhead per small datagram, so the cap trades burst absorption for a
+/// smaller worst case: 64 KiB holds fewer packets than an association can
+/// burst — the aarch64 burst test measured a fixed ~8 dropped packets per
+/// association at 64 KiB (16 KiB ~50; 128 KiB zero) — while the kernel side
+/// of a full house falls to ~1 GiB (8192 server sessions x 128 KiB across
+/// both directions) instead of ~2 GiB at 128 KiB. Raise it per host if drops
+/// at a full socket buffer show up in the drop warnings.
+pub const SESS_SOCKET_BUF: usize = 64 * 1024;
 
 /// Per-session / relay sockets: see [`SESS_SOCKET_BUF`].
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
@@ -426,7 +425,7 @@ mod tests {
     /// association (client relay) or session (server session socket) has dropped
     /// its own handle, and the worker used to await `send_to` with no deadline:
     /// a socket that never became writable pinned the fd — and on the server its
-    /// 2 x 128 KiB kernel buffers — for the process lifetime, and parked the
+    /// 2 x 64 KiB kernel buffers — for the process lifetime, and parked the
     /// whole shard with it, so no later datagram hashing to that shard was ever
     /// retried. `pending()` stands in for that socket: the point is that the
     /// deadline, not the kernel, ends the wait. Real time (no `test-util`

@@ -6,7 +6,7 @@ use super::*;
 /// 4s TCP connect + scheduling jitter, with margin for a loaded host.
 pub(crate) const TCP_DIAL_ACK_TIMEOUT: Duration = Duration::from_secs(25);
 /// Process-wide caps on client-side resources. Without these a local or LAN
-/// peer can spawn unbounded tasks / relay sockets (each with ~256 KiB kernel
+/// peer can spawn unbounded tasks / relay sockets (each with ~128 KiB kernel
 /// buffers) and exhaust fds and memory on the proxy host.
 pub(crate) const MAX_SOCKS_CONNS: usize = 8192;
 /// The admission cap above is only useful if the QUIC pool can actually carry

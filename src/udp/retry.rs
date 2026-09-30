@@ -79,7 +79,7 @@ pub(crate) fn retry_shards() -> &'static [RetryShard; UDP_RETRY_SHARDS] {
 /// lives. `send_to(...).await` parks until the socket is writable, and a
 /// destination that never becomes writable — a peer that stopped reading, a full
 /// qdisc, a black-holed route — parks it forever. That pinned the fd (and the
-/// session's 2 x 128 KiB kernel buffers on the server) for the process lifetime
+/// session's 2 x 64 KiB kernel buffers on the server) for the process lifetime
 /// *and* wedged the whole shard: a worker parked in `send_to` retries nothing
 /// else, so every later datagram hashing to that shard was silently dropped.
 /// 200 ms is far above the loopback/LAN drain this path exists for and far below

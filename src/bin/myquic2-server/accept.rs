@@ -223,7 +223,7 @@ pub(crate) async fn handle_conn(
         // strong handle here is a second owner of the session's socket, and it
         // outlives the session. The 180 s sweeper removes the table entry and
         // aborts the reply reader, which drops both of *their* handles — but a
-        // strong `fast_sock` would keep the socket (and its 2 x 128 KiB kernel
+        // strong `fast_sock` would keep the socket (and its 2 x 64 KiB kernel
         // buffers) alive outside the `MAX_SESSIONS_GLOBAL` budget until the next
         // datagram on this connection happened to take the slow path, or until
         // the connection closed. `abort.is_finished()` already stops the fast
