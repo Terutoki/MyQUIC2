@@ -4,7 +4,10 @@ pub mod reassembler;
 pub mod retry;
 pub mod send;
 
-pub use batch::{batch_backend, batch_report, recvmmsg_available, sendmmsg_available};
+pub use batch::{
+    batch_backend, batch_report, burst_msg_copy, recv_burst, recvmmsg_available,
+    sendmmsg_available, BURST_SLOT,
+};
 pub use batch::{record_drain_batch, record_send_group, LAST_HOP_DRAIN};
 pub use send::poll_once;
 

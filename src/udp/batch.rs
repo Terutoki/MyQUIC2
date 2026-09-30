@@ -9,14 +9,16 @@
 //!
 //! Two batching layers, deliberately split by reactor ownership:
 //!
-//! - **Receive drain (portable).** The hot loops keep their `recv_from().await`
-//!   for the first datagram (so Tokio's readiness integration is untouched)
-//!   and then drain up to `LAST_HOP_DRAIN - 1` more with `try_recv_from`.
-//!   This amortizes one task wakeup over up to 32 datagrams on every platform.
-//!   `recvmmsg` is *probed* ([`recvmmsg_available`]) for measurement only: a
-//!   raw `recvmmsg` on a Tokio-owned socket would bypass the reactor's
-//!   readiness bookkeeping, so the portable drain loop is the deployed recv
-//!   path and the probe exists so benches can report what the kernel offers.
+//! - **Receive drain (portable head + Linux `recvmmsg` burst).** The hot
+//!   loops keep their `recv_from().await` for the first datagram (so Tokio's
+//!   readiness integration is untouched) and then drain up to
+//!   `LAST_HOP_DRAIN - 1` more. On Linux the drain refills with one
+//!   `recvmmsg(MSG_DONTWAIT)` per burst ([`recv_burst`]); a kernel that does
+//!   not serve it (ENOSYS, seccomp) keeps the portable per-frame
+//!   `try_recv_from` loop. Both paths only ever run right after Tokio
+//!   reported the socket readable and stop on `EAGAIN`, so the reactor's
+//!   bookkeeping is untouched and one readiness event still moves at most
+//!   `LAST_HOP_DRAIN` datagrams.
 //! - **Send grouping (Linux `sendmmsg`, portable fallback).**
 //!   [`udp_try_send_grouped`](crate::udp::udp_try_send_grouped) sends up to
 //!   `LAST_HOP_DRAIN` already-encoded frames for one destination in a single
@@ -161,8 +163,9 @@ pub fn sendmmsg_available() -> bool {
 
 /// Whether the running kernel serves `recvmmsg` on UDP. Same gating contract
 /// as [`sendmmsg_available`]: probed once, cached, `false` off Linux.
-/// Measurement-only (see the module docs): the deployed recv path is the
-/// portable `try_recv_from` drain, which keeps Tokio's readiness intact.
+///
+/// Gates the deployed drain burst ([`recv_burst`]): a kernel without it keeps
+/// the portable per-frame `try_recv_from` loop.
 pub fn recvmmsg_available() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -182,7 +185,7 @@ pub fn batch_backend() -> &'static str {
         match (sendmmsg_available(), recvmmsg_available()) {
             (true, true) => "sendmmsg+recvmmsg",
             (true, false) => "sendmmsg-only",
-            (false, true) => "recvmmsg-probe-only/send-fallback",
+            (false, true) => "send-fallback+recvmmsg",
             (false, false) => "portable-fallback",
         }
     }
@@ -332,6 +335,178 @@ fn sockaddr_len_for(addr: &std::net::SocketAddr) -> libc::socklen_t {
     }
 }
 
+// ---------------------------------------------------------------------------
+// recvmmsg burst (Linux-gated): the deployed drain refill
+// ---------------------------------------------------------------------------
+
+/// Largest per-datagram slot the burst scratch must hold: the client relay
+/// buffer (`MQP_FRAG_MAX_PAYLOAD` + the SOCKS5 UDP header + slack). The
+/// server session buffer is smaller; [`burst_msg_copy`] truncates to the
+/// destination's length exactly like `recvfrom` would.
+pub const BURST_SLOT: usize =
+    crate::UDP_RECV_MAX + crate::SOCKS_UDP_HDR_MAX + crate::UDP_RECV_SLACK;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static BURST: std::cell::RefCell<Option<Box<BurstRecv>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One worker thread's reused `recvmmsg` scratch: up to [`LAST_HOP_DRAIN`]
+/// slots of [`BURST_SLOT`] bytes plus per-message length/source metadata.
+/// Allocated lazily on the thread's first burst (~270 KiB), never per message.
+/// Borrows are short: the syscall plus one [`burst_msg_copy`], never across
+/// an `.await`.
+#[cfg(target_os = "linux")]
+struct BurstRecv {
+    data: Vec<u8>,
+    lens: Vec<usize>,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
+#[cfg(target_os = "linux")]
+impl BurstRecv {
+    fn new() -> Self {
+        Self {
+            data: vec![0u8; LAST_HOP_DRAIN * BURST_SLOT],
+            lens: Vec::with_capacity(LAST_HOP_DRAIN),
+            addrs: Vec::with_capacity(LAST_HOP_DRAIN),
+        }
+    }
+
+    /// One `recvmmsg(MSG_DONTWAIT)` burst of up to `max` datagrams. Returns
+    /// the count; 0 on `EAGAIN` or any error — both end the caller's burst,
+    /// exactly like a failing `try_recv_from` arm.
+    fn recv(&mut self, fd: std::os::unix::io::RawFd, max: usize) -> usize {
+        self.lens.clear();
+        self.addrs.clear();
+        if max == 0 {
+            return 0;
+        }
+        let n = max.min(LAST_HOP_DRAIN);
+        let mut iovs: [libc::iovec; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
+        let mut names: [libc::sockaddr_storage; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
+        let mut hdrs: [libc::mmsghdr; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
+        for i in 0..n {
+            // SAFETY: each iovec points at its own BURST_SLOT-wide slice of
+            // `self.data`, which outlives the syscall (borrowed by the caller).
+            iovs[i].iov_base = unsafe { self.data.as_mut_ptr().add(i * BURST_SLOT) }.cast();
+            iovs[i].iov_len = BURST_SLOT;
+            hdrs[i].msg_hdr.msg_iov = &mut iovs[i];
+            hdrs[i].msg_hdr.msg_iovlen = 1;
+            hdrs[i].msg_hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
+            hdrs[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        }
+        // SAFETY: fd is a live non-blocking UDP socket; hdrs holds n fully
+        // initialised mmsghdrs whose iovecs and name buffers are live storage.
+        let r = unsafe {
+            libc::recvmmsg(
+                fd,
+                hdrs.as_mut_ptr(),
+                n as u32,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if r <= 0 {
+            return 0;
+        }
+        let r = r as usize;
+        for i in 0..r {
+            self.lens.push(hdrs[i].msg_len as usize);
+            self.addrs.push(sockaddr_to_std(&names[i]));
+        }
+        r
+    }
+}
+
+/// Receive up to `max` datagrams in one `recvmmsg` syscall into a
+/// thread-local scratch.
+///
+/// `Some(k)` stages `k` messages for [`burst_msg_copy`]; `k == 0` means
+/// nothing more was queued (or the socket errored) — end the burst. `None`
+/// means this kernel does not serve `recvmmsg`: use the portable per-frame
+/// fallback. `max` only bounds this syscall — callers pass their remaining
+/// drain budget so the burst can never overshoot it.
+///
+/// Call only with readiness already proven by the awaited head — the same
+/// gate the portable `try_recv_from` drain runs under. `MSG_DONTWAIT` keeps
+/// it non-blocking; on an empty socket the caller returns to
+/// `recv_from().await`, which re-arms readiness through Tokio as usual.
+pub fn recv_burst(sock: &tokio::net::UdpSocket, max: usize) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if !recvmmsg_available() {
+            return None;
+        }
+        BURST.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            let b = cell.get_or_insert_with(|| Box::new(BurstRecv::new()));
+            Some(b.recv(sock.as_raw_fd(), max))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (sock, max);
+        None
+    }
+}
+
+/// Copy burst message `i` (from the last [`recv_burst`] on this thread) into
+/// `dst`, reproducing `recvfrom` truncation semantics: a message longer than
+/// `dst` reports `dst.len()` and the excess is dropped, so the caller's
+/// `n == dst.len()` oversized-datagram predicate fires exactly as before.
+/// Returns `(n, source)`, or `None` when no burst is staged.
+pub fn burst_msg_copy(i: usize, dst: &mut [u8]) -> Option<(usize, std::net::SocketAddr)> {
+    #[cfg(target_os = "linux")]
+    {
+        BURST.with(|cell| {
+            let b = cell.borrow();
+            let b = b.as_ref()?;
+            let len = *b.lens.get(i)?;
+            let src = *b.addrs.get(i)?;
+            let n = len.min(dst.len());
+            let off = i * BURST_SLOT;
+            dst[..n].copy_from_slice(&b.data[off..off + n]);
+            Some((n, src))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (i, dst);
+        None
+    }
+}
+
+/// Convert a kernel-filled `sockaddr_storage` (from `recvmmsg`) back to a
+/// std address. A `recvmmsg` return value of `N` guarantees the first `N`
+/// name buffers hold a valid `sockaddr_in`/`sockaddr_in6`.
+#[cfg(target_os = "linux")]
+fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: ss_family == AF_INET, so the storage holds a sockaddr_in.
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
+                u16::from_be(sin.sin_port),
+            )
+        }
+        _ => {
+            // SAFETY: ss_family == AF_INET6, so the storage holds a sockaddr_in6.
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            ))
+        }
+    }
+}
+
 /// Batch-send already-encoded frames to one destination on a Tokio UDP socket.
 ///
 /// Returns the number of frames handed to the kernel. On Linux with a working
@@ -426,6 +601,49 @@ mod tests {
             n == buf.len(),
             "the truncation predicate must fire so drained sites drop it"
         );
+    }
+
+    /// Linux drain burst: one `recvmmsg` stages everything queued, sources and
+    /// lengths survive, and `burst_msg_copy` reproduces `recvfrom` truncation
+    /// semantics (a message longer than `dst` reports `dst.len()`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn burst_recv_and_copy_round_trip() {
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = rx.local_addr().unwrap();
+        let tx_port = tx.local_addr().unwrap().port();
+        // Five distinct datagrams; read one as the head (proves readiness),
+        // then stage the remaining four in one burst.
+        for i in 0..5u8 {
+            tx.send_to(&vec![i; 100 + i as usize], dst).await.unwrap();
+        }
+        let mut head = vec![0u8; BURST_SLOT];
+        let (_n, head_src) = rx.recv_from(&mut head).await.unwrap();
+        assert_eq!(head_src.port(), tx_port, "head source must be the sender");
+        let k = recv_burst(&rx, LAST_HOP_DRAIN).expect("Linux must serve recvmmsg");
+        assert_eq!(k, 4, "burst must stage the four remaining datagrams");
+        let mut lens = Vec::new();
+        for i in 0..k {
+            let mut buf = vec![0u8; BURST_SLOT];
+            let (len, src) = burst_msg_copy(i, &mut buf).expect("staged message must copy");
+            assert_eq!(src.port(), tx_port, "source must survive the burst");
+            assert!(
+                buf[..len].iter().all(|b| *b == (len - 100) as u8),
+                "payload byte and length must match the sent datagram"
+            );
+            lens.push(len);
+        }
+        lens.sort_unstable();
+        assert_eq!(lens, vec![101, 102, 103, 104]);
+        // Truncation semantics: a message copied into a smaller destination
+        // reports `dst.len()`, the predicate the drain loops check.
+        let mut small = vec![0u8; 10];
+        let (len, _) = burst_msg_copy(0, &mut small).unwrap();
+        assert_eq!(len, 10, "oversize datagram must report dst.len()");
+        // Empty burst: nothing left to stage, so no message is copyable.
+        assert_eq!(recv_burst(&rx, LAST_HOP_DRAIN), Some(0));
+        assert!(burst_msg_copy(0, &mut small).is_none());
     }
 
     /// Accounting helpers never panic on empty or oversized inputs.

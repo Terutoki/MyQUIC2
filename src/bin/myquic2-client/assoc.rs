@@ -182,13 +182,15 @@ pub(crate) async fn udp_associate_inner(
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
                 // Bounded ingress drain: the awaited head plus up to
-                // `LAST_HOP_DRAIN - 1` more via `try_recv_from`, so one
-                // readiness event moves up to 32 app datagrams instead of one
-                // wakeup per datagram. Tokio keeps readiness set until a
-                // `WouldBlock`, so the remainder is picked up on the next
-                // poll; nothing queues in userspace (no HOL). `continue`
-                // below advances the drain — the same packet-skip as before;
-                // only the head error ends the association.
+                // `LAST_HOP_DRAIN - 1` more, so one readiness event moves up
+                // to 32 app datagrams instead of one wakeup per datagram. On
+                // Linux the extras come from one `recvmmsg` burst per refill;
+                // a kernel without it keeps the per-frame `try_recv_from` arm.
+                // Tokio keeps readiness set until a `WouldBlock`, so the
+                // remainder is picked up on the next poll; nothing queues in
+                // userspace (no HOL). `continue` below advances the drain —
+                // the same packet-skip as before; only the head error ends
+                // the association.
                 let mut pending = match r {
                     Ok(x) => Some(x),
                     // A transient socket error must end this association only;
@@ -196,16 +198,41 @@ pub(crate) async fn udp_associate_inner(
                     Err(_) => break 'assoc,
                 };
                 let mut drained = 0usize;
+                // recvmmsg burst state (Linux): `burst_i < burst_n` consumes
+                // staged datagrams; otherwise one refill syscall covers the
+                // remaining per-wakeup budget. Both counters stay 0 on the
+                // portable path, where the `try_recv_from` arm below runs.
+                let mut burst_n = 0usize;
+                let mut burst_i = 0usize;
                 for _ in 0..LAST_HOP_DRAIN {
                     let (n, app) = match pending.take() {
                         Some(x) => x,
-                        None => match relay.try_recv_from(&mut buf) {
-                            Ok(x) => x,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            // A drained-packet error ends the burst, not the
-                            // association: the head already proved the socket
-                            // live this poll.
-                            Err(_) => break,
+                        None if burst_i < burst_n => {
+                            let i = burst_i;
+                            burst_i += 1;
+                            match burst_msg_copy(i, &mut buf) {
+                                Some(x) => x,
+                                None => break,
+                            }
+                        }
+                        None => match recv_burst(&relay, LAST_HOP_DRAIN - drained) {
+                            Some(0) => break,
+                            Some(k) => {
+                                burst_n = k;
+                                burst_i = 1;
+                                match burst_msg_copy(0, &mut buf) {
+                                    Some(x) => x,
+                                    None => break,
+                                }
+                            }
+                            None => match relay.try_recv_from(&mut buf) {
+                                Ok(x) => x,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                // A drained-packet error ends the burst, not the
+                                // association: the head already proved the socket
+                                // live this poll.
+                                Err(_) => break,
+                            },
                         },
                     };
                     drained += 1;

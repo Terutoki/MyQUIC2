@@ -133,29 +133,61 @@ pub(crate) async fn sess_reader_task(
             }
         };
         // Bounded reply drain (mirrors the client relay loops): the awaited
-        // head plus up to `LAST_HOP_DRAIN - 1` more via `try_recv_from`, so
-        // one wakeup moves up to 32 replies instead of one reply per wakeup.
-        // Tokio keeps recv readiness set until a `WouldBlock`, so the
-        // remainder is picked up on the next poll; nothing queues in
-        // userspace. Every drained datagram runs the same body as the head
-        // (truncation check, allowlist, fragmenter send). A drained error
-        // ends the burst, not the session: the head already proved the socket
-        // live this poll.
+        // head plus up to `LAST_HOP_DRAIN - 1` more, so one wakeup moves up
+        // to 32 replies instead of one reply per wakeup. On Linux the extras
+        // come from one `recvmmsg` burst per refill; a kernel without it keeps
+        // the per-frame `try_recv_from` arm. Tokio keeps recv readiness set
+        // until a `WouldBlock`, so the remainder is picked up on the next
+        // poll; nothing queues in userspace. Every drained datagram runs the
+        // same body as the head (truncation check, allowlist, fragmenter
+        // send). A drained error ends the burst, not the session: the head
+        // already proved the socket live this poll.
         let mut drained = 1usize;
         let mut pending: Option<(usize, SocketAddr)> = Some((n, src));
+        // recvmmsg burst state (Linux): `burst_i < burst_n` consumes staged
+        // datagrams; otherwise one refill syscall covers the remaining
+        // per-wakeup budget. Both counters stay 0 on the portable path, where
+        // the `try_recv_from` arm below runs.
+        let mut burst_n = 0usize;
+        let mut burst_i = 0usize;
         loop {
             let (n, src) = match pending.take() {
                 Some(x) => x,
+                None if burst_i < burst_n => {
+                    let i = burst_i;
+                    burst_i += 1;
+                    match burst_msg_copy(i, &mut buf) {
+                        Some(x) => {
+                            drained += 1;
+                            x
+                        }
+                        None => break,
+                    }
+                }
                 None => {
                     if drained >= LAST_HOP_DRAIN {
                         break;
                     }
-                    match rs.try_recv_from(&mut buf) {
-                        Ok(x) => {
-                            drained += 1;
-                            x
+                    match recv_burst(&rs, LAST_HOP_DRAIN - drained) {
+                        Some(0) => break,
+                        Some(k) => {
+                            burst_n = k;
+                            burst_i = 1;
+                            match burst_msg_copy(0, &mut buf) {
+                                Some(x) => {
+                                    drained += 1;
+                                    x
+                                }
+                                None => break,
+                            }
                         }
-                        Err(_) => break,
+                        None => match rs.try_recv_from(&mut buf) {
+                            Ok(x) => {
+                                drained += 1;
+                                x
+                            }
+                            Err(_) => break,
+                        },
                     }
                 }
             };
