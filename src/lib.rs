@@ -135,13 +135,14 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
 /// a single DATAGRAM flow that is already rate-limited by the QUIC congestion
 /// window and drained in ≤32-datagram bursts. The kernel charges ~2 KiB of
 /// skb overhead per small datagram, so the cap trades burst absorption for a
-/// smaller worst case: 64 KiB holds fewer packets than an association can
-/// burst — the aarch64 burst test measured a fixed ~8 dropped packets per
-/// association at 64 KiB (16 KiB ~50; 128 KiB zero) — while the kernel side
-/// of a full house falls to ~1 GiB (8192 server sessions x 128 KiB across
-/// both directions) instead of ~2 GiB at 128 KiB. Raise it per host if drops
-/// at a full socket buffer show up in the drop warnings.
-pub const SESS_SOCKET_BUF: usize = 64 * 1024;
+/// smaller worst case: below the measured floor a cap holds fewer packets
+/// than an association can burst — the aarch64 burst test measured a fixed
+/// ~8 dropped packets per association at 64 KiB and ~50 at 16 KiB (128 KiB
+/// was zero), and 32 KiB sits below that floor — while the kernel side of a
+/// full house falls to ~512 MiB (8192 server sessions x 64 KiB across both
+/// directions) instead of ~1 GiB at 64 KiB. Raise it per host if drops at a
+/// full socket buffer show up in the drop warnings.
+pub const SESS_SOCKET_BUF: usize = 32 * 1024;
 
 /// Per-session / relay sockets: see [`SESS_SOCKET_BUF`].
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
@@ -425,7 +426,7 @@ mod tests {
     /// association (client relay) or session (server session socket) has dropped
     /// its own handle, and the worker used to await `send_to` with no deadline:
     /// a socket that never became writable pinned the fd — and on the server its
-    /// 2 x 64 KiB kernel buffers — for the process lifetime, and parked the
+    /// 2 x 32 KiB kernel buffers — for the process lifetime, and parked the
     /// whole shard with it, so no later datagram hashing to that shard was ever
     /// retried. `pending()` stands in for that socket: the point is that the
     /// deadline, not the kernel, ends the wait. Real time (no `test-util`

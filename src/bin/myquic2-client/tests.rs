@@ -1197,7 +1197,7 @@ fn empty_dispatch_cache() -> [DispatchSlot; DISPATCH_CACHE] {
 /// association task exits, but the cache entry is only re-validated when
 /// another datagram for the *same session id* arrives. With a strong `Arc`
 /// there, every retired association stayed cached — up to `DISPATCH_CACHE`
-/// dead relay sockets, each an fd plus 2 x 64 KiB of kernel buffers, per
+/// dead relay sockets, each an fd plus 2 x 32 KiB of kernel buffers, per
 /// dispatcher — until a colliding session id happened to arrive or the
 /// connection was redialed. Measured before the fix: 1200 short-lived
 /// associations left 1024 UDP fds open in the client.
