@@ -404,7 +404,9 @@ impl BurstRecv {
                 fd,
                 hdrs.as_mut_ptr(),
                 n as u32,
-                libc::MSG_DONTWAIT,
+                // `as _`: the flags parameter is `c_int` in the libc crate's
+                // glibc bindings and `u32` in its musl bindings.
+                libc::MSG_DONTWAIT as _,
                 std::ptr::null_mut(),
             )
         };
