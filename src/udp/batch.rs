@@ -538,13 +538,13 @@ pub(crate) fn sendmmsg_frames(
     let storage = sockaddr_storage_for(dst);
     let namelen = sockaddr_len_for(dst);
     let mut hdrs: [libc::mmsghdr; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
-    for i in 0..n {
-        hdrs[i].msg_hdr.msg_name = &storage as *const _ as *mut libc::c_void;
-        hdrs[i].msg_hdr.msg_namelen = namelen;
+    for (i, h) in hdrs.iter_mut().enumerate().take(n) {
+        h.msg_hdr.msg_name = &storage as *const _ as *mut libc::c_void;
+        h.msg_hdr.msg_namelen = namelen;
         // SAFETY: `iovs` is a stack array that outlives the syscall below;
         // each entry borrows a live frame for the call's duration.
-        hdrs[i].msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(i) };
-        hdrs[i].msg_hdr.msg_iovlen = 1;
+        h.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(i) };
+        h.msg_hdr.msg_iovlen = 1;
     }
     // SAFETY: fd is a live non-blocking UDP socket; hdrs holds n initialised
     // mmsghdrs sharing one destination storage; stack iovecs borrow live
