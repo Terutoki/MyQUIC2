@@ -105,6 +105,18 @@ impl SharedEgress {
     /// once per 100 ms; `Unsupported` never re-acquires (the condition is
     /// static for the connection's life, so a re-acquire could only add two
     /// takes per datagram without finding a better slot).
+    ///
+    /// Dead-handle bound: the gen+stamp hit carries one extra `close_reason`
+    /// gate, which in quinn 0.11 is a `state` mutex take plus an error clone
+    /// (see `quinn-0.11.12/src/connection.rs:400-402`), not a local atomic
+    /// read: each memo hit therefore pays one uncontended mutex take (~20 ns
+    /// order, negligible against the ~25 us packet budget), and N=1 becomes
+    /// worst-case 2 takes/frame (this gate plus the `SendDatagram::poll` lock
+    /// inside `frag.send`). A dead handle serves at most 0 times — it misses
+    /// here directly, so the caller falls into `acquire` → `invalidate` and
+    /// counts `NO_EGRESS` precisely.
+    /// `with_fresh` never invalidates itself (avoids write amplification on
+    /// this hot path).
     pub(crate) fn with_fresh<R>(
         &self,
         class: EgressClass,
@@ -116,6 +128,9 @@ impl SharedEgress {
             let memo = slots.borrow();
             let entry = memo[class.index()].as_ref()?;
             if entry.gen == gen && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS {
+                if entry.conn.close_reason().is_some() {
+                    return None;
+                }
                 Some(f(&entry.conn, entry.limit))
             } else {
                 None

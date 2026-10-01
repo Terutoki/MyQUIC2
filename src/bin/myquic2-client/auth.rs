@@ -28,22 +28,74 @@ pub(crate) fn spawn_conn_loop(
                     slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
                     bump_gen(&slot.gen_tx);
                     let connected_at = std::time::Instant::now();
+                    // Silence watchdog, two independent detectors sharing one
+                    // poll loop. `tx` progress is deliberately NEVER treated
+                    // as health: keepalives and retransmits keep `udp_tx`
+                    // advancing into a dead path, so an `rx || tx` reset
+                    // blinds the detector exactly when the downlink dies.
                     let watchdog = async {
-                        let mut last_rx = conn.stats().udp_rx.datagrams;
+                        let s0 = conn.stats();
+                        // (a) Downlink / full blackhole: inbound datagrams
+                        // stall for >= silence, no matter what tx does.
+                        let mut last_rx = s0.udp_rx.datagrams;
                         let mut quiet_since = std::time::Instant::now();
+                        // (b) Uplink blackhole: our packets go out but no
+                        // ACK comes back, while the peer's keepalives still
+                        // feed `rx` so (a) stays blind. Progress signals
+                        // from `ConnectionStats` (quinn 0.11):
+                        // `frame_rx.acks` advances only when the peer's ACKs
+                        // reach us; `path.sent_packets` proves we sent
+                        // ack-eliciting traffic. `path.lost_packets` is
+                        // sampled for the log line only, never gated on:
+                        // quinn declares loss only inside the largest_acked
+                        // range and PTO bumps pto_count without bumping
+                        // lost, so a fully blackholed uplink may never
+                        // declare loss at all. `path.rtt` is NOT used: its
+                        // value may legitimately plateau on a stable link,
+                        // while these counters are monotonic progress signals.
+                        // Baselines are snapshotted whenever ACKs advance;
+                        // a stall fires as soon as we kept sending while ACKs
+                        // stalled, without waiting for a loss declaration, so
+                        // transient loss with recovering ACKs resets the
+                        // baseline and can never trip it.
+                        // Worst case if (b)'s gates somehow never line up:
+                        // the server's idle timeout (3x keepalive, >= 15 s)
+                        // fires first on the unanswered path and its
+                        // CONNECTION_CLOSE converges us.
+                        let mut last_ack = s0.frame_rx.acks;
+                        let mut ack_since = std::time::Instant::now();
+                        let mut ack_window_sent = s0.path.sent_packets;
                         info!("watchdog armed rx={last_rx} silence_limit={watchdog_silence:?}");
                         loop {
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             if conn.close_reason().is_some() {
                                 break;
                             }
-                            let rx = conn.stats().udp_rx.datagrams;
+                            let st = conn.stats();
+                            let rx = st.udp_rx.datagrams;
                             if rx != last_rx {
                                 last_rx = rx;
                                 quiet_since = std::time::Instant::now();
                             } else if quiet_since.elapsed() >= watchdog_silence {
                                 warn!(
-                                    "QUIC path silent {watchdog_silence:?}, force-closing {server}"
+                                    "QUIC path silent (downlink) rx={rx} tx={} {watchdog_silence:?}, force-closing {server}",
+                                    st.udp_tx.datagrams,
+                                );
+                                conn.close(0u32.into(), b"watchdog");
+                                break;
+                            }
+                            let acks = st.frame_rx.acks;
+                            let sent = st.path.sent_packets;
+                            let lost = st.path.lost_packets;
+                            if acks != last_ack {
+                                last_ack = acks;
+                                ack_since = std::time::Instant::now();
+                                ack_window_sent = sent;
+                            } else if ack_since.elapsed() >= watchdog_silence
+                                && sent != ack_window_sent
+                            {
+                                warn!(
+                                    "QUIC path silent (uplink) acks={acks} sent={sent} lost={lost} {watchdog_silence:?}, force-closing {server}"
                                 );
                                 conn.close(0u32.into(), b"watchdog");
                                 break;

@@ -54,6 +54,7 @@
 //!                                 worth deleting at all.
 //!
 //! Run with `--release`; the numbers are only comparable to each other.
+//! End-to-end check bench (byte-for-byte peer verify + socket I/O, no DCE); std::hint::black_box/criterion N/A.
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};

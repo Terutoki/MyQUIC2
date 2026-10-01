@@ -530,29 +530,25 @@ pub(crate) fn sendmmsg_frames(
     if n == 0 {
         return (0, None);
     }
-    let mut iovs: Vec<libc::iovec> = frames[..n]
-        .iter()
-        .map(|f| libc::iovec {
-            iov_base: f.as_ptr() as *mut libc::c_void,
-            iov_len: f.len(),
-        })
-        .collect();
+    let mut iovs: [libc::iovec; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
+    for (i, f) in frames[..n].iter().enumerate() {
+        iovs[i].iov_base = f.as_ptr() as *mut libc::c_void;
+        iovs[i].iov_len = f.len();
+    }
     let storage = sockaddr_storage_for(dst);
     let namelen = sockaddr_len_for(dst);
-    let mut hdrs: Vec<libc::mmsghdr> = (0..n)
-        .map(|i| {
-            let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-            h.msg_hdr.msg_name = &storage as *const _ as *mut libc::c_void;
-            h.msg_hdr.msg_namelen = namelen;
-            // SAFETY: `iovs` outlives the syscall below; each entry borrows a
-            // live frame for the call's duration.
-            h.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(i) };
-            h.msg_hdr.msg_iovlen = 1;
-            h
-        })
-        .collect();
+    let mut hdrs: [libc::mmsghdr; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
+    for i in 0..n {
+        hdrs[i].msg_hdr.msg_name = &storage as *const _ as *mut libc::c_void;
+        hdrs[i].msg_hdr.msg_namelen = namelen;
+        // SAFETY: `iovs` is a stack array that outlives the syscall below;
+        // each entry borrows a live frame for the call's duration.
+        hdrs[i].msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(i) };
+        hdrs[i].msg_hdr.msg_iovlen = 1;
+    }
     // SAFETY: fd is a live non-blocking UDP socket; hdrs holds n initialised
-    // mmsghdrs sharing one destination storage; iovecs borrow live frames.
+    // mmsghdrs sharing one destination storage; stack iovecs borrow live
+    // frames and outlive the syscall.
     let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as u32, 0) };
     if r < 0 {
         (0, Some(std::io::Error::last_os_error()))

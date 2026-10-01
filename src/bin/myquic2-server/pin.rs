@@ -360,7 +360,16 @@ pub(crate) fn resolve_pin(
     if s == pinned_sess {
         if let Some(pin) = pin.as_ref() {
             if pin.sess == s && pin_is_for(pin, h, p) && pin.expires > now {
-                return Some(pin.addr);
+                // SSRF recheck on the pin hit (allow_private=false only): a pin
+                // that now reads as non-global is treated as a miss and falls
+                // through to the memo/DNS re-resolve below (which scans the full
+                // cached set for a usable fallback), instead of being served
+                // stale for the rest of the pin life. Thread-local memoized, so
+                // the steady public flow pays one cached bool, no locks, no DNS
+                // reads; allow_private=true bypasses unchanged.
+                if allow_private || is_global_ip_cached(pin.addr.ip()) {
+                    return Some(pin.addr);
+                }
             }
         }
     }
@@ -436,6 +445,14 @@ pub(crate) fn resolve_pin(
 /// Every arming site therefore clamps to the source's remaining life; a fresh
 /// resolution (the spawned resolver task) passes `DNS_CACHE_TTL_MS`, where the
 /// 30 s pin wins and behaviour is unchanged.
+///
+/// Convergence bound: a public DNS flip is served stale for at most the pin's
+/// remaining life (worst 30 s from adoption, usually far less via the clamp);
+/// a flip to a filtered (non-global) address converges on the next datagram —
+/// the pin-hit SSRF recheck in `resolve_pin` treats it as a miss and falls
+/// through to the memo/DNS full-set scan instead of serving or dropping stale
+/// for the rest of the pin life. Steady public flows pay one thread-local
+/// cached bool per hit, no locks, no DNS reads.
 pub(crate) fn pin_life_ms(remaining_ms: u64) -> u64 {
     DEST_PIN_TTL_MS.min(remaining_ms)
 }
