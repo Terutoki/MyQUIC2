@@ -132,8 +132,20 @@ pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
         {
             j += 1;
         }
-        let refs: Vec<&[u8]> = staged[i..j].iter().map(|s| &s.payload[..]).collect();
-        udp_try_send_grouped(&staged[i].sock, staged[i].dst, &refs);
+        // Zero-alloc steady state: stack refs sized to the staging bound
+        // (mirrors the client's `flush_staged`). Staging is bounded by
+        // LAST_HOP_DRAIN, but the chunk loop keeps a defensive split so a
+        // future caller with a longer run cannot silently drop frames.
+        let mut refs: [&[u8]; LAST_HOP_DRAIN] = [&[]; LAST_HOP_DRAIN];
+        let mut k = i;
+        while k < j {
+            let n = (j - k).min(LAST_HOP_DRAIN);
+            for (r, s) in refs[..n].iter_mut().zip(&staged[k..k + n]) {
+                *r = &s.payload[..];
+            }
+            udp_try_send_grouped(&staged[i].sock, staged[i].dst, &refs[..n]);
+            k += n;
+        }
         i = j;
     }
     staged.clear();
@@ -368,7 +380,7 @@ pub(crate) async fn handle_conn(
                     // The slow path records destinations itself, so this task-local
                     // mirror of the allowlist can no longer describe it: clear it so
                     // the next fast-path send re-records. Without this a destination
-                    // pushed by the slow path can fall out of `RecentAddrs` (8
+                    // pushed by the slow path can fall out of `RecentAddrs` (16
                     // entries) while `fast_last_dst` still claims it is present, and
                     // that destination's replies are dropped as REFUSED until it is
                     // sent to again.

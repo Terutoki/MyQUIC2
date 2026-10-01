@@ -196,11 +196,25 @@ async fn main() -> Result<()> {
         info!("client token authentication enabled");
     }
     spawn_udp_reporter();
+    // SIGTERM/SIGINT: stop accepting and close the endpoint so every peer gets
+    // an immediate CONNECTION_CLOSE and redials, instead of a silent blackhole
+    // until its watchdog fires. No drain window — in-flight flows restart via
+    // the client's reconnect loops; the bounded wait is only for quinn to flush
+    // the close frames.
+    let mut shutdown = std::pin::pin!(shutdown_signal());
     loop {
-        let incoming = match ep.accept().await {
-            Some(i) => i,
-            None => {
-                error!("QUIC endpoint driver stopped (socket failure?); exiting");
+        let incoming = tokio::select! {
+            accepted = ep.accept() => match accepted {
+                Some(i) => i,
+                None => {
+                    error!("QUIC endpoint driver stopped (socket failure?); exiting");
+                    break;
+                }
+            },
+            _ = &mut shutdown => {
+                info!("shutdown signal received: closing endpoint so peers redial immediately");
+                ep.close(0u32.into(), b"shutdown");
+                let _ = tokio::time::timeout(Duration::from_secs(3), ep.wait_idle()).await;
                 break;
             }
         };

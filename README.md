@@ -10,7 +10,7 @@ SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-2 protocol · built
 [![QUIC](https://img.shields.io/badge/QUIC-TLS%201.3-38bdf8)](#-architecture)
 [![Performance](https://img.shields.io/badge/Performance-blazing%20fast-f97316)](#-performance-design)
 [![Protocol](https://img.shields.io/badge/Protocol-MQP--2-f59e0b)](#-the-mqp-2-protocol)
-[![Tests](https://img.shields.io/badge/Tests-187%20passing-16a34a)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-188%20passing-16a34a)](#-verification)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20OpenWrt-6366f1)](#-building)
 [![License](https://img.shields.io/badge/License-MIT-22c55e)](#-license)
 
@@ -161,7 +161,8 @@ Auth                           uni stream (type 0x02) carrying the token (sent a
 - **Modern congestion control**: BBR by default (Cubic as an escape hatch), ECN + adaptive PMTU, and GSO/GRO batched I/O — a single connection can saturate the link.
 - **Built for high latency**: default transport parameters are tuned for long-haul links and prioritize low queued latency.
 - **Connection-level isolation**: TCP, interactive UDP and bulk UDP each keep their own congestion window — no bandwidth fights, no queuing behind each other.
-- **Socket buffers that hold on Linux**: the QUIC endpoint asks for 4 MB and session sockets 256 KiB of `SO_RCVBUF`/`SO_SNDBUF`; where `net.core.{r,w}mem_max` clamps that (OpenWrt ships ~208 KiB), the service retries with `SO_*BUFFFORCE` whenever it holds `CAP_NET_ADMIN` — root-run OpenWrt included — so burst headroom survives stock sysctls; a clamp warning names the sysctl otherwise.
+- **Socket buffers that hold on Linux**: the QUIC endpoint asks for 4 MB and session sockets 64 KiB of `SO_RCVBUF`/`SO_SNDBUF` (`MYQUIC2_SESS_SOCKET_BUF=32768` on RAM-tight routers, `=131072` for the zero-loss point the burst test measured); where `net.core.{r,w}mem_max` clamps that (OpenWrt ships ~208 KiB), the service retries with `SO_*BUFFFORCE` whenever it holds `CAP_NET_ADMIN` — root-run OpenWrt included — so burst headroom survives stock sysctls; a clamp warning names the sysctl otherwise.
+- **Signal-driven shutdown**: SIGTERM/SIGINT closes the QUIC endpoint at once, so peers receive CONNECTION_CLOSE and redial within seconds instead of waiting out the ~20 s silence watchdog; in-flight flows restart through the reconnect loops (no drain window).
 - **Tunable ceiling**: widen the transport windows on both ends to match your link's BDP and push throughput higher; pure TOML, no rebuild required.
 
 ---
@@ -206,7 +207,7 @@ MyQUIC2/
 
 ## ✅ Verification
 
-- `cargo test --all-targets`: **187 passed / 0 failed** (186 with `--no-default-features`)
+- `cargo test --all-targets`: **188 passed / 0 failed** (187 with `--no-default-features`)
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`: clean on both feature sets
 - Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅
 - UDP N=1 soak (`hotpath_bench udpps`, single association, macOS dev box): open-loop 128 B blast delivers **~40k recv pps** at ~66k sent pps (was ~2.6k recv pps before the last-hop batching pass); closed-loop windowed holds **~30k pps / 0 loss**; `udpraw` loopback control ~82k pps

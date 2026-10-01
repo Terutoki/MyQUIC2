@@ -1,5 +1,7 @@
 //! 0-RTT end-to-end probe: connect twice to the SAME server process.
-//! First connection fetches resumption tickets; second must offer 0-RTT early data.
+//! First connection fetches resumption tickets; the second is attempted with
+//! 0-RTT, and the auth token plus app data are sent only after the server
+//! accepts — a bearer secret must never ride replayable early data.
 //! Usage: zero_rtt_probe [server_addr] [sni] [auth_token]
 //! (auth_token also read from MYQUIC2_AUTH_TOKEN; must match the server config)
 use myquic2::*;
@@ -50,9 +52,17 @@ async fn main() -> anyhow::Result<()> {
     let connecting = ep.connect(server, &sni)?;
     match connecting.into_0rtt() {
         Ok((c2, accepted_fut)) => {
-            authenticate(&c2, &token).await?;
             println!("conn2: client HAD resumption tickets, 0-RTT offered");
-            // Send application data immediately, before handshake completes.
+            // 0.11 API: `ZeroRttAccepted` resolves when the handshake completes
+            // with true = early data kept. The bearer token and app data wait
+            // for this gate so they ride 1-RTT keys only (never replayable
+            // early data); awaiting first also covers the accepted==false
+            // path, where c2 is now a plain 1-RTT connection and the same
+            // authenticate + app IO runs on fresh keys.
+            let accepted = accepted_fut.await;
+            println!("conn2: server accepted 0-RTT early data = {accepted}");
+            authenticate(&c2, &token).await?;
+            // Send application data only after handshake acceptance is known.
             let (mut send, mut recv) = c2.open_bi().await?;
             let mut hdr = Vec::new();
             TargetAddr::Ip("127.0.0.1:18081".parse()?).encode(&mut hdr)?;
@@ -79,11 +89,6 @@ async fn main() -> anyhow::Result<()> {
             let mut buf = vec![0u8; 13];
             recv.read_exact(&mut buf).await?;
             println!("conn2: 0-RTT echo ok: {:?}", String::from_utf8_lossy(&buf));
-            // 0.11 API: `ZeroRttAccepted` resolves when the handshake completes
-            // with true = early data kept. The echo above already proves it
-            // (a rejected 0-RTT stream cannot echo), this names it directly.
-            let accepted = accepted_fut.await;
-            println!("conn2: server accepted 0-RTT early data = {accepted}");
             c2.close(0u32.into(), b"probe-done");
             c1.close(0u32.into(), b"probe-done");
         }

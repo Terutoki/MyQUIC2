@@ -161,15 +161,28 @@ async fn main() -> Result<()> {
         if c.auth_token.is_empty() { "off" } else { "on" });
     spawn_udp_reporter();
     let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
+    // SIGTERM/SIGINT: close the endpoint so every pooled connection drops and
+    // in-flight SOCKS flows end with a reset instead of being silently killed
+    // with the process. There is no drain window; the reconnect loops would
+    // redial if the process stayed alive, and process exit follows immediately.
+    let mut shutdown = std::pin::pin!(shutdown_signal());
     loop {
-        let (sock, peer) = match li.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                // Transient accept errors (EMFILE/ECONNABORTED) must not kill
-                // the proxy for every other client.
-                warn!("accept failed: {e:#}; continuing");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
+        let (sock, peer) = tokio::select! {
+            accepted = li.accept() => match accepted {
+                Ok(x) => x,
+                Err(e) => {
+                    // Transient accept errors (EMFILE/ECONNABORTED) must not kill
+                    // the proxy for every other client.
+                    warn!("accept failed: {e:#}; continuing");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = &mut shutdown => {
+                info!("shutdown signal received: closing endpoint so conns drop and peers can reconnect");
+                ep.close(0u32.into(), b"shutdown");
+                let _ = tokio::time::timeout(Duration::from_secs(1), ep.wait_idle()).await;
+                break;
             }
         };
         let _ = sock.set_nodelay(true);
@@ -190,4 +203,5 @@ async fn main() -> Result<()> {
             }
         });
     }
+    Ok(())
 }

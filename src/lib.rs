@@ -128,25 +128,63 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
     udp_socket_dual_with_size(bind, 4 * 1024 * 1024)
 }
 
-/// Per-session / relay socket buffer, per direction.
+/// Per-session / relay socket buffer, per direction (the default; see
+/// [`sess_socket_buf`] for the effective value).
 ///
 /// These are *caps*, not reservations: the kernel only accounts for what is
 /// actually queued, but the cap is what a burst can pin. One association moves
 /// a single DATAGRAM flow that is already rate-limited by the QUIC congestion
 /// window and drained in ≤32-datagram bursts. The kernel charges ~2 KiB of
 /// skb overhead per small datagram, so the cap trades burst absorption for a
-/// smaller worst case: below the measured floor a cap holds fewer packets
-/// than an association can burst — the aarch64 burst test measured a fixed
-/// ~8 dropped packets per association at 64 KiB and ~50 at 16 KiB (128 KiB
-/// was zero), and 32 KiB sits below that floor — while the kernel side of a
-/// full house falls to ~512 MiB (8192 server sessions x 64 KiB across both
-/// directions) instead of ~1 GiB at 64 KiB. Raise it per host if drops at a
-/// full socket buffer show up in the drop warnings.
-pub const SESS_SOCKET_BUF: usize = 32 * 1024;
+/// smaller worst case. The aarch64 burst test measured a fixed ~8 dropped
+/// packets per association at 64 KiB and ~50 at 16 KiB (128 KiB was zero):
+/// 64 KiB is the measured floor and the shipped default, while the kernel side
+/// of a full house (8192 server sessions x 128 KiB across both directions) is
+/// ~1 GiB. On a RAM-tight router set `MYQUIC2_SESS_SOCKET_BUF=32768` (or
+/// `=131072` for zero measured loss on a server); a full-buffer clamp warning
+/// names the sysctl to raise otherwise.
+pub const SESS_SOCKET_BUF: usize = 64 * 1024;
 
-/// Per-session / relay sockets: see [`SESS_SOCKET_BUF`].
+/// Lower clamp for [`sess_socket_buf`] overrides: below the 16 KiB the burst
+/// test measured ~50 drops/association, an override asks for a loss rate the
+/// proxy cannot paper over.
+pub const SESS_SOCKET_BUF_MIN: usize = 16 * 1024;
+
+/// Upper clamp for [`sess_socket_buf`] overrides: 4 MiB matches the QUIC
+/// endpoint's own socket, and past it the per-session kernel cost stops
+/// scaling with any real burst.
+pub const SESS_SOCKET_BUF_MAX: usize = 4 * 1024 * 1024;
+
+/// Effective per-session / relay socket buffer: [`SESS_SOCKET_BUF`] unless
+/// `MYQUIC2_SESS_SOCKET_BUF` (bytes) overrides it, clamped to
+/// [`SESS_SOCKET_BUF_MIN`]..=[`SESS_SOCKET_BUF_MAX`].
+///
+/// Read once per process: the value feeds every session socket and an operator
+/// tuning memory/throughput should not be able to change it mid-run per socket.
+/// The override exists because the same binary ships to a 1 GiB server and a
+/// 128 MiB router; an invalid value falls back to the default (never panics at
+/// socket-creation time on a typo).
+pub fn sess_socket_buf() -> usize {
+    static OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("MYQUIC2_SESS_SOCKET_BUF")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(clamp_sess_socket_buf)
+            .unwrap_or(SESS_SOCKET_BUF)
+    })
+}
+
+/// Clamp an operator-supplied `MYQUIC2_SESS_SOCKET_BUF` value into the
+/// supported range. Split out from the env read so the clamp itself is
+/// testable without mutating process-global state.
+fn clamp_sess_socket_buf(v: usize) -> usize {
+    v.clamp(SESS_SOCKET_BUF_MIN, SESS_SOCKET_BUF_MAX)
+}
+
+/// Per-session / relay sockets: see [`SESS_SOCKET_BUF`] / [`sess_socket_buf`].
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
-    udp_socket_dual_with_size(bind, SESS_SOCKET_BUF)
+    udp_socket_dual_with_size(bind, sess_socket_buf())
 }
 
 pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::UdpSocket> {
@@ -266,6 +304,41 @@ pub fn tcp_listener_dual(bind: &str) -> Result<std::net::TcpListener> {
     Ok(s.into())
 }
 
+/// Resolve when the process receives a shutdown request: `SIGTERM` or `SIGINT`
+/// on Unix, Ctrl-C elsewhere.
+///
+/// Both binaries hold this in their accept loops and, on resolution, close the
+/// QUIC endpoint so connected peers receive a `CONNECTION_CLOSE` and redial
+/// instead of blackholing until their silence watchdog fires. There is no drain
+/// window: in-flight flows are interrupted by design (UDP has no
+/// retransmission, and the client's reconnect loops re-establish TCP/UDP).
+///
+/// Signal handlers are registered on first poll, so pin this future once
+/// outside the loop rather than rebuilding it per iteration. It performs no
+/// work on the accept path until the signal actually arrives.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("cannot install SIGTERM handler ({e}); listening for ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Consume the MQP-2 TCP-open ACK (`magic | 0x00 | atyp | addr | port`). The
 /// magic is checked first: raw application bytes from a pre-magic peer fail
 /// here (never parsed as the ACK), as do a non-zero status, a malformed
@@ -305,6 +378,18 @@ pub(crate) async fn read_mqp_ack(recv: &mut quinn::RecvStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session-socket override clamps instead of trusting the operator (or
+    /// a typo) verbatim: 1 B and `usize::MAX` must land on the measured range,
+    /// and the shipped default is the 64 KiB floor, not the 32 KiB value the
+    /// burst test measured as lossy.
+    #[test]
+    fn sess_socket_buf_override_clamps_to_supported_range() {
+        assert_eq!(clamp_sess_socket_buf(1), SESS_SOCKET_BUF_MIN);
+        assert_eq!(clamp_sess_socket_buf(usize::MAX), SESS_SOCKET_BUF_MAX);
+        assert_eq!(clamp_sess_socket_buf(96 * 1024), 96 * 1024);
+        assert_eq!(SESS_SOCKET_BUF, 64 * 1024);
+    }
 
     /// The retry pool outlives the runtime that first needed it.
     ///
