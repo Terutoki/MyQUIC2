@@ -152,29 +152,75 @@ pub(crate) async fn forward_server_dgram(
                             // counted drop on failure), so this guard only
                             // fires when the task dies before either ran.
                             let _coalesce_guard = DnsCoalesceGuard::for_name(&host, p);
-                            let dst = match resolve_all_cached(&host, p).await {
-                                Ok(v) => match v
-                                    .iter()
-                                    .copied()
-                                    .find(|a| allow_private || is_global_ip(a.ip()))
-                                {
-                                    Some(v) => v,
-                                    None => {
-                                        dgram_drops::bump(&dgram_drops::REFUSED);
-                                        dns_coalesce_drop(&host, p, &dgram_drops::REFUSED).await;
+                            // A contended shard is transient — every holder's
+                            // critical section is a hash op with no I/O — so
+                            // the spawned delivery retries past it instead of
+                            // dropping the datagram *and every follower that
+                            // coalesced behind it*. This mirrors the client's
+                            // spawned resolver (`dispatcher.rs`), with two
+                            // differences: the retry is bounded, so a
+                            // pathological holder cannot pin the slow-path
+                            // permit this task holds, and the backoff escalates
+                            // from a yield to a 1 ms sleep, because `yield_now`
+                            // only requeues — it hands the core to nobody, so a
+                            // holder the OS descheduled mid-critical-section
+                            // stays descheduled while the retries burn.
+                            const CONTENDED_YIELDS: u32 = 16;
+                            const CONTENDED_SLEEPS: u32 = 4;
+                            let mut yields = 0u32;
+                            let mut sleeps = 0u32;
+                            let dst = loop {
+                                match resolve_all_cached(&host, p).await {
+                                    Ok(v) => match v
+                                        .iter()
+                                        .copied()
+                                        .find(|a| allow_private || is_global_ip(a.ip()))
+                                    {
+                                        Some(v) => break v,
+                                        None => {
+                                            dgram_drops::bump(&dgram_drops::REFUSED);
+                                            dns_coalesce_drop(&host, p, &dgram_drops::REFUSED)
+                                                .await;
+                                            return;
+                                        }
+                                    },
+                                    Err(e)
+                                        if is_dns_contended(&e)
+                                            && (yields < CONTENDED_YIELDS
+                                                || sleeps < CONTENDED_SLEEPS) =>
+                                    {
+                                        // Each hit is still counted: the
+                                        // counter means "a shard mutex was
+                                        // busy", never "a resolution is in
+                                        // flight".
+                                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                        if yields < CONTENDED_YIELDS {
+                                            yields += 1;
+                                            tokio::task::yield_now().await;
+                                        } else {
+                                            sleeps += 1;
+                                            tokio::time::sleep(Duration::from_millis(1)).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Retries exhausted, or a real failure:
+                                        // the counted give-up this path used to
+                                        // take on the first contention.
+                                        if is_dns_contended(&e) {
+                                            dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                            dns_coalesce_drop(
+                                                &host,
+                                                p,
+                                                &dgram_drops::DNS_CONTENTION,
+                                            )
+                                            .await;
+                                        } else {
+                                            dgram_drops::bump(&dgram_drops::REFUSED);
+                                            dns_coalesce_drop(&host, p, &dgram_drops::REFUSED)
+                                                .await;
+                                        }
                                         return;
                                     }
-                                },
-                                Err(e) => {
-                                    if is_dns_contended(&e) {
-                                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-                                        dns_coalesce_drop(&host, p, &dgram_drops::DNS_CONTENTION)
-                                            .await;
-                                    } else {
-                                        dgram_drops::bump(&dgram_drops::REFUSED);
-                                        dns_coalesce_drop(&host, p, &dgram_drops::REFUSED).await;
-                                    }
-                                    return;
                                 }
                             };
                             // Coalesced drain: take the queue up front (no new

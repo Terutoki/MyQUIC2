@@ -2064,15 +2064,16 @@ async fn l2_dns_singleflight_burst_loss_repro_server() {
         first.is_none(),
         "the spawning miss delivers inline nothing; the task owns it"
     );
-    // Registration barrier: the spawn registers single-flight before its
-    // first await, so a `yield_now` spin observes Inflight within a yield
-    // or two and the rest of the burst deterministically probes Inflight.
-    // Under a loaded `cargo test --all-targets` run every worker can be
-    // spinning a `yield_now` loop of its own, starving the spawned task
-    // before it registers — yields alone never guarantee it runs. The sleep
-    // fallback hands the core back, so the registration lands within a
-    // millisecond or two. The premise stays strict: Inflight must still be
-    // observed, never assumed.
+    // Registration barrier: the spawn registers single-flight before its first
+    // await, and the resolver now retries a contended shard internally (see
+    // `forward.rs`), so `Inflight` is observed as soon as the resolver task is
+    // *scheduled* — which is the one thing this test cannot force. Yields alone
+    // never guarantee it (they only requeue), so the budget escalates to
+    // sleeps, which hand the core back. One second is four orders of magnitude
+    // above the microsecond-scale work being observed and is only ever spent
+    // when the premise is about to fail; the earlier 100 ms budget measured too
+    // tight on a loaded 2-core CI runner. The premise stays strict: Inflight
+    // must still be observed, never assumed.
     let mut registered = false;
     for _ in 0..5_000 {
         if dns_is_inflight(host, port) {
@@ -2081,7 +2082,7 @@ async fn l2_dns_singleflight_burst_loss_repro_server() {
         }
         tokio::task::yield_now().await;
     }
-    for _ in 0..100 {
+    for _ in 0..1_000 {
         if registered {
             break;
         }
@@ -2093,7 +2094,11 @@ async fn l2_dns_singleflight_burst_loss_repro_server() {
     }
     assert!(
         registered,
-        "premise: the first miss must register single-flight before the burst continues"
+        "premise: the first miss must register single-flight before the burst \
+         continues (dns_contention moved {} times over the wait: a nonzero delta \
+         means the resolver spent its contended retries and gave up on a busy \
+         shard, zero means it was never scheduled)",
+        dgram_drops::snapshot().since(&before).dns_contention,
     );
     // Datagrams 2..33: same host, one full cap of followers. The queue can
     // never overflow (32 followers fit 32 slots), so no timing can drop: each

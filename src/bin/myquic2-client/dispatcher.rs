@@ -365,6 +365,18 @@ pub(crate) fn dispatch_stage(
                         // the datagram is never the price of a busy mutex. A
                         // waiter that retries after the owner finished resolves
                         // straight out of the warm cache.
+                        //
+                        // Bounded, and escalating from a yield to a 1 ms sleep,
+                        // exactly like the server's spawned resolver
+                        // (`forward.rs`): `yield_now` only requeues, so a
+                        // holder the OS descheduled mid-section needs the core
+                        // back before the retry can make progress, and an
+                        // unbounded loop would let a pathological holder pin
+                        // this task's slow-path permit forever.
+                        const CONTENDED_YIELDS: u32 = 16;
+                        const CONTENDED_SLEEPS: u32 = 4;
+                        let mut yields = 0u32;
+                        let mut sleeps = 0u32;
                         let dst = loop {
                             match resolve_all_cached(&host, p).await {
                                 Ok(v) => match v.first().copied() {
@@ -376,14 +388,34 @@ pub(crate) fn dispatch_stage(
                                         return;
                                     }
                                 },
+                                Err(e)
+                                    if myquic2::is_dns_contended(&e)
+                                        && (yields < CONTENDED_YIELDS
+                                            || sleeps < CONTENDED_SLEEPS) =>
+                                {
+                                    dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                    if yields < CONTENDED_YIELDS {
+                                        yields += 1;
+                                        tokio::task::yield_now().await;
+                                    } else {
+                                        sleeps += 1;
+                                        tokio::time::sleep(Duration::from_millis(1)).await;
+                                    }
+                                }
                                 Err(e) => {
                                     if myquic2::is_dns_contended(&e) {
                                         dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-                                        tokio::task::yield_now().await;
-                                        continue;
+                                        client_dns_coalesce_drop(
+                                            &host,
+                                            p,
+                                            &dgram_drops::DNS_CONTENTION,
+                                        )
+                                        .await;
+                                    } else {
+                                        dgram_drops::bump(&dgram_drops::REFUSED);
+                                        client_dns_coalesce_drop(&host, p, &dgram_drops::REFUSED)
+                                            .await;
                                     }
-                                    dgram_drops::bump(&dgram_drops::REFUSED);
-                                    client_dns_coalesce_drop(&host, p, &dgram_drops::REFUSED).await;
                                     return;
                                 }
                             }
