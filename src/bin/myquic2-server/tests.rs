@@ -2104,12 +2104,28 @@ async fn l2_dns_singleflight_burst_loss_repro_server() {
     // never overflow (32 followers fit 32 slots), so no timing can drop: each
     // follower is enqueued, served inline from the warmed cache, or
     // waiter-spawned — all three deliver, none bumps `DNS_INFLIGHT`.
+    //
+    // The follower *disposition* is deliberately not pinned here, for the same
+    // reason the warm burst below does not pin it: the owner resolves on
+    // another task, so a follower that arrives after that resolution warmed the
+    // cache is served inline, and one whose `try_lock` lands inside the owner's
+    // cleanup hold takes the contention spawn path. Both are legitimate and
+    // both deliver. What is pinned is the loss contract — 33 in, 33 out on the
+    // sockets, with no `DNS_INFLIGHT`/budget/policy counter moving — and the
+    // exact coalesce accounting lives in the seeded tests
+    // (`coalesce_under_cap_enqueues_without_a_sync_bump`,
+    // `coalesce_over_cap_counts_inflight_exactly_once`), which register a fake
+    // owner and are therefore deterministic. Asserting `is_none()` per follower
+    // instead made this test race a real `getaddrinfo("localhost")`: on a fast
+    // runner the resolution wins and the late followers hit the warm cache.
+    let mut inline = 0usize;
     for _ in 1..33 {
-        let r = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
-        assert!(
-            r.is_none(),
-            "a coalesced datagram has no inline delivery either way"
-        );
+        if forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true)
+            .await
+            .is_some()
+        {
+            inline += 1;
+        }
     }
     // The owner's delivery plus the whole drained queue, then a quiet period
     // proves nothing else arrives.
@@ -2123,7 +2139,9 @@ async fn l2_dns_singleflight_burst_loss_repro_server() {
     assert!(
         delivered == 33 && d.dns_inflight == 0,
         "L2 burst loss (server slow path): delivered={delivered}/33 \
-         dns_inflight_delta={} session_full_delta={} refused_delta={} (want 33/0/0/0)",
+         dns_inflight_delta={} session_full_delta={} refused_delta={} \
+         (want 33/0/0/0; inline={inline} followers were served from the warmed \
+         cache, which is allowed)",
         d.dns_inflight,
         d.session_full,
         d.refused,
@@ -2161,17 +2179,16 @@ async fn l2_dns_singleflight_burst_loss_repro_server() {
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
     assert!(
-        delivered2 == 40
-            && d2.dns_inflight == 0
-            && d2.dns_contention == 0
-            && d2.session_full == 0
-            && d2.refused == 0,
+        delivered2 == 40 && d2.dns_inflight == 0 && d2.session_full == 0 && d2.refused == 0,
         "warm 40-burst: delivered={delivered2}/40 dns_inflight_delta={} \
-         dns_contention_delta={} session_full_delta={} refused_delta={} (want 40/0/0/0/0)",
+         session_full_delta={} refused_delta={} (want 40/0/0/0). \
+         dns_contention_delta={} is reported, not pinned: the warm burst's own \
+         loop above documents that a busy shard may take the spawn path, which \
+         still delivers the datagram and counts the contention it hit.",
         d2.dns_inflight,
-        d2.dns_contention,
         d2.session_full,
         d2.refused,
+        d2.dns_contention,
     );
 }
 
