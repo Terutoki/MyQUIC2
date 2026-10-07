@@ -726,7 +726,12 @@ pub(crate) fn sendmmsg_frames(
         // first `nios` entries of this message's pair were just written, and
         // `msg_hdr.msg_iovlen` says exactly how many.
         h.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(2 * i).cast::<libc::iovec>() };
-        h.msg_hdr.msg_iovlen = nios;
+        // `as _`: `msg_iovlen` is `size_t` in the libc crate's glibc bindings
+        // and `c_int` in its musl bindings (musl's own `struct msghdr` declares
+        // `int msg_iovlen`), exactly like the `MSG_DONTWAIT as _` flag below.
+        // A bare `usize` type-checks on glibc and breaks the static musl build
+        // (E0308); a bare literal cannot express the 1-or-2 count.
+        h.msg_hdr.msg_iovlen = nios as _;
         hdrs[i].write(h);
     }
     // SAFETY: fd is a live non-blocking UDP socket; the first `n` entries of
