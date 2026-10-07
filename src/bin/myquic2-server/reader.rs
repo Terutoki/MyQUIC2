@@ -220,11 +220,16 @@ pub(crate) async fn sess_reader_task(
                 }
             }
             if n == buf.len() {
-                warn!(
-                    "udp session {s}: target reply above {MQP_FRAG_MAX_PAYLOAD} B truncated; \
-                 raise MQP_FRAG_MAX_PAYLOAD to carry it"
+                // Rate-limited, exactly like every other drop on this path: the
+                // rate is chosen by the *target* (any reply above the protocol
+                // cap), and an unthrottled `warn!` here put a formatted line
+                // through tracing's process-wide writer lock once per packet.
+                let dropped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+                dgram_drops::warn_oversize_recv(
+                    dgram_drops::OversizeRecv::TargetReply,
+                    dropped,
+                    || format!("; session {s}"),
                 );
-                dgram_drops::bump(&dgram_drops::TOO_LARGE);
                 continue;
             }
             if limit == 0 {
@@ -404,7 +409,7 @@ pub(crate) async fn get_or_create_sess(
     // Re-measured exactly once the bound reaches the cap, and after a sweep
     // actually ran (it may have freed sessions).
     let now = mono_millis();
-    if ss.len_upper_bound(now, fair_cap) >= fair_cap {
+    if ss.len_upper_bound(now) >= fair_cap {
         if claim_fair_sweep(now) {
             let evicted = ss.sweep_all(now);
             abort_evicted(evicted);

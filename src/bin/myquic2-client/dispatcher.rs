@@ -253,7 +253,7 @@ pub(crate) fn dispatch_stage(
         let Ok(f) = decode_fragment(&d) else {
             return None;
         };
-        let (_, a, whole) = reasm.push(&f, mono_millis())?;
+        let (_, a, whole) = reasm.push(&f, coarse_millis())?;
         udp_stats::payload(whole.len());
         match a.as_ref() {
             TargetAddrRef::Ip(dst) => return Some(stage_reply(&entry, app, dst, whole)),
@@ -333,10 +333,13 @@ pub(crate) fn dispatch_stage(
                     // a permit freed between a probe and the acquire is still
                     // usable and an exhausted budget is counted once (same
                     // single-acquire shape as the server's forward path).
+                    // `DNS_BUDGET`, not `SESSION_FULL`: see the server's
+                    // `forward_server_dgram` for why the two must not share a
+                    // counter.
                     let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
-                            dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                            dgram_drops::bump(&dgram_drops::DNS_BUDGET);
                             return None;
                         }
                     };
@@ -437,15 +440,24 @@ pub(crate) fn dispatch_one(
 
 /// Flush staged replies grouped by consecutive `(sock, app)` runs.
 ///
-/// Each run shares one `sendmmsg` on Linux (one `try_send_to` per frame on
-/// the portable fallback); runs flush in encounter order, so reply order is
-/// preserved exactly. `arena`/`offs` are reused across bursts (cleared, never
-/// freed) and the `refs` array lives on the stack, so the steady path
-/// allocates nothing per reply. Every frame keeps its own accounting:
-/// `WouldBlock` still queues into the detached-retry pool per frame.
+/// Each run shares one `sendmmsg` on Linux (one `try_send_to` per frame on the
+/// portable fallback); runs flush in encounter order, so reply order is
+/// preserved exactly. `hdrs`/`offs` are reused across bursts (cleared, never
+/// freed) and the `refs` array lives on the stack, so the steady path allocates
+/// nothing per reply.
+///
+/// **Only the ≤22-byte SOCKS5 header is staged, never the payload.** The frame
+/// handed to [`udp_try_send_grouped`] is `(header, payload)` and Linux sends the
+/// two as separate iovecs of one datagram, so a reply is copied zero times
+/// here. The earlier shape concatenated header + payload into a full-size
+/// `arena` per reply — one whole-payload memcpy per datagram on the download
+/// path — and that arena was `with_capacity(32 * 2048)` while the protocol
+/// allows 8 KiB payloads, so a burst of large replies also reallocated it.
+/// Every frame keeps its own accounting: `WouldBlock` still queues into the
+/// detached-retry pool per frame.
 pub(crate) fn flush_staged(
     staged: &mut Vec<StagedReply>,
-    arena: &mut Vec<u8>,
+    hdrs: &mut Vec<u8>,
     offs: &mut Vec<(usize, usize)>,
 ) {
     let mut i = 0;
@@ -458,16 +470,16 @@ pub(crate) fn flush_staged(
             j += 1;
         }
         debug_assert!(j - i <= LAST_HOP_DRAIN);
-        arena.clear();
+        hdrs.clear();
         offs.clear();
         for s in &staged[i..j] {
-            let start = arena.len();
-            encode_reply(arena, s.dst, &s.payload);
-            offs.push((start, arena.len() - start));
+            let start = hdrs.len();
+            encode_reply_header(hdrs, s.dst);
+            offs.push((start, hdrs.len() - start));
         }
-        let mut refs: [&[u8]; LAST_HOP_DRAIN] = [&[]; LAST_HOP_DRAIN];
-        for (r, (o, l)) in refs.iter_mut().zip(offs.iter()) {
-            *r = &arena[*o..*o + *l];
+        let mut refs: [SendFrame<'_>; LAST_HOP_DRAIN] = [(&[], &[]); LAST_HOP_DRAIN];
+        for ((r, (o, l)), s) in refs.iter_mut().zip(offs.iter()).zip(&staged[i..j]) {
+            *r = (&hdrs[*o..*o + *l], &s.payload[..]);
         }
         udp_try_send_grouped(&staged[i].sock, map_for_dual(staged[i].app), &refs[..j - i]);
         i = j;
@@ -510,11 +522,14 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                 tokio::time::interval(Duration::from_millis(FRAG_SWEEP_INTERVAL_MS));
             reasm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut reader_failed = false;
-            // Staged replies of one drain burst plus their reused encode
-            // scratch: grouped by (sock, app) at flush and cleared per burst,
+            // Staged replies of one drain burst plus their reused header
+            // buffer: grouped by (sock, app) at flush and cleared per burst,
             // so this queueing is bounded by LAST_HOP_DRAIN, never unbounded.
+            // `hdrs` holds only the per-reply SOCKS5 headers (<= 22 B each, so
+            // 704 B for a full burst) — the payloads are borrowed from the
+            // staged replies, not copied.
             let mut staged: Vec<StagedReply> = Vec::with_capacity(LAST_HOP_DRAIN);
-            let mut arena: Vec<u8> = Vec::with_capacity(32 * 2048);
+            let mut hdrs: Vec<u8> = Vec::with_capacity(LAST_HOP_DRAIN * SOCKS_UDP_HDR_MAX);
             let mut offs: Vec<(usize, usize)> = Vec::with_capacity(LAST_HOP_DRAIN);
             loop {
                 tokio::select! {
@@ -555,13 +570,28 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                             }
                         }
                         record_drain_batch(drained);
-                        flush_staged(&mut staged, &mut arena, &mut offs);
+                        flush_staged(&mut staged, &mut hdrs, &mut offs);
+                        // Saturation yields. Every extra datagram above is
+                        // served by `poll_once` with a noop waker, and quinn's
+                        // `read_datagram` returns an already-buffered datagram
+                        // before its first await point — so a *full* burst
+                        // leaves this branch ready again immediately and the
+                        // task would keep its worker indefinitely (Tokio only
+                        // forces `Pending` once the task budget is spent, and
+                        // none of this loop's branches consumes any). A full
+                        // burst is by definition the saturated case, so that is
+                        // exactly where the yield belongs; a partial burst
+                        // already drained the peer, and the next `select!`
+                        // parks as before.
+                        if drained >= LAST_HOP_DRAIN {
+                            tokio::task::yield_now().await;
+                        }
                         if reader_failed {
                             break;
                         }
                     }
                     _ = gen.changed() => break,
-                    _ = reasm_tick.tick() => { reasm.expire(mono_millis()); }
+                    _ = reasm_tick.tick() => { reasm.expire(coarse_millis()); }
                 }
             }
             if reader_failed {

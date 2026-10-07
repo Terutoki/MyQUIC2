@@ -13,6 +13,7 @@
 //! 均经 `crate::` 绝对路径引用。
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use bytes::Bytes;
 
@@ -22,6 +23,96 @@ use crate::mqp::fragment::{
     MQP_FRAG_MAX_TOTAL,
 };
 use crate::udp_stats;
+
+/// Golden-ratio 64-bit odd multiplier (the constant the rest of this crate's
+/// hand-rolled folds use: `udp::retry::retry_shard_for`, `dns::memo`).
+const FRAG_HASH_K: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Multiply-fold hasher for the reassembler's `(u32, u16)` keys.
+///
+/// The std default is `RandomState` (SipHash-1-3) and one fragment probes the
+/// tables five to eight times — stale-replay probe, count cap, payload cap,
+/// restart probe, `entry`, removal, tombstone insert — which made key hashing
+/// the largest single item on the per-fragment receive path, comparable to the
+/// chunk copy itself. The key is six bytes of peer-chosen session id and
+/// fragment id, so the fold has to mix both words (a session-only hash would
+/// collapse every id of one session into one bucket); collisions still only
+/// cost a probe, because the map compares the full key and can never mis-serve.
+///
+/// `finish` finalizes SplitMix-style so the *high* bits vary too: hashbrown
+/// takes the bucket index from the low bits and the 7-bit control fingerprint
+/// from the top, and a bare multiply leaves the top bits a weak function of the
+/// inputs.
+///
+/// The state starts from a **per-process secret**, exactly as `RandomState`
+/// did: the keys are peer-chosen (session id and fragment id come off the
+/// wire), so a fixed fold would let a peer pre-compute a colliding set and turn
+/// every probe into a bounded-but-real compare chain. The seed comes from the
+/// process's own address-space and start time rather than a CSPRNG, which is
+/// all that unguessability requires here — and unlike `RandomState` it is one
+/// multiply-fold per probe instead of SipHash over five to eight probes.
+pub(crate) struct FragKeyHasher(u64);
+
+/// Per-process hash seed (see [`FragKeyHasher`]).
+///
+/// A `OnceLock` rather than per-`build_hasher` randomness: hashbrown calls
+/// `build_hasher()` once per lookup, and a fresh seed each time would make every
+/// probe miss.
+fn frag_hash_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(FRAG_HASH_K);
+        // ASLR: a stack local's address is not predictable from outside.
+        let local = 0u8;
+        let addr = std::ptr::addr_of!(local) as u64;
+        nanos
+            .wrapping_mul(FRAG_HASH_K)
+            .rotate_left(29)
+            .wrapping_add(addr.rotate_left(13))
+            .wrapping_add((std::process::id() as u64).rotate_left(47))
+    })
+}
+
+impl Default for FragKeyHasher {
+    fn default() -> Self {
+        Self(frag_hash_seed())
+    }
+}
+
+impl Hasher for FragKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut h = self.0;
+        h ^= h >> 29;
+        h = h.wrapping_mul(FRAG_HASH_K);
+        h ^ (h >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Not reached by `(u32, u16)` (which hashes through `write_u32` /
+        // `write_u16`); kept correct for any future key type.
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(FRAG_HASH_K);
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (self.0 ^ v as u64).wrapping_mul(FRAG_HASH_K);
+    }
+
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.0 = (self.0 ^ v as u64).wrapping_mul(FRAG_HASH_K);
+    }
+}
+
+/// `(sess, frag_id)` map with [`FragKeyHasher`].
+type FragMap<V> = HashMap<(u32, u16), V, BuildHasherDefault<FragKeyHasher>>;
 
 /// A partially reassembled datagram.
 pub(crate) struct Partial {
@@ -61,25 +152,18 @@ impl Partial {
     pub(crate) fn slot_table_bytes(total: u8) -> usize {
         total as usize * std::mem::size_of::<Option<Bytes>>()
     }
+}
 
-    /// Consume the partial into `(address, whole payload)`.
-    ///
-    /// The address is *moved* out rather than cloned: it is a `String` for a
-    /// domain target, so `p.address.clone()` was a heap allocation on every
-    /// reassembled datagram whose result was dropped immediately.
-    fn into_datagram(self) -> (TargetAddr, Bytes) {
-        let Self {
-            address,
-            chunks,
-            bytes,
-            ..
-        } = self;
-        let mut out = bytes::BytesMut::with_capacity(bytes);
-        for c in chunks.into_iter().flatten() {
-            out.extend_from_slice(&c);
-        }
-        (address, out.freeze())
+/// Concatenate a partial's stored chunks into the whole datagram.
+///
+/// One exact-size `BytesMut`, one pass, one allocation — the chunks are already
+/// owned copies of exactly their own length (see [`DgramReassembler::push`]).
+fn assemble(chunks: &[Option<Bytes>], bytes: usize) -> Bytes {
+    let mut out = bytes::BytesMut::with_capacity(bytes);
+    for c in chunks.iter().flatten() {
+        out.extend_from_slice(c);
     }
+    out.freeze()
 }
 
 /// The chunks of a generation the reassembler has already let go of — either
@@ -167,11 +251,11 @@ impl Tombstone {
 /// for the connection's lifetime.
 #[derive(Default)]
 pub struct DgramReassembler {
-    parts: HashMap<(u32, u16), Partial>,
+    parts: FragMap<Partial>,
     /// Recently completed or restarted generations by `(sess, id)` — see
     /// [`Tombstone`]. Never awaited, never delivered; consulted on every push
     /// and reaped by [`expire`](Self::expire) after [`FRAG_TIMEOUT_MS`].
-    recent: HashMap<(u32, u16), Tombstone>,
+    recent: FragMap<Tombstone>,
     /// Retained bytes across all partials *and* tombstones — see
     /// [`Partial::retained`] and [`Tombstone`].
     held: usize,
@@ -220,10 +304,17 @@ impl DgramReassembler {
     /// derived from them were fiction. Owning the chunk makes the charge exact
     /// (one small allocation per fragment) and keeps the bound real.
     pub fn push(&mut self, f: &FragmentRef<'_>, now_ms: u64) -> Option<(u32, TargetAddr, Bytes)> {
+        // Shape checks first, before anything can allocate. `push_with_chunk`
+        // still owns the admission policy (it re-checks these); this is a
+        // pre-filter so a malformed fragment — which a peer can send at line
+        // rate — never pays for a chunk that gets thrown away one line later.
+        if f.total < 2 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total {
+            return None;
+        }
         if self.is_stale_replay(f, now_ms) {
             return None;
         }
-        self.push_with_chunk(f, Bytes::copy_from_slice(f.chunk), now_ms)
+        self.push_with_chunk(f, now_ms)
     }
 
     /// Whether `f` is a replay of the generation this `(sess, id)` tombstone
@@ -279,7 +370,6 @@ impl DgramReassembler {
     fn push_with_chunk(
         &mut self,
         f: &FragmentRef<'_>,
-        chunk: Bytes,
         now_ms: u64,
     ) -> Option<(u32, TargetAddr, Bytes)> {
         if f.total < 2 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total {
@@ -314,7 +404,7 @@ impl DgramReassembler {
         // was already at the cap.
         if let Some(p) = self.parts.get(&key) {
             let duplicate = p.chunks.get(f.idx as usize).is_some_and(Option::is_some);
-            if !duplicate && p.bytes.saturating_add(chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
+            if !duplicate && p.bytes.saturating_add(f.chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
                 if let Some(p) = self.parts.remove(&key) {
                     self.held = self.held.saturating_sub(p.retained);
                     udp_stats::reassembly_evicted();
@@ -373,8 +463,15 @@ impl DgramReassembler {
             // residue is unreachable from a conforming peer.
             let slot = &mut entry.chunks[f.idx as usize];
             if slot.is_none() {
-                let len = chunk.len();
-                *slot = Some(chunk);
+                // Own the chunk **here**, not on entry. Everything above is a
+                // rejection path (shape, count cap, payload cap, duplicate,
+                // stale replay), and a duplicate or malformed fragment is
+                // ordinary on a real link — it must not cost a malloc + memcpy
+                // + free for bytes that are then dropped. `f.chunk` is still
+                // borrowed for the two comparisons that need it, so the copy
+                // happens exactly once, at the only point that keeps it.
+                let len = f.chunk.len();
+                *slot = Some(Bytes::copy_from_slice(f.chunk));
                 entry.got += 1;
                 entry.bytes += len;
                 // The slot table is charged with the first stored chunk, once
@@ -393,18 +490,23 @@ impl DgramReassembler {
         };
 
         if complete {
-            let p = self.parts.remove(&key)?;
+            let mut p = self.parts.remove(&key)?;
             self.held = self.held.saturating_sub(p.retained);
-            // File the delivered generation before its chunks are consumed:
-            // the clones are refcount bumps, not copies, and the tombstone
-            // keeps stale replays of this payload out of the next generation
-            // on the key. `remember` charges the bytes to `held`, so the
-            // aggregate bound still covers them.
+            // File the delivered generation before its chunks are consumed, and
+            // **move** the slot table into the tombstone rather than cloning it:
+            // the clone was one `Vec<Option<Bytes>>` allocation (total x 32 B,
+            // up to ~2 KiB) plus one refcount bump per slot on every completed
+            // fragmented payload, and it handed the tombstone the very same
+            // bytes the payload below is assembled from. The tombstone charges
+            // those bytes to `held` exactly as the partial did, so the aggregate
+            // budget is unchanged.
             let tomb_total = p.total;
-            let tomb_chunks = p.chunks.clone();
             let tomb_addr = p.address.clone();
-            let (address, whole) = p.into_datagram();
-            self.remember(key, tomb_total, tomb_addr, tomb_chunks, now_ms);
+            let bytes = p.bytes;
+            let chunks = std::mem::take(&mut p.chunks);
+            let address = p.address;
+            let whole = assemble(&chunks, bytes);
+            self.remember(key, tomb_total, tomb_addr, chunks, now_ms);
             return Some((key.0, address, whole));
         }
         // Reclaim tombstones first: they are id-reuse guards, not deliverable
@@ -482,6 +584,16 @@ impl DgramReassembler {
 
     /// Drop the oldest tombstone, giving its bytes back to `held`. Tombstones
     /// only — a live partial is never sacrificed for a remembered one.
+    ///
+    /// "Oldest" is `at_ms`, which is the coarse 1 s epoch (see the call sites):
+    /// entries created inside one tick tie, and the `min_by_key` then takes
+    /// whichever the map yields first. That is a policy detail, never an
+    /// accounting one — the bound is still enforced exactly by the loops that
+    /// call this — and the tie cohort is homogeneous in the case that reaches
+    /// here (a burst of same-sized payloads), so the freed bytes are the same
+    /// either way. A monotonic insertion sequence would buy exact FIFO order
+    /// for the cost of a counter and a wider key on both maps; it is not worth
+    /// the extra state for entries that are equal in every respect that matters.
     fn evict_oldest_tombstone(&mut self) -> bool {
         let Some(key) = self
             .recent

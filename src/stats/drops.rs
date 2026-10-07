@@ -11,11 +11,12 @@ pub mod dgram_drops {
     pub static TOO_LARGE: AtomicU64 = AtomicU64::new(0);
     /// Send buffer full: dropped per UDP semantics (quinn `Blocked`).
     pub static BUFFER_FULL: AtomicU64 = AtomicU64::new(0);
-    /// Session or DNS slow-path budget exhausted: dropped before a socket or
-    /// lookup was created (UDP semantics, fail-closed under flood). This is the
-    /// *global* pool (or its DNS limiter); a connection that hit only its own
-    /// fair share of the pool is counted in `FAIR_SHARE` instead, so the two
-    /// readings cannot be confused in the 60 s line.
+    /// Session budget exhausted: dropped before a socket was created (UDP
+    /// semantics, fail-closed under flood). This is the *global* session pool;
+    /// a connection that hit only its own fair share of it is counted in
+    /// `FAIR_SHARE` instead, and the resolver's separate permit pool is counted
+    /// in `DNS_BUDGET` — so the three readings cannot be confused in the 60 s
+    /// line.
     pub static SESSION_FULL: AtomicU64 = AtomicU64::new(0);
     /// The connection's own fair share of the session budget was reached while
     /// the process-wide pool still had room. Split from `SESSION_FULL` because
@@ -29,6 +30,17 @@ pub mod dgram_drops {
     /// because charging relay loss to a budget counter is exactly the
     /// misreport that counter's note warns about.
     pub static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+    /// The **DNS slow-path limiter** (1024 permits, shared with the server's
+    /// TCP dial path) was exhausted, so this datagram was dropped before any
+    /// resolution was attempted.
+    ///
+    /// Split from `SESSION_FULL` because the two mean opposite things to an
+    /// operator: `SESSION_FULL` is "the host is out of session capacity",
+    /// while this is "the resolver is slow or failing and its permit pool is
+    /// full". Charging a resolver outage to the session budget made an
+    /// unrelated fault look like capacity exhaustion in the 60 s line — and on
+    /// the TCP side the same pool's exhaustion silently reset a CONNECT.
+    pub static DNS_BUDGET: AtomicU64 = AtomicU64::new(0);
     /// The single-flight shard mutex (probe or registration) was contended, so
     /// nothing was known and the caller took the spawn path instead of waiting.
     /// Counted apart from `DNS_INFLIGHT` (which means "another resolution owns
@@ -85,6 +97,7 @@ pub mod dgram_drops {
         pub too_large: u64,
         pub buffer_full: u64,
         pub session_full: u64,
+        pub dns_budget: u64,
         pub fair_share: u64,
         pub dns_inflight: u64,
         pub dns_contention: u64,
@@ -102,6 +115,7 @@ pub mod dgram_drops {
                 too_large: d(self.too_large, prev.too_large),
                 buffer_full: d(self.buffer_full, prev.buffer_full),
                 session_full: d(self.session_full, prev.session_full),
+                dns_budget: d(self.dns_budget, prev.dns_budget),
                 fair_share: d(self.fair_share, prev.fair_share),
                 dns_inflight: d(self.dns_inflight, prev.dns_inflight),
                 dns_contention: d(self.dns_contention, prev.dns_contention),
@@ -126,6 +140,7 @@ pub mod dgram_drops {
             self.too_large
                 .saturating_add(self.buffer_full)
                 .saturating_add(self.session_full)
+                .saturating_add(self.dns_budget)
                 .saturating_add(self.fair_share)
                 .saturating_add(self.dns_inflight)
                 .saturating_add(self.dns_contention)
@@ -146,6 +161,7 @@ pub mod dgram_drops {
             too_large: TOO_LARGE.load(Ordering::Relaxed),
             buffer_full: BUFFER_FULL.load(Ordering::Relaxed),
             session_full: SESSION_FULL.load(Ordering::Relaxed),
+            dns_budget: DNS_BUDGET.load(Ordering::Relaxed),
             fair_share: FAIR_SHARE.load(Ordering::Relaxed),
             dns_inflight: DNS_INFLIGHT.load(Ordering::Relaxed),
             dns_contention: DNS_CONTENTION.load(Ordering::Relaxed),
@@ -306,5 +322,50 @@ pub mod dgram_drops {
         }
         let detail = detail();
         tracing::warn!("udp datagram dropped ({reason}): {total} so far{detail}");
+    }
+
+    /// Which **oversize-receive** fault a warning is about.
+    ///
+    /// A datagram the receiving socket could not hold is not a send-side drop:
+    /// the kernel already truncated it, so the payload above the protocol cap is
+    /// gone and the peer never learns. It is also the one drop class a *remote*
+    /// party chooses the rate of — a target that answers with a datagram above
+    /// [`UDP_RECV_MAX`](crate::UDP_RECV_MAX), or an app that sends one — which is
+    /// why both directions keep their own rate-limited slot. Unthrottled, each
+    /// such packet formatted and emitted a line through
+    /// `tracing_subscriber`'s process-wide writer lock, i.e. the log itself
+    /// became the per-packet cost on a path a peer controls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OversizeRecv {
+        /// A target's reply was larger than the session receive buffer
+        /// (server-side session reader).
+        TargetReply,
+        /// The app sent a datagram larger than the relay receive buffer
+        /// (client-side UDP association loop).
+        AppDatagram,
+    }
+
+    /// Rate-limited (at most one line per [`DROP_WARN_INTERVAL_MS`] per
+    /// direction) warning for a truncated oversize receive.
+    ///
+    /// Costs one coarse-epoch read per *oversized* datagram — never on the
+    /// steady path — and builds `detail` only when a line is actually emitted.
+    pub fn warn_oversize_recv(kind: OversizeRecv, total: u64, detail: impl FnOnce() -> String) {
+        use crate::stats::{claim_drop_warning, NEVER_WARNED};
+        static LAST_TARGET_REPLY: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+        static LAST_APP_DGRAM: AtomicU64 = AtomicU64::new(NEVER_WARNED);
+        let (slot, which) = match kind {
+            OversizeRecv::TargetReply => (&LAST_TARGET_REPLY, "target reply"),
+            OversizeRecv::AppDatagram => (&LAST_APP_DGRAM, "app datagram"),
+        };
+        if !claim_drop_warning(slot) {
+            return;
+        }
+        let detail = detail();
+        tracing::warn!(
+            "{which} above {} B truncated and dropped: {total} so far{detail}; raise \
+             MQP_FRAG_MAX_PAYLOAD to carry payloads this size",
+            crate::UDP_RECV_MAX,
+        );
     }
 }

@@ -30,6 +30,8 @@ use bytes::Bytes;
 use crate::stats::{claim_drop_warning, NEVER_WARNED};
 use crate::udp_write;
 
+use super::batch::SendFrame;
+
 /// One queued retry: the socket it must go out on, the destination and the
 /// bytes.
 ///
@@ -283,11 +285,28 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
 /// and hard errors still count `failed`. Never blocks, never spawns: an
 /// `EAGAIN` or short send stops the fast path at the first unsent frame.
 ///
+/// Each frame is a [`SendFrame`] — `(header, payload)`, sent as one datagram.
+/// On Linux the two are separate iovecs of one message, so a protocol header in
+/// front of a payload costs no copy at all; the portable fallback has no
+/// vectored datagram send, so it concatenates into a reused thread-local buffer
+/// (per frame, only when there *is* a header — the same one copy the caller used
+/// to pay for every frame unconditionally).
+///
 /// Callers stage consecutive same-destination replies of one drain burst here
 /// (client dispatcher, server accept-target sends); batching therefore changes
-/// the syscall count, never the per-datagram outcome.
-pub fn udp_try_send_grouped(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, frames: &[&[u8]]) {
-    use super::batch::{record_send_group, sendmmsg_available, LAST_HOP_DRAIN};
+/// the syscall count, never the per-datagram outcome. Note the grouping key
+/// includes the *socket*, and a last-hop socket belongs to one session, so a
+/// burst spanning several sessions is legitimately one run per frame — the
+/// batching pays off for the single hot flow, and cannot be widened further
+/// without merging sessions onto one socket.
+pub fn udp_try_send_grouped(
+    sock: &Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    frames: &[SendFrame<'_>],
+) {
+    use super::batch::{
+        record_extra_syscalls, record_send_group, sendmmsg_available, LAST_HOP_DRAIN,
+    };
     if frames.is_empty() {
         return;
     }
@@ -302,15 +321,19 @@ pub fn udp_try_send_grouped(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, 
                 udp_write::sent();
             }
             // Remainder (short send or EAGAIN) rejoins the per-frame path so
-            // each keeps its own WouldBlock -> retry treatment.
+            // each keeps its own WouldBlock -> retry treatment, and its own
+            // syscall is accounted so `syscall_per_packet` stays honest when the
+            // socket is saturated — the very regime the batching exists for.
             for f in &frames[sent..n] {
-                udp_try_send_slice(sock, dst, f);
+                udp_try_send_frame(sock, dst, *f);
             }
+            record_extra_syscalls((n - sent) as u64);
             // Frames past the bound belong to the next burst, not this one:
             // sending them here would grow the syscall's iovec unbounded.
             for f in &frames[n..] {
-                udp_try_send_slice(sock, dst, f);
+                udp_try_send_frame(sock, dst, *f);
             }
+            record_extra_syscalls((frames.len() - n) as u64);
             return;
         }
     }
@@ -318,11 +341,45 @@ pub fn udp_try_send_grouped(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, 
     let _ = sendmmsg_available;
     record_send_group(n, n as u64);
     for f in &frames[..n] {
-        udp_try_send_slice(sock, dst, f);
+        udp_try_send_frame(sock, dst, *f);
     }
     for f in &frames[n..] {
-        udp_try_send_slice(sock, dst, f);
+        udp_try_send_frame(sock, dst, *f);
     }
+    // Same accounting as the Linux arm: the frames past the drain bound really
+    // do issue one syscall each, so `syscall_per_packet` must see them.
+    record_extra_syscalls((frames.len() - n) as u64);
+}
+
+/// Send one [`SendFrame`] through the per-frame path.
+///
+/// Linux never reaches this with a header on the fast path (the grouped send
+/// handles both iovecs); the concatenation below exists for the portable
+/// fallback and for frames that fell out of a short `sendmmsg`.
+fn udp_try_send_frame(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, frame: SendFrame<'_>) {
+    let (hdr, body) = frame;
+    if hdr.is_empty() {
+        udp_try_send_slice(sock, dst, body);
+        return;
+    }
+    // Reused per thread, cleared per frame, never held across an await: only the
+    // frames that actually carry a header touch it (the server's target sends
+    // pass an empty header and stay copy-free everywhere).
+    GROUP_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.reserve(hdr.len() + body.len());
+        s.extend_from_slice(hdr);
+        s.extend_from_slice(body);
+        udp_try_send_slice(sock, dst, &s);
+    });
+}
+
+thread_local! {
+    /// Portable-fallback assembly buffer for [`udp_try_send_grouped`].
+    static GROUP_SCRATCH: std::cell::RefCell<Vec<u8>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 /// Which last-hop write fault a warning is about.
@@ -588,7 +645,8 @@ mod contract_tests {
             .unwrap();
         const N: usize = 10;
         let frames: Vec<[u8; 8]> = (0..N).map(|i| [i as u8; 8]).collect();
-        let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        let empty: &[u8] = &[];
+        let refs: Vec<SendFrame<'_>> = frames.iter().map(|f| (empty, &f[..])).collect();
         #[cfg_attr(not(feature = "stats"), allow(unused_variables))]
         let d = {
             let _guard = CONTRACT_LOCK.lock().unwrap();
@@ -628,6 +686,80 @@ mod contract_tests {
         }
     }
 
+    /// A grouped frame is `(header, payload)` and must land on the wire as **one**
+    /// datagram, header first.
+    ///
+    /// That two-iovec shape is what lets the client's reply flush stage only the
+    /// ≤22-byte SOCKS5 header and borrow the payload instead of concatenating
+    /// both into a staging arena — one whole-payload memcpy per reply removed
+    /// from the download path. The wire bytes therefore have to be pinned
+    /// independently of the per-frame fallback, because on Linux the header and
+    /// the body never meet in userspace at all.
+    #[tokio::test]
+    async fn grouped_header_and_payload_arrive_as_one_datagram() {
+        const HDR: &[u8] = &[0, 0, 0, 0x01, 198, 51, 100, 7, 0, 53];
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sock.send_to(b"prime", dst).await.unwrap();
+        let mut b = [0u8; 64];
+        tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+
+        const N: usize = 6;
+        let bodies: Vec<[u8; 4]> = (0..N).map(|i| [i as u8; 4]).collect();
+        let refs: Vec<SendFrame<'_>> = bodies.iter().map(|x| (HDR, &x[..])).collect();
+        udp_try_send_grouped(&sock, dst, &refs);
+
+        let mut got = [false; N];
+        let mut seen = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while seen < N {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, listener.recv_from(&mut b)).await {
+                Ok(Ok((n, _))) => {
+                    let want = HDR.len() + 4;
+                    assert_eq!(n, want, "header and payload must arrive as one datagram");
+                    assert_eq!(&b[..HDR.len()], HDR, "header must come first");
+                    let i = b[HDR.len()] as usize;
+                    assert!(i < N && !got[i] && b[HDR.len()..n] == bodies[i], "body {i}");
+                    got[i] = true;
+                    seen += 1;
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(seen, N, "every grouped frame must arrive: {seen}/{N}");
+    }
+
+    /// `record_extra_syscalls` corrects only the syscall tally: it must not move
+    /// any per-datagram outcome. The grouped path charges `1` syscall for the
+    /// `sendmmsg` itself and used to leave the per-frame tail uncounted, which
+    /// under-reported `syscall_per_packet` exactly when the socket was
+    /// saturated — the regime the batching exists for.
+    #[test]
+    fn extra_syscall_accounting_is_additive_only() {
+        use crate::record_extra_syscalls;
+        #[cfg(feature = "stats")]
+        {
+            let before = udp_write::snapshot();
+            record_extra_syscalls(7);
+            let d = udp_write::snapshot().since(&before);
+            assert!(d.clean(), "no drop outcome may move: {d:?}");
+            assert_eq!(d.sent, 0, "no datagram outcome may move: {d:?}");
+            assert_eq!(d.retried, 0, "no datagram outcome may move: {d:?}");
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            record_extra_syscalls(7);
+        }
+    }
+
     /// Empty groups are a no-op (no counters move, no syscall), and groups
     /// past the 32-frame bound still deliver every frame via the per-frame
     /// tail rather than truncating the burst.
@@ -652,7 +784,8 @@ mod contract_tests {
         }
         const N: usize = 40;
         let frames: Vec<[u8; 4]> = (0..N).map(|i| [i as u8; 4]).collect();
-        let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        let empty: &[u8] = &[];
+        let refs: Vec<SendFrame<'_>> = frames.iter().map(|f| (empty, &f[..])).collect();
         udp_try_send_grouped(&sock, dst, &refs);
         let mut seen = 0usize;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);

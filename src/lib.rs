@@ -106,10 +106,11 @@ pub use tcp::{copy_tcp_quic, copy_tcp_quic_acked, copy_tcp_quic_idle};
 #[allow(unused_imports)]
 pub(crate) use transport::{clamp_keep_alive, DATAGRAM_BUFFER, MQP_DGRAM_MAX};
 pub use udp::{
-    batch_backend, batch_report, burst_msg_copy, poll_once, record_drain_batch, record_send_group,
-    recv_burst, recvmmsg_available, send_udp_datagram, sendmmsg_available, try_send_datagram,
-    udp_try_send, udp_try_send_grouped, udp_try_send_slice, DatagramSend, DgramFragmenter,
-    DgramReassembler, PayloadSend, UdpWriteDrop, BURST_SLOT, LAST_HOP_DRAIN,
+    batch_backend, batch_report, burst_msg_copy, poll_once, record_drain_batch,
+    record_extra_syscalls, record_send_group, recv_burst, recvmmsg_available, send_udp_datagram,
+    sendmmsg_available, try_send_datagram, udp_try_send, udp_try_send_grouped, udp_try_send_slice,
+    DatagramSend, DgramFragmenter, DgramReassembler, PayloadSend, SendFrame, UdpWriteDrop,
+    BURST_SLOT, LAST_HOP_DRAIN,
 };
 // `pub(crate)` re-exports for the unit tests below (`use super::*`); unused in
 // the non-test build.
@@ -1055,6 +1056,7 @@ mod tests {
             &dgram_drops::TOO_LARGE,
             &dgram_drops::BUFFER_FULL,
             &dgram_drops::SESSION_FULL,
+            &dgram_drops::DNS_BUDGET,
             &dgram_drops::FAIR_SHARE,
             &dgram_drops::DNS_INFLIGHT,
             &dgram_drops::DNS_CONTENTION,
@@ -1069,6 +1071,7 @@ mod tests {
         assert!(after.too_large > before.too_large, "too_large");
         assert!(after.buffer_full > before.buffer_full, "buffer_full");
         assert!(after.session_full > before.session_full, "session_full");
+        assert!(after.dns_budget > before.dns_budget, "dns_budget");
         assert!(after.fair_share > before.fair_share, "fair_share");
         assert!(after.dns_inflight > before.dns_inflight, "dns_inflight");
         assert!(
@@ -1083,7 +1086,7 @@ mod tests {
             "sess_create_failed"
         );
         let d = after.since(&before);
-        assert!(d.lost() >= 10, "every drop counts as loss: {d:?}");
+        assert!(d.lost() >= 11, "every drop counts as loss: {d:?}");
     }
 
     /// Hold one single-flight shard mutex from another thread, the way a miss

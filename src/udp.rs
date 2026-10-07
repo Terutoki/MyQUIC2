@@ -6,9 +6,9 @@ pub mod send;
 
 pub use batch::{
     batch_backend, batch_report, burst_msg_copy, recv_burst, recvmmsg_available,
-    sendmmsg_available, BURST_SLOT,
+    sendmmsg_available, SendFrame, BURST_SLOT,
 };
-pub use batch::{record_drain_batch, record_send_group, LAST_HOP_DRAIN};
+pub use batch::{record_drain_batch, record_extra_syscalls, record_send_group, LAST_HOP_DRAIN};
 pub use send::poll_once;
 
 pub(crate) use fragmenter::frag_id_reuse_blocked;

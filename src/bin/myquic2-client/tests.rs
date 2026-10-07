@@ -763,6 +763,70 @@ async fn real_connection() -> (quinn::Connection, quinn::Endpoint, quinn::Endpoi
     (conn.unwrap(), client, server)
 }
 
+/// The production reply flush writes `header ++ payload` as **one** datagram,
+/// byte-identical to what `encode_reply` produces in one buffer.
+///
+/// This is the path the two-iovec change rewrote (the payload used to be
+/// concatenated into a full-size arena per reply), and it is the one the wire
+/// bytes actually depend on: the header lives in a reused `hdrs` buffer, the
+/// payload is borrowed from the receive path, and only the pairing built from
+/// `offs`/`refs` ties them together. Two associations with *different* relay
+/// sockets is the shape that matters — it makes each run length 1, exactly what
+/// a multi-association client produces.
+#[tokio::test]
+async fn flush_staged_sends_header_and_payload_as_one_datagram() {
+    // Relay sockets are dual-stack in production (`udp_socket_dual_small`), and
+    // the flush maps the app address the same way; binding plain IPv4 sockets
+    // here would test a send the production path never performs.
+    let mk_relay = || {
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap())
+    };
+    let apps = [
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let dsts: [SocketAddr; 2] = [
+        "198.51.100.1:53".parse().unwrap(),
+        "203.0.113.9:3478".parse().unwrap(),
+    ];
+    let bodies: [&[u8]; 2] = [b"one", b"two-reply"];
+    let mut staged = Vec::new();
+    for i in 0..2 {
+        staged.push(StagedReply {
+            sock: mk_relay(),
+            app: apps[i].local_addr().unwrap(),
+            dst: dsts[i],
+            payload: bytes::Bytes::copy_from_slice(bodies[i]),
+        });
+    }
+    let mut hdrs: Vec<u8> = Vec::new();
+    let mut offs: Vec<(usize, usize)> = Vec::new();
+    flush_staged(&mut staged, &mut hdrs, &mut offs);
+    assert!(staged.is_empty(), "a flush must clear the staging queue");
+
+    // Each app receives exactly its own reply, byte-for-byte as `encode_reply`
+    // would have built it (header first, payload appended).
+    let mut buf = [0u8; 128];
+    for (i, app) in apps.iter().enumerate() {
+        let mut want = Vec::new();
+        encode_reply(&mut want, dsts[i], bodies[i]);
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), app.recv_from(&mut buf))
+            .await
+            .expect("the staged reply must arrive")
+            .unwrap();
+        assert_eq!(&buf[..n], &want[..], "app {i} reply bytes");
+    }
+    // Nothing was sent twice: no second datagram is waiting on either socket.
+    for (i, app) in apps.iter().enumerate() {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), app.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "app {i} must receive exactly one datagram per staged reply"
+        );
+    }
+}
+
 /// The memo is served only while it is both current (generation matches)
 /// and fresh (stamp inside the window); `invalidate` bumps the generation
 /// so every thread's memo misses without a scan. The two classes are
@@ -803,6 +867,62 @@ async fn egress_memo_honours_generation_and_freshness() {
     e.memo_store(class, old_gen, &conn, 1200, now);
     assert!(e.with_fresh(class, now, |_, _| ()).is_some());
     e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert!(e.with_fresh(class, now, |_, _| ()).is_none());
+}
+
+/// A memo hit serves the handle whatever the connection's state: liveness is
+/// the **send's** verdict, not a per-frame `close_reason` gate.
+///
+/// The gate this replaces took quinn's connection-state mutex once per uplink
+/// frame — the one per-frame cost that cannot parallelize, because the
+/// connection driver holds that same mutex while processing every received
+/// packet. It bought nothing: a dead handle's next `send_datagram` returns
+/// `ConnectionLost`, and `assoc.rs` already invalidates the cache and counts
+/// `EGRESS_DEAD` on that arm, exactly as it does for `Unsupported` (which the
+/// code deliberately does *not* gate for the same reason). What must not
+/// regress is that the hit is still classified: the memo serves, the send
+/// fails, and the generation moves so every thread's memo misses next time.
+#[tokio::test]
+async fn memo_hit_serves_a_dead_handle_and_the_send_reports_it() {
+    let (conn, _client, _server) = real_connection().await;
+    let e = SharedEgress::default();
+    let class = EgressClass::Interactive;
+    let now = mono_millis();
+    e.cached[class.index()].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: now,
+        slot: 0,
+    })));
+    e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+    let gen = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+    e.memo_store(class, gen, &conn, 1200, now);
+    assert_eq!(
+        e.with_fresh(class, now, |_, limit| limit),
+        Some(1200),
+        "a fresh memo hit must be served without a quinn lock"
+    );
+
+    // Kill the connection: the memo is still current and fresh, so it still
+    // serves — and the send is what reports the death.
+    conn.close(0u32.into(), b"test");
+    assert!(
+        conn.close_reason().is_some(),
+        "the test's closed handle must probe dead"
+    );
+    assert!(
+        e.with_fresh(class, now, |_, limit| limit).is_some(),
+        "liveness is the send's verdict: the memo must not take a per-frame \
+         quinn lock to re-check it"
+    );
+    assert_eq!(
+        try_send_datagram(&conn, bytes::Bytes::from_static(b"x")),
+        DatagramSend::ConnectionLost,
+        "the send must report the death the memo no longer gates on"
+    );
+    // ... and the caller's `ConnectionLost` arm invalidates, so the next
+    // datagram on every thread re-acquires instead of reusing the handle.
+    e.invalidate(class);
     assert!(e.with_fresh(class, now, |_, _| ()).is_none());
 }
 
@@ -1055,14 +1175,16 @@ async fn dispatch_negative_cached_domain_counts_refused_exactly_once() {
     hub.release(sess);
 }
 
-/// P1-4 slow-path budget lock, SESSION_FULL arm: a 40-burst at one uncached
+/// P1-4 slow-path budget lock, `DNS_BUDGET` arm: a 40-burst at one uncached
 /// name with the 1024-permit budget exhausted counts every datagram exactly
-/// once on `SESSION_FULL` — the countable loss budget. The dispatcher's
-/// single guard (`try_acquire_owned` only, no `available_permits` probe)
-/// charges one count per datagram: a freed-between-probe-and-acquire permit
-/// stays usable and exhaustion is counted once.
+/// once on `DNS_BUDGET` — the countable loss budget for the *resolver's* pool,
+/// which is shared with the server's TCP dial path and must not be reported as
+/// session-capacity exhaustion. The dispatcher's single guard
+/// (`try_acquire_owned` only, no `available_permits` probe) charges one count
+/// per datagram: a freed-between-probe-and-acquire permit stays usable and
+/// exhaustion is counted once.
 #[tokio::test]
-async fn dispatch_limiter_exhaustion_counts_session_full_exactly_once_per_drop() {
+async fn dispatch_limiter_exhaustion_counts_dns_budget_exactly_once_per_drop() {
     let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
     let (host, port) = ("p14-dispatch-budget.invalid", 19532u16);
     assert_eq!(
@@ -1105,8 +1227,13 @@ async fn dispatch_limiter_exhaustion_counts_session_full_exactly_once_per_drop()
     );
     let d = dgram_drops::snapshot().since(&before);
     assert_eq!(
-        d.session_full, 40,
+        d.dns_budget, 40,
         "a 40-burst over budget counts every datagram exactly once"
+    );
+    assert_eq!(
+        d.session_full, 0,
+        "a resolver-budget refusal is not session-capacity exhaustion: charging \
+         it to `session_full` reported a slow upstream as a full host"
     );
     assert_eq!(d.dns_inflight, 0, "nothing was registered inflight");
     assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");

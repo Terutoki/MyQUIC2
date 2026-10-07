@@ -240,12 +240,16 @@ pub(crate) async fn udp_associate_inner(
                     // The kernel truncates a datagram larger than the buffer and
                     // reports only the buffer length, so the excess is already
                     // gone. Counted as oversized (the payload is past the
-                    // protocol cap by construction) as well as warned.
-                    dgram_drops::bump(&dgram_drops::TOO_LARGE);
-                    warn!(
-                        "udp assoc {sess}: app datagram of >= {} B truncated; raise \
-                         MQP_FRAG_MAX_PAYLOAD to carry it",
-                        buf.len()
+                    // protocol cap by construction) as well as warned — and the
+                    // warning is rate-limited like every other drop: the app
+                    // chooses this rate, and an unthrottled `warn!` here put a
+                    // formatted line through tracing's process-wide writer lock
+                    // once per datagram.
+                    let dropped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+                    dgram_drops::warn_oversize_recv(
+                        dgram_drops::OversizeRecv::AppDatagram,
+                        dropped,
+                        || format!("; association {sess}, {} B buffer", buf.len()),
                     );
                     continue;
                 }
@@ -547,6 +551,17 @@ pub(crate) fn send_reply_addr(
 /// the batched path. Generic over `BufMut` so both the `BytesMut` scratch
 /// and the flush arena use it.
 pub(crate) fn encode_reply<B: bytes::BufMut>(pkt: &mut B, dst: SocketAddr, payload: &[u8]) {
+    encode_reply_header(pkt, dst);
+    pkt.put_slice(payload);
+}
+
+/// The SOCKS5 UDP reply header alone: `RSV | FRAG | ATYP | ADDR | PORT`.
+///
+/// Split out of [`encode_reply`] so the grouped flush can stage **just the
+/// header** (≤ 22 B) and hand the payload to `sendmmsg` as a second iovec,
+/// instead of concatenating both into a staging arena — which copied every
+/// reply payload end to end on the download path.
+pub(crate) fn encode_reply_header<B: bytes::BufMut>(pkt: &mut B, dst: SocketAddr) {
     pkt.put_slice(&[0, 0, 0]);
     // The destination of a reply is always the source address the server
     // reported, which is IP-form; encode it straight into the caller's buffer.
@@ -562,5 +577,4 @@ pub(crate) fn encode_reply<B: bytes::BufMut>(pkt: &mut B, dst: SocketAddr, paylo
             pkt.put_slice(&a.port().to_be_bytes());
         }
     }
-    pkt.put_slice(payload);
 }

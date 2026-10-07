@@ -1,7 +1,6 @@
 use super::addr::{AddrHeader, TargetAddr, TargetAddrRef};
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
-use std::cell::RefCell;
+use bytes::Bytes;
 
 /// MQP-2 datagram frame type: the first byte of every DATAGRAM body (TCP-open
 /// streams start with the address `atyp` instead, so the two cannot be confused).
@@ -99,26 +98,19 @@ pub(crate) fn encode_datagram_with_header(
     Some(Bytes::from(v))
 }
 
-thread_local! {
-    static ENCODE_SCRATCH: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(2048));
-}
-// Thread-local single-packet encode staging (plain `//`: `thread_local!` does
-// not forward outer doc comments, so `///` here would warn).
-//
-// Steady-state N=1 budget: the scratch is `clear`ed and `reserve`d (a no-op
-// once warm — capacity sticks at the largest packet seen), the prefix and the
-// payload are each copied in once, and the **one** allocator hit is the fresh
-// `Bytes::copy_from_slice` below. The scratch itself never escapes: the
-// `Bytes` handed to quinn owns a private allocation because quinn's driver
-// frees that allocation on its own task, where no reservation could ever hand
-// it back (see `encode_datagram_ref_with_limit`). `split_to().freeze()` would
-// keep the backing store alive behind the thread-local's extra reference —
-// i.e. silently pooling exactly the allocation quinn frees — so the extra
-// bulk copy is deliberate, not an oversight.
-
 /// Encode from a pre-encoded [`DgramPrefixCache`] prefix: byte-identical to
 /// [`encode_datagram_with_header`], but the header is neither validated nor
 /// re-encoded here — the cache did both once, on the destination change.
+///
+/// **Single copy, by construction.** The buffer is `with_capacity`ed to the
+/// exact final size, the payload is copied into it once, and `Bytes::from(Vec)`
+/// takes that allocation over (`len == capacity`, so no reallocation and no
+/// copy). An earlier revision staged the frame through a thread-local
+/// `BytesMut` and then `Bytes::copy_from_slice`d it out, which paid a *second*
+/// full payload memcpy per relayed datagram. The staging saved nothing: the
+/// `Bytes` handed to quinn must own a private allocation regardless, because
+/// quinn's driver frees it on its own task, where no reservation could ever
+/// hand it back (see `encode_datagram_ref_with_limit`).
 pub(crate) fn encode_datagram_with_prefix(
     prefix: &[u8],
     payload: &[u8],
@@ -128,17 +120,10 @@ pub(crate) fn encode_datagram_with_prefix(
     if total > limit {
         return None;
     }
-    ENCODE_SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        b.clear();
-        let cap = b.capacity();
-        if cap < total {
-            b.reserve(total - cap);
-        }
-        b.extend_from_slice(prefix);
-        b.extend_from_slice(payload);
-        Some(Bytes::copy_from_slice(&b))
-    })
+    let mut v = Vec::with_capacity(total);
+    v.extend_from_slice(prefix);
+    v.extend_from_slice(payload);
+    Some(Bytes::from(v))
 }
 
 /// Pre-encoded `type | sess | addr` prefix for one steady destination.
@@ -221,12 +206,6 @@ impl DgramPrefixCache {
     pub(crate) fn validations(&self) -> u64 {
         self.validations
     }
-
-    /// Scratch capacity (steady-state reserve proof for tests).
-    #[cfg(test)]
-    pub(crate) fn scratch_capacity() -> usize {
-        ENCODE_SCRATCH.with(|s| s.borrow().capacity())
-    }
 }
 
 pub fn decode_datagram(b: &[u8]) -> Result<(u32, TargetAddr, &[u8])> {
@@ -307,10 +286,12 @@ mod tests {
         assert!(encode_datagram_ref_with_limit(0, &scoped, b"x", 4096).is_none());
     }
 
-    /// Steady-state alloc bound: one `header()` validation no matter how many
-    /// same-dst packets are encoded, scratch capacity stops growing after
-    /// warmup (steady `reserve` is a no-op), and any sess/dst change
-    /// revalidates exactly once.
+    /// Steady-state bound: one `header()` validation no matter how many
+    /// same-dst packets are encoded, and any sess/dst change revalidates
+    /// exactly once. The encode itself is allocation-flat by construction
+    /// (one exact-size `Vec` per frame, handed to `Bytes` whole — see
+    /// `encode_datagram_with_prefix`), which is why there is no scratch
+    /// capacity to assert on any more.
     #[test]
     fn prefix_cache_steady_state_one_validation() {
         let a = TargetAddr::Ip("10.0.0.1:53".parse().unwrap());
@@ -320,16 +301,10 @@ mod tests {
         let payload = [0x5au8; 128];
         for _ in 0..32 {
             let prefix = cache.prefix_for(7, &r).unwrap().to_vec();
-            let _ = encode_datagram_with_prefix(&prefix, &payload, 4096).unwrap();
+            let d = encode_datagram_with_prefix(&prefix, &payload, 4096).unwrap();
+            assert_eq!(d.len(), prefix.len() + payload.len());
         }
         assert_eq!(cache.validations(), 1);
-        let warm_cap = DgramPrefixCache::scratch_capacity();
-        for _ in 0..32 {
-            let prefix = cache.prefix_for(7, &r).unwrap().to_vec();
-            let _ = encode_datagram_with_prefix(&prefix, &payload, 4096).unwrap();
-        }
-        assert_eq!(cache.validations(), 1);
-        assert_eq!(DgramPrefixCache::scratch_capacity(), warm_cap);
         // Sess change revalidates once; dst change revalidates once more.
         let _ = cache.prefix_for(8, &r).unwrap().to_vec();
         assert_eq!(cache.validations(), 2);

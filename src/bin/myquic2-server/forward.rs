@@ -129,10 +129,16 @@ pub(crate) async fn forward_server_dgram(
                         // still usable and an exhausted budget is counted once
                         // (a separate `available_permits() == 0` pre-check both
                         // dropped usable permits and double-counted the race).
+                        //
+                        // Counted as `DNS_BUDGET`, not `SESSION_FULL`: this pool
+                        // is the *resolver's* (shared with the TCP dial path), so
+                        // charging it to the session budget reported a slow or
+                        // failing upstream as "the host is out of session
+                        // capacity".
                         let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                dgram_drops::bump(&dgram_drops::SESSION_FULL);
+                                dgram_drops::bump(&dgram_drops::DNS_BUDGET);
                                 return None;
                             }
                         };

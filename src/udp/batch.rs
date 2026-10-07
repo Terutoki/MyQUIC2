@@ -88,11 +88,87 @@ fn bucket(n: usize) -> usize {
     }
 }
 
+/// How many records one thread accumulates before flushing to the shared
+/// atomics. Same bound and same reasoning as `udp_write::sent`: one shared RMW
+/// per 256 records instead of one per record.
+#[cfg(feature = "stats")]
+const BATCH_FLUSH_EVERY: u32 = 256;
+
+/// Thread-local accumulator for the three grouped-I/O counters.
+///
+/// These were the only relay counters still doing a shared `fetch_add` per
+/// burst: `udp_stats::payload` and `udp_write::sent` are thread-local cells
+/// flushed every 256 for exactly this reason (see the `stats` feature comment
+/// in `Cargo.toml`), while `record_send_group`/`record_drain_batch` — called
+/// once per *run* per drain burst — wrote 2-3 process-global lines from every
+/// dispatcher and forward task. With runs of length 1 (a burst spanning several
+/// sessions, i.e. the normal multi-association case) that is 2 cross-core RMWs
+/// per relayed packet for a five-bucket histogram.
+///
+/// The reporting consequence is the documented one for `udp_write::sent`: a
+/// thread's pending count becomes visible when it reaches the flush bound or
+/// when that thread itself calls [`batch_report`]. At any real packet rate the
+/// bound is reached in milliseconds, and the alternative — a cross-core RMW per
+/// burst on the hot path — is what the feature gate exists to avoid.
+#[cfg(feature = "stats")]
+#[derive(Default)]
+struct LocalBatch {
+    drain: [u64; 5],
+    send: [u64; 5],
+    syscalls: u64,
+    pending: u32,
+}
+
+#[cfg(feature = "stats")]
+thread_local! {
+    static LOCAL_BATCH: std::cell::RefCell<LocalBatch> =
+        const { std::cell::RefCell::new(LocalBatch {
+            drain: [0; 5],
+            send: [0; 5],
+            syscalls: 0,
+            pending: 0,
+        }) };
+}
+
+/// Publish one thread's accumulated counters (no-op when it has none).
+#[cfg(feature = "stats")]
+fn flush_local_batch() {
+    LOCAL_BATCH.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.pending == 0 && c.syscalls == 0 {
+            return;
+        }
+        for i in 0..5 {
+            if c.drain[i] != 0 {
+                DRAIN_HIST[i].fetch_add(c.drain[i], Ordering::Relaxed);
+                c.drain[i] = 0;
+            }
+            if c.send[i] != 0 {
+                SEND_HIST[i].fetch_add(c.send[i], Ordering::Relaxed);
+                c.send[i] = 0;
+            }
+        }
+        if c.syscalls != 0 {
+            SEND_SYSCALLS.fetch_add(c.syscalls, Ordering::Relaxed);
+            c.syscalls = 0;
+        }
+        c.pending = 0;
+    });
+}
+
 /// Record one receive-drain burst of `n` datagrams (call once per poll).
 pub fn record_drain_batch(n: usize) {
     stats_only! {
         if n > 0 {
-            DRAIN_HIST[bucket(n)].fetch_add(1, Ordering::Relaxed);
+            let flush = LOCAL_BATCH.with(|c| {
+                let mut c = c.borrow_mut();
+                c.drain[bucket(n)] += 1;
+                c.pending += 1;
+                c.pending >= BATCH_FLUSH_EVERY
+            });
+            if flush {
+                flush_local_batch();
+            }
         }
     }
     let _ = n;
@@ -102,11 +178,41 @@ pub fn record_drain_batch(n: usize) {
 pub fn record_send_group(n: usize, syscalls: u64) {
     stats_only! {
         if n > 0 {
-            SEND_HIST[bucket(n)].fetch_add(1, Ordering::Relaxed);
-            SEND_SYSCALLS.fetch_add(syscalls, Ordering::Relaxed);
+            let flush = LOCAL_BATCH.with(|c| {
+                let mut c = c.borrow_mut();
+                c.send[bucket(n)] += 1;
+                c.syscalls += syscalls;
+                c.pending += 1;
+                c.pending >= BATCH_FLUSH_EVERY
+            });
+            if flush {
+                flush_local_batch();
+            }
         }
     }
     let _ = (n, syscalls);
+}
+
+/// Record `n` last-hop send syscalls issued **outside** a grouped flush: the
+/// per-frame tail of a short `sendmmsg`, and the frames past
+/// [`LAST_HOP_DRAIN`]. Both really do issue one syscall per frame, and leaving
+/// them out made `syscall_per_packet` under-report exactly when the socket is
+/// saturated — the regime the batching exists for.
+pub fn record_extra_syscalls(n: u64) {
+    stats_only! {
+        if n > 0 {
+            let flush = LOCAL_BATCH.with(|c| {
+                let mut c = c.borrow_mut();
+                c.syscalls += n;
+                c.pending += 1;
+                c.pending >= BATCH_FLUSH_EVERY
+            });
+            if flush {
+                flush_local_batch();
+            }
+        }
+    }
+    let _ = n;
 }
 
 /// One-line burst-latency / syscall report for the 60 s budget line or benches:
@@ -114,6 +220,10 @@ pub fn record_send_group(n: usize, syscalls: u64) {
 pub fn batch_report() -> String {
     #[cfg(feature = "stats")]
     {
+        // Publish this thread's pending counts first: a reporter that has itself
+        // been relaying would otherwise read a stale value for its own records
+        // (the same rule `udp_write::snapshot` follows).
+        flush_local_batch();
         let h = |a: &[AtomicU64; 5]| {
             format!(
                 "1:{} 2-4:{} 5-8:{} 9-16:{} 17-32:{}",
@@ -377,32 +487,55 @@ impl BurstRecv {
     /// the count; 0 on `EAGAIN` or any error — both end the caller's burst,
     /// exactly like a failing `try_recv_from` arm.
     fn recv(&mut self, fd: std::os::unix::io::RawFd, max: usize) -> usize {
+        use std::mem::MaybeUninit;
         self.lens.clear();
         self.addrs.clear();
         if max == 0 {
             return 0;
         }
         let n = max.min(LAST_HOP_DRAIN);
-        let mut iovs: [libc::iovec; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
-        let mut names: [libc::sockaddr_storage; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
-        let mut hdrs: [libc::mmsghdr; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
+        // Only the entries actually used are touched. `mem::zeroed()` on the
+        // whole set put ~6.4 KB of dead stores on every burst (4 KB of
+        // `sockaddr_storage` + 1.8 KB of `mmsghdr` + iovecs) whose addresses
+        // escape into the `extern "C"` call, so the compiler could not remove
+        // them — and a burst that drains 2 datagrams paid exactly as much as one
+        // that drains 32, which is the common shape when a connection carries
+        // several sessions.
+        let mut iovs: [MaybeUninit<libc::iovec>; LAST_HOP_DRAIN] =
+            [MaybeUninit::uninit(); LAST_HOP_DRAIN];
+        // The kernel fills the name buffer it is given, so these stay
+        // `MaybeUninit` until the syscall reports how many were used; only the
+        // first `n` are passed as storage.
+        let mut names: [MaybeUninit<libc::sockaddr_storage>; LAST_HOP_DRAIN] =
+            [MaybeUninit::uninit(); LAST_HOP_DRAIN];
+        let mut hdrs: [MaybeUninit<libc::mmsghdr>; LAST_HOP_DRAIN] =
+            [MaybeUninit::uninit(); LAST_HOP_DRAIN];
         for i in 0..n {
             // SAFETY: each iovec points at its own BURST_SLOT-wide slice of
             // `self.data`, which outlives the syscall (borrowed by the caller).
-            iovs[i].iov_base = unsafe { self.data.as_mut_ptr().add(i * BURST_SLOT) }.cast();
-            iovs[i].iov_len = BURST_SLOT;
-            hdrs[i].msg_hdr.msg_iov = &mut iovs[i];
-            hdrs[i].msg_hdr.msg_iovlen = 1;
-            hdrs[i].msg_hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
-            hdrs[i].msg_hdr.msg_namelen =
+            iovs[i].write(libc::iovec {
+                iov_base: unsafe { self.data.as_mut_ptr().add(i * BURST_SLOT) }.cast(),
+                iov_len: BURST_SLOT,
+            });
+            names[i].write(unsafe { std::mem::zeroed() });
+            // SAFETY: this message's iovec and name buffer were just written and
+            // outlive the syscall; `names` is fully initialized for `0..n` here,
+            // which is exactly the range handed to the kernel.
+            let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            h.msg_hdr.msg_iov = iovs[i].as_mut_ptr();
+            h.msg_hdr.msg_iovlen = 1;
+            h.msg_hdr.msg_name = names[i].as_mut_ptr().cast();
+            h.msg_hdr.msg_namelen =
                 std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            hdrs[i].write(h);
         }
-        // SAFETY: fd is a live non-blocking UDP socket; hdrs holds n fully
-        // initialised mmsghdrs whose iovecs and name buffers are live storage.
+        // SAFETY: fd is a live non-blocking UDP socket; the first `n` entries of
+        // `hdrs` are fully initialised (and only `n` are passed); each points at
+        // a live iovec over `self.data` and at its own initialised name buffer.
         let r = unsafe {
             libc::recvmmsg(
                 fd,
-                hdrs.as_mut_ptr(),
+                hdrs.as_mut_ptr().cast::<libc::mmsghdr>(),
                 n as u32,
                 // `as _`: the flags parameter is `c_int` in the libc crate's
                 // glibc bindings and `u32` in its musl bindings.
@@ -415,8 +548,16 @@ impl BurstRecv {
         }
         let r = r as usize;
         for i in 0..r {
-            self.lens.push(hdrs[i].msg_len as usize);
-            self.addrs.push(sockaddr_to_std(&names[i]));
+            // SAFETY: `recvmmsg` returned `r`, so the kernel filled `msg_len`
+            // and the address of every message in `0..r`.
+            let (msg_len, name) = unsafe {
+                (
+                    hdrs[i].assume_init_ref().msg_len,
+                    names[i].assume_init_ref(),
+                )
+            };
+            self.lens.push(msg_len as usize);
+            self.addrs.push(sockaddr_to_std(name));
         }
         r
     }
@@ -509,6 +650,16 @@ fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> std::net::SocketAddr {
     }
 }
 
+/// One grouped last-hop frame: the protocol header to prepend (possibly empty)
+/// and the payload — sent as **one** datagram, in one syscall, with two iovecs.
+///
+/// The split is what makes the grouped flush allocation- and copy-free: the
+/// per-reply SOCKS5 header is 22 bytes at most and can live in a small reused
+/// buffer, while the payload is borrowed straight from the receive path instead
+/// of being concatenated into a staging arena first (see the client's
+/// `flush_staged`).
+pub type SendFrame<'a> = (&'a [u8], &'a [u8]);
+
 /// Batch-send already-encoded frames to one destination on a Tokio UDP socket.
 ///
 /// Returns the number of frames handed to the kernel. On Linux with a working
@@ -524,32 +675,65 @@ fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> std::net::SocketAddr {
 pub(crate) fn sendmmsg_frames(
     fd: std::os::unix::io::RawFd,
     dst: &std::net::SocketAddr,
-    frames: &[&[u8]],
+    frames: &[SendFrame<'_>],
 ) -> (usize, Option<std::io::Error>) {
+    use std::mem::MaybeUninit;
     let n = frames.len().min(LAST_HOP_DRAIN);
     if n == 0 {
         return (0, None);
     }
-    let mut iovs: [libc::iovec; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
-    for (i, f) in frames[..n].iter().enumerate() {
-        iovs[i].iov_base = f.as_ptr() as *mut libc::c_void;
-        iovs[i].iov_len = f.len();
-    }
+    // Two iovecs per message (header, payload), each message's pair contiguous
+    // so one `msg_iov` pointer describes it.
+    //
+    // Both arrays are `MaybeUninit`: only the entries actually used are written.
+    // `mem::zeroed()` on the full arrays put ~2.7 KB of dead stores on every
+    // call, and `flush_staged`/`flush_staged_sends` issue one call per
+    // same-destination run — which is a run of length 1 whenever a burst spans
+    // several sessions, i.e. exactly the multi-association case. The addresses
+    // escape into the `extern "C"` call below, so the compiler cannot remove
+    // those stores itself.
+    let mut iovs: [MaybeUninit<libc::iovec>; 2 * LAST_HOP_DRAIN] =
+        [MaybeUninit::uninit(); 2 * LAST_HOP_DRAIN];
+    let mut hdrs: [MaybeUninit<libc::mmsghdr>; LAST_HOP_DRAIN] =
+        [MaybeUninit::uninit(); LAST_HOP_DRAIN];
     let storage = sockaddr_storage_for(dst);
     let namelen = sockaddr_len_for(dst);
-    let mut hdrs: [libc::mmsghdr; LAST_HOP_DRAIN] = unsafe { std::mem::zeroed() };
-    for (i, h) in hdrs.iter_mut().enumerate().take(n) {
+    for (i, (hdr, body)) in frames[..n].iter().enumerate() {
+        // A zero-length header must not become a zero-length *separate* iovec
+        // (the kernel would still join them, but skipping it keeps the common
+        // server case — no header — at exactly one iovec, as before).
+        let mut nios = 0usize;
+        if !hdr.is_empty() {
+            iovs[2 * i].write(libc::iovec {
+                iov_base: hdr.as_ptr() as *mut libc::c_void,
+                iov_len: hdr.len(),
+            });
+            nios += 1;
+        }
+        if !body.is_empty() || nios == 0 {
+            iovs[2 * i + nios].write(libc::iovec {
+                iov_base: body.as_ptr() as *mut libc::c_void,
+                iov_len: body.len(),
+            });
+            nios += 1;
+        }
+        // One fully-initialized header per message (~56 B) instead of zeroing
+        // all 32 up front.
+        let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
         h.msg_hdr.msg_name = &storage as *const _ as *mut libc::c_void;
         h.msg_hdr.msg_namelen = namelen;
-        // SAFETY: `iovs` is a stack array that outlives the syscall below;
-        // each entry borrows a live frame for the call's duration.
-        h.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(i) };
-        h.msg_hdr.msg_iovlen = 1;
+        // SAFETY: `iovs` is a stack array that outlives the syscall below; the
+        // first `nios` entries of this message's pair were just written, and
+        // `msg_hdr.msg_iovlen` says exactly how many.
+        h.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(2 * i).cast::<libc::iovec>() };
+        h.msg_hdr.msg_iovlen = nios;
+        hdrs[i].write(h);
     }
-    // SAFETY: fd is a live non-blocking UDP socket; hdrs holds n initialised
-    // mmsghdrs sharing one destination storage; stack iovecs borrow live
-    // frames and outlive the syscall.
-    let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as u32, 0) };
+    // SAFETY: fd is a live non-blocking UDP socket; the first `n` entries of
+    // `hdrs` are initialised (and only `n` are passed); every `msg_iov` points
+    // at initialised iovecs that borrow live frames and `storage`, all of which
+    // outlive the call.
+    let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr().cast::<libc::mmsghdr>(), n as u32, 0) };
     if r < 0 {
         (0, Some(std::io::Error::last_os_error()))
     } else {

@@ -120,9 +120,14 @@ pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64)
             }
         }
     }
-    // One clock read for both global caches: they are checked back to back and
-    // only their TTLs differ.
-    let now = Instant::now();
+    // The clock is read **inside** each block, only once an entry actually has
+    // to be compared against its deadline. A contended shard (`Unknown`) and a
+    // full miss both return without needing it, and this lookup runs per domain
+    // datagram while a name is cold — twice per datagram on the server
+    // (`resolve_pin` then `forward_server_dgram`), so one vDSO read per call was
+    // pure overhead on exactly the path that is already the expensive one. At
+    // most one read happens either way: the positive block returns on a hit, and
+    // the negative block is only reached when it missed.
     {
         let Some(m) = try_lock_read(dns_cache_for(key)) else {
             return (CachedLookup::Unknown, 0);
@@ -131,6 +136,7 @@ pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64)
             // Expiry is anchored to the global entry's insertion time, so the
             // memo can never outlive the cache TTL.
             let expires = *t + DNS_CACHE_TTL;
+            let now = Instant::now();
             if now < expires {
                 if let Some(a) = v.first().copied() {
                     memo_put(key, Some(a), expires);
@@ -148,6 +154,7 @@ pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64)
         };
         if let Some(t) = n.get(key) {
             let expires = *t + DNS_NEG_TTL;
+            let now = Instant::now();
             if now < expires {
                 memo_put(key, None, expires);
                 return (CachedLookup::Negative, 0);

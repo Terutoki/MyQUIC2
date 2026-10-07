@@ -625,6 +625,147 @@ fn allowlist_contains(ss: &SessTable, s: u32, dst: SocketAddr) -> bool {
     e.recent.load().contains(&dst)
 }
 
+/// Two interleaved sessions on one connection must **both** hit the
+/// per-connection fast table.
+///
+/// The table replaced a single `(session, dst)` slot, which was the largest
+/// defect on this path: the client multiplexes every UDP association of an
+/// egress class onto one QUIC connection (`SharedEgress::egress_order` picks
+/// that class's dedicated UDP slot first and a fail-closed pool stops there),
+/// so with one slot every datagram for any second session took the full slow
+/// path — a shard read lock, an unbatched target send that bypasses
+/// `flush_staged_sends`'s `sendmmsg`, and two extra memo probes with a `Weak`
+/// upgrade plus three `Arc` clones each.
+///
+/// Pinned at the level the defect lived: arm two sessions that map to different
+/// slots, then require a hit (and the allowlist record the fast path owes) from
+/// each, and a miss for a session that was never armed — the table is a cache,
+/// never a router.
+#[tokio::test]
+async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let conn_id = next_conn_id();
+    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
+    let dst: SocketAddr = "198.51.100.7:53".parse().unwrap();
+
+    let (s1, s2) = (1u32, 2u32);
+    assert_ne!(
+        fast_slot(s1),
+        fast_slot(s2),
+        "the fixture must exercise two distinct slots"
+    );
+    // Held for the test's life: the fast path's socket liveness is a `Weak`
+    // upgrade, so the table entry must be the socket's live owner.
+    let mut socks = Vec::new();
+    for s in [s1, s2] {
+        let entry = capped_session(0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(s).write().unwrap().insert(s, entry);
+        sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
+        socks.push(sock);
+    }
+
+    // Arm both slots through the production slow-path arm.
+    for s in [s1, s2] {
+        arm_fast(
+            &mut fast,
+            conn_id,
+            s,
+            TargetAddrRef::Ip(dst),
+            dst,
+            DNS_CACHE_TTL_MS,
+        );
+        assert!(fast[fast_slot(s)].is_some(), "arm must publish session {s}");
+    }
+
+    // Both sessions must stage. The single-slot version could only ever serve
+    // the most recently armed one.
+    for s in [s1, s2] {
+        let payload = Bytes::from_static(b"fast");
+        assert!(
+            try_stage(&mut fast, &ss, conn_id, s, dst, payload, true, &mut staged).is_ok(),
+            "session {s} must hit its own slot"
+        );
+        assert_eq!(staged.len(), 1, "exactly one datagram staged for {s}");
+        assert_eq!(staged[0].dst, map_for_dual(dst));
+        staged.clear();
+        // The fast path owes the reply allowlist the destination *before* the
+        // send, or the reader drops the target's answer as forged.
+        assert!(
+            allowlist_contains(&ss, s, dst),
+            "session {s}'s allowlist must record the fast-path destination"
+        );
+    }
+
+    // Never armed, and mapped to a slot that is EMPTY: must miss (this is the
+    // cheap case, and on its own it would still pass if `is_live_for` stopped
+    // checking the session id).
+    let empty_slot = 99u32;
+    assert!(
+        fast[fast_slot(empty_slot)].is_none(),
+        "premise: slot is empty"
+    );
+    assert!(
+        try_stage(
+            &mut fast,
+            &ss,
+            conn_id,
+            empty_slot,
+            dst,
+            Bytes::from_static(b"x"),
+            true,
+            &mut staged
+        )
+        .is_err(),
+        "an unarmed session must fall through to the slow path"
+    );
+
+    // The case that actually pins "a cache, never a router": a session whose id
+    // collides with an armed slot (same index, different session), with a live
+    // reader and an upgradable socket of its own. Dropping `slot.sess == s`
+    // would stage this datagram onto *session 1's* socket, and only this shape
+    // can catch that.
+    let colliding = s1 + FAST_SESS_SLOTS as u32;
+    assert_eq!(
+        fast_slot(colliding),
+        fast_slot(s1),
+        "the fixture must collide"
+    );
+    {
+        let entry = capped_session(0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(colliding)
+            .write()
+            .unwrap()
+            .insert(colliding, entry);
+        sess_memo_put(conn_id, colliding, sock.clone(), last, abort, epoch);
+        socks.push(sock);
+    }
+    assert!(
+        try_stage(
+            &mut fast,
+            &ss,
+            conn_id,
+            colliding,
+            dst,
+            Bytes::from_static(b"x"),
+            true,
+            &mut staged
+        )
+        .is_err(),
+        "a colliding session must miss its way to the slow path, never borrow \
+         the slot owner's socket"
+    );
+    assert!(staged.is_empty(), "a miss must not stage anything");
+}
+
 /// The reader's task-local mirror of the reply allowlist must be validated
 /// against the session's allowlist epoch, because one writer of that
 /// allowlist is not the reader: the DNS resolver task `forward_server_dgram`
@@ -840,15 +981,17 @@ async fn fair_share_counts_session_holders_not_live_connections() {
 /// pre-burst count and passed the gate — one connection could take every
 /// `MAX_SESSIONS_GLOBAL` permit, and hold them indefinitely by touching each
 /// session every <180 s (`sweep_all` reaps only idle sessions). The bound
-/// adds every insert since the sample and re-measures exactly once it
-/// reaches the cap, so the same burst is refused from the first packet past
-/// the share.
+/// adds every insert since the sample, so the same burst is refused from the
+/// first packet past the share — and it is returned *as a bound*: only a stale
+/// sample re-measures, because `cached_len` stays at or above the share until a
+/// sweep republishes it, so re-measuring on every over-cap datagram charged the
+/// 8-shard `len()` exactly where the peer is already over its share.
 #[tokio::test]
 async fn the_fair_share_gate_counts_inserts_since_the_sample() {
     let ss = ShardedSessTable::new();
     let now = mono_millis();
     // The first call measures and caches: nothing is held yet.
-    assert_eq!(ss.len_upper_bound(now, LOCAL_SESS_MAX), 0);
+    assert_eq!(ss.len_upper_bound(now), 0);
 
     // One connection's burst of new sessions, all inside the sample window.
     for s in 0..8u32 {
@@ -856,33 +999,33 @@ async fn the_fair_share_gate_counts_inserts_since_the_sample() {
         ss.note_insert();
     }
     assert!(
-        ss.len_upper_bound(now, LOCAL_SESS_MAX) >= 8,
+        ss.len_upper_bound(now) >= 8,
         "the gate must count inserts since the sample, not the frozen one"
     );
-    // At the cap the value is re-measured exactly, so the gate can never be
-    // wrong in the admitting direction.
-    assert_eq!(ss.len_upper_bound(now, 4), 8);
+    // Past the share the value is the conservative bound, never an
+    // under-count, so the gate can never be wrong in the admitting direction.
+    assert_eq!(ss.len_upper_bound(now), 8);
     // A fresh table with sessions inserted without `note_insert` (i.e. one
     // whose counter was reset by a sweep resync) is still measured exactly
     // once the window expires.
-    assert_eq!(ss.len_upper_bound(now + 2_000, LOCAL_SESS_MAX), 8);
+    assert_eq!(ss.len_upper_bound(now + 2_000), 8);
 }
 
 #[tokio::test]
 async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
     let ss = ShardedSessTable::new();
     let now = mono_millis();
-    assert_eq!(ss.len_upper_bound(now, LOCAL_SESS_MAX), 0);
+    assert_eq!(ss.len_upper_bound(now), 0);
     ss.shard(7).write().unwrap().insert(7, capped_session(0));
     ss.shard(7).write().unwrap().remove(&7);
     assert_eq!(
-        ss.len_upper_bound(now, LOCAL_SESS_MAX),
+        ss.len_upper_bound(now),
         0,
         "a rolled-back insert must not inflate the fair-share bound"
     );
     ss.shard(7).write().unwrap().insert(7, capped_session(0));
     ss.note_insert();
-    assert_eq!(ss.len_upper_bound(now, LOCAL_SESS_MAX), 1);
+    assert_eq!(ss.len_upper_bound(now), 1);
     ss.shard(7).write().unwrap().remove(&7);
 }
 
@@ -2111,11 +2254,13 @@ async fn coalesce_over_cap_counts_inflight_exactly_once() {
     server_conn.close(0u32.into(), b"done");
 }
 
-/// Slow-path budget lock, server `SESSION_FULL` arm: an uncached name with
+/// Slow-path budget lock, server `DNS_BUDGET` arm: an uncached name with
 /// the 1024-permit budget exhausted counts the refused datagram exactly once
-/// on `SESSION_FULL` — no spawn, no resolution, no other counter moves.
+/// on `DNS_BUDGET` — no spawn, no resolution, no other counter moves, and
+/// `session_full` stays at zero (the resolver's pool is not the session
+/// budget).
 #[tokio::test]
-async fn forward_limiter_exhaustion_counts_session_full_exactly_once() {
+async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
     let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
     let (host, port) = ("coalesce-budget.invalid", 19713u16);
     assert_eq!(
@@ -2163,8 +2308,13 @@ async fn forward_limiter_exhaustion_counts_session_full_exactly_once() {
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
     assert_eq!(
-        d.session_full, 1,
+        d.dns_budget, 1,
         "one exhausted datagram counts exactly once"
+    );
+    assert_eq!(
+        d.session_full, 0,
+        "the resolver's permit pool is not the session budget: charging its \
+         exhaustion to `session_full` reported a slow upstream as a full host"
     );
     assert_eq!(d.dns_inflight, 0, "nothing was registered inflight");
     assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");

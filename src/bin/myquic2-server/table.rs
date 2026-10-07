@@ -140,23 +140,39 @@ impl ShardedSessTable {
     /// sessions already idle for `SESS_IDLE_MS`), and the global semaphore it
     /// fell back on is the pool being monopolized. Every insert is therefore
     /// counted since the sample, making the returned value a conservative upper
-    /// bound (removals are not subtracted), and the exact `len` is re-measured
-    /// as soon as that bound reaches `cap`. Cost: one cached load per insert
-    /// under the share, one 8-lock measurement per second per connection — the
-    /// same order as before, now with a bound that cannot be outrun.
-    pub(crate) fn len_upper_bound(&self, now_ms: u64, cap: usize) -> usize {
+    /// bound (removals are not subtracted).
+    ///
+    /// **Only a stale sample re-measures.** An earlier revision re-measured
+    /// whenever the bound reached `cap` "so the gate can never be wrong in the
+    /// admitting direction" — but `cached_len` stays at or above `cap` until a
+    /// sweep resyncs it, so *every* over-cap new-session datagram paid the
+    /// 8-shard read-lock `len()`: an attacker-drivable 8-lock amplifier on the
+    /// datagram path, charged exactly where the peer is already over its share.
+    /// The bound is enough there — it can only be too high, which refuses — and
+    /// the exact number comes from the caller's own sweep window, which
+    /// republishes `len` through [`store_len`](Self::store_len) once per second
+    /// process-wide. So an over-share connection is still let back in as soon as
+    /// its sessions are actually reaped, and no datagram pays 8 locks to learn
+    /// that it is refused.
+    pub(crate) fn len_upper_bound(&self, now_ms: u64) -> usize {
         use std::sync::atomic::Ordering;
-        // Timestamp first, exactly as the old cache did: a racing writer either
-        // makes this look stale (re-measure) or leaves a consistent generation
-        // visible.
-        if now_ms.saturating_sub(self.cached_len_ms.load(Ordering::Acquire)) < 1000 {
-            let est = self
-                .cached_len
-                .load(Ordering::Acquire)
-                .saturating_add(self.inserts_since_sample.load(Ordering::Acquire));
-            if est < cap {
-                return est;
-            }
+        // Timestamp FIRST, then the pair it timestamps: that ordering is what
+        // makes the returned value a bound. A concurrent re-measure below
+        // (`inserts_since_sample` reset, then `len()`, then the two publishes)
+        // can then be observed either as "stale sample" — in which case this
+        // call re-measures too — or as a consistent generation. Reading the
+        // counters first and the stamp last would allow the torn combination
+        // *old* `cached_len` + *post-reset* `inserts_since_sample` (= 0) +
+        // *fresh* stamp, which under-counts and lets one session past the
+        // fair-share gate. (`cached_len` and the stamp are two separate atomics,
+        // so there is no single-load alternative; the ordering is the guard.)
+        let stamp = self.cached_len_ms.load(Ordering::Acquire);
+        let est = self
+            .cached_len
+            .load(Ordering::Acquire)
+            .saturating_add(self.inserts_since_sample.load(Ordering::Acquire));
+        if now_ms.saturating_sub(stamp) < 1000 {
+            return est;
         }
         // Reset the insert counter *before* measuring: an insert racing this
         // window is then either inside `n` or counted in the new generation,
