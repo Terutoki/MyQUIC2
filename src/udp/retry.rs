@@ -316,9 +316,21 @@ pub fn udp_try_send_grouped(
         if sendmmsg_available() {
             use std::os::unix::io::AsRawFd;
             let (sent, _) = super::batch::sendmmsg_frames(sock.as_raw_fd(), &dst, &frames[..n]);
-            record_send_group(n, 1);
-            for _ in &frames[..sent] {
-                udp_write::sent();
+            // Book the group only when the syscall actually put frames on the
+            // wire. A full send buffer (EAGAIN, the very saturation regime this
+            // batching exists for) returns 0 sent, and recording that as a
+            // "1-syscall group of n" both invented a send-group histogram
+            // observation out of a failed syscall and let
+            // `syscall_per_packet` under-report by one every saturated burst.
+            if sent > 0 {
+                record_send_group(sent, 1);
+                for _ in &frames[..sent] {
+                    udp_write::sent();
+                }
+            } else {
+                // The syscall did run and did cost us; count it as a syscall
+                // only, with no group observation.
+                record_extra_syscalls(1);
             }
             // Remainder (short send or EAGAIN) rejoins the per-frame path so
             // each keeps its own WouldBlock -> retry treatment, and its own

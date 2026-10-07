@@ -28,7 +28,18 @@ pub(crate) async fn handle_tcp_stream(
                 return;
             }
         };
-    if streams_held.load(std::sync::atomic::Ordering::Relaxed) >= share {
+    // Reserve a share slot atomically. `fetch_add` returns the *pre-increment*
+    // value, so the reservation is exact under concurrency: the previous
+    // `load() >= share` check followed by a later `fetch_add(1)` was a TOCTOU
+    // race — every stream is its own `tokio::spawn`ed task on a multi-thread
+    // runtime, so N tasks accepted at the same instant all read `share - 1`,
+    // all passed, and all incremented, overshooting the share by up to the
+    // number of concurrent accepts (bounded only by `MAX_BIDI_STREAMS_PER_CONN`
+    // rather than by `share`). A loser's `fetch_sub` puts the slot straight
+    // back, so the count is never left inflated.
+    let held = streams_held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if held >= share {
+        streams_held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         let n = STREAM_SHARE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if warn_stream_share_refused() {
             warn!(
@@ -39,6 +50,8 @@ pub(crate) async fn handle_tcp_stream(
         send.reset(0x05u32.into()).ok();
         return;
     }
+    // Armed before the permit attempt so the refusal below gives the slot back.
+    let _stream_share_guard = StreamShareGuard(streams_held);
     let _stream_permit = match stream_task_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -47,8 +60,6 @@ pub(crate) async fn handle_tcp_stream(
             return;
         }
     };
-    streams_held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let _stream_share_guard = StreamShareGuard(streams_held);
     // Candidate addresses for the dial. Both branches produce a plain
     // `&[SocketAddr]`: the IP-literal path (the dominant case) borrows
     // the decoded target and allocates nothing, while the domain path

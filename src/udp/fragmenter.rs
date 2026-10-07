@@ -31,7 +31,7 @@ use crate::{dgram_drops, udp_stats};
 #[derive(Debug, Default)]
 pub struct DgramFragmenter {
     pub(crate) next_id: u16,
-    /// [`mono_millis`] when `next_id` wrapped (0 = it never has). See
+    /// [`mono_millis`] when `next_id` last wrapped (0 = it never has). See
     /// [`FRAG_ID_SAFE_WINDOW_MS`].
     pub(crate) last_wrap_ms: u64,
     /// Pre-encoded `type | sess | addr` prefix for the steady destination, so
@@ -44,6 +44,18 @@ pub struct DgramFragmenter {
 /// Whether handing out a fresh fragment id would risk colliding with a partial
 /// the receiver may still hold — see [`FRAG_ID_SAFE_WINDOW_MS`].
 ///
+/// `last_wrap_ms` must be an **upper bound on the previous use of every id in
+/// the cycle now starting**; the ids of a cycle are all issued before the
+/// current cycle's first id, so the cycle's own start is the only such bound
+/// available without a per-id timestamp ring (65536 entries per sending
+/// context). That is why this is deliberately the *conservative* choice: a
+/// looser reference (e.g. the previous cycle's start, or an interpolated
+/// per-id estimate) over-estimates how long ago each id was last used and
+/// therefore lets an id be reused inside the window — a datagram splice. The
+/// cost is the 3 s pause after each wrap documented on
+/// [`FRAG_ID_SAFE_WINDOW_MS`], which is inherent to a 16-bit id with no wire
+/// generation marker, not an artefact of this reference.
+///
 /// Split out of [`DgramFragmenter::send`] so the window logic is testable
 /// without a live connection; `now_ms` is the [`mono_millis`] epoch.
 pub(crate) fn frag_id_reuse_blocked(last_wrap_ms: u64, now_ms: u64) -> bool {
@@ -53,6 +65,29 @@ pub(crate) fn frag_id_reuse_blocked(last_wrap_ms: u64, now_ms: u64) -> bool {
 impl DgramFragmenter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Claim the next fragment id, or `None` when the 16-bit id space cannot be
+    /// cycled yet without risking a splice (see [`FRAG_ID_SAFE_WINDOW_MS`]).
+    ///
+    /// The gate, the advance and the wrap stamp live here rather than inline in
+    /// [`Self::send`] so the invariant test drives the *production* logic: a
+    /// test that re-implements the three lines cannot catch a change to them.
+    /// That matters because a looser reference passes a refusals-only test while
+    /// quietly reissuing ids inside the window — gating on the *previous* cycle's
+    /// start instead of this one does exactly that, driving refusals to zero and
+    /// splicing datagrams. `id_reuse_never_lands_inside_the_reassembly_window`
+    /// exists to catch that shape.
+    pub(crate) fn try_claim_id(&mut self, now_ms: u64) -> Option<u16> {
+        if frag_id_reuse_blocked(self.last_wrap_ms, now_ms) {
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.last_wrap_ms = now_ms;
+        }
+        Some(id)
     }
 
     /// Encode and send `payload`, fragmenting only when it does not fit one
@@ -171,12 +206,8 @@ impl DgramFragmenter {
         // older generation's target (see the note on the restart heuristic in
         // `DgramReassembler::push_with_chunk`). Refusing to fragment while the
         // whole id space has been consumed faster than the receiver forgets is
-        // the only wire-compatible way to rule that out. The cost is a hard
-        // ceiling of `65_536 / FRAG_ID_SAFE_WINDOW_MS` fragmented payloads per
-        // second per sending context (~21k/s at the shipped 3 s window, i.e.
-        // ~30 MB/s of 1.4 KB payloads or ~170 MB/s of 8 KB payloads); above it
-        // oversized payloads are dropped and counted instead of corrupted.
-        if frag_id_reuse_blocked(self.last_wrap_ms, mono_millis()) {
+        // the only wire-compatible way to rule that out.
+        let Some(id) = self.try_claim_id(mono_millis()) else {
             let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
             warn_datagram_drop(
                 DatagramDropKind::Large,
@@ -184,10 +215,12 @@ impl DgramFragmenter {
                 n,
                 || {
                     format!(
-                        "; more than {} fragmented payloads/s on one session/association \
-                         would wrap the 16-bit fragment id while the receiver can still \
-                         hold a partial; refusing to fragment rather than splicing",
-                        65_536 / FRAG_ID_SAFE_WINDOW_MS
+                        "; all 65536 fragment ids were retired within {FRAG_ID_SAFE_WINDOW_MS} ms, \
+                         so the receiver may still hold a partial for the id this payload needs — \
+                         dropped rather than spliced. Expected cost is \
+                         {FRAG_ID_SAFE_WINDOW_MS} / (cycle + {FRAG_ID_SAFE_WINDOW_MS}) of \
+                         oversized payloads: ~4% at 1000/s, ~8% at 2000/s, 50% at 21845/s. This is \
+                         inherent to a 16-bit id with no wire generation marker, not a tuning knob"
                     )
                 },
             );
@@ -195,13 +228,8 @@ impl DgramFragmenter {
                 frames: 0,
                 failed: Some(DatagramSend::TooLarge),
             };
-        }
+        };
         let total = total_usize as u8;
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        if self.next_id == 0 {
-            self.last_wrap_ms = mono_millis();
-        }
 
         let mut frames = 0u8;
         for (i, part) in payload.chunks(chunk).enumerate() {

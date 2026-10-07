@@ -101,8 +101,18 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
                 || s[0] == 0x0100
                 // 2001:2::/48 benchmarking (RFC 5180)
                 || (s[0] == 0x2001 && s[1] == 0x0002)
-                // 3fff::/20 documentation (RFC 9637)
-                || ((s[0] & 0xfff0) == 0x3ff0)
+                // 3fff::/20 documentation (RFC 9637). Exact: the block is s[0]
+                // = 0x3fff plus the high *nibble of s[1]* — bits 16..19 of the
+                // address, i.e. `s[1] & 0xf000`, so s[1] in 0x0000..=0x0fff.
+                // (Masking `s[1]` with 0xf0 instead would test bits 4..7 and
+                // invert the block.) This used to be `(s[0] & 0xfff0) == 0x3ff0`,
+                // which matches s[0] in 0x3ff0..=0x3fff and so denied
+                // 3ff0::/12 — 256x the space the RFC defines, silently refusing
+                // 3ff0::-3ffe:... (all inside IANA's reserved 3000::/4, so
+                // nothing routable today, but the same class of over-broad mask
+                // this predicate already had to be corrected for in fe00::/9
+                // and 2001::/23).
+                || (s[0] == 0x3fff && (s[1] & 0xf000) == 0x0000)
                 // 2001:10::/28 ORCHIDv1 and 2001:20::/28 ORCHIDv2 (RFC 7343)
                 || (s[0] == 0x2001
                     && (((s[1] & 0xfff0) == 0x0010) || ((s[1] & 0xfff0) == 0x0020)))

@@ -895,6 +895,56 @@ mod tests {
         assert!(is_global_ip("2001:4860:4860::8888".parse().unwrap()));
     }
 
+    /// `3fff::/20` (RFC 9637) must be exactly that block — no wider.
+    ///
+    /// The mask used to be `(s[0] & 0xfff0) == 0x3ff0`, i.e. `3ff0::/12`: every
+    /// address from `3ff0::` to `3ffe:ffff:...` was refused, 256x the space the
+    /// RFC defines. Harmless while `3000::/4` stays IANA-reserved, but it is the
+    /// third over-broad denylist mask in this predicate (`fe00::/9` and
+    /// `2001::/23` were the first two), so the boundary is pinned here the same
+    /// way `2001::/23`'s is.
+    #[test]
+    fn global_ip_filter_rejects_exactly_3fff_20() {
+        // Sweep the whole s[1] nibble boundary: 0x0000..=0x0fff is 3fff::/20 and
+        // must be denied, 0x1000 upward must be dialable. Checking sampled
+        // addresses is not enough here — the bug was a wrong *mask width* on
+        // s[1], which only some addresses expose.
+        for hi in 0u32..=0xf {
+            for lo in (0u32..0x1000).step_by(0x40) {
+                let s1 = (hi << 12) | lo;
+                let ip = std::net::Ipv6Addr::new(0x3fff, s1 as u16, 0, 0, 0, 0, 0, 1);
+                if s1 <= 0x0fff {
+                    assert!(
+                        !is_global_ip(ip.into()),
+                        "3fff:{s1:x}::1 is inside 3fff::/20"
+                    );
+                } else {
+                    assert!(
+                        is_global_ip(ip.into()),
+                        "3fff:{s1:x}::1 is outside 3fff::/20"
+                    );
+                }
+            }
+        }
+        // The neighbouring /16s the old /12 mask swallowed.
+        for ip in [
+            "3ff0::1",
+            "3ff8::1",
+            "3ffe:ffff::1",
+            "3fff:1000::1",
+            "3fff:ffff::1",
+        ] {
+            assert!(
+                is_global_ip(ip.parse().unwrap()),
+                "{ip} is outside 3fff::/20"
+            );
+        }
+        // And the block is still denied at both ends of the /20.
+        for ip in ["3fff::", "3fff:0fff:ffff::1"] {
+            assert!(!is_global_ip(ip.parse().unwrap()), "{ip} is in 3fff::/20");
+        }
+    }
+
     /// The TTL-exposing lookups must report the *remaining* life, not the full
     /// TTL: that remainder is what an adopting caller (the server's connection
     /// pin and session destination memo) has to clamp against.
@@ -1989,9 +2039,10 @@ mod tests {
     /// cannot).
     #[test]
     fn fragment_id_reuse_is_blocked_inside_the_reassembly_window() {
-        // Never wrapped: nothing to guard.
+        // Never wrapped (0): every id so far is a first use, nothing to guard.
         assert!(!frag_id_reuse_blocked(0, 1_000_000));
-        // Wrapped just now: blocked.
+        // Wrapped just now: the ids of the new cycle were all in use a moment
+        // ago, so reusing one could splice.
         assert!(frag_id_reuse_blocked(10_000, 10_000));
         assert!(frag_id_reuse_blocked(
             10_000,
@@ -2004,6 +2055,58 @@ mod tests {
         ));
         // The window must outlast the partial lifetime it protects; that
         // invariant is asserted at the constant itself.
+    }
+
+    /// The invariant the id guard actually exists to protect: whenever an id is
+    /// reissued, at least [`FRAG_ID_SAFE_WINDOW_MS`] has passed since it was
+    /// last used. Asserting the *loss profile* instead is not enough — a looser
+    /// reference (the previous cycle's start, or an interpolated per-id estimate)
+    /// drives refusals to zero while quietly letting ids be reused inside the
+    /// window, which is a datagram splice. This test therefore tracks every id's
+    /// true last-use time independently and checks the gap.
+    ///
+    /// Pure, so it runs without a live connection; it calls
+    /// `try_claim_id` — the production gate — once per payload.
+    #[test]
+    fn id_reuse_never_lands_inside_the_reassembly_window() {
+        // `per_ms` payloads issued within one millisecond. The dangerous regime
+        // is a *high* value: the id space then retires in less than
+        // `FRAG_ID_SAFE_WINDOW_MS`, so a gate that references anything older than
+        // the current cycle's start starts reissuing ids inside the window.
+        // Production logic, not a copy — an earlier revision re-implemented the
+        // gate inline and therefore passed with the unsafe variant in place.
+        let mut refused_when_impossible = 0usize;
+        for per_ms in [1usize, 4, 16, 64, 256, 1024] {
+            let mut f = DgramFragmenter::new();
+            let mut last_use = vec![0u64; u16::MAX as usize + 1];
+            let mut now = 1_000_000u64;
+            let mut refused = 0usize;
+            for n in 0..3 * (u16::MAX as u64 + 1) {
+                match f.try_claim_id(now) {
+                    None => refused += 1,
+                    Some(id) => {
+                        let prev = last_use[id as usize];
+                        assert!(
+                            prev == 0 || now.saturating_sub(prev) >= FRAG_ID_SAFE_WINDOW_MS,
+                            "id {id} reissued after {}ms (< {FRAG_ID_SAFE_WINDOW_MS}) at \
+                             {per_ms} payloads/ms — that is a splice",
+                            now.saturating_sub(prev)
+                        );
+                        last_use[id as usize] = now;
+                    }
+                }
+                if (n as usize + 1).is_multiple_of(per_ms) {
+                    now += 1;
+                }
+            }
+            if per_ms >= 64 {
+                refused_when_impossible += refused;
+            }
+        }
+        assert!(
+            refused_when_impossible > 0,
+            "a cycle shorter than the window must be refused, so the guard is not vacuous"
+        );
     }
 
     /// The guard is wired into `send`, not merely available as a predicate: a
@@ -2032,7 +2135,11 @@ mod tests {
         let mut frag = DgramFragmenter::new();
 
         let before = dgram_drops::snapshot();
+        // The id space just wrapped: the ids of the new cycle were all in use a
+        // moment ago, so reusing one could splice. `next_id` is mid-cycle so the
+        // stamp this arm sets is not immediately overwritten by the next wrap.
         frag.last_wrap_ms = mono_millis();
+        frag.next_id = 7;
         let refused = frag.send(&conn, 1, &addr.as_ref(), &payload, limit);
         assert_eq!(refused.frames, 0);
         assert_eq!(refused.failed, Some(DatagramSend::TooLarge));

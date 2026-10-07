@@ -113,6 +113,21 @@ pub const FRAG_SWEEP_INTERVAL_MS: u64 = 500;
 /// datagrams together — which the receiver cannot detect without a wire
 /// generation marker, and which delivers the mix to the older target. See
 /// [`DgramFragmenter::send`].
+///
+/// **This is a per-cycle pause, not a rate limit.** Every wrap refuses *every*
+/// oversized payload for this long, because the guard's reference must be an
+/// upper bound on when each id in the new cycle was last used, and only the
+/// cycle's own start is such a bound without a per-id timestamp ring. The
+/// resulting loss is `W / (65536 * 1000 / payloads_per_s + W)`: ~0.5% at 100
+/// fragmented payloads/s, ~4% at 1000/s, ~8% at 2000/s, ~15% at 4000/s, and
+/// 50% at `65536 / W` = 21845/s — the number often mistaken for a clean
+/// ceiling, but where half the oversized payloads are dropped. No rate avoids
+/// it entirely; it only becomes negligible at very high rates.
+///
+/// So `65536 / FRAG_ID_SAFE_WINDOW_MS` is **not** a throughput ceiling: it is
+/// the rate at which this guard costs half of all oversized payloads. Closing
+/// that gap needs a generation counter on the wire (or 65536 timestamps per
+/// sending context), not a different constant.
 pub const FRAG_ID_SAFE_WINDOW_MS: u64 = FRAG_TIMEOUT_MS + FRAG_SWEEP_INTERVAL_MS + 500;
 
 const _: () = assert!(
