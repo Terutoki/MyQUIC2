@@ -1317,17 +1317,17 @@ async fn dispatch_failed_name_drops_followers_with_exact_refused() {
 /// flavour plus a `yield_now` spin: the spawn registers before its first
 /// await, so the transient is observed within a yield or two, while a
 /// single-thread runtime would run the whole resolution inside the first
-/// sleep and miss it entirely); the limiter premise is asserted, never
-/// drained.
+/// sleep and miss it entirely). On a fast/idle machine `localhost` can
+/// resolve between two barrier polls even on multi-thread (seen under
+/// `--no-default-features`): a miss with the key already warm drains the
+/// owner's lone reply and retries cold on the next port, so the burst below
+/// always starts inside a live resolution; a miss with the key still
+/// `Unknown` stays a hard premise failure, never an assumption.
+/// The limiter premise is asserted, never drained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l2_dns_singleflight_burst_loss_repro_dispatch() {
     let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
-    let (host, port) = ("localhost", 19641u16);
-    assert_eq!(
-        lookup_cached_fast(host, port),
-        CachedLookup::Unknown,
-        "premise: the name is uncached"
-    );
+    let host = "localhost";
     assert!(
         dns_slow_path_limiter().available_permits() > 0,
         "premise: the slow-path budget is available"
@@ -1340,46 +1340,69 @@ async fn l2_dns_singleflight_burst_loss_repro_dispatch() {
     let mut reasm = DgramReassembler::new();
     let mut pkt = bytes::BytesMut::with_capacity(256);
     let before = dgram_drops::snapshot();
-    // Datagram 1: cold miss, spawns the resolver, stages nothing.
-    dispatch_one(
-        &mut cache,
-        &hub,
-        sess,
-        dgram_domain(sess, host, port, b"l2"),
-        &mut reasm,
-        &mut pkt,
-    );
-    // Registration barrier: the spawn registers single-flight before its
-    // first await, so a `yield_now` spin observes Inflight within a yield
-    // or two and the rest of the burst deterministically probes Inflight.
-    // Under a loaded `cargo test --all-targets` run every worker can be
-    // spinning a `yield_now` loop of its own, starving the spawned task
-    // before it registers — yields alone never guarantee it runs. The sleep
-    // fallback hands the core back, so the registration lands within a
-    // millisecond or two. The premise stays strict: Inflight must still be
-    // observed, never assumed.
-    let mut registered = false;
-    for _ in 0..5_000 {
-        if dns_is_inflight(host, port) {
-            registered = true;
-            break;
+    // Datagram 1: cold miss, spawns the resolver, stages nothing. Retried
+    // on a fresh target port when the resolver beats the barrier (see the
+    // doc comment above): each attempt leaves zero counter deltas on the
+    // success path, and a beaten attempt's lone reply is drained before
+    // the next attempt, so the final burst still counts exactly 40/0.
+    let port = {
+        let mut chosen = None;
+        for attempt in 0..8u16 {
+            let p = 19641u16 + attempt;
+            if lookup_cached_fast(host, p) != CachedLookup::Unknown {
+                continue;
+            }
+            dispatch_one(
+                &mut cache,
+                &hub,
+                sess,
+                dgram_domain(sess, host, p, b"l2"),
+                &mut reasm,
+                &mut pkt,
+            );
+            // Registration barrier: the spawn registers single-flight before its
+            // first await, so a `yield_now` spin observes Inflight within a yield
+            // or two and the rest of the burst deterministically probes Inflight.
+            // Under a loaded `cargo test --all-targets` run every worker can be
+            // spinning a `yield_now` loop of its own, starving the spawned task
+            // before it registers — yields alone never guarantee it runs. The sleep
+            // fallback hands the core back, so the registration lands within a
+            // millisecond or two. The premise stays strict: Inflight must still be
+            // observed, never assumed.
+            let mut registered = false;
+            for _ in 0..5_000 {
+                if dns_is_inflight(host, p) {
+                    registered = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..100 {
+                if registered {
+                    break;
+                }
+                if dns_is_inflight(host, p) {
+                    registered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if registered {
+                chosen = Some(p);
+                break;
+            }
+            if lookup_cached_fast(host, p) != CachedLookup::Unknown {
+                // The resolver finished between two polls: the owner's lone
+                // reply is already on its way, so drain it and retry cold.
+                let _ = recv_reply(&a.app).await;
+                continue;
+            }
+            panic!(
+                "premise: the first miss must register single-flight before the burst continues"
+            );
         }
-        tokio::task::yield_now().await;
-    }
-    for _ in 0..100 {
-        if registered {
-            break;
-        }
-        if dns_is_inflight(host, port) {
-            registered = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert!(
-        registered,
-        "premise: the first miss must register single-flight before the burst continues"
-    );
+        chosen.expect("premise: an observable single-flight registration within 8 ports")
+    };
     // Datagrams 2..40: same host, resolution still in flight.
     for _ in 1..40 {
         dispatch_one(
