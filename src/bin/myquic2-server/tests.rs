@@ -1810,3 +1810,363 @@ fn too_large_probe_throttle_admits_one_reread_per_window() {
         1_000 + READER_BUDGET_PROBE_INTERVAL_MS + 1
     ));
 }
+
+/// Serializes the slow-path counter tests in this binary: the drop counters
+/// are process-wide and exact, so two such tests racing would move each
+/// other's deltas — and the limiter test drains the shared budget another
+/// test's burst needs. Every test below that asserts a counter delta holds
+/// this while it measures. (Mirrors the client's `DNS_SLOW_PATH_COUNTER_LOCK`
+/// and the lib's `SLOW_PATH_COUNTER_LOCK`.)
+static SLOW_PATH_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Drain loopback datagrams until `quiet` of silence after the first arrival
+/// (or `deadline`): returns how many arrived. Shared by the burst phases
+/// below so both count deliveries the same way — one delivery, then quiet,
+/// proves nothing else is coming.
+async fn recv_loopback_burst(
+    socks: [&tokio::net::UdpSocket; 2],
+    deadline: Duration,
+    quiet: Duration,
+) -> u32 {
+    let mut delivered = 0u32;
+    let mut buf = [0u8; 2048];
+    let mut last_at: Option<tokio::time::Instant> = None;
+    let deadline = tokio::time::Instant::now() + deadline;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if let Some(t) = last_at {
+            if delivered > 0 && now - t >= quiet {
+                break;
+            }
+        }
+        let mut got = false;
+        for s in socks {
+            if s.try_recv(&mut buf).is_ok() {
+                delivered += 1;
+                got = true;
+            }
+        }
+        if got {
+            last_at = Some(tokio::time::Instant::now());
+        } else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    delivered
+}
+
+/// L2 DNS single-flight burst loss (Wave-1 Task-1 TDD repro — NOW GREEN).
+///
+/// Design-A coalesce: a same-host cold burst queues behind the resolving
+/// owner instead of dropping on `DNS_INFLIGHT`. Cold-33 / warm-40 phases
+/// (not a blanket 40/40). Phase 1 drives a 33-burst
+/// (one owner plus exactly one cap of followers) at a cold name: every
+/// datagram is delivered — inline, queued-then-drained, or waiter-spawned —
+/// and none of them bumps `DNS_INFLIGHT`. Phase 2 re-sends 40 at the now-warm
+/// name: 40/40 inline with zero slow-path counts.
+///
+/// `localhost` resolves via the hosts file (no network), and the ephemeral
+/// port keeps the `(host, port)` cache key cold: no other test can have
+/// seeded or registered it. The registration barrier (first miss must read
+/// `Inflight` before the burst continues) is what makes the burst land inside
+/// the resolution instead of racing it: multi-thread flavour plus a
+/// `yield_now` spin observes the registration (which precedes the resolver's
+/// first await) within a yield or two, while a single-thread runtime would
+/// run the whole resolution inside the first sleep and miss the transient
+/// entirely. The limiter premise is asserted, never drained: the burst needs
+/// budget available.
+///
+/// `dns_contention` is deliberately not pinned here: a follower whose
+/// `try_lock` lands inside the owner's microsecond cleanup hold takes the
+/// contention spawn path — which still delivers its datagram through the
+/// cell, so delivery stays exact while the counter records genuine
+/// contention. The seeded tests below pin the exact counts deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l2_dns_singleflight_burst_loss_repro_server() {
+    let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
+    let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("loopback binds");
+    let port = v4.local_addr().expect("loopback has a port").port();
+    // `lookup_host("localhost")` may answer ::1 first and the spawned task
+    // delivers to the first usable address, so both families listen on the
+    // same port (distinct addresses, distinct families: no bind conflict).
+    let v6 = tokio::net::UdpSocket::bind(format!("[::1]:{port}"))
+        .await
+        .expect("v6 loopback binds");
+    let host = "localhost";
+    assert_eq!(
+        lookup_cached_fast_with_ttl(host, port).0,
+        CachedLookup::Unknown,
+        "premise: the (host, port) key is cold"
+    );
+    assert!(
+        dns_slow_path_limiter().available_permits() > 0,
+        "premise: the slow-path budget is available"
+    );
+
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let target = TargetAddr::Domain(host.to_owned(), port);
+    let addr = target.as_ref();
+    let payload = Bytes::from_static(b"l2-burst");
+
+    let before = dgram_drops::snapshot();
+    // Datagram 1: cold miss, spawns the resolver, returns None inline.
+    let first = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
+    assert!(
+        first.is_none(),
+        "the spawning miss delivers inline nothing; the task owns it"
+    );
+    // Registration barrier: the spawn registers single-flight before its
+    // first await, so a `yield_now` spin observes Inflight within a yield
+    // or two and the rest of the burst deterministically probes Inflight.
+    // Under a loaded `cargo test --all-targets` run every worker can be
+    // spinning a `yield_now` loop of its own, starving the spawned task
+    // before it registers — yields alone never guarantee it runs. The sleep
+    // fallback hands the core back, so the registration lands within a
+    // millisecond or two. The premise stays strict: Inflight must still be
+    // observed, never assumed.
+    let mut registered = false;
+    for _ in 0..5_000 {
+        if dns_is_inflight(host, port) {
+            registered = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..100 {
+        if registered {
+            break;
+        }
+        if dns_is_inflight(host, port) {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        registered,
+        "premise: the first miss must register single-flight before the burst continues"
+    );
+    // Datagrams 2..33: same host, one full cap of followers. The queue can
+    // never overflow (32 followers fit 32 slots), so no timing can drop: each
+    // follower is enqueued, served inline from the warmed cache, or
+    // waiter-spawned — all three deliver, none bumps `DNS_INFLIGHT`.
+    for _ in 1..33 {
+        let r = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
+        assert!(
+            r.is_none(),
+            "a coalesced datagram has no inline delivery either way"
+        );
+    }
+    // The owner's delivery plus the whole drained queue, then a quiet period
+    // proves nothing else arrives.
+    let delivered = recv_loopback_burst(
+        [&v4, &v6],
+        Duration::from_secs(5),
+        Duration::from_millis(300),
+    )
+    .await;
+    let d = dgram_drops::snapshot().since(&before);
+    assert!(
+        delivered == 33 && d.dns_inflight == 0,
+        "L2 burst loss (server slow path): delivered={delivered}/33 \
+         dns_inflight_delta={} session_full_delta={} refused_delta={} (want 33/0/0/0)",
+        d.dns_inflight,
+        d.session_full,
+        d.refused,
+    );
+    assert_eq!(d.session_full, 0, "budget was available throughout");
+    assert_eq!(d.refused, 0, "localhost is not a policy refusal");
+    // The cold burst warmed the cache: a 40-burst at the warm name delivers
+    // 40/40 inline with zero slow-path counts.
+    let mut warm = CachedLookup::Unknown;
+    for _ in 0..100 {
+        warm = lookup_cached_fast(host, port);
+        if matches!(warm, CachedLookup::Addr(_)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        matches!(warm, CachedLookup::Addr(_)),
+        "the cold burst must warm the cache"
+    );
+    let before2 = dgram_drops::snapshot();
+    for _ in 0..40 {
+        // No inline assertion: under shard contention a datagram may take the
+        // spawn path, which still delivers it with no count. Delivery is what
+        // the socket count below pins.
+        let _ = forward_server_dgram(&ss, &server_conn, 0, 12, addr, payload.clone(), true).await;
+    }
+    let delivered2 = recv_loopback_burst(
+        [&v4, &v6],
+        Duration::from_secs(5),
+        Duration::from_millis(300),
+    )
+    .await;
+    let d2 = dgram_drops::snapshot().since(&before2);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+    assert!(
+        delivered2 == 40
+            && d2.dns_inflight == 0
+            && d2.dns_contention == 0
+            && d2.session_full == 0
+            && d2.refused == 0,
+        "warm 40-burst: delivered={delivered2}/40 dns_inflight_delta={} \
+         dns_contention_delta={} session_full_delta={} refused_delta={} (want 40/0/0/0/0)",
+        d2.dns_inflight,
+        d2.dns_contention,
+        d2.session_full,
+        d2.refused,
+    );
+}
+
+/// Coalesce queue under cap: followers of a registered-but-uncompleted name
+/// enqueue with no synchronous bump at all — the owner will deliver them, so
+/// there is nothing to count yet. `dns_inflight_seed` registers a fake owner
+/// (no resolver runs), so the queueing is fully deterministic: ten followers
+/// in, zero counters moved, all ten payloads back out in order.
+#[tokio::test]
+async fn coalesce_under_cap_enqueues_without_a_sync_bump() {
+    let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (host, port) = ("coalesce-under-cap.invalid", 19711u16);
+    dns_inflight_seed(host, port);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let target = TargetAddr::Domain(host.to_owned(), port);
+    let addr = target.as_ref();
+    let before = dgram_drops::snapshot();
+    for i in 0..10u32 {
+        let payload = Bytes::from(format!("coalesce-under-{i}"));
+        let r = forward_server_dgram(&ss, &server_conn, 0, 61, addr, payload, true).await;
+        assert!(
+            r.is_none(),
+            "a coalesced datagram delivers inline nothing; the owner owns it"
+        );
+    }
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(d.dns_inflight, 0, "queued followers are not inflight loss");
+    assert_eq!(d.dns_contention, 0, "no shard was contended");
+    assert_eq!(d.session_full, 0, "no budget was spent");
+    assert_eq!(d.refused, 0, "queueing is not refusal");
+    let queued = dns_coalesce_take_now(host, port);
+    assert_eq!(queued.len(), 10, "all ten followers must be queued");
+    for (i, q) in queued.iter().enumerate() {
+        assert_eq!(
+            q.payload,
+            Bytes::from(format!("coalesce-under-{i}")),
+            "payload {i} must survive queueing byte-for-byte"
+        );
+        assert_eq!(q.conn_id, 0, "the owner needs the connection context");
+        assert_eq!(q.sess, 61, "the owner needs the session context");
+    }
+    dns_inflight_unseed(host, port);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Coalesce queue over cap: the follower past a full 32-queue is counted
+/// loss — exactly one `DNS_INFLIGHT` for the one dropped datagram, nothing
+/// else moves, and the queue still holds exactly the first 32.
+#[tokio::test]
+async fn coalesce_over_cap_counts_inflight_exactly_once() {
+    let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (host, port) = ("coalesce-over-cap.invalid", 19712u16);
+    dns_inflight_seed(host, port);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let target = TargetAddr::Domain(host.to_owned(), port);
+    let addr = target.as_ref();
+    let payload = Bytes::from_static(b"coalesce-over");
+    let before = dgram_drops::snapshot();
+    for _ in 0..DNS_COALESCE_CAP + 1 {
+        let r = forward_server_dgram(&ss, &server_conn, 0, 62, addr, payload.clone(), true).await;
+        assert!(
+            r.is_none(),
+            "neither a queued nor a dropped follower delivers inline"
+        );
+    }
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.dns_inflight, 1,
+        "the one over-cap datagram counts exactly once"
+    );
+    assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");
+    assert_eq!(d.session_full, 0, "no budget was spent");
+    assert_eq!(d.refused, 0, "over-cap is not policy refusal");
+    let queued = dns_coalesce_take_now(host, port);
+    assert_eq!(
+        queued.len(),
+        DNS_COALESCE_CAP,
+        "the cap holds the first 32 followers"
+    );
+    dns_inflight_unseed(host, port);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Slow-path budget lock, server `SESSION_FULL` arm: an uncached name with
+/// the 1024-permit budget exhausted counts the refused datagram exactly once
+/// on `SESSION_FULL` — no spawn, no resolution, no other counter moves.
+#[tokio::test]
+async fn forward_limiter_exhaustion_counts_session_full_exactly_once() {
+    let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (host, port) = ("coalesce-budget.invalid", 19713u16);
+    assert_eq!(
+        lookup_cached_fast(host, port),
+        CachedLookup::Unknown,
+        "premise: the name is uncached"
+    );
+    // Drain the slow-path budget the way a miss storm does. No other server
+    // test holds this limiter while this lock is held, and nothing is awaited
+    // while drained.
+    let lim = dns_slow_path_limiter();
+    let mut held = Vec::new();
+    while lim.available_permits() > 0 {
+        match lim.clone().try_acquire_owned() {
+            Ok(p) => held.push(p),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(lim.available_permits(), 0, "the budget must be exhaustible");
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let target = TargetAddr::Domain(host.to_owned(), port);
+    let addr = target.as_ref();
+    let before = dgram_drops::snapshot();
+    let r = forward_server_dgram(
+        &ss,
+        &server_conn,
+        0,
+        63,
+        addr,
+        Bytes::from_static(b"q"),
+        true,
+    )
+    .await;
+    assert!(
+        r.is_none(),
+        "a budget-exhausted datagram delivers nothing, never relays"
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    drop(held);
+    assert!(
+        lim.available_permits() > 0,
+        "the budget must recover when permits release"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+    assert_eq!(
+        d.session_full, 1,
+        "one exhausted datagram counts exactly once"
+    );
+    assert_eq!(d.dns_inflight, 0, "nothing was registered inflight");
+    assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");
+    assert_eq!(d.refused, 0, "budget loss is not policy refusal");
+}

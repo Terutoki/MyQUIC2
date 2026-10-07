@@ -460,7 +460,11 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
 
     // Owner path. Both guards live across the await: `_reset` releases the
     // claim and wakes waiters on any exit path, `cleanup` removes the inflight
-    // entry once the caches are warm.
+    // entry once the caches are warm. Declared `_reset` then `cleanup`, so
+    // drop runs `cleanup` first and `_reset` last; the explicit `drop(cleanup)`
+    // below keeps that order (entry removed while the claim is still held).
+    // Safe because publish (`cell.set` + `notify_waiters`) runs before either
+    // drop, so a waiter that observes the cell also observes warm caches.
     let _reset = OwnerReset { entry: &entry };
     let cleanup = InflightCleanup { entry: &entry };
 

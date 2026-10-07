@@ -89,12 +89,15 @@ pub(crate) use dns::{
     DNS_NEG_MAX, DNS_NEG_MAX_SHARD, DNS_SHARDS, MEMO_KEY_BYTES, MEMO_SETS, MEMO_WAYS,
 };
 pub use dns::{
-    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_inflight_status, dns_is_inflight,
-    dns_neg_cache_seed, dns_slow_path_limiter, is_dns_contended, is_global_ip,
-    lookup_cached_all_fast, lookup_cached_all_fast_with_ttl, lookup_cached_fast,
-    lookup_cached_fast_with_ttl, lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
+    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_coalesce_drop, dns_coalesce_take,
+    dns_coalesce_take_now, dns_coalesce_try_push, dns_coalesce_try_push_to, dns_inflight_seed,
+    dns_inflight_status, dns_inflight_unseed, dns_is_inflight, dns_neg_cache_seed,
+    dns_slow_path_limiter, is_dns_contended, is_global_ip, lookup_cached_all_fast,
+    lookup_cached_all_fast_with_ttl, lookup_cached_fast, lookup_cached_fast_with_ttl,
+    lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
     resolve_all_cached_with_contention_retry, resolve_server_addr, resolve_server_side, unmap,
-    CachedLookup, DnsContended, DnsInflight, DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT,
+    CachedLookup, CoalesceOutcome, DnsCoalesceGuard, DnsCoalesceQueue, DnsCoalesced, DnsContended,
+    DnsInflight, DNS_CACHE_TTL_MS, DNS_COALESCE_CAP, DNS_LOOKUP_TIMEOUT,
 };
 pub use stats::drops::dgram_drops;
 pub use stats::udp_stats::{self, UdpSnapshot};

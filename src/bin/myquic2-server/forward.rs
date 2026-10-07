@@ -76,13 +76,44 @@ pub(crate) async fn forward_server_dgram(
                     }
                     None => {
                         match dns_inflight_status(h, p) {
-                            // Single-flight: the packet that spawned the
-                            // resolver is delivered by that task, this one has
-                            // no owner. Counted so the loss shows up in the
-                            // 60 s budget line instead of being invisible.
+                            // Single-flight coalesce: queue behind the
+                            // resolving owner instead of dropping. The owner's
+                            // spawn drains the queue after the caches warm, so
+                            // a queued datagram is delivered, never counted.
+                            // Only a full queue is loss (DNS_INFLIGHT, exactly
+                            // once per datagram); Gone/Contended fall through
+                            // to the spawn path below, which delivers the
+                            // datagram itself.
                             DnsInflight::Inflight => {
-                                dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-                                return None;
+                                match dns_coalesce_try_push(
+                                    h,
+                                    p,
+                                    DnsCoalesced {
+                                        // `Bytes::clone` shares the
+                                        // allocation: the queue holds a
+                                        // refcount, never a copy.
+                                        payload: payload.clone(),
+                                        conn_id,
+                                        sess: s,
+                                    },
+                                ) {
+                                    CoalesceOutcome::Pushed => return None,
+                                    CoalesceOutcome::Full(_) => {
+                                        dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
+                                        return None;
+                                    }
+                                    // Finished between the probe and the push:
+                                    // fall through to the spawn path, which
+                                    // re-resolves (a warm hit) and delivers.
+                                    CoalesceOutcome::Gone(_) => {}
+                                    // Shard busy: nothing is known, so this
+                                    // is not an inflight drop. Count it apart
+                                    // and fall through to the spawn path
+                                    // below, not a return.
+                                    CoalesceOutcome::Contended(_) => {
+                                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                    }
+                                }
                             }
                             // Contended shard mutex: nothing is known, so this
                             // is not an inflight drop. Count it apart and fall
@@ -110,6 +141,11 @@ pub(crate) async fn forward_server_dgram(
                         let host = h.to_owned();
                         tokio::spawn(async move {
                             let _permit = permit;
+                            // Never strand coalesced datagrams: the explicit
+                            // paths below take the key first (drain on success,
+                            // counted drop on failure), so this guard only
+                            // fires when the task dies before either ran.
+                            let _coalesce_guard = DnsCoalesceGuard::for_name(&host, p);
                             let dst = match resolve_all_cached(&host, p).await {
                                 Ok(v) => match v
                                     .iter()
@@ -119,18 +155,30 @@ pub(crate) async fn forward_server_dgram(
                                     Some(v) => v,
                                     None => {
                                         dgram_drops::bump(&dgram_drops::REFUSED);
+                                        dns_coalesce_drop(&host, p, &dgram_drops::REFUSED).await;
                                         return;
                                     }
                                 },
                                 Err(e) => {
                                     if is_dns_contended(&e) {
                                         dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                        dns_coalesce_drop(&host, p, &dgram_drops::DNS_CONTENTION)
+                                            .await;
                                     } else {
                                         dgram_drops::bump(&dgram_drops::REFUSED);
+                                        dns_coalesce_drop(&host, p, &dgram_drops::REFUSED).await;
                                     }
                                     return;
                                 }
                             };
+                            // Coalesced drain: take the queue up front (no new
+                            // follower can enqueue after the entry is gone),
+                            // then deliver the owner's own datagram plus every
+                            // queued one the same way — session setup first
+                            // (the only awaits in this task past the
+                            // resolution), one synchronous `udp_try_send` per
+                            // send.
+                            let queued = dns_coalesce_take(&host, p).await;
                             let sock = match get_or_create_sess(
                                 &ss,
                                 &cd,
@@ -140,7 +188,7 @@ pub(crate) async fn forward_server_dgram(
                             )
                             .await
                             {
-                                Some(v) => v,
+                                Some(v) => Some(v),
                                 // `get_or_create_sess` already bumps the
                                 // specific budget counter for every resource
                                 // refusal (FAIR_SHARE / SESSION_FULL /
@@ -153,11 +201,41 @@ pub(crate) async fn forward_server_dgram(
                                     if cd.max_datagram_size().is_none() {
                                         dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
                                     }
-                                    return;
+                                    None
                                 }
                             };
-                            remember_dst(&ss, s, dst);
-                            udp_try_send(&sock, map_for_dual(dst), payload);
+                            if let Some(sock) = sock {
+                                remember_dst(&ss, s, dst);
+                                udp_try_send(&sock, map_for_dual(dst), payload);
+                            }
+                            // Every datagram that coalesced behind this
+                            // resolution, in arrival order. Each one gets the
+                            // same session setup (and the same exact-once
+                            // counting) as the owner's own above, so a queued
+                            // datagram is never stranded and never double
+                            // counted — including when the owner's own setup
+                            // just failed.
+                            for q in queued {
+                                let gsock = match get_or_create_sess(
+                                    &ss,
+                                    &cd,
+                                    q.conn_id,
+                                    q.sess,
+                                    Some((&host, p, dst, DNS_CACHE_TTL_MS)),
+                                )
+                                .await
+                                {
+                                    Some(v) => v,
+                                    None => {
+                                        if cd.max_datagram_size().is_none() {
+                                            dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
+                                        }
+                                        continue;
+                                    }
+                                };
+                                remember_dst(&ss, q.sess, dst);
+                                udp_try_send(&gsock, map_for_dual(dst), q.payload);
+                            }
                         });
                         // The resolution happens in the spawned task above (it awaits),
                         // so this datagram is delivered there and there is no pin for

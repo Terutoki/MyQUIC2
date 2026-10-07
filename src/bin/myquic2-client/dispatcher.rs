@@ -91,6 +91,68 @@ fn stage_reply(
     }
 }
 
+/// One DNS waiter parked behind a resolving owner on the shared
+/// [`DnsCoalesceQueue`] (the single coalesce implementation, also used by the
+/// server egress — this binary only supplies its own waiter-payload type and
+/// instance).
+///
+/// The entry handle (not the app address) is parked: the owner drains via the
+/// same `send_reply` sync path, which re-reads the app address at drain time.
+pub(crate) struct CoalescedReply {
+    pub(crate) entry: Arc<AssocEntry>,
+    pub(crate) payload: Bytes,
+}
+
+fn client_dns_coalesce() -> &'static DnsCoalesceQueue<CoalescedReply> {
+    static Q: std::sync::OnceLock<DnsCoalesceQueue<CoalescedReply>> = std::sync::OnceLock::new();
+    Q.get_or_init(DnsCoalesceQueue::new)
+}
+
+/// Failure-path twin of the success drain: drop this name's coalesced queue,
+/// counting every follower once on `counter` — the same exact-once contract
+/// as the server's `dns_coalesce_drop`, over this binary's own queue
+/// instance. Reuses the shared [`DnsCoalesceQueue::drain_coalesced`], so no
+/// coalesce implementation is duplicated.
+async fn client_dns_coalesce_drop(host: &str, port: u16, counter: &std::sync::atomic::AtomicU64) {
+    for _ in client_dns_coalesce().drain_coalesced(host, port).await {
+        dgram_drops::bump(counter);
+    }
+}
+
+/// Cancel-safety twin of the server's [`DnsCoalesceGuard`] for this binary's
+/// queue instance: the owner's explicit paths take the key first (drain on
+/// success, counted drop on failure), so this only ever fires when the owner
+/// task is cancelled or panics before either ran. Takes whatever is left and
+/// drops it with a single non-parking try: at that point no drain can run
+/// (the task is gone), and the process is shutting down around it.
+struct ClientDnsCoalesceGuard {
+    host: String,
+    port: u16,
+}
+
+impl ClientDnsCoalesceGuard {
+    fn for_name(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_owned(),
+            port,
+        }
+    }
+}
+
+impl Drop for ClientDnsCoalesceGuard {
+    fn drop(&mut self) {
+        // Single try, never park: cancellation already means teardown.
+        drop(client_dns_coalesce().take_now(&self.host, self.port));
+    }
+}
+
+/// Test-only: take this name's client coalesce queue without counting, so
+/// failure-path tests can prove no waiter stranded behind a dead owner.
+#[cfg(test)]
+pub(crate) fn client_dns_coalesce_take_now(host: &str, port: u16) -> Vec<CoalescedReply> {
+    client_dns_coalesce().take_now(host, port)
+}
+
 /// Route one inbound DATAGRAM to its association, staging the reply.
 ///
 /// Same routing, decoding, reassembly, DNS and drop accounting as the
@@ -226,30 +288,51 @@ pub(crate) fn dispatch_stage(
                 }
                 CachedLookup::Addr(dst) => return Some(stage_reply(&entry, app, dst, payload)),
                 CachedLookup::Unknown => {
-                    // Both of these are counted. The server's equivalent drop
-                    // (`forward_server_dgram`) charges `DNS_INFLIGHT`, and an
-                    // uncounted drop here showed up only as missing replies: a
-                    // 40-datagram burst at one uncached name silently loses 39
-                    // of them, and under contention that can be a sustained
-                    // loss with no counter and no log at all. A contended
-                    // shard mutex is unknown, never inflight: it is counted
-                    // apart as `DNS_CONTENTION` and falls through to the
-                    // limiter-bounded spawn below instead of parking on the
-                    // shard mutex (same tri-state contract as the server).
+                    // A contended shard mutex is unknown, never inflight: it
+                    // is counted apart as `DNS_CONTENTION` and falls through
+                    // to the limiter-bounded spawn below instead of parking on
+                    // the shard mutex (same tri-state contract as the server).
+                    //
+                    // The inflight waiter parks behind the resolving owner on the
+                    // shared queue instead of dropping on `DNS_INFLIGHT`: no
+                    // waiter here is ever counted, because none is ever
+                    // dropped — a queued waiter is delivered by the owner's
+                    // drain, and a past-the-cap (or queue-contended, or
+                    // just-finished) waiter falls through to a
+                    // self-delivering spawn that joins single-flight as a
+                    // waiter and sends its own payload. Past-the-cap spawns
+                    // instead of dropping (unlike the server egress, which
+                    // drops newest with one `DNS_INFLIGHT` bump) because an
+                    // ingress reply has no other signal: dropping it
+                    // blackholes an app query the app may never retry, while
+                    // the spawn is bounded by the same slow-path limiter
+                    // below and performs no extra upstream resolution.
+                    let mut payload = payload;
                     match dns_inflight_status(h, p) {
                         DnsInflight::Inflight => {
-                            dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-                            return None;
+                            let item = CoalescedReply {
+                                entry: entry.clone(),
+                                payload,
+                            };
+                            match dns_coalesce_try_push_to(client_dns_coalesce(), h, p, item) {
+                                CoalesceOutcome::Pushed => return None,
+                                CoalesceOutcome::Full(item)
+                                | CoalesceOutcome::Contended(item)
+                                | CoalesceOutcome::Gone(item) => {
+                                    payload = item.payload;
+                                }
+                            }
                         }
                         DnsInflight::Contended => {
                             dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
                         }
                         DnsInflight::Absent => {}
                     }
-                    if dns_slow_path_limiter().available_permits() == 0 {
-                        dgram_drops::bump(&dgram_drops::SESSION_FULL);
-                        return None;
-                    }
+                    // Fail fast on the slow-path budget with exactly one bump
+                    // per refusal: `try_acquire_owned` is the only check, so
+                    // a permit freed between a probe and the acquire is still
+                    // usable and an exhausted budget is counted once (same
+                    // single-acquire shape as the server's forward path).
                     let permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
@@ -266,20 +349,57 @@ pub(crate) fn dispatch_stage(
                     let host = h.to_string();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let dst = match resolve_all_cached(&host, p).await {
-                            Ok(v) => match v.first().copied() {
-                                Some(s) => s,
-                                None => return,
-                            },
-                            Err(e) => {
-                                if myquic2::is_dns_contended(&e) {
-                                    dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                        // Never strand coalesced followers: the explicit
+                        // failure paths below drop the key queue with one
+                        // `REFUSED` bump each (the success drain takes it
+                        // first), so this guard only fires when the task dies
+                        // before either ran.
+                        let _coalesce_guard = ClientDnsCoalesceGuard::for_name(&host, p);
+                        // A contended shard is transient (every holder's
+                        // critical section is a hash op, no I/O), so a spawned
+                        // delivery retries past it instead of dropping its
+                        // payload: each hit still bumps `DNS_CONTENTION`, but
+                        // the datagram is never the price of a busy mutex. A
+                        // waiter that retries after the owner finished resolves
+                        // straight out of the warm cache.
+                        let dst = loop {
+                            match resolve_all_cached(&host, p).await {
+                                Ok(v) => match v.first().copied() {
+                                    Some(s) => break s,
+                                    None => {
+                                        dgram_drops::bump(&dgram_drops::REFUSED);
+                                        client_dns_coalesce_drop(&host, p, &dgram_drops::REFUSED)
+                                            .await;
+                                        return;
+                                    }
+                                },
+                                Err(e) => {
+                                    if myquic2::is_dns_contended(&e) {
+                                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+                                        tokio::task::yield_now().await;
+                                        continue;
+                                    }
+                                    dgram_drops::bump(&dgram_drops::REFUSED);
+                                    client_dns_coalesce_drop(&host, p, &dgram_drops::REFUSED).await;
+                                    return;
                                 }
-                                return;
                             }
                         };
                         let mut pkt = bytes::BytesMut::with_capacity(256);
                         send_reply(&entry, dst, &payload, &mut pkt);
+                        // Everyone coalesced behind this resolution goes out
+                        // on the same sync path. The inflight entry is already
+                        // gone (removed inside `resolve_all_cached`), so a
+                        // waiter arriving after this drain sees `Absent` and
+                        // self-delivers; the second drain catches one that
+                        // probed `Inflight` just before the removal.
+                        for w in client_dns_coalesce().drain_coalesced(&host, p).await {
+                            send_reply(&w.entry, dst, &w.payload, &mut pkt);
+                        }
+                        tokio::task::yield_now().await;
+                        for w in client_dns_coalesce().drain_coalesced(&host, p).await {
+                            send_reply(&w.entry, dst, &w.payload, &mut pkt);
+                        }
                     });
                     return None;
                 }

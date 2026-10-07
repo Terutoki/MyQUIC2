@@ -8,7 +8,12 @@ pub mod resolve;
 pub(crate) use cache::{dns_cache_for, dns_neg_cache_for, DNS_NEG_MAX};
 pub use cache::{DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT};
 pub(crate) use inflight::dns_inflight_for;
-pub use inflight::{dns_inflight_status, dns_is_inflight, dns_slow_path_limiter, DnsInflight};
+pub use inflight::{
+    dns_coalesce_drop, dns_coalesce_take, dns_coalesce_take_now, dns_coalesce_try_push,
+    dns_coalesce_try_push_to, dns_inflight_seed, dns_inflight_status, dns_inflight_unseed,
+    dns_is_inflight, dns_slow_path_limiter, CoalesceOutcome, DnsCoalesceGuard, DnsCoalesceQueue,
+    DnsCoalesced, DnsInflight, DNS_COALESCE_CAP,
+};
 pub(crate) use key::{dns_key, dns_key_owned, dns_shard, DNS_KEY_BUF, DNS_SHARDS};
 pub(crate) use memo::{
     dns_memo_hash, dns_memo_set, memo_peek_both, memo_put, DnsMemoSlot, DNS_MEMO, MEMO_KEY_BYTES,
