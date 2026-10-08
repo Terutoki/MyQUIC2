@@ -36,7 +36,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # assembler contiguous-chunk coalescing, so no fork is needed; the custom
 # MAX_CHUNKS=16384 fork patch is intentionally dropped (1024 returns, hence
 # the 0-RTT flow below keys on `ZeroRttAccepted`, the 0.11 API).
-quinn = "0.11.12"
+# quinn trio pinned EXACTLY (=0.11.12): `udp::send::poll_once` /
+# `try_send_datagram` correctness is verified against the 0.11.12
+# `connection.rs` `SendDatagram` internals (one state-lock per poll,
+# `Notified` Drop unregisters the waiter). A caret float to a newer
+# 0.11.x that changes those internals would silently break the
+# `Blocked`-vs-parked contract, so the pin is load-bearing.
+quinn = "=0.11.12"
 rustls = { version = "0.23", features = ["ring", "std", "logging"] }
 rcgen = "0.14"
 time = "0.3"

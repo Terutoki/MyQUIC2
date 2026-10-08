@@ -510,6 +510,7 @@ pub(crate) async fn handle_conn(
                 // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else {
+                        dgram_drops::bump(&dgram_drops::REFUSED);
                         continue;
                     };
                     let Some((s, a, whole)) = reasm.push(&f, coarse_millis()) else {
@@ -558,6 +559,7 @@ pub(crate) async fn handle_conn(
                     }
                 } else {
                     let Ok((s, a, p)) = decode_datagram_ref(&d) else {
+                        dgram_drops::bump(&dgram_drops::REFUSED);
                         continue;
                     };
                     let want = resolve_fast(&mut fast, &ss, s, a, allow_private);

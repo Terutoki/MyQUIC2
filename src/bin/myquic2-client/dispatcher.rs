@@ -583,6 +583,8 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                             if let Some(s) = dispatch_stage(&mut cache, &hub, sess, head, &mut reasm) {
                                 staged.push(s);
                             }
+                        } else {
+                            dgram_drops::bump(&dgram_drops::REFUSED);
                         }
                         for _ in 1..LAST_HOP_DRAIN {
                             if staged.len() >= LAST_HOP_DRAIN {
@@ -595,6 +597,8 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                                         if let Some(s) = dispatch_stage(&mut cache, &hub, sess, d, &mut reasm) {
                                             staged.push(s);
                                         }
+                                    } else {
+                                        dgram_drops::bump(&dgram_drops::REFUSED);
                                     }
                                 }
                                 Some(Err(_)) => { reader_failed = true; break; }

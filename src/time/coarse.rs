@@ -80,7 +80,7 @@ pub fn coarse_millis() -> u64 {
                 h.spawn(async move {
                     let _disarm = disarm;
                     let mut tick = tokio::time::interval(COARSE_TICK);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         // `interval` completes its first tick immediately, so
                         // the cursor is real from the first packet rather than
