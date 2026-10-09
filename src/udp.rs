@@ -20,4 +20,4 @@ pub(crate) use retry::{
     UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT, UDP_RETRY_TIMEOUT,
 };
 pub use retry::{udp_try_send, udp_try_send_grouped, udp_try_send_slice, UdpWriteDrop};
-pub use send::{send_udp_datagram, try_send_datagram, DatagramSend, PayloadSend};
+pub use send::{send_udp_batch, send_udp_datagram, try_send_datagram, DatagramSend, PayloadSend};

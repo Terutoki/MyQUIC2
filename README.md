@@ -10,7 +10,7 @@ SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-2 protocol · built
 [![QUIC](https://img.shields.io/badge/QUIC-TLS%201.3-38bdf8)](#-architecture)
 [![Performance](https://img.shields.io/badge/Performance-blazing%20fast-f97316)](#-performance-design)
 [![Protocol](https://img.shields.io/badge/Protocol-MQP--2-f59e0b)](#-the-mqp-2-protocol)
-[![Tests](https://img.shields.io/badge/Tests-188%20passing-16a34a)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-205%20passing-16a34a)](#-verification)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20OpenWrt-6366f1)](#-building)
 [![License](https://img.shields.io/badge/License-MIT-22c55e)](#-license)
 
@@ -207,7 +207,7 @@ MyQUIC2/
 
 ## ✅ Verification
 
-- `cargo test --all-targets`: **188 passed / 0 failed** (187 with `--no-default-features`)
+- `cargo test --all-targets`: **205 passed / 0 failed**
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`: clean on both feature sets
 - Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅
 - UDP N=1 soak (`hotpath_bench udpps`, single association, macOS dev box): open-loop 128 B blast delivers **~40k recv pps** at ~66k sent pps (was ~2.6k recv pps before the last-hop batching pass); closed-loop windowed holds **~30k pps / 0 loss**; `udpraw` loopback control ~82k pps

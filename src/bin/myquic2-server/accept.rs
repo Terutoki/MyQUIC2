@@ -558,6 +558,65 @@ pub(crate) async fn handle_conn(
                         arm_fast(&mut fast, conn_id, s, a.as_ref(), dst, life);
                     }
                 } else {
+                    if is_batch(&d) {
+                        let Ok(b) = decode_batch_ref(&d) else {
+                            dgram_drops::bump(&dgram_drops::REFUSED);
+                            continue;
+                        };
+                        let s = b.sess;
+                        let want = resolve_fast(&mut fast, &ss, s, b.addr, allow_private);
+                        match want {
+                            Some(dst) => {
+                                for p in &b.payloads {
+                                    let off = p.as_ptr() as usize - d.as_ptr() as usize;
+                                    let payload = d.slice(off..off + p.len());
+                                    udp_stats::payload(p.len());
+                                    if let Err(payload) = try_stage(
+                                        &mut fast,
+                                        &ss,
+                                        conn_id,
+                                        s,
+                                        dst,
+                                        payload,
+                                        allow_private,
+                                        &mut staged,
+                                    ) {
+                                        flush_staged_sends(&mut staged);
+                                        let _ = forward_server_dgram(
+                                            &ss,
+                                            &cd,
+                                            conn_id,
+                                            s,
+                                            b.addr,
+                                            payload,
+                                            allow_private,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                continue;
+                            }
+                            None => {
+                                flush_staged_sends(&mut staged);
+                                for p in &b.payloads {
+                                    let off = p.as_ptr() as usize - d.as_ptr() as usize;
+                                    let payload = d.slice(off..off + p.len());
+                                    udp_stats::payload(p.len());
+                                    let _ = forward_server_dgram(
+                                        &ss,
+                                        &cd,
+                                        conn_id,
+                                        s,
+                                        b.addr,
+                                        payload,
+                                        allow_private,
+                                    )
+                                    .await;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let Ok((s, a, p)) = decode_datagram_ref(&d) else {
                         dgram_drops::bump(&dgram_drops::REFUSED);
                         continue;

@@ -60,9 +60,10 @@ pub async fn copy_tcp_quic_acked(
     copy_tcp_quic_inner(tcp, send, recv, idle, Some(ack_timeout)).await
 }
 
-/// Copy chunk: large enough that a high-BDP stream is not syscall-bound, small
-/// enough that thousands of them do not dominate the RSS.
-pub(crate) const COPY_CHUNK: usize = 32 * 1024;
+/// Copy chunk: 16 KiB keeps a high-BDP stream off the syscall ceiling while
+/// thousands of concurrent flows stay out of the RSS danger zone (32K per
+/// flow with the double buffer).
+pub(crate) const COPY_CHUNK: usize = 16 * 1024;
 
 /// Writes at least this large are handed to quinn as an owned `Bytes`
 /// (`write_chunk`, which moves the buffer straight into the send queue) instead

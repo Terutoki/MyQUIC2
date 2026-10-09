@@ -520,20 +520,13 @@ mod contract_tests {
             .expect("primed send must arrive directly")
             .unwrap();
         assert_eq!(&b[..n], b"p1-3-ok");
-        #[cfg(feature = "stats")]
-        {
-            assert_eq!(d.sent, 1, "primed Ok must count exactly one sent: {d:?}");
-            assert_eq!(d.retried, 0, "primed Ok must not book a retry: {d:?}");
-            assert_eq!(
-                d.dropped_no_permit, 0,
-                "a live loopback send must not drop: {d:?}"
-            );
-            assert_eq!(d.failed, 0, "a live loopback send must not fail: {d:?}");
-        }
-        #[cfg(not(feature = "stats"))]
-        {
-            assert!(d.clean(), "no-stats build reports zeros: {d:?}");
-        }
+        assert_eq!(d.sent, 1, "primed Ok must count exactly one sent: {d:?}");
+        assert_eq!(d.retried, 0, "primed Ok must not book a retry: {d:?}");
+        assert_eq!(
+            d.dropped_no_permit, 0,
+            "a live loopback send must not drop: {d:?}"
+        );
+        assert_eq!(d.failed, 0, "a live loopback send must not fail: {d:?}");
     }
 
     /// Borrowed fast path delivers the same bytes with the same exactly-once
@@ -551,7 +544,6 @@ mod contract_tests {
             .expect("priming datagram must arrive")
             .unwrap();
         let payload = [0x5Au8; 24];
-        #[cfg_attr(not(feature = "stats"), allow(unused_variables))]
         let d = {
             let _guard = CONTRACT_LOCK.lock().unwrap();
             let before = udp_write::snapshot();
@@ -563,18 +555,15 @@ mod contract_tests {
             .expect("primed slice send must arrive directly")
             .unwrap();
         assert_eq!(&b[..n], &payload[..]);
-        #[cfg(feature = "stats")]
-        {
-            assert_eq!(
-                d.sent, 1,
-                "primed slice Ok must count exactly one sent: {d:?}"
-            );
-            assert_eq!(d.retried, 0, "primed slice Ok must not book a retry: {d:?}");
-            assert_eq!(
-                d.dropped_no_permit, 0,
-                "a live loopback send must not drop: {d:?}"
-            );
-        }
+        assert_eq!(
+            d.sent, 1,
+            "primed slice Ok must count exactly one sent: {d:?}"
+        );
+        assert_eq!(d.retried, 0, "primed slice Ok must not book a retry: {d:?}");
+        assert_eq!(
+            d.dropped_no_permit, 0,
+            "a live loopback send must not drop: {d:?}"
+        );
     }
 
     /// `WouldBlock` submit vs. full-shard drop are mutually exclusive outcomes:
@@ -618,26 +607,23 @@ mod contract_tests {
         });
 
         // Exactly-once booking: each outcome bumps exactly its own counter.
-        #[cfg(feature = "stats")]
-        {
-            let _guard = CONTRACT_LOCK.lock().unwrap();
-            let before = udp_write::snapshot();
-            udp_write::retried();
-            let d = udp_write::snapshot().since(&before);
-            assert_eq!(d.retried, 1, "submit must book exactly one retried: {d:?}");
-            assert_eq!(
-                d.dropped_no_permit, 0,
-                "submit must not also book a drop: {d:?}"
-            );
-            let before = udp_write::snapshot();
-            udp_write::dropped_no_permit();
-            let d = udp_write::snapshot().since(&before);
-            assert_eq!(
-                d.dropped_no_permit, 1,
-                "full shard must book exactly one drop: {d:?}"
-            );
-            assert_eq!(d.retried, 0, "drop must not also book a retry: {d:?}");
-        }
+        let _guard = CONTRACT_LOCK.lock().unwrap();
+        let before = udp_write::snapshot();
+        udp_write::retried();
+        let d = udp_write::snapshot().since(&before);
+        assert_eq!(d.retried, 1, "submit must book exactly one retried: {d:?}");
+        assert_eq!(
+            d.dropped_no_permit, 0,
+            "submit must not also book a drop: {d:?}"
+        );
+        let before = udp_write::snapshot();
+        udp_write::dropped_no_permit();
+        let d = udp_write::snapshot().since(&before);
+        assert_eq!(
+            d.dropped_no_permit, 1,
+            "full shard must book exactly one drop: {d:?}"
+        );
+        assert_eq!(d.retried, 0, "drop must not also book a retry: {d:?}");
     }
 
     /// Grouped same-destination send delivers every frame with exactly-once
@@ -659,7 +645,6 @@ mod contract_tests {
         let frames: Vec<[u8; 8]> = (0..N).map(|i| [i as u8; 8]).collect();
         let empty: &[u8] = &[];
         let refs: Vec<SendFrame<'_>> = frames.iter().map(|f| (empty, &f[..])).collect();
-        #[cfg_attr(not(feature = "stats"), allow(unused_variables))]
         let d = {
             let _guard = CONTRACT_LOCK.lock().unwrap();
             let before = udp_write::snapshot();
@@ -687,15 +672,12 @@ mod contract_tests {
             }
         }
         assert_eq!(seen, N, "every grouped frame must arrive: {seen}/{N}");
-        #[cfg(feature = "stats")]
-        {
-            // Primed loopback takes `Ok` per frame on either backend (sendmmsg
-            // counts `sent` per delivered frame, fallback per try_send_to).
-            assert_eq!(d.sent, N as u64, "N frames must book N sent: {d:?}");
-            assert_eq!(d.retried, 0, "primed group must not book retries: {d:?}");
-            assert_eq!(d.dropped_no_permit, 0, "live loopback must not drop: {d:?}");
-            assert_eq!(d.failed, 0, "live loopback must not fail: {d:?}");
-        }
+        // Primed loopback takes `Ok` per frame on either backend (sendmmsg
+        // counts `sent` per delivered frame, fallback per try_send_to).
+        assert_eq!(d.sent, N as u64, "N frames must book N sent: {d:?}");
+        assert_eq!(d.retried, 0, "primed group must not book retries: {d:?}");
+        assert_eq!(d.dropped_no_permit, 0, "live loopback must not drop: {d:?}");
+        assert_eq!(d.failed, 0, "live loopback must not fail: {d:?}");
     }
 
     /// A grouped frame is `(header, payload)` and must land on the wire as **one**
@@ -757,19 +739,12 @@ mod contract_tests {
     #[test]
     fn extra_syscall_accounting_is_additive_only() {
         use crate::record_extra_syscalls;
-        #[cfg(feature = "stats")]
-        {
-            let before = udp_write::snapshot();
-            record_extra_syscalls(7);
-            let d = udp_write::snapshot().since(&before);
-            assert!(d.clean(), "no drop outcome may move: {d:?}");
-            assert_eq!(d.sent, 0, "no datagram outcome may move: {d:?}");
-            assert_eq!(d.retried, 0, "no datagram outcome may move: {d:?}");
-        }
-        #[cfg(not(feature = "stats"))]
-        {
-            record_extra_syscalls(7);
-        }
+        let before = udp_write::snapshot();
+        record_extra_syscalls(7);
+        let d = udp_write::snapshot().since(&before);
+        assert!(d.clean(), "no drop outcome may move: {d:?}");
+        assert_eq!(d.sent, 0, "no datagram outcome may move: {d:?}");
+        assert_eq!(d.retried, 0, "no datagram outcome may move: {d:?}");
     }
 
     /// Empty groups are a no-op (no counters move, no syscall), and groups

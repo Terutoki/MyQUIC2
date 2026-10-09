@@ -31,7 +31,6 @@
 //! Truncation detection is orthogonal and preserved: every drained receive
 //! still checks `n == buf.len()` per datagram (see [`TRUNCATION_NOTE`]).
 
-#[cfg(feature = "stats")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bound on one drain burst: first datagram from `recv_from().await`, the rest
@@ -47,13 +46,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const LAST_HOP_DRAIN: usize = 32;
 
 // ---------------------------------------------------------------------------
-// Batch-size / syscall accounting (stats builds only)
+// Batch-size / syscall accounting (thread-local batched, shared flushed)
 // ---------------------------------------------------------------------------
 
 /// Drain-burst sizes, bucketed by burst length: 1, 2-4, 5-8, 9-16, 17-32.
 /// A healthy saturated link sits in the top buckets; a persistent bucket-0
 /// with falling pps means the drain never fills (the peer, not the loop).
-#[cfg(feature = "stats")]
 static DRAIN_HIST: [AtomicU64; 5] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -63,7 +61,6 @@ static DRAIN_HIST: [AtomicU64; 5] = [
 ];
 
 /// Grouped-send flushes by group size, same buckets as [`DRAIN_HIST`].
-#[cfg(feature = "stats")]
 static SEND_HIST: [AtomicU64; 5] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -74,10 +71,8 @@ static SEND_HIST: [AtomicU64; 5] = [
 
 /// Actual last-hop send syscalls issued by the grouped path (one `sendmmsg`,
 /// or one per frame on the fallback). `syscall_per_packet = SYSCALLS / pkts`.
-#[cfg(feature = "stats")]
 static SEND_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "stats")]
 fn bucket(n: usize) -> usize {
     match n {
         0 | 1 => 0,
@@ -91,26 +86,24 @@ fn bucket(n: usize) -> usize {
 /// How many records one thread accumulates before flushing to the shared
 /// atomics. Same bound and same reasoning as `udp_write::sent`: one shared RMW
 /// per 256 records instead of one per record.
-#[cfg(feature = "stats")]
 const BATCH_FLUSH_EVERY: u32 = 256;
 
 /// Thread-local accumulator for the three grouped-I/O counters.
 ///
 /// These were the only relay counters still doing a shared `fetch_add` per
 /// burst: `udp_stats::payload` and `udp_write::sent` are thread-local cells
-/// flushed every 256 for exactly this reason (see the `stats` feature comment
-/// in `Cargo.toml`), while `record_send_group`/`record_drain_batch` — called
-/// once per *run* per drain burst — wrote 2-3 process-global lines from every
-/// dispatcher and forward task. With runs of length 1 (a burst spanning several
-/// sessions, i.e. the normal multi-association case) that is 2 cross-core RMWs
-/// per relayed packet for a five-bucket histogram.
+/// flushed every 256 for exactly this reason, while `record_send_group`/
+/// `record_drain_batch` — called once per *run* per drain burst — wrote 2-3
+/// process-global lines from every dispatcher and forward task. With runs of
+/// length 1 (a burst spanning several sessions, i.e. the normal
+/// multi-association case) that is 2 cross-core RMWs per relayed packet for a
+/// five-bucket histogram.
 ///
 /// The reporting consequence is the documented one for `udp_write::sent`: a
 /// thread's pending count becomes visible when it reaches the flush bound or
 /// when that thread itself calls [`batch_report`]. At any real packet rate the
 /// bound is reached in milliseconds, and the alternative — a cross-core RMW per
 /// burst on the hot path — is what the feature gate exists to avoid.
-#[cfg(feature = "stats")]
 #[derive(Default)]
 struct LocalBatch {
     drain: [u64; 5],
@@ -119,7 +112,6 @@ struct LocalBatch {
     pending: u32,
 }
 
-#[cfg(feature = "stats")]
 thread_local! {
     static LOCAL_BATCH: std::cell::RefCell<LocalBatch> =
         const { std::cell::RefCell::new(LocalBatch {
@@ -131,7 +123,6 @@ thread_local! {
 }
 
 /// Publish one thread's accumulated counters (no-op when it has none).
-#[cfg(feature = "stats")]
 fn flush_local_batch() {
     LOCAL_BATCH.with(|c| {
         let mut c = c.borrow_mut();
@@ -218,33 +209,26 @@ pub fn record_extra_syscalls(n: u64) {
 /// One-line burst-latency / syscall report for the 60 s budget line or benches:
 /// drain-burst histogram, send-group histogram, and send syscalls issued.
 pub fn batch_report() -> String {
-    #[cfg(feature = "stats")]
-    {
-        // Publish this thread's pending counts first: a reporter that has itself
-        // been relaying would otherwise read a stale value for its own records
-        // (the same rule `udp_write::snapshot` follows).
-        flush_local_batch();
-        let h = |a: &[AtomicU64; 5]| {
-            format!(
-                "1:{} 2-4:{} 5-8:{} 9-16:{} 17-32:{}",
-                a[0].load(Ordering::Relaxed),
-                a[1].load(Ordering::Relaxed),
-                a[2].load(Ordering::Relaxed),
-                a[3].load(Ordering::Relaxed),
-                a[4].load(Ordering::Relaxed),
-            )
-        };
+    // Publish this thread's pending counts first: a reporter that has itself
+    // been relaying would otherwise read a stale value for its own records
+    // (the same rule `udp_write::snapshot` follows).
+    flush_local_batch();
+    let h = |a: &[AtomicU64; 5]| {
         format!(
-            "drain[{}] send[{}] send_syscalls={}",
-            h(&DRAIN_HIST),
-            h(&SEND_HIST),
-            SEND_SYSCALLS.load(Ordering::Relaxed),
+            "1:{} 2-4:{} 5-8:{} 9-16:{} 17-32:{}",
+            a[0].load(Ordering::Relaxed),
+            a[1].load(Ordering::Relaxed),
+            a[2].load(Ordering::Relaxed),
+            a[3].load(Ordering::Relaxed),
+            a[4].load(Ordering::Relaxed),
         )
-    }
-    #[cfg(not(feature = "stats"))]
-    {
-        String::from("batch stats compiled out (--no-default-features)")
-    }
+    };
+    format!(
+        "drain[{}] send[{}] send_syscalls={}",
+        h(&DRAIN_HIST),
+        h(&SEND_HIST),
+        SEND_SYSCALLS.load(Ordering::Relaxed),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -842,17 +826,7 @@ mod tests {
         record_send_group(0, 0);
         record_send_group(17, 1);
         let r = batch_report();
-        #[cfg(feature = "stats")]
-        {
-            assert!(r.contains("drain["), "report must carry drain hist: {r}");
-            assert!(r.contains("send["), "report must carry send hist: {r}");
-        }
-        #[cfg(not(feature = "stats"))]
-        {
-            assert!(
-                r.contains("compiled out"),
-                "no-stats report must say so: {r}"
-            );
-        }
+        assert!(r.contains("drain["), "report must carry drain hist: {r}");
+        assert!(r.contains("send["), "report must carry send hist: {r}");
     }
 }

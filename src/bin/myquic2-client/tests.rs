@@ -1445,8 +1445,7 @@ async fn dispatch_failed_name_drops_followers_with_exact_refused() {
 /// await, so the transient is observed within a yield or two, while a
 /// single-thread runtime would run the whole resolution inside the first
 /// sleep and miss it entirely). On a fast/idle machine `localhost` can
-/// resolve between two barrier polls even on multi-thread (seen under
-/// `--no-default-features`): a miss with the key already warm drains the
+/// resolve between two barrier polls even on multi-thread: a miss with the
 /// owner's lone reply and retries cold on the next port, so the burst below
 /// always starts inside a live resolution; a miss with the key still
 /// `Unknown` stays a hard premise failure, never an assumption.
@@ -2312,10 +2311,9 @@ async fn dispatch_collision_reprobes_and_delivers_both() {
     // up to `UDP_RETRY_INFLIGHT` sends in flight at once; two datagrams to
     // the same destination can therefore complete in either order. UDP
     // permits reordering and that hop is best-effort by contract, so an
-    // order assertion here left the client bin red under
-    // `--no-default-features` (where the per-packet stats calls are compiled
-    // out and the timing shifts) for a reason that has nothing to do with
-    // the dispatcher — a red suite that hides real regressions.
+    // order assertion here left the client bin red for a reason that has
+    // nothing to do with the dispatcher — a red suite that hides real
+    // regressions.
     let mut replies = [
         f(recv_reply(&a1.app).await.unwrap()),
         f(recv_reply(&a1.app).await.unwrap()),

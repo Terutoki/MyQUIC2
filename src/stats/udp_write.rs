@@ -20,7 +20,6 @@ pub static NO_APP: AtomicU64 = AtomicU64::new(0);
 /// A detached retry finished without writing.
 pub static RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "stats")]
 fn bump(c: &AtomicU64) -> u64 {
     c.fetch_add(1, Ordering::Relaxed).saturating_add(1)
 }
@@ -28,7 +27,6 @@ thread_local! {
     static L_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(feature = "stats")]
 fn flush_sent() {
     L_SENT.with(|c| {
         let v = c.get();
@@ -56,45 +54,26 @@ pub fn sent() {
         });
     }
 }
-// Without the `stats` feature every total reads zero, as documented: these
-// are counts, and a literal 1 made every drop warning claim "1 so far" no
-// matter how many had happened.
 pub fn retried() -> u64 {
-    #[cfg(feature = "stats")]
-    return bump(&RETRIED);
-    #[cfg(not(feature = "stats"))]
-    return 0;
+    bump(&RETRIED)
 }
 pub fn dropped_no_permit() -> u64 {
-    #[cfg(feature = "stats")]
-    return bump(&DROPPED_NO_PERMIT);
-    #[cfg(not(feature = "stats"))]
-    return 0;
+    bump(&DROPPED_NO_PERMIT)
 }
 pub fn failed() -> u64 {
-    #[cfg(feature = "stats")]
-    return bump(&FAILED);
-    #[cfg(not(feature = "stats"))]
-    return 0;
+    bump(&FAILED)
 }
 pub fn no_app() -> u64 {
-    #[cfg(feature = "stats")]
-    return bump(&NO_APP);
-    #[cfg(not(feature = "stats"))]
-    return 0;
+    bump(&NO_APP)
 }
 pub fn retry_failed() -> u64 {
-    #[cfg(feature = "stats")]
-    return bump(&RETRY_FAILED);
-    #[cfg(not(feature = "stats"))]
-    return 0;
+    bump(&RETRY_FAILED)
 }
 
 /// Totals since process start. `sent` is thread-local batched (flushed at
 /// 256 or by a `snapshot` on the same thread); the other counters are
 /// direct `fetch_add` calls from the send paths.
 pub fn snapshot() -> UdpWriteSnapshot {
-    #[cfg(feature = "stats")]
     flush_sent();
     UdpWriteSnapshot {
         sent: SENT.load(Ordering::Relaxed),

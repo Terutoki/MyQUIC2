@@ -88,12 +88,12 @@ pub(crate) struct AssocEntry {
 ///
 /// The reply direction's activity bit is consumed on this tick, so the tick
 /// period is also the worst-case staleness of `last`. It must stay far below the
-/// deadline (18x here) or a receive-only flow could be reaped while replies are
-/// still arriving. The reap *schedule* is unchanged by folding the flag at the
+/// deadline (6x here: 30 s tick against the 180 s reap) or a receive-only flow
+/// could be reaped while replies are still arriving. The reap *schedule* is unchanged by folding the flag at the
 /// tick instead of stamping per reply: the flag is consumed before the deadline
 /// is evaluated, and the association is only reported idle when no tick in the
 /// preceding `ASSOC_IDLE_MS` observed activity.
-pub(crate) const ASSOC_IDLE_TICK_SECS: u64 = 10;
+pub(crate) const ASSOC_IDLE_TICK_SECS: u64 = 30;
 pub(crate) const ASSOC_IDLE_MS: u64 = 180_000;
 
 /// App-direction stamp throttle. One relaxed load plus one store per second,

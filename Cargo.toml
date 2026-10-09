@@ -18,17 +18,6 @@ path = "src/bin/myquic2-server/main.rs"
 name = "myquic2-client"
 path = "src/bin/myquic2-client/main.rs"
 
-[features]
-default = ["stats"]
-# Per-packet relay counters (`udp_stats`/`udp_write`). They are shared atomics:
-# at a few hundred thousand packets per second the cache lines they own are
-# ping-ponging between reader tasks and the reporter. `--no-default-features`
-# compiles every one of them out of the hot path; the modules keep their API
-# and report zeros. The drop-path counters stay live either way (`dgram_drops`
-# and `udp_stats`'s reassembly expiry/eviction), so the protocol's drop and
-# reassembly warnings work in both builds.
-stats = []
-
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 # quinn trio from crates.io (0.11 line): quinn 0.11.12 / quinn-proto 0.11.18 /

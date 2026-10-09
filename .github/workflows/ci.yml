@@ -1,7 +1,7 @@
 name: CI
 
 # Runs on every pushed commit (all branches) and on every pull request.
-#   1. rustfmt / clippy / tests verify the commit (both feature sets)
+#   1. rustfmt / clippy / tests verify the commit
 #   2. x86_64 Linux release binaries are built and uploaded as workflow
 #      artifacts: static musl (OpenWrt / any x86_64 Linux) and glibc gnu.
 on:
@@ -33,16 +33,8 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
-    name: Clippy (${{ matrix.name }})
+    name: Clippy
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            flags: ""
-          - name: no-default-features
-            flags: --no-default-features
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.98.1
@@ -50,29 +42,21 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          key: clippy-${{ matrix.name }}
+          key: clippy
       - name: cargo clippy
-        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test (${{ matrix.name }})
+    name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            flags: ""
-          - name: no-default-features
-            flags: --no-default-features
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          key: test-${{ matrix.name }}
-      - run: cargo test --all-targets ${{ matrix.flags }}
+          key: test
+      - run: cargo test --all-targets
 
   build-musl:
     name: Build x86_64-unknown-linux-musl (static)

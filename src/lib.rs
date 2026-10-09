@@ -14,13 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Compile the wrapped statements only in a statistics-enabled build (the
-/// default). `--no-default-features` removes them entirely: the per-packet
-/// counters are shared atomics, and at a few hundred thousand packets per
-/// second their cache lines are the contention, not the code.
+/// Relay counters (`udp_stats`/`udp_write`) use thread-local batching: one
+/// shared atomic update per 256 records instead of one per packet, so the hot
+/// path stays off shared cache lines.
 macro_rules! stats_only {
     ($($t:tt)*) => {
-        #[cfg(feature = "stats")]
         {
             $($t)*
         }
@@ -56,6 +54,10 @@ pub use mqp::ack::{
     AUTH_TOKEN_MAX_BYTES, MAX_BND_LEN, MAX_TCP_ACK_LEN, MQP_ALPN, MQP_TCP_ACK, MQP_TCP_ACK_MAGIC,
 };
 pub use mqp::addr::{AddrHeader, TargetAddr, TargetAddrRef};
+pub use mqp::batch::{
+    batch_sess, decode_batch_ref, encode_batch, is_batch, BatchRef, BATCH_ITEM_OVERHEAD,
+    BATCH_PREFIX_LEN, BATCH_SMALL_MAX, MAX_BATCH_ITEMS, MQP_DGRAM_BATCH,
+};
 pub use mqp::datagram::{
     decode_datagram, decode_datagram_ref, dgram_payload_cap, encode_datagram,
     encode_datagram_ref_with_limit, encode_datagram_with_limit, DGRAM_DEFAULT_LIMIT,
@@ -73,9 +75,9 @@ pub use tls::{
     parse_congestion, server_tls_config,
 };
 pub use transport::{
-    build_transport, build_transport_tuned, DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW,
-    SEND_WINDOW, STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC,
-    TARGET_LINK_RTT,
+    build_transport, build_transport_tuned, build_transport_tuned_class, DGRAM_MAX_WIRE,
+    KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW, STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES,
+    TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT,
 };
 // `MQP_DGRAM_MAX` / `clamp_keep_alive` are exercised by the unit tests below
 // through `use super::*` (`DATAGRAM_BUFFER` is also read by `config::tuning`).
@@ -105,6 +107,7 @@ pub use stats::udp_write::{self, UdpWriteSnapshot};
 pub use tcp::{copy_tcp_quic, copy_tcp_quic_acked, copy_tcp_quic_idle};
 #[allow(unused_imports)]
 pub(crate) use transport::{clamp_keep_alive, DATAGRAM_BUFFER, MQP_DGRAM_MAX};
+pub use udp::send_udp_batch;
 pub use udp::{
     batch_backend, batch_report, burst_msg_copy, poll_once, record_drain_batch,
     record_extra_syscalls, record_send_group, recv_burst, recvmmsg_available, send_udp_datagram,
@@ -1849,7 +1852,6 @@ mod tests {
     /// The counters must actually move, and `max_payload` must be a high-water
     /// mark rather than the most recent value — that is what makes it the
     /// empirical answer to "is the 8 KiB cap big enough here?".
-    #[cfg(feature = "stats")]
     #[test]
     fn udp_stats_records_payloads_and_sessions() {
         // Other tests drive `DgramFragmenter::send` concurrently, so assert
@@ -1871,12 +1873,10 @@ mod tests {
         assert!(udp_stats::snapshot().max_payload >= 1_472);
     }
 
-    /// Reassembly losses must be observable in the build that compiles the
-    /// per-packet relay counters out: they are drop-path counters, and the
-    /// reassembly line is the only signal for a fragment lost in transit.
-    #[cfg(not(feature = "stats"))]
+    /// Reassembly losses must stay observable: they are drop-path counters, and
+    /// the reassembly line is the only signal for a fragment lost in transit.
     #[test]
-    fn reassembly_counters_are_live_without_the_stats_feature() {
+    fn reassembly_counters_are_live() {
         let (expired, evicted) = udp_stats::reassembly_drops();
         udp_stats::reassembly_expired();
         udp_stats::reassembly_evicted();
@@ -1893,7 +1893,6 @@ mod tests {
     /// Deliberately wired through a real connection and the real
     /// `DgramFragmenter::send`: the direct `udp_stats::payload()` test above
     /// cannot catch a caller that never calls it.
-    #[cfg(feature = "stats")]
     #[tokio::test]
     async fn fragmented_send_counts_the_payload_and_the_high_water() {
         let (client, server) = endpoint_pair().await;
@@ -2309,13 +2308,10 @@ mod tests {
             r.inflight() > 0 && r.inflight() < 200,
             "old partials were evicted"
         );
-        #[cfg(feature = "stats")]
         assert!(
             udp_stats::reassembly_drops().1 > ev0,
             "an evicted partial must be counted"
         );
-        #[cfg(not(feature = "stats"))]
-        let _ = ev0;
     }
 
     #[test]

@@ -77,6 +77,10 @@ const _: () = {
 /// semantics deliberately do not provide.
 pub(crate) const DATAGRAM_BUFFER: usize = 1024 * 1024;
 
+/// Bulk-class DATAGRAM buffer: 2MB absorbs bursts on the bulk UDP/TCP
+/// connections without the 4MB worst case per connection.
+pub(crate) const DATAGRAM_BUFFER_BULK: usize = 2 * 1024 * 1024;
+
 /// Upper bound for one MQP-2 datagram on the wire: the largest address form
 /// (1 + 1 + 255 + 2) plus the type/session header. Kept as a named constant so
 /// the tests below can prove the send-buffer invariant rather than assert it.

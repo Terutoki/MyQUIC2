@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::limits::{DATAGRAM_BUFFER, DGRAM_MAX_WIRE, MQP_DGRAM_MAX};
+use super::limits::{DATAGRAM_BUFFER, DATAGRAM_BUFFER_BULK, DGRAM_MAX_WIRE, MQP_DGRAM_MAX};
 use crate::{TransportTuning, MAX_BIDI_STREAMS_PER_CONN};
 
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
@@ -36,6 +36,33 @@ pub fn build_transport_tuned(
     keep_alive_secs: u64,
     tuning: TransportTuning,
 ) -> Arc<quinn::TransportConfig> {
+    build_transport_tuned_class(congestion, keep_alive_secs, tuning, false)
+}
+
+/// Per-class transport builder.
+/// `is_bulk` selects the bulk preset (ACK threshold 8, 10ms delay; 2MB DATAGRAM
+/// buffers) that trades reverse-path CPU for coarser feedback; interactive
+/// keeps the tuned values (default 2/5ms) and 1MB DATAGRAM buffers.
+pub fn build_transport_tuned_class(
+    congestion: &str,
+    keep_alive_secs: u64,
+    tuning: TransportTuning,
+    is_bulk: bool,
+) -> Arc<quinn::TransportConfig> {
+    let tuning = if is_bulk {
+        TransportTuning {
+            ack_threshold: 8,
+            max_ack_delay: Duration::from_millis(10),
+            ..tuning
+        }
+    } else {
+        tuning
+    };
+    let dgram_buf = if is_bulk {
+        DATAGRAM_BUFFER_BULK
+    } else {
+        DATAGRAM_BUFFER
+    };
     let mut t = quinn::TransportConfig::default();
     // BBR default; cubic only as escape hatch. Callers validate + log the
     // configured value via `parse_congestion`; unknown values fall back to BBR.
@@ -48,8 +75,8 @@ pub fn build_transport_tuned(
     // Datagrams are a lossy best-effort path drained by a dedicated reader, so
     // 1MB (~740 x 1350B datagrams) absorbs bursts without the per-connection
     // 4MB x 4096-connection worst case (16GB of queueable user memory).
-    t.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
-    t.datagram_send_buffer_size(DATAGRAM_BUFFER);
+    t.datagram_receive_buffer_size(Some(dgram_buf));
+    t.datagram_send_buffer_size(dgram_buf);
     // Invariant required by `try_send_datagram`: quinn's `datagram_send_buffer_size`
     // must be large enough to hold a datagram of the maximum size we can encode.
     // A buffer smaller than one datagram makes `send_datagram_wait` report

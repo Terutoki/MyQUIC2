@@ -47,10 +47,8 @@ jobs:
           key: verify
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - name: Test (default features)
+      - name: Test
         run: cargo test --all-targets
-      - name: Test (no default features)
-        run: cargo test --all-targets --no-default-features
 
   build-musl:
     name: Static musl OpenWrt x86_64 (${{ matrix.level }})

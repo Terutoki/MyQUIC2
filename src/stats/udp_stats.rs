@@ -35,12 +35,9 @@ thread_local! {
 /// threshold for the whole reporting interval and the line read 0. The
 /// remaining bound (a thread that exits with a pending count, or a report
 /// thread other than the one that counted) is documented on `snapshot`.
-#[cfg(feature = "stats")]
 const FLUSH_DATAGRAMS: u64 = 256;
-#[cfg(feature = "stats")]
 const FLUSH_BYTES: u64 = 256 * 1024;
 
-#[cfg(feature = "stats")]
 fn flush_locals() {
     L_DATAGRAMS.with(|c| {
         let v = c.get();
@@ -109,19 +106,14 @@ pub fn session() {
 
 /// A partial datagram was discarded because a fragment never arrived.
 ///
-/// Drop-path only (never per packet), so it stays live in the
-/// `--no-default-features` build where the per-packet relay counters are
-/// compiled out: this is the only signal for a fragment lost in transit.
+/// Drop-path only (never per packet): this is the only signal for a fragment
+/// lost in transit.
 pub fn reassembly_expired() {
     REASSEMBLY_EXPIRED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A partial datagram was discarded to stay inside [`MQP_FRAG_MAX_PAYLOAD`]
-/// (a peer sent fragments whose sum exceeds the protocol's payload ceiling)
-/// or [`FRAG_MAX_HELD_BYTES`] (the aggregate reassembly budget).
-///
-/// Drop-path only, so it stays live without the `stats` feature — same
-/// reason as [`reassembly_expired`].
+/// Drop-path only: a peer sending fragments whose sum exceeds the protocol's
+/// payload ceiling or the aggregate reassembly budget.
 pub fn reassembly_evicted() {
     REASSEMBLY_EVICTED.fetch_add(1, Ordering::Relaxed);
 }
@@ -146,7 +138,6 @@ pub fn reassembly_drops() -> (u64, u64) {
 /// count drops it. 256 datagrams bounds the worst-case undercount to ~15 s
 /// at 17 pps, which is why the threshold is not the old 1024.
 pub fn snapshot() -> UdpSnapshot {
-    #[cfg(feature = "stats")]
     flush_locals();
     UdpSnapshot {
         datagrams: DATAGRAMS.load(Ordering::Relaxed),

@@ -18,6 +18,7 @@ use bytes::Bytes;
 
 use crate::dgram_drops;
 use crate::mqp::addr::{AddrHeader, TargetAddrRef};
+use crate::mqp::batch::{encode_batch_with_header, BATCH_SMALL_MAX, MAX_BATCH_ITEMS};
 use crate::mqp::datagram::{
     encode_datagram_with_header, encode_datagram_with_prefix, DGRAM_PREFIX_LEN,
 };
@@ -229,6 +230,49 @@ pub(crate) fn send_encoded(conn: &quinn::Connection, body: Bytes) -> DatagramSen
     outcome
 }
 
+/// Encode and send up to [`MAX_BATCH_ITEMS`] small payloads to one destination
+/// as a single MQP-2 BATCH frame.
+///
+/// Same-destination, small-payload packing without added latency: callers pack
+/// only datagrams already staged in the current drain burst, never waiting for
+/// more. One quinn lock + one AEAD for N payloads instead of N.
+/// Loss fate-sharing (one QUIC loss kills N app datagrams) bounds this to
+/// `BATCH_SMALL_MAX` payloads; larger payloads keep the single-datagram path.
+/// Returns the single-frame outcome collapsed like [`PayloadSend::outcome`].
+pub fn send_udp_batch(
+    conn: &quinn::Connection,
+    sess: u32,
+    address: &TargetAddrRef<'_>,
+    payloads: &[&[u8]],
+    limit: usize,
+) -> DatagramSend {
+    if payloads.is_empty() || payloads.len() > MAX_BATCH_ITEMS {
+        return DatagramSend::TooLarge;
+    }
+    if payloads.iter().any(|p| p.len() > BATCH_SMALL_MAX) {
+        return DatagramSend::TooLarge;
+    }
+    let Ok(header) = address.header() else {
+        let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        warn_datagram_drop(
+            DatagramDropKind::Large,
+            "bad address header",
+            n,
+            String::new,
+        );
+        return DatagramSend::TooLarge;
+    };
+    let Some(body) = encode_batch_with_header(sess, &header, payloads, limit) else {
+        return DatagramSend::TooLarge;
+    };
+    let outcome = send_encoded(conn, body);
+    if outcome == DatagramSend::Sent {
+        for p in payloads {
+            crate::udp_stats::payload(p.len());
+        }
+    }
+    outcome
+}
 /// Result of [`DgramFragmenter::send`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayloadSend {

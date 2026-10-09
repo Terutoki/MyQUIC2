@@ -153,6 +153,122 @@ pub(crate) fn client_dns_coalesce_take_now(host: &str, port: u16) -> Vec<Coalesc
     client_dns_coalesce().take_now(host, port)
 }
 
+fn lookup_entry(
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    sess: u32,
+) -> Option<(Arc<AssocEntry>, SocketAddr)> {
+    let idx = (sess as usize) & (DISPATCH_CACHE - 1);
+    let cached = if cache[idx].sess == sess {
+        cache[idx]
+            .entry
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|e| e.is_alive())
+    } else {
+        None
+    };
+    let (entry, app) = match cached {
+        Some(e) => match cache[idx].app {
+            Some(app) => (e, Some(app)),
+            None => {
+                let app = e.app();
+                cache[idx].app = app;
+                (e, app)
+            }
+        },
+        None => {
+            let Some(fresh) = hub.entry(sess) else {
+                cache[idx] = DispatchSlot {
+                    sess,
+                    entry: None,
+                    app: None,
+                };
+                dgram_drops::bump(&dgram_drops::UNKNOWN_SESS);
+                return None;
+            };
+            if !fresh.is_alive() {
+                cache[idx] = DispatchSlot {
+                    sess,
+                    entry: None,
+                    app: None,
+                };
+                return None;
+            }
+            let app = fresh.app();
+            cache[idx] = DispatchSlot {
+                sess,
+                entry: Some(Arc::downgrade(&fresh)),
+                app,
+            };
+            (fresh, app)
+        }
+    };
+    app.map(|a| (entry, a))
+}
+
+/// Batch-capable staging: routes one QUIC DATAGRAM that may hold 1 app payload
+/// (0x02) or N packed payloads (0x06 BATCH). Single frames behave
+/// exactly like [`dispatch_stage`]; batch frames stage one reply per item.
+/// Returns the number of replies staged (0 = dropped or handed to a resolver).
+pub(crate) fn dispatch_stage_multi(
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    sess: u32,
+    d: Bytes,
+    reasm: &mut DgramReassembler,
+    out: &mut Vec<StagedReply>,
+) -> usize {
+    if is_batch(&d) {
+        let Ok(b) = decode_batch_ref(&d) else {
+            return 0;
+        };
+        if b.sess != sess {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            return 0;
+        }
+        let Some((entry, app)) = lookup_entry(cache, hub, sess) else {
+            udp_write::no_app();
+            return 0;
+        };
+        match b.addr {
+            TargetAddrRef::Ip(dst) => {
+                let n = b.payloads.len();
+                for p in &b.payloads {
+                    udp_stats::payload(p.len());
+                    out.push(stage_reply(&entry, app, dst, d.slice_ref(p)));
+                }
+                return n;
+            }
+            TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
+                CachedLookup::Addr(dst) => {
+                    let n = b.payloads.len();
+                    for q in &b.payloads {
+                        udp_stats::payload(q.len());
+                        out.push(stage_reply(&entry, app, dst, d.slice_ref(q)));
+                    }
+                    return n;
+                }
+                // Deliberately no resolver spawn here, unlike the single-frame
+                // path: the server always echoes replies with an IP-form source
+                // address, so a domain batch address is either hostile or a
+                // future peer — spawning one resolver task per *item* of a
+                // burst would turn a forged batch into a task-spawn amplifier.
+                CachedLookup::Negative | CachedLookup::Unknown => {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                }
+            },
+        }
+        return 0;
+    }
+    match dispatch_stage(cache, hub, sess, d, reasm) {
+        Some(s) => {
+            out.push(s);
+            1
+        }
+        None => 0,
+    }
+}
 /// Route one inbound DATAGRAM to its association, staging the reply.
 ///
 /// Same routing, decoding, reassembly, DNS and drop accounting as the
@@ -501,19 +617,23 @@ pub(crate) fn flush_staged(
         {
             j += 1;
         }
-        debug_assert!(j - i <= LAST_HOP_DRAIN);
-        hdrs.clear();
-        offs.clear();
-        for s in &staged[i..j] {
-            let start = hdrs.len();
-            encode_reply_header(hdrs, s.dst);
-            offs.push((start, hdrs.len() - start));
+        let mut k = i;
+        while k < j {
+            let n = (j - k).min(LAST_HOP_DRAIN);
+            hdrs.clear();
+            offs.clear();
+            for s in &staged[k..k + n] {
+                let start = hdrs.len();
+                encode_reply_header(hdrs, s.dst);
+                offs.push((start, hdrs.len() - start));
+            }
+            let mut refs: [SendFrame<'_>; LAST_HOP_DRAIN] = [(&[], &[]); LAST_HOP_DRAIN];
+            for ((r, (o, l)), s) in refs.iter_mut().zip(offs.iter()).zip(&staged[k..k + n]) {
+                *r = (&hdrs[*o..*o + *l], &s.payload[..]);
+            }
+            udp_try_send_grouped(&staged[i].sock, map_for_dual(staged[i].app), &refs[..n]);
+            k += n;
         }
-        let mut refs: [SendFrame<'_>; LAST_HOP_DRAIN] = [(&[], &[]); LAST_HOP_DRAIN];
-        for ((r, (o, l)), s) in refs.iter_mut().zip(offs.iter()).zip(&staged[i..j]) {
-            *r = (&hdrs[*o..*o + *l], &s.payload[..]);
-        }
-        udp_try_send_grouped(&staged[i].sock, map_for_dual(staged[i].app), &refs[..j - i]);
         i = j;
     }
     staged.clear();
@@ -579,24 +699,37 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         // replies; a drained connection error breaks out after
                         // flushing what was staged.
                         let mut drained = 1usize;
-                        if let Some(sess) = dgram_sess(&head) {
-                            if let Some(s) = dispatch_stage(&mut cache, &hub, sess, head, &mut reasm) {
-                                staged.push(s);
+                        let sess_of = |d: &Bytes| dgram_sess(d).or_else(|| batch_sess(d));
+                        if let Some(sess) = sess_of(&head) {
+                            if staged.len() < LAST_HOP_DRAIN * 2 {
+                                dispatch_stage_multi(
+                                    &mut cache,
+                                    &hub,
+                                    sess,
+                                    head,
+                                    &mut reasm,
+                                    &mut staged,
+                                );
                             }
                         } else {
                             dgram_drops::bump(&dgram_drops::REFUSED);
                         }
                         for _ in 1..LAST_HOP_DRAIN {
-                            if staged.len() >= LAST_HOP_DRAIN {
+                            if staged.len() >= LAST_HOP_DRAIN * 2 {
                                 break;
                             }
                             match poll_once(reader.as_mut()) {
                                 Some(Ok(d)) => {
                                     drained += 1;
-                                    if let Some(sess) = dgram_sess(&d) {
-                                        if let Some(s) = dispatch_stage(&mut cache, &hub, sess, d, &mut reasm) {
-                                            staged.push(s);
-                                        }
+                                    if let Some(sess) = sess_of(&d) {
+                                        dispatch_stage_multi(
+                                            &mut cache,
+                                            &hub,
+                                            sess,
+                                            d,
+                                            &mut reasm,
+                                            &mut staged,
+                                        );
                                     } else {
                                         dgram_drops::bump(&dgram_drops::REFUSED);
                                     }

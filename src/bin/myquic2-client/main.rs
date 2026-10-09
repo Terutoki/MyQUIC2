@@ -78,28 +78,40 @@ async fn main() -> Result<()> {
     );
     let tls = client_tls_config(load_cert_der(&c.server_cert_file)?, &c.alpn_bytes())?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
-    let mut ccfg = quinn::ClientConfig::new(Arc::new(quic_client));
-    ccfg.transport_config(build_transport_tuned(
+    let quic_client = Arc::new(quic_client);
+    let mut ccfg_interactive = quinn::ClientConfig::new(quic_client.clone());
+    ccfg_interactive.transport_config(build_transport_tuned_class(
         &c.congestion,
         c.keep_alive_secs,
         c.tuning(),
+        false,
     ));
-    let ccfg = Arc::new(ccfg);
+    let mut ccfg_bulk = quinn::ClientConfig::new(quic_client);
+    ccfg_bulk.transport_config(build_transport_tuned_class(
+        &c.congestion,
+        c.keep_alive_secs,
+        c.tuning(),
+        true,
+    ));
     let server_str = c.server_addr.clone();
     let server_str_log = server_str.clone();
 
-    // Single Endpoint for the process lifetime: one UDP socket, shared session-ticket
-    // cache (0-RTT resumption) and CID routing for every dial. Never recreate per dial.
-    // Tuned socket buffers so bursts do not drop before quinn sees them.
     let rt = Arc::new(quinn::TokioRuntime);
     let std_sock = udp_socket_dual("[::]:0")?;
     let mut ep = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
         rt.wrap_udp_socket(std_sock)?,
+        rt.clone(),
+    )?;
+    ep.set_default_client_config(ccfg_interactive);
+    let mut ep_udp = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        rt.wrap_udp_socket(udp_socket_dual("[::]:0")?)?,
         rt,
     )?;
-    ep.set_default_client_config((*ccfg).clone());
+    ep_udp.set_default_client_config(ccfg_bulk);
 
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();
@@ -109,7 +121,7 @@ async fn main() -> Result<()> {
     // "TCP pool size" and the dedicated UDP connections never take a congestion
     // window away from the bulk TCP class.
     info!(
-        "quic pool: {conns} TCP connection(s){} + {} dedicated UDP connection(s) ({}){}",
+        "quic pool: {conns} TCP connection(s){} + {} dedicated UDP connection(s) ({}){} (endpoints: TCP vs UDP split, one socket each)",
         if conns > 1 {
             " (bulk round-robin + interactive pin)"
         } else {
@@ -133,8 +145,7 @@ async fn main() -> Result<()> {
     );
     let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
     let egress_shared: Arc<SharedEgress> = Arc::new(SharedEgress::default());
-    // One DATAGRAM dispatcher and one reconnect loop per pool slot, all sharing
-    // the same Endpoint (one UDP socket, one ticket cache, one CID router).
+    // One DATAGRAM dispatcher and one reconnect loop per pool slot.
     // Every slot keeps its own reassembler, which is correct because a
     // payload's fragments all travel on the connection that carried them.
     // Each connection carries its own class: the interactive ports and the UDP
@@ -144,9 +155,15 @@ async fn main() -> Result<()> {
     for i in 0..pool.slots_total() {
         spawn_dispatcher(pool.slot(i), hub.clone());
     }
+    let tcp_slots = pool.tcp_slots();
     for i in 0..pool.slots_total() {
+        let use_ep = if i < tcp_slots {
+            ep.clone()
+        } else {
+            ep_udp.clone()
+        };
         spawn_conn_loop(
-            ep.clone(),
+            use_ep,
             server_str.clone(),
             c.server_name.clone(),
             c.auth_token.clone(),
@@ -181,7 +198,9 @@ async fn main() -> Result<()> {
             _ = &mut shutdown => {
                 info!("shutdown signal received: closing endpoint so conns drop and peers can reconnect");
                 ep.close(0u32.into(), b"shutdown");
+                ep_udp.close(0u32.into(), b"shutdown");
                 let _ = tokio::time::timeout(Duration::from_secs(1), ep.wait_idle()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), ep_udp.wait_idle()).await;
                 break;
             }
         };

@@ -169,6 +169,12 @@ pub(crate) async fn udp_associate_inner(
     // not reset the idle timer and keep an otherwise dead association alive.
     let mut idle_tick = tokio::time::interval(Duration::from_secs(ASSOC_IDLE_TICK_SECS));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    {
+        let phase = jitter_ms() % (ASSOC_IDLE_TICK_SECS * 1000).max(1);
+        if phase > 0 {
+            tokio::time::sleep(Duration::from_millis(phase)).await;
+        }
+    }
     // Local copy of the last published app address: the value almost never
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
@@ -178,6 +184,12 @@ pub(crate) async fn udp_associate_inner(
     // datagram would classify from itself, which cannot happen because the
     // first send classifies before it goes out.
     let mut class: Option<EgressClass> = None;
+    // Opportunistic 2-pack buffer: one owned small payload held across drain
+    // iterations so two consecutive same-destination small datagrams go out as
+    // a single BATCH frame (one quinn lock + one AEAD instead of two). Never
+    // waits: flushed at burst end or when the next datagram does not match,
+    // so no added latency, only saved work.
+    let mut batch_pending: Option<(EgressClass, TargetAddr, Vec<u8>)> = None;
     'assoc: loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
@@ -338,6 +350,59 @@ pub(crate) async fn udp_associate_inner(
                     c
                 });
                 let sent = match egress_shared.with_fresh(class, now, |c, limit| {
+                    {
+                        if payload.len() <= BATCH_SMALL_MAX {
+                            if let Some((pc, pa, pp)) = batch_pending.take() {
+                                if pc == class && pa.as_ref() == addr {
+                                    let pair: [&[u8]; 2] = [&pp, payload];
+                                    match send_udp_batch(c, sess, &addr, &pair, limit) {
+                                        DatagramSend::Sent => {
+                                            return PayloadSend {
+                                                frames: 1,
+                                                failed: None,
+                                            };
+                                        }
+                                        DatagramSend::TooLarge | DatagramSend::Blocked => {
+                                            let s1 =
+                                                frag.send(c, sess, &pa.as_ref(), &pp, limit);
+                                            if s1.failed.is_some() {
+                                                let s2 =
+                                                    frag.send(c, sess, &addr, payload, limit);
+                                                return prefer_severe(s1, s2);
+                                            }
+                                            return frag.send(c, sess, &addr, payload, limit);
+                                        }
+                                        other => {
+                                            return PayloadSend {
+                                                frames: 0,
+                                                failed: Some(other),
+                                            };
+                                        }
+                                    }
+                                }
+                                let pa_ref = pa.as_ref();
+                                let s1 = frag.send(c, sess, &pa_ref, &pp, limit);
+                                if s1.failed.is_some() {
+                                    let s2 = frag.send(c, sess, &addr, payload, limit);
+                                    return prefer_severe(s1, s2);
+                                }
+                            }
+                            if payload.len() <= BATCH_SMALL_MAX {
+                                batch_pending = Some((class, addr.into_owned(), payload.to_vec()));
+                                return PayloadSend {
+                                    frames: 1,
+                                    failed: None,
+                                };
+                            }
+                        } else if let Some((_, pa, pp)) = batch_pending.take() {
+                            let pa_ref = pa.as_ref();
+                            let s1 = frag.send(c, sess, &pa_ref, &pp, limit);
+                            if s1.failed.is_some() {
+                                let s2 = frag.send(c, sess, &addr, payload, limit);
+                                return prefer_severe(s1, s2);
+                            }
+                        }
+                    }
                     frag.send(c, sess, &addr, payload, limit)
                 }) {
                     Some(s) => s,
@@ -449,6 +514,15 @@ pub(crate) async fn udp_associate_inner(
                     }
                 }
                 }
+                if let Some((pc, pa, pp)) = batch_pending.take() {
+                    let now_flush = coarse_millis();
+                    let flushed = egress_shared.with_fresh(pc, now_flush, |c, limit| {
+                        frag.send(c, sess, &pa.as_ref(), &pp, limit)
+                    });
+                    if flushed.is_none() {
+                        batch_pending = Some((pc, pa, pp));
+                    }
+                }
                 record_drain_batch(drained);
             }
             _ = tcp.readable() => {
@@ -498,9 +572,34 @@ pub(crate) async fn udp_associate_inner(
     }
     // Every exit above breaks to here, so the buffer is recycled exactly once
     // per association lifetime, however it ended (idle reap, control close,
-    // socket error).
+    // socket error). A held 2-pack payload never reached the wire: count it so
+    // the exit cannot create invisible loss (one datagram, worst case).
+    if batch_pending.is_some() {
+        dgram_drops::bump(&dgram_drops::NO_EGRESS);
+    }
     assoc_recycle_buf(buf);
     Ok(())
+}
+
+/// Pick the outcome the caller must react to when two single sends were both
+/// attempted (batch fallback, pending flush): a dead connection outranks a
+/// size/backpressure verdict, so the egress cache is invalidated rather than
+/// merely refreshed. Both sends already did their own drop accounting; this
+/// only decides which verdict drives the shared recovery.
+fn prefer_severe(first: PayloadSend, second: PayloadSend) -> PayloadSend {
+    fn rank(failed: Option<DatagramSend>) -> u8 {
+        match failed {
+            None | Some(DatagramSend::Sent) => 0,
+            Some(DatagramSend::Blocked) | Some(DatagramSend::TooLarge) => 1,
+            Some(DatagramSend::Unsupported) => 2,
+            Some(DatagramSend::ConnectionLost) => 3,
+        }
+    }
+    if rank(second.failed) > rank(first.failed) {
+        second
+    } else {
+        first
+    }
 }
 
 /// Build a SOCKS5 UDP reply (RSV/FRAG + source address + payload) for the app
