@@ -362,7 +362,8 @@ impl SharedEgress {
         // Precise clock for the throttle: `coarse_millis` advances in 1 s
         // steps, so a 100 ms interval measured on it is really 0~1 s and a
         // PMTU shrink keeps dropping on a stale budget for up to a second.
-        // `mono_millis` is a vDSO read paid only on the `TooLarge` path.
+        // `mono_millis` is a TSC (x86) or OS-clock read paid only on the
+        // `TooLarge` path.
         // `.max(1)`: the zero stamp means "never probed", and the mono epoch
         // counts from process start, so a verdict inside the first millisecond
         // must still arm the throttle instead of probing once per datagram.

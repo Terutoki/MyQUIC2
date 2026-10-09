@@ -1674,20 +1674,21 @@ mod tests {
     /// This is the property that makes it a safe replacement for a per-packet
     /// `mono_millis()` in the throttles: a *packet-count* sampler freezes when
     /// packets stop arriving (see `TouchMemo`), so a trickle flow's stamp stops
-    /// moving and the 180 s reaper kills a live session. An epoch that advances
-    /// because a task says so cannot do that — and this test fails if the
-    /// implementation is ever swapped for a counter.
+    /// moving and the 180 s reaper kills a live session. An epoch driven by
+    /// wall time (quanta's upkeep thread) cannot do that — and this test fails
+    /// if the implementation is ever swapped for a counter.
     #[tokio::test]
     async fn coarse_millis_advances_without_traffic() {
-        // The cursor must be a real sample of the shared clock, not an
+        // The value must be a real sample of the shared clock, not an
         // uninitialized sentinel. A consumer stores the first value it sees as
         // its baseline and compares later samples against it, so a 0 read *long
         // after* process start would mean "idle since the epoch began" and its
         // very first deadline check would fire — which is why `coarse_millis`
-        // seeds the cursor on the way out rather than returning 0 until the
-        // ticker is first polled. (A literal 0 is still legitimate during the
-        // process's first millisecond, when `mono_millis` is 0 as well, so the
-        // assertion is about the *gap* between the two clocks.)
+        // falls back to the live clock until the upkeep thread has published
+        // its first sample, and shares `mono_millis`'s START. (A literal 0 is
+        // still legitimate during the process's first millisecond, when
+        // `mono_millis` is 0 as well, so the assertion is about the *gap*
+        // between the two clocks.)
         let first = coarse_millis();
         let fine = mono_millis();
         assert!(
@@ -1710,31 +1711,30 @@ mod tests {
         );
     }
 
-    /// A ticker whose runtime ended is re-armed, not left frozen.
+    /// The coarse epoch keeps advancing across a runtime hand-off.
     ///
     /// This is the failure mode the whole design has to rule out: a frozen
-    /// cursor does not corrupt anything, it silently stops every idle watchdog
+    /// clock does not corrupt anything, it silently stops every idle watchdog
     /// and every reaper in the process — the exact liveness bug the epoch was
-    /// chosen over a packet counter to avoid, arriving by a different route. A
-    /// runtime hand-off is how it happens in practice (one runtime per
-    /// `#[tokio::test]`; an embedder may run several), so the armed flag has to
-    /// be cleared by the outgoing task and re-armed by the next caller.
+    /// chosen over a packet counter to avoid, arriving by a different route.
+    /// The old ticker was a Tokio task, so a runtime hand-off (one runtime per
+    /// `#[tokio::test]`; an embedder may run several) could freeze it;
+    /// quanta's upkeep thread is runtime-independent, and this test still pins
+    /// the property end to end rather than trusting that.
     ///
-    /// The assertion is "the cursor advanced while a second runtime was live",
-    /// which holds whichever runtime ends up owning the ticker — so it is a
-    /// genuine test of the property rather than of one implementation's
-    /// bookkeeping.
+    /// The assertion is "the epoch advanced while a second runtime was live",
+    /// which holds however the epoch is being driven — so it is a genuine test
+    /// of the property rather than of one implementation's bookkeeping.
     #[test]
     fn the_coarse_epoch_is_rearmed_after_its_runtime_ends() {
         let rt1 = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // Both runtimes must live long enough for their ticker to publish a
-        // *non-zero* sample. `coarse_millis` re-seeds while its cursor is 0, so
-        // a test that dropped the first runtime inside the process's first
-        // millisecond would be rescued by that re-seed and would pass even with
-        // the re-arm broken — measured: it did.
+        // Both runtimes must live long enough for the epoch to read non-zero
+        // (it counts from the process's first clock read). A test that dropped
+        // the first runtime inside the process's first millisecond would read
+        // 0 and could not tell a live clock from a frozen one.
         rt1.block_on(async {
             let _ = coarse_millis();
             tokio::time::sleep(Duration::from_millis(1_200)).await;
@@ -1752,13 +1752,12 @@ mod tests {
         });
         assert!(
             first > 0,
-            "the seed path is still in play, so this test cannot tell a live ticker from \
-             a frozen one"
+            "a zero epoch means this test cannot tell a live clock from a frozen one"
         );
         assert!(
             later > first,
-            "the epoch froze across a runtime hand-off ({first} -> {later}): the outgoing \
-             task left the armed flag set and nothing re-armed it"
+            "the epoch froze across a runtime hand-off ({first} -> {later}): nothing \
+             runtime-bound is keeping it alive"
         );
     }
 

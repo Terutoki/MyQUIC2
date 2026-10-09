@@ -46,6 +46,8 @@ clap = { version = "4", features = ["derive"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 arc-swap = "1"
+parking_lot = "0.12"
+quanta = "0.13"
 
 # mimalloc for musl targets only. The shipped static / OpenWrt binaries link
 # musl, whose allocator measured ~22% behind glibc on the closed-loop UDP soak

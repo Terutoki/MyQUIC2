@@ -213,8 +213,8 @@ pub(crate) fn touch_memo_idx(conn: usize, sess: u32) -> usize {
 /// `sweep_local`, the reader idle tick) already uses the mono epoch, so
 /// storing the 1 s-quantized coarse sample here made the sweep subtract a
 /// stamp up to one tick older than the true touch — reaping a live session up
-/// to ~1 s before its 180 s budget ran out. The precise read costs one vDSO
-/// call and runs only when the touch is actually due (at most once per
+/// to ~1 s before its 180 s budget ran out. The precise read costs a TSC/OS
+/// clock read and runs only when the touch is actually due (at most once per
 /// second per session), so the per-packet cost stays one coarse read.
 pub(crate) fn touch_session_throttled(conn: usize, sess: u32, last: &std::sync::atomic::AtomicU64) {
     pub(crate) const TOUCH_INTERVAL_MS: u64 = 1000;

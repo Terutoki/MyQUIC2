@@ -58,11 +58,11 @@ impl Drop for InflightCleanup<'_> {
 }
 
 /// Sharded single-flight table: one mutex per shard (see `DNS_SHARDS`).
-pub(crate) type DnsInflightTable = std::sync::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>;
+pub(crate) type DnsInflightTable = parking_lot::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>;
 
 fn dns_inflights() -> &'static [DnsInflightTable; DNS_SHARDS] {
     static INFS: std::sync::OnceLock<[DnsInflightTable; DNS_SHARDS]> = std::sync::OnceLock::new();
-    INFS.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())))
+    INFS.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())))
 }
 
 pub(crate) fn dns_inflight_for(key: &str) -> &'static DnsInflightTable {
@@ -169,7 +169,7 @@ pub enum CoalesceOutcome<T> {
 /// (silent loss with no counter — the critical section is a single map
 /// remove).
 pub struct DnsCoalesceQueue<T> {
-    shards: [std::sync::Mutex<HashMap<DnsCacheKey, Vec<T>>>; DNS_SHARDS],
+    shards: [parking_lot::Mutex<HashMap<DnsCacheKey, Vec<T>>>; DNS_SHARDS],
 }
 
 impl<T> Default for DnsCoalesceQueue<T> {
@@ -181,7 +181,7 @@ impl<T> Default for DnsCoalesceQueue<T> {
 impl<T> DnsCoalesceQueue<T> {
     pub fn new() -> Self {
         Self {
-            shards: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
+            shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
         }
     }
 

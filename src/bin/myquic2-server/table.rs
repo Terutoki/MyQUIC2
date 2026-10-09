@@ -52,7 +52,7 @@ pub(crate) type SessTable = Arc<ShardedSessTable>;
 pub(crate) const SESS_SHARDS: usize = 8;
 
 pub(crate) struct ShardedSessTable {
-    pub(crate) shards: Vec<std::sync::RwLock<HashMap<u32, SessEntry>>>,
+    pub(crate) shards: Vec<parking_lot::RwLock<HashMap<u32, SessEntry>>>,
     /// Whether this table is currently counted in [`session_holders`]. Kept in
     /// step by [`ShardedSessTable::note_empty_state`] on every insert/removal
     /// that can change emptiness.
@@ -81,7 +81,7 @@ impl ShardedSessTable {
     pub(crate) fn new() -> Self {
         Self {
             shards: (0..SESS_SHARDS)
-                .map(|_| std::sync::RwLock::new(HashMap::new()))
+                .map(|_| parking_lot::RwLock::new(HashMap::new()))
                 .collect(),
             counted: std::sync::atomic::AtomicBool::new(false),
             cached_len: std::sync::atomic::AtomicUsize::new(0),
@@ -90,7 +90,7 @@ impl ShardedSessTable {
         }
     }
 
-    pub(crate) fn shard(&self, s: u32) -> &std::sync::RwLock<HashMap<u32, SessEntry>> {
+    pub(crate) fn shard(&self, s: u32) -> &parking_lot::RwLock<HashMap<u32, SessEntry>> {
         &self.shards[(s as usize) % SESS_SHARDS]
     }
 
@@ -105,8 +105,8 @@ impl ShardedSessTable {
     /// `MAX_UDP_ASSOCS`.
     ///
     /// Must be called with **no** guard on any of `self.shards` held —
-    /// `is_empty()` takes the shard read locks, and `std::sync::RwLock` is not
-    /// reentrant. Two concurrent calls can transiently mis-count by one (the
+    /// `is_empty()` takes the shard read locks, and `parking_lot::RwLock` is
+    /// not reentrant. Two concurrent calls can transiently mis-count by one (the
     /// emptiness check and the `counted` swap are not one atomic step); the
     /// error self-corrects on the next insert/removal and only ever moves the
     /// share, never a data path.

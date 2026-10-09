@@ -53,6 +53,9 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    // Warm the quanta clock (one-time lazy calibration, worst case ~200 ms)
+    // and start its upkeep thread before the first packet can pay for either.
+    let _ = coarse_millis();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
     if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {

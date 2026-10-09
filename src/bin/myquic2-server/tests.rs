@@ -153,7 +153,7 @@ fn sess_with_dest(addr: Option<SocketAddr>) -> (SessTable, Arc<tokio::net::UdpSo
     let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let h = tokio::spawn(std::future::pending::<()>());
     let permit = session_limiter().clone().try_acquire_owned().unwrap();
-    ss.shard(7).write().unwrap().insert(
+    lock_write(ss.shard(7)).insert(
         7,
         SessEntry {
             sock: sock.clone(),
@@ -211,7 +211,7 @@ async fn session_dest_store_writes_only_when_the_memo_needs_it() {
     let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
     let moved: SocketAddr = "1.1.1.1:443".parse().unwrap();
     let (ss, _sock) = sess_with_dest(None);
-    let expires = || ss.shard(7).read().unwrap().get(&7).unwrap().dest.expires;
+    let expires = || lock_read(ss.shard(7)).get(&7).unwrap().dest.expires;
 
     sess_dest_store(&ss, 7, "alpha.test", 443, dst, DNS_CACHE_TTL_MS);
     let first = expires();
@@ -239,13 +239,7 @@ async fn session_dest_store_writes_only_when_the_memo_needs_it() {
     // Inside the refresh window the value is unchanged but the life is not:
     // that one must rewrite, or the entry would expire and the next packet
     // would pay a full resolve.
-    ss.shard(7)
-        .write()
-        .unwrap()
-        .get_mut(&7)
-        .unwrap()
-        .dest
-        .expires = mono_millis() + 1;
+    lock_write(ss.shard(7)).get_mut(&7).unwrap().dest.expires = mono_millis() + 1;
     sess_dest_store(&ss, 7, "alpha.test", 443, moved, DNS_CACHE_TTL_MS);
     assert!(
         expires() > mono_millis() + DEST_PIN_REFRESH_MS,
@@ -559,15 +553,12 @@ async fn session_memo_does_not_own_the_socket() {
 #[tokio::test]
 async fn sweep_recheck_keeps_a_session_touched_after_the_snapshot() {
     let (ss, _sock) = sess_with_dest(None);
-    let last = ss.shard(7).read().unwrap().get(&7).unwrap().last.clone();
+    let last = lock_read(ss.shard(7)).get(&7).unwrap().last.clone();
     // A sweep that starts well past the session's idle deadline.
     let now = last.load(std::sync::atomic::Ordering::Relaxed) + SESS_IDLE_MS + 10_000;
 
     // Phase 1: the read-locked snapshot.
-    let keys: Vec<u32> = ss
-        .shard(7)
-        .read()
-        .unwrap()
+    let keys: Vec<u32> = lock_read(ss.shard(7))
         .iter()
         .filter(|(_, e)| {
             now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
@@ -583,14 +574,14 @@ async fn sweep_recheck_keeps_a_session_touched_after_the_snapshot() {
 
     // Phase 2: the write-locked removal must skip it.
     let evicted = {
-        let mut w = ss.shard(7).write().unwrap();
+        let mut w = lock_write(ss.shard(7));
         take_idle(&mut w, &keys, now)
     };
     assert!(
         evicted.is_empty(),
         "a session touched after the snapshot must survive"
     );
-    assert!(ss.shard(7).read().unwrap().contains_key(&7));
+    assert!(lock_read(ss.shard(7)).contains_key(&7));
 }
 
 /// A reader that stays alive (`SessHit::Fresh` requires a running task).
@@ -664,7 +655,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
-        ss.shard(s).write().unwrap().insert(s, entry);
+        lock_write(ss.shard(s)).insert(s, entry);
         sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
@@ -741,10 +732,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
-        ss.shard(colliding)
-            .write()
-            .unwrap()
-            .insert(colliding, entry);
+        lock_write(ss.shard(colliding)).insert(colliding, entry);
         sess_memo_put(conn_id, colliding, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
@@ -779,14 +767,7 @@ async fn the_allowlist_mirror_re_records_after_a_foreign_push() {
     use std::sync::atomic::Ordering;
 
     let (ss, _sock) = sess_with_dest(None);
-    let epoch = ss
-        .shard(7)
-        .read()
-        .unwrap()
-        .get(&7)
-        .unwrap()
-        .recent_epoch
-        .clone();
+    let epoch = lock_read(ss.shard(7)).get(&7).unwrap().recent_epoch.clone();
     let a: SocketAddr = "93.184.216.34:443".parse().unwrap();
 
     let mut mirror: Option<(u32, SocketAddr, u64)> = None;
@@ -995,7 +976,7 @@ async fn the_fair_share_gate_counts_inserts_since_the_sample() {
 
     // One connection's burst of new sessions, all inside the sample window.
     for s in 0..8u32 {
-        ss.shard(s).write().unwrap().insert(s, capped_session(0));
+        lock_write(ss.shard(s)).insert(s, capped_session(0));
         ss.note_insert();
     }
     assert!(
@@ -1016,17 +997,17 @@ async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
     let ss = ShardedSessTable::new();
     let now = mono_millis();
     assert_eq!(ss.len_upper_bound(now), 0);
-    ss.shard(7).write().unwrap().insert(7, capped_session(0));
-    ss.shard(7).write().unwrap().remove(&7);
+    lock_write(ss.shard(7)).insert(7, capped_session(0));
+    lock_write(ss.shard(7)).remove(&7);
     assert_eq!(
         ss.len_upper_bound(now),
         0,
         "a rolled-back insert must not inflate the fair-share bound"
     );
-    ss.shard(7).write().unwrap().insert(7, capped_session(0));
+    lock_write(ss.shard(7)).insert(7, capped_session(0));
     ss.note_insert();
     assert_eq!(ss.len_upper_bound(now), 1);
-    ss.shard(7).write().unwrap().remove(&7);
+    lock_write(ss.shard(7)).remove(&7);
 }
 
 /// Expired entries go through `take_idle` unbounded: 70 idle sessions are
@@ -1101,11 +1082,11 @@ async fn sweep_local_rechecks_idle_before_removing() {
 /// reads up to one tick older than the true touch and reaps a live
 /// session up to ~1 s before its 180 s budget runs out.
 ///
-/// The test waits until the coarse cursor visibly lags mono (>= 300 ms —
-/// the 1 s ticker guarantees this within one tick), then touches with a
-/// key no other test can hold so the store is unconditional. Against the
-/// old store the stamp would lag by that same >= 300 ms; a mono store
-/// reads fresh within microseconds.
+/// The test waits until the coarse sample visibly lags mono (>= 300 ms —
+/// the 1 s upkeep interval guarantees this within one interval), then
+/// touches with a key no other test can hold so the store is
+/// unconditional. Against the old store the stamp would lag by that same
+/// >= 300 ms; a mono store reads fresh within microseconds.
 #[tokio::test]
 async fn touch_stores_mono_millis_not_the_coarse_gate() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1116,7 +1097,10 @@ async fn touch_stores_mono_millis_not_the_coarse_gate() {
     while mono_millis().saturating_sub(coarse_millis()) < 300 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         waited += 1;
-        assert!(waited < 200, "the 1 s ticker must advance the cursor");
+        assert!(
+            waited < 200,
+            "the upkeep thread must advance the cached sample"
+        );
     }
     let lag = mono_millis().saturating_sub(coarse_millis());
     assert!(lag >= 300, "need a visible coarse lag to test against");
@@ -1822,7 +1806,7 @@ async fn session_churn_holds_caps_without_leaking() {
     let permits_before = session_limiter().available_permits();
     let ss = Arc::new(ShardedSessTable::new());
     for s in 1..=N as u32 {
-        ss.shard(s).write().unwrap().insert(s, capped_session(0));
+        lock_write(ss.shard(s)).insert(s, capped_session(0));
         ss.note_insert();
     }
     ss.note_empty_state();

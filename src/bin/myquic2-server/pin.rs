@@ -348,7 +348,7 @@ pub(crate) fn resolve_pin(
 ) -> Option<SocketAddr> {
     // The coarse epoch: this value only ever feeds 30 s comparisons (the pin's
     // deadline and the session memo's TTL), and it sits on the per-datagram
-    // domain path, so it must not be a vDSO `clock_gettime` per packet.
+    // domain path, so it must not be a precise clock read per packet.
     // `sess_dest_store` writes the memo's `expires` from the same epoch, so the
     // two sides are directly comparable.
     let now = coarse_millis();

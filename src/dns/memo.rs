@@ -170,7 +170,7 @@ pub(crate) struct MemoHit {
 /// Probe both ways of our key's set, returning the positive and negative hits
 /// separately. Deliberately does *not* read the clock: the caller reads it once,
 /// and only after a key match, so a memo miss is never charged a
-/// `clock_gettime` — the whole point of the memo is that a hit is cheaper than
+/// clock read — the whole point of the memo is that a hit is cheaper than
 /// the global cache lookup, and a miss must not cost more than one.
 pub(crate) fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
     let hash = dns_memo_hash(key);

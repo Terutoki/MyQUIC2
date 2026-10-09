@@ -355,8 +355,8 @@ pub(crate) async fn get_or_create_sess(
     // contend with itself. Against that, the old behaviour silently dropped a
     // datagram every time any of those brief writers won the race, and charged
     // the drop to a counter documented as "budget exhausted", hiding relay loss
-    // inside a resource-limit metric. `std::sync::RwLock::read` already tries
-    // before it parks, so the uncontended cost is unchanged; only the drop is
+    // inside a resource-limit metric. `parking_lot`'s `RwLock::read` already
+    // spin-tries before it parks, so the uncontended cost is unchanged; only the drop is
     // gone.
     {
         let sh = ss.shard(s);
