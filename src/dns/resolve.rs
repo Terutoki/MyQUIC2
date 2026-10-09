@@ -37,13 +37,67 @@ pub async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
 
 async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>> {
     let addrs = tokio::time::timeout(timeout, async {
-        let mut v: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+        let mut v: Vec<SocketAddr> = match upstream_resolver() {
+            // The IP-literal case is handled inside `lookup_ip` directly, and
+            // the system hosts file is consulted before any upstream query
+            // (`ResolveHosts::Auto` is the default), so `localhost` and other
+            // /etc/hosts entries keep resolving.
+            Ok(r) => {
+                let lookup = r
+                    .lookup_ip(host)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("dns lookup failed: {e}"))?;
+                lookup.iter().map(|ip| SocketAddr::new(ip, port)).collect()
+            }
+            // The platform DNS configuration could not be read (see
+            // `upstream_resolver`): degrade to the previous blocking
+            // `getaddrinfo` path instead of losing name resolution entirely.
+            Err(why) => {
+                tracing::debug!("hickory resolver unavailable ({why}); using getaddrinfo");
+                tokio::net::lookup_host((host, port)).await?.collect()
+            }
+        };
         v.sort_by_key(|s| if s.is_ipv4() { 0 } else { 1 });
         Ok::<Vec<SocketAddr>, anyhow::Error>(v)
     })
     .await
     .context("dns lookup timed out")??;
     Ok(addrs)
+}
+
+/// Process-wide upstream resolver, built once from the platform's own DNS
+/// configuration: resolv.conf on Linux/OpenWrt, the System Configuration
+/// dynamic store on macOS. Unlike `getaddrinfo` on the tokio blocking pool,
+/// its lookups are cancellable async futures, so the `timeout` wrapper above
+/// actually stops the work instead of leaving a blocking thread to finish it
+/// after the caller gave up. Its internal response cache is TTL-clamped to
+/// this module's positive/negative TTLs, so a name whose answer is still in
+/// hickory's cache when the caches above expire can never be served an answer
+/// older than the documented windows. `Err` is only the do-not-use-hickory
+/// signal for the fallback above; the reason is logged once, at construction.
+fn upstream_resolver() -> Result<&'static hickory_resolver::TokioResolver, &'static str> {
+    static RESOLVER: std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>> =
+        std::sync::OnceLock::new();
+    RESOLVER
+        .get_or_init(|| {
+            let built = hickory_resolver::TokioResolver::builder_tokio().and_then(|mut b| {
+                let opts = b.options_mut();
+                opts.positive_max_ttl = Some(DNS_CACHE_TTL);
+                opts.negative_max_ttl = Some(DNS_NEG_TTL);
+                b.build()
+            });
+            match built {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    tracing::warn!(
+                        "hickory resolver init failed ({e}); dns lookups fall back to getaddrinfo"
+                    );
+                    Err(e.to_string())
+                }
+            }
+        })
+        .as_ref()
+        .map_err(String::as_str)
 }
 
 /// Result of a synchronous cache lookup.

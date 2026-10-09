@@ -2,13 +2,15 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Server TLS: TLS1.3 only (QUIC mandates it; single version = min handshake RTT).
-/// Cipher: ring default negotiates AES-128-GCM first on AES-NI => fastest path.
+/// Cipher: the aws-lc-rs provider negotiates the same ordering as ring did
+/// (AES-128-GCM first on AES-NI => fastest path); the provider switch moves
+/// the per-packet QUIC AEAD and the handshake crypto onto it.
 pub fn server_tls_config(
     cert: rustls::pki_types::CertificateDer<'static>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
     alpn: &[u8],
 ) -> Result<Arc<rustls::ServerConfig>> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()

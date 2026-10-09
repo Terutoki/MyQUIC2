@@ -6,7 +6,7 @@ pub fn client_tls_config(
     pinned: rustls::pki_types::CertificateDer<'static>,
     alpn: &[u8],
 ) -> Result<Arc<rustls::ClientConfig>> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(pinned)?;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)

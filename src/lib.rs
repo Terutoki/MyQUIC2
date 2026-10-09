@@ -3156,7 +3156,7 @@ mod tests {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let params = rcgen::CertificateParams::new(vec!["test.com".to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut scfg = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()

@@ -39,9 +39,10 @@ use crate::{
     assoc::*, auth::*, dispatcher::*, egress::*, hub::*, pool::*, reporter::*, socks::*, util::*,
 };
 
-// The shipped static / OpenWrt binaries link musl, whose allocator measured
-// well behind glibc on the UDP soak; mimalloc closes part of that gap.
-#[cfg(target_env = "musl")]
+// mimalloc on every target (see Cargo.toml): the shipped static / OpenWrt
+// binaries link musl, whose allocator measured well behind glibc on the UDP
+// soak; on glibc it measured neutral, and one allocator keeps the hot-path
+// allocation profile identical between the dev machine and the router.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
