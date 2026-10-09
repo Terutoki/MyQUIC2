@@ -500,3 +500,17 @@ impl ConnPool {
         self.interactive_ports.contains(&Self::target_port(t))
     }
 }
+
+/// Whether pool slot `i` dials with the coarse **bulk** transport preset
+/// (ACK threshold 8 / 10 ms delay / 2 MB DATAGRAM buffers) instead of the
+/// tuned interactive one (2 / 5 ms / 1 MB).
+///
+/// Exactly the dedicated bulk UDP class connection does. The TCP pool and
+/// the *interactive* UDP class — whose whole point is latency-sensitive
+/// flows — keep the tuned preset, as `build_transport_tuned_class`
+/// documents. With `udp_split` off the two UDP classes share one slot,
+/// which keeps the bulk preset it had before the per-class split (same
+/// index as `udp_slot(Bulk)`).
+pub(crate) fn slot_uses_bulk_preset(pool: &ConnPool, i: usize) -> bool {
+    i == pool.udp_slot(EgressClass::Bulk)
+}

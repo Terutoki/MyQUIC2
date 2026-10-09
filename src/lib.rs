@@ -40,8 +40,9 @@ pub use config::{
     client_conf::ClientConf,
     server_conf::ServerConf,
     tuning::{
-        load_toml, per_connection_memory_bytes, TransportTuning, DEFAULT_QUIC_CONNS,
-        MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_UDP_ASSOCS,
+        load_toml, per_connection_memory_bytes, TransportTuning, DEFAULT_INITIAL_RTT_MS,
+        DEFAULT_QUIC_CONNS, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN, MAX_BIDI_STREAMS_PER_CONN,
+        MAX_POOL_CONNS, MAX_UDP_ASSOCS,
     },
 };
 pub use sync::guards::{
@@ -3409,10 +3410,26 @@ mod tests {
         assert_eq!(t.send_window, 2 * 1024 * 1024);
         assert_eq!(t.ack_threshold, 2);
         assert_eq!(t.max_ack_delay, Duration::from_millis(5));
+        assert_eq!(t.initial_rtt, Duration::from_millis(DEFAULT_INITIAL_RTT_MS));
         assert_eq!(c.conn_count(), 4, "pool default is four connections");
         assert_eq!(DEFAULT_QUIC_CONNS, 4);
         let conf =
             |extra: &str| -> ClientConf { toml::from_str(&format!("{base}{extra}")).unwrap() };
+        assert_eq!(
+            conf("initial_rtt_ms = 140\n").tuning().initial_rtt,
+            Duration::from_millis(140),
+            "the documented 140 ms seed must reach the transport builder"
+        );
+        assert_eq!(
+            conf("initial_rtt_ms = 0\n").tuning().initial_rtt,
+            Duration::from_millis(INITIAL_RTT_MS_MIN),
+            "a zero seed must clamp up, not zero the estimator"
+        );
+        assert_eq!(
+            conf("initial_rtt_ms = 999_999\n").tuning().initial_rtt,
+            Duration::from_millis(INITIAL_RTT_MS_MAX),
+            "a typo must not postpone first-flight loss recovery absurdly"
+        );
         assert_eq!(conf("quic_conns = 1\n").conn_count(), 1);
         assert_eq!(conf("quic_conns = 3\n").conn_count(), 3);
         assert_eq!(conf("quic_conns = 0\n").conn_count(), 1, "clamped up");

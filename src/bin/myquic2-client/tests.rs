@@ -5,7 +5,7 @@
 //! exist to catch a framing regression in any future rewrite.
 use super::*;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Serve `bytes` on a loopback socket and run the real reader against it,
 /// exactly as `handle_socks` drives it.
@@ -2816,4 +2816,123 @@ fn assoc_recv_buf_pool_is_bounded_and_exactly_sized() {
     let b = assoc_recv_buf();
     assert_eq!(b.len(), ASSOC_RECV_BUF_LEN);
     assoc_recycle_buf(b);
+}
+
+/// Regression for the association startup stall: after the SOCKS reply the
+/// relay loop must be serving the app's first datagram immediately.
+///
+/// The old code slept `jitter_ms()` (0..=199 ms) *after* answering SOCKS and
+/// *before* entering the relay loop, so the app's first datagram — typically
+/// the latency-critical one (DNS query, STUN binding, game handshake) — sat
+/// unread in the relay socket while the app believed the proxy was ready.
+///
+/// The paused clock plus a spinner task make the property deterministic: the
+/// spinner keeps the scheduler non-idle, so every park is a zero-timeout
+/// `park_yield` (which still polls the IO driver) and tokio's test-util
+/// auto-advance never fires. A pre-loop sleep therefore parks the association
+/// on an unfireable timer and the datagram stays queued — exactly what the
+/// final probe detects.
+#[tokio::test(start_paused = true)]
+async fn udp_associate_serves_its_first_datagram_without_a_startup_sleep() {
+    let spinner = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = l.local_addr().unwrap();
+    let mut control = tokio::net::TcpStream::connect(control_addr).await.unwrap();
+    let (control_server, _) = l.accept().await.unwrap();
+
+    // No QUIC connection is ever published in this harness, so the datagram
+    // takes the synchronous counted NO_EGRESS path once it is read.
+    let pool = ConnPool::new(1, vec![], true, true);
+    let hub = Arc::new(UdpHub::new());
+    let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
+    let task = tokio::spawn(handle_udp_associate(
+        control_server,
+        pool,
+        hub.clone(),
+        egress,
+    ));
+
+    // SOCKS5 reply: VER REP RSV ATYP=IPv4 addr port.
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply[..4], &[0x05, 0x00, 0x00, 0x01]);
+    let relay = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    );
+
+    // The entry is published before the reply; capture the relay socket so the
+    // test can prove the datagram was consumed.
+    let entry = hub
+        .subs
+        .iter()
+        .find_map(|shard| shard.load().values().next().cloned())
+        .expect("the association must publish its entry before the SOCKS reply");
+
+    // One well-formed SOCKS5 UDP frame: RSV/FRAG + IPv4 target + payload.
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut frame = vec![0, 0, 0, 0x01, 127, 0, 0, 1, 0, 53];
+    frame.extend_from_slice(b"q");
+    app.send_to(&frame, relay).await.unwrap();
+
+    // Spin yields: the scheduler polls the IO driver every `event_interval`
+    // task polls (`park_yield`), so readiness is delivered without parking
+    // and — under paused time — without any clock advance.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+
+    // Consumed => the relay queue is empty. A pre-loop sleep leaves it queued:
+    // the paused clock never reaches the sleep deadline.
+    let mut b = [0u8; 64];
+    assert!(
+        entry.relay.try_recv_from(&mut b).is_err(),
+        "the association must consume the first datagram, not sleep before the relay loop"
+    );
+    task.abort();
+    spinner.abort();
+}
+
+/// The per-slot transport preset split: only the dedicated bulk UDP class
+/// connection may dial with the coarse bulk preset. TCP slots and the
+/// interactive UDP class keep the tuned low-latency preset — the old wiring
+/// gave *both* UDP classes the bulk preset through the UDP endpoint default,
+/// silently degrading the class whose whole point is latency-sensitive flows.
+#[test]
+fn only_the_dedicated_bulk_udp_slot_uses_the_bulk_preset() {
+    let split = ConnPool::new(4, vec![], true, true);
+    for i in 0..split.slots_total() {
+        assert_eq!(
+            slot_uses_bulk_preset(&split, i),
+            i == split.udp_slot(EgressClass::Bulk),
+            "slot {i} preset wrong with udp_split on"
+        );
+    }
+    assert!(
+        !slot_uses_bulk_preset(&split, split.udp_slot(EgressClass::Interactive)),
+        "the interactive UDP class must keep the tuned 2/5 ms preset"
+    );
+    assert!(slot_uses_bulk_preset(
+        &split,
+        split.udp_slot(EgressClass::Bulk)
+    ));
+
+    // `udp_split` off: the classes share one slot, which keeps the preset it
+    // had before the per-class split, and no TCP slot ever goes bulk.
+    let shared = ConnPool::new(4, vec![], true, false);
+    assert_eq!(shared.tcp_slots + 1, shared.slots_total());
+    assert!(slot_uses_bulk_preset(
+        &shared,
+        shared.udp_slot(EgressClass::Interactive)
+    ));
+    for i in 0..shared.tcp_slots() {
+        assert!(
+            !slot_uses_bulk_preset(&shared, i),
+            "a TCP slot must never dial with the bulk preset"
+        );
+    }
 }

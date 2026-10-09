@@ -20,6 +20,10 @@ auth_token = ""
 # send_window_mb = 2
 # ack_threshold = 2
 # max_ack_delay_ms = 5
+# RTT seed in ms used for the first PTO / initial pacing before the first
+# measured sample (default 190). Set it to the link RTT, e.g. 140 on a 140 ms
+# link, to shorten first-flight loss recovery (~575 -> ~435 ms first PTO).
+# initial_rtt_ms = 140
 # Connection isolation (optional; omit = 4 TCP connections, the code default).
 # quic_conns=4 spreads bulk TCP round-robin across three bulk cwnds while
 # interactive_ports pin to the first. UDP is never one of those slots: it gets

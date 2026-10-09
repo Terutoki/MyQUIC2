@@ -32,6 +32,12 @@ pub struct ClientConf {
     pub ack_threshold: Option<u32>,
     #[serde(default)]
     pub max_ack_delay_ms: Option<u64>,
+    /// RTT seed in ms for loss detection/pacing until the first measured
+    /// sample; default 190. Set it to the link's real RTT (e.g. 140 on a
+    /// 140 ms link) to shorten the first PTO from ~575 ms to ~435 ms; only
+    /// first-flight loss recovery is affected. Clamped 1..=3000.
+    #[serde(default)]
+    pub initial_rtt_ms: Option<u64>,
     // ---- Connection isolation ----
     // TCP pool size: bulk TCP spreads round-robin across the bulk slots while
     // ports in `interactive_ports` pin to slot 0, so a latency probe never

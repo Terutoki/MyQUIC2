@@ -104,14 +104,14 @@ async fn main() -> Result<()> {
         rt.wrap_udp_socket(std_sock)?,
         rt.clone(),
     )?;
-    ep.set_default_client_config(ccfg_interactive);
+    ep.set_default_client_config(ccfg_interactive.clone());
     let mut ep_udp = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
         rt.wrap_udp_socket(udp_socket_dual("[::]:0")?)?,
         rt,
     )?;
-    ep_udp.set_default_client_config(ccfg_bulk);
+    ep_udp.set_default_client_config(ccfg_bulk.clone());
 
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();
@@ -162,8 +162,20 @@ async fn main() -> Result<()> {
         } else {
             ep_udp.clone()
         };
+        // Per-slot transport preset (see `slot_uses_bulk_preset`): only the
+        // dedicated bulk UDP class connection gets the coarse bulk preset;
+        // the TCP pool and the interactive UDP class keep the tuned 2/5 ms
+        // one. The endpoint default cannot express this for the two UDP
+        // classes, which share `ep_udp` — the old code handed both the bulk
+        // preset via that default, silently degrading the interactive class.
+        let cfg = if slot_uses_bulk_preset(&pool, i) {
+            ccfg_bulk.clone()
+        } else {
+            ccfg_interactive.clone()
+        };
         spawn_conn_loop(
             use_ep,
+            cfg,
             server_str.clone(),
             c.server_name.clone(),
             c.auth_token.clone(),

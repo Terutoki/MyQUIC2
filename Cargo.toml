@@ -54,6 +54,12 @@ arc-swap = "1"
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1"
 
+# `test-util` backs the paused-clock regression test in the client bin
+# (`udp_associate_serves_its_first_datagram_without_a_startup_sleep`); it is
+# dev-only so release builds keep the minimal tokio feature set.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = 3
 lto = true

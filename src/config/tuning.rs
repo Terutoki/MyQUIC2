@@ -82,6 +82,17 @@ pub const MAX_BIDI_STREAMS_PER_CONN: u32 = 8192;
 /// budget, not this number.
 pub const MAX_UDP_ASSOCS: usize = 4032;
 
+/// Default RTT seed in ms for the loss-detection estimator before the first
+/// measured sample (see `TransportTuning::initial_rtt`). 190 is the tuned
+/// value for the ~140 ms WAN link this build targets: quinn's 333 ms default
+/// makes the first PTO and the initial pacing rate far too pessimistic there.
+pub const DEFAULT_INITIAL_RTT_MS: u64 = 190;
+/// Lower clamp for `initial_rtt_ms`.
+pub const INITIAL_RTT_MS_MIN: u64 = 1;
+/// Upper clamp for `initial_rtt_ms`; a seed above a few seconds can only be a
+/// typo and would postpone first-flight loss recovery absurdly.
+pub const INITIAL_RTT_MS_MAX: u64 = 3_000;
+
 /// Runtime transport tuning resolved from optional TOML fields.
 /// Defaults are the low-latency preset for ~140 ms links (2/4/2 MB windows,
 /// ACK every 2nd, 5 ms delay): ~114 Mb/s @140 ms with minimal loaded queue.
@@ -94,6 +105,11 @@ pub struct TransportTuning {
     pub send_window: u64,
     pub ack_threshold: u32,
     pub max_ack_delay: Duration,
+    /// Seed for quinn's RTT estimator (and thus the first PTO) until the first
+    /// measured sample lands. Only tail-relevant: set it to the link's real
+    /// RTT (e.g. 140 on a 140 ms link) to shorten first-flight loss recovery;
+    /// steady state re-measures and ignores the seed.
+    pub initial_rtt: Duration,
 }
 
 impl Default for TransportTuning {
@@ -104,8 +120,16 @@ impl Default for TransportTuning {
             send_window: 2 * 1024 * 1024,
             ack_threshold: 2,
             max_ack_delay: Duration::from_millis(5),
+            initial_rtt: Duration::from_millis(DEFAULT_INITIAL_RTT_MS),
         }
     }
+}
+
+fn initial_rtt_from_ms(v: Option<u64>) -> Duration {
+    Duration::from_millis(
+        v.unwrap_or(DEFAULT_INITIAL_RTT_MS)
+            .clamp(INITIAL_RTT_MS_MIN, INITIAL_RTT_MS_MAX),
+    )
 }
 
 fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
@@ -144,6 +168,7 @@ impl ServerConf {
             send_window: clamp_window_mb(self.send_window_mb, 2),
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
+            initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
         }
     }
 }
@@ -156,6 +181,7 @@ impl ClientConf {
             send_window: clamp_window_mb(self.send_window_mb, 2),
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
+            initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
         }
     }
 }

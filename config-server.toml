@@ -29,6 +29,9 @@ auth_token = ""
 # send_window_mb = 2
 # ack_threshold = 2
 # max_ack_delay_ms = 5
+# RTT seed in ms for the first PTO / initial pacing (default 190). Set it to
+# the link RTT, e.g. 140 on a 140 ms link; steady state re-measures.
+# initial_rtt_ms = 140
 # ALPN (optional; omit = h3 masquerade). Must match the client;
 # alpn="myquic2/2" restores the versioned identifier + skew fail-closed guard.
 # alpn = "h3"

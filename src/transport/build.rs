@@ -125,8 +125,13 @@ pub fn build_transport_tuned_class(
     t.ack_frequency_config(Some(ack_freq));
     // Seed the RTT estimator for the link this build targets. quinn's 333ms
     // default is a spec-derived placeholder that makes the first PTO and
-    // BBR's initial bandwidth estimate far too pessimistic at 140ms.
-    t.initial_rtt(Duration::from_millis(190));
+    // BBR's initial bandwidth estimate far too pessimistic at 140ms. The
+    // seed is `DEFAULT_INITIAL_RTT_MS` (190) unless `initial_rtt_ms`
+    // overrides it; operators on a known link set it to the measured RTT
+    // (140 shortens the first PTO from ~575ms to ~435ms). It only lives
+    // until the first RTT sample, so it is a first-flight tail knob, never a
+    // steady-state one.
+    t.initial_rtt(tuning.initial_rtt);
     // Raise the PMTU search ceiling from quinn's 1452 to 1472 (the endpoint's
     // `max_udp_payload_size` default, so this is the hard limit anyway): 20
     // more bytes per packet is ~1.4% fewer packets for the same payload, which

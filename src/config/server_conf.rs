@@ -65,6 +65,12 @@ pub struct ServerConf {
     pub ack_threshold: Option<u32>,
     #[serde(default)]
     pub max_ack_delay_ms: Option<u64>,
+    /// RTT seed in ms for loss detection/pacing until the first measured
+    /// sample; default 190. Set it to the link's real RTT (e.g. 140 on a
+    /// 140 ms link) to shorten the first PTO; steady state is unaffected.
+    /// Clamped 1..=3000.
+    #[serde(default)]
+    pub initial_rtt_ms: Option<u64>,
     /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]

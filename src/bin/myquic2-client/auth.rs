@@ -3,6 +3,7 @@ use super::*;
 
 pub(crate) fn spawn_conn_loop(
     ep: quinn::Endpoint,
+    cfg: quinn::ClientConfig,
     server_str: String,
     sname: String,
     auth: String,
@@ -21,7 +22,7 @@ pub(crate) fn spawn_conn_loop(
                     continue;
                 }
             };
-            match dial_once(&ep, server, &sname, &auth).await {
+            match dial_once(&ep, &cfg, server, &sname, &auth).await {
                 Ok(conn) => {
                     info!("QUIC connected to {server}");
                     slot.publish(&conn);
@@ -172,8 +173,15 @@ pub(crate) async fn ensure_dialed_alive(conn: &quinn::Connection) -> bool {
     conn.close_reason().is_none()
 }
 
+/// Dial one connection with the slot's own transport preset.
+///
+/// `cfg` is per-slot, not the endpoint default: the two UDP egress classes
+/// need different ACK presets on the same endpoint (the bulk class trades
+/// feedback precision for reverse-path CPU; the interactive class must keep
+/// the tuned low-latency one), which `Endpoint::connect` cannot express.
 pub(crate) async fn dial_once(
     ep: &quinn::Endpoint,
+    cfg: &quinn::ClientConfig,
     server: SocketAddr,
     name: &str,
     auth_token: &str,
@@ -186,7 +194,7 @@ pub(crate) async fn dial_once(
     // and widening the window in which the pool still advertises the previous,
     // dead connection. Every stage below now shares this instant.
     let deadline = t0 + DIAL_ATTEMPT_TIMEOUT;
-    let connecting = ep.connect(server, name)?;
+    let connecting = ep.connect_with(cfg.clone(), server, name)?;
     // 0-RTT: the token is deliberately NOT sent in early data. A bearer
     // secret in replayable early data lets anyone who observes one handshake
     // open new authenticated connections by replaying it inside the ticket

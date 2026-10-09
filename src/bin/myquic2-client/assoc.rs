@@ -167,14 +167,22 @@ pub(crate) async fn udp_associate_inner(
     let mut frag = DgramFragmenter::new();
     // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
     // not reset the idle timer and keep an otherwise dead association alive.
-    let mut idle_tick = tokio::time::interval(Duration::from_secs(ASSOC_IDLE_TICK_SECS));
+    //
+    // The jitter phase is baked into the interval's **first deadline**, never
+    // slept off before this loop. The sleep used to run after the SOCKS reply
+    // had already told the app the relay was ready, so the app's first
+    // datagram — a DNS query, a STUN binding, a game handshake: the most
+    // latency-sensitive one — sat unread in the relay socket while the
+    // association was not even polling. `jitter_ms()` is bounded to 0..=199,
+    // so that was up to ~200 ms of pure added latency per association
+    // (1.4x a 140 ms RTT). `interval_at` keeps the same desynchronized tick
+    // schedule and starts serving the relay socket immediately.
+    let phase_ms = jitter_ms(); // 0..=199; desynchronizes the 30 s tick phase
+    let mut idle_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(phase_ms),
+        Duration::from_secs(ASSOC_IDLE_TICK_SECS),
+    );
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    {
-        let phase = jitter_ms() % (ASSOC_IDLE_TICK_SECS * 1000).max(1);
-        if phase > 0 {
-            tokio::time::sleep(Duration::from_millis(phase)).await;
-        }
-    }
     // Local copy of the last published app address: the value almost never
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
