@@ -95,12 +95,13 @@ pub use dns::{
     dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_coalesce_drop, dns_coalesce_take,
     dns_coalesce_take_now, dns_coalesce_try_push, dns_coalesce_try_push_to, dns_inflight_seed,
     dns_inflight_status, dns_inflight_unseed, dns_is_inflight, dns_neg_cache_seed,
-    dns_slow_path_limiter, is_dns_contended, is_global_ip, lookup_cached_all_fast,
+    dns_slow_path_limiter, ip_preference, is_dns_contended, is_global_ip, lookup_cached_all_fast,
     lookup_cached_all_fast_with_ttl, lookup_cached_fast, lookup_cached_fast_with_ttl,
     lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
-    resolve_all_cached_with_contention_retry, resolve_server_addr, resolve_server_side, unmap,
-    CachedLookup, CoalesceOutcome, DnsCoalesceGuard, DnsCoalesceQueue, DnsCoalesced, DnsContended,
-    DnsInflight, DNS_CACHE_TTL_MS, DNS_COALESCE_CAP, DNS_LOOKUP_TIMEOUT,
+    resolve_all_cached_with_contention_retry, resolve_server_addr, resolve_server_side,
+    set_ip_preference, unmap, CachedLookup, CoalesceOutcome, DnsCoalesceGuard, DnsCoalesceQueue,
+    DnsCoalesced, DnsContended, DnsInflight, IpPreference, DNS_CACHE_TTL_MS, DNS_COALESCE_CAP,
+    DNS_LOOKUP_TIMEOUT,
 };
 pub use stats::drops::dgram_drops;
 pub use stats::udp_stats::{self, UdpSnapshot};
@@ -3344,6 +3345,32 @@ mod tests {
         let err = toml::from_str::<ServerConf>(&format!("{server}allow_priv = true\n"))
             .expect_err("a typo must not silently flip the SSRF policy");
         assert!(err.to_string().contains("allow_priv"), "{err}");
+    }
+
+    /// `dns_ip_preference` accepts exactly "ipv6"/"ipv4", defaults to the
+    /// RFC 6724-style IPv6-first order on both sides, and a bad value fails
+    /// the parse instead of silently keeping a preference the operator did
+    /// not choose.
+    #[test]
+    fn dns_ip_preference_parses_and_defaults() {
+        let client = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
+            server_name = 'test.com'\nserver_cert_file = 'x'\n";
+        let c: ClientConf = toml::from_str(client).unwrap();
+        assert_eq!(c.dns_ip_preference, IpPreference::Ipv6);
+        let c: ClientConf =
+            toml::from_str(&format!("{client}dns_ip_preference = 'ipv4'\n")).unwrap();
+        assert_eq!(c.dns_ip_preference, IpPreference::Ipv4);
+
+        let server = "listen = '[::]:8443'\ncert_file = 'c'\nkey_file = 'k'\nserver_name = 's'\n";
+        let s: ServerConf = toml::from_str(server).unwrap();
+        assert_eq!(s.dns_ip_preference, IpPreference::Ipv6);
+        let s: ServerConf =
+            toml::from_str(&format!("{server}dns_ip_preference = 'ipv4'\n")).unwrap();
+        assert_eq!(s.dns_ip_preference, IpPreference::Ipv4);
+
+        let err = toml::from_str::<ClientConf>(&format!("{client}dns_ip_preference = 'v4'\n"))
+            .expect_err("an unknown variant must not silently keep a default");
+        assert!(err.to_string().contains("v4"), "{err}");
     }
 
     /// The keepalive clamp bounds the derived detection window: idle is `3x`

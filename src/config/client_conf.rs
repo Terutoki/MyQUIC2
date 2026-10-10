@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::tuning::{d_5, d_bbr, d_keepalive, d_true, DEFAULT_QUIC_CONNS, MAX_POOL_CONNS};
+use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +15,11 @@ pub struct ClientConf {
     pub congestion: String,
     #[serde(default = "d_true")]
     pub gso: bool,
+    /// Address-family preference for DNS results: "ipv6" (default) or
+    /// "ipv4". On the client this orders the `server_addr` lookup (which
+    /// family the tunnel dials first) and the defensive domain-reply paths.
+    #[serde(default)]
+    pub dns_ip_preference: IpPreference,
     #[serde(default = "d_keepalive")]
     pub keep_alive_secs: u64,
     #[serde(default = "d_5")]

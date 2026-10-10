@@ -88,19 +88,21 @@ pub(crate) async fn handle_tcp_stream(
             };
             dns_n = match resolve_all_cached_with_contention_retry(h, *p).await {
                 Ok(v) => {
-                    // `resolve_all_cached` sorts IPv4 first, so a flat
-                    // prefix cut would starve IPv6 whenever upstream
-                    // returns more than 8 v4 records. Alternate
-                    // families instead, keeping v4 preference while
-                    // guaranteeing v6 gets tried.
+                    // `resolve_all_cached` sorts by the configured family
+                    // preference, so a flat prefix cut would starve the
+                    // non-preferred family whenever upstream returns more
+                    // than 8 preferred-family records. Alternate families
+                    // instead, keeping the preference while guaranteeing the
+                    // other family gets tried.
                     let mut n = 0;
                     let mut v4 = v.iter().filter(|a| a.is_ipv4());
                     let mut v6 = v.iter().filter(|a| !a.is_ipv4());
-                    // Alternate families so v6 is never starved, but
-                    // keep filling from whichever family still has
-                    // records until the 8-slot buffer is full (a
-                    // v4-only answer must still yield up to 8).
-                    let mut want_v4 = true;
+                    // Start on the preferred family and alternate so the
+                    // other family is never starved, but keep filling from
+                    // whichever family still has records until the 8-slot
+                    // buffer is full (a single-family answer must still
+                    // yield up to 8).
+                    let mut want_v4 = ip_preference() == IpPreference::Ipv4;
                     while n < dns_cand.len() {
                         let next = if want_v4 {
                             v4.next().or_else(|| v6.next())

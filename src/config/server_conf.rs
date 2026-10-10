@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::tuning::{d_bbr, d_false, d_keepalive, d_true};
+use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
 
 // ---------------- Config files ----------------
@@ -21,6 +22,11 @@ pub struct ServerConf {
     pub congestion: String, // bbr | cubic
     #[serde(default = "d_true")]
     pub gso: bool, // informational: quinn-udp auto-enables; false = log warn only
+    /// Address-family preference for resolved targets: "ipv6" (default) or
+    /// "ipv4". Orders every resolved address list; the first entry leads UDP
+    /// sends and TCP's happy-eyeballs dial. IP-literal targets are unaffected.
+    #[serde(default)]
+    pub dns_ip_preference: IpPreference,
     #[serde(default = "d_keepalive")]
     pub keep_alive_secs: u64,
     #[serde(default = "d_false")]

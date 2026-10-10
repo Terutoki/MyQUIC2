@@ -90,6 +90,7 @@ key_file = "server-key.pem"
 server_name = "test.com"       # certificate SAN + expected SNI
 congestion = "bbr"             # bbr | cubic
 keep_alive_secs = 5            # 1–300; idle = max(3x, 15s)
+# dns_ip_preference = "ipv6"   # ipv6 (default) | ipv4: family tried first for resolved targets
 allow_private = false          # keep false on public exit nodes
 auth_token = ""                # shared secret; must match the client (empty = no auth; firewall otherwise)
 
@@ -112,6 +113,7 @@ server_cert_file = "server-cert.pem"  # pinned server certificate
 congestion = "bbr"
 keep_alive_secs = 5
 reconnect_timeout_secs = 5
+# dns_ip_preference = "ipv6"           # ipv6 (default) | ipv4: family tried first (incl. server_addr)
 auth_token = ""                       # must match the server
 quic_conns = 4                        # TCP pool size, 1–8 (UDP has its own connections)
 
@@ -127,6 +129,7 @@ quic_conns = 4                        # TCP pool size, 1–8 (UDP has its own co
 | 🔐 `auth_token` | Strongly recommended; an empty token makes the server an open relay (firewall isolation only) |
 | 🧵 `quic_conns` | TCP pool size; interactive ports (DNS/NTP/STUN) pin to slot 0; UDP gets 2 class-split connections |
 | 🛡️ `allow_private` | Whether private/loopback targets may be dialed (default `false`) |
+| 🌐 `dns_ip_preference` | Family tried first for resolved names: `"ipv6"` (default, RFC 6724-style) or `"ipv4"`; applies to exit-side targets and the client's `server_addr` |
 
 ---
 

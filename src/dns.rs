@@ -21,11 +21,11 @@ pub(crate) use memo::{
 };
 pub use policy::{is_global_ip, map_for_dual, unmap};
 pub use resolve::{
-    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed, is_dns_contended,
-    lookup_cached_all_fast, lookup_cached_all_fast_with_ttl, lookup_cached_fast,
+    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed, ip_preference,
+    is_dns_contended, lookup_cached_all_fast, lookup_cached_all_fast_with_ttl, lookup_cached_fast,
     lookup_cached_fast_with_ttl, lookup_cached_sync, resolve_all, resolve_all_cached,
     resolve_all_cached_with_contention_retry, resolve_server_addr, resolve_server_side,
-    CachedLookup, DnsContended,
+    set_ip_preference, CachedLookup, DnsContended, IpPreference,
 };
 pub(crate) use resolve::{
     positive_entry_state, record_negative, PositiveState, DNS_CACHE_MAX, DNS_CACHE_MAX_SHARD,

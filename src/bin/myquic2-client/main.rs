@@ -74,6 +74,8 @@ async fn main() -> Result<()> {
             c.congestion
         );
     }
+    set_ip_preference(c.dns_ip_preference);
+    info!("dns address preference: {:?}", c.dns_ip_preference);
     info!(
         "udp batch backend: {} (sendmmsg={}, recvmmsg={}); GSO/GRO are auto-probed by quinn-udp",
         batch_backend(),

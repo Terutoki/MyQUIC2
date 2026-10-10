@@ -7,6 +7,8 @@ congestion = "bbr"
 gso = true
 keep_alive_secs = 5
 allow_private = true
+# Address family tried first for resolved targets: "ipv6" (default) or "ipv4".
+dns_ip_preference = "ipv6"
 # Shared secret clients must present (set on both sides).
 # Leave empty to disable auth (then rely on firewall/network isolation).
 auth_token = ""

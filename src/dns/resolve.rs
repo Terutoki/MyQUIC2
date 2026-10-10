@@ -6,6 +6,7 @@
 //! resolve_server_side / resolve_all / resolve_all_timeout.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,9 +20,60 @@ use super::key::{dns_key, dns_key_owned, DnsCacheKey, DnsCacheVal, DNS_KEY_BUF, 
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
 use crate::{coarse_millis, dgram_drops, lock_write, try_lock_mutex, try_lock_read};
 
-/// Server-side DNS with IPv4 preference (many targets are v4-only).
-/// Uses a short-lived cache so per-packet domain lookups cannot stall the
-/// datagram fast path or amplify upstream DNS.
+/// Address-family preference for DNS resolution results, from the
+/// `dns_ip_preference` config key (`"ipv6"` — the default — or `"ipv4"`).
+///
+/// Mirrors RFC 6724's model of a configurable precedence policy: IPv6 sorts
+/// first by default, switchable to IPv4-first for exits or paths whose
+/// targets/connectivity are mostly v4-only. The preference orders the address
+/// list every consumer sees — UDP datagram sends and TCP's happy-eyeballs
+/// take the first entry first, and the client's `server_addr` dial resolves
+/// through the same list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpPreference {
+    /// IPv6 addresses sort first (default; RFC 6724-style precedence).
+    #[default]
+    Ipv6,
+    /// IPv4 addresses sort first.
+    Ipv4,
+}
+
+impl IpPreference {
+    /// `sort_by_key` key: the preferred family sorts first (`0`). The sort is
+    /// stable, so the resolver's own order within a family is preserved.
+    #[inline]
+    pub(crate) fn sort_key(self, addr: SocketAddr) -> u8 {
+        match self {
+            IpPreference::Ipv6 => u8::from(addr.is_ipv4()),
+            IpPreference::Ipv4 => u8::from(!addr.is_ipv4()),
+        }
+    }
+}
+
+/// Process-wide preference, set once at startup by the binary from its config
+/// (`dns_ip_preference`), read on every resolution.
+static IP_PREFERENCE: AtomicU8 = AtomicU8::new(IpPreference::Ipv6 as u8);
+
+/// Set the process-wide [`IpPreference`] (call once at startup).
+pub fn set_ip_preference(pref: IpPreference) {
+    IP_PREFERENCE.store(pref as u8, Ordering::Relaxed);
+}
+
+/// Current process-wide [`IpPreference`].
+#[must_use]
+pub fn ip_preference() -> IpPreference {
+    if IP_PREFERENCE.load(Ordering::Relaxed) == IpPreference::Ipv4 as u8 {
+        IpPreference::Ipv4
+    } else {
+        IpPreference::Ipv6
+    }
+}
+
+/// Server-side DNS with the configured address-family preference (default
+/// IPv6 first; `dns_ip_preference = "ipv4"` restores the v4-first order for
+/// v4-heavy exits). Uses a short-lived cache so per-packet domain lookups
+/// cannot stall the datagram fast path or amplify upstream DNS.
 pub async fn resolve_server_side(host: &str, port: u16) -> Result<SocketAddr> {
     resolve_all_cached(host, port)
         .await?
@@ -30,7 +82,8 @@ pub async fn resolve_server_side(host: &str, port: u16) -> Result<SocketAddr> {
         .context("dns empty")
 }
 
-/// All resolved addresses, IPv4 first. Caller tries each until one dials (dual-stack fallback).
+/// All resolved addresses, the configured preferred family first. Caller
+/// tries each until one dials (dual-stack fallback).
 pub async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await
 }
@@ -57,7 +110,10 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
                 tokio::net::lookup_host((host, port)).await?.collect()
             }
         };
-        v.sort_by_key(|s| if s.is_ipv4() { 0 } else { 1 });
+        // Preferred family first; the stable sort keeps the resolver's order
+        // within each family (see [`IpPreference`]).
+        let pref = ip_preference();
+        v.sort_by_key(|s| pref.sort_key(*s));
         Ok::<Vec<SocketAddr>, anyhow::Error>(v)
     })
     .await
@@ -670,4 +726,32 @@ pub async fn resolve_server_addr(s: &str) -> Result<SocketAddr> {
     let port: u16 = port.parse().context("bad server port")?;
     let v = resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await?;
     v.into_iter().next().context("dns empty")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn preference_defaults_to_ipv6_first() {
+        assert_eq!(IpPreference::default(), IpPreference::Ipv6);
+        assert_eq!(ip_preference(), IpPreference::Ipv6);
+    }
+
+    #[test]
+    fn sort_key_orders_the_preferred_family_first() {
+        let v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443));
+        let v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0));
+
+        assert!(IpPreference::Ipv6.sort_key(v6) < IpPreference::Ipv6.sort_key(v4));
+        assert!(IpPreference::Ipv4.sort_key(v4) < IpPreference::Ipv4.sort_key(v6));
+
+        let mut addrs = [v4, v6];
+        addrs.sort_by_key(|s| IpPreference::Ipv6.sort_key(*s));
+        assert!(!addrs[0].is_ipv4(), "v6-first must put the v6 entry first");
+        let mut addrs = [v6, v4];
+        addrs.sort_by_key(|s| IpPreference::Ipv4.sort_key(*s));
+        assert!(addrs[0].is_ipv4(), "v4-first must put the v4 entry first");
+    }
 }
