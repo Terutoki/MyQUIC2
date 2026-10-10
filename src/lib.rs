@@ -64,6 +64,7 @@ pub use mqp::datagram::{
     encode_datagram_ref_with_limit, encode_datagram_with_limit, DGRAM_DEFAULT_LIMIT,
     DGRAM_PREFIX_LEN, MQP_DGRAM_TYPE,
 };
+pub use mqp::error::MqpError;
 pub use mqp::fragment::{
     decode_fragment, dgram_sess, encode_fragment, fragment_chunk_len, FragmentRef,
     FRAG_ID_SAFE_WINDOW_MS, FRAG_MAX_HELD_BYTES, FRAG_MAX_PARTIALS, FRAG_PREFIX_LEN,

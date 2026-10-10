@@ -1019,7 +1019,7 @@ async fn sweep_local_reaps_all_expired_in_one_call() {
     use std::sync::atomic::Ordering;
 
     let now: u64 = 3_000_000;
-    let mut m: HashMap<u32, SessEntry> = HashMap::new();
+    let mut m: SessMap = SessMap::default();
     for k in 0..70u32 {
         m.insert(k, capped_session(1));
         m.get(&k).unwrap().last.store(0, Ordering::Relaxed);
@@ -1051,7 +1051,7 @@ async fn sweep_local_reaps_all_expired_in_one_call() {
 async fn sweep_local_rechecks_idle_before_removing() {
     use std::sync::atomic::Ordering;
 
-    let mut m: HashMap<u32, SessEntry> = HashMap::new();
+    let mut m: SessMap = SessMap::default();
     m.insert(1, capped_session(1));
     let last = m.get(&1).unwrap().last.clone();
     // A sweep that starts well past the session's idle deadline.
@@ -1127,7 +1127,7 @@ async fn touch_stores_mono_millis_not_the_coarse_gate() {
     // Synthetic stamps: mono is process uptime, so a fast test process
     // can never be 180 s old and no wall-clock stamp reads expired.
     let now: u64 = 1_000_000;
-    let mut m: HashMap<u32, SessEntry> = HashMap::new();
+    let mut m: SessMap = SessMap::default();
     m.insert(1, capped_session(1));
     m.get(&1)
         .unwrap()
@@ -1556,7 +1556,7 @@ async fn admission_after_header_still_fails_fast() {
 /// an eviction here.
 #[tokio::test]
 async fn a_live_over_share_shard_loses_nothing_to_the_sweep() {
-    let mut m: HashMap<u32, SessEntry> = HashMap::new();
+    let mut m: SessMap = SessMap::default();
     for k in 0..512u32 {
         m.insert(k, capped_session(5));
     }

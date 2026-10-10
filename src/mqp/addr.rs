@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use super::error::MqpError;
 use std::net::{IpAddr, SocketAddr};
 
 // ---------------- Address codec (MQP-2) ----------------
@@ -25,11 +25,11 @@ impl TargetAddr {
         }
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), MqpError> {
         self.as_ref().encode(out)
     }
 
-    pub fn decode(b: &[u8]) -> Result<(Self, usize)> {
+    pub fn decode(b: &[u8]) -> Result<(Self, usize), MqpError> {
         let (a, n) = TargetAddrRef::decode(b)?;
         Ok((a.into_owned(), n))
     }
@@ -106,7 +106,7 @@ impl<'a> AddrHeader<'a> {
     }
 
     /// Append the header to `out`.
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), MqpError> {
         self.addr.encode(out)
     }
 }
@@ -119,11 +119,11 @@ impl<'a> TargetAddrRef<'a> {
         }
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), MqpError> {
         match *self {
             TargetAddrRef::Ip(SocketAddr::V4(a)) => {
                 if a.ip().is_unspecified() {
-                    anyhow::bail!("refuse unspecified v4");
+                    return Err(MqpError::Refused("refuse unspecified v4"));
                 }
                 out.push(0x01);
                 out.extend_from_slice(&a.ip().octets());
@@ -131,10 +131,12 @@ impl<'a> TargetAddrRef<'a> {
             }
             TargetAddrRef::Ip(SocketAddr::V6(a)) => {
                 if a.ip().is_unspecified() {
-                    anyhow::bail!("refuse unspecified v6");
+                    return Err(MqpError::Refused("refuse unspecified v6"));
                 }
                 if a.scope_id() != 0 {
-                    anyhow::bail!("v6 scope_id dropped on wire, refuse scoped addr");
+                    return Err(MqpError::Refused(
+                        "v6 scope_id dropped on wire, refuse scoped addr",
+                    ));
                 }
                 out.push(0x04);
                 out.extend_from_slice(&a.ip().octets());
@@ -143,10 +145,10 @@ impl<'a> TargetAddrRef<'a> {
             TargetAddrRef::Domain(d, p) => {
                 let bytes = d.as_bytes();
                 if bytes.is_empty() {
-                    anyhow::bail!("empty domain");
+                    return Err(MqpError::Refused("empty domain"));
                 }
                 if bytes.len() > 255 {
-                    anyhow::bail!("domain too long");
+                    return Err(MqpError::Refused("domain too long"));
                 }
                 out.push(0x03);
                 out.push(bytes.len() as u8);
@@ -160,30 +162,32 @@ impl<'a> TargetAddrRef<'a> {
     /// Validate and measure this address once, so a hot-path encoder can
     /// `with_capacity` the exact size (no growth reallocation) and skip the
     /// second validation pass that a separate `encode` call would repeat.
-    pub fn header(&self) -> Result<AddrHeader<'a>> {
+    pub fn header(&self) -> Result<AddrHeader<'a>, MqpError> {
         let len = match *self {
             TargetAddrRef::Ip(SocketAddr::V4(a)) => {
                 if a.ip().is_unspecified() {
-                    anyhow::bail!("refuse unspecified v4");
+                    return Err(MqpError::Refused("refuse unspecified v4"));
                 }
                 1 + 4 + 2
             }
             TargetAddrRef::Ip(SocketAddr::V6(a)) => {
                 if a.ip().is_unspecified() {
-                    anyhow::bail!("refuse unspecified v6");
+                    return Err(MqpError::Refused("refuse unspecified v6"));
                 }
                 if a.scope_id() != 0 {
-                    anyhow::bail!("v6 scope_id dropped on wire, refuse scoped addr");
+                    return Err(MqpError::Refused(
+                        "v6 scope_id dropped on wire, refuse scoped addr",
+                    ));
                 }
                 1 + 16 + 2
             }
             TargetAddrRef::Domain(d, _) => {
                 let n = d.len();
                 if n == 0 {
-                    anyhow::bail!("empty domain");
+                    return Err(MqpError::Refused("empty domain"));
                 }
                 if n > 255 {
-                    anyhow::bail!("domain too long");
+                    return Err(MqpError::Refused("domain too long"));
                 }
                 1 + 1 + n + 2
             }
@@ -191,52 +195,52 @@ impl<'a> TargetAddrRef<'a> {
         Ok(AddrHeader { addr: *self, len })
     }
 
-    pub fn decode(b: &'a [u8]) -> Result<(Self, usize)> {
+    pub fn decode(b: &'a [u8]) -> Result<(Self, usize), MqpError> {
         if b.is_empty() {
-            anyhow::bail!("empty addr");
+            return Err(MqpError::Malformed("empty addr"));
         }
         let atyp = b[0];
         match atyp {
             0x01 => {
                 if b.len() < 7 {
-                    anyhow::bail!("short v4");
+                    return Err(MqpError::Malformed("short v4"));
                 }
                 let ip = IpAddr::from([b[1], b[2], b[3], b[4]]);
                 if ip.is_unspecified() {
-                    anyhow::bail!("refuse unspecified v4 target");
+                    return Err(MqpError::Refused("refuse unspecified v4 target"));
                 }
                 let port = u16::from_be_bytes([b[5], b[6]]);
                 Ok((TargetAddrRef::Ip(SocketAddr::new(ip, port)), 7))
             }
             0x04 => {
                 if b.len() < 19 {
-                    anyhow::bail!("short v6");
+                    return Err(MqpError::Malformed("short v6"));
                 }
                 let mut o = [0u8; 16];
                 o.copy_from_slice(&b[1..17]);
                 let ip = IpAddr::from(o);
                 if ip.is_unspecified() {
-                    anyhow::bail!("refuse unspecified v6 target");
+                    return Err(MqpError::Refused("refuse unspecified v6 target"));
                 }
                 let port = u16::from_be_bytes([b[17], b[18]]);
                 Ok((TargetAddrRef::Ip(SocketAddr::new(ip, port)), 19))
             }
             0x03 => {
                 if b.len() < 2 {
-                    anyhow::bail!("short domain");
+                    return Err(MqpError::Malformed("short domain"));
                 }
                 let n = b[1] as usize;
                 if n == 0 {
-                    anyhow::bail!("bad domain len");
+                    return Err(MqpError::Malformed("bad domain len"));
                 }
                 if b.len() < 2 + n + 2 {
-                    anyhow::bail!("short domain body");
+                    return Err(MqpError::Malformed("short domain body"));
                 }
-                let d = std::str::from_utf8(&b[2..2 + n]).context("bad domain utf8")?;
+                let d = std::str::from_utf8(&b[2..2 + n]).map_err(|_| MqpError::BadDomainUtf8)?;
                 let port = u16::from_be_bytes([b[2 + n], b[3 + n]]);
                 Ok((TargetAddrRef::Domain(d, port), 4 + n))
             }
-            _ => anyhow::bail!("bad atyp {atyp}"),
+            _ => Err(MqpError::BadAtyp(atyp)),
         }
     }
 }

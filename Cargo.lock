@@ -940,6 +940,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "clap",
+ "foldhash",
  "hickory-resolver",
  "libc",
  "mimalloc",

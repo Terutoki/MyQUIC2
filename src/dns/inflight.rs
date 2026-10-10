@@ -3,13 +3,12 @@
 //! InflightCleanup/DnsInflightTable/dns_inflights/dns_inflight_for/
 //! dns_slow_path_limiter/DnsInflight/dns_inflight_status/dns_is_inflight.
 //! `lib.rs` untouched.
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::key::{dns_key, dns_key_owned, dns_shard, DnsCacheKey, DNS_KEY_BUF, DNS_SHARDS};
+use super::key::{dns_key, dns_key_owned, dns_shard, DnsCacheKey, DnsMap, DNS_KEY_BUF, DNS_SHARDS};
 use crate::dgram_drops;
 use crate::sync::guards::{lock_mutex, try_lock_mutex};
 
@@ -58,11 +57,11 @@ impl Drop for InflightCleanup<'_> {
 }
 
 /// Sharded single-flight table: one mutex per shard (see `DNS_SHARDS`).
-pub(crate) type DnsInflightTable = parking_lot::Mutex<HashMap<DnsCacheKey, Arc<DnsInflightEntry>>>;
+pub(crate) type DnsInflightTable = parking_lot::Mutex<DnsMap<Arc<DnsInflightEntry>>>;
 
 fn dns_inflights() -> &'static [DnsInflightTable; DNS_SHARDS] {
     static INFS: std::sync::OnceLock<[DnsInflightTable; DNS_SHARDS]> = std::sync::OnceLock::new();
-    INFS.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())))
+    INFS.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(DnsMap::default())))
 }
 
 pub(crate) fn dns_inflight_for(key: &str) -> &'static DnsInflightTable {
@@ -169,7 +168,7 @@ pub enum CoalesceOutcome<T> {
 /// (silent loss with no counter — the critical section is a single map
 /// remove).
 pub struct DnsCoalesceQueue<T> {
-    shards: [parking_lot::Mutex<HashMap<DnsCacheKey, Vec<T>>>; DNS_SHARDS],
+    shards: [parking_lot::Mutex<DnsMap<Vec<T>>>; DNS_SHARDS],
 }
 
 impl<T> Default for DnsCoalesceQueue<T> {
@@ -181,7 +180,7 @@ impl<T> Default for DnsCoalesceQueue<T> {
 impl<T> DnsCoalesceQueue<T> {
     pub fn new() -> Self {
         Self {
-            shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
+            shards: std::array::from_fn(|_| parking_lot::Mutex::new(DnsMap::default())),
         }
     }
 

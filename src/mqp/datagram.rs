@@ -1,5 +1,5 @@
 use super::addr::{AddrHeader, TargetAddr, TargetAddrRef};
-use anyhow::Result;
+use super::error::MqpError;
 use bytes::Bytes;
 
 /// MQP-2 datagram frame type: the first byte of every DATAGRAM body (TCP-open
@@ -208,15 +208,15 @@ impl DgramPrefixCache {
     }
 }
 
-pub fn decode_datagram(b: &[u8]) -> Result<(u32, TargetAddr, &[u8])> {
+pub fn decode_datagram(b: &[u8]) -> Result<(u32, TargetAddr, &[u8]), MqpError> {
     let (sess, a, p) = decode_datagram_ref(b)?;
     Ok((sess, a.into_owned(), p))
 }
 
 /// Allocation-free variant of [`decode_datagram`] for the UDP fast paths.
-pub fn decode_datagram_ref(b: &[u8]) -> Result<(u32, TargetAddrRef<'_>, &[u8])> {
+pub fn decode_datagram_ref(b: &[u8]) -> Result<(u32, TargetAddrRef<'_>, &[u8]), MqpError> {
     if b.len() < DGRAM_PREFIX_LEN + 1 || b[0] != MQP_DGRAM_TYPE {
-        anyhow::bail!("bad dgram");
+        return Err(MqpError::Malformed("bad dgram"));
     }
     let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
     let (a, n) = TargetAddrRef::decode(&b[DGRAM_PREFIX_LEN..])?;

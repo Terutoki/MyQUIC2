@@ -201,6 +201,12 @@ impl Drop for SessReservation<'_> {
     }
 }
 
+/// The hub's shard map type. `foldhash` rather than the std default: every
+/// association lookup/insert hashes a 4-byte peer-influenced session id, so
+/// the hasher must be fast *and* randomly seeded — see the `foldhash` note in
+/// `Cargo.toml`.
+pub(crate) type SubMap = HashMap<u32, Arc<AssocEntry>, foldhash::fast::RandomState>;
+
 pub(crate) struct UdpHub {
     /// One immutable map per shard, published through `ArcSwap`.
     ///
@@ -214,7 +220,7 @@ pub(crate) struct UdpHub {
     /// Writes are clone-on-publish (`rcu`), which is affordable because they
     /// happen once per association open / close and each shard holds at most
     /// `MAX_UDP_ASSOCS / HUB_SHARDS` entries.
-    pub(crate) subs: Vec<arc_swap::ArcSwap<HashMap<u32, Arc<AssocEntry>>>>,
+    pub(crate) subs: Vec<arc_swap::ArcSwap<SubMap>>,
     pub(crate) next: std::sync::atomic::AtomicU32,
     /// Exact process-wide association count across all shards.
     pub(crate) len: std::sync::atomic::AtomicUsize,
@@ -224,14 +230,14 @@ impl UdpHub {
     pub(crate) fn new() -> Self {
         Self {
             subs: (0..HUB_SHARDS)
-                .map(|_| arc_swap::ArcSwap::from_pointee(HashMap::new()))
+                .map(|_| arc_swap::ArcSwap::from_pointee(SubMap::default()))
                 .collect(),
             next: std::sync::atomic::AtomicU32::new(1),
             len: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn shard(&self, s: u32) -> &arc_swap::ArcSwap<HashMap<u32, Arc<AssocEntry>>> {
+    pub(crate) fn shard(&self, s: u32) -> &arc_swap::ArcSwap<SubMap> {
         &self.subs[(s as usize) % HUB_SHARDS]
     }
 

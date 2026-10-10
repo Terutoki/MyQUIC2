@@ -1,5 +1,5 @@
 use super::addr::{AddrHeader, TargetAddrRef};
-use anyhow::Result;
+use super::error::MqpError;
 use bytes::Bytes;
 
 pub const MQP_DGRAM_BATCH: u8 = 0x06;
@@ -90,36 +90,36 @@ pub struct BatchRef<'a> {
     pub payloads: Vec<&'a [u8]>,
 }
 
-pub fn decode_batch_ref(b: &[u8]) -> Result<BatchRef<'_>> {
+pub fn decode_batch_ref(b: &[u8]) -> Result<BatchRef<'_>, MqpError> {
     if b.len() < BATCH_PREFIX_LEN + 1 || b[0] != MQP_DGRAM_BATCH {
-        anyhow::bail!("bad batch");
+        return Err(MqpError::Malformed("bad batch"));
     }
     let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
     let (addr, n) = TargetAddrRef::decode(&b[BATCH_PREFIX_LEN..])?;
     let mut off = BATCH_PREFIX_LEN + n;
     if off >= b.len() {
-        anyhow::bail!("bad batch count");
+        return Err(MqpError::Malformed("bad batch count"));
     }
     let count = b[off] as usize;
     off += 1;
     if count == 0 || count > MAX_BATCH_ITEMS {
-        anyhow::bail!("bad batch count {count}");
+        return Err(MqpError::BadBatchCount(count as u8));
     }
     let mut payloads = Vec::with_capacity(count);
     for _ in 0..count {
         if off + 2 > b.len() {
-            anyhow::bail!("bad batch item len");
+            return Err(MqpError::Malformed("bad batch item len"));
         }
         let len = u16::from_le_bytes([b[off], b[off + 1]]) as usize;
         off += 2;
         if off + len > b.len() {
-            anyhow::bail!("bad batch item body");
+            return Err(MqpError::Malformed("bad batch item body"));
         }
         payloads.push(&b[off..off + len]);
         off += len;
     }
     if off != b.len() {
-        anyhow::bail!("bad batch trailing bytes");
+        return Err(MqpError::Malformed("bad batch trailing bytes"));
     }
     Ok(BatchRef {
         sess,

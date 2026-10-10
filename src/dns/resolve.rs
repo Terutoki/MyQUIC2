@@ -4,7 +4,6 @@
 //! DnsContended / is_dns_contended / resolve_all_cached* / PositiveState /
 //! positive_entry_state / clear_negative / record_negative / resolve_server_addr /
 //! resolve_server_side / resolve_all / resolve_all_timeout.
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -16,7 +15,9 @@ use super::cache::{
     dns_cache_for, dns_neg_cache_for, DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_MAX, DNS_NEG_TTL,
 };
 use super::inflight::{dns_inflight_for, DnsInflightEntry, InflightCleanup, OwnerReset};
-use super::key::{dns_key, dns_key_owned, DnsCacheKey, DnsCacheVal, DNS_KEY_BUF, DNS_SHARDS};
+use super::key::{
+    dns_key, dns_key_owned, DnsCacheKey, DnsCacheVal, DnsMap, DNS_KEY_BUF, DNS_SHARDS,
+};
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
 use crate::{coarse_millis, dgram_drops, lock_write, try_lock_mutex, try_lock_read};
 
@@ -424,7 +425,7 @@ pub(crate) const DNS_NEG_MAX_SHARD: usize = DNS_NEG_MAX / DNS_SHARDS;
 /// path during a miss storm. Expired entries need no eager `retain` either:
 /// reads already treat them as misses via the TTL check, so they just wait
 /// for arbitrary eviction. Work per call is O(over) clones + removes.
-pub(crate) fn evict_if_needed(m: &mut HashMap<DnsCacheKey, DnsCacheVal>) {
+pub(crate) fn evict_if_needed(m: &mut DnsMap<DnsCacheVal>) {
     const SLACK: usize = 32;
     if m.len() <= DNS_CACHE_MAX_SHARD + SLACK {
         return;

@@ -1,6 +1,7 @@
 //! DNS cache key — extracted verbatim from `src/lib.rs` (zero-logic-change split).
 //! Source lines: DnsCacheKey/DnsCacheVal/DNS_KEY_BUF/dns_name_bytes/
 //! dns_key_owned/dns_key/DNS_SHARDS/dns_shard. `lib.rs` untouched.
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +16,13 @@ pub(crate) type DnsCacheKey = String;
 /// refcount instead of duplicating the address vector.
 pub(crate) type DnsCacheVal = (Instant, Arc<[SocketAddr]>);
 pub(crate) const DNS_KEY_BUF: usize = 255 + 1 + 5;
+
+/// The positive/negative cache, inflight and coalesce tables' map type.
+///
+/// One alias so the hasher choice cannot drift between the four: the keys are
+/// short (host+port) and target names come off the wire, so the hasher must be
+/// fast *and* randomly seeded — see the `foldhash` note in `Cargo.toml`.
+pub(crate) type DnsMap<V> = HashMap<DnsCacheKey, V, foldhash::fast::RandomState>;
 
 /// Normalize a DNS name for cache keys: DNS is case-insensitive and an
 /// absolute (trailing-dot) name is equivalent to its relative form.

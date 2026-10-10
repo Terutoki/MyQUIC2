@@ -1,8 +1,8 @@
 use super::{
     addr::{AddrHeader, TargetAddrRef},
     datagram::{DGRAM_PREFIX_LEN, MQP_DGRAM_TYPE},
+    error::MqpError,
 };
-use anyhow::Result;
 use bytes::Bytes;
 
 /// MQP-2 fragmented-datagram frame type.
@@ -245,9 +245,9 @@ pub(crate) fn encode_fragment_with_header(
     Some(Bytes::from(v))
 }
 
-pub fn decode_fragment(b: &[u8]) -> Result<FragmentRef<'_>> {
+pub fn decode_fragment(b: &[u8]) -> Result<FragmentRef<'_>, MqpError> {
     if b.len() < FRAG_PREFIX_LEN + 1 || b[0] != MQP_DGRAM_FRAG {
-        anyhow::bail!("bad fragment");
+        return Err(MqpError::Malformed("bad fragment"));
     }
     let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
     let id = u16::from_le_bytes([b[5], b[6]]);

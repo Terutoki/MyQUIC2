@@ -349,7 +349,7 @@ pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 pub(crate) struct ConnPool {
     pub(crate) slots: Arc<Vec<ConnSlot>>,
     pub(crate) rr: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) interactive_ports: Arc<std::collections::HashSet<u16>>,
+    pub(crate) interactive_ports: Arc<std::collections::HashSet<u16, foldhash::fast::RandomState>>,
     /// TCP slots: the routing range is `0..tcp_slots` (0 interactive, rest
     /// bulk). Never includes the UDP slots.
     pub(crate) tcp_slots: usize,

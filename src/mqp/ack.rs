@@ -1,4 +1,4 @@
-use anyhow::Result;
+use super::error::MqpError;
 use std::net::{IpAddr, SocketAddr};
 
 /// Versioned ALPN identifier. Bumped to `/2` together with the MQP-2 TCP-open
@@ -92,14 +92,14 @@ pub fn encode_bnd_addr_into(addr: SocketAddr, out: &mut [u8]) -> usize {
 
 /// Decode the address portion of an ACK (`atyp | addr | port`).
 /// Returns the address and the number of bytes consumed.
-pub fn decode_bnd_addr(b: &[u8]) -> Result<(SocketAddr, usize)> {
+pub fn decode_bnd_addr(b: &[u8]) -> Result<(SocketAddr, usize), MqpError> {
     if b.is_empty() {
-        anyhow::bail!("empty bnd");
+        return Err(MqpError::Malformed("empty bnd"));
     }
     match b[0] {
         0x01 => {
             if b.len() < 7 {
-                anyhow::bail!("short bnd v4");
+                return Err(MqpError::Malformed("short bnd v4"));
             }
             let ip = IpAddr::from([b[1], b[2], b[3], b[4]]);
             let port = u16::from_be_bytes([b[5], b[6]]);
@@ -107,14 +107,14 @@ pub fn decode_bnd_addr(b: &[u8]) -> Result<(SocketAddr, usize)> {
         }
         0x04 => {
             if b.len() < 19 {
-                anyhow::bail!("short bnd v6");
+                return Err(MqpError::Malformed("short bnd v6"));
             }
             let mut o = [0u8; 16];
             o.copy_from_slice(&b[1..17]);
             let port = u16::from_be_bytes([b[17], b[18]]);
             Ok((SocketAddr::new(IpAddr::from(o), port), 19))
         }
-        a => anyhow::bail!("bad bnd atyp {a}"),
+        a => Err(MqpError::BadBndAtyp(a)),
     }
 }
 

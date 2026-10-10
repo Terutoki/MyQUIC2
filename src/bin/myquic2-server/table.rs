@@ -49,10 +49,16 @@ pub(crate) struct SessEntry {
 }
 pub(crate) type SessTable = Arc<ShardedSessTable>;
 
+/// The session-table shard map type. `foldhash` rather than the std default:
+/// a session get/insert hashes a 4-byte peer-influenced key, so the hasher
+/// must be fast *and* randomly seeded against collision precomputation — see
+/// the `foldhash` note in `Cargo.toml`.
+pub(crate) type SessMap = HashMap<u32, SessEntry, foldhash::fast::RandomState>;
+
 pub(crate) const SESS_SHARDS: usize = 8;
 
 pub(crate) struct ShardedSessTable {
-    pub(crate) shards: Vec<parking_lot::RwLock<HashMap<u32, SessEntry>>>,
+    pub(crate) shards: Vec<parking_lot::RwLock<SessMap>>,
     /// Whether this table is currently counted in [`session_holders`]. Kept in
     /// step by [`ShardedSessTable::note_empty_state`] on every insert/removal
     /// that can change emptiness.
@@ -81,7 +87,7 @@ impl ShardedSessTable {
     pub(crate) fn new() -> Self {
         Self {
             shards: (0..SESS_SHARDS)
-                .map(|_| parking_lot::RwLock::new(HashMap::new()))
+                .map(|_| parking_lot::RwLock::new(SessMap::default()))
                 .collect(),
             counted: std::sync::atomic::AtomicBool::new(false),
             cached_len: std::sync::atomic::AtomicUsize::new(0),
@@ -90,7 +96,7 @@ impl ShardedSessTable {
         }
     }
 
-    pub(crate) fn shard(&self, s: u32) -> &parking_lot::RwLock<HashMap<u32, SessEntry>> {
+    pub(crate) fn shard(&self, s: u32) -> &parking_lot::RwLock<SessMap> {
         &self.shards[(s as usize) % SESS_SHARDS]
     }
 
@@ -244,7 +250,7 @@ impl ShardedSessTable {
 /// write guard, but a touch lands through the lock-free atomic stamp
 /// (`touch_session_throttled` takes no table lock), so it can land between the
 /// scan and the removal even with the write guard held.
-pub(crate) fn take_idle(w: &mut HashMap<u32, SessEntry>, keys: &[u32], now: u64) -> Vec<SessEntry> {
+pub(crate) fn take_idle(w: &mut SessMap, keys: &[u32], now: u64) -> Vec<SessEntry> {
     let mut out = Vec::with_capacity(keys.len());
     for k in keys {
         let idle = w.get(k).is_some_and(|e| {
@@ -372,7 +378,7 @@ pub(crate) fn shard_over_share(shard_len: usize, fair_cap: usize) -> bool {
 /// its reader. `take_idle` re-tests idleness against one `now`, so a session the
 /// client touched while the scan ran survives (see its note) — the re-test is
 /// the whole reason this cannot be an unconditional removal of the scanned keys.
-pub(crate) fn sweep_local(w: &mut HashMap<u32, SessEntry>) -> Vec<SessEntry> {
+pub(crate) fn sweep_local(w: &mut SessMap) -> Vec<SessEntry> {
     let now = mono_millis();
     let expired: Vec<u32> = w
         .iter()
