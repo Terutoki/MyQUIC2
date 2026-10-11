@@ -40,9 +40,9 @@ pub use config::{
     client_conf::ClientConf,
     server_conf::ServerConf,
     tuning::{
-        load_toml, per_connection_memory_bytes, TransportTuning, DEFAULT_INITIAL_RTT_MS,
-        DEFAULT_QUIC_CONNS, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN, MAX_BIDI_STREAMS_PER_CONN,
-        MAX_POOL_CONNS, MAX_UDP_ASSOCS,
+        DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN,
+        MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_UDP_ASSOCS, TransportTuning, load_toml,
+        per_connection_memory_bytes,
     },
 };
 pub use sync::guards::{
@@ -51,52 +51,50 @@ pub use sync::guards::{
 pub use time::{coarse::coarse_millis, mono::mono_millis};
 
 pub use mqp::ack::{
-    decode_bnd_addr, encode_bnd_addr, encode_bnd_addr_into, encode_tcp_ack_into, normalize_alpn,
     AUTH_TOKEN_MAX_BYTES, MAX_BND_LEN, MAX_TCP_ACK_LEN, MQP_ALPN, MQP_TCP_ACK, MQP_TCP_ACK_MAGIC,
+    decode_bnd_addr, encode_bnd_addr, encode_bnd_addr_into, encode_tcp_ack_into, normalize_alpn,
 };
 pub use mqp::addr::{AddrHeader, TargetAddr, TargetAddrRef};
 pub use mqp::batch::{
-    batch_sess, decode_batch_ref, encode_batch, is_batch, BatchRef, BATCH_ITEM_OVERHEAD,
-    BATCH_PREFIX_LEN, BATCH_SMALL_MAX, MAX_BATCH_ITEMS, MQP_DGRAM_BATCH,
+    BATCH_ITEM_OVERHEAD, BATCH_PREFIX_LEN, BATCH_SMALL_MAX, BatchRef, MAX_BATCH_ITEMS,
+    MQP_DGRAM_BATCH, batch_sess, decode_batch_ref, encode_batch, is_batch,
 };
 pub use mqp::datagram::{
-    decode_datagram, decode_datagram_ref, dgram_payload_cap, encode_datagram,
-    encode_datagram_ref_with_limit, encode_datagram_with_limit, DGRAM_DEFAULT_LIMIT,
-    DGRAM_PREFIX_LEN, MQP_DGRAM_TYPE,
+    DGRAM_DEFAULT_LIMIT, DGRAM_PREFIX_LEN, MQP_DGRAM_TYPE, decode_datagram, decode_datagram_ref,
+    dgram_payload_cap, encode_datagram, encode_datagram_ref_with_limit, encode_datagram_with_limit,
 };
 pub use mqp::error::MqpError;
 pub use mqp::fragment::{
-    decode_fragment, dgram_sess, encode_fragment, fragment_chunk_len, FragmentRef,
     FRAG_ID_SAFE_WINDOW_MS, FRAG_MAX_HELD_BYTES, FRAG_MAX_PARTIALS, FRAG_PREFIX_LEN,
-    FRAG_SWEEP_INTERVAL_MS, FRAG_TIMEOUT_MS, MIN_PATH_DGRAM_BUDGET, MQP_DGRAM_FRAG,
+    FRAG_SWEEP_INTERVAL_MS, FRAG_TIMEOUT_MS, FragmentRef, MIN_PATH_DGRAM_BUDGET, MQP_DGRAM_FRAG,
     MQP_FRAG_MAX_PAYLOAD, MQP_FRAG_MAX_TOTAL, SOCKS_UDP_HDR_MAX, UDP_PAYLOAD_MAX, UDP_RECV_MAX,
-    UDP_RECV_SLACK,
+    UDP_RECV_SLACK, decode_fragment, dgram_sess, encode_fragment, fragment_chunk_len,
 };
 pub use tls::{
     client_tls_config, gen_self_signed_files, is_placeholder_token, load_cert_der, load_key_der,
     parse_congestion, server_tls_config,
 };
 pub use transport::{
-    build_transport, build_transport_tuned, build_transport_tuned_class, DGRAM_MAX_WIRE,
-    KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW, STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES,
-    TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT,
+    DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW, STREAM_RECEIVE_WINDOW,
+    TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT, build_transport,
+    build_transport_tuned, build_transport_tuned_class,
 };
 // `MQP_DGRAM_MAX` / `clamp_keep_alive` are exercised by the unit tests below
 // through `use super::*` (`DATAGRAM_BUFFER` is also read by `config::tuning`).
+pub use dns::{
+    CachedLookup, DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT, IpPreference, dns_cache_seed,
+    dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed, dns_slow_path_limiter,
+    ip_preference, is_global_ip, lookup_cached_fast, lookup_cached_fast_with_ttl,
+    lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached, resolve_server_addr,
+    resolve_server_side, set_ip_preference, unmap,
+};
 /// Test-only compatibility surface: the unit tests below address the moved
 /// DNS internals through the crate root (`use super::*`).
 #[allow(unused_imports)]
 pub(crate) use dns::{
-    bump_neg_epoch, dns_key, dns_key_owned, dns_memo_hash, dns_memo_set, memo_peek_both, memo_put,
-    neg_epoch, negatives, positives, DnsMemoSlot, DNS_CACHE_MAX, DNS_KEY_BUF, DNS_MEMO,
-    DNS_NEG_MAX, DNS_NEG_TTL, MEMO_KEY_BYTES, MEMO_SETS, MEMO_WAYS,
-};
-pub use dns::{
-    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed,
-    dns_slow_path_limiter, ip_preference, is_global_ip, lookup_cached_fast,
-    lookup_cached_fast_with_ttl, lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
-    resolve_server_addr, resolve_server_side, set_ip_preference, unmap, CachedLookup, IpPreference,
-    DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT,
+    DNS_CACHE_MAX, DNS_KEY_BUF, DNS_MEMO, DNS_NEG_MAX, DNS_NEG_TTL, DnsMemoSlot, MEMO_KEY_BYTES,
+    MEMO_SETS, MEMO_WAYS, bump_neg_epoch, dns_key, dns_key_owned, dns_memo_hash, dns_memo_set,
+    memo_peek_both, memo_put, neg_epoch, negatives, positives,
 };
 pub use stats::drops::dgram_drops;
 pub use stats::udp_stats::{self, UdpSnapshot};
@@ -104,26 +102,25 @@ pub use stats::udp_write::{self, UdpWriteSnapshot};
 pub use stats::warn::{claim_log_window, claim_log_window_counted, tcp_abort_log_due};
 pub use tcp::{copy_tcp_quic, copy_tcp_quic_acked, copy_tcp_quic_idle};
 #[allow(unused_imports)]
-pub(crate) use transport::{clamp_keep_alive, DATAGRAM_BUFFER, MQP_DGRAM_MAX};
+pub(crate) use transport::{DATAGRAM_BUFFER, MQP_DGRAM_MAX, clamp_keep_alive};
 pub use udp::send_udp_batch;
 pub use udp::{
-    batch_backend, batch_report, burst_msg_copy, record_drain_batch, record_extra_syscalls,
-    record_send_group, recv_burst, recvmmsg_available, send_udp_datagram, sendmmsg_available,
-    try_send_datagram, udp_try_send, udp_try_send_grouped, udp_try_send_slice, DatagramSend,
-    DgramFragmenter, DgramReassembler, PayloadSend, SendFrame, UdpWriteDrop, BURST_SLOT,
-    LAST_HOP_DRAIN,
+    BURST_SLOT, DatagramSend, DgramFragmenter, DgramReassembler, LAST_HOP_DRAIN, PayloadSend,
+    SendFrame, UdpWriteDrop, batch_backend, batch_report, burst_msg_copy, record_drain_batch,
+    record_extra_syscalls, record_send_group, recv_burst, recvmmsg_available, send_udp_datagram,
+    sendmmsg_available, try_send_datagram, udp_try_send, udp_try_send_grouped, udp_try_send_slice,
 };
 // `pub(crate)` re-exports for the unit tests below (`use super::*`); unused in
 // the non-test build.
 #[allow(unused_imports)]
-pub(crate) use stats::{claim_drop_warning, drop_warn_due, NEVER_WARNED};
+pub(crate) use stats::{NEVER_WARNED, claim_drop_warning, drop_warn_due};
 #[allow(unused_imports)]
-pub(crate) use tcp::{reserve_copy_chunk, COPY_CHUNK};
+pub(crate) use tcp::{COPY_CHUNK, reserve_copy_chunk};
 #[allow(unused_imports)]
 pub(crate) use udp::{
+    Partial, UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT, UDP_RETRY_TIMEOUT, UdpRetry,
     frag_id_reuse_blocked, retry_shards, spawn_retry_worker, udp_retry_submit,
-    under_retry_deadline, Partial, UdpRetry, UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT,
-    UDP_RETRY_TIMEOUT,
+    under_retry_deadline,
 };
 
 /// Dual-stack UDP socket (V6ONLY=0 when bound to ::). Buffer enlarged for GSO bursts.
@@ -229,15 +226,15 @@ pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::Udp
     // value once per process — these calls run for every UDP session socket,
     // so warning per socket would flood the log on routers with default
     // (small) rmem_max/wmem_max.
-    if let Ok(actual) = s.send_buffer_size() {
-        if actual < buf {
-            warn_buf_clamped("send", actual, buf);
-        }
+    if let Ok(actual) = s.send_buffer_size()
+        && actual < buf
+    {
+        warn_buf_clamped("send", actual, buf);
     }
-    if let Ok(actual) = s.recv_buffer_size() {
-        if actual < buf {
-            warn_buf_clamped("recv", actual, buf);
-        }
+    if let Ok(actual) = s.recv_buffer_size()
+        && actual < buf
+    {
+        warn_buf_clamped("recv", actual, buf);
     }
     s.bind(&addr.into())?;
     Ok(s.into())
@@ -324,7 +321,7 @@ pub fn tcp_listener_dual(bind: &str) -> Result<std::net::TcpListener> {
 pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
                 tokio::select! {
@@ -622,10 +619,10 @@ mod tests {
             let k = format!("h{i}.example.net\0443");
             let set = dns_memo_set(dns_memo_hash(&k));
             by_set[set].push(k);
-            if let Some(v) = by_set.iter().find(|v| v.len() >= 2) {
-                if trio.is_none() {
-                    trio = Some((v[0].clone(), v[1].clone()));
-                }
+            if let Some(v) = by_set.iter().find(|v| v.len() >= 2)
+                && trio.is_none()
+            {
+                trio = Some((v[0].clone(), v[1].clone()));
             }
             if trio.is_some() {
                 break;
@@ -636,8 +633,8 @@ mod tests {
 
         memo_put(&a, Some("10.1.1.1:1".parse().unwrap()), far);
         memo_put(&b, Some("10.1.1.2:1".parse().unwrap()), far); // a demoted to way 1
-                                                                // Re-put a (now in way 1) with a new address: it must promote, and b
-                                                                // must survive in way 1.
+        // Re-put a (now in way 1) with a new address: it must promote, and b
+        // must survive in way 1.
         memo_put(&a, Some("10.1.1.9:1".parse().unwrap()), far);
         assert_eq!(
             memo_peek_both(&a).0.expect("a resident").addr,
@@ -1292,9 +1289,10 @@ mod tests {
         }
         // Replaying index 0 must be ignored, and the last fragment must still
         // complete the datagram.
-        assert!(r
-            .push(&decode_fragment(&exact[0]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&exact[0]).unwrap(), 1_000)
+                .is_none()
+        );
         let done = r.push(&decode_fragment(&exact[7]).unwrap(), 1_000);
         assert_eq!(
             done.expect("a payload exactly at the cap must complete")
@@ -1651,9 +1649,10 @@ mod tests {
         let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
         let frames = frag_frames(1, 1, &addr.as_ref(), &pattern(6000), 4000);
         let mut r = DgramReassembler::new();
-        assert!(r
-            .push(&decode_fragment(&frames[0]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&frames[0]).unwrap(), 1_000)
+                .is_none()
+        );
         assert_eq!(r.inflight(), 1);
         assert!(r.held_bytes() > 0);
 
@@ -1908,12 +1907,13 @@ mod tests {
         let mut r = DgramReassembler::new();
         assert!(r.push(&decode_fragment(&frames[0]).unwrap(), 0).is_none());
         assert_eq!(r.inflight(), 1);
-        assert!(r
-            .push(
+        assert!(
+            r.push(
                 &decode_fragment(&frames[1]).unwrap(),
                 FRAG_TIMEOUT_MS + 1_500
             )
-            .is_none());
+            .is_none()
+        );
         assert_eq!(
             r.inflight(),
             1,
@@ -2126,20 +2126,23 @@ mod tests {
         assert_eq!(r.inflight(), 0);
 
         // Generation B starts on the reused id: its prefix goes live.
-        assert!(r
-            .push(&decode_fragment(&frames_b[0]).unwrap(), 1_000)
-            .is_none());
-        assert!(r
-            .push(&decode_fragment(&frames_b[1]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&frames_b[0]).unwrap(), 1_000)
+                .is_none()
+        );
+        assert!(
+            r.push(&decode_fragment(&frames_b[1]).unwrap(), 1_000)
+                .is_none()
+        );
         assert_eq!(r.inflight(), 1);
         let held_before = r.held_bytes();
 
         // A stale replay of A's suffix lands on B's last empty slot. This is
         // the splice: stored, it would complete `[B0, B1, A2]`.
-        assert!(r
-            .push(&decode_fragment(&frames_a[2]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&frames_a[2]).unwrap(), 1_000)
+                .is_none()
+        );
         assert_eq!(
             r.inflight(),
             1,
@@ -2170,24 +2173,29 @@ mod tests {
         let fourth = flipped(&third);
         let frames_c = frag_frames(12, 5, &addr.as_ref(), &third, 1400);
         let frames_d = frag_frames(12, 5, &addr.as_ref(), &fourth, 1400);
-        assert!(r
-            .push(&decode_fragment(&frames_c[0]).unwrap(), 1_000)
-            .is_none());
-        assert!(r
-            .push(&decode_fragment(&frames_c[1]).unwrap(), 1_000)
-            .is_none());
-        assert!(r
-            .push(&decode_fragment(&frames_d[0]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&frames_c[0]).unwrap(), 1_000)
+                .is_none()
+        );
+        assert!(
+            r.push(&decode_fragment(&frames_c[1]).unwrap(), 1_000)
+                .is_none()
+        );
+        assert!(
+            r.push(&decode_fragment(&frames_d[0]).unwrap(), 1_000)
+                .is_none()
+        );
         let held_before = r.held_bytes();
-        assert!(r
-            .push(&decode_fragment(&frames_c[1]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&frames_c[1]).unwrap(), 1_000)
+                .is_none()
+        );
         assert_eq!(r.inflight(), 1);
         assert_eq!(r.held_bytes(), held_before);
-        assert!(r
-            .push(&decode_fragment(&frames_d[1]).unwrap(), 1_000)
-            .is_none());
+        assert!(
+            r.push(&decode_fragment(&frames_d[1]).unwrap(), 1_000)
+                .is_none()
+        );
         let done = r.push(&decode_fragment(&frames_d[2]).unwrap(), 1_000);
         let (_, _, whole) = done.expect("generation D completes with its own fragments");
         assert_eq!(&whole[..], &fourth[..], "must not splice C and D together");

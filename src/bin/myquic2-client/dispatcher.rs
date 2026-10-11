@@ -480,15 +480,15 @@ pub(crate) fn flush_staged(
 
 pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
     tokio::spawn(async move {
-        let mut gen = slot.gen_rx.clone();
+        let mut gen_rx = slot.gen_rx.clone();
         // Backstop across consecutive dead reads, 100ms -> 1s cap. A read
         // error fires before the conn loop clears `live` + `bump_gen`, so a
         // fixed 10ms backstop spins every slot at 100Hz for the whole dead
         // window; exponential growth bounds it at ~10Hz then ~1Hz while
-        // `gen.changed()` keeps priority wakeup (fresh generation resets).
+        // `gen_rx.changed()` keeps priority wakeup (fresh generation resets).
         let mut backoff = Duration::from_millis(100);
         loop {
-            let conn = match slot.wait_conn(&mut gen, Duration::from_secs(10)).await {
+            let conn = match slot.wait_conn(&mut gen_rx, Duration::from_secs(10)).await {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -598,7 +598,7 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                             break;
                         }
                     }
-                    _ = gen.changed() => break,
+                    _ = gen_rx.changed() => break,
                     _ = reasm_tick.tick() => { reasm.expire(coarse_millis()); }
                 }
             }
@@ -607,11 +607,11 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                 // live bit; without this, wait_conn would immediately hand back
                 // the same dead connection and the dispatcher would busy-spin.
                 // Wait for the generation bump, with an exponential backstop
-                // (100ms -> 1s): gen.changed() keeps priority wakeup so a
+                // (100ms -> 1s): gen_rx.changed() keeps priority wakeup so a
                 // fresh connection resets immediately, while a dead window
                 // that outlives several reads decays to ~1Hz instead of 100Hz.
                 tokio::select! {
-                    _ = gen.changed() => {
+                    _ = gen_rx.changed() => {
                         backoff = Duration::from_millis(100);
                     }
                     _ = tokio::time::sleep(backoff) => {

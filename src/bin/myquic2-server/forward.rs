@@ -21,16 +21,16 @@ pub(crate) async fn forward_server_dgram(
                 dgram_drops::bump(&dgram_drops::REFUSED);
                 return None;
             } // No destination memo for an IP target: `resolve_pin` — the memo's
-              // only reader on the datagram path — consults it for domain targets
-              // exclusively (an IP target's address is already in the datagram, so
-              // it takes the `TargetAddrRef::Ip` arm and never reaches the memo).
-              // An entry keyed `("", port)` *is* readable in principle — see
-              // `session_dest_memo_distinguishes_ip_and_domain_targets`, which
-              // stores and reads exactly that — but nothing on the datagram path
-              // would ever ask for it, because the wire decoder refuses a
-              // zero-length domain, so the lookup that could match it is
-              // unreachable. Storing it was a shard write lock plus a 72-byte memo
-              // write per datagram that nothing could read back.
+            // only reader on the datagram path — consults it for domain targets
+            // exclusively (an IP target's address is already in the datagram, so
+            // it takes the `TargetAddrRef::Ip` arm and never reaches the memo).
+            // An entry keyed `("", port)` *is* readable in principle — see
+            // `session_dest_memo_distinguishes_ip_and_domain_targets`, which
+            // stores and reads exactly that — but nothing on the datagram path
+            // would ever ask for it, because the wire decoder refuses a
+            // zero-length domain, so the lookup that could match it is
+            // unreachable. Storing it was a shard write lock plus a 72-byte memo
+            // write per datagram that nothing could read back.
             let sock = get_or_create_sess(ss, cd, conn_id, s, None).await?;
             remember_dst(ss, s, dst);
             udp_try_send(&sock, map_for_dual(dst), payload);

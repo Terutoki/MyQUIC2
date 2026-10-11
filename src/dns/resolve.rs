@@ -23,15 +23,15 @@
 //!   shares errors with concurrent waiters but never caches them.
 //! - **upstream**: hickory, cancellable and TTL-clamped to the same windows.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::key::{dns_key, dns_key_owned, DNS_KEY_BUF};
+use super::key::{DNS_KEY_BUF, dns_key, dns_key_owned};
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
-use super::store::{negatives, positives, DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL};
+use super::store::{DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, negatives, positives};
 use crate::coarse_millis;
 
 /// Address-family preference for DNS resolution results, from the
@@ -232,13 +232,13 @@ pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64)
     let (pos, neg) = memo_peek_both(key);
     if pos.is_some() || neg.is_some() {
         let now = coarse_millis();
-        if let Some(m) = pos {
-            if now < m.expires_ms {
-                return match m.addr {
-                    Some(a) => (CachedLookup::Addr(a), m.expires_ms - now),
-                    None => (CachedLookup::Unknown, 0),
-                };
-            }
+        if let Some(m) = pos
+            && now < m.expires_ms
+        {
+            return match m.addr {
+                Some(a) => (CachedLookup::Addr(a), m.expires_ms - now),
+                None => (CachedLookup::Unknown, 0),
+            };
         }
         if let Some(m) = neg {
             // The epoch check is what keeps a negative memo coherent with a

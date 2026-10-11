@@ -277,7 +277,7 @@ pub mod dgram_drops {
     /// reads the coarse epoch, so the cost is a relaxed load in the common case)
     /// and builds `detail` only when a line is actually emitted.
     pub fn warn_egress_drop(kind: EgressDrop, total: u64, detail: impl FnOnce() -> String) {
-        use crate::stats::{claim_drop_warning, NEVER_WARNED};
+        use crate::stats::{NEVER_WARNED, claim_drop_warning};
         static LAST_NO_CONNECTION: AtomicU64 = AtomicU64::new(NEVER_WARNED);
         static LAST_LOST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
         static LAST_UNSUPPORTED: AtomicU64 = AtomicU64::new(NEVER_WARNED);
@@ -323,7 +323,7 @@ pub mod dgram_drops {
     /// Costs one coarse-epoch read per *oversized* datagram — never on the
     /// steady path — and builds `detail` only when a line is actually emitted.
     pub fn warn_oversize_recv(kind: OversizeRecv, total: u64, detail: impl FnOnce() -> String) {
-        use crate::stats::{claim_drop_warning, NEVER_WARNED};
+        use crate::stats::{NEVER_WARNED, claim_drop_warning};
         static LAST_TARGET_REPLY: AtomicU64 = AtomicU64::new(NEVER_WARNED);
         static LAST_APP_DGRAM: AtomicU64 = AtomicU64::new(NEVER_WARNED);
         let (slot, which) = match kind {

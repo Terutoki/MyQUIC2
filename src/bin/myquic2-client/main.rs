@@ -66,7 +66,9 @@ async fn main() -> Result<()> {
         );
     }
     if is_placeholder_token(&c.auth_token) {
-        warn!("auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)");
+        warn!(
+            "auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)"
+        );
     }
     if !parse_congestion(&c.congestion) {
         warn!(
@@ -192,8 +194,10 @@ async fn main() -> Result<()> {
 
     let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
     let li = tokio::net::TcpListener::from_std(tcp_listener_dual(&c.socks_listen)?)?;
-    info!("socks5 listening on {listen} -> QUIC {server_str_log} (dns=server-side, token={}, tls13-pinned, 0rtt)",
-        if c.auth_token.is_empty() { "off" } else { "on" });
+    info!(
+        "socks5 listening on {listen} -> QUIC {server_str_log} (dns=server-side, token={}, tls13-pinned, 0rtt)",
+        if c.auth_token.is_empty() { "off" } else { "on" }
+    );
     spawn_udp_reporter();
     let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
     // SIGTERM/SIGINT: close the endpoint so every pooled connection drops and

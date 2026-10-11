@@ -289,10 +289,10 @@ pub(crate) async fn sess_reader_task(
     {
         let sh = ss2.shard(s);
         let mut w = lock_write(sh);
-        if let Some(cur) = w.get(&s) {
-            if Arc::ptr_eq(&cur.sock, &rs) {
-                w.remove(&s);
-            }
+        if let Some(cur) = w.get(&s)
+            && Arc::ptr_eq(&cur.sock, &rs)
+        {
+            w.remove(&s);
         }
     }
     // The table may now be empty: if this was its last session, drop out of the
@@ -361,26 +361,26 @@ pub(crate) async fn get_or_create_sess(
     {
         let sh = ss.shard(s);
         let r = lock_read(sh);
-        if let Some(e) = r.get(&s) {
-            if !e.reader.is_finished() {
-                let sock = e.sock.clone();
-                let last = e.last.clone();
-                let abort = e.reader.abort_handle();
-                let epoch = e.recent_epoch.clone();
-                touch_session_throttled(conn_id, s, &e.last);
-                drop(r);
-                // Publish this thread's memo from the table. A session created
-                // by a DNS-spawned resolver task lives on another worker's memo
-                // (or on none), and without this the per-connection fast path
-                // could never arm for it: the caller's `SessHit::Miss` would
-                // clear the fast state on every datagram instead of adopting
-                // the session that was just used.
-                sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
-                if let Some((h, p, d, life)) = dest {
-                    sess_dest_store(ss, s, h, p, d, life);
-                }
-                return Some(sock);
+        if let Some(e) = r.get(&s)
+            && !e.reader.is_finished()
+        {
+            let sock = e.sock.clone();
+            let last = e.last.clone();
+            let abort = e.reader.abort_handle();
+            let epoch = e.recent_epoch.clone();
+            touch_session_throttled(conn_id, s, &e.last);
+            drop(r);
+            // Publish this thread's memo from the table. A session created
+            // by a DNS-spawned resolver task lives on another worker's memo
+            // (or on none), and without this the per-connection fast path
+            // could never arm for it: the caller's `SessHit::Miss` would
+            // clear the fast state on every datagram instead of adopting
+            // the session that was just used.
+            sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
+            if let Some((h, p, d, life)) = dest {
+                sess_dest_store(ss, s, h, p, d, life);
             }
+            return Some(sock);
         }
     }
     // No DATAGRAM support on this path: refuse before pinning a global permit,
@@ -591,9 +591,5 @@ pub(crate) async fn get_or_create_sess(
     }
     abort_evicted(stale_dead);
     abort_evicted(swept);
-    if inserted {
-        Some(sock)
-    } else {
-        None
-    }
+    if inserted { Some(sock) } else { None }
 }

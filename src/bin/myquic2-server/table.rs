@@ -256,10 +256,8 @@ pub(crate) fn take_idle(w: &mut SessMap, keys: &[u32], now: u64) -> Vec<SessEntr
         let idle = w.get(k).is_some_and(|e| {
             now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
         });
-        if idle {
-            if let Some(e) = w.remove(k) {
-                out.push(e);
-            }
+        if idle && let Some(e) = w.remove(k) {
+            out.push(e);
         }
     }
     out
@@ -423,10 +421,10 @@ pub(crate) fn sess_dest_lookup_ttl(
     port: u16,
 ) -> Option<(SocketAddr, u64)> {
     let sh = ss.shard(s);
-    if let Some(e) = lock_read(sh).get(&s) {
-        if let Some(addr) = e.dest.get(now, host, port) {
-            return Some((addr, e.dest.expires.saturating_sub(now)));
-        }
+    if let Some(e) = lock_read(sh).get(&s)
+        && let Some(addr) = e.dest.get(now, host, port)
+    {
+        return Some((addr, e.dest.expires.saturating_sub(now)));
     }
     None
 }
@@ -465,12 +463,11 @@ pub(crate) fn sess_dest_store(
     let now = coarse_millis();
     {
         let r = lock_read(ss.shard(s));
-        if let Some(e) = r.get(&s) {
-            if e.dest.is_for(host, port, addr)
-                && e.dest.expires.saturating_sub(now) > DEST_PIN_REFRESH_MS
-            {
-                return;
-            }
+        if let Some(e) = r.get(&s)
+            && e.dest.is_for(host, port, addr)
+            && e.dest.expires.saturating_sub(now) > DEST_PIN_REFRESH_MS
+        {
+            return;
         }
     }
     let mut w = lock_write(ss.shard(s));

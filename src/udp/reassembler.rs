@@ -18,7 +18,7 @@ use bytes::Bytes;
 
 use crate::mqp::addr::{TargetAddr, TargetAddrRef};
 use crate::mqp::fragment::{
-    FragmentRef, FRAG_MAX_HELD_BYTES, FRAG_MAX_PARTIALS, FRAG_TIMEOUT_MS, MQP_FRAG_MAX_PAYLOAD,
+    FRAG_MAX_HELD_BYTES, FRAG_MAX_PARTIALS, FRAG_TIMEOUT_MS, FragmentRef, MQP_FRAG_MAX_PAYLOAD,
     MQP_FRAG_MAX_TOTAL,
 };
 use crate::udp_stats;
@@ -355,12 +355,10 @@ impl DgramReassembler {
                     }
                 }
             };
-            if restart {
-                if let Some(old) = self.parts.remove(&key) {
-                    self.held = self.held.saturating_sub(old.retained);
-                    let total = old.total;
-                    self.remember(key, total, old.address, old.chunks, now_ms);
-                }
+            if restart && let Some(old) = self.parts.remove(&key) {
+                self.held = self.held.saturating_sub(old.retained);
+                let total = old.total;
+                self.remember(key, total, old.address, old.chunks, now_ms);
             }
             let entry = self
                 .parts

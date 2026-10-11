@@ -6,7 +6,7 @@
 
 SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-2 protocol · built for speed and low latency
 
-[![Rust](https://img.shields.io/badge/Rust-1.88%2B-dea584?logo=rust&logoColor=white)](#-building)
+[![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?logo=rust&logoColor=white)](#-building)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS%201.3-38bdf8)](#-architecture)
 [![Performance](https://img.shields.io/badge/Performance-blazing%20fast-f97316)](#-performance-design)
 [![Protocol](https://img.shields.io/badge/Protocol-MQP--2-f59e0b)](#-the-mqp-2-protocol)

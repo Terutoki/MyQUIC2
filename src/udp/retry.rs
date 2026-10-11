@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::stats::{claim_drop_warning, NEVER_WARNED};
+use crate::stats::{NEVER_WARNED, claim_drop_warning};
 use crate::udp_write;
 
 use super::batch::SendFrame;
@@ -305,7 +305,7 @@ pub fn udp_try_send_grouped(
     frames: &[SendFrame<'_>],
 ) {
     use super::batch::{
-        record_extra_syscalls, record_send_group, sendmmsg_available, LAST_HOP_DRAIN,
+        LAST_HOP_DRAIN, record_extra_syscalls, record_send_group, sendmmsg_available,
     };
     if frames.is_empty() {
         return;
@@ -865,7 +865,7 @@ mod contract_tests {
     /// behaviour: first drop warns unconditionally, floods are silenced.
     #[test]
     fn budget_warning_fires_once_per_window() {
-        use crate::stats::{drop_warn_due, NEVER_WARNED};
+        use crate::stats::{NEVER_WARNED, drop_warn_due};
         assert!(
             drop_warn_due(NEVER_WARNED, 0),
             "first Budget drop must warn"

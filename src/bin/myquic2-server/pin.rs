@@ -310,10 +310,11 @@ pub(crate) fn fast_allow_cached(
     if allow_private {
         return true;
     }
-    if let Some((cs, cd, v)) = *cache {
-        if cs == s && cd == dst {
-            return v;
-        }
+    if let Some((cs, cd, v)) = *cache
+        && cs == s
+        && cd == dst
+    {
+        return v;
     }
     let v = is_global_ip_cached(dst.ip());
     *cache = Some((s, dst, v));
@@ -358,20 +359,21 @@ pub(crate) fn resolve_pin(
     // Matching on the session alone would send a datagram naming a *different*
     // target to the address resolved for the previous one -- a silent
     // mis-route; ignoring the deadline would never re-resolve at all.
-    if s == pinned_sess {
-        if let Some(pin) = pin.as_ref() {
-            if pin.sess == s && pin_is_for(pin, h, p) && pin.expires > now {
-                // SSRF recheck on the pin hit (allow_private=false only): a pin
-                // that now reads as non-global is treated as a miss and falls
-                // through to the memo/DNS re-resolve below (which scans the full
-                // cached set for a usable fallback), instead of being served
-                // stale for the rest of the pin life. Thread-local memoized, so
-                // the steady public flow pays one cached bool, no locks, no DNS
-                // reads; allow_private=true bypasses unchanged.
-                if allow_private || is_global_ip_cached(pin.addr.ip()) {
-                    return Some(pin.addr);
-                }
-            }
+    if s == pinned_sess
+        && let Some(pin) = pin.as_ref()
+        && pin.sess == s
+        && pin_is_for(pin, h, p)
+        && pin.expires > now
+    {
+        // SSRF recheck on the pin hit (allow_private=false only): a pin
+        // that now reads as non-global is treated as a miss and falls
+        // through to the memo/DNS re-resolve below (which scans the full
+        // cached set for a usable fallback), instead of being served
+        // stale for the rest of the pin life. Thread-local memoized, so
+        // the steady public flow pays one cached bool, no locks, no DNS
+        // reads; allow_private=true bypasses unchanged.
+        if allow_private || is_global_ip_cached(pin.addr.ip()) {
+            return Some(pin.addr);
         }
     }
     if let Some((dst, memo_life)) = sess_dest_lookup_ttl(ss, now, s, h, p) {

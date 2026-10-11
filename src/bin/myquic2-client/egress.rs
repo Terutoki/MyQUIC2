@@ -14,7 +14,7 @@ pub(crate) const EGRESS_REFRESH_MS: u64 = 1000;
 /// serves it with no lock and no refcount traffic; a generation bump (any
 /// successful `cached` mutation) invalidates it without touching other threads.
 pub(crate) struct EgressMemo {
-    pub(crate) gen: u64,
+    pub(crate) generation: u64,
     pub(crate) conn: quinn::Connection,
     pub(crate) limit: usize,
     pub(crate) stamp_ms: u64,
@@ -128,11 +128,13 @@ impl SharedEgress {
         now_ms: u64,
         f: impl FnOnce(&quinn::Connection, usize) -> R,
     ) -> Option<R> {
-        let gen = self.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        let generation = self.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
         EGRESS_MEMO.with(|slots| {
             let memo = slots.borrow();
             let entry = memo[class.index()].as_ref()?;
-            if entry.gen == gen && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS {
+            if entry.generation == generation
+                && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS
+            {
                 Some(f(&entry.conn, entry.limit))
             } else {
                 None
@@ -141,20 +143,20 @@ impl SharedEgress {
     }
 
     /// Publish a handle into this thread's memo (one clone per thread per
-    /// generation, not per packet). `gen` is the generation observed before the
+    /// generation, not per packet). `generation` is the generation observed before the
     /// acquire's cached read, so a mutation racing the acquire cannot leave a
     /// stale memo entry behind.
     pub(crate) fn memo_store(
         &self,
         class: EgressClass,
-        gen: u64,
+        generation: u64,
         conn: &quinn::Connection,
         limit: usize,
         stamp_ms: u64,
     ) {
         EGRESS_MEMO.with(|slots| {
             slots.borrow_mut()[class.index()] = Some(EgressMemo {
-                gen,
+                generation,
                 conn: conn.clone(),
                 limit,
                 stamp_ms,
@@ -284,20 +286,18 @@ impl SharedEgress {
         // pool can only have published that class's UDP slot, so stickiness
         // cannot keep it on a TCP connection.
         let current = cached.load();
-        if let Some(c) = current.as_ref() {
-            if c.conn.close_reason().is_none() {
-                if let Some(m) = c.conn.max_datagram_size() {
-                    cached.store(Some(Arc::new(EgressCache {
-                        conn: c.conn.clone(),
-                        limit: m,
-                        stamp_ms: now_ms,
-                        slot: c.slot,
-                    })));
-                    self.generation[class.index()]
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    return Some((c.conn.clone(), m, now_ms));
-                }
-            }
+        if let Some(c) = current.as_ref()
+            && c.conn.close_reason().is_none()
+            && let Some(m) = c.conn.max_datagram_size()
+        {
+            cached.store(Some(Arc::new(EgressCache {
+                conn: c.conn.clone(),
+                limit: m,
+                stamp_ms: now_ms,
+                slot: c.slot,
+            })));
+            self.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+            return Some((c.conn.clone(), m, now_ms));
         }
         drop(current);
         // The cached connection is gone (or lost DATAGRAM support): walk the

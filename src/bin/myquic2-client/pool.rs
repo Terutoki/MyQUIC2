@@ -190,10 +190,11 @@ impl ConnSlot {
             // `ArcSwap::load` borrows the published handle instead, so a flow
             // opening during a reconnect never blocks a runtime thread.
             let g = self.shared.load();
-            if let Some(c) = g.as_ref() {
-                if self.is_live() && c.close_reason().is_none() {
-                    return Ok((**c).clone());
-                }
+            if let Some(c) = g.as_ref()
+                && self.is_live()
+                && c.close_reason().is_none()
+            {
+                return Ok((**c).clone());
             }
             drop(g);
             if tokio::time::Instant::now() >= deadline {
@@ -249,11 +250,7 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     }
     // Every bulk slot is down: share the interactive connection rather than
     // stall, but only if it is actually carrying traffic.
-    if live[0] {
-        0
-    } else {
-        preferred
-    }
+    if live[0] { 0 } else { preferred }
 }
 
 /// UDP egress class: which dedicated connection an association's datagrams ride.

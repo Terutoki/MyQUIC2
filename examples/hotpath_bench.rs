@@ -57,8 +57,8 @@
 //! End-to-end check bench (byte-for-byte peer verify + socket I/O, no DCE); std::hint::black_box/criterion N/A.
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -247,11 +247,11 @@ fn tcp(socks: &str, target: &str, n: usize, conc: usize) {
             for _ in 0..per {
                 if let Ok(mut s) = socks_connect(&socks, &host, port) {
                     let mut replied = false;
-                    if s.write_all(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_ok() {
-                        if let Ok(k) = s.read(&mut buf) {
-                            bytes.fetch_add(k as u64, Ordering::Relaxed);
-                            replied = k > 0;
-                        }
+                    if s.write_all(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_ok()
+                        && let Ok(k) = s.read(&mut buf)
+                    {
+                        bytes.fetch_add(k as u64, Ordering::Relaxed);
+                        replied = k > 0;
                     }
                     done.fetch_add(1, Ordering::Relaxed);
                     if replied {

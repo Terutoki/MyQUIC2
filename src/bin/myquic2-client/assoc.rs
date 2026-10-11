@@ -275,12 +275,11 @@ pub(crate) async fn udp_associate_inner(
                 }
                 // Pin the source IP: any host that can reach the relay port
                 // could otherwise become "the app" and steal all replies.
-                if let Some(expected) = expected_app_ip {
-                    if unmap(app.ip()) != expected {
+                if let Some(expected) = expected_app_ip
+                    && unmap(app.ip()) != expected {
                         tracing::debug!("udp assoc {sess}: datagram from unauthorized app {app} ignored");
                         continue;
                     }
-                }
                 // The coarse epoch: this value feeds the 1 s liveness throttle
                 // and the egress memo's 1 s freshness window, and both are whole
                 // seconds. `mono_millis()` here was a vDSO `clock_gettime` on
@@ -419,11 +418,11 @@ pub(crate) async fn udp_associate_inner(
                         // mutation concurrent with `acquire` then bumps past
                         // this tag, so the memo below is never served for a
                         // value the mutation replaced.
-                        let gen = egress_shared.generation[class.index()]
+                        let generation = egress_shared.generation[class.index()]
                             .load(std::sync::atomic::Ordering::Acquire);
                         match egress_shared.acquire(&pool, class, now) {
                             Some((conn, limit, stamp)) => {
-                                egress_shared.memo_store(class, gen, &conn, limit, stamp);
+                                egress_shared.memo_store(class, generation, &conn, limit, stamp);
                                 frag.send(&conn, sess, &addr, payload, limit)
                             }
                             None => {

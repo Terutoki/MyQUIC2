@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::tuning::{d_5, d_bbr, d_keepalive, d_true, DEFAULT_QUIC_CONNS, MAX_POOL_CONNS};
+use super::tuning::{DEFAULT_QUIC_CONNS, MAX_POOL_CONNS, d_5, d_bbr, d_keepalive, d_true};
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
 

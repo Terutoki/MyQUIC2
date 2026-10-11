@@ -1987,10 +1987,11 @@ async fn recv_loopback_burst(
         if now >= deadline {
             break;
         }
-        if let Some(t) = last_at {
-            if delivered > 0 && now - t >= quiet {
-                break;
-            }
+        if let Some(t) = last_at
+            && delivered > 0
+            && now - t >= quiet
+        {
+            break;
         }
         let mut got = false;
         for s in socks {

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::limits::{DATAGRAM_BUFFER, DATAGRAM_BUFFER_BULK, DGRAM_MAX_WIRE, MQP_DGRAM_MAX};
-use crate::{TransportTuning, MAX_BIDI_STREAMS_PER_CONN};
+use crate::{MAX_BIDI_STREAMS_PER_CONN, TransportTuning};
 
 pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
     build_transport_tuned(congestion, keep_alive_secs, TransportTuning::default())

@@ -12,15 +12,15 @@
 //! `DatagramDropKind`）、同目录 `send`（`DatagramSend`、`send_udp_datagram_with_header`、
 //! `send_encoded`）均经 `crate::` / `super::` 路径引用。
 
-use super::send::{send_encoded, send_udp_datagram_with_prefix, DatagramSend, PayloadSend};
+use super::send::{DatagramSend, PayloadSend, send_encoded, send_udp_datagram_with_prefix};
 use crate::mono_millis;
 use crate::mqp::addr::TargetAddrRef;
-use crate::mqp::datagram::{DgramPrefixCache, DGRAM_PREFIX_LEN};
+use crate::mqp::datagram::{DGRAM_PREFIX_LEN, DgramPrefixCache};
 use crate::mqp::fragment::{
-    encode_fragment_with_header, FRAG_ID_SAFE_WINDOW_MS, FRAG_PREFIX_LEN, MQP_FRAG_MAX_PAYLOAD,
-    MQP_FRAG_MAX_TOTAL,
+    FRAG_ID_SAFE_WINDOW_MS, FRAG_PREFIX_LEN, MQP_FRAG_MAX_PAYLOAD, MQP_FRAG_MAX_TOTAL,
+    encode_fragment_with_header,
 };
-use crate::stats::{warn_datagram_drop, DatagramDropKind};
+use crate::stats::{DatagramDropKind, warn_datagram_drop};
 use crate::{dgram_drops, udp_stats};
 
 /// Splits oversized UDP payloads across [`MQP_DGRAM_FRAG`] frames.
@@ -256,7 +256,7 @@ impl DgramFragmenter {
                     return PayloadSend {
                         frames,
                         failed: Some(other),
-                    }
+                    };
                 }
             }
         }

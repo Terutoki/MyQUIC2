@@ -109,13 +109,13 @@ async fn socks_reader_survives_random_and_truncated_ingress() {
         // so an accepted one must be encodable. (The lenient form returns the
         // placeholder below on purpose: it parses the ignored ASSOCIATE outer
         // address, which is never encoded.)
-        if let Ok(addr) = out {
-            if !lenient {
-                assert!(
-                    addr.as_ref().header().is_ok(),
-                    "an accepted address must be encodable (case {case}): {addr:?}"
-                );
-            }
+        if let Ok(addr) = out
+            && !lenient
+        {
+            assert!(
+                addr.as_ref().header().is_ok(),
+                "an accepted address must be encodable (case {case}): {addr:?}"
+            );
         }
     }
 }
@@ -844,8 +844,8 @@ async fn egress_memo_honours_generation_and_freshness() {
         slot: 0,
     })));
     e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
-    let gen = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, gen, &conn, 1200, now);
+    let generation = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+    e.memo_store(class, generation, &conn, 1200, now);
     assert_eq!(e.with_fresh(class, now, |_, limit| limit), Some(1200));
     assert!(
         e.with_fresh(EgressClass::Bulk, now, |_, _| ()).is_none(),
@@ -895,8 +895,8 @@ async fn memo_hit_serves_a_dead_handle_and_the_send_reports_it() {
         slot: 0,
     })));
     e.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
-    let gen = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, gen, &conn, 1200, now);
+    let generation = e.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+    e.memo_store(class, generation, &conn, 1200, now);
     assert_eq!(
         e.with_fresh(class, now, |_, limit| limit),
         Some(1200),
@@ -1028,14 +1028,14 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
         slot: 0,
     })));
     e.generation[class.index()].fetch_add(1, Ordering::Release);
-    let gen = e.generation[class.index()].load(Ordering::Acquire);
-    e.memo_store(class, gen, &conn, live, now);
+    let generation = e.generation[class.index()].load(Ordering::Acquire);
+    e.memo_store(class, generation, &conn, live, now);
     for _ in 0..16 {
         assert_eq!(e.with_fresh(class, now, |_, limit| limit), Some(live));
     }
     assert_eq!(
         e.generation[class.index()].load(Ordering::Acquire),
-        gen,
+        generation,
         "memo hits must not mutate shared state"
     );
     assert!(
@@ -1498,10 +1498,10 @@ async fn dispatch_cache_does_not_own_the_relay_socket() {
     let weak_relay = Arc::downgrade(&a.entry.relay);
     hub.release(7); // the association exits: hub entry and slot released
     drop(a); // ... and its own Arc goes with the task
-             // The relay socket can still be in the global `WouldBlock` retry pool for
-             // a moment — the first send on a fresh socket is answered with
-             // `WouldBlock` on this platform — so poll briefly instead of demanding
-             // instant release.
+    // The relay socket can still be in the global `WouldBlock` retry pool for
+    // a moment — the first send on a fresh socket is answered with
+    // `WouldBlock` on this platform — so poll briefly instead of demanding
+    // instant release.
     let mut released = false;
     for _ in 0..100 {
         if weak.upgrade().is_none() && weak_relay.upgrade().is_none() {
@@ -2456,11 +2456,12 @@ async fn open_bi_failure_path_never_kills_a_fresh_connection() {
         slot.is_live(),
         "a connection published after the clear stays live"
     );
-    assert!(slot
-        .shared
-        .load()
-        .as_ref()
-        .is_some_and(|x| x.stable_id() == c.stable_id()));
+    assert!(
+        slot.shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id())
+    );
 
     // Order 2: C is already installed when the stale failure for D runs.
     let slot = ConnSlot::fresh();
@@ -2473,11 +2474,12 @@ async fn open_bi_failure_path_never_kills_a_fresh_connection() {
         "stable_id mismatch clears nothing"
     );
     assert!(slot.is_live(), "the fresh connection is untouched");
-    assert!(slot
-        .shared
-        .load()
-        .as_ref()
-        .is_some_and(|x| x.stable_id() == c.stable_id()));
+    assert!(
+        slot.shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id())
+    );
 
     // Teardown interleaving: the slot holds fresh C (live) while the
     // teardown for dead D runs. The old unconditional store + `clear_if`
@@ -2488,11 +2490,12 @@ async fn open_bi_failure_path_never_kills_a_fresh_connection() {
     slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
     slot.live.store(false, std::sync::atomic::Ordering::Relaxed);
     assert!(!slot.clear_if(&d), "D's teardown sees C and clears nothing");
-    assert!(slot
-        .shared
-        .load()
-        .as_ref()
-        .is_some_and(|x| x.stable_id() == c.stable_id()));
+    assert!(
+        slot.shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id())
+    );
     assert!(
         !slot.is_live(),
         "old teardown leaves (C, false) with no wake"
@@ -2505,11 +2508,12 @@ async fn open_bi_failure_path_never_kills_a_fresh_connection() {
         !slot.clear_if_and_mark_dead(&d),
         "D's teardown sees C and clears nothing"
     );
-    assert!(slot
-        .shared
-        .load()
-        .as_ref()
-        .is_some_and(|x| x.stable_id() == c.stable_id()));
+    assert!(
+        slot.shared
+            .load()
+            .as_ref()
+            .is_some_and(|x| x.stable_id() == c.stable_id())
+    );
     assert!(
         slot.is_live(),
         "a stale teardown must never mark the fresh connection dead"

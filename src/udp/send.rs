@@ -15,11 +15,11 @@ use futures_util::future::FutureExt;
 
 use crate::dgram_drops;
 use crate::mqp::addr::{AddrHeader, TargetAddrRef};
-use crate::mqp::batch::{encode_batch_with_header, BATCH_SMALL_MAX, MAX_BATCH_ITEMS};
+use crate::mqp::batch::{BATCH_SMALL_MAX, MAX_BATCH_ITEMS, encode_batch_with_header};
 use crate::mqp::datagram::{
-    encode_datagram_with_header, encode_datagram_with_prefix, DGRAM_PREFIX_LEN,
+    DGRAM_PREFIX_LEN, encode_datagram_with_header, encode_datagram_with_prefix,
 };
-use crate::stats::{budget_detail, warn_datagram_drop, DatagramDropKind};
+use crate::stats::{DatagramDropKind, budget_detail, warn_datagram_drop};
 
 // ---------------- QUIC DATAGRAM send (never the drop-oldest path) ----------------
 /// Outcome of [`try_send_datagram`]. Mirrors quinn's error surface, but a full

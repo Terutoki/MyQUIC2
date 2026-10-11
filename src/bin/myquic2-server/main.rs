@@ -78,7 +78,9 @@ async fn main() -> Result<()> {
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
 
     if is_placeholder_token(&c.auth_token) {
-        warn!("auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)");
+        warn!(
+            "auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)"
+        );
     }
     // Self-signed cert: auto-generate on first run (fast path, no external CA RTT).
     // Regenerate only when BOTH files are absent: silently recreating one over
@@ -126,7 +128,9 @@ async fn main() -> Result<()> {
         c.congestion, c.gso
     );
     if !c.gso {
-        warn!("gso=false requested: quinn still uses GRO/GSO if kernel supports; set only affects logging");
+        warn!(
+            "gso=false requested: quinn still uses GRO/GSO if kernel supports; set only affects logging"
+        );
     }
     let auth_token = Arc::new(c.auth_token.clone().into_bytes());
     let auth_enabled = !auth_token.is_empty();
@@ -176,16 +180,18 @@ async fn main() -> Result<()> {
              unauthenticated, and each one may pin {per_conn_bytes} B of this host's memory"
         );
     }
-    if let Some(mb) = c.max_peer_memory_mb {
-        if cap < conn_cap {
-            info!(
-                "memory budget {mb} MiB binds the connection cap: {cap} of {conn_cap} \
+    if let Some(mb) = c.max_peer_memory_mb
+        && cap < conn_cap
+    {
+        info!(
+            "memory budget {mb} MiB binds the connection cap: {cap} of {conn_cap} \
                  admitted (raise max_peer_memory_mb or lower the windows to admit more)"
-            );
-        }
+        );
     }
     if !auth_enabled {
-        warn!("auth_token is empty: the QUIC endpoint accepts any peer (rely on firewall/network isolation)");
+        warn!(
+            "auth_token is empty: the QUIC endpoint accepts any peer (rely on firewall/network isolation)"
+        );
         // Spell out the shipped-default combination, because each half looks
         // benign alone: with no token `allow_private` lets any peer make this
         // host dial its own loopback/LAN (the router's admin UI included), and
