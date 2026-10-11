@@ -1,5 +1,6 @@
 //! Inbound DATAGRAM dispatcher.
 use super::*;
+use futures_util::future::FutureExt as _;
 
 /// Direct-mapped dispatcher cache, one slot per session id modulo the table
 /// size. A collision only means the slot is re-probed, never that a packet is
@@ -530,7 +531,7 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         };
                         // Bounded QUIC-ingress drain: the awaited head plus up
                         // to LAST_HOP_DRAIN - 1 already-buffered datagrams via
-                        // poll_once (`read_datagram` is cancel-safe: a
+                        // `now_or_never` (`read_datagram` is cancel-safe: a
                         // buffered datagram returns before its first await
                         // point, and a Pending probe parks nothing — the noop
                         // waker drops with it). One wakeup moves up to 32
@@ -556,7 +557,7 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                             if staged.len() >= LAST_HOP_DRAIN * 2 {
                                 break;
                             }
-                            match poll_once(reader.as_mut()) {
+                            match reader.as_mut().now_or_never() {
                                 Some(Ok(d)) => {
                                     drained += 1;
                                     if let Some(sess) = sess_of(&d) {
@@ -579,7 +580,7 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         record_drain_batch(drained);
                         flush_staged(&mut staged, &mut hdrs, &mut offs);
                         // Saturation yields. Every extra datagram above is
-                        // served by `poll_once` with a noop waker, and quinn's
+                        // served by `now_or_never` with a noop waker, and quinn's
                         // `read_datagram` returns an already-buffered datagram
                         // before its first await point — so a *full* burst
                         // leaves this branch ready again immediately and the

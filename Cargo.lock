@@ -975,6 +975,7 @@ dependencies = [
  "bytes",
  "clap",
  "foldhash",
+ "futures-util",
  "hickory-resolver",
  "libc",
  "mimalloc",
@@ -987,11 +988,14 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "socket2",
+ "subtle",
+ "thiserror",
  "time",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 //! Admission limits: connection/dial/stream caps and the per-connection handler.
 use super::*;
+use futures_util::future::FutureExt as _;
 
 /// Hard process-wide bounds: new QUIC connections are refused past this count
 /// and new UDP sessions borrow from a shared permit pool, so a single peer
@@ -476,7 +477,7 @@ pub(crate) async fn handle_conn(
             };
             // Bounded drain (mirrors the client dispatcher): the awaited head
             // plus up to `LAST_HOP_DRAIN - 1` already-buffered datagrams via
-            // `poll_once` (`read_datagram` is cancel-safe: a buffered datagram
+            // `now_or_never` (`read_datagram` is cancel-safe: a buffered datagram
             // returns before its first await point, and a Pending probe parks
             // nothing). One wakeup moves up to 32 datagrams; the fast path
             // stages its target send and the burst flushes grouped per
@@ -492,7 +493,7 @@ pub(crate) async fn handle_conn(
                         if drained >= LAST_HOP_DRAIN {
                             break 'burst;
                         }
-                        match poll_once(reader.as_mut()) {
+                        match reader.as_mut().now_or_never() {
                             Some(Ok(d)) => {
                                 drained += 1;
                                 d
@@ -660,7 +661,7 @@ pub(crate) async fn handle_conn(
             flush_staged_sends(&mut staged);
             record_drain_batch(drained);
             // Saturation yields: the extra datagrams of a burst are served by
-            // `poll_once` with a noop waker, and quinn returns an
+            // `now_or_never` with a noop waker, and quinn returns an
             // already-buffered datagram before its first await point, so a
             // *full* burst leaves this branch ready again at once and the task
             // would hold its worker indefinitely. A full burst is exactly the

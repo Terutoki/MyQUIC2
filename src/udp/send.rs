@@ -2,7 +2,6 @@
 //!
 //! 搬运区间（以符号为准）：
 //! - `DatagramSend`：旧 lib.rs `DatagramSend` 全体（含分隔线与文档）
-//! - `poll_once`：旧 lib.rs `poll_once` 全体
 //! - `try_send_datagram`：旧 lib.rs `try_send_datagram` 全体
 //! - `send_udp_datagram` / `send_udp_datagram_with_header` / `send_encoded`：旧 lib.rs 同名项
 //! - `PayloadSend`：旧 lib.rs `PayloadSend` 全体
@@ -11,10 +10,8 @@
 //! `stats`（`dgram_drops::*`、`udp_stats::payload`、`warn_datagram_drop`、
 //! `DatagramDropKind`、`budget_detail`）均经 `crate::` 绝对路径引用。
 
-use std::future::Future;
-use std::task::{Context as TaskContext, Poll, Waker};
-
 use bytes::Bytes;
+use futures_util::future::FutureExt;
 
 use crate::dgram_drops;
 use crate::mqp::addr::{AddrHeader, TargetAddrRef};
@@ -41,50 +38,6 @@ pub enum DatagramSend {
     Unsupported,
     /// The connection is gone; the caller should tear the flow down.
     ConnectionLost,
-}
-
-/// Poll a future exactly once with a no-op waker.
-///
-/// Sound for futures that are polled to completion elsewhere or dropped right
-/// after: a `Pending` result may leave a waker registered, but the no-op waker
-/// is a valid `RawWaker` and the future is dropped immediately, so nothing is
-/// ever woken on a dangling task.
-///
-/// Cancellation-safety for the one caller ([`try_send_datagram`], verified
-/// against quinn 0.11.12 `connection.rs` `SendDatagram`): on `Blocked` quinn
-/// puts the datagram bytes back into the future (`this.data.replace(data)`)
-/// and parks on `datagrams_unblocked.notified()` (tokio `Notified`, whose
-/// `Drop` unregisters the waiter). Dropping the future after `Pending` therefore
-/// drops the bytes with it and leaves no waiter behind — no byte-count drift,
-/// no notify-queue residue. `cancelled_datagram_waits_leave_no_residue` pins this.
-///
-/// Primitive behind [`try_send_datagram`]: `send_datagram_wait` takes quinn's
-/// connection-state mutex on every poll, so the non-blocking variant has to be
-/// able to ask once without parking a task.
-///
-/// N=1 AUDIT (quinn 0.11.12 `connection.rs`, verified against the registry
-/// source): `send_datagram` takes the state lock exactly once
-/// (`state.lock("send_datagram")`, `datagrams().send(data, true)`), and
-/// `SendDatagram::poll` — the only thing `poll_once` below drives — takes it
-/// exactly once per poll (`state.lock("SendDatagram::poll")`,
-/// `datagrams().send(data, false)`). Both are therefore 1 take per frame; the
-/// irreducible per-frame mutex lives inside quinn and cannot be removed from
-/// here. This wrapper keeps `send_datagram_wait` (not `send_datagram`) because
-/// only the wait variant reports a full buffer as `Blocked`: `send_datagram`
-/// silently evicts the oldest queued datagram and returns `Ok`, which would
-/// erase the per-connection newest-drop accounting (see below, send.rs:88-97).
-/// Shared with the last-hop drain loops: `read_datagram` is likewise
-/// cancel-safe (a buffered datagram is returned before its first await point),
-/// so the dispatchers drain up to 31 already-buffered datagrams per wakeup
-/// through this instead of one wakeup per datagram.
-pub fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
-    let mut fut = std::pin::pin!(fut);
-    let waker = Waker::noop();
-    let mut cx = TaskContext::from_waker(waker);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => Some(v),
-        Poll::Pending => None,
-    }
 }
 
 /// Non-blocking DATAGRAM send that MUST be used instead of quinn's
@@ -114,15 +67,29 @@ pub fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
 /// per-connection drop accounting. Bytes are copied per datagram regardless
 /// (quinn assembles each datagram frame with `extend_from_slice`), so this costs
 /// nothing extra.
+///
+/// The single non-blocking poll is `FutureExt::now_or_never` (one poll with a
+/// no-op waker; on `Pending` the future is dropped immediately, so nothing is
+/// ever woken on a dangling task). Cancellation safety was verified against
+/// quinn 0.11.12 `connection.rs` `SendDatagram`: on `Blocked` quinn puts the
+/// datagram bytes back into the future (`this.data.replace(data)`) and parks
+/// on `datagrams_unblocked.notified()` (tokio `Notified`, whose `Drop`
+/// unregisters the waiter), so dropping the future after `Pending` drops the
+/// bytes with it and leaves no waiter behind — no byte-count drift, no
+/// notify-queue residue (`cancelled_datagram_waits_leave_no_residue` pins
+/// this). `send_datagram_wait` takes the connection-state mutex on every poll
+/// (`send_datagram` and `SendDatagram::poll` each take it exactly once per
+/// frame; that irreducible mutex lives inside quinn), so the non-blocking
+/// variant has to be able to ask once without parking a task.
 pub fn try_send_datagram(conn: &quinn::Connection, d: Bytes) -> DatagramSend {
-    match poll_once(conn.send_datagram_wait(d)) {
+    match conn.send_datagram_wait(d).now_or_never() {
         Some(Ok(())) => DatagramSend::Sent,
         Some(Err(quinn::SendDatagramError::TooLarge)) => DatagramSend::TooLarge,
         Some(Err(quinn::SendDatagramError::UnsupportedByPeer)) => DatagramSend::Unsupported,
         Some(Err(quinn::SendDatagramError::ConnectionLost(_))) => DatagramSend::ConnectionLost,
         Some(Err(quinn::SendDatagramError::Disabled)) => DatagramSend::ConnectionLost,
         // Full send buffer: `send_datagram_wait` parks the datagram in its own
-        // future, which `poll_once` drops here, so nothing leaks.
+        // future, which `now_or_never` drops here, so nothing leaks.
         None => DatagramSend::Blocked,
     }
 }

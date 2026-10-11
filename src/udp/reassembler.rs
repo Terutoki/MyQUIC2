@@ -13,7 +13,6 @@
 //! 均经 `crate::` 绝对路径引用。
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 
 use bytes::Bytes;
 
@@ -24,95 +23,20 @@ use crate::mqp::fragment::{
 };
 use crate::udp_stats;
 
-/// Golden-ratio 64-bit odd multiplier (the constant the rest of this crate's
-/// hand-rolled folds use: `udp::retry::retry_shard_for`, `dns::memo`).
-const FRAG_HASH_K: u64 = 0x9e37_79b9_7f4a_7c15;
-
-/// Multiply-fold hasher for the reassembler's `(u32, u16)` keys.
+/// `(sess, frag_id)` map on [`foldhash::fast::RandomState`] — the same hasher
+/// every other packet-adjacent table in this crate uses (see the `foldhash`
+/// note in Cargo.toml).
 ///
-/// The std default is `RandomState` (SipHash-1-3) and one fragment probes the
-/// tables five to eight times — stale-replay probe, count cap, payload cap,
-/// restart probe, `entry`, removal, tombstone insert — which made key hashing
-/// the largest single item on the per-fragment receive path, comparable to the
-/// chunk copy itself. The key is six bytes of peer-chosen session id and
-/// fragment id, so the fold has to mix both words (a session-only hash would
-/// collapse every id of one session into one bucket); collisions still only
-/// cost a probe, because the map compares the full key and can never mis-serve.
-///
-/// `finish` finalizes SplitMix-style so the *high* bits vary too: hashbrown
-/// takes the bucket index from the low bits and the 7-bit control fingerprint
-/// from the top, and a bare multiply leaves the top bits a weak function of the
-/// inputs.
-///
-/// The state starts from a **per-process secret**, exactly as `RandomState`
-/// did: the keys are peer-chosen (session id and fragment id come off the
-/// wire), so a fixed fold would let a peer pre-compute a colliding set and turn
-/// every probe into a bounded-but-real compare chain. The seed comes from the
-/// process's own address-space and start time rather than a CSPRNG, which is
-/// all that unguessability requires here — and unlike `RandomState` it is one
-/// multiply-fold per probe instead of SipHash over five to eight probes.
-pub(crate) struct FragKeyHasher(u64);
-
-/// Per-process hash seed (see [`FragKeyHasher`]).
-///
-/// A `OnceLock` rather than per-`build_hasher` randomness: hashbrown calls
-/// `build_hasher()` once per lookup, and a fresh seed each time would make every
-/// probe miss.
-fn frag_hash_seed() -> u64 {
-    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SEED.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(FRAG_HASH_K);
-        // ASLR: a stack local's address is not predictable from outside.
-        let local = 0u8;
-        let addr = std::ptr::addr_of!(local) as u64;
-        nanos
-            .wrapping_mul(FRAG_HASH_K)
-            .rotate_left(29)
-            .wrapping_add(addr.rotate_left(13))
-            .wrapping_add((std::process::id() as u64).rotate_left(47))
-    })
-}
-
-impl Default for FragKeyHasher {
-    fn default() -> Self {
-        Self(frag_hash_seed())
-    }
-}
-
-impl Hasher for FragKeyHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        let mut h = self.0;
-        h ^= h >> 29;
-        h = h.wrapping_mul(FRAG_HASH_K);
-        h ^ (h >> 32)
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        // Not reached by `(u32, u16)` (which hashes through `write_u32` /
-        // `write_u16`); kept correct for any future key type.
-        for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(FRAG_HASH_K);
-        }
-    }
-
-    #[inline]
-    fn write_u32(&mut self, v: u32) {
-        self.0 = (self.0 ^ v as u64).wrapping_mul(FRAG_HASH_K);
-    }
-
-    #[inline]
-    fn write_u16(&mut self, v: u16) {
-        self.0 = (self.0 ^ v as u64).wrapping_mul(FRAG_HASH_K);
-    }
-}
-
-/// `(sess, frag_id)` map with [`FragKeyHasher`].
-type FragMap<V> = HashMap<(u32, u16), V, BuildHasherDefault<FragKeyHasher>>;
+/// The key is six bytes of peer-chosen session id and fragment id, and one
+/// fragment probes the tables five to eight times (stale-replay probe, count
+/// cap, payload cap, restart probe, `entry`, removal, tombstone insert), so
+/// key hashing must be a fast fold rather than SipHash — and because the keys
+/// come off the wire, the state must carry a random seed so a peer cannot
+/// pre-compute a colliding set. `foldhash`'s `RandomState` seeds each map
+/// instance independently (one `HashMap::default()` per field below), and a
+/// collision still only costs a probe: the map compares the full key and can
+/// never mis-serve.
+type FragMap<V> = HashMap<(u32, u16), V, foldhash::fast::RandomState>;
 
 /// A partially reassembled datagram.
 pub(crate) struct Partial {

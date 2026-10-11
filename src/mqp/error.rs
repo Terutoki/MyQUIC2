@@ -26,11 +26,12 @@
 
 /// A decode/validation failure of the MQP-2 codec, constructible without a
 /// heap allocation (see the module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MqpError {
     /// Shape/framing failure: truncated field, wrong frame type, trailing
     /// bytes. The static text names the failed check and matches the
     /// `anyhow::bail!` message it replaced.
+    #[error("{0}")]
     Malformed(&'static str),
     /// A structurally readable field refused by policy: an unspecified or
     /// scoped address, an empty or over-long domain name. Distinct from
@@ -38,30 +39,21 @@ pub enum MqpError {
     /// operator (a hostile/buggy peer versus a target this tunnel will not
     /// dial), mirroring the `Refused`-vs-budget split the drop counters
     /// already make.
+    #[error("{0}")]
     Refused(&'static str),
     /// Unknown address-type byte (`atyp`) in an MQP-2 address header.
+    #[error("bad atyp {0}")]
     BadAtyp(u8),
     /// Unknown bound-address `atyp` in the TCP-open ACK.
+    #[error("bad bnd atyp {0}")]
     BadBndAtyp(u8),
     /// Domain bytes are not valid UTF-8.
+    #[error("bad domain utf8")]
     BadDomainUtf8,
     /// A BATCH frame named an item count outside `1..=MAX_BATCH_ITEMS`.
+    #[error("bad batch count {0}")]
     BadBatchCount(u8),
 }
-
-impl std::fmt::Display for MqpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MqpError::Malformed(m) | MqpError::Refused(m) => f.write_str(m),
-            MqpError::BadAtyp(a) => write!(f, "bad atyp {a}"),
-            MqpError::BadBndAtyp(a) => write!(f, "bad bnd atyp {a}"),
-            MqpError::BadDomainUtf8 => f.write_str("bad domain utf8"),
-            MqpError::BadBatchCount(c) => write!(f, "bad batch count {c}"),
-        }
-    }
-}
-
-impl std::error::Error for MqpError {}
 
 #[cfg(test)]
 mod tests {

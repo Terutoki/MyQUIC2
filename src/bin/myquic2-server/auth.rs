@@ -1,5 +1,7 @@
 //! Client authentication (token) and auth-phase deadlines.
 use super::*;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Wall-clock budget for the handshake wait of a connection that holds
 /// one of the [`MAX_UNAUTH_CONNECTIONS`] slots. The token exchange gets its
@@ -37,25 +39,13 @@ pub(crate) async fn authenticate(
     })
     .await
     .context("auth timeout")??;
-    if !ct_eq(&got, expected) {
+    // Wipe the received bytes on drop: a bearer secret should not linger in a
+    // freed heap block.
+    let got = Zeroizing::new(got);
+    // Constant-time per-byte compare; a length mismatch folds into the result,
+    // so only *whether* the lengths differ is revealed, never the token bytes.
+    if !bool::from(got.ct_eq(expected)) {
         anyhow::bail!("auth token mismatch");
     }
     Ok(())
-}
-
-/// Constant-time token compare that never short-circuits on the first
-/// mismatching byte: mismatched lengths contribute a single flag and the loop
-/// runs over `max(len)` bytes with zero padding.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    // Length inequality is folded in as a 0/1 flag: casting `(len_a ^ len_b)`
-    // to u8 could wrap to 0 for lengths 256 apart (e.g. 256 vs 0) and compare
-    // equal if every common byte matched. Only *whether* the lengths differ
-    // is revealed, never the token bytes.
-    let mut diff = if a.len() == b.len() { 0u8 } else { 1u8 };
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
 }

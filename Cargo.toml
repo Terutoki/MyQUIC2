@@ -71,15 +71,39 @@ arc-swap = "1"
 parking_lot = "0.12"
 # foldhash: the hasher for every in-process ad-hoc table whose keys are short
 # and peer-influenced (server session table, client hub, DNS caches/inflight,
-# the interactive-port set). std's SipHash-1-3 default costs ~5-8 ns per
-# 4-byte lookup where this measures ~1-2 ns, and unlike `rustc-hash` (also in
-# the tree) its `RandomState` carries a per-instance random seed, so a peer
-# cannot precompute a colliding set — the same argument `FragKeyHasher`
-# (udp/reassembler.rs) documents for its per-process secret. Already linked
-# transitively (fastbloom -> quinn-proto), so declaring it adds no compile
-# unit; `SipHash` remains only where a table is keyed by something longer
-# than a few bytes or is genuinely cold.
+# the fragment reassembler's `(sess, id)` tables, the interactive-port set).
+# std's SipHash-1-3 default costs ~5-8 ns per 4-byte lookup where this
+# measures ~1-2 ns, and unlike `rustc-hash` (also in the tree) its
+# `RandomState` carries a per-instance random seed, so a peer cannot
+# precompute a colliding set. Already linked transitively (fastbloom ->
+# quinn-proto), so declaring it adds no compile unit; `SipHash` remains only
+# where a table is keyed by something longer than a few bytes or is genuinely
+# cold.
 foldhash = "0.2"
+# futures-util: only `FutureExt::now_or_never`, the single non-blocking poll
+# the DATAGRAM paths drive quinn's `send_datagram_wait` and `read_datagram`
+# with (it replaced the hand-written `poll_once`). Already linked transitively
+# (moka and hickory pull it), and `std` is a subset of the features the graph
+# already enables, so the direct edge adds no compile unit.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# subtle: `ConstantTimeEq` for the auth-token comparison (replaces the
+# hand-rolled `ct_eq` with the audited dalek-cryptography implementation).
+# Already linked transitively by rustls at the same version, so the direct
+# edge adds no compile unit; no default features are requested, so the feature
+# set stays whatever rustls already selected.
+subtle = { version = "2.6", default-features = false }
+# zeroize: wipes the received auth-token buffer once compared (a bearer secret
+# should not linger in freed heap memory; the client-side config token is a
+# process-lifetime `String` and stays out of scope here). Already linked
+# transitively (aws-lc-rs / rustls) with the `alloc` feature this uses, so the
+# direct edge adds no compile unit.
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+# thiserror: derive-only `Display`/`Error` for `mqp::error::MqpError`,
+# replacing the hand-written impls (the derive keeps construction
+# allocation-free: `Copy` variants carrying only `&'static str` / `u8`).
+# Already linked transitively (quinn, hickory), so the direct edge adds no
+# compile unit.
+thiserror = "2"
 quanta = "0.13"
 # Moka: the DNS caches and single-flight, replacing the hand-written
 # sharded tables, batch eviction, owner/waiter protocol and the coalesce

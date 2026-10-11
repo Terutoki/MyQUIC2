@@ -9,7 +9,6 @@ pub use batch::{
     sendmmsg_available, SendFrame, BURST_SLOT,
 };
 pub use batch::{record_drain_batch, record_extra_syscalls, record_send_group, LAST_HOP_DRAIN};
-pub use send::poll_once;
 
 pub(crate) use fragmenter::frag_id_reuse_blocked;
 pub use fragmenter::DgramFragmenter;
