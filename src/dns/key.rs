@@ -1,28 +1,12 @@
-//! DNS cache key — extracted verbatim from `src/lib.rs` (zero-logic-change split).
-//! Source lines: DnsCacheKey/DnsCacheVal/DNS_KEY_BUF/dns_name_bytes/
-//! dns_key_owned/dns_key/DNS_SHARDS/dns_shard. `lib.rs` untouched.
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
-
-/// Cache key encoding: `host` bytes + NUL separator + decimal port. This is
-/// injective (the decimal port never contains NUL, so splitting at the last
-/// NUL recovers the exact host/port), so it is safe to build on the stack and
-/// look up with the borrowed `&str` form of `HashMap<String, _>` — no `String`
-/// allocation on the per-datagram hot path.
-pub(crate) type DnsCacheKey = String;
-/// `Arc<[SocketAddr]>` so cache hits and single-flight waiters clone a
-/// refcount instead of duplicating the address vector.
-pub(crate) type DnsCacheVal = (Instant, Arc<[SocketAddr]>);
+//! DNS cache key construction.
+//!
+//! The key encoding is `host` bytes + NUL separator + decimal port. This is
+//! injective (the decimal port never contains NUL, so splitting at the last
+//! NUL recovers the exact host/port), so it is safe to build on the stack and
+//! look up with the borrowed `&str` form of a `String` key — no `String`
+//! allocation on the per-datagram hot path. Moka's `Equivalent`-based lookups
+//! (`get`, `try_get_with_by_ref`) accept exactly this borrowed form.
 pub(crate) const DNS_KEY_BUF: usize = 255 + 1 + 5;
-
-/// The positive/negative cache, inflight and coalesce tables' map type.
-///
-/// One alias so the hasher choice cannot drift between the four: the keys are
-/// short (host+port) and target names come off the wire, so the hasher must be
-/// fast *and* randomly seeded — see the `foldhash` note in `Cargo.toml`.
-pub(crate) type DnsMap<V> = HashMap<DnsCacheKey, V, foldhash::fast::RandomState>;
 
 /// Normalize a DNS name for cache keys: DNS is case-insensitive and an
 /// absolute (trailing-dot) name is equivalent to its relative form.
@@ -76,23 +60,4 @@ pub(crate) fn dns_key<'a>(
     buf[pos..pos + (5 - i)].copy_from_slice(&digits[i..]);
     pos += 5 - i;
     std::str::from_utf8(&buf[..pos]).ok()
-}
-
-/// Shard count for the DNS tables. A single global `RwLock`/`Mutex` puts every
-/// packet-path reader on one reader count / one mutex cache line; sharding by
-/// key keeps the per-entry critical sections identical while spreading
-/// cross-core contention, the same pattern as the server session table and the
-/// client dispatcher hub.
-pub(crate) const DNS_SHARDS: usize = 16;
-
-/// Key-hash shard selector. Manual fold (no SipHash): this runs on the
-/// per-packet path and only needs spreading, not DoS resistance (keys are
-/// DNS names, and a collision only shares a lock, never a cache entry).
-pub(crate) fn dns_shard(key: &str) -> usize {
-    const K: u64 = 0x9e3779b97f4a7c15;
-    let mut h: u64 = 0;
-    for b in key.as_bytes() {
-        h = h.wrapping_mul(K).wrapping_add(*b as u64);
-    }
-    (h as usize) % DNS_SHARDS
 }

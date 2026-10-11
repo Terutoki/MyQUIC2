@@ -58,11 +58,9 @@ pub(crate) fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             if dd.lost() > 0 {
                 info!(
-                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} dropped (session cap), {} dropped (DNS slow-path budget), {} refused (policy); totals too_large={} buffer_full={} no_egress={} egress_dead={} dns_inflight={} dns_contention={} session_full={} dns_budget={} refused={}",
+                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (session cap), {} dropped (DNS slow-path budget), {} refused (policy); totals too_large={} buffer_full={} no_egress={} egress_dead={} session_full={} dns_budget={} refused={}",
                     dd.no_egress,
                     dd.egress_dead,
-                    dd.dns_inflight,
-                    dd.dns_contention,
                     dd.session_full,
                     dd.dns_budget,
                     dd.refused,
@@ -70,8 +68,6 @@ pub(crate) fn spawn_udp_reporter() {
                     now_d.buffer_full,
                     now_d.no_egress,
                     now_d.egress_dead,
-                    now_d.dns_inflight,
-                    now_d.dns_contention,
                     now_d.session_full,
                     now_d.dns_budget,
                     now_d.refused

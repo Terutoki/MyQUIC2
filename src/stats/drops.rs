@@ -24,12 +24,6 @@ pub mod dgram_drops {
     /// is out of capacity", this is "one busy client hit its cap". A datagram
     /// dropped here is still lost, so it counts in `lost()`.
     pub static FAIR_SHARE: AtomicU64 = AtomicU64::new(0);
-    /// The name's resolution was already in flight, so this datagram was
-    /// dropped rather than queued behind it (single-flight delivers only the
-    /// packet that spawned the resolver). Counted apart from `SESSION_FULL`
-    /// because charging relay loss to a budget counter is exactly the
-    /// misreport that counter's note warns about.
-    pub static DNS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
     /// The **DNS slow-path limiter** (1024 permits, shared with the server's
     /// TCP dial path) was exhausted, so this datagram was dropped before any
     /// resolution was attempted.
@@ -41,13 +35,6 @@ pub mod dgram_drops {
     /// unrelated fault look like capacity exhaustion in the 60 s line — and on
     /// the TCP side the same pool's exhaustion silently reset a CONNECT.
     pub static DNS_BUDGET: AtomicU64 = AtomicU64::new(0);
-    /// The single-flight shard mutex (probe or registration) was contended, so
-    /// nothing was known and the caller took the spawn path instead of waiting.
-    /// Counted apart from `DNS_INFLIGHT` (which means "another resolution owns
-    /// this name") because lock contention is not resolution in flight, and
-    /// apart from `SESSION_FULL` because no budget was exhausted. Batched like
-    /// the other flood-type counters: a miss storm contends every datagram.
-    pub static DNS_CONTENTION: AtomicU64 = AtomicU64::new(0);
     /// No usable egress connection at the moment the datagram was ready: its
     /// egress class's dedicated UDP connection had not come up yet, was
     /// reconnecting, or the class's single-flight refresh was already owned by
@@ -89,7 +76,7 @@ pub mod dgram_drops {
     pub static SESS_CREATE_FAILED: AtomicU64 = AtomicU64::new(0);
 
     /// Every drop counter in one read, so the 60 s report cannot silently omit
-    /// one. Named fields rather than a tuple: an 11-tuple read at two call sites
+    /// one. Named fields rather than a tuple: a tuple read at two call sites
     /// is exactly the shape that pairs a socket with the wrong field elsewhere
     /// in this codebase (see the client's `SessEntry` note).
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,8 +86,6 @@ pub mod dgram_drops {
         pub session_full: u64,
         pub dns_budget: u64,
         pub fair_share: u64,
-        pub dns_inflight: u64,
-        pub dns_contention: u64,
         pub no_egress: u64,
         pub egress_dead: u64,
         pub unknown_sess: u64,
@@ -117,8 +102,6 @@ pub mod dgram_drops {
                 session_full: d(self.session_full, prev.session_full),
                 dns_budget: d(self.dns_budget, prev.dns_budget),
                 fair_share: d(self.fair_share, prev.fair_share),
-                dns_inflight: d(self.dns_inflight, prev.dns_inflight),
-                dns_contention: d(self.dns_contention, prev.dns_contention),
                 no_egress: d(self.no_egress, prev.no_egress),
                 egress_dead: d(self.egress_dead, prev.egress_dead),
                 unknown_sess: d(self.unknown_sess, prev.unknown_sess),
@@ -142,8 +125,6 @@ pub mod dgram_drops {
                 .saturating_add(self.session_full)
                 .saturating_add(self.dns_budget)
                 .saturating_add(self.fair_share)
-                .saturating_add(self.dns_inflight)
-                .saturating_add(self.dns_contention)
                 .saturating_add(self.no_egress)
                 .saturating_add(self.egress_dead)
                 .saturating_add(self.refused)
@@ -163,8 +144,6 @@ pub mod dgram_drops {
             session_full: SESSION_FULL.load(Ordering::Relaxed),
             dns_budget: DNS_BUDGET.load(Ordering::Relaxed),
             fair_share: FAIR_SHARE.load(Ordering::Relaxed),
-            dns_inflight: DNS_INFLIGHT.load(Ordering::Relaxed),
-            dns_contention: DNS_CONTENTION.load(Ordering::Relaxed),
             no_egress: NO_EGRESS.load(Ordering::Relaxed),
             egress_dead: EGRESS_DEAD.load(Ordering::Relaxed),
             unknown_sess: UNKNOWN_SESS.load(Ordering::Relaxed),
@@ -198,12 +177,6 @@ pub mod dgram_drops {
                 FAIR_SHARE.fetch_add(v, Ordering::Relaxed);
             }
         });
-        L_DNS_INFLIGHT.with(|c| {
-            let v = c.replace(0);
-            if v != 0 {
-                DNS_INFLIGHT.fetch_add(v, Ordering::Relaxed);
-            }
-        });
         L_UNKNOWN_SESS.with(|c| {
             let v = c.replace(0);
             if v != 0 {
@@ -229,7 +202,6 @@ pub mod dgram_drops {
         static L_BUFFER_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESSION_FULL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_FAIR_SHARE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        static L_DNS_INFLIGHT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_UNKNOWN_SESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         static L_SESS_CREATE_FAILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

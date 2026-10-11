@@ -134,18 +134,14 @@ pub(crate) fn spawn_udp_reporter() {
             if dd.session_full > 0
                 || dd.dns_budget > 0
                 || dd.fair_share > 0
-                || dd.dns_inflight > 0
-                || dd.dns_contention > 0
                 || dd.sess_create_failed > 0
                 || dd.refused > 0
             {
                 info!(
-                    "udp budget (60s): {} dropped (session cap), {} dropped (DNS slow-path budget), {} dropped (connection fair share), {} dropped (resolution in flight), {} dropped (DNS lock contention), {} dropped (session setup failed), {} refused (policy); totals too_large={} buffer_full={} session_full={} dns_budget={} fair_share={} dns_inflight={} dns_contention={} sess_create_failed={} refused={}",
+                    "udp budget (60s): {} dropped (session cap), {} dropped (DNS slow-path budget), {} dropped (connection fair share), {} dropped (session setup failed), {} refused (policy); totals too_large={} buffer_full={} session_full={} dns_budget={} fair_share={} sess_create_failed={} refused={}",
                     dd.session_full,
                     dd.dns_budget,
                     dd.fair_share,
-                    dd.dns_inflight,
-                    dd.dns_contention,
                     dd.sess_create_failed,
                     dd.refused,
                     now_d.too_large,
@@ -153,8 +149,6 @@ pub(crate) fn spawn_udp_reporter() {
                     now_d.session_full,
                     now_d.dns_budget,
                     now_d.fair_share,
-                    now_d.dns_inflight,
-                    now_d.dns_contention,
                     now_d.sess_create_failed,
                     now_d.refused
                 );

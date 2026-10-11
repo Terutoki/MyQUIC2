@@ -87,22 +87,16 @@ pub use transport::{
 /// DNS internals through the crate root (`use super::*`).
 #[allow(unused_imports)]
 pub(crate) use dns::{
-    dns_cache_for, dns_inflight_for, dns_key, dns_key_owned, dns_memo_hash, dns_memo_set,
-    dns_neg_cache_for, dns_shard, memo_peek_both, memo_put, positive_entry_state, record_negative,
-    DnsMemoSlot, PositiveState, DNS_CACHE_MAX, DNS_CACHE_MAX_SHARD, DNS_KEY_BUF, DNS_MEMO,
-    DNS_NEG_MAX, DNS_NEG_MAX_SHARD, DNS_SHARDS, MEMO_KEY_BYTES, MEMO_SETS, MEMO_WAYS,
+    bump_neg_epoch, dns_key, dns_key_owned, dns_memo_hash, dns_memo_set, memo_peek_both, memo_put,
+    neg_epoch, negatives, positives, DnsMemoSlot, DNS_CACHE_MAX, DNS_KEY_BUF, DNS_MEMO,
+    DNS_NEG_MAX, DNS_NEG_TTL, MEMO_KEY_BYTES, MEMO_SETS, MEMO_WAYS,
 };
 pub use dns::{
-    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_coalesce_drop, dns_coalesce_take,
-    dns_coalesce_take_now, dns_coalesce_try_push, dns_coalesce_try_push_to, dns_inflight_seed,
-    dns_inflight_status, dns_inflight_unseed, dns_is_inflight, dns_neg_cache_seed,
-    dns_slow_path_limiter, ip_preference, is_dns_contended, is_global_ip, lookup_cached_all_fast,
-    lookup_cached_all_fast_with_ttl, lookup_cached_fast, lookup_cached_fast_with_ttl,
-    lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
-    resolve_all_cached_with_contention_retry, resolve_server_addr, resolve_server_side,
-    set_ip_preference, unmap, CachedLookup, CoalesceOutcome, DnsCoalesceGuard, DnsCoalesceQueue,
-    DnsCoalesced, DnsContended, DnsInflight, IpPreference, DNS_CACHE_TTL_MS, DNS_COALESCE_CAP,
-    DNS_LOOKUP_TIMEOUT,
+    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed,
+    dns_slow_path_limiter, ip_preference, is_global_ip, lookup_cached_fast,
+    lookup_cached_fast_with_ttl, lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
+    resolve_server_addr, resolve_server_side, set_ip_preference, unmap, CachedLookup, IpPreference,
+    DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT,
 };
 pub use stats::drops::dgram_drops;
 pub use stats::udp_stats::{self, UdpSnapshot};
@@ -697,18 +691,20 @@ mod tests {
         assert!(neg2.is_none());
     }
 
-    /// A negative *memo* entry must not outlive the global negative entry it was
-    /// derived from.
+    /// A negative *memo* entry must not outlive the shared negative verdict it
+    /// was derived from.
     ///
-    /// The memo is thread-private, and `resolve_all_cached`'s success path can
-    /// only clear the global entry plus the resolving thread's own memo — so a
+    /// The memo is thread-private, and a resolution's success can only remove
+    /// the shared negative entry plus the resolving thread's own memo — so a
     /// name that failed on one worker and then resolved on another stayed
     /// refused on the failing worker for the rest of `DNS_NEG_TTL`: every
     /// datagram for it dropped as `REFUSED`, every TCP flow failing with
-    /// "dns negative cached", while the cache held a valid address. Two real
-    /// threads drive the hole (it is cross-thread by construction), and the
-    /// negative memo is produced by [`dns_neg_cache_seed`] rather than a live
-    /// resolver failure so the test needs no network.
+    /// "dns negative cached". The `NEG_EPOCH` tag closes that: after another
+    /// worker resolves the name, this worker's memo entry is stale and its
+    /// lookup falls back to the shared caches — which the sync layer is
+    /// memo-only, so the observable is `Unknown` (hand the datagram to the
+    /// async path), never `Negative`. Two real threads drive the hole (it is
+    /// cross-thread by construction); the seeds need no network.
     #[test]
     fn a_resolution_invalidates_another_threads_negative_memo() {
         let (host, port) = ("neg-memo-coherence.test", 19056u16);
@@ -717,9 +713,15 @@ mod tests {
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
 
         let w = std::thread::spawn(move || {
+            // A current-thread runtime drives the async seed on THIS worker,
+            // so the negative memo is written to this thread's memo.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             // Premise: nothing is known about this name on this thread.
             assert_eq!(lookup_cached_fast(host, port), CachedLookup::Unknown);
-            dns_neg_cache_seed(host, port);
+            rt.block_on(dns_neg_cache_seed(host, port));
             assert_eq!(
                 lookup_cached_fast(host, port),
                 CachedLookup::Negative,
@@ -732,106 +734,23 @@ mod tests {
 
         ready_rx.recv().unwrap();
         // Another worker resolves the same name successfully.
-        dns_cache_seed(host, port, addr);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(dns_cache_seed(host, port, addr));
         assert_eq!(
             lookup_cached_fast(host, port),
             CachedLookup::Addr(addr),
-            "a fresh positive entry answers on a thread with no stale memo"
+            "a fresh positive seed answers on the seeding thread"
         );
         go_tx.send(()).unwrap();
         assert_eq!(
             w.join().unwrap(),
-            CachedLookup::Addr(addr),
-            "a successful resolution must invalidate another thread's negative memo"
-        );
-    }
-
-    /// A transient resolver failure must not downgrade a still-valid positive
-    /// answer into a negative one.
-    ///
-    /// The positive probes on the resolution path are `try_lock_read`, so a
-    /// contended-but-valid entry reaches the upstream lookup; if that lookup
-    /// fails, the old code wrote a negative cache entry *and* a negative
-    /// thread-local memo entry unconditionally. `lookup_cached_fast` consults
-    /// the memo first and one memo set holds one slot per key, so every datagram
-    /// for that name was then refused for `DNS_NEG_TTL` (10 s) and every TCP
-    /// flow failed with "dns negative cached" — while the cached address was
-    /// still good. `record_negative` is the gate; this pins both directions.
-    #[test]
-    fn transient_resolution_failure_does_not_poison_a_fresh_positive_entry() {
-        memo_reset();
-        let addr: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let (host, port) = ("poison-guard.test", 19053u16);
-        dns_cache_seed(host, port, addr);
-        let mut kbuf = [0u8; DNS_KEY_BUF];
-        let key = dns_key(host, port, &mut kbuf).unwrap().to_owned();
-        assert!(
-            matches!(positive_entry_state(&key), PositiveState::Fresh),
-            "test premise: positive is fresh"
-        );
-
-        // The failure the owner observed is recorded, but must not shadow the
-        // live positive answer.
-        record_negative(&key, Instant::now());
-        assert_eq!(
-            lookup_cached_fast(host, port),
-            CachedLookup::Addr(addr),
-            "a fresh positive entry must survive a transient resolver failure"
-        );
-        assert!(
-            lock_read(dns_neg_cache_for(&key)).get(&key).is_none(),
-            "no negative entry may be written over a live positive one"
-        );
-        assert!(
-            memo_peek_both(&key).1.is_none(),
-            "no negative memo entry may shadow a live positive one"
-        );
-
-        // Positive control: with no fresh positive answer, the failure *is*
-        // recorded and the packet path refuses the name without a lookup.
-        let (miss_host, miss_port) = ("poison-guard-miss.test", 19054u16);
-        let mut kbuf2 = [0u8; DNS_KEY_BUF];
-        let miss_key = dns_key(miss_host, miss_port, &mut kbuf2)
-            .unwrap()
-            .to_owned();
-        assert!(matches!(
-            positive_entry_state(&miss_key),
-            PositiveState::Absent
-        ));
-        record_negative(&miss_key, Instant::now());
-        assert_eq!(
-            lookup_cached_fast(miss_host, miss_port),
-            CachedLookup::Negative,
-            "an uncached failure must still be negatively cached"
-        );
-    }
-
-    #[test]
-    fn contended_positive_probe_skips_negative_caching() {
-        memo_reset();
-        let addr: SocketAddr = "93.184.216.34:53".parse().unwrap();
-        let (host, port) = ("contention-guard.test", 19055u16);
-        dns_cache_seed(host, port, addr);
-        let mut kbuf = [0u8; DNS_KEY_BUF];
-        let key = dns_key(host, port, &mut kbuf).unwrap().to_owned();
-        // Hold the positive shard: std RwLock is not reentrant, so the probe
-        // sees contention (not absence) while the guard lives.
-        let _guard = lock_write(dns_cache_for(&key));
-        assert!(matches!(positive_entry_state(&key), PositiveState::Unknown));
-        record_negative(&key, Instant::now());
-        drop(_guard);
-        assert!(
-            lock_read(dns_neg_cache_for(&key)).get(&key).is_none(),
-            "contention must not produce a negative entry"
-        );
-        assert!(
-            memo_peek_both(&key).1.is_none(),
-            "contention must not produce a negative memo entry"
-        );
-        assert_eq!(
-            lookup_cached_fast(host, port),
-            CachedLookup::Addr(addr),
-            "the live positive answer must stay servable"
+            CachedLookup::Unknown,
+            "a successful resolution must invalidate another thread's negative \
+             memo: the stale tag must fall through to the shared caches instead \
+             of refusing the name for the rest of DNS_NEG_TTL"
         );
     }
 
@@ -954,12 +873,12 @@ mod tests {
     /// The TTL-exposing lookups must report the *remaining* life, not the full
     /// TTL: that remainder is what an adopting caller (the server's connection
     /// pin and session destination memo) has to clamp against.
-    #[test]
-    fn lookup_ttl_reports_the_entries_remaining_life() {
+    #[tokio::test]
+    async fn lookup_ttl_reports_the_entries_remaining_life() {
         memo_reset();
         let addr: SocketAddr = "93.184.216.34:19057".parse().unwrap();
         let (host, port) = ("ttl-report.test", 19057u16);
-        dns_cache_seed(host, port, addr);
+        dns_cache_seed(host, port, addr).await;
         let (hit, ttl) = lookup_cached_fast_with_ttl(host, port);
         assert_eq!(hit, CachedLookup::Addr(addr));
         assert!(
@@ -967,10 +886,16 @@ mod tests {
             "a fresh entry reports its full life, got {ttl} ms"
         );
 
-        // 59.5 s into a 60 s TTL: half a second of life is all an adopting
+        // Half a second before the TTL: that remainder is all an adopting
         // caller may use.
         let (aged, aged_port) = ("ttl-report-aged.test", 19058u16);
-        dns_cache_seed_aged(aged, aged_port, addr, Duration::from_millis(59_500));
+        dns_cache_seed_aged(
+            aged,
+            aged_port,
+            addr,
+            Duration::from_millis(DNS_CACHE_TTL_MS - 500),
+        )
+        .await;
         let (hit2, ttl2) = lookup_cached_fast_with_ttl(aged, aged_port);
         assert_eq!(hit2, CachedLookup::Addr(addr));
         assert!(
@@ -978,9 +903,7 @@ mod tests {
             "an aged entry must report only its remainder, got {ttl2} ms"
         );
 
-        // The full-set form carries it too, and a miss reports none.
-        let set = lookup_cached_all_fast_with_ttl(aged, aged_port).expect("cached set");
-        assert!(set.1 <= 1_500, "set life {} ms", set.1);
+        // A miss reports none.
         assert_eq!(
             lookup_cached_fast_with_ttl("ttl-report-miss.test", 19059).1,
             0
@@ -1114,8 +1037,6 @@ mod tests {
             &dgram_drops::SESSION_FULL,
             &dgram_drops::DNS_BUDGET,
             &dgram_drops::FAIR_SHARE,
-            &dgram_drops::DNS_INFLIGHT,
-            &dgram_drops::DNS_CONTENTION,
             &dgram_drops::NO_EGRESS,
             &dgram_drops::EGRESS_DEAD,
             &dgram_drops::REFUSED,
@@ -1129,11 +1050,6 @@ mod tests {
         assert!(after.session_full > before.session_full, "session_full");
         assert!(after.dns_budget > before.dns_budget, "dns_budget");
         assert!(after.fair_share > before.fair_share, "fair_share");
-        assert!(after.dns_inflight > before.dns_inflight, "dns_inflight");
-        assert!(
-            after.dns_contention > before.dns_contention,
-            "dns_contention"
-        );
         assert!(after.no_egress > before.no_egress, "no_egress");
         assert!(after.egress_dead > before.egress_dead, "egress_dead");
         assert!(after.refused > before.refused, "refused");
@@ -1142,194 +1058,17 @@ mod tests {
             "sess_create_failed"
         );
         let d = after.since(&before);
-        assert!(d.lost() >= 11, "every drop counts as loss: {d:?}");
-    }
-
-    /// Hold one single-flight shard mutex from another thread, the way a miss
-    /// storm does. Probing that name must read as unknown — never as inflight.
-    ///
-    /// The old probe returned `true` on `WouldBlock`, so a contended shard
-    /// dropped datagrams charged to `DNS_INFLIGHT` for what was only lock
-    /// contention; the `!dns_is_inflight` assertion below fails against it.
-    #[test]
-    fn contended_dns_mutex_is_unknown_not_inflight() {
-        let host = "status-contended-probe.invalid";
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let mut kbuf = [0u8; DNS_KEY_BUF];
-            let owned;
-            let key: &str = match dns_key(host, 53, &mut kbuf) {
-                Some(k) => k,
-                None => {
-                    owned = dns_key_owned(host, 53);
-                    &owned
-                }
-            };
-            let _guard = lock_mutex(dns_inflight_for(key));
-            locked_tx.send(()).expect("holder signals the lock");
-            release_rx.recv().expect("holder waits for release");
-        });
-        locked_rx.recv().expect("shard mutex is now held elsewhere");
-        assert_eq!(
-            dns_inflight_status(host, 53),
-            DnsInflight::Contended,
-            "a busy shard is unknown, not inflight"
-        );
-        assert!(
-            !dns_is_inflight(host, 53),
-            "contention must never read as inflight"
-        );
-        release_tx.send(()).expect("release the holder");
-        holder.join().expect("holder thread exits");
-        assert_eq!(
-            dns_inflight_status(host, 53),
-            DnsInflight::Absent,
-            "an unregistered name is absent once the shard is free"
-        );
-    }
-
-    /// Registration must fail fast with `DnsContended` when its shard mutex is
-    /// busy — never park the task on it. Against the old blocking register
-    /// this test times out instead of returning (the holder only releases
-    /// after the awaited call completes).
-    #[tokio::test]
-    async fn contended_register_fails_fast_as_contention() {
-        let host = "register-contended-probe.invalid";
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let mut kbuf = [0u8; DNS_KEY_BUF];
-            let owned;
-            let key: &str = match dns_key(host, 53, &mut kbuf) {
-                Some(k) => k,
-                None => {
-                    owned = dns_key_owned(host, 53);
-                    &owned
-                }
-            };
-            let _guard = lock_mutex(dns_inflight_for(key));
-            locked_tx.send(()).expect("holder signals the lock");
-            release_rx.recv().expect("holder waits for release");
-        });
-        locked_rx.recv().expect("shard mutex is now held elsewhere");
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            resolve_all_cached(host, 53),
-        )
-        .await;
-        release_tx.send(()).expect("release the holder");
-        holder.join().expect("holder thread exits");
-        let err = r
-            .expect("register must fail fast, not park on the shard mutex")
-            .unwrap_err();
-        assert!(
-            is_dns_contended(&err),
-            "register contention must be Contended, got {err:#}"
-        );
-    }
-
-    /// The contention retry still fails fast when the shard stays busy: both
-    /// attempts hit `DnsContended` and the flow fails instead of parking. The
-    /// timeout proves neither attempt blocks; the error proves the retry does
-    /// not loop. A single contention event is counted even though nothing was
-    /// dropped — the mutex was genuinely busy, and the count is what makes a
-    /// miss storm visible.
-    #[tokio::test]
-    // Test-only serializing mutex, held across a fail-fast future that never
-    // parks on it (the holder releases as soon as the contended call returns).
-    #[allow(clippy::await_holding_lock)]
-    async fn contention_retry_fails_fast_when_shard_stays_busy() {
-        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
-        let host = "retry-still-contended-probe.invalid";
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let mut kbuf = [0u8; DNS_KEY_BUF];
-            let owned;
-            let key: &str = match dns_key(host, 53, &mut kbuf) {
-                Some(k) => k,
-                None => {
-                    owned = dns_key_owned(host, 53);
-                    &owned
-                }
-            };
-            let _guard = lock_mutex(dns_inflight_for(key));
-            locked_tx.send(()).expect("holder signals the lock");
-            release_rx.recv().expect("holder waits for release");
-        });
-        locked_rx.recv().expect("shard mutex is now held elsewhere");
-        let before = dgram_drops::snapshot();
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            resolve_all_cached_with_contention_retry(host, 53),
-        )
-        .await;
-        release_tx.send(()).expect("release the holder");
-        holder.join().expect("holder thread exits");
-        let err = r
-            .expect("retry must fail fast, not park on the shard mutex")
-            .unwrap_err();
-        assert!(
-            is_dns_contended(&err),
-            "sustained contention must stay Contended, got {err:#}"
-        );
-        let after = dgram_drops::snapshot();
-        assert!(
-            after.dns_contention > before.dns_contention,
-            "the first contention is counted even though the flow fails"
-        );
-    }
-
-    /// The retry wrapper is transparent off contention: a seeded name resolves
-    /// without ever touching the single-flight mutex.
-    #[tokio::test]
-    async fn contention_retry_preserves_the_uncontended_path() {
-        let host = "retry-uncontended-probe.invalid";
-        let addr: SocketAddr = "93.184.216.34:443".parse().expect("probe addr parses");
-        dns_cache_seed(host, 443, addr);
-        let v = resolve_all_cached_with_contention_retry(host, 443)
-            .await
-            .expect("a seeded name must resolve");
-        assert!(
-            v.contains(&addr),
-            "the seeded address must come back through the retry wrapper"
-        );
-    }
-
-    /// `DNS_CONTENTION` is exact like the egress counters: a short episode on
-    /// a thread that never reports must be in the very next snapshot. With the
-    /// old batching wiring the spawned thread's cell dies with it and the
-    /// delta below is zero, deterministically.
-    #[test]
-    fn contention_drops_are_exact_across_threads() {
-        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
-        let before = dgram_drops::snapshot();
-        std::thread::spawn(|| {
-            for _ in 0..20 {
-                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-            }
-        })
-        .join()
-        .expect("the drop thread must not panic");
-        let after = dgram_drops::snapshot();
-        assert!(
-            after.dns_contention >= before.dns_contention + 20,
-            "a 20-event contention episode must be in the next snapshot: {} -> {}",
-            before.dns_contention,
-            after.dns_contention
-        );
+        assert!(d.lost() >= 9, "every drop counts as loss: {d:?}");
     }
 
     /// A unique-domain flood must fail fast on the slow-path limiter: with the
     /// budget exhausted `try_acquire_owned` returns `Err` synchronously (it can
-    /// never park the caller), the excess is counted as `SESSION_FULL` — the
-    /// same counter both relay paths bump on that arm — and the contention
-    /// counter stays a distinct field. No other lib test holds this limiter
-    /// (only the binaries take it, in their own test processes), and nothing
-    /// is awaited while the permits are held, so the drain lasts microseconds.
+    /// never park the caller) and the budget recovers when permits release.
+    /// No other lib test holds this limiter (only the binaries take it, in
+    /// their own test processes), and nothing is awaited while the permits
+    /// are held, so the drain lasts microseconds.
     #[test]
-    fn dns_limiter_exhaustion_fails_fast_and_counts_session_full() {
+    fn dns_limiter_exhaustion_fails_fast() {
         let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
         let lim = dns_slow_path_limiter();
         let mut held = Vec::new();
@@ -1348,18 +1087,6 @@ mod tests {
             lim.clone().try_acquire_owned().is_err(),
             "excess misses must fail fast, never park"
         );
-        let before = dgram_drops::snapshot();
-        dgram_drops::bump(&dgram_drops::SESSION_FULL);
-        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-        let after = dgram_drops::snapshot();
-        assert!(
-            after.session_full > before.session_full,
-            "exhaustion must be counted as SESSION_FULL"
-        );
-        assert!(
-            after.dns_contention > before.dns_contention,
-            "contention must stay a distinct counted field"
-        );
         drop(held);
         assert!(
             lim.available_permits() > 0,
@@ -1370,8 +1097,8 @@ mod tests {
     /// Serializes the tests that assert exact slow-path counter deltas. The
     /// drop counters are process-wide and `bump` is exact (no batching), so
     /// two such tests racing would move each other's deltas; every test that
-    /// bumps `REFUSED` / `DNS_INFLIGHT` / `DNS_CONTENTION` / `SESSION_FULL`
-    /// holds this while it measures.
+    /// bumps `REFUSED` / `DNS_BUDGET` / `SESSION_FULL` while it measures holds
+    /// this.
     static SLOW_PATH_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// P1-4 slow-path budget lock: each drop arm owns exactly one counter and
@@ -1387,108 +1114,13 @@ mod tests {
         let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
         let before = dgram_drops::snapshot();
         dgram_drops::bump(&dgram_drops::REFUSED);
-        dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
+        dgram_drops::bump(&dgram_drops::DNS_BUDGET);
         dgram_drops::bump(&dgram_drops::SESSION_FULL);
         let d = dgram_drops::snapshot().since(&before);
         assert_eq!(d.refused, 1, "REFUSED (negative cache / policy) fires once");
-        assert_eq!(d.dns_inflight, 1, "DNS_INFLIGHT (single-flight) fires once");
-        assert_eq!(
-            d.dns_contention, 1,
-            "DNS_CONTENTION (shard contention) fires once"
-        );
-        assert_eq!(
-            d.session_full, 1,
-            "SESSION_FULL (slow-path budget) fires once"
-        );
-        assert_eq!(d.lost(), 4, "every slow-path drop is budget loss: {d:?}");
-    }
-
-    /// P1-4 slow-path budget lock: the tri-state probe maps to exactly one
-    /// counter, and contention is never charged as inflight.
-    ///
-    /// `forward_server_dgram` (server) and `dispatch_one` (client) share one
-    /// contract over `dns_inflight_status`: `Inflight` counts `DNS_INFLIGHT`
-    /// and returns, `Contended` counts `DNS_CONTENTION` and falls through to
-    /// the limiter-bounded spawn, `Absent` spawns with no count. This drives
-    /// the same probe through both contended states and asserts the counting
-    /// half of that contract exactly once per arm.
-    #[test]
-    fn dns_slow_path_probe_counts_contention_apart_from_inflight_exactly_once() {
-        let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().unwrap();
-        let host = "p14-probe-distinction.invalid";
-        // Baseline: unregistered and uncontended is Absent (no counter arm).
-        assert_eq!(dns_inflight_status(host, 53), DnsInflight::Absent);
-        assert!(!dns_is_inflight(host, 53));
-        // Register a fake owner the way `resolve_all_cached` does, so the
-        // probe reads Inflight while a resolution owns the name.
-        let mut kbuf = [0u8; DNS_KEY_BUF];
-        let key_owned = dns_key(host, 53, &mut kbuf).unwrap().to_owned();
-        let entry = std::sync::Arc::new(crate::dns::inflight::DnsInflightEntry {
-            key: key_owned.clone(),
-            cell: tokio::sync::OnceCell::new(),
-            notify: tokio::sync::Notify::new(),
-            owner: std::sync::atomic::AtomicBool::new(true),
-        });
-        {
-            let mut inf = lock_mutex(dns_inflight_for(&key_owned));
-            inf.insert(key_owned.clone(), entry);
-        }
-        assert_eq!(dns_inflight_status(host, 53), DnsInflight::Inflight);
-        assert!(dns_is_inflight(host, 53));
-        // The Inflight arm, verbatim: one datagram, one DNS_INFLIGHT.
-        let before = dgram_drops::snapshot();
-        match dns_inflight_status(host, 53) {
-            DnsInflight::Inflight => {
-                dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-            }
-            DnsInflight::Contended => {
-                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-            }
-            DnsInflight::Absent => {}
-        }
-        let d = dgram_drops::snapshot().since(&before);
-        assert_eq!(d.dns_inflight, 1, "one inflight drop counts exactly once");
-        assert_eq!(
-            d.dns_contention, 0,
-            "inflight must never touch the contention counter"
-        );
-        // Release the name, then hold the shard the way a miss storm does:
-        // the same probe must read Contended (unknown), never Inflight.
-        {
-            let mut inf = lock_mutex(dns_inflight_for(&key_owned));
-            inf.remove(&key_owned);
-        }
-        let _held = lock_mutex(dns_inflight_for(&key_owned));
-        assert_eq!(
-            dns_inflight_status(host, 53),
-            DnsInflight::Contended,
-            "a busy shard is unknown, not inflight"
-        );
-        assert!(
-            !dns_is_inflight(host, 53),
-            "contention must never read as inflight"
-        );
-        // The Contended arm, verbatim: one datagram, one DNS_CONTENTION.
-        let before = dgram_drops::snapshot();
-        match dns_inflight_status(host, 53) {
-            DnsInflight::Inflight => {
-                dgram_drops::bump(&dgram_drops::DNS_INFLIGHT);
-            }
-            DnsInflight::Contended => {
-                dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-            }
-            DnsInflight::Absent => {}
-        }
-        let d = dgram_drops::snapshot().since(&before);
-        assert_eq!(
-            d.dns_contention, 1,
-            "one contended drop counts exactly once"
-        );
-        assert_eq!(
-            d.dns_inflight, 0,
-            "contention must never touch the inflight counter"
-        );
+        assert_eq!(d.dns_budget, 1, "DNS_BUDGET (resolver pool) fires once");
+        assert_eq!(d.session_full, 1, "SESSION_FULL (session pool) fires once");
+        assert_eq!(d.lost(), 3, "every slow-path drop is budget loss: {d:?}");
     }
 
     /// The two egress counters must be visible **immediately and from another
@@ -3120,26 +2752,28 @@ mod tests {
     }
 
     #[test]
-    fn dns_shards_split_keys_and_preserve_total_caps() {
-        assert_eq!(DNS_SHARDS, 16);
-        assert_eq!(DNS_CACHE_MAX_SHARD * DNS_SHARDS, DNS_CACHE_MAX);
-        assert_eq!(DNS_NEG_MAX_SHARD * DNS_SHARDS, DNS_NEG_MAX);
-        // Deterministic: the same key always lands on the same shard, or
-        // single-flight/warming would address a different lock than the lookup.
-        let mut a = [0u8; DNS_KEY_BUF];
-        let k = dns_key("example.com", 443, &mut a).unwrap().to_owned();
-        assert_eq!(dns_shard(&k), dns_shard(&k));
-        assert_eq!(dns_cache_for(&k) as *const _, dns_cache_for(&k) as *const _);
-        // Spreading: distinct names must cover multiple shards, or the
-        // sharding pays code without removing the single-lock contention.
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..64 {
-            let h = format!("host{i}.example.com");
-            let mut b = [0u8; DNS_KEY_BUF];
-            let kk = dns_key(&h, 80, &mut b).unwrap().to_owned();
-            seen.insert(dns_shard(&kk));
-        }
-        assert!(seen.len() > 1, "sharding must spread keys, got {seen:?}");
+    fn dns_stores_are_configured_with_the_documented_bounds() {
+        // The capacity/expiry bounds moved from per-shard arithmetic to the
+        // moka caches' builders; the values themselves must not drift.
+        assert_eq!(DNS_CACHE_MAX, 10_240);
+        assert_eq!(DNS_NEG_MAX, 4096);
+        assert!(
+            DNS_NEG_TTL < Duration::from_millis(DNS_CACHE_TTL_MS),
+            "a negative verdict must never outlive a positive one"
+        );
+        assert_eq!(
+            positives().policy().max_capacity(),
+            Some(DNS_CACHE_MAX as u64)
+        );
+        assert_eq!(
+            negatives().policy().max_capacity(),
+            Some(DNS_NEG_MAX as u64)
+        );
+        assert_eq!(
+            positives().policy().time_to_live(),
+            Some(Duration::from_millis(DNS_CACHE_TTL_MS))
+        );
+        assert_eq!(negatives().policy().time_to_live(), Some(DNS_NEG_TTL));
     }
 
     /// Live regression test for the quinn-proto datagram accounting.

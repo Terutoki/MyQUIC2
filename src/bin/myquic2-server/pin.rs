@@ -156,7 +156,7 @@ impl DestMemo {
 
 /// How long a resolved destination is reused before it is re-resolved.
 ///
-/// Deliberately shorter than the DNS cache TTL (60 s): DNS answers can change
+/// Deliberately shorter than the DNS cache TTL (120 s): DNS answers can change
 /// while the cache entry is still live, so this bounds how long a session can
 /// keep sending to an address the name no longer resolves to.
 pub(crate) const DEST_PIN_TTL_MS: u64 = 30_000;
@@ -335,8 +335,9 @@ pub(crate) fn target_name(a: TargetAddrRef<'_>) -> (&str, u16) {
 /// Resolve this datagram's target once, for both the fragment and the plain
 /// branch. Order matters: the connection's pin first (free, and only trusted
 /// while it still names the pinned session *and* has not expired), then the
-/// session's own memo, then the DNS cache. `None` means "not known yet" --
-/// `forward_server_dgram` spawns the resolver, so it is not an error.
+/// session's own memo, then this thread's DNS memo. `None` means "not known
+/// yet" -- `forward_server_dgram` spawns the resolver (which resolves from the
+/// shared caches and stores the session memo), so it is not an error.
 pub(crate) fn resolve_pin(
     ss: &SessTable,
     pin: &mut Option<ConnPin>,
@@ -374,60 +375,37 @@ pub(crate) fn resolve_pin(
         }
     }
     if let Some((dst, memo_life)) = sess_dest_lookup_ttl(ss, now, s, h, p) {
-        // A filtered memo hit is unusable as-is, but the name may still
-        // resolve to an allowed address in the full cached set (multi-record
-        // names whose first address is private). Scan it here so the pin can
-        // still arm on the fast path instead of forcing every packet through
-        // the slow path for the rest of the DNS TTL.
         if allow_private || is_global_ip_cached(dst.ip()) {
             // Adopt the session's memo so the next datagram is a pure compare with
             // no table read at all -- for the memo's remaining life, never longer.
             pin_arm(pin, s, h, p, dst, memo_life);
             return Some(dst);
         }
-        if let Some((set, set_life)) = lookup_cached_all_fast_with_ttl(h, p) {
-            if let Some(d2) = set
-                .iter()
-                .copied()
-                .find(|a| allow_private || is_global_ip_cached(a.ip()))
-            {
-                pin_arm(pin, s, h, p, d2, set_life);
-                return Some(d2);
-            }
-        }
+        // A filtered memo hit is unusable as-is. The full address set is not
+        // reachable from this synchronous path (the fast layer is the thread
+        // memo, which holds the first address only); the async slow path
+        // re-resolves from the shared caches, picks a usable record and stores
+        // it into the session memo, which arms the pin on the next datagram.
         return None;
     }
     let (lookup, ttl_ms) = lookup_cached_fast_with_ttl(h, p);
     match lookup {
         CachedLookup::Addr(dst) => {
-            // The fast cache serves the first address only; a filtered first
-            // address falls back to the full cached set before giving up, so
-            // the pin arms the same way the slow path (`forward_server_dgram`)
-            // would resolve it. Without this a name whose first record is
-            // private never pinned and every packet paid the slow path.
-            // A fallback into the full set inherits *that* set's remaining life,
-            // not the first address's (they are the same entry here, but the
-            // clamp must follow whichever address was actually adopted).
-            let (addr, life) = if !allow_private && !is_global_ip_cached(dst.ip()) {
-                lookup_cached_all_fast_with_ttl(h, p).and_then(|(set, life)| {
-                    set.iter()
-                        .copied()
-                        .find(|a| allow_private || is_global_ip_cached(a.ip()))
-                        .map(|a| (a, life))
-                })?
-            } else {
-                (dst, ttl_ms)
-            };
-            // Adopt the DNS hit into the connection pin. Without this the pin
-            // was only ever written from `sess_dest_lookup`, and a fast-path
-            // success skips `forward_server_dgram` → `sess_dest_store` entirely:
-            // the pin and the session dest expired together at T+30s while the
-            // 60s DNS cache was still live, so every subsequent packet paid
-            // `sess_dest_lookup` again for the rest of the DNS TTL (~50%
-            // duty-cycle degradation on a steady domain flow). Same contract as
-            // the memo branch above: pin for at most `DEST_PIN_TTL_MS`.
-            pin_arm(pin, s, h, p, addr, life);
-            Some(addr)
+            // Filtered first address: same handoff as the memo branch above —
+            // one slow-path datagram resolves the rest of the set. Without the
+            // pin write-back below, a fast-path success skips
+            // `forward_server_dgram` → `sess_dest_store` entirely: the pin and
+            // the session dest expired together at T+30s while the DNS entry
+            // (120 s) was still live, so every subsequent packet paid
+            // `sess_dest_lookup` again for the rest of the TTL (~50%
+            // duty-cycle degradation on a steady domain flow).
+            if !allow_private && !is_global_ip_cached(dst.ip()) {
+                return None;
+            }
+            // Adopt the memo hit into the connection pin for at most
+            // `DEST_PIN_TTL_MS`, clamped by the hit's own remaining life.
+            pin_arm(pin, s, h, p, dst, ttl_ms);
+            Some(dst)
         }
         CachedLookup::Negative | CachedLookup::Unknown => None,
     }
@@ -436,15 +414,15 @@ pub(crate) fn resolve_pin(
 /// of its own life left.
 ///
 /// `DEST_PIN_TTL_MS` is documented as "deliberately shorter than the DNS cache
-/// TTL (60 s): DNS answers can change while the cache entry is still live, so
+/// TTL (120 s): DNS answers can change while the cache entry is still live, so
 /// this bounds how long a session can keep sending to an address the name no
 /// longer resolves to". Measured *from adoption* that bound was false: a pin
 /// armed from an entry with 100 ms of life left (or from a session memo with the
-/// same) lived its own full 30 s, so an address resolved 60 s ago could still be
-/// used 90 s after resolution — 30 s past the TTL every other layer respects.
-/// Every arming site therefore clamps to the source's remaining life; a fresh
-/// resolution (the spawned resolver task) passes `DNS_CACHE_TTL_MS`, where the
-/// 30 s pin wins and behaviour is unchanged.
+/// same) lived its own full 30 s, so an address resolved at the start of an
+/// entry could still be used 30 s past its resolution's TTL — the one every
+/// other layer respects. Every arming site therefore clamps to the source's
+/// remaining life; a fresh resolution (the spawned resolver task) passes
+/// `DNS_CACHE_TTL_MS`, where the 30 s pin wins and behaviour is unchanged.
 ///
 /// Convergence bound: a public DNS flip is served stale for at most the pin's
 /// remaining life (worst 30 s from adoption, usually far less via the clamp);

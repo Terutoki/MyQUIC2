@@ -1,9 +1,27 @@
-//! DNS resolve / cache lookup — verbatim extraction from `src/lib.rs` (zero logic change).
-//! Symbols: CachedLookup / lookup_cached_fast* / lookup_cached_sync /
-//! lookup_cached_all_fast* / dns_cache_seed* / DNS_CACHE_MAX* / evict_if_needed /
-//! DnsContended / is_dns_contended / resolve_all_cached* / PositiveState /
-//! positive_entry_state / clear_negative / record_negative / resolve_server_addr /
-//! resolve_server_side / resolve_all / resolve_all_timeout.
+//! DNS resolve / cache lookup, on top of the moka-backed verdict stores
+//! (`dns::store`) and the thread-local memo (`dns::memo`).
+//!
+//! Layering:
+//!
+//! - **sync fast path** ([`lookup_cached_fast`]): thread-local memo only. The
+//!   packet path (server egress `resolve_pin`/`forward_server_dgram`, client
+//!   `dispatch_stage*`) is synchronous in its staging phase and must not await;
+//!   a memo hit costs two atomic loads and a byte compare, and a memo *miss*
+//!   is reported as [`CachedLookup::Unknown`] so the caller takes the
+//!   limiter-gated spawn path. `moka::future::Cache` has no synchronous read
+//!   view, and one atomic Arc clone per hit to fetch a full address set from
+//!   the memo would tax this path for a case (filtered first record) that the
+//!   async slow path already handles — one datagram per session, after which
+//!   the session destination memo and the pin serve the flow.
+//! - **async path** ([`resolve_all_cached`]): positive-cache single flight via
+//!   `try_get_with_by_ref`. Moka evaluates the init future exactly once per
+//!   key among concurrent callers and wakes the rest with the same result; a
+//!   cancelled or panicked owner hands the initialization to a waiter
+//!   (`src/future/value_initializer.rs`, `EnclosingFutureAborted`), so the old
+//!   `OwnerReset`/`InflightCleanup` guard pair is not needed. The negative
+//!   cache is checked first and written explicitly on failure — `try_get_with`
+//!   shares errors with concurrent waiters but never caches them.
+//! - **upstream**: hickory, cancellable and TTL-clamped to the same windows.
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -11,15 +29,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::cache::{
-    dns_cache_for, dns_neg_cache_for, DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_MAX, DNS_NEG_TTL,
-};
-use super::inflight::{dns_inflight_for, DnsInflightEntry, InflightCleanup, OwnerReset};
-use super::key::{
-    dns_key, dns_key_owned, DnsCacheKey, DnsCacheVal, DnsMap, DNS_KEY_BUF, DNS_SHARDS,
-};
+use super::key::{dns_key, dns_key_owned, DNS_KEY_BUF};
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
-use crate::{coarse_millis, dgram_drops, lock_write, try_lock_mutex, try_lock_read};
+use super::store::{negatives, positives, DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL};
+use crate::coarse_millis;
 
 /// Address-family preference for DNS resolution results, from the
 /// `dns_ip_preference` config key (`"ipv6"` — the default — or `"ipv4"`).
@@ -73,7 +86,7 @@ pub fn ip_preference() -> IpPreference {
 
 /// Server-side DNS with the configured address-family preference (default
 /// IPv6 first; `dns_ip_preference = "ipv4"` restores the v4-first order for
-/// v4-heavy exits). Uses a short-lived cache so per-packet domain lookups
+/// v4-heavy exits). Uses the short-lived cache so per-packet domain lookups
 /// cannot stall the datagram fast path or amplify upstream DNS.
 pub async fn resolve_server_side(host: &str, port: u16) -> Result<SocketAddr> {
     resolve_all_cached(host, port)
@@ -157,24 +170,34 @@ fn upstream_resolver() -> Result<&'static hickory_resolver::TokioResolver, &'sta
         .map_err(String::as_str)
 }
 
+/// Process-wide budget for spawned resolution work (UDP waiter tasks and the
+/// server's TCP dial path share it). Exhaustion fails fast — a datagram or
+/// dial is refused and counted as `DNS_BUDGET` — instead of parking callers
+/// behind an unbounded queue.
+pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1024)))
+}
+
 /// Result of a synchronous cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedLookup {
-    /// A fresh address is cached.
+    /// A fresh address is cached in this thread's memo.
     Addr(SocketAddr),
     /// A fresh negative entry says the name will not resolve; do not spawn a
     /// resolver task for this packet.
     Negative,
-    /// Not cached; the caller must use the async resolver.
+    /// Not in this thread's memo; the caller must use the async resolver.
     Unknown,
 }
 
 /// Cached variant used on hot paths (UDP per-packet, TCP per-connection).
-/// Consults the thread-local memo, then the positive cache, then the negative
-/// cache, so a known-bad name never costs a task spawn. A hit performs no heap
-/// allocation (stack-built key + full-key compare against the memo) and, on the
-/// memo hit path, no precise clock read (the deadline is compared in the coarse
-/// epoch) — it never touches a lock at all.
+/// Consults the thread-local memo so a hit performs no heap allocation
+/// (stack-built key + full-key compare) and, on the hit path, no precise
+/// clock read (the deadline is compared in the coarse epoch) — it never
+/// touches a lock at all. A memo miss is `Unknown`: the async path re-checks
+/// the shared caches (warm entries there resolve without an upstream query).
 pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     lookup_cached_fast_with_ttl(host, port).0
 }
@@ -182,15 +205,15 @@ pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
 /// [`lookup_cached_fast`] plus the remaining life of what it returned.
 ///
 /// `ttl_ms` is how much longer the answer may be used before it must be looked
-/// up again: the *remaining* lifetime of the cache entry (or of this thread's
-/// memo of it — the memo is written with the entry's own deadline, so the two
-/// agree) for a positive hit, and 0 for a miss or a negative hit.
+/// up again: the *remaining* lifetime of this thread's memo of the entry (the
+/// memo is written with the entry's own deadline, so the two agree) for a
+/// positive hit, and 0 for a miss or a negative hit.
 ///
 /// Callers that arm their **own** deadline from a cache hit must clamp with it.
 /// The server's connection pin and per-session destination memo both used to
 /// take a fresh `DEST_PIN_TTL_MS` (30 s) from whatever the lookup returned, so a
-/// pin armed at 59.9 s into a 60 s entry served that address for another 30 s —
-/// 90 s after the resolution, contradicting their own documented bound
+/// pin armed 0.1 s before its entry expired served that address for another
+/// 30 s — 30 s past the entry, contradicting their own documented bound
 /// ("deliberately shorter than the DNS cache TTL").
 pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64) {
     let mut kbuf = [0u8; DNS_KEY_BUF];
@@ -202,10 +225,10 @@ pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64)
             &owned
         }
     };
-    // Memo first, and only then the clock: a memo hit costs two atomic loads
-    // and a byte compare instead of two global read locks. The deadline lives
-    // in the coarse epoch (see `expires_ms`), so even the hit path reads no
-    // precise clock — only whole-second TTLs are at stake.
+    // Memo only, and only then the clock: a memo hit costs two atomic loads
+    // and a byte compare. The deadline lives in the coarse epoch (see
+    // `expires_ms`), so even the hit path reads no precise clock — only
+    // whole-second TTLs are at stake.
     let (pos, neg) = memo_peek_both(key);
     if pos.is_some() || neg.is_some() {
         let now = coarse_millis();
@@ -220,54 +243,13 @@ pub fn lookup_cached_fast_with_ttl(host: &str, port: u16) -> (CachedLookup, u64)
         if let Some(m) = neg {
             // The epoch check is what keeps a negative memo coherent with a
             // resolution that succeeded on another worker: the memo is
-            // thread-private, so the global negative entry's removal cannot
+            // thread-private, so the shared negative entry's removal cannot
             // reach it. Without the tag the recording worker kept answering
             // `Negative` — REFUSED datagrams, `dns negative cached` TCP
-            // failures — for the rest of `DNS_NEG_TTL` while the cache held a
-            // valid address. A stale tag simply falls through to the global
-            // caches below, which are the authority either way.
+            // failures — for the rest of `DNS_NEG_TTL` while the caches held a
+            // valid address. A stale tag simply falls through to the async
+            // path, which reads the shared caches — the authority either way.
             if now < m.expires_ms && m.neg_epoch == neg_epoch() {
-                return (CachedLookup::Negative, 0);
-            }
-        }
-    }
-    // The clock is read **inside** each block, only once an entry actually has
-    // to be compared against its deadline. A contended shard (`Unknown`) and a
-    // full miss both return without needing it, and this lookup runs per domain
-    // datagram while a name is cold — twice per datagram on the server
-    // (`resolve_pin` then `forward_server_dgram`), so one vDSO read per call was
-    // pure overhead on exactly the path that is already the expensive one. At
-    // most one read happens either way: the positive block returns on a hit, and
-    // the negative block is only reached when it missed.
-    {
-        let Some(m) = try_lock_read(dns_cache_for(key)) else {
-            return (CachedLookup::Unknown, 0);
-        };
-        if let Some((t, v)) = m.get(key) {
-            // Expiry is anchored to the global entry's insertion time, so the
-            // memo can never outlive the cache TTL.
-            let expires = *t + DNS_CACHE_TTL;
-            let now = Instant::now();
-            if now < expires {
-                if let Some(a) = v.first().copied() {
-                    memo_put(key, Some(a), expires);
-                    return (
-                        CachedLookup::Addr(a),
-                        expires.saturating_duration_since(now).as_millis() as u64,
-                    );
-                }
-            }
-        }
-    }
-    {
-        let Some(n) = try_lock_read(dns_neg_cache_for(key)) else {
-            return (CachedLookup::Unknown, 0);
-        };
-        if let Some(t) = n.get(key) {
-            let expires = *t + DNS_NEG_TTL;
-            let now = Instant::now();
-            if now < expires {
-                memo_put(key, None, expires);
                 return (CachedLookup::Negative, 0);
             }
         }
@@ -283,24 +265,22 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
     }
 }
 
-/// Full cached address set, read synchronously without spawning resolution.
+/// Resolve `(host, port)` through the shared caches with single-flight.
 ///
-/// The fast probe serves the first address only; when that one is filtered the
-/// caller must scan the rest the way TCP does, but awaiting `resolve_all_cached`
-/// on a packet path parks the reader task for up to a DNS timeout. This returns
-/// the cached set — or `None` when it is not synchronously visible (contended
-/// lock or expired entry) — so the caller stays off the async path whenever the
-/// answer is already in memory.
-pub fn lookup_cached_all_fast(host: &str, port: u16) -> Option<Arc<[SocketAddr]>> {
-    lookup_cached_all_fast_with_ttl(host, port).map(|(v, _)| v)
-}
-
-/// [`lookup_cached_all_fast`] plus the remaining life of the set it returned.
+/// Concurrent callers for the same key are coalesced by moka: the first call
+/// evaluates the resolution inside `try_get_with_by_ref`, all others wait and
+/// receive the same `Arc<[SocketAddr]>` (or the same error). Cache warming and
+/// the thread memo happen **inside the init future, before it returns**, so
+/// every waiter that observes the outcome also observes a warmed cache and a
+/// failed lookup is negatively cached before any waiter can retry (the old
+/// publish-order contract, kept).
 ///
-/// Same contract as [`lookup_cached_fast_with_ttl`]: a caller that arms its own
-/// deadline from a cached set must clamp against `ttl_ms`, or a set read at the
-/// end of its life is re-used for the caller's whole (longer) TTL.
-pub fn lookup_cached_all_fast_with_ttl(host: &str, port: u16) -> Option<(Arc<[SocketAddr]>, u64)> {
+/// `Err` covers three cases with distinct meanings for the caller: a live
+/// negative entry ("dns negative cached" — a policy refusal), a genuine
+/// resolution failure, and (via [`resolve_all_timeout`]) a timeout.
+pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
+    // Stack-built key: no allocation while the key is present in the caches.
+    // The fallback only triggers for hosts longer than the 255-byte wire limit.
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -310,27 +290,50 @@ pub fn lookup_cached_all_fast_with_ttl(host: &str, port: u16) -> Option<(Arc<[So
             &owned
         }
     };
-    let m = try_lock_read(dns_cache_for(key))?;
-    let (t, v) = m.get(key)?;
-    let expires = *t + DNS_CACHE_TTL;
-    let now = Instant::now();
-    if now < expires {
-        Some((
-            v.clone(),
-            expires.saturating_duration_since(now).as_millis() as u64,
-        ))
-    } else {
-        None
+    // The negative check comes first: a known-bad name must be refused without
+    // touching the single-flight machinery, and (unlike a positive sentinel in
+    // the same keyspace) a present negative entry can never be returned by
+    // `try_get_with` as a resolution result.
+    if negatives().get(key).await.is_some() {
+        anyhow::bail!("dns negative cached");
     }
+    let outcome = positives()
+        .try_get_with_by_ref(key, async {
+            match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
+                Ok(v) => {
+                    let now = Instant::now();
+                    let v: Arc<[SocketAddr]> = Arc::from(v);
+                    // A success clears the negative entry (the name resolves
+                    // now) and bumps the epoch so other threads' stale
+                    // negative memos stop refusing. Done before returning, so
+                    // it precedes every waiter wake-up.
+                    if negatives().remove(key).await.is_some() {
+                        bump_neg_epoch();
+                    }
+                    if let Some(a) = v.first().copied() {
+                        memo_put(key, Some(a), now + DNS_CACHE_TTL);
+                    }
+                    Ok((now, v))
+                }
+                Err(e) => {
+                    let now = Instant::now();
+                    negatives().insert(key.to_owned(), ()).await;
+                    memo_put(key, None, now + DNS_NEG_TTL);
+                    Err(format!("{e:#}"))
+                }
+            }
+        })
+        .await;
+    outcome.map(|(_, v)| v).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Seed the positive DNS cache as if `host:port` had just resolved to `addr`.
+/// Seed the positive cache as if `host:port` had just resolved to `addr`.
 ///
 /// Bin unit tests need this to exercise a DNS-hit path without a live
 /// resolver; production always warms the cache through `resolve_all_cached`.
 #[doc(hidden)]
-pub fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
-    dns_cache_seed_aged(host, port, addr, Duration::ZERO);
+pub async fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
+    dns_cache_seed_aged(host, port, addr, Duration::ZERO).await;
 }
 
 /// [`dns_cache_seed`] with an explicit entry age, so a test can drive the
@@ -340,7 +343,7 @@ pub fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
 /// deadline), i.e. the remaining life is `DNS_CACHE_TTL - age` — the input a TTL
 /// clamp has to react to.
 #[doc(hidden)]
-pub fn dns_cache_seed_aged(host: &str, port: u16, addr: SocketAddr, age: Duration) {
+pub async fn dns_cache_seed_aged(host: &str, port: u16, addr: SocketAddr, age: Duration) {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -352,22 +355,22 @@ pub fn dns_cache_seed_aged(host: &str, port: u16, addr: SocketAddr, age: Duratio
     };
     let now = Instant::now();
     let inserted = now.checked_sub(age).unwrap_or(now);
-    {
-        let mut m = lock_write(dns_cache_for(key));
-        m.insert(key.to_owned(), (inserted, Arc::from([addr])));
-        evict_if_needed(&mut m);
+    positives()
+        .insert(key.to_owned(), (inserted, Arc::from([addr])))
+        .await;
+    if negatives().remove(key).await.is_some() {
+        bump_neg_epoch();
     }
-    clear_negative(key);
     memo_put(key, Some(addr), inserted + DNS_CACHE_TTL);
 }
 
-/// Seed the negative DNS cache as if `host:port` had just failed to resolve.
+/// Seed the negative cache as if `host:port` had just failed to resolve.
 ///
 /// Same test-only purpose as [`dns_cache_seed`], for the other verdict: without
 /// it a negative *memo* entry can only be produced by a real (network) resolver
 /// failure, so the memo's coherence rules would be untestable.
 #[doc(hidden)]
-pub fn dns_neg_cache_seed(host: &str, port: u16) {
+pub async fn dns_neg_cache_seed(host: &str, port: u16) {
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
     let key: &str = match dns_key(host, port, &mut kbuf) {
@@ -377,15 +380,15 @@ pub fn dns_neg_cache_seed(host: &str, port: u16) {
             &owned
         }
     };
-    record_negative(key, Instant::now());
+    record_negative(key).await;
 }
 
-/// Seed the positive DNS cache with a full multi-record set, first record
-/// first. Same test-only purpose as [`dns_cache_seed`]: the fast probe serves
-/// only the first address, so a filtered-first multi-record name cannot be
+/// Seed the positive cache with a full multi-record set, first record first.
+/// Same test-only purpose as [`dns_cache_seed`]: the fast probe serves only
+/// the first address, so a filtered-first multi-record name cannot be
 /// exercised without seeding more than one.
 #[doc(hidden)]
-pub fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
+pub async fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
     let Some(first) = addrs.first().copied() else {
         return;
     };
@@ -399,319 +402,25 @@ pub fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
         }
     };
     let now = Instant::now();
-    {
-        let mut m = lock_write(dns_cache_for(key));
-        m.insert(key.to_owned(), (now, Arc::from(addrs)));
-        evict_if_needed(&mut m);
+    positives()
+        .insert(key.to_owned(), (now, Arc::from(addrs)))
+        .await;
+    if negatives().remove(key).await.is_some() {
+        bump_neg_epoch();
     }
-    clear_negative(key);
     memo_put(key, Some(first), now + DNS_CACHE_TTL);
 }
 
-pub(crate) const DNS_CACHE_MAX: usize = 4096;
-/// Per-shard positive-cache cap: shards share the process-wide total evenly,
-/// so the aggregate bound stays `DNS_CACHE_MAX` while no single write lock
-/// ever covers the whole table.
-pub(crate) const DNS_CACHE_MAX_SHARD: usize = DNS_CACHE_MAX / DNS_SHARDS;
-/// Per-shard negative-cache cap, same even split of `DNS_NEG_MAX`.
-pub(crate) const DNS_NEG_MAX_SHARD: usize = DNS_NEG_MAX / DNS_SHARDS;
-
-/// Batch eviction with a bounded write-lock hold: once the table crosses the
-/// cap, drop enough entries in one pass to cover the whole overflow, then
-/// leave the next few hundred inserts alone. Eviction is arbitrary (hash
-/// order) rather than oldest-first on purpose: oldest-first needed a full
-/// O(n) collect + `select_nth_unstable` plus per-victim key clones *while
-/// holding the write lock*, stalling every DNS reader on the packet fast
-/// path during a miss storm. Expired entries need no eager `retain` either:
-/// reads already treat them as misses via the TTL check, so they just wait
-/// for arbitrary eviction. Work per call is O(over) clones + removes.
-pub(crate) fn evict_if_needed(m: &mut DnsMap<DnsCacheVal>) {
-    const SLACK: usize = 32;
-    if m.len() <= DNS_CACHE_MAX_SHARD + SLACK {
-        return;
-    }
-    let over = m.len().saturating_sub(DNS_CACHE_MAX_SHARD);
-    if over == 0 {
-        return;
-    }
-    let victims: Vec<DnsCacheKey> = m.keys().take(over).cloned().collect();
-    for k in victims {
-        m.remove(&k);
-    }
-}
-
-/// Single-flight registration hit a contended shard mutex. Distinct from a
-/// failed lookup: nothing is known (the resolution may or may not be in
-/// flight), so callers fail fast down the spawn path and count
-/// `dgram_drops::DNS_CONTENTION` instead of charging a budget or policy
-/// counter for what was only lock contention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DnsContended;
-
-impl std::fmt::Display for DnsContended {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "dns single-flight shard contended")
-    }
-}
-
-impl std::error::Error for DnsContended {}
-
-/// Whether `err` is a [`DnsContended`] fail-fast from single-flight
-/// registration, as opposed to a genuine resolution failure.
-pub fn is_dns_contended(err: &anyhow::Error) -> bool {
-    err.is::<DnsContended>()
-}
-
-/// Resolve with one fail-fast retry on single-flight contention, for callers
-/// with no spawn fallback — the server TCP dial path only. UDP paths spawn a
-/// resolver task on contention and must not use this.
-///
-/// A `DnsContended` here would otherwise kill a healthy TCP flow over
-/// microseconds of shard-mutex hold time: the register critical section is one
-/// hash lookup plus insert (no I/O), so yielding once lets the holder drain
-/// and only a second *consecutive* contention fails the caller. The first
-/// contention is counted even when the retry succeeds — the mutex was
-/// genuinely busy, and the count is what makes a miss storm visible.
-pub async fn resolve_all_cached_with_contention_retry(
-    host: &str,
-    port: u16,
-) -> Result<Arc<[SocketAddr]>> {
-    match resolve_all_cached(host, port).await {
-        Err(e) if is_dns_contended(&e) => {
-            dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-            tokio::task::yield_now().await;
-            resolve_all_cached(host, port).await
-        }
-        r => r,
-    }
-}
-
-pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
-    // Stack-built key: no allocation on the positive-cache fast path. The
-    // fallback only triggers for hosts longer than the 255-byte wire limit.
-    let mut kbuf = [0u8; DNS_KEY_BUF];
-    let owned;
-    let key: &str = match dns_key(host, port, &mut kbuf) {
-        Some(k) => k,
-        None => {
-            owned = dns_key_owned(host, port);
-            &owned
-        }
-    };
-    // 1. Positive cache. Try-lock: contended => treat as miss and fall
-    // through to singleflight instead of parking this task.
-    {
-        if let Some(m) = try_lock_read(dns_cache_for(key)) {
-            if let Some((t, v)) = m.get(key) {
-                if t.elapsed() < DNS_CACHE_TTL {
-                    return Ok(v.clone());
-                }
-            }
-        }
-    }
-    // 2. Negative cache.
-    {
-        if let Some(n) = try_lock_read(dns_neg_cache_for(key)) {
-            if let Some(t) = n.get(key) {
-                if t.elapsed() < DNS_NEG_TTL {
-                    anyhow::bail!("dns negative cached");
-                }
-            }
-        }
-    }
-    // 3. Singleflight: exactly one owner resolves; everyone else waits on the
-    //    cell. Ownership is claimed atomically. If the owner is cancelled or
-    //    panics, `OwnerReset` clears the claim and wakes the waiters; the next
-    //    waiter re-claims it, so no waiter can sleep forever on a cell that
-    //    nobody will ever fill.
-    let entry = {
-        // Fail fast: parking this task on the shard mutex during a miss storm
-        // would hold its slow-path permit (TCP) or stall the reply (spawned
-        // UDP) for what is only lock contention. The caller counts the
-        // `DnsContended` error as `DNS_CONTENTION` and takes the spawn path.
-        let Some(mut inf) = try_lock_mutex(dns_inflight_for(key)) else {
-            return Err(DnsContended.into());
-        };
-        match inf.get(key) {
-            Some(c) => c.clone(),
-            None => {
-                let c = Arc::new(DnsInflightEntry {
-                    key: key.to_owned(),
-                    cell: tokio::sync::OnceCell::new(),
-                    notify: tokio::sync::Notify::new(),
-                    owner: std::sync::atomic::AtomicBool::new(false),
-                });
-                inf.insert(c.key.clone(), c.clone());
-                c
-            }
-        }
-    };
-    loop {
-        if let Some(v) = entry.cell.get() {
-            return match v {
-                Ok(v) => Ok(v.clone()),
-                Err(msg) => anyhow::bail!("{msg}"),
-            };
-        }
-        if !entry.owner.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            break; // this caller is the owner
-        }
-        // Waiter: register before re-checking the cell (`notify_waiters` stores
-        // no permit, so an unregistered waiter could otherwise miss completion).
-        let notified = entry.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if let Some(v) = entry.cell.get() {
-            return match v {
-                Ok(v) => Ok(v.clone()),
-                Err(msg) => anyhow::bail!("{msg}"),
-            };
-        }
-        if !entry.owner.load(std::sync::atomic::Ordering::Acquire) {
-            // The owner died without publishing; yield once so N woken
-            // waiters desynchronize instead of CAS-herding on `owner`.
-            tokio::task::yield_now().await;
-            continue;
-        }
-        notified.await;
-    }
-
-    // Owner path. Both guards live across the await: `_reset` releases the
-    // claim and wakes waiters on any exit path, `cleanup` removes the inflight
-    // entry once the caches are warm. Declared `_reset` then `cleanup`, so
-    // drop runs `cleanup` first and `_reset` last; the explicit `drop(cleanup)`
-    // below keeps that order (entry removed while the claim is still held).
-    // Safe because publish (`cell.set` + `notify_waiters`) runs before either
-    // drop, so a waiter that observes the cell also observes warm caches.
-    let _reset = OwnerReset { entry: &entry };
-    let cleanup = InflightCleanup { entry: &entry };
-
-    // A racing caller may have completed and removed the inflight entry between
-    // the initial cache checks and the registration above; re-check before
-    // issuing a duplicate upstream lookup.
-    {
-        if let Some(m) = try_lock_read(dns_cache_for(key)) {
-            if let Some((t, v)) = m.get(key) {
-                if t.elapsed() < DNS_CACHE_TTL {
-                    return Ok(v.clone());
-                }
-            }
-        }
-    }
-
-    let r: Result<Arc<[SocketAddr]>, String> =
-        match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
-            Ok(v) => Ok(Arc::from(v)),
-            Err(e) => Err(format!("{e:#}")),
-        };
+/// Record that resolving `key` failed, so the packet paths can refuse it
+/// without spawning a resolver per datagram. Runs inside
+/// [`resolve_all_cached`]'s init future, before the error is published to
+/// waiters; the single-flight serialization is what makes the write safe —
+/// no live positive entry can exist while the init that writes this runs (the
+/// old "never downgrade a live positive" probe guarded a contention window
+/// that no longer exists).
+async fn record_negative(key: &str) {
     let now = Instant::now();
-    // Warm the caches and the thread memo BEFORE publishing the result, so a
-    // caller that observes the cell also observes a cache hit, and only the
-    // owner ever pays for the insert + eviction sweep (previously every waiter
-    // re-inserted and re-swept the whole map).
-    match &r {
-        Ok(v) => {
-            {
-                let mut m = lock_write(dns_cache_for(key));
-                m.insert(key.to_owned(), (now, v.clone()));
-                evict_if_needed(&mut m);
-            }
-            clear_negative(key);
-            if let Some(a) = v.first().copied() {
-                memo_put(key, Some(a), now + DNS_CACHE_TTL);
-            }
-        }
-        Err(_) => record_negative(key, now),
-    }
-    let _ = entry.cell.set(r.clone());
-    entry.notify.notify_waiters();
-    drop(cleanup);
-    match r {
-        Ok(v) => Ok(v),
-        Err(msg) => anyhow::bail!("{msg}"),
-    }
-}
-
-/// Three-way positive-cache probe for [`record_negative`].
-///
-/// A contended shard is `Unknown`, not "absent": the entry behind it may be
-/// perfectly valid, and treating contention as absence let a failed lookup
-/// shadow a live positive answer (plus this thread's positive memo) with a
-/// negative one. Callers that only need a fast-path hint keep using
-/// `try_lock_read` miss semantics at their own call site; this helper exists
-/// so the *write* path can fail open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PositiveState {
-    Fresh,
-    Absent,
-    Unknown,
-}
-
-pub(crate) fn positive_entry_state(key: &str) -> PositiveState {
-    let Some(m) = try_lock_read(dns_cache_for(key)) else {
-        return PositiveState::Unknown;
-    };
-    if m.get(key).is_some_and(|(t, _)| t.elapsed() < DNS_CACHE_TTL) {
-        PositiveState::Fresh
-    } else {
-        PositiveState::Absent
-    }
-}
-
-/// Drop `key`'s negative cache entry because the name resolves now.
-///
-/// The single place that turns a "does not resolve" verdict into a good one, so
-/// it is also the single place that has to invalidate the thread-local negative
-/// memos derived from it (see [`bump_neg_epoch`]).
-pub(crate) fn clear_negative(key: &str) {
-    let removed = { lock_write(dns_neg_cache_for(key)).remove(key).is_some() };
-    if removed {
-        bump_neg_epoch();
-    }
-}
-
-/// Record that resolving `key` failed, so the packet paths can refuse it without
-/// spawning a resolver per datagram.
-///
-/// **Never downgrade a live positive answer.** The positive probes on the
-/// resolution path are `try_lock_read`, so a *contended* — but perfectly valid —
-/// entry makes the caller fall through to a real upstream lookup. If that
-/// lookup then fails (SERVFAIL, timeout, an overloaded resolver), recording a
-/// negative entry would shadow the valid answer: [`lookup_cached_fast`] consults
-/// the thread-local memo before anything else and a memo set holds one slot per
-/// key, so for `DNS_NEG_TTL` every datagram for that name is dropped as
-/// `REFUSED` and every TCP flow fails with "dns negative cached" — while the
-/// cached address was still good. The failure is still reported to the caller
-/// that performed it; it just does not poison the cache.
-pub(crate) fn record_negative(key: &str, now: Instant) {
-    match positive_entry_state(key) {
-        PositiveState::Fresh => return,
-        // Fail open: on a contended shard the positive entry may be perfectly
-        // valid. Recording a negative here would overwrite this thread's
-        // positive memo (which the fast path trusts over the global positive
-        // cache) and refuse the name for DNS_NEG_TTL while other threads keep
-        // serving the good address. The lost shedding is bounded by the
-        // slow-path limiter instead.
-        PositiveState::Unknown => return,
-        PositiveState::Absent => {}
-    }
-    {
-        let mut n = lock_write(dns_neg_cache_for(key));
-        // Bounded hold: evict one arbitrary entry instead of a full O(n)
-        // `retain` scan under the write lock. Expired entries are already
-        // treated as misses by the TTL check on read, so eager reaping buys
-        // nothing while stalling every packet path reader during a
-        // failing-domain flood. Per-shard cap keeps the process-wide total at
-        // `DNS_NEG_MAX`.
-        if n.len() >= DNS_NEG_MAX_SHARD {
-            if let Some(k) = n.keys().next().cloned() {
-                n.remove(&k);
-            }
-        }
-        if n.len() < DNS_NEG_MAX_SHARD {
-            n.insert(key.to_owned(), now);
-        }
-    }
+    negatives().insert(key.to_owned(), ()).await;
     memo_put(key, None, now + DNS_NEG_TTL);
 }
 
@@ -754,5 +463,107 @@ mod tests {
         let mut addrs = [v6, v4];
         addrs.sort_by_key(|s| IpPreference::Ipv4.sort_key(*s));
         assert!(addrs[0].is_ipv4(), "v4-first must put the v4 entry first");
+    }
+
+    /// A seeded name must resolve out of the positive cache without any
+    /// upstream query, negative entry, or memo write on this thread beyond
+    /// the seed's own.
+    #[tokio::test]
+    async fn seeded_name_resolves_from_the_cache() {
+        let (host, port) = ("seeded.resolve.test", 19701u16);
+        let addr: SocketAddr = "93.184.216.34:19701".parse().unwrap();
+        dns_cache_seed(host, port, addr).await;
+        let v = resolve_all_cached(host, port).await.expect("seeded hit");
+        assert_eq!(&v[..], &[addr]);
+        assert_eq!(lookup_cached_fast(host, port), CachedLookup::Addr(addr));
+    }
+
+    /// A live negative entry refuses without touching the resolver.
+    #[tokio::test]
+    async fn negative_entry_refuses_without_resolving() {
+        let (host, port) = ("negative.resolve.test", 19702u16);
+        dns_neg_cache_seed(host, port).await;
+        let err = resolve_all_cached(host, port).await.unwrap_err();
+        assert!(
+            err.to_string().contains("dns negative cached"),
+            "got: {err:#}"
+        );
+        assert_eq!(lookup_cached_fast(host, port), CachedLookup::Negative);
+    }
+
+    /// Concurrent callers of one cold key must all receive the same address
+    /// set from a single-flight resolution. `127.0.0.1` is an IP literal, which
+    /// hickory answers without any network query, so the init path (single
+    /// flight, cache insert, memo write) runs deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_lookups_coalesce_and_all_get_the_answer() {
+        let host = "127.0.0.1";
+        let port = 19703u16;
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Unknown,
+            "premise: the key is cold"
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            tasks.push(tokio::spawn(
+                async move { resolve_all_cached(host, port).await },
+            ));
+        }
+        let mut seen: Vec<Arc<[SocketAddr]>> = Vec::new();
+        for t in tasks {
+            seen.push(t.await.expect("task joins").expect("literal resolves"));
+        }
+        let first = seen[0].clone();
+        for v in &seen {
+            assert_eq!(&v[..], &first[..], "every caller must see the same set");
+        }
+        assert_eq!(
+            &first[..],
+            &[SocketAddr::from(([127, 0, 0, 1], port))],
+            "the literal must resolve to itself"
+        );
+        assert!(
+            negatives().get("127.0.0.1\u{0}19703").await.is_none(),
+            "a success must not leave a negative entry"
+        );
+    }
+
+    /// The single-flight assumption this module rests on: when the
+    /// initializing future's task is cancelled, a waiting caller must not
+    /// hang — moka hands the initialization to a waiter. Pinned here against a
+    /// private cache so a moka upgrade that broke it fails loudly in this
+    /// suite instead of wedging a deployed proxy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_owner_does_not_strand_a_waiter() {
+        use moka::future::Cache;
+        let cache: Cache<&'static str, u32> = Cache::new(16);
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let owner = tokio::spawn({
+            let c = cache.clone();
+            async move {
+                let _ = c
+                    .get_with("k", async move {
+                        let _ = release_rx.await;
+                        1u32
+                    })
+                    .await;
+            }
+        });
+        // Let the owner register its init, then queue a waiter behind it.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let waiter = tokio::spawn({
+            let c = cache.clone();
+            async move { c.get_with("k", async { 2u32 }).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        owner.abort();
+        let v = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must not hang behind a cancelled owner")
+            .expect("waiter joins");
+        assert_eq!(v, 2, "the waiter's own init must have run");
+        drop(release_tx);
     }
 }

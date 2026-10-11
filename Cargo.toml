@@ -81,6 +81,18 @@ parking_lot = "0.12"
 # than a few bytes or is genuinely cold.
 foldhash = "0.2"
 quanta = "0.13"
+# Moka: the DNS caches and single-flight, replacing the hand-written
+# sharded tables, batch eviction, owner/waiter protocol and the coalesce
+# subsystem. `default-features = false` + `future` is the minimal surface:
+# no `sync` public cache (the packet path reads the thread-local memo, and
+# `moka::future::Cache` has no synchronous read view), no `quanta` (moka's
+# quanta is 0.12; this crate already links 0.13 for its own clock — moka's
+# docs say the feature makes no measurable difference since 0.12.10), no
+# runtime feature (0.12 drives maintenance inline on cache operations).
+# The hasher is swapped to foldhash via `build_with_hasher` (see
+# `dns/store.rs`), so the DoS-resistance/seed story is the one Cargo.toml
+# already documents for the DNS tables.
+moka = { version = "0.12", default-features = false, features = ["future"] }
 # Upstream DNS for the cold path (cache miss / first resolution). Replaces
 # `tokio::net::lookup_host`, whose blocking `getaddrinfo` runs on the tokio
 # blocking pool and cannot be cancelled by the 5 s timeout wrapper: the

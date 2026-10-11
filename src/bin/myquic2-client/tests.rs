@@ -1141,7 +1141,7 @@ fn dgram_domain(sess: u32, host: &str, port: u16, payload: &[u8]) -> Bytes {
 async fn dispatch_negative_cached_domain_counts_refused_exactly_once() {
     let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
     let (host, port) = ("p14-dispatch-refused.invalid", 19531u16);
-    dns_neg_cache_seed(host, port);
+    dns_neg_cache_seed(host, port).await;
     assert_eq!(
         lookup_cached_fast(host, port),
         CachedLookup::Negative,
@@ -1169,8 +1169,7 @@ async fn dispatch_negative_cached_domain_counts_refused_exactly_once() {
     );
     let d = dgram_drops::snapshot().since(&before);
     assert_eq!(d.refused, 1, "one refused datagram counts exactly once");
-    assert_eq!(d.dns_inflight, 0, "no resolution was in flight");
-    assert_eq!(d.dns_contention, 0, "no shard was contended");
+    assert_eq!(d.dns_budget, 0, "no budget was spent");
     assert_eq!(d.session_full, 0, "no budget was spent");
     hub.release(sess);
 }
@@ -1235,8 +1234,6 @@ async fn dispatch_limiter_exhaustion_counts_dns_budget_exactly_once_per_drop() {
         "a resolver-budget refusal is not session-capacity exhaustion: charging \
          it to `session_full` reported a slow upstream as a full host"
     );
-    assert_eq!(d.dns_inflight, 0, "nothing was registered inflight");
-    assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");
     assert_eq!(d.refused, 0, "budget loss is not policy refusal");
     drop(held);
     assert!(
@@ -1281,11 +1278,7 @@ async fn dispatch_uncached_domain_spawns_without_a_sync_bump() {
     // delivers nothing, counts nothing.
     let sync = dgram_drops::snapshot().since(&before);
     assert_eq!(sync.refused, 0, "uncached is not refusal");
-    assert_eq!(
-        sync.dns_inflight, 0,
-        "the first miss spawns, it is not inflight"
-    );
-    assert_eq!(sync.dns_contention, 0, "no shard was contended");
+    assert_eq!(sync.dns_budget, 0, "budget was available");
     assert_eq!(sync.session_full, 0, "budget was available");
     assert!(
         no_reply(&a.app).await,
@@ -1320,31 +1313,25 @@ async fn dispatch_uncached_domain_spawns_without_a_sync_bump() {
     }
     assert!(counted, "the failed owner must count its datagram");
     let d = dgram_drops::snapshot().since(&before);
-    assert_eq!(d.refused, 1, "one failed owner counts exactly once");
-    assert_eq!(
-        d.dns_inflight, 0,
-        "the first miss spawns, it is not inflight"
-    );
-    assert_eq!(d.dns_contention, 0, "no shard was contended");
+    assert_eq!(d.refused, 1, "one failed waiter counts exactly once");
+    assert_eq!(d.dns_budget, 0, "budget was available");
     assert_eq!(d.session_full, 0, "budget was available");
     hub.release(sess);
 }
 
-/// Failure-path coalesce drain, dispatch path: a burst at an unresolvable
-/// name must strand nothing and count everything exactly once. The seed parks
-/// 32 followers (exactly `DNS_COALESCE_CAP`, so none spills to a `Full`
-/// fallthrough spawn) behind a fake owner with no racing resolver; unseeding
-/// then lets one more datagram spawn the real owner, whose resolution fails
-/// and must drop the 32 queued followers with one `REFUSED` bump each plus
-/// one for its own datagram. Before the fix the spawn returned bare on
-/// failure: the queue stranded (followers never delivered, never counted)
-/// and even the owner stayed silent.
+/// A burst at an unresolvable name must count every datagram exactly once.
+///
+/// Every datagram spawns its own waiter; the waiters coalesce into one
+/// upstream query that fails, and each waiter counts its payload on `REFUSED`
+/// exactly once — there is no queue left for a follower to strand in, and no
+/// follower is counted twice.
 ///
 /// Holds `DNS_SLOW_PATH_COUNTER_LOCK` like every other slow-path counter
-/// test; `.invalid` never resolves (RFC 2606), so the owner deterministically
-/// takes the failure path on both the `None` and the `Err` arms.
+/// test; `.invalid` never resolves (RFC 2606), so the waiters
+/// deterministically take the failure path on both the `None` and the `Err`
+/// arms.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dispatch_failed_name_drops_followers_with_exact_refused() {
+async fn dispatch_failed_name_counts_every_waiter_exactly_once() {
     let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
     let (host, port) = ("dispatch-fail-followers.invalid", 19534u16);
     assert_eq!(
@@ -1364,12 +1351,8 @@ async fn dispatch_failed_name_drops_followers_with_exact_refused() {
     let mut reasm = DgramReassembler::new();
     let mut pkt = bytes::BytesMut::with_capacity(256);
     let before = dgram_drops::snapshot();
-    // Park exactly a cap of followers behind a seeded entry that never
-    // completes: fully synchronous, so no resolver can finish mid-burst and
-    // steal the queue, and no follower spills to a `Full` fallthrough spawn
-    // (which would wait on the seed forever).
-    dns_inflight_seed(host, port);
-    for _ in 0..DNS_COALESCE_CAP {
+    const BURST: usize = 8;
+    for _ in 0..BURST {
         dispatch_one(
             &mut cache,
             &hub,
@@ -1379,79 +1362,43 @@ async fn dispatch_failed_name_drops_followers_with_exact_refused() {
             &mut pkt,
         );
     }
-    assert!(
-        no_reply(&a.app).await,
-        "queued followers stage nothing synchronously"
-    );
-    let mid = dgram_drops::snapshot().since(&before);
-    assert_eq!(mid.refused, 0, "parking a follower counts nothing");
-    assert_eq!(mid.dns_inflight, 0, "parking a follower is not loss");
-    // Hand the name to a real owner: it registers, fails `.invalid`, and must
-    // drop the queued cap plus count its own datagram.
-    dns_inflight_unseed(host, port);
-    dispatch_one(
-        &mut cache,
-        &hub,
-        sess,
-        dgram_domain(sess, host, port, b"fail"),
-        &mut reasm,
-        &mut pkt,
-    );
-    // Counter-driven settle: the counted drop runs in the owner task right
-    // after the resolution fails, so `refused == cap + 1` proves the drain ran.
+    assert!(no_reply(&a.app).await, "a failed name relays nothing");
+    // Counter-driven settle: each waiter's counted drop runs right after the
+    // shared resolution fails, so `refused == BURST` proves every waiter ran.
     let mut settled = false;
     for _ in 0..150 {
-        if dgram_drops::snapshot().since(&before).refused >= (DNS_COALESCE_CAP + 1) as u64 {
+        if dgram_drops::snapshot().since(&before).refused >= BURST as u64 {
             settled = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        settled,
-        "the failed owner must count its own datagram plus the queued followers"
-    );
-    assert!(no_reply(&a.app).await, "a failed name relays nothing");
+    assert!(settled, "every spawned waiter must count its own datagram");
     let d = dgram_drops::snapshot().since(&before);
     assert_eq!(
-        d.refused,
-        (DNS_COALESCE_CAP + 1) as u64,
-        "owner + queued followers count exactly once each on REFUSED"
+        d.refused, BURST as u64,
+        "each waiter counts exactly once on REFUSED"
     );
-    assert_eq!(d.dns_inflight, 0, "parking is not loss");
-    assert_eq!(d.dns_contention, 0, "contention stays a distinct counter");
+    assert_eq!(d.dns_budget, 0, "budget was available");
     assert_eq!(d.session_full, 0, "budget was available");
-    assert!(
-        client_dns_coalesce_take_now(host, port).is_empty(),
-        "no follower may strand behind the failed owner"
-    );
-    dns_inflight_unseed(host, port);
     hub.release(sess);
 }
 
-/// L2 DNS single-flight burst loss, dispatch path (Wave-1 Task-1 TDD repro —
-/// NOW GREEN). Cold 40-datagram same-host burst through `dispatch_one`,
-/// mirroring the server's `l2_dns_singleflight_burst_loss_repro_server`
-/// cold phase: the first miss spawns the resolver, followers coalesce behind
-/// the owner (`Pushed`), and cap overflow (`Full`) falls through to a
-/// self-delivering spawn that joins single-flight as a waiter, so all 40
-/// replies reach the app socket. Asserts the fixed end state: 40 replies,
-/// zero inflight drops. No prod file changes here.
+/// L2 DNS single-flight burst delivery (dispatch path).
+///
+/// Cold 40-datagram same-host burst through `dispatch_one`, mirroring the
+/// server's `l2_dns_singleflight_burst_delivers_server`: the first miss
+/// spawns a waiter, every follower spawns its own, moka coalesces all of
+/// them into one upstream query, and every waiter delivers its own reply —
+/// all 40 replies reach the app socket with zero budget/policy counters
+/// moving.
 ///
 /// Holds `DNS_SLOW_PATH_COUNTER_LOCK` like every other slow-path counter
-/// test; `localhost` + an unused port keeps the key cold without network;
-/// the registration barrier makes the N-1 count deterministic (multi-thread
-/// flavour plus a `yield_now` spin: the spawn registers before its first
-/// await, so the transient is observed within a yield or two, while a
-/// single-thread runtime would run the whole resolution inside the first
-/// sleep and miss it entirely). On a fast/idle machine `localhost` can
-/// resolve between two barrier polls even on multi-thread: a miss with the
-/// owner's lone reply and retries cold on the next port, so the burst below
-/// always starts inside a live resolution; a miss with the key still
-/// `Unknown` stays a hard premise failure, never an assumption.
-/// The limiter premise is asserted, never drained.
+/// test; `localhost` + an unused port keeps the `(host, port)` key cold
+/// without network. The limiter premise is asserted, never drained: each
+/// waiter holds one permit while it waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn l2_dns_singleflight_burst_loss_repro_dispatch() {
+async fn l2_dns_singleflight_burst_delivers_dispatch() {
     let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
     let host = "localhost";
     assert!(
@@ -1465,72 +1412,14 @@ async fn l2_dns_singleflight_burst_loss_repro_dispatch() {
     let mut cache = empty_dispatch_cache();
     let mut reasm = DgramReassembler::new();
     let mut pkt = bytes::BytesMut::with_capacity(256);
+    let port = 19641u16;
+    assert_eq!(
+        lookup_cached_fast(host, port),
+        CachedLookup::Unknown,
+        "premise: the (host, port) key is cold"
+    );
     let before = dgram_drops::snapshot();
-    // Datagram 1: cold miss, spawns the resolver, stages nothing. Retried
-    // on a fresh target port when the resolver beats the barrier (see the
-    // doc comment above): each attempt leaves zero counter deltas on the
-    // success path, and a beaten attempt's lone reply is drained before
-    // the next attempt, so the final burst still counts exactly 40/0.
-    let port = {
-        let mut chosen = None;
-        for attempt in 0..8u16 {
-            let p = 19641u16 + attempt;
-            if lookup_cached_fast(host, p) != CachedLookup::Unknown {
-                continue;
-            }
-            dispatch_one(
-                &mut cache,
-                &hub,
-                sess,
-                dgram_domain(sess, host, p, b"l2"),
-                &mut reasm,
-                &mut pkt,
-            );
-            // Registration barrier: the spawn registers single-flight before its
-            // first await, so a `yield_now` spin observes Inflight within a yield
-            // or two and the rest of the burst deterministically probes Inflight.
-            // Under a loaded `cargo test --all-targets` run every worker can be
-            // spinning a `yield_now` loop of its own, starving the spawned task
-            // before it registers — yields alone never guarantee it runs. The sleep
-            // fallback hands the core back, so the registration lands within a
-            // millisecond or two. The premise stays strict: Inflight must still be
-            // observed, never assumed.
-            let mut registered = false;
-            for _ in 0..5_000 {
-                if dns_is_inflight(host, p) {
-                    registered = true;
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            for _ in 0..100 {
-                if registered {
-                    break;
-                }
-                if dns_is_inflight(host, p) {
-                    registered = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            if registered {
-                chosen = Some(p);
-                break;
-            }
-            if lookup_cached_fast(host, p) != CachedLookup::Unknown {
-                // The resolver finished between two polls: the owner's lone
-                // reply is already on its way, so drain it and retry cold.
-                let _ = recv_reply(&a.app).await;
-                continue;
-            }
-            panic!(
-                "premise: the first miss must register single-flight before the burst continues"
-            );
-        }
-        chosen.expect("premise: an observable single-flight registration within 8 ports")
-    };
-    // Datagrams 2..40: same host, resolution still in flight.
-    for _ in 1..40 {
+    for _ in 0..40 {
         dispatch_one(
             &mut cache,
             &hub,
@@ -1540,26 +1429,27 @@ async fn l2_dns_singleflight_burst_loss_repro_dispatch() {
             &mut pkt,
         );
     }
-    // Exactly the spawned task's own reply arrives; a further quiet probe
-    // proves nothing else was staged.
+    // Every spawned waiter delivers once the (single) resolution completes;
+    // count them all.
     let mut delivered = 0u32;
-    if recv_reply(&a.app).await.is_some() {
-        delivered += 1;
-        while recv_reply_in(&a.app, REPLY_PROBE).await.is_some() {
+    while delivered < 40 {
+        if recv_reply(&a.app).await.is_some() {
             delivered += 1;
+        } else {
+            break;
         }
     }
     let d = dgram_drops::snapshot().since(&before);
     hub.release(sess);
-    assert!(
-        delivered == 40 && d.dns_inflight == 0,
-        "L2 burst loss (dispatch path): delivered={delivered}/40 \
-         dns_inflight_delta={} dns_contention_delta={} session_full_delta={} refused_delta={} (want 40/0/0/0/0)",
-        d.dns_inflight,
-        d.dns_contention,
-        d.session_full,
-        d.refused,
+    assert_eq!(
+        delivered, 40,
+        "L2 burst delivery (dispatch path): delivered={delivered}/40 \
+         dns_budget_delta={} session_full_delta={} refused_delta={} (want 40/0/0/0)",
+        d.dns_budget, d.session_full, d.refused,
     );
+    assert_eq!(d.dns_budget, 0, "budget was available");
+    assert_eq!(d.session_full, 0, "budget was available");
+    assert_eq!(d.refused, 0, "localhost is not a policy refusal");
 }
 
 fn empty_dispatch_cache() -> [DispatchSlot; DISPATCH_CACHE] {

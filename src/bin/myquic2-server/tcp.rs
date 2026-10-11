@@ -86,7 +86,7 @@ pub(crate) async fn handle_tcp_stream(
                     return;
                 }
             };
-            dns_n = match resolve_all_cached_with_contention_retry(h, *p).await {
+            dns_n = match resolve_all_cached(h, *p).await {
                 Ok(v) => {
                     // `resolve_all_cached` sorts by the configured family
                     // preference, so a flat prefix cut would starve the
@@ -120,12 +120,9 @@ pub(crate) async fn handle_tcp_stream(
                     }
                     n
                 }
-                Err(e) => {
-                    if is_dns_contended(&e) {
-                        dgram_drops::bump(&dgram_drops::DNS_CONTENTION);
-                    }
-                    0
-                }
+                // Negative-cached name, policy refusal, resolution failure or
+                // timeout: an empty candidate list fails the dial below.
+                Err(_) => 0,
             };
             drop(permit);
             &dns_cand[..dns_n]

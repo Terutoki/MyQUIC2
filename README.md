@@ -29,7 +29,7 @@ SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-2 protocol · built
 | ⚡ | **Extreme performance** | Hand-written zero-copy hot paths + BBR + GSO/GRO; one connection saturates the link, connection count scales linearly |
 | 🔀 | **Connection isolation** | 4 TCP connections + 2 class-split UDP connections; UDP never competes with TCP for a congestion window |
 | 🛡️ | **Secure by design** | TLS 1.3 + pinned Ed25519 server cert; optional `auth_token` (constant-time) keeps it from being an open relay |
-| 🌐 | **Server-side DNS** | Resolved at the exit with 60 s positive/negative caches and single-flight, so results match the egress |
+| 🌐 | **Server-side DNS** | Resolved at the exit with 120 s positive / 10 s negative caches and single-flight, so results match the egress |
 | ♻️ | **Self-healing** | ~20 s detection after a server crash, second-scale redial, UDP associations recover automatically |
 | 📦 | **OpenWrt-ready** | Static musl binaries (four CPU levels, v1–v4), ~4.4 MB each |
 
@@ -194,7 +194,7 @@ MyQUIC2/
 │   ├── config/                # TOML config schema and transport parameters
 │   ├── tls/                   # certificate generation + client / server TLS
 │   ├── transport/             # QUIC transport builder (BBR / GSO / windows / limits)
-│   ├── dns/                   # sharded caches · single-flight · memos · egress policy
+│   ├── dns/                   # moka-backed caches · single-flight · memos · egress policy
 │   ├── time/ · sync/          # clocks (mono / coarse) · lock helpers
 │   ├── stats/                 # drop / relay counters and rate-limited warnings
 │   ├── udp/                   # send path · fragmenter · reassembler · retry pool
