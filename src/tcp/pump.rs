@@ -169,7 +169,7 @@ async fn write_batch_vectored<W>(tw: &mut W, bufs: &[Bytes]) -> std::io::Result<
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use std::future::poll_fn;
+    use tokio::io::AsyncWriteExt;
     let mut off = 0usize;
     let mut skip = 0usize;
     while skip < bufs.len() {
@@ -201,10 +201,7 @@ where
             break;
         }
         let ios = &ios[..nios];
-        let n = poll_fn(|cx| {
-            tokio::io::AsyncWrite::poll_write_vectored(std::pin::Pin::new(&mut *tw), cx, ios)
-        })
-        .await?;
+        let n = tw.write_vectored(ios).await?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,

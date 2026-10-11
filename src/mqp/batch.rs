@@ -25,31 +25,8 @@ pub fn encode_batch(
     payloads: &[&[u8]],
     limit: usize,
 ) -> Option<Bytes> {
-    if payloads.is_empty() || payloads.len() > MAX_BATCH_ITEMS {
-        return None;
-    }
     let header = addr.header().ok()?;
-    let mut total = BATCH_PREFIX_LEN + header.len() + 1;
-    for p in payloads {
-        total = total.saturating_add(BATCH_ITEM_OVERHEAD + p.len());
-    }
-    if total > limit {
-        return None;
-    }
-    let mut v = Vec::with_capacity(total);
-    v.push(MQP_DGRAM_BATCH);
-    v.extend_from_slice(&sess.to_le_bytes());
-    let hdr_len = header.len();
-    v.resize(v.len() + hdr_len, 0);
-    let start = v.len() - hdr_len;
-    let n = header.encode_into(&mut v[start..]);
-    debug_assert_eq!(n, hdr_len);
-    v.push(payloads.len() as u8);
-    for p in payloads {
-        v.extend_from_slice(&(p.len() as u16).to_le_bytes());
-        v.extend_from_slice(p);
-    }
-    Some(Bytes::from(v))
+    encode_batch_with_header(sess, &header, payloads, limit)
 }
 
 pub fn encode_batch_with_header(

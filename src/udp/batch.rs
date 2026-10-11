@@ -326,14 +326,15 @@ fn probe_sendmmsg() -> bool {
         iov_base: payload.as_ptr() as *mut libc::c_void,
         iov_len: payload.len(),
     };
-    let mut storage = sockaddr_storage_for(&dst);
+    let sa = socket2::SockAddr::from(dst);
     let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
-    hdr.msg_hdr.msg_name = &mut storage as *mut _ as *mut libc::c_void;
-    hdr.msg_hdr.msg_namelen = sockaddr_len_for(&dst);
+    hdr.msg_hdr.msg_name = sa.as_ptr().cast_mut().cast::<libc::c_void>();
+    hdr.msg_hdr.msg_namelen = sa.len();
     hdr.msg_hdr.msg_iov = &mut iov;
     hdr.msg_hdr.msg_iovlen = 1;
     // SAFETY: fd is a live non-blocking UDP socket, hdrs points at one
-    // initialised mmsghdr whose iovec points at a live 1-byte buffer.
+    // initialised mmsghdr whose iovec points at a live 1-byte buffer and
+    // whose name points at `sa`'s storage, all of which outlive the call.
     let r = unsafe { libc::sendmmsg(tx.as_raw_fd(), &mut hdr, 1, 0) };
     r == 1
 }
@@ -393,40 +394,6 @@ fn probe_recvmmsg() -> bool {
     // one initialised mmsghdr; timeout points at a live timespec.
     let r = unsafe { libc::recvmmsg(rx.as_raw_fd(), &mut hdr, 1, 0, &mut ts) };
     r == 1
-}
-
-#[cfg(target_os = "linux")]
-fn sockaddr_storage_for(addr: &std::net::SocketAddr) -> libc::sockaddr_storage {
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    match addr {
-        std::net::SocketAddr::V4(a) => {
-            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
-            sin.sin_family = libc::AF_INET as libc::sa_family_t;
-            sin.sin_port = a.port().to_be();
-            sin.sin_addr = libc::in_addr {
-                s_addr: u32::from_ne_bytes(a.ip().octets()).to_be(),
-            };
-        }
-        std::net::SocketAddr::V6(a) => {
-            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
-            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sin6.sin6_port = a.port().to_be();
-            sin6.sin6_flowinfo = 0;
-            sin6.sin6_addr = libc::in6_addr {
-                s6_addr: a.ip().octets(),
-            };
-            sin6.sin6_scope_id = a.scope_id();
-        }
-    }
-    storage
-}
-
-#[cfg(target_os = "linux")]
-fn sockaddr_len_for(addr: &std::net::SocketAddr) -> libc::socklen_t {
-    match addr {
-        std::net::SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        std::net::SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -680,8 +647,9 @@ pub(crate) fn sendmmsg_frames(
         [MaybeUninit::uninit(); 2 * LAST_HOP_DRAIN];
     let mut hdrs: [MaybeUninit<libc::mmsghdr>; LAST_HOP_DRAIN] =
         [MaybeUninit::uninit(); LAST_HOP_DRAIN];
-    let storage = sockaddr_storage_for(dst);
-    let namelen = sockaddr_len_for(dst);
+    // One name buffer shared by every message: all frames in this call go to
+    // `dst`, and `sa` outlives the syscall below.
+    let sa = socket2::SockAddr::from(*dst);
     for (i, (hdr, body)) in frames[..n].iter().enumerate() {
         // A zero-length header must not become a zero-length *separate* iovec
         // (the kernel would still join them, but skipping it keeps the common
@@ -704,8 +672,8 @@ pub(crate) fn sendmmsg_frames(
         // One fully-initialized header per message (~56 B) instead of zeroing
         // all 32 up front.
         let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        h.msg_hdr.msg_name = &storage as *const _ as *mut libc::c_void;
-        h.msg_hdr.msg_namelen = namelen;
+        h.msg_hdr.msg_name = sa.as_ptr().cast_mut().cast::<libc::c_void>();
+        h.msg_hdr.msg_namelen = sa.len();
         // SAFETY: `iovs` is a stack array that outlives the syscall below; the
         // first `nios` entries of this message's pair were just written, and
         // `msg_hdr.msg_iovlen` says exactly how many.
@@ -720,8 +688,8 @@ pub(crate) fn sendmmsg_frames(
     }
     // SAFETY: fd is a live non-blocking UDP socket; the first `n` entries of
     // `hdrs` are initialised (and only `n` are passed); every `msg_iov` points
-    // at initialised iovecs that borrow live frames and `storage`, all of which
-    // outlive the call.
+    // at initialised iovecs that borrow live frames and every `msg_name` at
+    // `sa`'s storage, all of which outlive the call.
     let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr().cast::<libc::mmsghdr>(), n as u32, 0) };
     if r < 0 {
         (0, Some(std::io::Error::last_os_error()))

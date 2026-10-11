@@ -104,6 +104,18 @@ zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 # Already linked transitively (quinn, hickory), so the direct edge adds no
 # compile unit.
 thiserror = "2"
+# rand: replaces the hand-rolled xorshift64 in the client's reconnect jitter
+# (`myquic2-client/util.rs::jitter_ms`) with the audited generator — one
+# `rand::random_range(0..200)` per reconnect decision instead of a
+# hand-seeded PRNG. Already linked transitively (hickory-resolver and
+# quinn-proto both pull rand 0.10.3, and its default-feature deps —
+# rand_core, chacha20, getrandom — are all in the current build), so the
+# direct edge adds no compile unit and resolves to the same 0.10.3. Every
+# call site is cold (dial/redial backoff and the per-association idle-tick
+# phase), so the ChaCha12-backed `ThreadRng` costs nothing that matters;
+# being per-thread seeded, it preserves the hand-rolled version's
+# "concurrent clients do not share one backoff sequence" property.
+rand = "0.10"
 quanta = "0.13"
 # Moka: the DNS caches and single-flight, replacing the hand-written
 # sharded tables, batch eviction, owner/waiter protocol and the coalesce

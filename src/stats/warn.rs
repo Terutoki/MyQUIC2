@@ -91,3 +91,72 @@ pub(crate) fn warn_datagram_drop(
 pub(crate) fn budget_detail(limit: usize, cap: usize) -> String {
     format!("; path DATAGRAM limit {limit} B, usable UDP payload {cap} B")
 }
+
+/// Window of the per-second log limiters ([`claim_log_window`] and
+/// [`claim_log_window_counted`]).
+pub const LOG_WINDOW_MS: u64 = 1_000;
+
+/// Claim a one-per-[`LOG_WINDOW_MS`] window on `slot`; the caller supplies the
+/// clock reading, so the shared clock choice stays at the call site.
+///
+/// `true` for the single winner; every other caller inside the window — and
+/// every loser of a concurrent race — gets `false` without blocking (relaxed
+/// load + relaxed CAS, the same claim protocol as [`claim_drop_warning`]).
+pub fn claim_log_window(slot: &std::sync::atomic::AtomicU64, now: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let prev = slot.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < LOG_WINDOW_MS {
+        return false;
+    }
+    slot.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Counted variant of [`claim_log_window`]: `None` while the window is closed
+/// (and this call is counted as suppressed), `Some(n)` for the winner, where
+/// `n` is the number of calls suppressed since the previous window opened —
+/// reset by the claim so the winner can fold it into its next line.
+pub fn claim_log_window_counted(
+    slot: &std::sync::atomic::AtomicU64,
+    suppressed: &std::sync::atomic::AtomicU64,
+    now: u64,
+) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let prev = slot.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < LOG_WINDOW_MS {
+        suppressed.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if slot
+        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        Some(suppressed.swap(0, Ordering::Relaxed))
+    } else {
+        suppressed.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Rate-limited (one per [`LOG_WINDOW_MS`], process-wide) claim for the
+/// per-flow TCP-abort log line, folding the suppressed count into a warning
+/// whenever the next window opens.
+///
+/// The caller's failure line reads `conn.stats()`, which takes quinn's
+/// connection-state mutex, so an abort storm must not reach it per flow — a
+/// `false` here keeps the storm off the mutex entirely. Both binaries carried
+/// byte-identical copies of this state machine before it moved here.
+pub fn tcp_abort_log_due() -> bool {
+    use std::sync::atomic::AtomicU64;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    match claim_log_window_counted(&LAST, &SUPPRESSED, crate::mono_millis()) {
+        None => false,
+        Some(n) => {
+            if n > 0 {
+                tracing::warn!("tcp aborts suppressed in the last window: {n}");
+            }
+            true
+        }
+    }
+}

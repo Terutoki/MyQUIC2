@@ -101,6 +101,7 @@ pub use dns::{
 pub use stats::drops::dgram_drops;
 pub use stats::udp_stats::{self, UdpSnapshot};
 pub use stats::udp_write::{self, UdpWriteSnapshot};
+pub use stats::warn::{claim_log_window, claim_log_window_counted, tcp_abort_log_due};
 pub use tcp::{copy_tcp_quic, copy_tcp_quic_acked, copy_tcp_quic_idle};
 #[allow(unused_imports)]
 pub(crate) use transport::{clamp_keep_alive, DATAGRAM_BUFFER, MQP_DGRAM_MAX};

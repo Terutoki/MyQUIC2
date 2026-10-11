@@ -4,82 +4,34 @@ use super::*;
 /// Rate limit for the per-connection stream-share refusal line (1/s, with a
 /// suppressed count, like the other per-flow abort logs).
 pub(crate) fn warn_stream_share_refused() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static LAST: AtomicU64 = AtomicU64::new(0);
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
-    let now = mono_millis();
-    let prev = LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 1000 {
-        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if LAST
-        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-    {
-        let n = SUPPRESSED.swap(0, Ordering::Relaxed);
-        if n > 0 {
-            tracing::warn!("tcp stream-share refusals suppressed in the last window: {n}");
+    match claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()) {
+        None => false,
+        Some(n) => {
+            if n > 0 {
+                tracing::warn!("tcp stream-share refusals suppressed in the last window: {n}");
+            }
+            true
         }
-        true
-    } else {
-        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-        false
     }
 }
 
 /// Rate limit for "refusing new connection" logs under a flood.
 pub(crate) fn warn_once_per_sec() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = mono_millis();
-    let prev = LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 1000 {
-        return false;
-    }
-    LAST.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
+    claim_log_window(&LAST, mono_millis())
 }
 
 /// Rate limit for session-socket setup failures (fd or memory exhaustion).
 /// A separate slot from [`warn_once_per_sec`] on purpose: an fd-exhaustion
 /// storm must not silence the connection-limit warning, and vice versa.
 pub(crate) fn warn_sess_create_failed() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = mono_millis();
-    let prev = LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 1000 {
-        return false;
-    }
-    LAST.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-}
-/// Rate limit for per-flow abort lines: the `conn.stats()` snapshot takes the
-/// quinn connection-state mutex, so an abort storm must not pay it per flow.
-pub(crate) fn tcp_abort_log_due() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
-    let now = mono_millis();
-    let prev = LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < 1000 {
-        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if LAST
-        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-    {
-        let n = SUPPRESSED.swap(0, Ordering::Relaxed);
-        if n > 0 {
-            tracing::warn!("tcp aborts suppressed in the last window: {n}");
-        }
-        true
-    } else {
-        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-        false
-    }
+    claim_log_window(&LAST, mono_millis())
 }
 /// One UDP activity line per minute.
 ///

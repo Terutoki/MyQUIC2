@@ -983,6 +983,7 @@ dependencies = [
  "parking_lot",
  "quanta",
  "quinn",
+ "rand",
  "rcgen",
  "rustls",
  "rustls-pemfile",
