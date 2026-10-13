@@ -977,6 +977,7 @@ dependencies = [
  "foldhash",
  "futures-util",
  "hickory-resolver",
+ "ipnet",
  "libc",
  "mimalloc",
  "moka",

@@ -868,6 +868,32 @@ mod tests {
         }
     }
 
+    /// M1 regression: the whole reserved region *below* `2000::/3` is denied as
+    /// blocks. The old denylist had one arm per RFC and no arm at all for most
+    /// of the region, so `::/8` beyond `::1` and `::` (e.g.
+    /// `::1:203:405:607:809:a0b`) read as globally routable. The CIDR table in
+    /// `dns/policy.rs` denies all of it; the boundary at `2000::/3` and the
+    /// embedded-IPv4 recurions stay.
+    #[test]
+    fn is_global_ip_denies_the_reserved_region_below_2000() {
+        for ip in [
+            "::1:203:405:607:809:a0b", // ::/8, not the ::/96 compatible form
+            "::ffff:1:2:3",            // not the ::ffff:0:0/96 mapped prefix
+            "100::1",                  // 0100::/16
+            "200::1",                  // 0200::/7
+            "400::1",                  // 0400::/6
+            "800::1",                  // 0800::/5
+            "1000::1",                 // 1000::/4
+            "1fff:ffff::1",
+        ] {
+            assert!(!is_global_ip(ip.parse().unwrap()), "{ip} is IETF-reserved");
+        }
+        // The boundary itself: 2000::/3 is global unicast.
+        for ip in ["2000::1", "2600::1", "3fff:ffff::1"] {
+            assert!(is_global_ip(ip.parse().unwrap()), "{ip} is global unicast");
+        }
+    }
+
     /// The TTL-exposing lookups must report the *remaining* life, not the full
     /// TTL: that remainder is what an adopting caller (the server's connection
     /// pin and session destination memo) has to clamp against.

@@ -141,6 +141,15 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
     "system-config",
     "tokio",
 ] }
+# ipnet: the egress-policy deny lists (`dns/policy.rs::is_global_ip`) are CIDR
+# data, not code. `Ipv4Net`/`Ipv6Net` with `contains` replaces the hand-rolled
+# octet/mask chain this file had, whose history is a list of near-miss
+# corrections (fe00::/9, 2001::/23, 3fff::/20 — each fixed in place because a
+# bitmask can be wrong in a way a CIDR cannot). `new_assert` makes a bad
+# prefix length a compile error. Packet-adjacent consumers memoize the
+# verdict (`is_global_ip_cached`), so the linear scan runs on uncached
+# addresses only. `std` and `serde` off: only `contains` is used.
+ipnet = { version = "2", default-features = false }
 
 # mimalloc on every target. The shipped static / OpenWrt binaries link musl,
 # whose allocator measured ~22% behind glibc on the closed-loop UDP soak

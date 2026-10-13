@@ -314,8 +314,8 @@ pub fn udp_try_send_grouped(
     #[cfg(target_os = "linux")]
     {
         if sendmmsg_available() {
-            use std::os::unix::io::AsRawFd;
-            let (sent, _) = super::batch::sendmmsg_frames(sock.as_raw_fd(), &dst, &frames[..n]);
+            use std::os::fd::AsFd;
+            let (sent, _) = super::batch::sendmmsg_frames(sock.as_fd(), &dst, &frames[..n]);
             // Book the group only when the syscall actually put frames on the
             // wire. A full send buffer (EAGAIN, the very saturation regime this
             // batching exists for) returns 0 sent, and recording that as a

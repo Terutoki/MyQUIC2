@@ -291,7 +291,10 @@ pub fn batch_backend() -> &'static str {
 
 #[cfg(target_os = "linux")]
 fn probe_sendmmsg() -> bool {
-    use std::os::unix::io::AsRawFd;
+    use rustix::io::IoSlice;
+    use rustix::net::{MMsgHdr, SendAncillaryBuffer, SendFlags, SocketAddrAny};
+    use std::os::fd::AsFd;
+
     let tx = match socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -320,23 +323,22 @@ fn probe_sendmmsg() -> bool {
     if tx.set_nonblocking(true).is_err() {
         return false;
     }
-    // One 1-byte message: proves the syscall exists and works, nothing more.
+    // One 1-byte message: proves the syscall exists and is served, nothing
+    // more. rustix's `sendmmsg` is a thin, type-checked wrapper over the same
+    // syscall — the iovec borrows the payload, the destination is one
+    // `SocketAddrAny`, and the (empty) control buffer means no cmsg — so this
+    // path needs no `unsafe` and no manual `mmsghdr` layout. An ENOSYS from a
+    // seccomp filter or old kernel surfaces as the `Err` that makes the probe
+    // report `false`, exactly as the raw `r == 1` did.
     let payload = [0x5Au8; 1];
-    let mut iov = libc::iovec {
-        iov_base: payload.as_ptr() as *mut libc::c_void,
-        iov_len: payload.len(),
-    };
-    let sa = socket2::SockAddr::from(dst);
-    let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
-    hdr.msg_hdr.msg_name = sa.as_ptr().cast_mut().cast::<libc::c_void>();
-    hdr.msg_hdr.msg_namelen = sa.len();
-    hdr.msg_hdr.msg_iov = &mut iov;
-    hdr.msg_hdr.msg_iovlen = 1;
-    // SAFETY: fd is a live non-blocking UDP socket, hdrs points at one
-    // initialised mmsghdr whose iovec points at a live 1-byte buffer and
-    // whose name points at `sa`'s storage, all of which outlive the call.
-    let r = unsafe { libc::sendmmsg(tx.as_raw_fd(), &mut hdr, 1, 0) };
-    r == 1
+    let sa = SocketAddrAny::from(dst);
+    let iov = [IoSlice::new(&payload)];
+    let mut cmsg = SendAncillaryBuffer::default();
+    let mut msgs = [MMsgHdr::new_with_addr(&sa, &iov, &mut cmsg)];
+    matches!(
+        rustix::net::sendmmsg(tx.as_fd(), &mut msgs, SendFlags::empty()),
+        Ok(1)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -624,77 +626,67 @@ pub type SendFrame<'a> = (&'a [u8], &'a [u8]);
 /// `dst` is the single destination every frame goes to.
 #[cfg(target_os = "linux")]
 pub(crate) fn sendmmsg_frames(
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::BorrowedFd<'_>,
     dst: &std::net::SocketAddr,
     frames: &[SendFrame<'_>],
 ) -> (usize, Option<std::io::Error>) {
+    use rustix::io::IoSlice;
+    use rustix::net::{MMsgHdr, SendAncillaryBuffer, SendFlags, SocketAddrAny};
     use std::mem::MaybeUninit;
+
     let n = frames.len().min(LAST_HOP_DRAIN);
     if n == 0 {
         return (0, None);
     }
-    // Two iovecs per message (header, payload), each message's pair contiguous
-    // so one `msg_iov` pointer describes it.
-    //
-    // Both arrays are `MaybeUninit`: only the entries actually used are written.
-    // `mem::zeroed()` on the full arrays put ~2.7 KB of dead stores on every
+    // Two iovecs per message (header, payload), each pair starting at `2*i`,
+    // plus one (empty) control buffer and one message header per frame — all
+    // only for the entries actually used. Zero-initializing the fixed arrays
+    // is what the pre-rustix revision measured as ~2.7 KB of dead stores per
     // call, and `flush_staged`/`flush_staged_sends` issue one call per
     // same-destination run — which is a run of length 1 whenever a burst spans
-    // several sessions, i.e. exactly the multi-association case. The addresses
-    // escape into the `extern "C"` call below, so the compiler cannot remove
-    // those stores itself.
-    let mut iovs: [MaybeUninit<libc::iovec>; 2 * LAST_HOP_DRAIN] =
-        [MaybeUninit::uninit(); 2 * LAST_HOP_DRAIN];
-    let mut hdrs: [MaybeUninit<libc::mmsghdr>; LAST_HOP_DRAIN] =
-        [MaybeUninit::uninit(); LAST_HOP_DRAIN];
-    // One name buffer shared by every message: all frames in this call go to
-    // `dst`, and `sa` outlives the syscall below.
-    let sa = socket2::SockAddr::from(*dst);
+    // several sessions, i.e. exactly the multi-association case.
+    //
+    // `MMsgHdr` is rustix's `#[repr(transparent)]` `mmsghdr`: the wrapper owns
+    // the ABI (including the musl/glibc `msg_iovlen` and flag-width
+    // differences the raw version worked around with `as _` casts) and
+    // type-checks the iovec/addr borrows. What remains are the two
+    // initialized-slice views below — no raw pointer arithmetic into a C
+    // call, no manual `mmsghdr` layout.
+    let mut iovs: [MaybeUninit<IoSlice<'_>>; 2 * LAST_HOP_DRAIN] =
+        [const { MaybeUninit::uninit() }; 2 * LAST_HOP_DRAIN];
+    let mut cmsgs: [_; LAST_HOP_DRAIN] = std::array::from_fn(|_| SendAncillaryBuffer::default());
+    let mut msgs: [MaybeUninit<MMsgHdr<'_>>; LAST_HOP_DRAIN] =
+        [const { MaybeUninit::uninit() }; LAST_HOP_DRAIN];
+    // One destination shared by every message: all frames in this call go to
+    // `dst`, and `SocketAddrAny` owns its storage, so one `msg_name` serves
+    // the whole run.
+    let sa = SocketAddrAny::from(*dst);
     for (i, (hdr, body)) in frames[..n].iter().enumerate() {
         // A zero-length header must not become a zero-length *separate* iovec
         // (the kernel would still join them, but skipping it keeps the common
         // server case — no header — at exactly one iovec, as before).
         let mut nios = 0usize;
         if !hdr.is_empty() {
-            iovs[2 * i].write(libc::iovec {
-                iov_base: hdr.as_ptr() as *mut libc::c_void,
-                iov_len: hdr.len(),
-            });
+            iovs[2 * i].write(IoSlice::new(hdr));
             nios += 1;
         }
         if !body.is_empty() || nios == 0 {
-            iovs[2 * i + nios].write(libc::iovec {
-                iov_base: body.as_ptr() as *mut libc::c_void,
-                iov_len: body.len(),
-            });
+            iovs[2 * i + nios].write(IoSlice::new(body));
             nios += 1;
         }
-        // One fully-initialized header per message (~56 B) instead of zeroing
-        // all 32 up front.
-        let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        h.msg_hdr.msg_name = sa.as_ptr().cast_mut().cast::<libc::c_void>();
-        h.msg_hdr.msg_namelen = sa.len();
-        // SAFETY: `iovs` is a stack array that outlives the syscall below; the
-        // first `nios` entries of this message's pair were just written, and
-        // `msg_hdr.msg_iovlen` says exactly how many.
-        h.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(2 * i).cast::<libc::iovec>() };
-        // `as _`: `msg_iovlen` is `size_t` in the libc crate's glibc bindings
-        // and `c_int` in its musl bindings (musl's own `struct msghdr` declares
-        // `int msg_iovlen`), exactly like the `MSG_DONTWAIT as _` flag below.
-        // A bare `usize` type-checks on glibc and breaks the static musl build
-        // (E0308); a bare literal cannot express the 1-or-2 count.
-        h.msg_hdr.msg_iovlen = nios as _;
-        hdrs[i].write(h);
+        // SAFETY: the `nios` entries at `2*i` were just written above, the
+        // range is inside the array, and each iovec borrows a frame that
+        // outlives the syscall.
+        let iov = unsafe { std::slice::from_raw_parts(iovs[2 * i].as_ptr(), nios) };
+        msgs[i].write(MMsgHdr::new_with_addr(&sa, iov, &mut cmsgs[i]));
     }
-    // SAFETY: fd is a live non-blocking UDP socket; the first `n` entries of
-    // `hdrs` are initialised (and only `n` are passed); every `msg_iov` points
-    // at initialised iovecs that borrow live frames and every `msg_name` at
-    // `sa`'s storage, all of which outlive the call.
-    let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr().cast::<libc::mmsghdr>(), n as u32, 0) };
-    if r < 0 {
-        (0, Some(std::io::Error::last_os_error()))
-    } else {
-        (r as usize, None)
+    // SAFETY: exactly `n` messages were written, at `0..n`, and only `0..n` is
+    // passed below.
+    let msgs =
+        unsafe { std::slice::from_raw_parts_mut(msgs.as_mut_ptr().cast::<MMsgHdr<'_>>(), n) };
+    match rustix::net::sendmmsg(fd, msgs, SendFlags::empty()) {
+        Ok(sent) => (sent, None),
+        Err(e) => (0, Some(e)),
     }
 }
 
