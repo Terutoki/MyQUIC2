@@ -661,7 +661,11 @@ pub(crate) fn sendmmsg_frames(
     // `dst`, and `SocketAddrAny` owns its storage, so one `msg_name` serves
     // the whole run.
     let sa = SocketAddrAny::from(*dst);
-    for (i, (hdr, body)) in frames[..n].iter().enumerate() {
+    // `zip(cmsgs.iter_mut())`: each message needs its own `&mut
+    // SendAncillaryBuffer` for as long as the `MMsgHdr` lives, and indexing
+    // the array per message would reborrow the whole array each time (E0499);
+    // `iter_mut` hands out disjoint items instead.
+    for (i, (cmsg, (hdr, body))) in cmsgs.iter_mut().zip(frames[..n].iter()).enumerate() {
         // A zero-length header must not become a zero-length *separate* iovec
         // (the kernel would still join them, but skipping it keeps the common
         // server case — no header — at exactly one iovec, as before).
@@ -678,7 +682,7 @@ pub(crate) fn sendmmsg_frames(
         // range is inside the array, and each iovec borrows a frame that
         // outlives the syscall.
         let iov = unsafe { std::slice::from_raw_parts(iovs[2 * i].as_ptr(), nios) };
-        msgs[i].write(MMsgHdr::new_with_addr(&sa, iov, &mut cmsgs[i]));
+        msgs[i].write(MMsgHdr::new_with_addr(&sa, iov, cmsg));
     }
     // SAFETY: exactly `n` messages were written, at `0..n`, and only `0..n` is
     // passed below.
@@ -686,7 +690,9 @@ pub(crate) fn sendmmsg_frames(
         unsafe { std::slice::from_raw_parts_mut(msgs.as_mut_ptr().cast::<MMsgHdr<'_>>(), n) };
     match rustix::net::sendmmsg(fd, msgs, SendFlags::empty()) {
         Ok(sent) => (sent, None),
-        Err(e) => (0, Some(e)),
+        // `Errno` -> `std::io::Error`: the caller reports this through the
+        // same `Option<io::Error>` the raw version returned.
+        Err(e) => (0, Some(e.into())),
     }
 }
 

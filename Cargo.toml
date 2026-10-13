@@ -150,6 +150,19 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 # verdict (`is_global_ip_cached`), so the linear scan runs on uncached
 # addresses only. `std` and `serde` off: only `contains` is used.
 ipnet = { version = "2", default-features = false }
+# rustix: `net::sendmmsg` (feature `net`) replaces the hand-written
+# `libc::mmsghdr` construction on the UDP send path (`udp/batch.rs`, both
+# call sites are `#[cfg(target_os = "linux")]`). rustix owns the Linux/musl
+# ABI quirks the hand-rolled version worked around (`msg_iovlen as _`,
+# `MSG_DONTWAIT as _`) and type-checks the iovec/addr borrows, which removed
+# four of the crate's `unsafe` blocks. `recvmmsg` stays hand-rolled: rustix
+# lists it under `not_implemented::yet`, and `nix`'s `MultiHeaders`/`RecvMsg`
+# iterator API is heavier than the fixed `mmsghdr` array that path needs.
+# `std` for the `SocketAddrAny` conversions; the crate links everywhere but
+# is only *called* on Linux. `time` is a hard requirement of `net` in
+# rustix 1.1 (`net`'s sockopt code uses `crate::timespec`, which the `time`
+# feature gates), so it must be enabled with it.
+rustix = { version = "1", default-features = false, features = ["net", "std", "time"] }
 
 # mimalloc on every target. The shipped static / OpenWrt binaries link musl,
 # whose allocator measured ~22% behind glibc on the closed-loop UDP soak
