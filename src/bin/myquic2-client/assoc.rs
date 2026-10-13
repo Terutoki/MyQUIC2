@@ -522,16 +522,24 @@ pub(crate) async fn udp_associate_inner(
                 }
                 }
                 if let Some((pc, pa, pp)) = batch_pending.take() {
-                    let now_flush = coarse_millis();
-                    let flushed = egress_shared.with_fresh(pc, now_flush, |c, limit| {
-                        frag.send(c, sess, &pa.as_ref(), &pp, limit)
-                    });
-                    if flushed.is_none() {
-                        batch_pending = Some((pc, pa, pp));
-                    }
+                    flush_deferred_pair(
+                        &egress_shared,
+                        &pool,
+                        &mut frag,
+                        sess,
+                        pc,
+                        &pa.as_ref(),
+                        &pp,
+                    );
                 }
                 record_drain_batch(drained);
             }
+            // Fresh future per iteration, on purpose: `readable()` is an
+            // `async fn`, and polling its state machine after it has returned
+            // `Ready` panics ("async fn resumed after completion") — a pinned
+            // future crashed every association whose control connection fired
+            // readability once without closing. The per-iteration registration
+            // it saves is one slab churn per drained burst, not per packet.
             _ = tcp.readable() => {
                 let mut closed = false;
                 let mut got = false;
@@ -577,15 +585,62 @@ pub(crate) async fn udp_associate_inner(
             }
         }
     }
-    // Every exit above breaks to here, so the buffer is recycled exactly once
-    // per association lifetime, however it ended (idle reap, control close,
-    // socket error). A held 2-pack payload never reached the wire: count it so
-    // the exit cannot create invisible loss (one datagram, worst case).
+    // Backstop only: the flush at the end of the recv branch above always
+    // drains `batch_pending` now (it sends, or drops it with accounting), so
+    // no exit path can leave one behind. Kept so a future staging site added
+    // outside that branch fails loudly in the counters instead of losing a
+    // datagram silently.
     if batch_pending.is_some() {
         dgram_drops::bump(&dgram_drops::NO_EGRESS);
     }
     assoc_recycle_buf(buf);
     Ok(())
+}
+
+/// Send the deferred 2-pack payload once, or drop it with accounting.
+///
+/// The payload is never returned: parking it back for a later iteration is
+/// what the pre-fix code did, and a parked payload waits for the next app
+/// datagram — unbounded when the app pauses, since the idle and control
+/// branches never look at it. A memo that has gone stale between staging and
+/// this flush (a coarse-tick boundary, or a concurrent generation bump from
+/// a reconnect or budget probe) therefore falls back to the same acquire a
+/// datagram takes on a memo miss, exactly once; a genuine no-egress outcome
+/// drops the payload and counts it. Either way the deferred queue empties.
+pub(crate) fn flush_deferred_pair(
+    egress_shared: &SharedEgress,
+    pool: &ConnPool,
+    frag: &mut DgramFragmenter,
+    sess: u32,
+    class: EgressClass,
+    addr: &TargetAddrRef<'_>,
+    payload: &[u8],
+) {
+    let now_flush = coarse_millis();
+    if egress_shared
+        .with_fresh(class, now_flush, |c, limit| {
+            frag.send(c, sess, addr, payload, limit)
+        })
+        .is_some()
+    {
+        return;
+    }
+    // Generation read before the cached read, the same contract the
+    // per-datagram miss path in `udp_associate_inner` documents.
+    let generation =
+        egress_shared.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+    match egress_shared.acquire(pool, class, now_flush) {
+        Some((conn, limit, stamp)) => {
+            egress_shared.memo_store(class, generation, &conn, limit, stamp);
+            frag.send(&conn, sess, addr, payload, limit);
+        }
+        None => {
+            let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+            dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, n, || {
+                format!("; class={} (deferred 2-pack flush)", class.name())
+            });
+        }
+    }
 }
 
 /// Pick the outcome the caller must react to when two single sends were both

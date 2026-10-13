@@ -172,19 +172,35 @@ pub(crate) fn dispatch_stage_multi(
         };
         match b.addr {
             TargetAddrRef::Ip(dst) => {
+                // One liveness flag per frame, not per item: every item of a
+                // batch shares the association, `mark_replied` is an
+                // idempotent relaxed store, and its only consumer folds it
+                // into the idle stamp at the association's own tick.
+                entry.mark_replied();
                 let n = b.payloads.len();
                 for p in &b.payloads {
                     udp_stats::payload(p.len());
-                    out.push(stage_reply(&entry, app, dst, d.slice_ref(p)));
+                    out.push(StagedReply {
+                        sock: entry.relay.clone(),
+                        app,
+                        dst,
+                        payload: d.slice_ref(p),
+                    });
                 }
                 return n;
             }
             TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
                 CachedLookup::Addr(dst) => {
+                    entry.mark_replied();
                     let n = b.payloads.len();
                     for q in &b.payloads {
                         udp_stats::payload(q.len());
-                        out.push(stage_reply(&entry, app, dst, d.slice_ref(q)));
+                        out.push(StagedReply {
+                            sock: entry.relay.clone(),
+                            app,
+                            dst,
+                            payload: d.slice_ref(q),
+                        });
                     }
                     return n;
                 }

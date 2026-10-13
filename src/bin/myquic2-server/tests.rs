@@ -2180,3 +2180,200 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
     );
     assert_eq!(d.refused, 0, "budget loss is not policy refusal");
 }
+
+/// Reply-path batching: one BATCH frame carries every staged small reply,
+/// in staging order, with the session id and the shared source address.
+///
+/// This is the reply-path twin of the client association's 2-pack, driven
+/// directly against a live loopback pair so the wire format is what is
+/// asserted — one `0x06` frame the client dispatcher already decodes into
+/// per-association replies, not N `0x02` frames.
+#[tokio::test]
+async fn reply_batch_frame_carries_every_staged_reply_in_order() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let mut frag = DgramFragmenter::new();
+    let mut staged = vec![
+        Bytes::from_static(b"first"),
+        Bytes::from_static(b"second-reply"),
+        Bytes::from_static(b"third"),
+    ];
+    let mut staged_src = Some("198.51.100.9:4242".parse::<SocketAddr>().unwrap());
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let mut last_probe = 0u64;
+
+    flush_reply_batch(
+        &server_conn,
+        7,
+        &mut frag,
+        &mut staged,
+        &mut staged_src,
+        &mut limit,
+        &mut last_probe,
+    );
+    assert!(
+        staged.is_empty() && staged_src.is_none(),
+        "a flush must drain the queue and its source, never park them"
+    );
+
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the batch frame must arrive")
+        .unwrap();
+    assert!(
+        is_batch(&d),
+        "staged small replies must ride one BATCH frame"
+    );
+    let b = decode_batch_ref(&d).expect("the frame must decode as a batch");
+    assert_eq!(b.sess, 7, "the session id must survive the batch frame");
+    let payloads: Vec<&[u8]> = b.payloads;
+    assert_eq!(
+        payloads,
+        vec![
+            b"first".as_slice(),
+            b"second-reply".as_slice(),
+            b"third".as_slice()
+        ],
+        "a batch must preserve reply order exactly"
+    );
+    match b.addr {
+        TargetAddrRef::Ip(a) => assert_eq!(a.port(), 4242, "the shared reply source address"),
+        other => panic!("an IP target reply must stay IP-form: {other:?}"),
+    }
+    // Exactly one frame for three replies: a duplicate single 0x02 frame per
+    // reply (a half-wired staging loop) leaves this probe firing, which the
+    // payload assertions above cannot see.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), client_conn.read_datagram())
+            .await
+            .is_err(),
+        "three staged replies must produce exactly one frame, not one plus extras"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A batch frame that does not fit the path must not take its replies down
+/// with it: every reply goes out as its own `0x02` frame, in order, and each
+/// keeps its own accounting. Without the fallback a shrunken DATAGRAM budget
+/// would lose N replies that would each have fit.
+#[tokio::test]
+async fn reply_batch_falls_back_to_per_reply_frames_when_it_cannot_fit() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let mut frag = DgramFragmenter::new();
+    let replies: Vec<Bytes> = vec![
+        Bytes::from(vec![0xA1; 100]),
+        Bytes::from(vec![0xB2; 100]),
+        Bytes::from(vec![0xC3; 100]),
+    ];
+    let mut staged = replies.clone();
+    let mut staged_src = Some("198.51.100.9:4242".parse::<SocketAddr>().unwrap());
+    // Each single frame is 5 + 7 + 100 = 112 B; the batch needs
+    // 5 + 7 + 1 + 3 x (2 + 100) = 321 B, so this budget admits the replies
+    // and refuses the frame — the exact shape the fallback exists for.
+    let mut limit = 300usize;
+    let mut last_probe = 0u64;
+
+    flush_reply_batch(
+        &server_conn,
+        9,
+        &mut frag,
+        &mut staged,
+        &mut staged_src,
+        &mut limit,
+        &mut last_probe,
+    );
+    assert!(staged.is_empty(), "the fallback must still drain the queue");
+
+    for (i, want) in replies.iter().enumerate() {
+        let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+            .await
+            .unwrap_or_else(|_| panic!("reply {i} must arrive"))
+            .unwrap();
+        assert_eq!(
+            d.first(),
+            Some(&MQP_DGRAM_TYPE),
+            "a fallback reply must be a single 0x02 frame, got {d:02x?}"
+        );
+        let (_, _, p) = decode_datagram_ref(&d).expect("a fallback frame must decode");
+        assert_eq!(
+            p,
+            want.as_ref(),
+            "fallback reply {i} must be byte-identical"
+        );
+    }
+    // Three replies and no more: a fourth frame would mean the fallback
+    // double-sent (or a batch frame tagged along), which the per-frame
+    // assertions above cannot see.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), client_conn.read_datagram())
+            .await
+            .is_err(),
+        "the fallback must send exactly one frame per reply, never a duplicate"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Distinct target sources must not share one batch frame, and a run's flush
+/// must complete before the next run's replies are sent: two flushes produce
+/// two frames in source order, each carrying only its own replies. A
+/// half-wired source check merges them into one frame whose address belongs
+/// to neither (or both) sources — a silent mis-route of the reply's source
+/// address, which the payload bytes alone would not reveal.
+#[tokio::test]
+async fn distinct_source_runs_flush_in_order_as_separate_frames() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let mut frag = DgramFragmenter::new();
+    let src_a: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let src_b: SocketAddr = "203.0.113.7:5353".parse().unwrap();
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let mut last_probe = 0u64;
+
+    let mut staged = vec![Bytes::from_static(b"a-1"), Bytes::from_static(b"a-2")];
+    let mut staged_src = Some(src_a);
+    flush_reply_batch(
+        &server_conn,
+        11,
+        &mut frag,
+        &mut staged,
+        &mut staged_src,
+        &mut limit,
+        &mut last_probe,
+    );
+
+    let mut staged = vec![Bytes::from_static(b"b-1"), Bytes::from_static(b"b-2")];
+    let mut staged_src = Some(src_b);
+    flush_reply_batch(
+        &server_conn,
+        11,
+        &mut frag,
+        &mut staged,
+        &mut staged_src,
+        &mut limit,
+        &mut last_probe,
+    );
+
+    let d1 = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the first run's frame must arrive first")
+        .unwrap();
+    let b1 = decode_batch_ref(&d1).expect("the first frame must decode");
+    assert_eq!(b1.payloads, vec![b"a-1".as_slice(), b"a-2".as_slice()]);
+    match b1.addr {
+        TargetAddrRef::Ip(a) => assert_eq!(a, src_a, "the first frame must name source A"),
+        other => panic!("an IP target reply must stay IP-form: {other:?}"),
+    }
+
+    let d2 = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the second run's frame must arrive")
+        .unwrap();
+    let b2 = decode_batch_ref(&d2).expect("the second frame must decode");
+    assert_eq!(b2.payloads, vec![b"b-1".as_slice(), b"b-2".as_slice()]);
+    match b2.addr {
+        TargetAddrRef::Ip(a) => assert_eq!(a, src_b, "the second frame must name source B"),
+        other => panic!("an IP target reply must stay IP-form: {other:?}"),
+    }
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}

@@ -2830,3 +2830,39 @@ fn only_the_dedicated_bulk_udp_slot_uses_the_bulk_preset() {
         );
     }
 }
+
+/// P0-2 regression: the deferred 2-pack flush must never park its payload
+/// back for a later loop iteration. The pre-fix code re-stored it on a stale
+/// memo, so the payload waited for the next app datagram — unbounded when
+/// the app pauses, since the idle and control branches never look at the
+/// deferred queue — and was finally mis-counted at association exit. With no
+/// publishable egress the payload is dropped and counted exactly once.
+#[tokio::test]
+async fn deferred_2pack_flush_drops_once_instead_of_parking() {
+    use std::sync::atomic::Ordering;
+    let pool = ConnPool::new(1, vec![], true, true);
+    let egress = SharedEgress::default();
+    let mut frag = DgramFragmenter::new();
+    let addr = TargetAddr::Ip("127.0.0.1:53".parse().unwrap());
+
+    let before = dgram_drops::snapshot();
+    flush_deferred_pair(
+        &egress,
+        &pool,
+        &mut frag,
+        7,
+        EgressClass::Interactive,
+        &addr.as_ref(),
+        b"deferred-query",
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.no_egress, 1,
+        "an undeliverable deferred payload is dropped and counted exactly once"
+    );
+    assert_eq!(
+        dgram_drops::NO_EGRESS.load(Ordering::Relaxed),
+        before.no_egress + 1,
+        "exactly one bookkeeping event for one lost payload"
+    );
+}

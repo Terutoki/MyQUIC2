@@ -86,6 +86,80 @@ pub(crate) fn sess_buf_pool_len() -> usize {
     SESS_BUF_POOL.with(|p| p.borrow().len())
 }
 
+/// Flush staged small replies for one target as a single MQP-2 BATCH frame.
+///
+/// Server-side mirror of the client association's 2-pack: up to
+/// [`MAX_BATCH_ITEMS`] replies that share one `(ip, port)` source ride one
+/// DATAGRAM — one quinn connection-state lock and one AEAD instead of one
+/// per reply. Staging is bounded by `MAX_BATCH_ITEMS` and never waits: the
+/// caller flushes at burst end, on a source change, on a large reply and
+/// before every `break 'session`, so nothing survives across awaits.
+///
+/// **Accounting is per reply, not per frame.** `send_udp_batch` books a
+/// full send buffer once for the whole frame, so a blocked N-item batch
+/// would count N lost app datagrams as one drop — and a frame that never
+/// fit has to fall back to per-reply sends anyway (each small reply would
+/// have fit on its own). Both are avoided by driving the encode/send here:
+/// a frame that was not queued counts nothing, and the per-reply fallback
+/// re-sends each reply through `DgramFragmenter::send`, which does its own
+/// exactly-once accounting — the same bookkeeping an unbatched reply gets.
+pub(crate) fn flush_reply_batch(
+    c2: &quinn::Connection,
+    s: u32,
+    frag: &mut DgramFragmenter,
+    staged: &mut Vec<Bytes>,
+    staged_src: &mut Option<SocketAddr>,
+    limit: &mut usize,
+    last_too_large_probe_ms: &mut u64,
+) {
+    let Some(src) = staged_src.take() else {
+        return;
+    };
+    if staged.is_empty() {
+        return;
+    }
+    let ta = TargetAddr::Ip(src);
+    let aref = ta.as_ref();
+    let mut refs: [&[u8]; MAX_BATCH_ITEMS] = [&[][..]; MAX_BATCH_ITEMS];
+    let n = staged.len().min(MAX_BATCH_ITEMS);
+    for (r, b) in refs.iter_mut().zip(staged.iter().take(n)) {
+        *r = b.as_ref();
+    }
+    if let Some(body) = encode_batch(s, &aref, &refs[..n], *limit)
+        && try_send_datagram(c2, body) == DatagramSend::Sent
+    {
+        for b in staged.iter().take(n) {
+            udp_stats::payload(b.len());
+        }
+        // Every flush, including n == 1: whether the grouping actually earns
+        // its keep is an operational question, and a silent n == 1 path is
+        // exactly what a mis-wired staging loop looks like from outside.
+        tracing::debug!("udp session {s}: {n} replies sent as one batch frame");
+        staged.clear();
+        return;
+    }
+    // The frame was not queued and nothing was counted for it, so every
+    // reply goes out on its own below — the same path (and the same
+    // per-datagram drop accounting) an unstaged reply takes.
+    let mut too_large = false;
+    for body in staged.drain(..) {
+        if frag.send(c2, s, &aref, &body, *limit).outcome() == DatagramSend::TooLarge {
+            // A per-reply size verdict is the one real path-budget signal
+            // here (the batch encoder declining to fit does not imply a
+            // single reply would not). Probe under the same 100 ms throttle
+            // the main loop uses, never per reply.
+            too_large = true;
+        }
+    }
+    if too_large {
+        let now_probe = mono_millis().max(1);
+        if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
+            *last_too_large_probe_ms = now_probe;
+            *limit = c2.max_datagram_size().unwrap_or(0);
+        }
+    }
+}
+
 pub(crate) async fn sess_reader_task(
     conn_id: usize,
     s: u32,
@@ -108,6 +182,14 @@ pub(crate) async fn sess_reader_task(
     // never). Gates the re-probe so a PMTU shrink cannot cost one quinn lock
     // per oversized reply; see `READER_BUDGET_PROBE_INTERVAL_MS`.
     let mut last_too_large_probe_ms = 0u64;
+    // Staged small replies for one grouped BATCH frame — the reply-path twin
+    // of the client association's 2-pack. One run is the replies of the
+    // current drain burst that share a source; a different source, a large
+    // reply, the burst end and every session-exiting path flush it through
+    // `flush_reply_batch`, so the queue is bounded by `MAX_BATCH_ITEMS` and
+    // holds nothing across awaits.
+    let mut staged: Vec<Bytes> = Vec::with_capacity(MAX_BATCH_ITEMS);
+    let mut staged_src: Option<SocketAddr> = None;
     'session: loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
@@ -233,6 +315,18 @@ pub(crate) async fn sess_reader_task(
                 continue;
             }
             if limit == 0 {
+                // The staged replies cannot go out either: flush counts them
+                // through the per-reply path (each is a TooLarge drop) instead
+                // of losing them silently on the way out.
+                flush_reply_batch(
+                    &c2,
+                    s,
+                    &mut frag,
+                    &mut staged,
+                    &mut staged_src,
+                    &mut limit,
+                    &mut last_too_large_probe_ms,
+                );
                 break 'session;
             }
             let src = SocketAddr::new(unmap(src.ip()), src.port());
@@ -252,6 +346,39 @@ pub(crate) async fn sess_reader_task(
                 dgram_drops::bump(&dgram_drops::REFUSED);
                 continue;
             }
+            // Reply batching: a small reply rides the run's BATCH frame
+            // instead of its own DATAGRAM. A run is the consecutive replies
+            // of this burst from one source, so a different source, a large
+            // reply, the burst end and the exit paths below flush what is
+            // staged first — order on the wire is preserved and nothing
+            // waits (the payload is copied once, into the staged bytes).
+            if n <= BATCH_SMALL_MAX {
+                if staged_src == Some(src) && staged.len() < MAX_BATCH_ITEMS {
+                    staged.push(Bytes::copy_from_slice(&buf[..n]));
+                    continue;
+                }
+                flush_reply_batch(
+                    &c2,
+                    s,
+                    &mut frag,
+                    &mut staged,
+                    &mut staged_src,
+                    &mut limit,
+                    &mut last_too_large_probe_ms,
+                );
+                staged_src = Some(src);
+                staged.push(Bytes::copy_from_slice(&buf[..n]));
+                continue;
+            }
+            flush_reply_batch(
+                &c2,
+                s,
+                &mut frag,
+                &mut staged,
+                &mut staged_src,
+                &mut limit,
+                &mut last_too_large_probe_ms,
+            );
             let ta = TargetAddr::Ip(src);
             let sent = frag.send(&c2, s, &ta.as_ref(), &buf[..n], limit);
             if sent.fragmented() {
@@ -276,9 +403,37 @@ pub(crate) async fn sess_reader_task(
                         limit = c2.max_datagram_size().unwrap_or(0);
                     }
                 }
-                DatagramSend::Unsupported | DatagramSend::ConnectionLost => break 'session,
+                DatagramSend::Unsupported | DatagramSend::ConnectionLost => {
+                    // Best-effort delivery for what is staged before the
+                    // reader exits: on a dead connection each per-reply send
+                    // reports the same terminal outcome, and nothing is
+                    // counted for it — the same disposition an unstaged
+                    // reply on this path gets.
+                    flush_reply_batch(
+                        &c2,
+                        s,
+                        &mut frag,
+                        &mut staged,
+                        &mut staged_src,
+                        &mut limit,
+                        &mut last_too_large_probe_ms,
+                    );
+                    break 'session;
+                }
             }
         }
+        // The burst ends here, so whatever is staged goes out before the
+        // reader parks: the last reply of a burst must not wait for the next
+        // target reply to be flushed.
+        flush_reply_batch(
+            &c2,
+            s,
+            &mut frag,
+            &mut staged,
+            &mut staged_src,
+            &mut limit,
+            &mut last_too_large_probe_ms,
+        );
         record_drain_batch(drained);
     }
     // Every exit above breaks to here, so the buffer is recycled exactly once
