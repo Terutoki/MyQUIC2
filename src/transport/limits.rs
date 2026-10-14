@@ -45,8 +45,13 @@ pub const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 /// Aggregate connection receive window. MUST be set explicitly: quinn's default
 /// is `VarInt::MAX`, which would otherwise allow 1024 streams x 8MB of receive
 /// buffering per connection. 16MB covers the BDP with margin for a few
-/// concurrent streams; 4096 conns x 16MB is the 64GB worst case documented in
-/// the README limits table (halved to 4GB for the 256 pre-auth connections).
+/// concurrent streams. This is the term that dominates the memory ceiling, and
+/// the README's *Limits & memory* table carries the numbers:
+/// `per_connection_memory_bytes` is 26.25 MiB at this preset (16 MB receive +
+/// 8 MB send + 2 x 1 MB DATAGRAM + 256 KiB reassembly), so 4096 connections
+/// represent ~105 GiB of peer-pinnable transport memory with no budget set —
+/// 64 GiB of that being this window alone — and 256 pre-auth connections
+/// 6.56 GiB. `max_peer_memory_mb` is the knob that bounds it.
 pub const RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
 /// Send-side budget: the upper bound on data this endpoint may keep buffered and
 /// unacknowledged on one connection. quinn blocks a writer once

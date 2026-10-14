@@ -8,6 +8,7 @@ use super::server_conf::ServerConf;
 // `DATAGRAM_BUFFER` still lives in `src/lib.rs` (transport section, not yet
 // split); refer to it at the crate root until it moves with that section.
 use crate::DATAGRAM_BUFFER;
+use crate::FRAG_MAX_HELD_BYTES;
 
 pub(super) fn d_bbr() -> String {
     "bbr".into()
@@ -138,7 +139,7 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 }
 
 /// Worst-case peer-pinnable memory one admitted connection can represent under
-/// `tuning`, in bytes.
+/// `tuning`, in bytes — the **transport** term only.
 ///
 /// Deliberately conservative and simple, because it feeds an *admission* bound:
 ///
@@ -147,17 +148,57 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 /// - `send_window`: queued outbound stream data a peer that stops reading can
 ///   make us hold before our writers block;
 /// - both DATAGRAM buffers: not flow-controlled at all, so a flood fills them
-///   whatever the application does.
+///   whatever the application does;
+/// - the per-connection reassembly budget ([`FRAG_MAX_HELD_BYTES`]): a peer that
+///   sends fragments it never completes pins this until the partial expires.
 ///
 /// Per-stream windows are not added: they are bounded by the connection window.
 /// The result is a ceiling, not a reservation — quinn allocates on demand — which
 /// is exactly what "how many connections may this host admit" has to be based
 /// on. See [`ServerConf::max_peer_memory_mb`].
+///
+/// **UDP sessions are a second, process-wide term.** Every session owns a kernel
+/// socket plus a userspace read buffer (see [`per_session_memory_bytes`]), and
+/// the number of them is bounded by the *global* session pool rather than per
+/// connection — so adding "sessions per connection x per-session" here would
+/// double-count a budget shared by every peer. The server's `admission_cap`
+/// subtracts the pool from the operator's budget once, globally; see
+/// [`session_pool_memory_bytes`].
 pub fn per_connection_memory_bytes(tuning: &TransportTuning) -> u64 {
     tuning
         .receive_window
         .saturating_add(tuning.send_window)
         .saturating_add(2 * DATAGRAM_BUFFER as u64)
+        .saturating_add(FRAG_MAX_HELD_BYTES as u64)
+}
+
+/// Worst-case memory one UDP session can pin, in bytes: the session socket's
+/// send *and* receive caps (`sess_socket_buf()` each way) plus the reply
+/// reader's userspace receive buffer (`UDP_RECV_MAX + UDP_RECV_SLACK`).
+///
+/// These are caps, not reservations — the kernel only accounts what is actually
+/// queued — but they are what a peer can hold, and a cap is what an admission
+/// bound has to be built from. The receive direction is the easy one to pin (a
+/// target that answers faster than the reader drains, or many sessions whose
+/// readers are starved); the send direction fills only against a black-holed
+/// route or a full qdisc. `MYQUIC2_SESS_SOCKET_BUF` lowers both.
+#[must_use]
+pub fn per_session_memory_bytes() -> u64 {
+    (2 * crate::sess_socket_buf() + crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK) as u64
+}
+
+/// Worst-case memory the *whole* UDP session pool can pin: the process-wide
+/// session cap times [`per_session_memory_bytes`].
+///
+/// This term is global, not per connection: `MAX_SESSIONS_GLOBAL` permits are
+/// shared by every admitted peer, so it must be charged against
+/// `max_peer_memory_mb` exactly once. Before this existed the admission bound
+/// counted only the transport windows, so an operator could set a 512 MiB budget
+/// and still have the process pin ~1 GiB of session socket buffers plus the
+/// transport windows — the knob bounded a fraction of what its log line claimed.
+#[must_use]
+pub fn session_pool_memory_bytes(max_sessions: usize) -> u64 {
+    (max_sessions as u64).saturating_mul(per_session_memory_bytes())
 }
 
 impl ServerConf {

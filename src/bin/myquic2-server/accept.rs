@@ -90,19 +90,31 @@ pub(crate) fn stream_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 /// peer-memory budget.
 ///
 /// `per_conn_bytes` is [`per_connection_memory_bytes`] for this server's
-/// effective transport tuning, so raising the windows admits proportionally
-/// fewer connections instead of silently multiplying the memory ceiling. A
-/// budget too small for even one connection clamps to one rather than zero: an
-/// endpoint that admits nothing cannot be diagnosed from the outside.
+/// effective transport tuning (windows, DATAGRAM buffers, reassembly), so
+/// raising the windows admits proportionally fewer connections instead of
+/// silently multiplying the memory ceiling. `session_pool_bytes` is
+/// [`session_pool_memory_bytes`] for the process-wide session cap: UDP session
+/// sockets and their reader buffers are a **global** term (the session
+/// semaphore is shared by every peer), so it is charged against the budget once
+/// rather than per connection — which is exactly what makes the printed worst
+/// case match what the process can actually pin. A budget too small for even
+/// one connection clamps to one rather than zero: an endpoint that admits
+/// nothing cannot be diagnosed from the outside.
 ///
 /// Pure so the arithmetic is testable without a live endpoint.
-pub(crate) fn admission_cap(conn_cap: usize, budget_mb: Option<u64>, per_conn_bytes: u64) -> usize {
+pub(crate) fn admission_cap(
+    conn_cap: usize,
+    budget_mb: Option<u64>,
+    per_conn_bytes: u64,
+    session_pool_bytes: u64,
+) -> usize {
     let by_count = conn_cap.max(1);
     match budget_mb {
         None => by_count,
         Some(mb) => {
             let budget = mb.clamp(1, 1 << 20).saturating_mul(1024 * 1024);
-            let by_memory = (budget / per_conn_bytes.max(1)).max(1);
+            let for_connections = budget.saturating_sub(session_pool_bytes);
+            let by_memory = (for_connections / per_conn_bytes.max(1)).max(1);
             by_count.min(usize::try_from(by_memory).unwrap_or(usize::MAX))
         }
     }
@@ -560,7 +572,7 @@ pub(crate) async fn handle_conn(
                     }
                 } else {
                     if is_batch(&d) {
-                        let Ok(b) = decode_batch_ref(&d) else {
+                        let Ok(b) = decode_batch(&d) else {
                             dgram_drops::bump(&dgram_drops::REFUSED);
                             continue;
                         };
@@ -568,7 +580,7 @@ pub(crate) async fn handle_conn(
                         let want = resolve_fast(&mut fast, &ss, s, b.addr, allow_private);
                         match want {
                             Some(dst) => {
-                                for p in &b.payloads {
+                                for p in b.payloads() {
                                     let off = p.as_ptr() as usize - d.as_ptr() as usize;
                                     let payload = d.slice(off..off + p.len());
                                     udp_stats::payload(p.len());
@@ -599,7 +611,7 @@ pub(crate) async fn handle_conn(
                             }
                             None => {
                                 flush_staged_sends(&mut staged);
-                                for p in &b.payloads {
+                                for p in b.payloads() {
                                     let off = p.as_ptr() as usize - d.as_ptr() as usize;
                                     let payload = d.slice(off..off + p.len());
                                     udp_stats::payload(p.len());

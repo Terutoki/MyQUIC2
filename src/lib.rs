@@ -42,7 +42,7 @@ pub use config::{
     tuning::{
         DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN,
         MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_UDP_ASSOCS, TransportTuning, load_toml,
-        per_connection_memory_bytes,
+        per_connection_memory_bytes, per_session_memory_bytes, session_pool_memory_bytes,
     },
 };
 pub use sync::guards::{
@@ -56,8 +56,9 @@ pub use mqp::ack::{
 };
 pub use mqp::addr::{AddrHeader, TargetAddr, TargetAddrRef};
 pub use mqp::batch::{
-    BATCH_ITEM_OVERHEAD, BATCH_PREFIX_LEN, BATCH_SMALL_MAX, BatchRef, MAX_BATCH_ITEMS,
-    MQP_DGRAM_BATCH, batch_sess, decode_batch_ref, encode_batch, is_batch,
+    BATCH_ITEM_OVERHEAD, BATCH_PREFIX_LEN, BATCH_SMALL_MAX, BatchFrame, BatchItems, BatchRef,
+    MAX_BATCH_ITEMS, MQP_DGRAM_BATCH, batch_sess, decode_batch, decode_batch_ref, encode_batch,
+    is_batch,
 };
 pub use mqp::datagram::{
     DGRAM_DEFAULT_LIMIT, DGRAM_PREFIX_LEN, MQP_DGRAM_TYPE, decode_datagram, decode_datagram_ref,
@@ -119,7 +120,7 @@ pub(crate) use tcp::{COPY_CHUNK, reserve_copy_chunk};
 #[allow(unused_imports)]
 pub(crate) use udp::{
     Partial, UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT, UDP_RETRY_TIMEOUT, UdpRetry,
-    frag_id_reuse_blocked, retry_shards, spawn_retry_worker, udp_retry_submit,
+    frag_id_reuse_blocked, retry_shards, spawn_retry_worker, tombstone_bytes, udp_retry_submit,
     under_retry_deadline,
 };
 
@@ -1617,15 +1618,12 @@ mod tests {
             "retained must be exactly the owned chunk plus its slot table"
         );
         // Completion files the delivered generation as the key's tombstone,
-        // so `held` keeps exactly the payload plus its slot table — still
-        // bounded, still accounted — and the tick releases it with the window.
+        // which now costs its fingerprint table only: the chunk bytes it used
+        // to retain (and charge a second time) are released with the payload.
         assert!(r.push(&decode_fragment(&frames[1]).unwrap(), 0).is_some());
         assert_eq!(r.inflight(), 0);
         let f1 = decode_fragment(&frames[1]).unwrap();
-        assert_eq!(
-            r.held_bytes(),
-            f0.chunk.len() + f1.chunk.len() + Partial::slot_table_bytes(f1.total),
-        );
+        assert_eq!(r.held_bytes(), tombstone_bytes(f1.total));
         r.expire(FRAG_TIMEOUT_MS);
         assert_eq!(r.held_bytes(), 0, "the tombstone ages out with the window");
 
@@ -1837,8 +1835,9 @@ mod tests {
             assert_eq!(r.inflight(), 0, "the partial is released on completion");
             assert_eq!(
                 r.held_bytes(),
-                payload.len() + Partial::slot_table_bytes(4),
-                "completion files the delivered generation against the budget"
+                tombstone_bytes(4),
+                "completion files the delivered generation's fingerprints against \
+                 the budget, never its payload bytes again"
             );
         }
     }
@@ -2187,8 +2186,8 @@ mod tests {
         assert_eq!(r.inflight(), 0);
 
         // Completion files the delivered generation against the aggregate
-        // budget — exactly the payload plus its slot table...
-        assert_eq!(r.held_bytes(), second.len() + Partial::slot_table_bytes(3));
+        // budget — exactly its fingerprint table...
+        assert_eq!(r.held_bytes(), tombstone_bytes(3));
         // ...and the tick releases it with the window.
         r.expire(1_000 + FRAG_TIMEOUT_MS);
         assert_eq!(r.held_bytes(), 0);
@@ -2238,15 +2237,16 @@ mod tests {
         let held_before = r.held_bytes();
         assert!(held_before > 0);
         // Different shape forces a restart: held must drop the old bytes from
-        // the live partial and file them as the key's tombstone, counting the
-        // new fragment (payload + its slot table) plus the filed generation —
-        // never accumulating either twice.
+        // the live partial and file the retired generation's fingerprints as the
+        // key's tombstone, counting the new fragment (payload + its slot table)
+        // plus that table — never accumulating the old payload twice.
+        let old = decode_fragment(&frames[0]).unwrap();
         assert!(r.push(&decode_fragment(&other[0]).unwrap(), 0).is_none());
         let f0 = decode_fragment(&other[0]).unwrap();
         let table = Partial::slot_table_bytes(f0.total);
         assert!(table > 0, "the slot table is charged, not free");
-        let old = decode_fragment(&frames[0]).unwrap();
-        let tomb = old.chunk.len() + Partial::slot_table_bytes(old.total);
+        let tomb = tombstone_bytes(old.total);
+        assert!(tomb > 0, "the tombstone table is charged, not free");
         assert_eq!(r.held_bytes(), f0.chunk.len() + table + tomb);
     }
 
@@ -3068,10 +3068,14 @@ mod tests {
     #[test]
     fn per_connection_memory_tracks_the_windows() {
         let d = per_connection_memory_bytes(&TransportTuning::default());
-        // 4 MB receive + 2 MB send + 2 x 1 MB DATAGRAM buffers.
+        // 4 MB receive + 2 MB send + 2 x 1 MB DATAGRAM buffers + the
+        // per-connection reassembly budget.
         assert_eq!(
             d,
-            4 * 1024 * 1024 + 2 * 1024 * 1024 + 2 * DATAGRAM_BUFFER as u64
+            4 * 1024 * 1024
+                + 2 * 1024 * 1024
+                + 2 * DATAGRAM_BUFFER as u64
+                + FRAG_MAX_HELD_BYTES as u64
         );
         let wide = TransportTuning {
             receive_window: 16 * 1024 * 1024,
@@ -3086,12 +3090,24 @@ mod tests {
             ..TransportTuning::default()
         };
         assert_eq!(per_connection_memory_bytes(&narrow_streams), d);
-        // A full house of the shipped defaults is the number the README's limits
-        // table has to agree with.
+        // A full house of the shipped defaults: 4096 x (transport 8 MB +
+        // reassembly 256 KiB). The UDP session pool is a *separate*, global term
+        // (`session_pool_memory_bytes`), charged once by the admission bound
+        // rather than per connection.
         assert_eq!(
-            d * 4096 / (1024 * 1024 * 1024),
-            32,
-            "4096 x 8 MB is the 32 GiB worst case documented for the default windows"
+            d * 4096 / (1024 * 1024),
+            33792,
+            "4096 x 8.25 MB is the 33 GiB worst case for the default windows"
+        );
+        let pool = session_pool_memory_bytes(8192);
+        assert_eq!(
+            pool / (1024 * 1024),
+            1088,
+            "the session pool is its own ~1.06 GiB term"
+        );
+        assert!(
+            pool > 512 * 1024 * 1024,
+            "the pool has to be a term worth charging"
         );
     }
 

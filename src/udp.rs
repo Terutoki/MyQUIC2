@@ -14,6 +14,7 @@ pub use fragmenter::DgramFragmenter;
 pub(crate) use fragmenter::frag_id_reuse_blocked;
 pub use reassembler::DgramReassembler;
 pub(crate) use reassembler::Partial;
+pub(crate) use reassembler::tombstone_bytes;
 pub(crate) use retry::{
     UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT, UDP_RETRY_TIMEOUT, UdpRetry, retry_shards,
     spawn_retry_worker, udp_retry_submit, under_retry_deadline,

@@ -15,11 +15,15 @@ auth_token = ""
 # pre-auth budget. Clamped to 1..=4096; raising it tokenless is warned about.
 # max_connections = 4096
 # Optional cap, in MiB, on the peer-pinnable memory the admitted connections may
-# represent: the connection cap is then also limited to
-# budget / (receive window + send budget + both DATAGRAM buffers) = budget / 8 MiB
-# with the default 2/4/2 MB windows. Raising the windows therefore admits fewer
-# connections instead of multiplying the memory ceiling. The worst case
-# (connections x per-connection figure) is logged at startup either way.
+# represent. The process-wide UDP session pool is charged first — MAX_SESSIONS_
+# GLOBAL (8192) x (2 x MYQUIC2_SESS_SOCKET_BUF + its reader buffer) = ~1.06 GiB
+# at the shipped 64 KiB buffers — and what is left is divided by
+# receive window + send budget + both DATAGRAM buffers + the reassembly budget
+# = 8.25 MiB with the default 2/4/2 MB windows. Raising the windows therefore
+# admits fewer connections instead of multiplying the memory ceiling, and a
+# budget at or below the session pool admits exactly one connection (warned
+# about at startup). The worst case (session pool + connections x
+# per-connection figure) is logged at startup either way.
 # max_peer_memory_mb = 512
 # Default 2/4/2 MB matches code defaults; must mirror the client (download
 # capped by receiver, upload by sender, so change both sides together).

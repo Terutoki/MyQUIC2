@@ -148,15 +148,27 @@ fn memo_sock() -> Arc<tokio::net::UdpSocket> {
 /// would insert it, so the destination memo can be exercised without a live
 /// QUIC connection.
 fn sess_with_dest(addr: Option<SocketAddr>) -> (SessTable, Arc<tokio::net::UdpSocket>) {
-    let ss = Arc::new(ShardedSessTable::new());
     let sock = memo_sock();
+    (sess_with_sock(addr, sock.clone()), sock)
+}
+
+/// [`sess_with_dest`] with a caller-chosen session socket.
+///
+/// Session 7's entry is inserted directly (no `note_empty_state`, no holder
+/// transition), so tests using it never disturb the process-global holder count
+/// that `HOLDER_TEST_LOCK` keeps exact for two other tests. The socket is a
+/// parameter because the relay sends to `map_for_dual(dst)`: reaching a v4
+/// target needs the dual-stack socket production sessions use, while the DNS
+/// memo tests only need any bound socket.
+fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) -> SessTable {
+    let ss = Arc::new(ShardedSessTable::new());
     let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let h = tokio::spawn(std::future::pending::<()>());
     let permit = session_limiter().clone().try_acquire_owned().unwrap();
     lock_write(ss.shard(7)).insert(
         7,
         SessEntry {
-            sock: sock.clone(),
+            sock,
             reader: h,
             last,
             _permit: permit,
@@ -169,7 +181,7 @@ fn sess_with_dest(addr: Option<SocketAddr>) -> (SessTable, Arc<tokio::net::UdpSo
             recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     );
-    (ss, sock)
+    ss
 }
 
 /// The per-datagram path, before this change, re-resolved a domain target
@@ -1327,27 +1339,58 @@ fn fair_shard_trigger_fires_below_the_static_shard_cap() {
 }
 
 /// The admission cap must be a real memory bound: raising the transport
-/// windows has to admit fewer connections, a budget too small for one
-/// connection still admits one (so the endpoint is diagnosable), and no
-/// configuration may exceed the hard connection cap.
+/// windows has to admit fewer connections, the process-wide UDP session pool
+/// has to be charged against the budget exactly once (it is not per
+/// connection), a budget too small for one connection still admits one (so the
+/// endpoint is diagnosable), and no configuration may exceed the hard
+/// connection cap.
 #[test]
 fn admission_cap_bounds_connections_by_memory() {
     let per_conn = per_connection_memory_bytes(&TransportTuning::default());
     assert_eq!(
         per_conn,
-        8 * 1024 * 1024,
-        "2/4/2 MB windows + 2 x 1 MB packets"
+        8 * 1024 * 1024 + FRAG_MAX_HELD_BYTES as u64,
+        "2/4/2 MB windows + 2 x 1 MB packets + the per-connection reassembly budget"
+    );
+    let per_session = per_session_memory_bytes();
+    assert_eq!(
+        per_session,
+        (2 * sess_socket_buf() + UDP_RECV_MAX + UDP_RECV_SLACK) as u64,
+        "a session's two kernel caps plus its reader's userspace buffer"
+    );
+    let pool = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
+    assert_eq!(pool, MAX_SESSIONS_GLOBAL as u64 * per_session);
+    assert!(
+        pool > 512 * 1024 * 1024,
+        "the session pool alone must be a term worth charging (got {pool} B)"
     );
 
     // No budget: the count cap stands, clamped to the hard cap.
     assert_eq!(
-        admission_cap(MAX_CONNECTIONS, None, per_conn),
+        admission_cap(MAX_CONNECTIONS, None, per_conn, pool),
         MAX_CONNECTIONS
     );
-    assert_eq!(admission_cap(1, None, per_conn), 1);
+    assert_eq!(admission_cap(1, None, per_conn, pool), 1);
 
-    // A 512 MiB budget / 8 MiB per connection = 64 connections.
-    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(512), per_conn), 64);
+    // A 4 GiB budget: the session pool comes off the top, the rest is divided
+    // by the per-connection figure.
+    let budget = 4096 * 1024 * 1024u64;
+    let expected = ((budget - pool) / per_conn) as usize;
+    assert_eq!(
+        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool),
+        expected
+    );
+    assert!(
+        expected > 100,
+        "a 4 GiB budget must still admit a useful pool (got {expected})"
+    );
+    // Charging the pool is the whole point: without it the same budget would
+    // admit `budget / per_conn` connections and pin that much *plus* the pool.
+    assert!(
+        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, 0)
+            > admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool),
+        "the session pool must reduce the admitted count"
+    );
     // Raising the windows must lower the admitted count for the same budget.
     let wide = TransportTuning {
         receive_window: 16 * 1024 * 1024,
@@ -1358,17 +1401,27 @@ fn admission_cap_bounds_connections_by_memory() {
     let per_conn_wide = per_connection_memory_bytes(&wide);
     assert!(per_conn_wide > per_conn);
     assert!(
-        admission_cap(MAX_CONNECTIONS, Some(512), per_conn_wide)
-            < admission_cap(MAX_CONNECTIONS, Some(512), per_conn),
+        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn_wide, pool)
+            < admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool),
         "the same budget must admit fewer wide-window connections"
     );
     // Count cap still wins when it is the smaller of the two.
-    assert_eq!(admission_cap(8, Some(512), per_conn), 8);
-    // A budget too small for even one connection admits exactly one.
-    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn), 1);
+    assert_eq!(admission_cap(8, Some(4096), per_conn, pool), 8);
+    // A budget too small for even one connection admits exactly one, and a
+    // budget at or below the session pool is the same case rather than zero.
+    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn, pool), 1);
+    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn, 0), 1);
+    assert_eq!(
+        admission_cap(MAX_CONNECTIONS, Some(1088), per_conn, pool),
+        1,
+        "a budget equal to the session pool leaves nothing for connections"
+    );
     // No division by zero for a degenerate per-connection figure: the
     // divisor floors at one byte, so the count cap still binds.
-    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), 0), MAX_CONNECTIONS);
+    assert_eq!(
+        admission_cap(MAX_CONNECTIONS, Some(4096), 0, 0),
+        MAX_CONNECTIONS
+    );
 }
 
 /// One connection's stream-task share must be bounded by the pool, floored
@@ -2181,6 +2234,99 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
     assert_eq!(d.refused, 0, "budget loss is not policy refusal");
 }
 
+/// A domain target whose answer is only in the **session destination memo**
+/// (the shared DNS cache and this thread's memo are both cold) must resolve
+/// inline.
+///
+/// This is the production shape the spawn arm used to catch on *every* packet:
+/// `lookup_cached_fast*` reads a thread-local memo that only the cache-*miss*
+/// init writes, so a moka hit — or, as here, a memo written by the first
+/// datagram's spawned resolver on another worker — left it cold,
+/// `forward_server_dgram` spawned a resolver task per datagram, and the reader
+/// never saw the `Some((dst, life))` that `arm_fast` needs to install the
+/// connection fast table. The whole N=1 fast path (pin + staged `sendmmsg`) was
+/// bypassed for domain targets. The memo is now consulted here, so the slow
+/// path runs once per session rather than once per packet.
+///
+/// The session fixture inserts its entry directly (never through
+/// `get_or_create_sess`), so the process-global holder count — which
+/// `HOLDER_TEST_LOCK` exists to keep exact for two other tests — is untouched.
+#[tokio::test]
+async fn a_session_dest_memo_answers_a_domain_target_inline() {
+    let (host, port) = ("inline-resolve.test", 19741u16);
+    // The target is a loopback socket the test owns, so the relayed datagram is
+    // observable and nothing leaves the host (`allow_private = true`).
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    // A dual-stack session socket, built the way `get_or_create_sess` builds
+    // one: the relay sends to `map_for_dual(dst)`, so a v4-only fixture socket
+    // could not deliver to the v4 target above.
+    let raw = udp_socket_dual_small("[::]:0").expect("dual-stack session socket");
+    let ss = sess_with_sock(
+        None,
+        Arc::new(tokio::net::UdpSocket::from_std(raw).unwrap()),
+    );
+    // The memo a previous datagram's spawned resolver would have stored; the
+    // premise below is what makes this the shape under test.
+    sess_dest_store(&ss, 7, host, port, dst, DNS_CACHE_TTL_MS);
+    assert_eq!(
+        lookup_cached_fast(host, port),
+        CachedLookup::Unknown,
+        "premise: the session memo is the only source that can answer this name"
+    );
+
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let conn_id = next_conn_id();
+    let mut buf = [0u8; 64];
+    let used = forward_server_dgram(
+        &ss,
+        &server_conn,
+        conn_id,
+        7,
+        TargetAddrRef::Domain(host, port),
+        Bytes::from_static(b"first"),
+        true,
+    )
+    .await;
+    let (resolved, life) = used.expect(
+        "the session memo must resolve inline: `None` here is the per-datagram \
+         spawn path, and the reader needs `Some` to arm the connection fast table",
+    );
+    assert_eq!(
+        resolved, dst,
+        "the memoized answer must be relayed verbatim"
+    );
+    assert!(life > 0, "the returned life must be usable as a pin TTL");
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("the inline send must deliver")
+        .unwrap();
+    assert_eq!(&buf[..n], b"first");
+    assert!(
+        from.ip().is_loopback(),
+        "relay came from the session socket: {from}"
+    );
+
+    // ...and it keeps resolving inline (this path refreshes the memo).
+    let again = forward_server_dgram(
+        &ss,
+        &server_conn,
+        conn_id,
+        7,
+        TargetAddrRef::Domain(host, port),
+        Bytes::from_static(b"second"),
+        true,
+    )
+    .await;
+    assert_eq!(
+        again.map(|(a, _)| a),
+        Some(dst),
+        "the memo must keep serving"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
 /// Reply-path batching: one BATCH frame carries every staged small reply,
 /// in staging order, with the session id and the shared source address.
 ///
@@ -2192,19 +2338,24 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
 async fn reply_batch_frame_carries_every_staged_reply_in_order() {
     let (client_conn, server_conn) = stream_test_pair().await;
     let mut frag = DgramFragmenter::new();
-    let mut staged = vec![
-        Bytes::from_static(b"first"),
-        Bytes::from_static(b"second-reply"),
-        Bytes::from_static(b"third"),
-    ];
-    let mut staged_src = Some("198.51.100.9:4242".parse::<SocketAddr>().unwrap());
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
     let mut limit = server_conn.max_datagram_size().unwrap();
     let mut last_probe = 0u64;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    for body in [&b"first"[..], b"second-reply", b"third"] {
+        assert!(
+            reply_stage(&mut arena, &mut staged, &mut staged_src, src, body, limit),
+            "a small reply must stage under a full path budget"
+        );
+    }
 
     flush_reply_batch(
         &server_conn,
         7,
         &mut frag,
+        &mut arena,
         &mut staged,
         &mut staged_src,
         &mut limit,
@@ -2254,8 +2405,13 @@ async fn reply_batch_frame_carries_every_staged_reply_in_order() {
 
 /// A batch frame that does not fit the path must not take its replies down
 /// with it: every reply goes out as its own `0x02` frame, in order, and each
-/// keeps its own accounting. Without the fallback a shrunken DATAGRAM budget
-/// would lose N replies that would each have fit.
+/// keeps its own accounting.
+///
+/// Reached today only when the path budget **shrinks after staging**: staging
+/// itself is budget-aware (`reply_stage` refuses an item that would not fit),
+/// so a run is only ever flushed into a frame that could hold it. The shrink is
+/// exactly the case the fallback exists for — a PMTU reduction between the
+/// staging and the flush must not lose N replies that each still fit alone.
 #[tokio::test]
 async fn reply_batch_falls_back_to_per_reply_frames_when_it_cannot_fit() {
     let (client_conn, server_conn) = stream_test_pair().await;
@@ -2265,24 +2421,35 @@ async fn reply_batch_falls_back_to_per_reply_frames_when_it_cannot_fit() {
         Bytes::from(vec![0xB2; 100]),
         Bytes::from(vec![0xC3; 100]),
     ];
-    let mut staged = replies.clone();
-    let mut staged_src = Some("198.51.100.9:4242".parse::<SocketAddr>().unwrap());
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let mut last_probe = 0u64;
+    for want in &replies {
+        assert!(
+            reply_stage(&mut arena, &mut staged, &mut staged_src, src, want, limit),
+            "three 100 B replies must stage under a full path budget"
+        );
+    }
     // Each single frame is 5 + 7 + 100 = 112 B; the batch needs
     // 5 + 7 + 1 + 3 x (2 + 100) = 321 B, so this budget admits the replies
     // and refuses the frame — the exact shape the fallback exists for.
-    let mut limit = 300usize;
-    let mut last_probe = 0u64;
+    limit = 300usize;
 
     flush_reply_batch(
         &server_conn,
         9,
         &mut frag,
+        &mut arena,
         &mut staged,
         &mut staged_src,
         &mut limit,
         &mut last_probe,
     );
     assert!(staged.is_empty(), "the fallback must still drain the queue");
+    assert!(arena.is_empty(), "the fallback must release the arena");
 
     for (i, want) in replies.iter().enumerate() {
         let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
@@ -2329,24 +2496,45 @@ async fn distinct_source_runs_flush_in_order_as_separate_frames() {
     let mut limit = server_conn.max_datagram_size().unwrap();
     let mut last_probe = 0u64;
 
-    let mut staged = vec![Bytes::from_static(b"a-1"), Bytes::from_static(b"a-2")];
-    let mut staged_src = Some(src_a);
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
+    for body in [&b"a-1"[..], b"a-2"] {
+        assert!(reply_stage(
+            &mut arena,
+            &mut staged,
+            &mut staged_src,
+            src_a,
+            body,
+            limit
+        ));
+    }
     flush_reply_batch(
         &server_conn,
         11,
         &mut frag,
+        &mut arena,
         &mut staged,
         &mut staged_src,
         &mut limit,
         &mut last_probe,
     );
 
-    let mut staged = vec![Bytes::from_static(b"b-1"), Bytes::from_static(b"b-2")];
-    let mut staged_src = Some(src_b);
+    for body in [&b"b-1"[..], b"b-2"] {
+        assert!(reply_stage(
+            &mut arena,
+            &mut staged,
+            &mut staged_src,
+            src_b,
+            body,
+            limit
+        ));
+    }
     flush_reply_batch(
         &server_conn,
         11,
         &mut frag,
+        &mut arena,
         &mut staged,
         &mut staged_src,
         &mut limit,

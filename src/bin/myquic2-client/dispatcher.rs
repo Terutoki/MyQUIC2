@@ -159,7 +159,7 @@ pub(crate) fn dispatch_stage_multi(
     out: &mut Vec<StagedReply>,
 ) -> usize {
     if is_batch(&d) {
-        let Ok(b) = decode_batch_ref(&d) else {
+        let Ok(b) = decode_batch(&d) else {
             return 0;
         };
         if b.sess != sess {
@@ -177,8 +177,7 @@ pub(crate) fn dispatch_stage_multi(
                 // idempotent relaxed store, and its only consumer folds it
                 // into the idle stamp at the association's own tick.
                 entry.mark_replied();
-                let n = b.payloads.len();
-                for p in &b.payloads {
+                for p in b.payloads() {
                     udp_stats::payload(p.len());
                     out.push(StagedReply {
                         sock: entry.relay.clone(),
@@ -187,13 +186,12 @@ pub(crate) fn dispatch_stage_multi(
                         payload: d.slice_ref(p),
                     });
                 }
-                return n;
+                return b.len();
             }
             TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
                 CachedLookup::Addr(dst) => {
                     entry.mark_replied();
-                    let n = b.payloads.len();
-                    for q in &b.payloads {
+                    for q in b.payloads() {
                         udp_stats::payload(q.len());
                         out.push(StagedReply {
                             sock: entry.relay.clone(),
@@ -202,7 +200,7 @@ pub(crate) fn dispatch_stage_multi(
                             payload: d.slice_ref(q),
                         });
                     }
-                    return n;
+                    return b.len();
                 }
                 // Deliberately no resolver spawn here, unlike the single-frame
                 // path: the server always echoes replies with an IP-form source

@@ -90,20 +90,59 @@ fn assemble(chunks: &[Option<Bytes>], bytes: usize) -> Bytes {
     out.freeze()
 }
 
+/// One remembered chunk: the length of the bytes the old generation held at
+/// that index, plus a seeded 64-bit fingerprint of them.
+///
+/// The tombstone used to keep the old generation's chunks *owned* (`Vec<Option<
+/// Bytes>>`), which charged the delivered payload's bytes to the reassembly
+/// budget a second time and kept them alive for the whole
+/// [`FRAG_TIMEOUT_MS`] window — so a burst of completed 8 KiB payloads filled
+/// the 256 KiB budget with tombstones and started evicting live partials (and,
+/// once the tombstones were gone, stopped refusing replays at all). A
+/// fingerprint answers the only question the guard asks ("is this the same
+/// bytes the old generation held at this index?") in 24 bytes per index, with
+/// no payload retention.
+///
+/// The disposition on a fingerprint match is unchanged and still fail-closed:
+/// identical bytes always match (a real replay is still refused), and a
+/// collision between two *different* chunks can only refuse a fresh fragment —
+/// it can never splice two generations together, which is the failure the
+/// tombstone exists to prevent. The seed is per-reassembler and per-process, so
+/// a peer cannot precompute a colliding pair.
+#[derive(Clone, Copy)]
+struct ChunkFp {
+    len: u32,
+    hash: u64,
+}
+
+impl ChunkFp {
+    #[inline]
+    fn matches(&self, b: &[u8], seed: &foldhash::fast::RandomState) -> bool {
+        self.len as usize == b.len() && self.hash == chunk_hash(b, seed)
+    }
+}
+
+/// Seeded 64-bit fingerprint of one chunk.
+fn chunk_hash(b: &[u8], seed: &foldhash::fast::RandomState) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = seed.build_hasher();
+    h.write(b);
+    h.finish()
+}
+
 /// The chunks of a generation the reassembler has already let go of — either
 /// delivered whole ([`DgramReassembler::push`] completing a partial) or
-/// discarded by an id-reuse restart — kept for one [`FRAG_TIMEOUT_MS`] window
-/// so a stale replay of that generation cannot mix into the *next* generation
-/// on the same `(sess, id)`.
+/// discarded by an id-reuse restart — remembered for one [`FRAG_TIMEOUT_MS`]
+/// window so a stale replay of that generation cannot mix into the *next*
+/// generation on the same `(sess, id)`.
 ///
 /// The restart heuristic in `push_with_chunk` can only see a stale fragment
 /// that lands on an *occupied* slot (or carries a different address/total). A
 /// replay of the old generation that lands on an *empty* slot of the new
 /// generation's live partial is byte-for-byte indistinguishable from a
 /// legitimate out-of-order fragment — unless the receiver remembers what the
-/// old generation held at that index. That is what this stores: the old
-/// generation's per-index chunks, compared by exact bytes on every push (one
-/// `HashMap` lookup plus at most one chunk `memcmp`, i.e. O(1) per fragment).
+/// old generation held at that index. That is what this stores (as
+/// [`ChunkFp`] fingerprints, compared per fragment), so the check stays O(1).
 ///
 /// Only the most recent generation per key is kept: a conforming sender
 /// cannot reuse an id inside the window at all (see
@@ -114,27 +153,33 @@ fn assemble(chunks: &[Option<Bytes>], bytes: usize) -> Bytes {
 /// never delivered here); that shape is unreachable from a conforming peer
 /// and stays documented at the restart heuristic rather than solved.
 ///
-/// `retained` mirrors [`Partial::retained`] (owned chunk bytes plus the slot
-/// table) and is charged to the same `held` budget, so every removal path —
-/// expiry, count-cap eviction, byte-cap eviction, overwrite — must subtract
-/// it, exactly like a live partial.
+/// `retained` is the fingerprint table's own bytes (there are no payload bytes
+/// to charge any more) and is charged to the same `held` budget as a live
+/// partial, so every removal path — expiry, count-cap eviction, byte-cap
+/// eviction, overwrite — must subtract it, exactly like a live partial.
 struct Tombstone {
     total: u8,
     address: TargetAddr,
-    chunks: Vec<Option<Bytes>>,
+    prints: Box<[Option<ChunkFp>]>,
     at_ms: u64,
     retained: usize,
 }
 
 impl Tombstone {
-    fn retained_of(total: u8, chunks: &[Option<Bytes>]) -> usize {
-        chunks
-            .iter()
-            .flatten()
-            .map(Bytes::len)
-            .sum::<usize>()
-            .saturating_add(Partial::slot_table_bytes(total))
+    /// Bytes the fingerprint table itself occupies.
+    fn retained_for(total: u8) -> usize {
+        tombstone_bytes(total)
     }
+}
+
+/// Bytes one retired generation's fingerprint table occupies: what a
+/// [`Tombstone`] charges to the reassembly budget.
+///
+/// Exposed to the crate's unit tests (see the re-export in `lib.rs`), which pin
+/// `held_bytes()` exactly on every operation; production code reaches it
+/// through [`Tombstone::retained_for`].
+pub(crate) fn tombstone_bytes(total: u8) -> usize {
+    total as usize * std::mem::size_of::<Option<ChunkFp>>()
 }
 
 /// Reassembles [`MQP_DGRAM_FRAG`] frames into whole UDP payloads.
@@ -184,6 +229,11 @@ pub struct DgramReassembler {
     /// [`Partial::retained`] and [`Tombstone`].
     held: usize,
     last_sweep_ms: u64,
+    /// Per-reassembler seed for the tombstones' chunk fingerprints. Random per
+    /// instance (foldhash's `RandomState`), so a peer cannot precompute a
+    /// colliding pair for the bytes it sends; a collision could only refuse a
+    /// fresh fragment, never splice two generations.
+    fp_seed: foldhash::fast::RandomState,
 }
 
 impl DgramReassembler {
@@ -242,8 +292,8 @@ impl DgramReassembler {
     }
 
     /// Whether `f` is a replay of the generation this `(sess, id)` tombstone
-    /// remembers: same shape and address, and byte-identical to what the old
-    /// generation held at this index. Pure lookup, no mutation — O(1).
+    /// remembers: same shape and address, and a chunk fingerprint equal to what
+    /// the old generation held at this index. Pure lookup, no mutation — O(1).
     fn is_stale_replay(&self, f: &FragmentRef<'_>, now_ms: u64) -> bool {
         let Some(t) = self.recent.get(&(f.sess, f.id)) else {
             return false;
@@ -254,25 +304,44 @@ impl DgramReassembler {
         if t.total != f.total || t.address.as_ref() != f.address {
             return false;
         }
-        t.chunks
-            .get(f.idx as usize)
-            .is_some_and(|old| old.as_ref().is_some_and(|old| old.as_ref() == f.chunk))
+        t.prints.get(f.idx as usize).is_some_and(|slot| {
+            slot.as_ref()
+                .is_some_and(|fp| fp.matches(f.chunk, &self.fp_seed))
+        })
     }
 
-    /// File one generation's chunks as the `(sess, id)` tombstone, replacing
-    /// any older one for the key. Charged to `held` like a live partial, so
-    /// the count cap and the aggregate byte cap are enforced here — evicting
-    /// tombstones only, never a live partial, which keeps this path's
+    /// Fingerprint every stored chunk of a retired generation, in index order.
+    ///
+    /// One pass over the bytes the partial held — the same order of cost as the
+    /// `assemble` memcpy it sits next to, once per *completed* fragmented
+    /// payload — after which the chunks themselves are dropped instead of being
+    /// pinned for the tombstone's window.
+    fn prints_of(&self, chunks: &[Option<Bytes>]) -> Box<[Option<ChunkFp>]> {
+        chunks
+            .iter()
+            .map(|c| {
+                c.as_ref().map(|b| ChunkFp {
+                    len: b.len() as u32,
+                    hash: chunk_hash(b, &self.fp_seed),
+                })
+            })
+            .collect()
+    }
+
+    /// File one generation's fingerprints as the `(sess, id)` tombstone,
+    /// replacing any older one for the key. Charged to `held` like a live
+    /// partial, so the count cap and the aggregate byte cap are enforced here —
+    /// evicting tombstones only, never a live partial, which keeps this path's
     /// disposition identical to the pre-tombstone code when memory is tight.
     fn remember(
         &mut self,
         key: (u32, u16),
         total: u8,
         address: TargetAddr,
-        chunks: Vec<Option<Bytes>>,
+        prints: Box<[Option<ChunkFp>]>,
         now_ms: u64,
     ) {
-        let retained = Tombstone::retained_of(total, &chunks);
+        let retained = Tombstone::retained_for(total);
         if let Some(old) = self.recent.remove(&key) {
             self.held = self.held.saturating_sub(old.retained);
         }
@@ -282,7 +351,7 @@ impl DgramReassembler {
             Tombstone {
                 total,
                 address,
-                chunks,
+                prints,
                 at_ms: now_ms,
                 retained,
             },
@@ -302,63 +371,76 @@ impl DgramReassembler {
         self.maybe_sweep(now_ms);
 
         let key = (f.sess, f.id);
+        // **One** immutable probe answers every decision that depends on the
+        // existing partial: whether this key needs a fresh slot (count cap),
+        // whether the fragment would push it past the payload ceiling
+        // (discard-whole), and whether it belongs to a new generation
+        // (restart). Fusing them is pure: the three checks read the same entry
+        // and none of them mutates the map, so the ordering the previous
+        // separate probes relied on (count cap, then payload cap, then restart)
+        // is preserved exactly. `chunks.get` — not indexing — because the
+        // restart decision below is only taken against a slot that
+        // `f.idx < f.total == p.total` proves exists.
+        let (present, over_cap, restart) = match self.parts.get(&key) {
+            None => (false, false, false),
+            Some(p) => {
+                let stored = p.chunks.get(f.idx as usize);
+                let duplicate = stored.is_some_and(Option::is_some);
+                // The per-partial *payload* cap the module documents, actually
+                // enforced. `total` is bounded by `MQP_FRAG_MAX_TOTAL`, but
+                // nothing bounds a *chunk*: at the QUIC path MTU each fragment
+                // carries ~1.4 KiB, so a 64-fragment partial assembles to ~91 KiB
+                // — far past the payload ceiling this protocol states, and the
+                // caller relays whatever comes out (`udp_try_send` would hand the
+                // kernel a 91 KiB datagram to IP-fragment). Discarded whole
+                // rather than truncated or partially kept: a prefix of a
+                // datagram is not a short datagram, it is a *corrupt* one, and
+                // UDP above this has no integrity check to notice. A duplicate
+                // fragment is exempt (it adds no bytes) so a replayed fragment
+                // cannot kill a partial that was already at the cap.
+                let over_cap =
+                    !duplicate && p.bytes.saturating_add(f.chunk.len()) > MQP_FRAG_MAX_PAYLOAD;
+                let restart = if p.total != f.total {
+                    true
+                } else {
+                    // A wrapped id reused with a different shape, or the same
+                    // shape but a different generation (the address changed, or
+                    // this index already holds different bytes — an identical
+                    // chunk is a plain replay and stays ignored below).
+                    let differs = stored
+                        .is_some_and(|s| s.as_ref().is_some_and(|old| old.as_ref() != f.chunk));
+                    p.got > 0 && (p.address.as_ref() != f.address || differs)
+                };
+                (true, over_cap, restart)
+            }
+        };
         // Count cap first: `held` misses the per-partial slot-table cost, so a
         // flood of tiny single-fragment partials would otherwise grow memory
         // without ever tripping the byte bound. Evict-before-insert keeps the
         // `min_by_key` scan bounded to FRAG_MAX_PARTIALS entries.
-        if !self.parts.contains_key(&key)
+        if !present
             && self.parts.len() >= FRAG_MAX_PARTIALS
             && (!self.evict_oldest() || self.parts.len() >= FRAG_MAX_PARTIALS)
         {
             return None;
         }
-        // The per-partial *payload* cap the module documents, actually enforced.
-        // `total` is bounded by `MQP_FRAG_MAX_TOTAL`, but nothing bounds a
-        // *chunk*: at the QUIC path MTU each fragment carries ~1.4 KiB, so a
-        // 64-fragment partial assembles to ~91 KiB — far past the payload
-        // ceiling this protocol states, and the caller relays whatever comes out
-        // (`udp_try_send` would hand the kernel a 91 KiB datagram to
-        // IP-fragment). The aggregate retention bound is a different quantity
-        // and is enforced below.
-        //
-        // Discarded whole rather than truncated or partially kept: a prefix of a
-        // datagram is not a short datagram, it is a *corrupt* one, and UDP above
-        // this has no integrity check to notice. A duplicate fragment is exempt
-        // (it adds no bytes) so a replayed fragment cannot kill a partial that
-        // was already at the cap.
-        if let Some(p) = self.parts.get(&key) {
-            let duplicate = p.chunks.get(f.idx as usize).is_some_and(Option::is_some);
-            if !duplicate && p.bytes.saturating_add(f.chunk.len()) > MQP_FRAG_MAX_PAYLOAD {
-                if let Some(p) = self.parts.remove(&key) {
-                    self.held = self.held.saturating_sub(p.retained);
-                    udp_stats::reassembly_evicted();
-                }
-                return None;
+        if over_cap {
+            if let Some(p) = self.parts.remove(&key) {
+                self.held = self.held.saturating_sub(p.retained);
+                udp_stats::reassembly_evicted();
             }
+            return None;
         }
         let complete = {
-            // A restart needs the old partial *moved out* (its chunks become
-            // the tombstone), which cannot happen through the entry borrow
-            // held across a `remember` call — so the decision is read first
-            // through a shared lookup, and the removal below owns the value.
-            let restart = match self.parts.get(&key) {
-                None => false,
-                Some(p) => {
-                    if p.total != f.total {
-                        true
-                    } else {
-                        p.got > 0
-                            && (p.address.as_ref() != f.address
-                                || p.chunks[f.idx as usize]
-                                    .as_ref()
-                                    .is_some_and(|old| old.as_ref() != f.chunk))
-                    }
-                }
-            };
+            // A restart needs the old partial *moved out* (its fingerprints
+            // become the tombstone), which cannot happen through the entry
+            // borrow held across a `remember` call — so the decision was read
+            // above, and the removal below owns the value.
             if restart && let Some(old) = self.parts.remove(&key) {
                 self.held = self.held.saturating_sub(old.retained);
                 let total = old.total;
-                self.remember(key, total, old.address, old.chunks, now_ms);
+                let prints = self.prints_of(&old.chunks);
+                self.remember(key, total, old.address, prints, now_ms);
             }
             let entry = self
                 .parts
@@ -414,21 +496,23 @@ impl DgramReassembler {
         if complete {
             let mut p = self.parts.remove(&key)?;
             self.held = self.held.saturating_sub(p.retained);
-            // File the delivered generation before its chunks are consumed, and
-            // **move** the slot table into the tombstone rather than cloning it:
-            // the clone was one `Vec<Option<Bytes>>` allocation (total x 32 B,
-            // up to ~2 KiB) plus one refcount bump per slot on every completed
-            // fragmented payload, and it handed the tombstone the very same
-            // bytes the payload below is assembled from. The tombstone charges
-            // those bytes to `held` exactly as the partial did, so the aggregate
-            // budget is unchanged.
+            // File the delivered generation's **fingerprints** before its chunks
+            // are freed. The old shape moved the slot table (and therefore every
+            // owned chunk) into the tombstone, which kept the whole payload alive
+            // for the tombstone window and charged it to `held` a second time —
+            // so ~25 completed 8 KiB payloads filled the reassembly budget with
+            // tombstones and the guard began evicting live partials (and, once
+            // evicted, stopped refusing replays at all). The fingerprints cost
+            // `total x 24 B`, carry no payload, and answer the same question.
             let tomb_total = p.total;
             let tomb_addr = p.address.clone();
             let bytes = p.bytes;
             let chunks = std::mem::take(&mut p.chunks);
+            let prints = self.prints_of(&chunks);
             let address = p.address;
             let whole = assemble(&chunks, bytes);
-            self.remember(key, tomb_total, tomb_addr, chunks, now_ms);
+            drop(chunks);
+            self.remember(key, tomb_total, tomb_addr, prints, now_ms);
             return Some((key.0, address, whole));
         }
         // Reclaim tombstones first: they are id-reuse guards, not deliverable
@@ -584,8 +668,13 @@ mod tests {
         for t in r.recent.values() {
             assert_eq!(
                 t.retained,
-                Tombstone::retained_of(t.total, &t.chunks),
-                "tombstone retained must be owned chunks plus its slot table"
+                Tombstone::retained_for(t.total),
+                "tombstone retained must be its fingerprint table"
+            );
+            assert_eq!(
+                t.prints.len(),
+                t.total as usize,
+                "one fingerprint slot per fragment index"
             );
             expect = expect.saturating_add(t.retained);
         }
@@ -859,8 +948,62 @@ mod tests {
         );
         assert_eq!(
             r.held_bytes(),
-            40 + Partial::slot_table_bytes(total),
-            "completion files exactly the payload plus its slot table"
+            Tombstone::retained_for(total),
+            "completion must file fingerprints only: the delivered payload's \
+             bytes are no longer retained by the id-reuse guard"
+        );
+        assert!(
+            r.held_bytes() < 40 + Partial::slot_table_bytes(total),
+            "a tombstone must cost less than the chunks it replaces"
+        );
+    }
+
+    /// The tombstone's whole point is that a *completed* generation stays
+    /// refused for its window without pinning the payload again. The old shape
+    /// charged the delivered bytes to the reassembly budget a second time, so a
+    /// burst of completed payloads filled the 256 KiB cap with tombstones and
+    /// the guard started evicting live partials (and stopped refusing replays
+    /// once the tombstones were gone).
+    #[test]
+    fn completed_payloads_do_not_refill_the_reassembly_budget() {
+        let addr = v4();
+        let aref = addr.as_ref();
+        let payload = pattern(7800);
+        let chunks: Vec<&[u8]> = payload.chunks(1300).collect();
+        assert_eq!(chunks.len(), 6);
+        let total = chunks.len() as u8;
+
+        let mut r = DgramReassembler::new();
+        // Twenty completed 7.8 KiB generations: ~156 KiB of payload passed
+        // through, and twenty tombstones must remain — at `total x 24 B` each,
+        // 2.9 KiB in all, where the old representation charged ~156 KiB and
+        // would have been evicting live partials within four more payloads.
+        for id in 0..20u16 {
+            let mut done = false;
+            for (i, c) in chunks.iter().enumerate() {
+                let body = encode_fragment(3, id, i as u8, total, &aref, c, 64 * 1024).unwrap();
+                let f = decode_fragment(&body).unwrap();
+                done = r.push(&f, 4_000).is_some();
+            }
+            assert!(done, "generation {id} must complete");
+        }
+        assert_held_exact(&r);
+        assert_eq!(
+            r.held_bytes(),
+            20 * Tombstone::retained_for(total),
+            "twenty retired generations must cost their fingerprint tables only"
+        );
+        assert!(
+            r.held_bytes() < 4 * 1024,
+            "the guard must not retain payload bytes (held={})",
+            r.held_bytes()
+        );
+        // ...and the guard still refuses a replay of a delivered generation.
+        let body = encode_fragment(3, 19, 0, total, &aref, chunks[0], 64 * 1024).unwrap();
+        let f = decode_fragment(&body).unwrap();
+        assert!(
+            r.is_stale_replay(&f, 4_000),
+            "a completed generation must stay refused inside the window"
         );
     }
 }

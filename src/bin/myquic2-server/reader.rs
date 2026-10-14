@@ -86,28 +86,89 @@ pub(crate) fn sess_buf_pool_len() -> usize {
     SESS_BUF_POOL.with(|p| p.borrow().len())
 }
 
+/// Wire length of the `atyp | addr | port` header a batch frame carries for
+/// `src`. A reply's source is always IP-form (the session reader reports the
+/// address the target answered from), so this is 7 or 19 bytes.
+fn reply_addr_len(src: SocketAddr) -> usize {
+    match src {
+        SocketAddr::V4(_) => 1 + 4 + 2,
+        SocketAddr::V6(_) => 1 + 16 + 2,
+    }
+}
+
+/// Payload bytes (length prefixes included) one BATCH frame can carry for
+/// `src` at the current path budget.
+///
+/// Staging against this is what keeps the staging copy from being paid for
+/// nothing: the previous shape staged *every* small reply into its own `Bytes`
+/// and only discovered at flush time that the frame could not fit
+/// (`encode_batch` needs the whole frame inside the DATAGRAM budget — three
+/// 500 B replies already exceed a 1472 B path), so a burst of 100-512 B
+/// replies paid a staging allocation and memcpy per reply *plus* the
+/// per-reply frame it would have paid anyway.
+fn reply_batch_budget(limit: usize, src: SocketAddr) -> usize {
+    limit.saturating_sub(BATCH_PREFIX_LEN + reply_addr_len(src) + 1)
+}
+
+/// Stage one small reply into the current run's arena.
+///
+/// `false` means "do not stage this reply": a different source, a full run, or
+/// no room left in the frame budget. The caller flushes the run and retries; a
+/// reply that still cannot be staged on its own is sent as a single datagram.
+///
+/// The arena is reused across bursts and cleared on every flush, so the steady
+/// state allocates nothing per reply — the copy into the arena is the only one
+/// the caller pays, and `encode_batch` reads the payloads straight out of it.
+pub(crate) fn reply_stage(
+    arena: &mut Vec<u8>,
+    staged: &mut Vec<(usize, usize)>,
+    staged_src: &mut Option<SocketAddr>,
+    src: SocketAddr,
+    payload: &[u8],
+    limit: usize,
+) -> bool {
+    if staged_src.is_some_and(|s| s != src) || staged.len() >= MAX_BATCH_ITEMS {
+        return false;
+    }
+    if arena
+        .len()
+        .saturating_add(BATCH_ITEM_OVERHEAD + payload.len())
+        > reply_batch_budget(limit, src)
+    {
+        return false;
+    }
+    let off = arena.len();
+    arena.extend_from_slice(payload);
+    staged.push((off, payload.len()));
+    *staged_src = Some(src);
+    true
+}
+
 /// Flush staged small replies for one target as a single MQP-2 BATCH frame.
 ///
 /// Server-side mirror of the client association's 2-pack: up to
 /// [`MAX_BATCH_ITEMS`] replies that share one `(ip, port)` source ride one
 /// DATAGRAM — one quinn connection-state lock and one AEAD instead of one
-/// per reply. Staging is bounded by `MAX_BATCH_ITEMS` and never waits: the
-/// caller flushes at burst end, on a source change, on a large reply and
-/// before every `break 'session`, so nothing survives across awaits.
+/// per reply. `arena`/`staged` are the run's reused buffers (see
+/// [`reply_stage`]); both are cleared here, and staging never waits: the caller
+/// flushes at burst end, on a source change, on a large reply and before every
+/// `break 'session`, so nothing survives across awaits.
 ///
-/// **Accounting is per reply, not per frame.** `send_udp_batch` books a
-/// full send buffer once for the whole frame, so a blocked N-item batch
-/// would count N lost app datagrams as one drop — and a frame that never
-/// fit has to fall back to per-reply sends anyway (each small reply would
-/// have fit on its own). Both are avoided by driving the encode/send here:
-/// a frame that was not queued counts nothing, and the per-reply fallback
+/// **Accounting is per reply, not per frame.** `send_udp_batch` books a full
+/// send buffer once for the whole frame, so a blocked N-item batch would count
+/// N lost app datagrams as one drop — and a frame that never fit has to fall
+/// back to per-reply sends anyway. Both are avoided by driving the encode/send
+/// here: a frame that was not queued counts nothing, and the per-reply fallback
 /// re-sends each reply through `DgramFragmenter::send`, which does its own
-/// exactly-once accounting — the same bookkeeping an unbatched reply gets.
+/// exactly-once accounting — the same bookkeeping an unbatched reply gets. That
+/// fallback now only fires when the path budget shrank under a staged run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_reply_batch(
     c2: &quinn::Connection,
     s: u32,
     frag: &mut DgramFragmenter,
-    staged: &mut Vec<Bytes>,
+    arena: &mut Vec<u8>,
+    staged: &mut Vec<(usize, usize)>,
     staged_src: &mut Option<SocketAddr>,
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
@@ -116,34 +177,40 @@ pub(crate) fn flush_reply_batch(
         return;
     };
     if staged.is_empty() {
+        arena.clear();
         return;
     }
     let ta = TargetAddr::Ip(src);
     let aref = ta.as_ref();
     let mut refs: [&[u8]; MAX_BATCH_ITEMS] = [&[][..]; MAX_BATCH_ITEMS];
     let n = staged.len().min(MAX_BATCH_ITEMS);
-    for (r, b) in refs.iter_mut().zip(staged.iter().take(n)) {
-        *r = b.as_ref();
+    for (r, (off, len)) in refs.iter_mut().zip(staged.iter().take(n)) {
+        *r = &arena[*off..*off + *len];
     }
     if let Some(body) = encode_batch(s, &aref, &refs[..n], *limit)
         && try_send_datagram(c2, body) == DatagramSend::Sent
     {
-        for b in staged.iter().take(n) {
-            udp_stats::payload(b.len());
+        for (_, len) in staged.iter().take(n) {
+            udp_stats::payload(*len);
         }
         // Every flush, including n == 1: whether the grouping actually earns
         // its keep is an operational question, and a silent n == 1 path is
         // exactly what a mis-wired staging loop looks like from outside.
         tracing::debug!("udp session {s}: {n} replies sent as one batch frame");
         staged.clear();
+        arena.clear();
         return;
     }
-    // The frame was not queued and nothing was counted for it, so every
-    // reply goes out on its own below — the same path (and the same
-    // per-datagram drop accounting) an unstaged reply takes.
+    // The frame was not queued and nothing was counted for it, so every reply
+    // goes out on its own below — the same path (and the same per-datagram drop
+    // accounting) an unstaged reply takes.
     let mut too_large = false;
-    for body in staged.drain(..) {
-        if frag.send(c2, s, &aref, &body, *limit).outcome() == DatagramSend::TooLarge {
+    for (off, len) in staged.drain(..) {
+        if frag
+            .send(c2, s, &aref, &arena[off..off + len], *limit)
+            .outcome()
+            == DatagramSend::TooLarge
+        {
             // A per-reply size verdict is the one real path-budget signal
             // here (the batch encoder declining to fit does not imply a
             // single reply would not). Probe under the same 100 ms throttle
@@ -151,6 +218,7 @@ pub(crate) fn flush_reply_batch(
             too_large = true;
         }
     }
+    arena.clear();
     if too_large {
         let now_probe = mono_millis().max(1);
         if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
@@ -187,8 +255,13 @@ pub(crate) async fn sess_reader_task(
     // current drain burst that share a source; a different source, a large
     // reply, the burst end and every session-exiting path flush it through
     // `flush_reply_batch`, so the queue is bounded by `MAX_BATCH_ITEMS` and
-    // holds nothing across awaits.
-    let mut staged: Vec<Bytes> = Vec::with_capacity(MAX_BATCH_ITEMS);
+    // holds nothing across awaits. The payloads live in one reused `arena`
+    // (offsets+lengths in `staged`), so a staged reply costs a copy into a
+    // buffer that is never reallocated, not a fresh `Bytes` allocation. The
+    // arena starts empty: a session that never batches keeps no buffer, and one
+    // that does grows it to at most one frame (`reply_batch_budget`).
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::with_capacity(MAX_BATCH_ITEMS);
     let mut staged_src: Option<SocketAddr> = None;
     'session: loop {
         let (n, src) = tokio::select! {
@@ -322,6 +395,7 @@ pub(crate) async fn sess_reader_task(
                     &c2,
                     s,
                     &mut frag,
+                    &mut arena,
                     &mut staged,
                     &mut staged_src,
                     &mut limit,
@@ -350,30 +424,50 @@ pub(crate) async fn sess_reader_task(
             // instead of its own DATAGRAM. A run is the consecutive replies
             // of this burst from one source, so a different source, a large
             // reply, the burst end and the exit paths below flush what is
-            // staged first — order on the wire is preserved and nothing
-            // waits (the payload is copied once, into the staged bytes).
+            // staged first — order on the wire is preserved and nothing waits
+            // (the payload is copied once, into the reused arena).
+            //
+            // Staging is budget-aware: `reply_stage` refuses a reply that would
+            // not fit the frame, so a run always encodes (unless the path
+            // budget shrank after staging). A reply that cannot be staged even
+            // alone falls through to the single-datagram send below.
             if n <= BATCH_SMALL_MAX {
-                if staged_src == Some(src) && staged.len() < MAX_BATCH_ITEMS {
-                    staged.push(Bytes::copy_from_slice(&buf[..n]));
+                if reply_stage(
+                    &mut arena,
+                    &mut staged,
+                    &mut staged_src,
+                    src,
+                    &buf[..n],
+                    limit,
+                ) {
                     continue;
                 }
                 flush_reply_batch(
                     &c2,
                     s,
                     &mut frag,
+                    &mut arena,
                     &mut staged,
                     &mut staged_src,
                     &mut limit,
                     &mut last_too_large_probe_ms,
                 );
-                staged_src = Some(src);
-                staged.push(Bytes::copy_from_slice(&buf[..n]));
-                continue;
+                if reply_stage(
+                    &mut arena,
+                    &mut staged,
+                    &mut staged_src,
+                    src,
+                    &buf[..n],
+                    limit,
+                ) {
+                    continue;
+                }
             }
             flush_reply_batch(
                 &c2,
                 s,
                 &mut frag,
+                &mut arena,
                 &mut staged,
                 &mut staged_src,
                 &mut limit,
@@ -413,6 +507,7 @@ pub(crate) async fn sess_reader_task(
                         &c2,
                         s,
                         &mut frag,
+                        &mut arena,
                         &mut staged,
                         &mut staged_src,
                         &mut limit,
@@ -429,6 +524,7 @@ pub(crate) async fn sess_reader_task(
             &c2,
             s,
             &mut frag,
+            &mut arena,
             &mut staged,
             &mut staged_src,
             &mut limit,

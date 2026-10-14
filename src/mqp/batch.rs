@@ -67,7 +67,78 @@ pub struct BatchRef<'a> {
     pub payloads: Vec<&'a [u8]>,
 }
 
-pub fn decode_batch_ref(b: &[u8]) -> Result<BatchRef<'_>, MqpError> {
+/// Borrowed, allocation-free view of one BATCH frame: the session id, the
+/// shared address, and a lazy iterator over the payloads.
+///
+/// [`decode_batch_ref`] owns the wire validation and is the reference
+/// implementation; this is its twin for the receive paths, which decode one
+/// BATCH frame per burst and used to pay one `Vec` allocation per frame — on
+/// the very path the batching exists to make cheaper. Both validate the whole
+/// frame up front (count, every item boundary, exact end), so a malformed
+/// frame is rejected before a single item is yielded and [`BatchItems`] can
+/// slice without re-checking.
+pub struct BatchFrame<'a> {
+    pub sess: u32,
+    pub addr: TargetAddrRef<'a>,
+    /// Everything after the `count` byte: `len u16 LE | body` repeated.
+    items: &'a [u8],
+    count: u8,
+}
+
+impl<'a> BatchFrame<'a> {
+    /// Number of payloads in the frame (1..=[`MAX_BATCH_ITEMS`]).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// A fresh iterator over the payloads; callable more than once.
+    #[must_use]
+    pub fn payloads(&self) -> BatchItems<'a> {
+        BatchItems {
+            rest: self.items,
+            left: self.count,
+        }
+    }
+}
+
+/// Lazy payload iterator of a [`BatchFrame`]; see there for the validation
+/// contract.
+pub struct BatchItems<'a> {
+    rest: &'a [u8],
+    left: u8,
+}
+
+impl<'a> Iterator for BatchItems<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.left == 0 {
+            return None;
+        }
+        // Bounds are proven by `decode_batch`'s up-front validation, which
+        // walked exactly this parse.
+        let len = u16::from_le_bytes([self.rest[0], self.rest[1]]) as usize;
+        let body = &self.rest[2..2 + len];
+        self.rest = &self.rest[2 + len..];
+        self.left -= 1;
+        Some(body)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left as usize, Some(self.left as usize))
+    }
+}
+
+impl ExactSizeIterator for BatchItems<'_> {}
+
+/// Validate one BATCH frame and return a borrowing view of it.
+pub fn decode_batch(b: &[u8]) -> Result<BatchFrame<'_>, MqpError> {
     if b.len() < BATCH_PREFIX_LEN + 1 || b[0] != MQP_DGRAM_BATCH {
         return Err(MqpError::Malformed("bad batch"));
     }
@@ -82,26 +153,42 @@ pub fn decode_batch_ref(b: &[u8]) -> Result<BatchRef<'_>, MqpError> {
     if count == 0 || count > MAX_BATCH_ITEMS {
         return Err(MqpError::BadBatchCount(count as u8));
     }
-    let mut payloads = Vec::with_capacity(count);
-    for _ in 0..count {
-        if off + 2 > b.len() {
+    // Full validation before any item is handed out: `BatchItems::next` slices
+    // with `rest[..]` indexing and must not be able to panic on a hostile frame.
+    let mut seen = 0usize;
+    let mut cursor = off;
+    while seen < count {
+        if cursor + 2 > b.len() {
             return Err(MqpError::Malformed("bad batch item len"));
         }
-        let len = u16::from_le_bytes([b[off], b[off + 1]]) as usize;
-        off += 2;
-        if off + len > b.len() {
+        let len = u16::from_le_bytes([b[cursor], b[cursor + 1]]) as usize;
+        cursor += 2;
+        if cursor + len > b.len() {
             return Err(MqpError::Malformed("bad batch item body"));
         }
-        payloads.push(&b[off..off + len]);
-        off += len;
+        cursor += len;
+        seen += 1;
     }
-    if off != b.len() {
+    if cursor != b.len() {
         return Err(MqpError::Malformed("bad batch trailing bytes"));
     }
-    Ok(BatchRef {
+    Ok(BatchFrame {
         sess,
         addr,
-        payloads,
+        items: &b[off..],
+        count: count as u8,
+    })
+}
+
+/// Owning-index form of [`decode_batch`] (test/tooling convenience: it
+/// allocates one `Vec` per frame). Production receive paths use
+/// [`decode_batch`] and iterate [`BatchFrame::payloads`].
+pub fn decode_batch_ref(b: &[u8]) -> Result<BatchRef<'_>, MqpError> {
+    let f = decode_batch(b)?;
+    Ok(BatchRef {
+        sess: f.sess,
+        addr: f.addr,
+        payloads: f.payloads().collect(),
     })
 }
 
@@ -137,6 +224,49 @@ mod tests {
         assert!(encode_batch(1, &r, &big_refs, 1472).is_none());
         assert!(decode_batch_ref(b"\x06\x01").is_err());
         assert!(decode_batch_ref(b"\x02\x01\x02\x03\x04\x05").is_err());
+    }
+
+    /// The allocation-free decoder must accept exactly what the `Vec` form
+    /// accepts, yield the same payloads in the same order, be re-iterable, and
+    /// still reject every malformed shape (the iterator slices without
+    /// re-checking, so the up-front validation is what keeps it panic-free).
+    #[test]
+    fn batch_iter_matches_the_vec_form_and_rejects_malformed() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let r = addr.as_ref();
+        let payloads: Vec<&[u8]> = vec![b"", b"a", &[0x5Au8; 400], b"tail"];
+        let body = encode_batch(9, &r, &payloads, 4096).expect("encode");
+        let f = decode_batch(&body).expect("decode");
+        assert_eq!(f.sess, 9);
+        assert_eq!(f.len(), payloads.len());
+        assert!(!f.is_empty());
+        assert_eq!(f.payloads().collect::<Vec<_>>(), payloads);
+        // Re-iterable: two passes must agree (the server's batch branch walks
+        // the frame once per arm).
+        assert_eq!(f.payloads().collect::<Vec<_>>(), payloads);
+        // Same bytes, same verdict as the allocating form.
+        let v = decode_batch_ref(&body).expect("vec form decodes too");
+        assert_eq!(v.sess, f.sess);
+        assert_eq!(v.payloads, payloads);
+        assert_eq!(v.addr, f.addr);
+
+        // Truncations at every prefix must be `Err`, never a panic or a short
+        // item list: that is the property the lazy iterator relies on.
+        for cut in 0..body.len() {
+            let head = &body[..cut];
+            assert!(
+                decode_batch(head).is_err(),
+                "a {cut}-byte prefix must be rejected"
+            );
+            assert!(decode_batch_ref(head).is_err(), "forms must agree at {cut}");
+        }
+        // Trailing bytes, a zero count and an over-cap count stay rejected.
+        let mut trailing = body.to_vec();
+        trailing.push(0);
+        assert!(decode_batch(&trailing).is_err());
+        assert!(decode_batch_ref(&trailing).is_err());
+        assert!(decode_batch(b"\x06\x01").is_err());
+        assert!(decode_batch(b"\x02\x01\x02\x03\x04\x05").is_err());
     }
 
     #[test]

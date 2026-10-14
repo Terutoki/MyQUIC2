@@ -324,7 +324,28 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
             }
         })
         .await;
-    outcome.map(|(_, v)| v).map_err(|e| anyhow::anyhow!("{e}"))
+    match outcome {
+        Ok((inserted, v)) => {
+            // Warm *this* thread's memo even on a shared-cache **hit**. The init
+            // future above is the only other writer, and moka runs it once per
+            // key per TTL, on whichever thread missed first — so without this a
+            // caller that finds the entry already in moka still reads
+            // `lookup_cached_fast*` as `Unknown` and takes the slow path again.
+            // On the server's UDP ingress that slow path is a spawned resolver
+            // task *per datagram* for a domain target (see
+            // `forward_server_dgram`), which is precisely the per-packet cost the
+            // session destination memo and the connection pin exist to remove.
+            // Never extends the entry's own deadline.
+            if let Some(first) = v.first().copied() {
+                let deadline = inserted + DNS_CACHE_TTL;
+                if deadline > Instant::now() {
+                    memo_put(key, Some(first), deadline);
+                }
+            }
+            Ok(v)
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
 }
 
 /// Seed the positive cache as if `host:port` had just resolved to `addr`.
@@ -476,6 +497,43 @@ mod tests {
         let v = resolve_all_cached(host, port).await.expect("seeded hit");
         assert_eq!(&v[..], &[addr]);
         assert_eq!(lookup_cached_fast(host, port), CachedLookup::Addr(addr));
+    }
+
+    /// A shared-cache **hit** must warm this thread's memo.
+    ///
+    /// The memo is thread-local and was only ever written by the init future —
+    /// which moka runs once per key per TTL, on whichever thread missed first.
+    /// So a caller that found the entry already in the shared cache still read
+    /// `lookup_cached_fast*` as `Unknown`, and on the server's UDP ingress that
+    /// meant a spawned resolver task *per datagram* for a domain target. The
+    /// seed runs on another thread, so the premise (this thread's memo is cold
+    /// while the shared cache is warm) is exactly the production shape.
+    #[tokio::test]
+    async fn a_shared_cache_hit_warms_this_threads_memo() {
+        let (host, port) = ("memo-warm.resolve.test", 19704u16);
+        let addr: SocketAddr = "93.184.216.34:19704".parse().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(dns_cache_seed(host, port, addr));
+        })
+        .join()
+        .expect("seed thread");
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Unknown,
+            "premise: the shared cache is warm, this thread's memo is not"
+        );
+
+        let v = resolve_all_cached(host, port).await.expect("seeded hit");
+        assert_eq!(&v[..], &[addr]);
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Addr(addr),
+            "a cache hit must leave this thread able to answer without the cache"
+        );
     }
 
     /// A live negative entry refuses without touching the resolver.

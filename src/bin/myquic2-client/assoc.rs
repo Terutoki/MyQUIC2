@@ -192,12 +192,24 @@ pub(crate) async fn udp_associate_inner(
     // datagram would classify from itself, which cannot happen because the
     // first send classifies before it goes out.
     let mut class: Option<EgressClass> = None;
-    // Opportunistic 2-pack buffer: one owned small payload held across drain
+    // Opportunistic 2-pack staging: one small payload held across drain
     // iterations so two consecutive same-destination small datagrams go out as
     // a single BATCH frame (one quinn lock + one AEAD instead of two). Never
-    // waits: flushed at burst end or when the next datagram does not match,
-    // so no added latency, only saved work.
-    let mut batch_pending: Option<(EgressClass, TargetAddr, Vec<u8>)> = None;
+    // waits: flushed at burst end or when the next datagram does not match, so
+    // no added latency, only saved work.
+    //
+    // The bytes live in a **reused** buffer and the address is re-materialized
+    // only when the destination actually changes, so a steady destination pays
+    // one `memcpy` and no allocation. The previous shape stored
+    // `payload.to_vec()` (plus a `String` for a domain target) on *every* small
+    // datagram, pairing or not — a per-datagram allocation on the interactive
+    // class, whose whole point is latency.
+    let mut pending_buf: Vec<u8> = Vec::with_capacity(BATCH_SMALL_MAX);
+    let mut pending_pack: Option<PendingPack> = None;
+    // The staged payload's destination, kept *outside* the `Option` so the
+    // domain key's `String` survives a take/flush cycle and is rewritten in
+    // place instead of reallocated on every stage.
+    let mut pending_addr = TargetAddr::Ip(SocketAddr::from(([0, 0, 0, 0], 0)));
     'assoc: loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
@@ -359,9 +371,9 @@ pub(crate) async fn udp_associate_inner(
                 let sent = match egress_shared.with_fresh(class, now, |c, limit| {
                     {
                         if payload.len() <= BATCH_SMALL_MAX {
-                            if let Some((pc, pa, pp)) = batch_pending.take() {
-                                if pc == class && pa.as_ref() == addr {
-                                    let pair: [&[u8]; 2] = [&pp, payload];
+                            if let Some(p) = pending_pack.take() {
+                                if p.class == class && pending_addr.as_ref() == addr {
+                                    let pair: [&[u8]; 2] = [&pending_buf[..p.len], payload];
                                     match send_udp_batch(c, sess, &addr, &pair, limit) {
                                         DatagramSend::Sent => {
                                             return PayloadSend {
@@ -370,8 +382,14 @@ pub(crate) async fn udp_associate_inner(
                                             };
                                         }
                                         DatagramSend::TooLarge | DatagramSend::Blocked => {
-                                            let s1 =
-                                                frag.send(c, sess, &pa.as_ref(), &pp, limit);
+                                            let pa = pending_addr.as_ref();
+                                            let s1 = frag.send(
+                                                c,
+                                                sess,
+                                                &pa,
+                                                &pending_buf[..p.len],
+                                                limit,
+                                            );
                                             if s1.failed.is_some() {
                                                 let s2 =
                                                     frag.send(c, sess, &addr, payload, limit);
@@ -387,23 +405,30 @@ pub(crate) async fn udp_associate_inner(
                                         }
                                     }
                                 }
-                                let pa_ref = pa.as_ref();
-                                let s1 = frag.send(c, sess, &pa_ref, &pp, limit);
+                                // Different destination or class: hand the
+                                // staged payload to the single-datagram path
+                                // first, then stage this one below.
+                                let pa = pending_addr.as_ref();
+                                let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
                                 if s1.failed.is_some() {
                                     let s2 = frag.send(c, sess, &addr, payload, limit);
                                     return prefer_severe(s1, s2);
                                 }
                             }
-                            if payload.len() <= BATCH_SMALL_MAX {
-                                batch_pending = Some((class, addr.into_owned(), payload.to_vec()));
-                                return PayloadSend {
-                                    frames: 1,
-                                    failed: None,
-                                };
-                            }
-                        } else if let Some((_, pa, pp)) = batch_pending.take() {
-                            let pa_ref = pa.as_ref();
-                            let s1 = frag.send(c, sess, &pa_ref, &pp, limit);
+                            pending_retarget(&mut pending_addr, &addr);
+                            pending_buf.clear();
+                            pending_buf.extend_from_slice(payload);
+                            pending_pack = Some(PendingPack {
+                                class,
+                                len: payload.len(),
+                            });
+                            return PayloadSend {
+                                frames: 1,
+                                failed: None,
+                            };
+                        } else if let Some(p) = pending_pack.take() {
+                            let pa = pending_addr.as_ref();
+                            let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
                             if s1.failed.is_some() {
                                 let s2 = frag.send(c, sess, &addr, payload, limit);
                                 return prefer_severe(s1, s2);
@@ -521,15 +546,15 @@ pub(crate) async fn udp_associate_inner(
                     }
                 }
                 }
-                if let Some((pc, pa, pp)) = batch_pending.take() {
+                if let Some(p) = pending_pack.take() {
                     flush_deferred_pair(
                         &egress_shared,
                         &pool,
                         &mut frag,
                         sess,
-                        pc,
-                        &pa.as_ref(),
-                        &pp,
+                        p.class,
+                        &pending_addr.as_ref(),
+                        &pending_buf[..p.len],
                     );
                 }
                 record_drain_batch(drained);
@@ -586,15 +611,47 @@ pub(crate) async fn udp_associate_inner(
         }
     }
     // Backstop only: the flush at the end of the recv branch above always
-    // drains `batch_pending` now (it sends, or drops it with accounting), so
-    // no exit path can leave one behind. Kept so a future staging site added
-    // outside that branch fails loudly in the counters instead of losing a
-    // datagram silently.
-    if batch_pending.is_some() {
+    // drains `pending_pack` now (it sends, or drops it with accounting), so no exit
+    // path can leave one behind. Kept so a future staging site added outside
+    // that branch fails loudly in the counters instead of losing a datagram
+    // silently.
+    if pending_pack.is_some() {
         dgram_drops::bump(&dgram_drops::NO_EGRESS);
     }
     assoc_recycle_buf(buf);
     Ok(())
+}
+
+/// One staged small payload of the association's opportunistic 2-pack.
+///
+/// Metadata only: the bytes live in the association's reused `pending_buf`
+/// (`len` bytes) and the destination in its `pending_addr` slot, so nothing
+/// here allocates.
+pub(crate) struct PendingPack {
+    pub(crate) class: EgressClass,
+    pub(crate) len: usize,
+}
+
+/// Point the association's staged destination at `addr`, reusing the key
+/// buffer it already owns.
+///
+/// A domain target keeps its `String` allocation across destination switches
+/// (`clear` + `push_str`), which is what makes the alternating-destination case
+/// allocation-free as well as the steady one. The caller must invoke this
+/// *before* publishing a pack, so `pending_addr` always describes the staged
+/// payload.
+pub(crate) fn pending_retarget(slot: &mut TargetAddr, addr: &TargetAddrRef<'_>) {
+    match (&mut *slot, addr) {
+        (TargetAddr::Domain(name, port), TargetAddrRef::Domain(h, p)) => {
+            if name.as_str() != *h || *port != *p {
+                name.clear();
+                name.push_str(h);
+                *port = *p;
+            }
+        }
+        (TargetAddr::Ip(slot), TargetAddrRef::Ip(a)) => *slot = *a,
+        (slot, other) => *slot = other.into_owned(),
+    }
 }
 
 /// Send the deferred 2-pack payload once, or drop it with accounting.

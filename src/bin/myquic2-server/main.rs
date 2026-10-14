@@ -152,13 +152,31 @@ async fn main() -> Result<()> {
         })
         .clamp(1, MAX_CONNECTIONS);
     let per_conn_bytes = per_connection_memory_bytes(&tuning);
-    let cap = admission_cap(conn_cap, c.max_peer_memory_mb, per_conn_bytes);
+    // The UDP session pool is a process-wide term, not a per-connection one:
+    // every session owns a kernel socket (two directions) plus its reader's
+    // userspace buffer, and `MAX_SESSIONS_GLOBAL` permits are shared by every
+    // peer. Charging it once against the budget is what makes the "worst case"
+    // line below the memory this process can actually pin — before this the
+    // budget covered only the transport windows and the printed figure was off
+    // by the whole session pool.
+    let per_session_bytes = per_session_memory_bytes();
+    let session_pool_bytes = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
+    let cap = admission_cap(
+        conn_cap,
+        c.max_peer_memory_mb,
+        per_conn_bytes,
+        session_pool_bytes,
+    );
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(cap));
     let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS.min(cap)));
-    let worst_mib = (per_conn_bytes as u128 * cap as u128) / (1024 * 1024);
+    let transport_mib = (per_conn_bytes as u128 * cap as u128) / (1024 * 1024);
+    let session_mib = session_pool_bytes / (1024 * 1024);
+    let worst_mib = transport_mib + session_mib as u128;
     info!(
         "admission: up to {cap} connection(s); worst case {worst_mib} MiB pinned \
-         ({per_conn_bytes} B/connection, auth={}, configured cap={conn_cap}{})",
+         ({transport_mib} MiB transport at {per_conn_bytes} B/connection + {session_mib} MiB \
+         session pool for {MAX_SESSIONS_GLOBAL} sessions at {per_session_bytes} B each; \
+         auth={}, configured cap={conn_cap}{})",
         if auth_enabled { "on" } else { "off" },
         match c.max_peer_memory_mb {
             Some(mb) => format!(", memory budget {mb} MiB"),
@@ -180,13 +198,23 @@ async fn main() -> Result<()> {
              unauthenticated, and each one may pin {per_conn_bytes} B of this host's memory"
         );
     }
-    if let Some(mb) = c.max_peer_memory_mb
-        && cap < conn_cap
-    {
-        info!(
-            "memory budget {mb} MiB binds the connection cap: {cap} of {conn_cap} \
-                 admitted (raise max_peer_memory_mb or lower the windows to admit more)"
-        );
+    if let Some(mb) = c.max_peer_memory_mb {
+        let budget = mb.clamp(1, 1 << 20).saturating_mul(1024 * 1024);
+        if cap < conn_cap {
+            info!(
+                "memory budget {mb} MiB binds the connection cap: {cap} of {conn_cap} \
+                 admitted (raise max_peer_memory_mb, lower the windows, or lower \
+                 MYQUIC2_SESS_SOCKET_BUF to admit more)"
+            );
+        }
+        if session_pool_bytes >= budget {
+            warn!(
+                "memory budget {mb} MiB is at or below the {session_mib} MiB UDP session pool \
+                 ({MAX_SESSIONS_GLOBAL} sessions x {per_session_bytes} B), so only one connection \
+                 is admitted: raise max_peer_memory_mb above the pool, or lower \
+                 MYQUIC2_SESS_SOCKET_BUF on a RAM-tight host"
+            );
+        }
     }
     if !auth_enabled {
         warn!(
