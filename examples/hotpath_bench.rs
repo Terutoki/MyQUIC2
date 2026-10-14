@@ -42,6 +42,22 @@
 //!                                 single-association ceiling the 100k pps N=1
 //!                                 small-packet target is measured against.
 //!
+//!   `udppaced <socks> <host:port> <secs> [payload] [pps]`
+//!                                 paced small-packet soak: the same socket
+//!                                 shape as `udpps`, but the sender paces at
+//!                                 exactly `pps` packets/s (default 20000) on
+//!                                 an absolute timeline instead of blasting.
+//!                                 `udpps` collapses both ends in buffers/BBR
+//!                                 (loss 70%+, so per-frame savings are
+//!                                 invisible) while `udp`/`udpmulti` use fixed
+//!                                 1000 B payloads that never batch — a paced
+//!                                 rate just under the collapse knee keeps
+//!                                 every loss in the tunnel, which is what
+//!                                 `loss%` then measures. Sweep `pps` across
+//!                                 runs to find the knee (highest rate at ~0%
+//!                                 loss); the N-pack staging exists to move
+//!                                 exactly this ceiling.
+//!
 //!   `chan <n> [depth]`
 //!                                 per-datagram cost of the client's inbound
 //!                                 hand-off (`tokio::sync::mpsc` bounded
@@ -117,6 +133,13 @@ fn main() {
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60),
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128),
         ),
+        Some("udppaced") => udppaced(
+            &args[2],
+            &args[3],
+            args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128),
+            args.get(6).and_then(|s| s.parse().ok()).unwrap_or(20_000),
+        ),
         Some("chan") => chan(
             args[2].parse().unwrap(),
             args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256),
@@ -143,7 +166,7 @@ fn main() {
         ),
         _ => {
             eprintln!(
-                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpps|udpsweep|tcpecho|chan|server|reply|bulk> ..."
+                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpps|udppaced|udpsweep|tcpecho|chan|server|reply|bulk> ..."
             );
             std::process::exit(2);
         }
@@ -1060,6 +1083,151 @@ fn udpps(socks: &str, target: &str, secs: u64, payload: usize) {
     }
     if recv > s {
         eprintln!("udpps FAIL: accounting mismatch recv={recv} > sent={s}");
+        std::process::exit(1);
+    }
+}
+
+/// Paced small-packet soak: one UDP ASSOCIATE, one relay socket, fixed small
+/// `payload`-byte payload (1-512 B, the batchable range) sent at exactly
+/// `pps` packets/s for `secs` wall seconds. Sender and receiver run on two
+/// threads sharing the one socket (cloned fd), as in `udpps`.
+///
+/// Pacing runs on an absolute timeline (`start + k * interval`): a stall
+/// sends catch-up packets only within a 1 s lag window, past it the schedule
+/// re-syncs instead of emitting a burst that would measure the burst
+/// collapse rather than the paced ceiling. `sent_pps` must read back at
+/// `target_pps` — if it does not, the sender (or the loopback path itself)
+/// is the bottleneck, not the tunnel.
+fn udppaced(socks: &str, target: &str, secs: u64, payload: usize, pps: u64) {
+    if secs == 0 {
+        eprintln!("udppaced: secs must be > 0");
+        std::process::exit(2);
+    }
+    if !(1..=512).contains(&payload) {
+        eprintln!("udppaced: payload must be 1-512 (batchable range), got {payload}");
+        std::process::exit(2);
+    }
+    if pps == 0 {
+        eprintln!("udppaced: pps must be > 0");
+        std::process::exit(2);
+    }
+    let (host, port) = split_host(target);
+    let (_control, relay) = match socks_associate(socks) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("udppaced: associate {e}");
+            std::process::exit(1);
+        }
+    };
+    let u = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("udppaced: bind {e}");
+            std::process::exit(1);
+        }
+    };
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let pkt = udp_request(&host, port, payload);
+    let secs_d = Duration::from_secs(secs);
+    let deadline = Instant::now() + secs_d;
+    let interval = Duration::from_nanos(1_000_000_000 / pps);
+    let sent = Arc::new(AtomicU64::new(0));
+    let send_errs = Arc::new(AtomicU64::new(0));
+    let sender = {
+        let tx = u.try_clone().expect("udppaced: clone relay socket");
+        let sent = sent.clone();
+        let send_errs = send_errs.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut next = start;
+            let mut n = 0u64;
+            let mut e = 0u64;
+            // Past this lag the schedule re-syncs: emitting the backlog as
+            // one burst would collapse buffers and measure that collapse.
+            let max_lag = Duration::from_secs(1);
+            while Instant::now() < deadline {
+                let now = Instant::now();
+                if next > now {
+                    let left = next - now;
+                    if left > Duration::from_micros(50) {
+                        std::thread::sleep(left - Duration::from_micros(20));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                    continue;
+                }
+                if now.duration_since(next) > max_lag {
+                    next = now;
+                }
+                match tx.send_to(&pkt, relay) {
+                    Ok(_) => n += 1,
+                    Err(_) => e += 1,
+                }
+                next += interval;
+            }
+            sent.fetch_add(n, Ordering::Relaxed);
+            send_errs.fetch_add(e, Ordering::Relaxed);
+        })
+    };
+    // Receiver runs here until the send deadline plus a drain grace so
+    // in-flight replies are counted rather than truncated by the stop time.
+    let t0 = Instant::now();
+    let mut recv = 0u64;
+    let mut buf = vec![0u8; 2048];
+    let drain_end = deadline + Duration::from_secs(2);
+    while Instant::now() < drain_end {
+        match u.recv_from(&mut buf) {
+            Ok(_) => recv += 1,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        if Instant::now() >= drain_end {
+            break;
+        }
+    }
+    let _ = sender.join();
+    // Final short drain on the now-idle socket: the sender is done, so any
+    // datagram still in the kernel queue belongs to this run.
+    u.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    while u.recv_from(&mut buf).is_ok() {
+        recv += 1;
+    }
+    let dt = t0.elapsed();
+    let s = sent.load(Ordering::Relaxed);
+    let se = send_errs.load(Ordering::Relaxed);
+    let wall = dt.as_secs_f64();
+    // `sent` was produced during exactly the `secs` send window (the sender
+    // stops at the deadline while the wall also covers the drain grace), so
+    // sent_pps is over `secs` and recv_pps over the wall that carried replies.
+    let sent_pps = s as f64 / secs as f64;
+    let recv_pps = recv as f64 / wall;
+    let loss = if s == 0 {
+        0.0
+    } else {
+        100.0 * s.saturating_sub(recv) as f64 / s as f64
+    };
+    println!(
+        "udppaced socks={socks} target={target} payload={payload} secs={secs} \
+         target_pps={pps} sent={s} recv={recv} send_errs={se} wall={wall:.3}s \
+         sent_pps={sent_pps:.0} recv_pps={recv_pps:.0} loss={loss:.3}%"
+    );
+    if s == 0 {
+        eprintln!("udppaced FAIL: nothing sent (associate down or send path broken)");
+        std::process::exit(1);
+    }
+    if (sent_pps - pps as f64).abs() > 0.05 * pps as f64 {
+        eprintln!(
+            "udppaced WARN: sender did not hold the pace (sent_pps={sent_pps:.0} vs target {pps}); \
+             the bottleneck is the harness, not the tunnel"
+        );
+    }
+    if recv > s {
+        eprintln!("udppaced FAIL: accounting mismatch recv={recv} > sent={s}");
         std::process::exit(1);
     }
 }

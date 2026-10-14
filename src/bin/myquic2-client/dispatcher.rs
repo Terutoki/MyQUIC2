@@ -70,8 +70,16 @@ pub(crate) struct DispatchSlot {
 /// `try_send_to` per frame on the portable fallback. Runs flush in encounter
 /// order, so batching preserves reply order exactly and cannot head-of-line
 /// block one destination behind another.
+///
+/// `sock` is `None` for the non-leading items of one staged BATCH frame: every
+/// item of a frame shares the association (one `lookup_entry` per frame, one
+/// `mark_replied` per frame), so cloning the relay `Arc` per *item* paid a
+/// refcount round-trip per payload for ownership the run already has. The
+/// head item always carries `Some`, and staged items of one frame are always
+/// consecutive, so a `None` inherits the nearest preceding `Some` in staging
+/// order (see `flush_staged`). Single replies always carry `Some`.
 pub(crate) struct StagedReply {
-    pub(crate) sock: Arc<tokio::net::UdpSocket>,
+    pub(crate) sock: Option<Arc<tokio::net::UdpSocket>>,
     pub(crate) app: SocketAddr,
     pub(crate) dst: SocketAddr,
     pub(crate) payload: Bytes,
@@ -85,7 +93,7 @@ fn stage_reply(
 ) -> StagedReply {
     entry.mark_replied();
     StagedReply {
-        sock: entry.relay.clone(),
+        sock: Some(entry.relay.clone()),
         app,
         dst,
         payload,
@@ -177,10 +185,15 @@ pub(crate) fn dispatch_stage_multi(
                 // idempotent relaxed store, and its only consumer folds it
                 // into the idle stamp at the association's own tick.
                 entry.mark_replied();
+                // One relay `Arc` per frame, not per item: the head item
+                // carries it and the rest inherit it at flush (see
+                // `StagedReply::sock`), so a 16-item frame pays one refcount
+                // round-trip instead of sixteen.
+                let mut head = Some(entry.relay.clone());
                 for p in b.payloads() {
                     udp_stats::payload(p.len());
                     out.push(StagedReply {
-                        sock: entry.relay.clone(),
+                        sock: head.take(),
                         app,
                         dst,
                         payload: d.slice_ref(p),
@@ -191,10 +204,11 @@ pub(crate) fn dispatch_stage_multi(
             TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
                 CachedLookup::Addr(dst) => {
                     entry.mark_replied();
+                    let mut head = Some(entry.relay.clone());
                     for q in b.payloads() {
                         udp_stats::payload(q.len());
                         out.push(StagedReply {
-                            sock: entry.relay.clone(),
+                            sock: head.take(),
                             app,
                             dst,
                             payload: d.slice_ref(q),
@@ -436,7 +450,11 @@ pub(crate) fn dispatch_one(
     };
     pkt.truncate(0);
     encode_reply(pkt, s.dst, &s.payload);
-    udp_try_send_slice(&s.sock, map_for_dual(s.app), &pkt[..]);
+    let sock = s
+        .sock
+        .as_ref()
+        .expect("a staged single reply always carries its relay socket");
+    udp_try_send_slice(sock, map_for_dual(s.app), &pkt[..]);
 }
 
 /// Flush staged replies grouped by consecutive `(sock, app)` runs.
@@ -463,11 +481,27 @@ pub(crate) fn flush_staged(
 ) {
     let mut i = 0;
     while i < staged.len() {
+        // The run's socket lives on the head item; trailing items of one
+        // staged BATCH frame carry `None` and inherit it (see
+        // `StagedReply::sock`). Staging always emits a frame's items
+        // consecutively with the head first, so the head is `Some` here.
+        let run_sock: &Arc<tokio::net::UdpSocket> = staged[i]
+            .sock
+            .as_ref()
+            .expect("a flush run head always carries the relay socket");
+        let run_app = staged[i].app;
         let mut j = i + 1;
         while j < staged.len()
-            && Arc::ptr_eq(&staged[j].sock, &staged[i].sock)
-            && staged[j].app == staged[i].app
+            && staged[j].app == run_app
+            && staged[j]
+                .sock
+                .as_ref()
+                .is_none_or(|s| Arc::ptr_eq(s, run_sock))
         {
+            // A `None` item inherits this run; a `Some` item whose socket is
+            // a different relay ends it. A `None` can only follow its own
+            // frame's head (staging emits frames consecutively), so
+            // inheritance never crosses runs.
             j += 1;
         }
         let mut k = i;
@@ -484,7 +518,7 @@ pub(crate) fn flush_staged(
             for ((r, (o, l)), s) in refs.iter_mut().zip(offs.iter()).zip(&staged[k..k + n]) {
                 *r = (&hdrs[*o..*o + *l], &s.payload[..]);
             }
-            udp_try_send_grouped(&staged[i].sock, map_for_dual(staged[i].app), &refs[..n]);
+            udp_try_send_grouped(run_sock, map_for_dual(run_app), &refs[..n]);
             k += n;
         }
         i = j;

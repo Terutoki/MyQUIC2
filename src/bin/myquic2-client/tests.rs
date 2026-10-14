@@ -793,7 +793,7 @@ async fn flush_staged_sends_header_and_payload_as_one_datagram() {
     let mut staged = Vec::new();
     for i in 0..2 {
         staged.push(StagedReply {
-            sock: mk_relay(),
+            sock: Some(mk_relay()),
             app: apps[i].local_addr().unwrap(),
             dst: dsts[i],
             payload: bytes::Bytes::copy_from_slice(bodies[i]),
@@ -824,6 +824,85 @@ async fn flush_staged_sends_header_and_payload_as_one_datagram() {
                 .is_err(),
             "app {i} must receive exactly one datagram per staged reply"
         );
+    }
+}
+
+/// Items of one staged BATCH frame share their run: the head carries the
+/// relay `Arc` and the rest inherit it (`None`), and the flush must deliver
+/// every item to the one app as its own datagram — one refcount round-trip
+/// for the frame, not one per item.
+#[tokio::test]
+async fn flush_staged_batch_items_share_one_run() {
+    let relay = Arc::new(
+        tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+    );
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_addr = app.local_addr().unwrap();
+    let dsts: [SocketAddr; 3] = [
+        "198.51.100.1:53".parse().unwrap(),
+        "198.51.100.2:53".parse().unwrap(),
+        "198.51.100.3:53".parse().unwrap(),
+    ];
+    let bodies: [&[u8]; 3] = [b"a", b"bb", b"ccc"];
+    let mut staged = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        staged.push(StagedReply {
+            sock: if i == 0 { Some(relay.clone()) } else { None },
+            app: app_addr,
+            dst: dsts[i],
+            payload: bytes::Bytes::copy_from_slice(body),
+        });
+    }
+    // One extra single for the same app but a *different* relay: it must end
+    // the inherited run rather than join it.
+    let other = Arc::new(
+        tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+    );
+    staged.push(StagedReply {
+        sock: Some(other.clone()),
+        app: app_addr,
+        dst: dsts[0],
+        payload: bytes::Bytes::copy_from_slice(bodies[0]),
+    });
+    // Prime writable readiness on both relays: a freshly registered socket
+    // may report `WouldBlock` before its first readiness edge (no syscall
+    // ever runs), which would detour the first frame through the detached
+    // retry worker and reorder it behind the later frames. The contract
+    // tests prime the same way; the primes are drained, never asserted.
+    for r in [&relay, &other] {
+        r.send_to(b"prime", map_for_dual(app_addr)).await.unwrap();
+    }
+    let mut prime = [0u8; 8];
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(2), app.recv_from(&mut prime))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+    }
+    let mut hdrs: Vec<u8> = Vec::new();
+    let mut offs: Vec<(usize, usize)> = Vec::new();
+    flush_staged(&mut staged, &mut hdrs, &mut offs);
+    assert!(staged.is_empty(), "a flush must clear the staging queue");
+
+    let mut buf = [0u8; 128];
+    for want_body in [
+        b"a".as_slice(),
+        b"bb".as_slice(),
+        b"ccc".as_slice(),
+        b"a".as_slice(),
+    ] {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), app.recv_from(&mut buf))
+            .await
+            .expect("every staged item must arrive")
+            .unwrap();
+        // Header pins the source; body pins the payload: order and pairing
+        // must survive the shared run.
+        let hlen = match buf.get(3) {
+            Some(1) => 10,
+            Some(4) => 22,
+            _ => panic!("reply must carry an IP-form source"),
+        };
+        assert_eq!(&buf[hlen..n], want_body, "reply body");
     }
 }
 

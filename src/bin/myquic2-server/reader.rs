@@ -228,6 +228,7 @@ pub(crate) fn flush_reply_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sess_reader_task(
     conn_id: usize,
     s: u32,
@@ -236,6 +237,7 @@ pub(crate) async fn sess_reader_task(
     c2: quinn::Connection,
     last2: Arc<std::sync::atomic::AtomicU64>,
     recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
+    recent_epoch: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -250,6 +252,16 @@ pub(crate) async fn sess_reader_task(
     // never). Gates the re-probe so a PMTU shrink cannot cost one quinn lock
     // per oversized reply; see `READER_BUDGET_PROBE_INTERVAL_MS`.
     let mut last_too_large_probe_ms = 0u64;
+    // Task-local mirror of the reply-source allowlist. This task is the
+    // allowlist's only reader, and every mutation of the shared snapshot bumps
+    // `recent_epoch` — including a spawned resolver task's foreign push, which
+    // this task cannot otherwise see. The snapshot is therefore reloaded only
+    // when the epoch moves: one relaxed epoch load per reply instead of an
+    // `ArcSwap` hazard-pointer read whose cache line a concurrent foreign push
+    // would invalidate on the download hot path. `u64::MAX` can never be a
+    // real epoch (it counts pushes), so the first reply always loads.
+    let mut allow_snap: Option<Arc<RecentAddrs>> = None;
+    let mut allow_epoch: u64 = u64::MAX;
     // Staged small replies for one grouped BATCH frame — the reply-path twin
     // of the client association's 2-pack. One run is the replies of the
     // current drain burst that share a source; a different source, a large
@@ -409,13 +421,18 @@ pub(crate) async fn sess_reader_task(
             // target's answer. Drop anything sent from a host this session never
             // sent to (see `RecentAddrs`: the port is deliberately not part of the
             // key, so a server answering from a different port still gets through).
-            // Lock-free snapshot: the outbound path pushes into the same allowlist
-            // from another task, so a lock here was the only per-reply mutex on the
-            // download path (and the only place the two directions shared a cache
-            // line). `load` is a hazard-pointer read, not a refcount RMW.
-            let r = recent.load();
-            let allowed = !r.is_empty() && r.contains(&src);
-            drop(r);
+            // Epoch-gated mirror: the outbound path (and a spawned resolver
+            // task's foreign push) bumps `recent_epoch` on every allowlist
+            // mutation, so a steady flow validates against the task-local
+            // snapshot and only reloads it when something actually moved.
+            let epoch_now = recent_epoch.load(std::sync::atomic::Ordering::Relaxed);
+            if allow_epoch != epoch_now {
+                allow_snap = Some(recent.load_full());
+                allow_epoch = epoch_now;
+            }
+            let allowed = allow_snap
+                .as_ref()
+                .is_some_and(|r| !r.is_empty() && r.contains(&src));
             if !allowed {
                 dgram_drops::bump(&dgram_drops::REFUSED);
                 continue;
@@ -739,6 +756,7 @@ pub(crate) async fn get_or_create_sess(
         c2_pre,
         last_pre.clone(),
         recent_pre.clone(),
+        recent_epoch.clone(),
     ));
     let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();

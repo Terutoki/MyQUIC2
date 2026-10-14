@@ -20,22 +20,26 @@ path = "src/bin/myquic2-client/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
-# quinn trio from crates.io (0.11 line): quinn 0.11.12 / quinn-proto 0.11.19 /
+# quinn trio from crates.io (0.11 line): quinn 0.11.x / quinn-proto 0.11.x /
 # quinn-udp 0.5.x. The 0.11.18+ line backports the DATAGRAM accounting fix and
 # the assembler contiguous-chunk coalescing, so no fork is needed; the custom
 # MAX_CHUNKS=16384 fork patch is intentionally dropped (1024 returns, hence
 # the 0-RTT flow below keys on `ZeroRttAccepted`, the 0.11 API).
-# quinn trio pinned EXACTLY (=0.11.12): `udp::send::poll_once` /
-# `try_send_datagram` correctness is verified against the 0.11.12
-# `connection.rs` `SendDatagram` internals (one state-lock per poll,
-# `Notified` Drop unregisters the waiter). A caret float to a newer
-# 0.11.x that changes those internals would silently break the
-# `Blocked`-vs-parked contract, so the pin is load-bearing.
+# quinn floats on caret `0.11` (upgrades within the line via `cargo update`;
+# `0.12` stays out by semver): `try_send_datagram` correctness rests on
+# quinn's `SendDatagram` internals (one state-lock per poll, `Notified` Drop
+# unregisters the waiter, `Blocked` parks the bytes back in the future for a
+# `Pending` drop to release). Those internals are pinned behaviorally, not by
+# version: `cancelled_datagram_waits_leave_no_residue` fails the build if a
+# newer 0.11.x changes the `Blocked`-vs-parked contract, and the N=1
+# per-frame-lock tests fail if the lock multiplicity moves. Re-verify this
+# note against the new internals on every quinn bump that touches
+# `connection.rs` `SendDatagram`.
 # default-features = false drops `platform-verifier` (the client pins one
 # self-signed certificate; nothing here calls the platform verifier) and
 # selects the aws-lc-rs QUIC crypto backend instead of ring. `bloom` and
 # `log` are quinn's own defaults; `runtime-tokio` is the runtime in use.
-quinn = { version = "=0.11.12", default-features = false, features = [
+quinn = { version = "0.11", default-features = false, features = [
     "log",
     "runtime-tokio",
     "bloom",
