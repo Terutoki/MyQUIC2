@@ -250,6 +250,13 @@ pub(crate) async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<Targ
 /// the hand-rolled `JoinSet` + `watch` cancellation. Total budget 4 s is kept
 /// via `timeout` so the client-side ACK wait still covers it.
 ///
+/// Single-candidate fast path: IP-literal targets (the dominant case, and the
+/// reason the old hand-rolled version special-cased them) get one direct
+/// connect — no `lookup_host` clone, no partition/merge `Vec`s, no `JoinSet`,
+/// no attempt/delay task spawns. The crate is only consulted when there is
+/// actually a race to run; delegating the single case to it re-introduced
+/// several allocations and two task spawns per TCP flow for nothing.
+///
 /// Note: `happy-eyeballs` re-interleaves v6/v4 (v6-first per RFC 8305) after
 /// `lookup_host`, so a `dns_ip_preference = "ipv4"` deployment still resolves
 /// v4-first but races v6-first. That matches the RFC default; strict v4-first
@@ -273,6 +280,20 @@ pub(crate) async fn dial_happy_eyeballs(
     }
     if n == 0 {
         return None;
+    }
+    if let [only] = &accept[..n] {
+        return match tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::net::TcpStream::connect(*only),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                let _ = s.set_nodelay(true);
+                Some(s)
+            }
+            _ => None,
+        };
     }
     // Total budget 4s; the client-side ACK wait is sized to cover it.
     let res = tokio::time::timeout(
