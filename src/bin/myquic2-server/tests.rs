@@ -16,6 +16,17 @@ use super::*;
 /// test that can make a table non-empty must serialize here.
 static HOLDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Acquire [`HOLDER_TEST_LOCK`], recovering from poisoning. The lock guards
+/// only this serialization, not any data under it, so one holder's panic
+/// must not turn every later holder's exact read into a spurious
+/// `PoisonError` failure of its own — the panicking test has already failed
+/// the suite on its own.
+fn holder_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    HOLDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn hdr(atyp: u8, body: &[u8]) -> Vec<u8> {
     let mut v = vec![atyp];
     v.extend_from_slice(body);
@@ -940,7 +951,7 @@ async fn allowlist_pushes_are_lock_free_and_both_land() {
 #[tokio::test]
 async fn fair_share_counts_session_holders_not_live_connections() {
     use std::sync::atomic::Ordering;
-    let _holder_guard = HOLDER_TEST_LOCK.lock().unwrap();
+    let _holder_guard = holder_test_guard();
     let prev = session_holders().load(Ordering::Relaxed);
     // The client cap and the server's static per-connection target are one
     // number, shared through `lib.rs`.
@@ -1891,7 +1902,7 @@ fn ip_cache_collision_evicts_and_never_mis_serves() {
 async fn session_churn_holds_caps_without_leaking() {
     use std::sync::atomic::Ordering;
 
-    let _holder_guard = HOLDER_TEST_LOCK.lock().unwrap();
+    let _holder_guard = holder_test_guard();
     const N: usize = 1024;
     let holders_before = session_holders().load(Ordering::Relaxed);
     let permits_before = session_limiter().available_permits();
@@ -2080,13 +2091,13 @@ async fn recv_loopback_burst(
 /// L2 DNS single-flight burst delivery (server egress).
 ///
 /// A same-host cold burst must deliver every datagram. The first miss spawns
-/// a waiter, every follower spawns its own waiter, and moka coalesces all of
-/// them into one upstream query; each waiter delivers its own payload once
-/// the resolution completes. No queue, no in-flight probe, no drop between
-/// the two. Phase 1 drives a 33-burst at a cold name (the spawning miss plus
-/// 32 followers); phase 2 re-sends 40 at the now-warm name. Both phases must
-/// land 100% of their datagrams on the loopback sockets with zero
-/// budget/policy counters moving.
+/// a waiter, every follower whose lookup is still cold spawns its own, and
+/// moka coalesces all of them into one upstream query; each spawn-delivered
+/// waiter delivers its own payload once the resolution completes. No queue,
+/// no in-flight probe, no drop between the two. Phase 1 drives a 33-burst at
+/// a cold name (the spawning miss plus 32 followers); phase 2 re-sends 40 at
+/// the now-warm name. Both phases must land 100% of their datagrams on the
+/// loopback sockets with zero budget/policy counters moving.
 ///
 /// `localhost` resolves via the hosts file (no network), and the ephemeral
 /// port keeps the `(host, port)` cache key cold: no other test can have
@@ -2094,9 +2105,12 @@ async fn recv_loopback_burst(
 /// each waiter holds one permit while it waits, so the burst needs budget
 /// available. Follower *disposition* (inline from a warm memo vs.
 /// spawn-delivered) is deliberately not pinned: the resolution runs on
-/// another task's thread, so a follower whose thread happens to carry the
-/// memo hit is served inline, and both shapes deliver exactly once — the
-/// socket count below is the contract.
+/// another task's thread, so a follower whose lookup finds the memo it
+/// warmed (this thread's fast memo, or the session destination memo the
+/// first waiter stored) is served inline, and both shapes deliver exactly
+/// once — the socket count below is the contract. Pinning the disposition
+/// (as this test once did) makes the burst fail whenever the runner is
+/// fast enough to complete the resolution mid-loop.
 ///
 /// The holder guard: the burst lands on `get_or_create_sess`'s *creation*
 /// path (sessions 11/12 are absent from the fresh table), which registers
@@ -2113,7 +2127,7 @@ async fn recv_loopback_burst(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l2_dns_singleflight_burst_delivers_server() {
     let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
-    let _holder_guard = HOLDER_TEST_LOCK.lock().unwrap();
+    let _holder_guard = holder_test_guard();
     let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("loopback binds");
@@ -2142,15 +2156,19 @@ async fn l2_dns_singleflight_burst_delivers_server() {
     let payload = Bytes::from_static(b"l2-burst");
 
     let before = dgram_drops::snapshot();
-    // Datagrams 1..33: the first miss spawns the resolving waiter, every
-    // follower spawns its own; all return None inline (the spawned tasks own
-    // delivery).
-    for _ in 0..33 {
-        let r = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
-        assert!(
-            r.is_none(),
-            "a spawned-miss datagram delivers inline nothing; its task owns it"
-        );
+    // Datagram 1: the cold miss must spawn the resolving waiter and return
+    // `None` — the spawned task owns that payload. Followers are not pinned
+    // (see the disposition note above): while the resolver runs on another
+    // worker, a follower can find the memo it just warmed and deliver inline
+    // (`Some`, still exactly one delivery); a follower that still misses
+    // spawns its own waiter (`None`).
+    let first = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
+    assert!(
+        first.is_none(),
+        "the cold miss spawns its waiter and delivers inline nothing"
+    );
+    for _ in 1..33 {
+        let _ = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
     }
     // Every waiter delivers once the (single) resolution completes; the quiet
     // period proves nothing else arrives.
