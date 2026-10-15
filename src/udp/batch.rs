@@ -472,7 +472,7 @@ impl BurstRecv {
         // drains 2 datagrams never pays for 32.
         let mut iovs: [std::mem::MaybeUninit<[IoSliceMut<'_>; 1]>; LAST_HOP_DRAIN] =
             [const { std::mem::MaybeUninit::uninit() }; LAST_HOP_DRAIN];
-        for i in 0..n {
+        for (i, io) in iovs.iter_mut().enumerate().take(n) {
             // Each iovec borrows its own `BURST_SLOT`-wide slice of
             // `self.data`, which outlives the syscall.
             let slot = unsafe {
@@ -481,7 +481,7 @@ impl BurstRecv {
                     BURST_SLOT,
                 )
             };
-            iovs[i].write([IoSliceMut::new(slot)]);
+            io.write([IoSliceMut::new(slot)]);
         }
         // SAFETY: exactly `n` entries were just initialised above; only
         // `0..n` is passed to nix, and each borrows live `self.data`.

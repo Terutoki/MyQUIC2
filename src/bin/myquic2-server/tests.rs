@@ -3,6 +3,17 @@ use super::*;
 
 /// Serializes the tests that mutate the process-global session-holder
 /// count, so their exact reads cannot race each other.
+///
+/// Three tests touch the counter: the two exact-delta holder tests
+/// (`fair_share_counts_session_holders_not_live_connections`,
+/// `session_churn_holds_caps_without_leaking`) and
+/// `l2_dns_singleflight_burst_delivers_server`, whose burst runs
+/// `forward_server_dgram` through the real `get_or_create_sess` creation
+/// path — it registers its own table as a holder (and releases it only
+/// when the test's runtime drops), so without this lock a concurrent
+/// churn run could observe two holders for a one-table delta. This race
+/// predates the lock's third user: the count is process-global, so every
+/// test that can make a table non-empty must serialize here.
 static HOLDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn hdr(atyp: u8, body: &[u8]) -> Vec<u8> {
@@ -156,10 +167,10 @@ fn sess_with_dest(addr: Option<SocketAddr>) -> (SessTable, Arc<tokio::net::UdpSo
 ///
 /// Session 7's entry is inserted directly (no `note_empty_state`, no holder
 /// transition), so tests using it never disturb the process-global holder count
-/// that `HOLDER_TEST_LOCK` keeps exact for two other tests. The socket is a
-/// parameter because the relay sends to `map_for_dual(dst)`: reaching a v4
-/// target needs the dual-stack socket production sessions use, while the DNS
-/// memo tests only need any bound socket.
+/// that `HOLDER_TEST_LOCK` keeps exact for the tests that assert on it. The
+/// socket is a parameter because the relay sends to `map_for_dual(dst)`:
+/// reaching a v4 target needs the dual-stack socket production sessions use,
+/// while the DNS memo tests only need any bound socket.
 fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) -> SessTable {
     let ss = Arc::new(ShardedSessTable::new());
     let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
@@ -1870,9 +1881,11 @@ fn ip_cache_collision_evicts_and_never_mis_serves() {
 /// the table empty, every global permit released, the holder count
 /// restored, and no live session swept.
 ///
-/// The holder assertions are exact because this test and
-/// `fair_share_counts_session_holders_not_live_connections` serialize on
-/// `HOLDER_TEST_LOCK`: both mutate the process-global holder count, and
+/// The holder assertions are exact because every test that can register a
+/// non-empty table — this one,
+/// `fair_share_counts_session_holders_not_live_connections`, and the
+/// `l2_dns_singleflight_burst_delivers_server` burst (which reaches
+/// `get_or_create_sess`'s creation arm) — serializes on `HOLDER_TEST_LOCK`;
 /// exact reads would otherwise race each other.
 #[tokio::test]
 async fn session_churn_holds_caps_without_leaking() {
@@ -2084,9 +2097,23 @@ async fn recv_loopback_burst(
 /// another task's thread, so a follower whose thread happens to carry the
 /// memo hit is served inline, and both shapes deliver exactly once — the
 /// socket count below is the contract.
+///
+/// The holder guard: the burst lands on `get_or_create_sess`'s *creation*
+/// path (sessions 11/12 are absent from the fresh table), which registers
+/// this table in the process-global holder count and only releases it when
+/// this test's runtime drops. Without the lock a concurrent
+/// `session_churn_holds_caps_without_leaking` or
+/// `fair_share_counts_session_holders_not_live_connections` reads two
+/// holders for its one-table delta — a flake the CI's 4-vCPU runner can hit
+/// whenever the two tests overlap. Holding a std guard across awaits is
+/// deliberate and safe here: each test owns its own runtime, so the guard
+/// only parks other tests' threads, never a task of this test, and the lock
+/// order (SLOW_PATH_COUNTER_LOCK first) is consistent with every user.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l2_dns_singleflight_burst_delivers_server() {
     let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
+    let _holder_guard = HOLDER_TEST_LOCK.lock().unwrap();
     let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("loopback binds");
@@ -2252,7 +2279,9 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
 ///
 /// The session fixture inserts its entry directly (never through
 /// `get_or_create_sess`), so the process-global holder count — which
-/// `HOLDER_TEST_LOCK` exists to keep exact for two other tests — is untouched.
+/// `HOLDER_TEST_LOCK` keeps exact for the tests that assert on it — is
+/// untouched (this fixture's session 7 hit also keeps the memo path here
+/// from ever reaching the creation arm).
 #[tokio::test]
 async fn a_session_dest_memo_answers_a_domain_target_inline() {
     let (host, port) = ("inline-resolve.test", 19741u16);

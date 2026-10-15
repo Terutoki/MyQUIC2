@@ -191,9 +191,13 @@ happy-eyeballs = { version = "0.2.1", default-features = false, features = ["tok
 fast-socks5 = "1.0.0"
 # nix: `sys::socket::recvmmsg` + `MultiHeaders`/`SockaddrStorage` replace the
 # hand-written `libc::mmsghdr`/`sockaddr_storage` receive path in
-# `udp/batch.rs` (probe + burst + addr conversion). `socket` + `time` only;
-# only *called* on Linux, portable fallback elsewhere.
-nix = { version = "0.31.3", default-features = false, features = ["socket", "time"] }
+# `udp/batch.rs` (probe + burst + addr conversion). Feature set mirrors what
+# the Linux-only call sites actually touch: `socket` (module), `uio`
+# (`recvmmsg`/`MultiHeaders` live behind it in nix 0.31), `net` (the
+# `SockaddrStorage::as_sockaddr_in{6}` downcast accessors) and `time` (the
+# `TimeSpec` timeout parameter). Only *called* on Linux, portable fallback
+# elsewhere.
+nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net", "time"] }
 # metrics: `histogram!`/`counter!` facade for the UDP batch sizes/syscalls in
 # `udp/batch.rs`, alongside the 60 s `batch_report` log line the tests pin.
 # No-op without a recorder; a Prometheus exporter can scrape it when set.
