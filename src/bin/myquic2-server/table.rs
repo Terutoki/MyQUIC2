@@ -118,7 +118,7 @@ impl ShardedSessTable {
     /// share, never a data path.
     pub(crate) fn note_empty_state(&self) {
         use std::sync::atomic::Ordering;
-        let any = self.shards.iter().any(|sh| !lock_read(sh).is_empty());
+        let any = self.shards.iter().any(|sh| !sh.read().is_empty());
         if any {
             if !self.counted.swap(true, Ordering::AcqRel) {
                 session_holders().fetch_add(1, Ordering::AcqRel);
@@ -132,7 +132,7 @@ impl ShardedSessTable {
     /// only on the session-creation path (never per datagram) to bound one
     /// connection's share of the process-wide session budget.
     pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(|sh| lock_read(sh).len()).sum()
+        self.shards.iter().map(|sh| sh.read().len()).sum()
     }
 
     /// `len` with a bound on how stale it can be, for the fair-share gate.
@@ -207,7 +207,7 @@ impl ShardedSessTable {
     pub(crate) fn drain_all(&self) -> Vec<SessEntry> {
         let mut out = Vec::new();
         for sh in &self.shards {
-            out.extend(lock_write(sh).drain().map(|(_, v)| v));
+            out.extend(sh.write().drain().map(|(_, v)| v));
         }
         self.note_empty_state();
         out
@@ -217,7 +217,7 @@ impl ShardedSessTable {
         let mut out = Vec::new();
         for sh in &self.shards {
             let expired: Vec<u32> = {
-                let m = lock_read(sh);
+                let m = sh.read();
                 m.iter()
                     .filter(|(_, e)| {
                         now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed))
@@ -229,7 +229,7 @@ impl ShardedSessTable {
             if expired.is_empty() {
                 continue;
             }
-            let mut m = lock_write(sh);
+            let mut m = sh.write();
             out.extend(take_idle(&mut m, &expired, now));
         }
         self.note_empty_state();
@@ -421,7 +421,7 @@ pub(crate) fn sess_dest_lookup_ttl(
     port: u16,
 ) -> Option<(SocketAddr, u64)> {
     let sh = ss.shard(s);
-    if let Some(e) = lock_read(sh).get(&s)
+    if let Some(e) = sh.read().get(&s)
         && let Some(addr) = e.dest.get(now, host, port)
     {
         return Some((addr, e.dest.expires.saturating_sub(now)));
@@ -462,7 +462,7 @@ pub(crate) fn sess_dest_store(
     // would only make the memo look shorter-lived than the reader believes.
     let now = coarse_millis();
     {
-        let r = lock_read(ss.shard(s));
+        let r = ss.shard(s).read();
         if let Some(e) = r.get(&s)
             && e.dest.is_for(host, port, addr)
             && e.dest.expires.saturating_sub(now) > DEST_PIN_REFRESH_MS
@@ -470,7 +470,7 @@ pub(crate) fn sess_dest_store(
             return;
         }
     }
-    let mut w = lock_write(ss.shard(s));
+    let mut w = ss.shard(s).write();
     if let Some(e) = w.get_mut(&s) {
         e.dest = DestMemo {
             key,

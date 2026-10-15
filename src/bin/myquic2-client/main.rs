@@ -88,15 +88,16 @@ async fn main() -> Result<()> {
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let quic_client = Arc::new(quic_client);
     let mut ccfg_interactive = quinn::ClientConfig::new(quic_client.clone());
+    let congestion = Congestion::from_config(&c.congestion);
     ccfg_interactive.transport_config(build_transport_tuned_class(
-        &c.congestion,
+        congestion,
         c.keep_alive_secs,
         c.tuning(),
         false,
     ));
     let mut ccfg_bulk = quinn::ClientConfig::new(quic_client);
     ccfg_bulk.transport_config(build_transport_tuned_class(
-        &c.congestion,
+        congestion,
         c.keep_alive_secs,
         c.tuning(),
         true,

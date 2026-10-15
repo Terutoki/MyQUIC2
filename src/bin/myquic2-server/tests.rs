@@ -165,7 +165,7 @@ fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) ->
     let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let h = tokio::spawn(std::future::pending::<()>());
     let permit = session_limiter().clone().try_acquire_owned().unwrap();
-    lock_write(ss.shard(7)).insert(
+    ss.shard(7).write().insert(
         7,
         SessEntry {
             sock,
@@ -223,7 +223,7 @@ async fn session_dest_store_writes_only_when_the_memo_needs_it() {
     let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
     let moved: SocketAddr = "1.1.1.1:443".parse().unwrap();
     let (ss, _sock) = sess_with_dest(None);
-    let expires = || lock_read(ss.shard(7)).get(&7).unwrap().dest.expires;
+    let expires = || ss.shard(7).read().get(&7).unwrap().dest.expires;
 
     sess_dest_store(&ss, 7, "alpha.test", 443, dst, DNS_CACHE_TTL_MS);
     let first = expires();
@@ -251,7 +251,7 @@ async fn session_dest_store_writes_only_when_the_memo_needs_it() {
     // Inside the refresh window the value is unchanged but the life is not:
     // that one must rewrite, or the entry would expire and the next packet
     // would pay a full resolve.
-    lock_write(ss.shard(7)).get_mut(&7).unwrap().dest.expires = mono_millis() + 1;
+    ss.shard(7).write().get_mut(&7).unwrap().dest.expires = mono_millis() + 1;
     sess_dest_store(&ss, 7, "alpha.test", 443, moved, DNS_CACHE_TTL_MS);
     assert!(
         expires() > mono_millis() + DEST_PIN_REFRESH_MS,
@@ -581,12 +581,14 @@ async fn session_memo_does_not_own_the_socket() {
 #[tokio::test]
 async fn sweep_recheck_keeps_a_session_touched_after_the_snapshot() {
     let (ss, _sock) = sess_with_dest(None);
-    let last = lock_read(ss.shard(7)).get(&7).unwrap().last.clone();
+    let last = ss.shard(7).read().get(&7).unwrap().last.clone();
     // A sweep that starts well past the session's idle deadline.
     let now = last.load(std::sync::atomic::Ordering::Relaxed) + SESS_IDLE_MS + 10_000;
 
     // Phase 1: the read-locked snapshot.
-    let keys: Vec<u32> = lock_read(ss.shard(7))
+    let keys: Vec<u32> = ss
+        .shard(7)
+        .read()
         .iter()
         .filter(|(_, e)| {
             now.saturating_sub(e.last.load(std::sync::atomic::Ordering::Relaxed)) >= SESS_IDLE_MS
@@ -602,14 +604,14 @@ async fn sweep_recheck_keeps_a_session_touched_after_the_snapshot() {
 
     // Phase 2: the write-locked removal must skip it.
     let evicted = {
-        let mut w = lock_write(ss.shard(7));
+        let mut w = ss.shard(7).write();
         take_idle(&mut w, &keys, now)
     };
     assert!(
         evicted.is_empty(),
         "a session touched after the snapshot must survive"
     );
-    assert!(lock_read(ss.shard(7)).contains_key(&7));
+    assert!(ss.shard(7).read().contains_key(&7));
 }
 
 /// A reader that stays alive (`SessHit::Fresh` requires a running task).
@@ -637,7 +639,7 @@ fn capped_session(idle_ms: u64) -> SessEntry {
 
 /// Whether `s`'s reply allowlist currently admits `dst`.
 fn allowlist_contains(ss: &SessTable, s: u32, dst: SocketAddr) -> bool {
-    let sh = lock_read(ss.shard(s));
+    let sh = ss.shard(s).read();
     let Some(e) = sh.get(&s) else {
         return false;
     };
@@ -683,7 +685,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
-        lock_write(ss.shard(s)).insert(s, entry);
+        ss.shard(s).write().insert(s, entry);
         sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
@@ -760,7 +762,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
-        lock_write(ss.shard(colliding)).insert(colliding, entry);
+        ss.shard(colliding).write().insert(colliding, entry);
         sess_memo_put(conn_id, colliding, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
@@ -795,7 +797,7 @@ async fn the_allowlist_mirror_re_records_after_a_foreign_push() {
     use std::sync::atomic::Ordering;
 
     let (ss, _sock) = sess_with_dest(None);
-    let epoch = lock_read(ss.shard(7)).get(&7).unwrap().recent_epoch.clone();
+    let epoch = ss.shard(7).read().get(&7).unwrap().recent_epoch.clone();
     let a: SocketAddr = "93.184.216.34:443".parse().unwrap();
 
     let mut mirror: Option<(u32, SocketAddr, u64)> = None;
@@ -1004,7 +1006,7 @@ async fn the_fair_share_gate_counts_inserts_since_the_sample() {
 
     // One connection's burst of new sessions, all inside the sample window.
     for s in 0..8u32 {
-        lock_write(ss.shard(s)).insert(s, capped_session(0));
+        ss.shard(s).write().insert(s, capped_session(0));
         ss.note_insert();
     }
     assert!(
@@ -1025,17 +1027,17 @@ async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
     let ss = ShardedSessTable::new();
     let now = mono_millis();
     assert_eq!(ss.len_upper_bound(now), 0);
-    lock_write(ss.shard(7)).insert(7, capped_session(0));
-    lock_write(ss.shard(7)).remove(&7);
+    ss.shard(7).write().insert(7, capped_session(0));
+    ss.shard(7).write().remove(&7);
     assert_eq!(
         ss.len_upper_bound(now),
         0,
         "a rolled-back insert must not inflate the fair-share bound"
     );
-    lock_write(ss.shard(7)).insert(7, capped_session(0));
+    ss.shard(7).write().insert(7, capped_session(0));
     ss.note_insert();
     assert_eq!(ss.len_upper_bound(now), 1);
-    lock_write(ss.shard(7)).remove(&7);
+    ss.shard(7).write().remove(&7);
 }
 
 /// Expired entries go through `take_idle` unbounded: 70 idle sessions are
@@ -1468,7 +1470,7 @@ async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
     scfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    server_cfg.transport_config(build_transport("bbr", 5));
+    server_cfg.transport_config(build_transport(Congestion::Bbr, 5));
     let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
 
     let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -1483,7 +1485,7 @@ async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
     ccfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
     let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
-    ccfg.transport_config(build_transport("bbr", 5));
+    ccfg.transport_config(build_transport(Congestion::Bbr, 5));
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client.set_default_client_config(ccfg);
 
@@ -1882,7 +1884,7 @@ async fn session_churn_holds_caps_without_leaking() {
     let permits_before = session_limiter().available_permits();
     let ss = Arc::new(ShardedSessTable::new());
     for s in 1..=N as u32 {
-        lock_write(ss.shard(s)).insert(s, capped_session(0));
+        ss.shard(s).write().insert(s, capped_session(0));
         ss.note_insert();
     }
     ss.note_empty_state();

@@ -45,9 +45,6 @@ pub use config::{
         per_connection_memory_bytes, per_session_memory_bytes, session_pool_memory_bytes,
     },
 };
-pub use sync::guards::{
-    lock_mutex, lock_read, lock_write, try_lock_mutex, try_lock_read, try_lock_write,
-};
 pub use time::{coarse::coarse_millis, mono::mono_millis};
 
 pub use mqp::ack::{
@@ -76,9 +73,9 @@ pub use tls::{
     parse_congestion, server_tls_config,
 };
 pub use transport::{
-    DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW, STREAM_RECEIVE_WINDOW,
-    TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT, build_transport,
-    build_transport_tuned, build_transport_tuned_class,
+    Congestion, DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW,
+    STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT,
+    build_transport, build_transport_tuned, build_transport_tuned_class,
 };
 // `MQP_DGRAM_MAX` / `clamp_keep_alive` are exercised by the unit tests below
 // through `use super::*` (`DATAGRAM_BUFFER` is also read by `config::tuning`).
@@ -265,27 +262,11 @@ fn warn_buf_clamped(which: &str, actual: usize, want: usize) {
 /// fires.
 #[cfg(target_os = "linux")]
 fn force_udp_buffers(s: &socket2::Socket, bytes: usize) {
-    use std::os::unix::io::AsRawFd;
-    let v: libc::c_int = bytes.min(libc::c_int::MAX as usize) as libc::c_int;
-    let len = std::mem::size_of_val(&v) as libc::socklen_t;
-    // SAFETY: `s` owns a live UDP socket fd, and `&v` points at a valid c_int
-    // for the duration of each call.
-    unsafe {
-        libc::setsockopt(
-            s.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUFFORCE,
-            &v as *const _ as *const libc::c_void,
-            len,
-        );
-        libc::setsockopt(
-            s.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUFFORCE,
-            &v as *const _ as *const libc::c_void,
-            len,
-        );
-    }
+    // rustix owns the Linux/musl ABI quirks and type-checks the borrows;
+    // best-effort: without CAP_NET_ADMIN these fail EPERM and the caller
+    // still emits its clamp warning.
+    let _ = rustix::net::sockopt::set_socket_send_buffer_size_force(s, bytes);
+    let _ = rustix::net::sockopt::set_socket_recv_buffer_size_force(s, bytes);
 }
 
 /// Dual-stack TCP listener (V6ONLY=0 when bound to ::).
@@ -2840,7 +2821,7 @@ mod tests {
         scfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
         let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
         let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-        server_cfg.transport_config(build_transport("bbr", 5));
+        server_cfg.transport_config(build_transport(Congestion::Bbr, 5));
         let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
 
         let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -2855,7 +2836,7 @@ mod tests {
         ccfg.alpn_protocols = vec![MQP_ALPN.to_vec()];
         let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
         let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
-        ccfg.transport_config(build_transport("bbr", 5));
+        ccfg.transport_config(build_transport(Congestion::Bbr, 5));
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client.set_default_client_config(ccfg);
         (client, server)

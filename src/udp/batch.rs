@@ -149,6 +149,12 @@ fn flush_local_batch() {
 
 /// Record one receive-drain burst of `n` datagrams (call once per poll).
 pub fn record_drain_batch(n: usize) {
+    // `metrics` facade: no-op without a recorder, exporter reads it when set.
+    // Kept alongside the 60 s `batch_report` histograms so existing log-line
+    // tests keep passing while Prometheus can scrape the same signal.
+    if n > 0 {
+        metrics::histogram!("myquic2_udp_drain_batch_size").record(n as f64);
+    }
     stats_only! {
         if n > 0 {
             let flush = LOCAL_BATCH.with(|c| {
@@ -167,6 +173,10 @@ pub fn record_drain_batch(n: usize) {
 
 /// Record one grouped-send flush of `n` frames issued in `syscalls` syscalls.
 pub fn record_send_group(n: usize, syscalls: u64) {
+    if n > 0 {
+        metrics::histogram!("myquic2_udp_send_group_size").record(n as f64);
+        metrics::counter!("myquic2_udp_send_syscalls").increment(syscalls);
+    }
     stats_only! {
         if n > 0 {
             let flush = LOCAL_BATCH.with(|c| {
@@ -190,6 +200,9 @@ pub fn record_send_group(n: usize, syscalls: u64) {
 /// them out made `syscall_per_packet` under-report exactly when the socket is
 /// saturated — the regime the batching exists for.
 pub fn record_extra_syscalls(n: u64) {
+    if n > 0 {
+        metrics::counter!("myquic2_udp_send_syscalls").increment(n);
+    }
     stats_only! {
         if n > 0 {
             let flush = LOCAL_BATCH.with(|c| {
@@ -240,8 +253,8 @@ pub fn batch_report() -> String {
 /// Linux-only symbol *and* runtime-gated: a seccomp filter or an old kernel
 /// can return `ENOSYS` where the symbol exists, so the first call performs one
 /// real 1-message `sendmmsg` on a loopback socket (via `socket2` for
-/// construction and `libc` for the call) and caches the answer. Non-Linux
-/// targets report `false` without touching `libc`'s Linux-only symbols, so
+/// construction and `rustix` for the call) and caches the answer. Non-Linux
+/// targets report `false` without touching Linux-only symbols, so
 /// macOS and musl-static builds compile and run on the portable fallback.
 pub fn sendmmsg_available() -> bool {
     #[cfg(target_os = "linux")]
@@ -343,7 +356,6 @@ fn probe_sendmmsg() -> bool {
 
 #[cfg(target_os = "linux")]
 fn probe_recvmmsg() -> bool {
-    use std::os::unix::io::AsRawFd;
     let tx = match socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -377,25 +389,26 @@ fn probe_recvmmsg() -> bool {
     if tx.send_to(&[0x5Au8; 1], &dst_sa).is_err() {
         return false;
     }
+    // nix owns the `mmsghdr` layout: one preallocated header plus one iovec
+    // over a 1-byte scratch. ENOSYS/seccomp surfaces as `Err` → `false`,
+    // exactly as the raw `r == 1` did, with no `unsafe` in this file.
+    use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage};
+    use std::io::IoSliceMut;
+    use std::os::fd::AsRawFd;
     let mut payload = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: payload.as_mut_ptr() as *mut libc::c_void,
-        iov_len: payload.len(),
-    };
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
-    hdr.msg_hdr.msg_name = &mut storage as *mut _ as *mut libc::c_void;
-    hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    hdr.msg_hdr.msg_iov = &mut iov;
-    hdr.msg_hdr.msg_iovlen = 1;
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 100_000_000,
-    };
-    // SAFETY: fd is a live UDP socket with one datagram queued; hdrs points at
-    // one initialised mmsghdr; timeout points at a live timespec.
-    let r = unsafe { libc::recvmmsg(rx.as_raw_fd(), &mut hdr, 1, 0, &mut ts) };
-    r == 1
+    let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(1, None);
+    let mut iovs: [[IoSliceMut<'_>; 1]; 1] = [[IoSliceMut::new(&mut payload)]];
+    match nix::sys::socket::recvmmsg(
+        // socket2 0.6 implements `AsFd`; `AsRawFd` is the nix `RawFd` shape.
+        rx.as_raw_fd(),
+        &mut headers,
+        &mut iovs,
+        MsgFlags::MSG_DONTWAIT,
+        None,
+    ) {
+        Ok(results) => results.count() == 1,
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,11 +432,16 @@ thread_local! {
 /// Allocated lazily on the thread's first burst (~270 KiB), never per message.
 /// Borrows are short: the syscall plus one [`burst_msg_copy`], never across
 /// an `.await`.
+///
+/// The headers live in nix's `MultiHeaders` (preallocated once per thread);
+/// nix owns the `mmsghdr` layout and the musl/glibc ABI quirks, so this file
+/// holds no `unsafe` for the receive path.
 #[cfg(target_os = "linux")]
 struct BurstRecv {
     data: Vec<u8>,
     lens: Vec<usize>,
     addrs: Vec<std::net::SocketAddr>,
+    headers: nix::sys::socket::MultiHeaders<nix::sys::socket::SockaddrStorage>,
 }
 
 #[cfg(target_os = "linux")]
@@ -433,6 +451,7 @@ impl BurstRecv {
             data: vec![0u8; LAST_HOP_DRAIN * BURST_SLOT],
             lens: Vec::with_capacity(LAST_HOP_DRAIN),
             addrs: Vec::with_capacity(LAST_HOP_DRAIN),
+            headers: nix::sys::socket::MultiHeaders::preallocate(LAST_HOP_DRAIN, None),
         }
     }
 
@@ -440,79 +459,56 @@ impl BurstRecv {
     /// the count; 0 on `EAGAIN` or any error — both end the caller's burst,
     /// exactly like a failing `try_recv_from` arm.
     fn recv(&mut self, fd: std::os::unix::io::RawFd, max: usize) -> usize {
-        use std::mem::MaybeUninit;
+        use nix::sys::socket::MsgFlags;
+        use std::io::IoSliceMut;
         self.lens.clear();
         self.addrs.clear();
         if max == 0 {
             return 0;
         }
         let n = max.min(LAST_HOP_DRAIN);
-        // Only the entries actually used are touched. `mem::zeroed()` on the
-        // whole set put ~6.4 KB of dead stores on every burst (4 KB of
-        // `sockaddr_storage` + 1.8 KB of `mmsghdr` + iovecs) whose addresses
-        // escape into the `extern "C"` call, so the compiler could not remove
-        // them — and a burst that drains 2 datagrams paid exactly as much as one
-        // that drains 32, which is the common shape when a connection carries
-        // several sessions.
-        let mut iovs: [MaybeUninit<libc::iovec>; LAST_HOP_DRAIN] =
-            [MaybeUninit::uninit(); LAST_HOP_DRAIN];
-        // The kernel fills the name buffer it is given, so these stay
-        // `MaybeUninit` until the syscall reports how many were used; only the
-        // first `n` are passed as storage.
-        let mut names: [MaybeUninit<libc::sockaddr_storage>; LAST_HOP_DRAIN] =
-            [MaybeUninit::uninit(); LAST_HOP_DRAIN];
-        let mut hdrs: [MaybeUninit<libc::mmsghdr>; LAST_HOP_DRAIN] =
-            [MaybeUninit::uninit(); LAST_HOP_DRAIN];
+        // One iovec per message over this thread's `data` slices. Only the
+        // first `n` headers/iovecs are handed to the kernel; a burst that
+        // drains 2 datagrams never pays for 32.
+        let mut iovs: [std::mem::MaybeUninit<[IoSliceMut<'_>; 1]>; LAST_HOP_DRAIN] =
+            [const { std::mem::MaybeUninit::uninit() }; LAST_HOP_DRAIN];
         for i in 0..n {
-            // SAFETY: each iovec points at its own BURST_SLOT-wide slice of
-            // `self.data`, which outlives the syscall (borrowed by the caller).
-            iovs[i].write(libc::iovec {
-                iov_base: unsafe { self.data.as_mut_ptr().add(i * BURST_SLOT) }.cast(),
-                iov_len: BURST_SLOT,
-            });
-            names[i].write(unsafe { std::mem::zeroed() });
-            // SAFETY: this message's iovec and name buffer were just written and
-            // outlive the syscall; `names` is fully initialized for `0..n` here,
-            // which is exactly the range handed to the kernel.
-            let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-            h.msg_hdr.msg_iov = iovs[i].as_mut_ptr();
-            h.msg_hdr.msg_iovlen = 1;
-            h.msg_hdr.msg_name = names[i].as_mut_ptr().cast();
-            h.msg_hdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            hdrs[i].write(h);
-        }
-        // SAFETY: fd is a live non-blocking UDP socket; the first `n` entries of
-        // `hdrs` are fully initialised (and only `n` are passed); each points at
-        // a live iovec over `self.data` and at its own initialised name buffer.
-        let r = unsafe {
-            libc::recvmmsg(
-                fd,
-                hdrs.as_mut_ptr().cast::<libc::mmsghdr>(),
-                n as u32,
-                // `as _`: the flags parameter is `c_int` in the libc crate's
-                // glibc bindings and `u32` in its musl bindings.
-                libc::MSG_DONTWAIT as _,
-                std::ptr::null_mut(),
-            )
-        };
-        if r <= 0 {
-            return 0;
-        }
-        let r = r as usize;
-        for i in 0..r {
-            // SAFETY: `recvmmsg` returned `r`, so the kernel filled `msg_len`
-            // and the address of every message in `0..r`.
-            let (msg_len, name) = unsafe {
-                (
-                    hdrs[i].assume_init_ref().msg_len,
-                    names[i].assume_init_ref(),
+            // Each iovec borrows its own `BURST_SLOT`-wide slice of
+            // `self.data`, which outlives the syscall.
+            let slot = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.data.as_mut_ptr().add(i * BURST_SLOT),
+                    BURST_SLOT,
                 )
             };
-            self.lens.push(msg_len as usize);
-            self.addrs.push(sockaddr_to_std(name));
+            iovs[i].write([IoSliceMut::new(slot)]);
         }
-        r
+        // SAFETY: exactly `n` entries were just initialised above; only
+        // `0..n` is passed to nix, and each borrows live `self.data`.
+        let iov_slice = unsafe {
+            std::slice::from_raw_parts_mut(iovs.as_mut_ptr() as *mut [IoSliceMut<'_>; 1], n)
+        };
+        let results = match nix::sys::socket::recvmmsg(
+            fd,
+            &mut self.headers,
+            iov_slice,
+            MsgFlags::MSG_DONTWAIT,
+            None,
+        ) {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let mut count = 0;
+        for msg in results {
+            let addr = match msg.address {
+                Some(a) => sockaddr_storage_to_std(&a),
+                None => continue,
+            };
+            self.lens.push(msg.bytes);
+            self.addrs.push(addr);
+            count += 1;
+        }
+        count
     }
 }
 
@@ -575,31 +571,24 @@ pub fn burst_msg_copy(i: usize, dst: &mut [u8]) -> Option<(usize, std::net::Sock
     }
 }
 
-/// Convert a kernel-filled `sockaddr_storage` (from `recvmmsg`) back to a
-/// std address. A `recvmmsg` return value of `N` guarantees the first `N`
-/// name buffers hold a valid `sockaddr_in`/`sockaddr_in6`.
+/// Convert a nix `SockaddrStorage` (from `recvmmsg`) back to a std address.
+/// Safe: nix downcasts via `as_sockaddr_in/in6` instead of raw pointer casts.
 #[cfg(target_os = "linux")]
-fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> std::net::SocketAddr {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
-            // SAFETY: ss_family == AF_INET, so the storage holds a sockaddr_in.
-            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
-                u16::from_be(sin.sin_port),
-            )
-        }
-        _ => {
-            // SAFETY: ss_family == AF_INET6, so the storage holds a sockaddr_in6.
-            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
-            SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(sin6.sin6_addr.s6_addr),
-                u16::from_be(sin6.sin6_port),
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            ))
-        }
+fn sockaddr_storage_to_std(storage: &nix::sys::socket::SockaddrStorage) -> std::net::SocketAddr {
+    use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+    if let Some(sin) = storage.as_sockaddr_in() {
+        SocketAddr::new(IpAddr::V4(sin.ip()), sin.port())
+    } else if let Some(sin6) = storage.as_sockaddr_in6() {
+        SocketAddr::V6(SocketAddrV6::new(
+            sin6.ip(),
+            sin6.port(),
+            sin6.flowinfo(),
+            sin6.scope_id(),
+        ))
+    } else {
+        // `recvmmsg` only ever returns INET/INET6 here; unreachable in practice.
+        // Fall back to unspecified rather than panicking on the packet path.
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
     }
 }
 

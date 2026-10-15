@@ -109,11 +109,8 @@ async fn main() -> Result<()> {
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     let tuning = c.tuning();
-    scfg.transport_config(build_transport_tuned(
-        &c.congestion,
-        c.keep_alive_secs,
-        tuning,
-    ));
+    let congestion = Congestion::from_config(&c.congestion);
+    scfg.transport_config(build_transport_tuned(congestion, c.keep_alive_secs, tuning));
     // Dual-stack QUIC socket: explicit V6ONLY=0 so [::] also serves IPv4-mapped clients.
     let rt = Arc::new(quinn::TokioRuntime);
     let std_sock = udp_socket_dual(&c.listen)?;
@@ -125,7 +122,8 @@ async fn main() -> Result<()> {
     )?;
     info!(
         "server listening on {listen} congestion={} gso_auto={} (quinn-udp probes UDP_SEGMENT/GRO)",
-        c.congestion, c.gso
+        Congestion::from_config(&c.congestion),
+        c.gso
     );
     if !c.gso {
         warn!(

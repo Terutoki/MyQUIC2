@@ -471,13 +471,13 @@ async fn stale_true_preference_repicks_to_a_live_bulk_sibling() {
         .unwrap();
         let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
         let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-        scfg.transport_config(build_transport("bbr", 5));
+        scfg.transport_config(build_transport(Congestion::Bbr, 5));
         let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server.local_addr().unwrap();
         let client_tls = client_tls_config(certified.cert.der().clone(), &alpn).unwrap();
         let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
         let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
-        ccfg.transport_config(build_transport("bbr", 5));
+        ccfg.transport_config(build_transport(Congestion::Bbr, 5));
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client.set_default_client_config(ccfg);
         let accept = async {
@@ -743,14 +743,14 @@ async fn real_connection() -> (quinn::Connection, quinn::Endpoint, quinn::Endpoi
     .unwrap();
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    scfg.transport_config(build_transport("bbr", 5));
+    scfg.transport_config(build_transport(Congestion::Bbr, 5));
     let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
 
     let client_tls = client_tls_config(certified.cert.der().clone(), &alpn).unwrap();
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
     let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
-    ccfg.transport_config(build_transport("bbr", 5));
+    ccfg.transport_config(build_transport(Congestion::Bbr, 5));
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client.set_default_client_config(ccfg);
 

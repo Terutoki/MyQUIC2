@@ -20,7 +20,7 @@ pub fn client_tls_config(
 
 // ---------------- QUIC transport: BBR + DATAGRAM + keepalive ----------------
 pub fn parse_congestion(name: &str) -> bool {
-    name.eq_ignore_ascii_case("cubic") || name.eq_ignore_ascii_case("bbr")
+    name.parse::<crate::transport::Congestion>().is_ok()
 }
 
 /// Placeholder secrets shipped in the sample configs. Deploying one is

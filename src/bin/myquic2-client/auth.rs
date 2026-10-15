@@ -1,5 +1,24 @@
 //! Dial, auth and reconnect loop.
 use super::*;
+use backon::{BackoffBuilder, ExponentialBuilder};
+
+/// Reconnect backoff: 200 ms base, x2, capped at 5 s, with jitter.
+///
+/// Replaces the hand-rolled `backoff = (backoff * 2).min(5s) + jitter_ms()`
+/// with the audited `backon` iterator: same shape (200 ms → 5 s cap,
+/// per-thread seeded jitter), but the doubling/cap/jitter live in one
+/// builder instead of three copy-pasted sites. Infinite (`without_max_times`)
+/// because the reconnect loop never gives up; reset by rebuilding after a
+/// long-lived connection.
+fn reconnect_backoff() -> impl Iterator<Item = Duration> {
+    ExponentialBuilder::default()
+        .with_min_delay(Duration::from_millis(200))
+        .with_max_delay(Duration::from_secs(5))
+        .with_factor(2.0)
+        .with_jitter()
+        .without_max_times()
+        .build()
+}
 
 pub(crate) fn spawn_conn_loop(
     ep: quinn::Endpoint,
@@ -11,14 +30,14 @@ pub(crate) fn spawn_conn_loop(
     watchdog_silence: Duration,
 ) {
     tokio::spawn(async move {
-        let mut backoff = Duration::from_millis(200);
+        let mut backoff = reconnect_backoff();
         loop {
             let server: SocketAddr = match resolve_server_addr(&server_str).await {
                 Ok(a) => a,
                 Err(e) => {
-                    warn!("resolve {server_str} failed: {e:#}; retry in {backoff:?}");
-                    tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    let wait = backoff.next().unwrap_or(Duration::from_secs(5));
+                    warn!("resolve {server_str} failed: {e:#}; retry in {wait:?}");
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
             };
@@ -127,16 +146,15 @@ pub(crate) fn spawn_conn_loop(
                         bump_gen(&slot.gen_tx);
                     }
                     if connected_at.elapsed() >= Duration::from_secs(5) {
-                        backoff = Duration::from_millis(200);
+                        backoff = reconnect_backoff();
                     }
-                    let wait = backoff + Duration::from_millis(jitter_ms());
+                    let wait = backoff.next().unwrap_or(Duration::from_secs(5));
                     tokio::time::sleep(wait).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
                 Err(e) => {
-                    warn!("dial {server} failed: {e:#}; retry in {backoff:?}");
-                    tokio::time::sleep(backoff + Duration::from_millis(jitter_ms())).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    let wait = backoff.next().unwrap_or(Duration::from_secs(5));
+                    warn!("dial {server} failed: {e:#}; retry in {wait:?}");
+                    tokio::time::sleep(wait).await;
                 }
             }
         }

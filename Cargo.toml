@@ -64,7 +64,6 @@ time = "0.3"
 rustls-pemfile = "2"
 bytes = "1"
 socket2 = "0.6"
-libc = "0.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -101,7 +100,7 @@ subtle = { version = "2.6", default-features = false }
 # process-lifetime `String` and stays out of scope here). Already linked
 # transitively (aws-lc-rs / rustls) with the `alloc` feature this uses, so the
 # direct edge adds no compile unit.
-zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # thiserror: derive-only `Display`/`Error` for `mqp::error::MqpError`,
 # replacing the hand-written impls (the derive keeps construction
 # allocation-free: `Copy` variants carrying only `&'static str` / `u8`).
@@ -154,14 +153,14 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 # verdict (`is_global_ip_cached`), so the linear scan runs on uncached
 # addresses only. `std` and `serde` off: only `contains` is used.
 ipnet = { version = "2", default-features = false }
-# rustix: `net::sendmmsg` (feature `net`) replaces the hand-written
-# `libc::mmsghdr` construction on the UDP send path (`udp/batch.rs`, both
-# call sites are `#[cfg(target_os = "linux")]`). rustix owns the Linux/musl
-# ABI quirks the hand-rolled version worked around (`msg_iovlen as _`,
-# `MSG_DONTWAIT as _`) and type-checks the iovec/addr borrows, which removed
-# four of the crate's `unsafe` blocks. `recvmmsg` stays hand-rolled: rustix
-# lists it under `not_implemented::yet`, and `nix`'s `MultiHeaders`/`RecvMsg`
-# iterator API is heavier than the fixed `mmsghdr` array that path needs.
+# rustix: `net::sendmmsg` + `sockopt::set_socket_*_buffer_size_force`
+# replace the hand-written `libc::mmsghdr` / `libc::setsockopt(SO_*BUFFORCE)`
+# on the UDP paths (`udp/batch.rs` send, `lib.rs::force_udp_buffers`). rustix
+# owns the Linux/musl ABI quirks the hand-rolled versions worked around
+# (`msg_iovlen as _`, `MSG_DONTWAIT as _`) and type-checks the iovec/addr
+# borrows, which removed all `libc` `unsafe` blocks (the direct `libc` dep is
+# gone). `recvmmsg` is `nix` (below): rustix lists it under
+# `not_implemented::yet`.
 # `std` for the `SocketAddrAny` conversions; the crate links everywhere but
 # is only *called* on Linux. `time` is a hard requirement of `net` in
 # rustix 1.1 (`net`'s sockopt code uses `crate::timespec`, which the `time`
@@ -175,6 +174,30 @@ rustix = { version = "1", default-features = false, features = ["net", "std", "t
 # the dev machine and the deployed router on the same hot-path allocation
 # profile, instead of a glibc-only behaviour difference in the field.
 mimalloc = "0.1"
+# backon: `ExponentialBuilder` (200 ms x2, 5 s cap, jitter) replaces the three
+# copy-pasted `backoff = (backoff * 2).min(5s) + jitter_ms()` sites in the
+# client reconnect loop (`bin/myquic2-client/auth.rs`). `std` only: only the
+# `Backoff` iterator is used, sleeps stay `tokio::time::sleep`.
+backon = { version = "1.6.0", default-features = false, features = ["std"] }
+# happy-eyeballs: RFC 8305 staggered racing replaces the hand-rolled
+# `JoinSet` + `watch` cancellation in `server/tcp.rs::dial_happy_eyeballs`.
+# `tokio` only: `happy_eyeballs::tokio::connect` + a 4 s `timeout` budget.
+# Filtering (`allow_private`) and the 8-candidate cap stay in our code.
+happy-eyeballs = { version = "0.2.1", default-features = false, features = ["tokio"] }
+# fast-socks5 (MIT): `consts` (VER/CMD/ATYP/REP) replace the hand-written
+# SOCKS5 magic numbers in `bin/myquic2-client/socks.rs`. Framing only: the
+# ASSOCIATE leniency and optimistic CONNECT timing stay hand-rolled.
+# (`socks5-impl` was rejected: GPL-3.0-only, incompatible with this MIT crate.)
+fast-socks5 = "1.0.0"
+# nix: `sys::socket::recvmmsg` + `MultiHeaders`/`SockaddrStorage` replace the
+# hand-written `libc::mmsghdr`/`sockaddr_storage` receive path in
+# `udp/batch.rs` (probe + burst + addr conversion). `socket` + `time` only;
+# only *called* on Linux, portable fallback elsewhere.
+nix = { version = "0.31.3", default-features = false, features = ["socket", "time"] }
+# metrics: `histogram!`/`counter!` facade for the UDP batch sizes/syscalls in
+# `udp/batch.rs`, alongside the 60 s `batch_report` log line the tests pin.
+# No-op without a recorder; a Prometheus exporter can scrape it when set.
+metrics = "0.24.6"
 
 # `test-util` backs the paused-clock regression test in the client bin
 # (`udp_associate_serves_its_first_datagram_without_a_startup_sleep`); it is

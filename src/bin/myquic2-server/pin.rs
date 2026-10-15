@@ -452,7 +452,7 @@ pub(crate) fn pin_life_ms(remaining_ms: u64) -> u64 {
 /// is a silently refused reply).
 pub(crate) fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
     let sh = ss.shard(s);
-    if let Some(e) = lock_read(sh).get(&s) {
+    if let Some(e) = sh.read().get(&s) {
         let ip = unmap(dst.ip());
         // Fast exit for the steady flow (one already-known destination): no
         // clone, no allocation, no CAS — just the epoch move below. A concurrent

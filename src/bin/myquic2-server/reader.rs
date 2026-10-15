@@ -556,7 +556,7 @@ pub(crate) async fn sess_reader_task(
     sess_memo_forget(conn_id, s, &rs);
     {
         let sh = ss2.shard(s);
-        let mut w = lock_write(sh);
+        let mut w = sh.write();
         if let Some(cur) = w.get(&s)
             && Arc::ptr_eq(&cur.sock, &rs)
         {
@@ -628,7 +628,7 @@ pub(crate) async fn get_or_create_sess(
     // gone.
     {
         let sh = ss.shard(s);
-        let r = lock_read(sh);
+        let r = sh.read();
         if let Some(e) = r.get(&s)
             && !e.reader.is_finished()
         {
@@ -768,7 +768,7 @@ pub(crate) async fn get_or_create_sess(
         // drop the datagram, which is strictly worse than waiting out a short
         // `HashMap` mutation. The socket syscalls above deliberately stay outside
         // this critical section.
-        let mut w = lock_write(sh);
+        let mut w = sh.write();
         if let Some(e) = w.get(&s) {
             if !e.reader.is_finished() {
                 touch_session_throttled(conn_id, s, &e.last);

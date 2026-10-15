@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let tls = client_tls_config(cert, &normalize_alpn(None))?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let mut ccfg = quinn::ClientConfig::new(std::sync::Arc::new(quic_client));
-    ccfg.transport_config(build_transport("bbr", 5));
+    ccfg.transport_config(build_transport(Congestion::Bbr, 5));
     let mut ep = quinn::Endpoint::client("[::]:0".parse()?)?;
     ep.set_default_client_config(ccfg);
     let server: SocketAddr = std::env::args()

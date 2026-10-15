@@ -4,7 +4,72 @@ use std::time::Duration;
 use super::limits::{DATAGRAM_BUFFER, DATAGRAM_BUFFER_BULK, DGRAM_MAX_WIRE, MQP_DGRAM_MAX};
 use crate::{MAX_BIDI_STREAMS_PER_CONN, TransportTuning};
 
-pub fn build_transport(congestion: &str, keep_alive_secs: u64) -> Arc<quinn::TransportConfig> {
+/// QUIC congestion controller selection.
+///
+/// `Bbr` is the default; `Cubic` is the escape hatch. `clap::ValueEnum`
+/// gives CLI `--congestion` parsing/validation for free, and `serde`
+/// keeps TOML `congestion = "bbr"|"cubic"` working. Unknown strings fall
+/// back to `Bbr` via [`Congestion::from_config`] to preserve the previous
+/// `&str` behaviour (warn + BBR) instead of failing the process.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Congestion {
+    /// BBR (default).
+    #[default]
+    Bbr,
+    /// Cubic escape hatch.
+    Cubic,
+}
+
+impl Congestion {
+    /// Lossy conversion from operator config: `cubic` (any case) → `Cubic`,
+    /// everything else → `Bbr`. Callers validate with `parse_congestion`
+    /// first so unknown values warn instead of silently falling back.
+    pub fn from_config(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("cubic") {
+            Self::Cubic
+        } else {
+            Self::Bbr
+        }
+    }
+}
+
+impl std::fmt::Display for Congestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bbr => write!(f, "bbr"),
+            Self::Cubic => write!(f, "cubic"),
+        }
+    }
+}
+
+impl std::str::FromStr for Congestion {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("cubic") {
+            Ok(Self::Cubic)
+        } else if s.eq_ignore_ascii_case("bbr") {
+            Ok(Self::Bbr)
+        } else {
+            Err(format!("want bbr|cubic, got {s:?}"))
+        }
+    }
+}
+
+pub fn build_transport(
+    congestion: Congestion,
+    keep_alive_secs: u64,
+) -> Arc<quinn::TransportConfig> {
     build_transport_tuned(congestion, keep_alive_secs, TransportTuning::default())
 }
 
@@ -32,7 +97,7 @@ pub(crate) fn clamp_keep_alive(keep_alive_secs: u64) -> u64 {
 }
 
 pub fn build_transport_tuned(
-    congestion: &str,
+    congestion: Congestion,
     keep_alive_secs: u64,
     tuning: TransportTuning,
 ) -> Arc<quinn::TransportConfig> {
@@ -44,7 +109,7 @@ pub fn build_transport_tuned(
 /// buffers) that trades reverse-path CPU for coarser feedback; interactive
 /// keeps the tuned values (default 2/5ms) and 1MB DATAGRAM buffers.
 pub fn build_transport_tuned_class(
-    congestion: &str,
+    congestion: Congestion,
     keep_alive_secs: u64,
     tuning: TransportTuning,
     is_bulk: bool,
@@ -66,10 +131,13 @@ pub fn build_transport_tuned_class(
     let mut t = quinn::TransportConfig::default();
     // BBR default; cubic only as escape hatch. Callers validate + log the
     // configured value via `parse_congestion`; unknown values fall back to BBR.
-    if congestion.eq_ignore_ascii_case("cubic") {
-        t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
-    } else {
-        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    match congestion {
+        Congestion::Cubic => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+        Congestion::Bbr => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
     }
     // GSO/GRO: no flag in quinn API — quinn-udp auto-probes UDP_SEGMENT/UDP_GRO.
     // Datagrams are a lossy best-effort path drained by a dedicated reader, so

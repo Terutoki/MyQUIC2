@@ -40,11 +40,18 @@ pub(crate) enum SocksRequest {
 
 /// Reads the greeting (only the no-auth method is offered) and the request.
 /// Framing only; the caller owns the deadline (see [`SOCKS_NEGOTIATE_TIMEOUT`]).
+///
+/// Frame constants come from `fast-socks5` (MIT): version/cmd/atyp/reply codes
+/// are the crate's `consts`, not hand-written magic numbers. The ASSOCIATE
+/// outer-address leniency and the optimistic CONNECT timing below stay
+/// hand-rolled: the outer addr is a hint only (often 0.0.0.0:0) and the
+/// success reply is sent before the server dial ACK.
 pub(crate) async fn negotiate(s: &mut tokio::net::TcpStream) -> Result<SocksRequest> {
+    use fast_socks5::consts::*;
     // handshake: VER NMETHODS METHODS; we only support 0x00
     let mut h = [0u8; 2];
     s.read_exact(&mut h).await.context("socks greeting")?;
-    if h[0] != 0x05 {
+    if h[0] != SOCKS5_VERSION {
         anyhow::bail!("bad ver");
     }
     if h[1] == 0 {
@@ -54,44 +61,63 @@ pub(crate) async fn negotiate(s: &mut tokio::net::TcpStream) -> Result<SocksRequ
     s.read_exact(&mut m[..h[1] as usize])
         .await
         .context("socks methods")?;
-    if !m[..h[1] as usize].contains(&0x00) {
-        write_socks(s, &[0x05, 0xFF]).await?;
+    if !m[..h[1] as usize].contains(&SOCKS5_AUTH_METHOD_NONE) {
+        write_socks(s, &[SOCKS5_VERSION, SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE]).await?;
         anyhow::bail!("no acceptable auth (client must offer 0x00)");
     }
-    write_socks(s, &[0x05, 0x00]).await?;
+    write_socks(s, &[SOCKS5_VERSION, SOCKS5_AUTH_METHOD_NONE]).await?;
 
     let mut r = [0u8; 3];
     s.read_exact(&mut r).await.context("socks request")?;
-    if r[0] != 0x05 {
+    if r[0] != SOCKS5_VERSION {
         anyhow::bail!("bad req ver");
     }
     if r[2] != 0x00 {
         anyhow::bail!("bad req rsv {:#x}", r[2]);
     }
     match r[1] {
-        0x01 => match read_socks_addr(s).await {
+        SOCKS5_CMD_TCP_CONNECT => match read_socks_addr(s).await {
             Ok(t) => Ok(SocksRequest::Connect(t)),
             Err(_) => {
                 if let Ok(b) = bnd_for(s) {
-                    write_socks_reply(s, 0x08, b).await.ok();
+                    write_socks_reply(s, SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED, b)
+                        .await
+                        .ok();
                 }
                 anyhow::bail!("bad connect target");
             }
         },
-        0x03 => {
+        SOCKS5_CMD_UDP_ASSOCIATE => {
             // UDP ASSOCIATE: outer addr is a hint only (often 0.0.0.0:0) and
             // is always ignored, so read it leniently without TargetAddr
             // validation. Real packet targets inside DATAGRAMs stay strict.
             if read_socks_addr_lenient(s).await.is_err() {
                 if let Ok(b) = bnd_for(s) {
-                    write_socks_reply(s, 0x08, b).await.ok();
+                    write_socks_reply(s, SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED, b)
+                        .await
+                        .ok();
                 }
                 anyhow::bail!("bad associate target");
             }
             Ok(SocksRequest::Associate)
         }
         _ => {
-            write_socks(s, &[0x05, 0x07, 0, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            write_socks(
+                s,
+                &[
+                    SOCKS5_VERSION,
+                    SOCKS5_REPLY_COMMAND_NOT_SUPPORTED,
+                    0,
+                    SOCKS5_ADDR_TYPE_IPV4,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await?;
             anyhow::bail!("unsupported cmd");
         }
     }
@@ -126,7 +152,13 @@ pub(crate) async fn handle_socks(
         Err(e) => {
             // Answer the SOCKS client instead of just dropping the TCP
             // connection (a reset looks like a proxy crash to the app).
-            write_socks_reply(&mut s, 0x04, bnd).await.ok();
+            write_socks_reply(
+                &mut s,
+                fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,
+                bnd,
+            )
+            .await
+            .ok();
             return Err(e);
         }
     };
@@ -150,10 +182,22 @@ pub(crate) async fn handle_socks(
                     if slot.clear_if_and_mark_dead(&conn) {
                         bump_gen(&gen_tx);
                     }
-                    write_socks_reply(&mut s, 0x04, bnd).await.ok();
+                    write_socks_reply(
+                        &mut s,
+                        fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,
+                        bnd,
+                    )
+                    .await
+                    .ok();
                     anyhow::bail!("quic connection dead, retry");
                 }
-                write_socks_reply(&mut s, 0x01, bnd).await.ok();
+                write_socks_reply(
+                    &mut s,
+                    fast_socks5::consts::SOCKS5_REPLY_GENERAL_FAILURE,
+                    bnd,
+                )
+                .await
+                .ok();
                 anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
             }
         };
@@ -178,7 +222,13 @@ pub(crate) async fn handle_socks(
     if !hdr_sent {
         send.reset(0x04u32.into()).ok();
         recv.stop(0x04u32.into()).ok();
-        write_socks_reply(&mut s, 0x04, bnd).await.ok();
+        write_socks_reply(
+            &mut s,
+            fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,
+            bnd,
+        )
+        .await
+        .ok();
         anyhow::bail!("quic stream header write failed or timed out");
     }
     // Optimistic SOCKS success: the application's first bytes must not be
@@ -193,7 +243,9 @@ pub(crate) async fn handle_socks(
     // (quinn's `Drop` calls `finish()`), which would advertise a truncated
     // flow as complete.
     let unknown = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    if let Err(e) = write_socks_reply(&mut s, 0x00, unknown).await {
+    if let Err(e) =
+        write_socks_reply(&mut s, fast_socks5::consts::SOCKS5_REPLY_SUCCEEDED, unknown).await
+    {
         send.reset(0x04u32.into()).ok();
         recv.stop(0x04u32.into()).ok();
         return Err(e);
@@ -253,18 +305,19 @@ pub(crate) async fn handle_socks(
 /// keeps the proven size and order. No per-field deadline here: `negotiate`'s
 /// caller bounds the whole negotiation with one timeout.
 pub(crate) async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<TargetAddr> {
+    use fast_socks5::consts::*;
     let mut buf = [0u8; AddrHeader::MAX_LEN];
     s.read_exact(&mut buf[..1]).await.context("socks atyp")?;
     let len = match buf[0] {
-        0x01 => {
+        SOCKS5_ADDR_TYPE_IPV4 => {
             s.read_exact(&mut buf[1..7]).await.context("socks v4")?;
             7
         }
-        0x04 => {
+        SOCKS5_ADDR_TYPE_IPV6 => {
             s.read_exact(&mut buf[1..19]).await.context("socks v6")?;
             19
         }
-        0x03 => {
+        SOCKS5_ADDR_TYPE_DOMAIN_NAME => {
             s.read_exact(&mut buf[1..2])
                 .await
                 .context("socks domain len")?;
@@ -283,20 +336,21 @@ pub(crate) async fn read_socks_addr(s: &mut tokio::net::TcpStream) -> Result<Tar
 }
 
 pub(crate) async fn read_socks_addr_lenient(s: &mut tokio::net::TcpStream) -> Result<()> {
+    use fast_socks5::consts::*;
     let mut t = [0u8; 1];
     s.read_exact(&mut t).await.context("socks atyp")?;
     match t[0] {
-        0x01 => {
+        SOCKS5_ADDR_TYPE_IPV4 => {
             let mut b = [0u8; 6];
             s.read_exact(&mut b).await.context("socks v4")?;
             Ok(())
         }
-        0x04 => {
+        SOCKS5_ADDR_TYPE_IPV6 => {
             let mut b = [0u8; 18];
             s.read_exact(&mut b).await.context("socks v6")?;
             Ok(())
         }
-        0x03 => {
+        SOCKS5_ADDR_TYPE_DOMAIN_NAME => {
             let mut n = [0u8; 1];
             s.read_exact(&mut n).await.context("socks domain len")?;
             if n[0] == 0 {
@@ -340,8 +394,9 @@ pub(crate) async fn write_socks_reply(
     rep: u8,
     bnd: SocketAddr,
 ) -> Result<()> {
+    use fast_socks5::consts::SOCKS5_VERSION;
     let mut v = [0u8; 3 + MAX_BND_LEN];
-    v[0] = 0x05;
+    v[0] = SOCKS5_VERSION;
     v[1] = rep;
     v[2] = 0x00;
     let n = 3 + encode_bnd_addr_into(bnd, &mut v[3..]);

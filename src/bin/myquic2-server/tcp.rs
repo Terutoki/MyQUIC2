@@ -244,10 +244,16 @@ pub(crate) async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<Targ
 
 /// Connect to the first candidate that succeeds.
 ///
-/// `cands` is borrowed so the IP-literal path allocates nothing. The filtered
-/// candidate list and the task set live in fixed arrays: the old `Vec::collect`
-/// plus `JoinSet` allocated two or three times per flow just to set up a dial
-/// that, in the single-candidate case, needs one `connect`.
+/// `cands` is borrowed so the IP-literal path allocates nothing. Filtering
+/// (`allow_private`) and the 8-candidate cap stay here; the staggered racing
+/// itself is `happy-eyeballs` (RFC 8305, 250 ms stagger internally) instead of
+/// the hand-rolled `JoinSet` + `watch` cancellation. Total budget 4 s is kept
+/// via `timeout` so the client-side ACK wait still covers it.
+///
+/// Note: `happy-eyeballs` re-interleaves v6/v4 (v6-first per RFC 8305) after
+/// `lookup_host`, so a `dns_ip_preference = "ipv4"` deployment still resolves
+/// v4-first but races v6-first. That matches the RFC default; strict v4-first
+/// racing would need input-order racing instead of this crate.
 pub(crate) async fn dial_happy_eyeballs(
     cands: &[SocketAddr],
     allow_private: bool,
@@ -265,62 +271,20 @@ pub(crate) async fn dial_happy_eyeballs(
             break;
         }
     }
-    let cands = &accept[..n];
-    if cands.is_empty() {
+    if n == 0 {
         return None;
     }
     // Total budget 4s; the client-side ACK wait is sized to cover it.
-    let budget = tokio::time::sleep(Duration::from_secs(4));
-    tokio::pin!(budget);
-    if let [only] = cands {
-        tokio::select! {
-            r = tokio::net::TcpStream::connect(*only) => {
-                let s = r.ok()?;
-                let _ = s.set_nodelay(true);
-                return Some(s);
-            }
-            _ = &mut budget => return None,
+    let res = tokio::time::timeout(
+        Duration::from_secs(4),
+        happy_eyeballs::tokio::connect(&accept[..n]),
+    )
+    .await;
+    match res {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            Some(s)
         }
+        _ => None,
     }
-    // Event-driven cancellation: losers are woken by a watch value instead of
-    // polling a flag every 50ms (which cost extra wakeups on hot dial paths).
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let mut tasks = Vec::with_capacity(cands.len());
-    for (i, a) in cands.iter().enumerate() {
-        let tx = tx.clone();
-        let mut cancel = cancel_rx.clone();
-        let a = *a;
-        tasks.push(tokio::spawn(async move {
-            if i > 0 {
-                let delay = Duration::from_millis(250 * i.min(4) as u64);
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = cancel.wait_for(|v| *v) => return,
-                }
-            }
-            if *cancel.borrow() || tx.is_closed() {
-                return;
-            }
-            let connected = tokio::select! {
-                r = tokio::net::TcpStream::connect(a) => r.ok(),
-                _ = cancel.wait_for(|v| *v) => None,
-            };
-            if let Some(s) = connected {
-                let _ = s.set_nodelay(true);
-                // Capacity 1: the first winner wins, the rest drop their socket.
-                let _ = tx.try_send(s);
-            }
-        }));
-    }
-    drop(tx);
-    let res = tokio::select! {
-        r = rx.recv() => r,
-        _ = &mut budget => None,
-    };
-    let _ = cancel_tx.send(true);
-    for t in tasks {
-        t.abort();
-    }
-    res
 }
