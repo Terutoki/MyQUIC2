@@ -191,13 +191,25 @@ happy-eyeballs = { version = "0.2.1", default-features = false, features = ["tok
 fast-socks5 = "1.0.0"
 # nix: `sys::socket::recvmmsg` + `MultiHeaders`/`SockaddrStorage` replace the
 # hand-written `libc::mmsghdr`/`sockaddr_storage` receive path in
-# `udp/batch.rs` (probe + burst + addr conversion). Feature set mirrors what
-# the Linux-only call sites actually touch: `socket` (module), `uio`
-# (`recvmmsg`/`MultiHeaders` live behind it in nix 0.31), `net` (the
-# `SockaddrStorage::as_sockaddr_in{6}` downcast accessors) and `time` (the
-# `TimeSpec` timeout parameter). Only *called* on Linux, portable fallback
-# elsewhere.
-nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net", "time"] }
+# `udp/batch.rs` (probe + burst + addr conversion); `sched::sched_setaffinity`
+# + `CpuSet` pin the server's per-endpoint shard runtimes on Linux (see the
+# `MYQUIC2_SHARD_RUNTIME` block in `bin/myquic2-server/main.rs`). Feature set
+# mirrors what the Linux-only call sites actually touch: `socket` (module),
+# `uio` (`recvmmsg`/`MultiHeaders` live behind it in nix 0.31), `net` (the
+# `SockaddrStorage::as_sockaddr_in{6}` downcast accessors), `time` (the
+# `TimeSpec` timeout parameter) and `sched` (the affinity call; the module is
+# Linux-only, the feature is inert elsewhere). Only *called* on Linux,
+# portable fallback elsewhere.
+nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net", "time", "sched"] }
+# NOTE (frame pooling experiment): crossbeam-queue was trialled here as the
+# shard store of a reusable frame-buffer pool fed by `Bytes::from_owner`. It
+# measured *slower* than the plain per-frame `Vec` + `Bytes::from` shape
+# (+39..52% same-thread, +128..324% cross-thread per frame on the dev box —
+# the owner route boxes a control block per frame and a pool can never hit
+# `Bytes::from`'s exact-fit fast path), so the dependency was removed. The
+# decision bench that produced those numbers lives on as
+# `examples/frame_bench.rs`; re-add the crate only together with a pooling
+# design that beats that bench.
 # metrics: `histogram!`/`counter!` facade for the UDP batch sizes/syscalls in
 # `udp/batch.rs`, alongside the 60 s `batch_report` log line the tests pin.
 # No-op without a recorder; a Prometheus exporter can scrape it when set.
@@ -206,11 +218,27 @@ metrics = "0.24.6"
 # `test-util` backs the paused-clock regression test in the client bin
 # (`udp_associate_serves_its_first_datagram_without_a_startup_sleep`); it is
 # dev-only so release builds keep the minimal tokio feature set.
+#
+# crossbeam-queue backs the frame-pool experiment in `examples/frame_bench.rs`
+# only — the production dependency was trialled and removed (the pool measured
+# slower than the plain per-frame allocation; see the note next to `nix`
+# above). The example keeps the exact trialled design so the decision stays
+# reproducible.
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = "symbols"
+# Crash-only: a panic in any task aborts the process instead of unwinding that
+# task into a `JoinError`. The service is already designed for a supervisor
+# restart — a lost QUIC driver exits non-zero rather than half-serve, and the
+# client's reconnect loops re-establish TCP/UDP after any process death — so
+# trading per-task panic isolation for the smaller code (no unwind tables or
+# landing pads in the hot paths) is the aligned choice. Dev/test profiles keep
+# unwinding (cargo ignores this setting for test targets), so `#[should_panic]`
+# tests and the test harness are unaffected.
+panic = "abort"

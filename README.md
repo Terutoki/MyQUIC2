@@ -315,7 +315,7 @@ Key MQP-2 constants (all pinned by unit tests): `DGRAM_PREFIX_LEN = 5`, `FRAG_PR
 ### Server (`src/bin/myquic2-server/`): admission-first design
 
 - **`main.rs` startup**: `coarse_millis` warm → `load_toml<ServerConf>` → token/congestion/IP-preference checks → placeholder/open-proxy warnings → cert reuse-or-generate (both files or neither; one missing = bail, never overwrite a pinned cert) → `server_tls_config` + `build_transport_tuned` → `SO_REUSEPORT` endpoint group → `AcceptState{conn_limit, pending_limit, …}` → one `accept_loop` per endpoint → `shutdown_signal` closes endpoints (`CONNECTION_CLOSE`, 3 s `wait_idle`; a lost driver bails so a supervisor restarts instead of half-serving).
-- **Ingress parallelism**: `quic_endpoints` unset = one per usable core on Linux (cgroup-aware), 1 elsewhere; clamped 1–8. Each member is a full `quinn::Endpoint` (own socket/CID table/driver); Linux spreads by 4-tuple, macOS delivers to the last-bound member only (warned). A NAT rebind re-hashes to a member that does not know the CID — the connection drops and the client redials.
+- **Ingress parallelism**: `quic_endpoints` unset = one per usable core on Linux (cgroup-aware), 1 elsewhere; clamped 1–8. Each member is a full `quinn::Endpoint` (own socket/CID table/driver) run inside its **own pinned current-thread runtime** (`MYQUIC2_SHARD_RUNTIME=0` restores the shared runtime), so the driver, accept loop, connection tasks and all of their thread-local state stay on one core instead of migrating under work-stealing; Linux spreads by 4-tuple, macOS delivers to the last-bound member only (warned). A NAT rebind re-hashes to a member that does not know the CID — the connection drops and the client redials.
 - **`accept.rs` accept**: `try_acquire(conn_limit)` else implicit refuse (1/s warn); with auth, an additional `pending_limit = min(256, cap)` slot. Handshake deadlines: `PRE_AUTH 5 s` (holding a pending slot) / `HANDSHAKE 10 s` (tokenless) / `AUTH 5 s` re-armed after the handshake, then `handle_conn`. Per connection: 60 s session sweep task + uni-stream drain (`stop(0)`) + DATAGRAM reader (awaited head + `now_or_never` drain to 32, `yield_now` on a full burst; 16-entry `FastSess` + `DgramReassembler` + 500 ms sweep tick).
 - **`auth.rs` gate**: client writes the token verbatim on a uni stream (`read_to_end`, 256 B cap); empty token = auth off. Comparison is `subtle::ConstantTimeEq` with length folded in, buffer wiped via `Zeroizing`; failure closes `0x01`.
 - **Admission (`table.rs` + `tuning.rs`)**: `conn_cap` = configured `max_connections` else 4096 with token / 256 without (clamped 1–4096); `max_peer_memory_mb` → `admission_cap = (budget − session_pool) / per_conn` (default per-conn 8.25 MiB, pool ~1.06 GiB at 64 KiB buffers; ≤ pool admits exactly 1, logged). Process caps: `MAX_CONNECTIONS 4096`, `MAX_UNAUTH 256`, `MAX_DIALS_GLOBAL 4096`, `MAX_STREAM_TASKS 16384` (min 1024 share/conn), `MAX_SESSIONS_GLOBAL 8192`, per-conn `LOCAL_SESS_MAX 4096 / TARGET 4032 = MAX_UDP_ASSOCS` (compile-asserted equal), `MIN_SESSION_SHARE 1024`, 8 shards (`foldhash`), 180 s idle. `fair_sess_cap = clamp(8192/holders, 1024, 4096)` counts only non-empty tables; `len_upper_bound` + 1/s throttled sweeps stop forged sess-ids from becoming an `O(sessions)` amplifier.
@@ -404,6 +404,7 @@ quic_conns = 4                        # TCP pool size, 1–16 (UDP has its own c
 | 🌐 `dns_ip_preference` | Family tried first for resolved names: `"ipv6"` (default, RFC 6724-style) or `"ipv4"`; applies to exit-side targets and the client's `server_addr` |
 | 🧮 `max_peer_memory_mb` | Optional admission cap. The ~1.06 GiB UDP session pool is charged first, then the remainder is divided by the 8.25 MiB per-connection transport figure — see [Limits & memory](#-limits--memory) |
 | 📡 Transport tuning | `stream_receive_window_mb` / `receive_window_mb` / `send_window_mb` (default 2/4/2 MiB), `ack_threshold` (2), `max_ack_delay_ms` (5), `initial_rtt_ms` (190, clamped 1–3000). Mirror on both ends; `4/8/4` ≈ 240 Mb/s, `8/16/8` ≈ 300 Mb/s peak at 2x/4x loaded latency. `MYQUIC2_SESS_SOCKET_BUF` (bytes, 16 KiB–4 MiB) resizes the per-session kernel buffers without a rebuild |
+| 🧵 Ingress runtime | Server-side env knob: `MYQUIC2_SHARD_RUNTIME=0` runs every ingress endpoint on the shared multi-thread runtime instead. Default is one pinned current-thread runtime per endpoint — see [Architecture](#-architecture); the topology in use is logged at startup |
 
 ---
 
@@ -437,7 +438,7 @@ Auth                           uni stream carrying the token bytes verbatim (sen
 
 ## 🚀 Performance Design
 
-- **Hot paths kept razor-thin**: zero-copy TCP ↔ QUIC pump (`write_chunk`/`read_chunks` hand owned buffers to quinn, one vectored write to TCP), lock-free thread-local memos (DNS, session, egress), and reused staging buffers. A relayed UDP payload costs **one frame allocation per outgoing QUIC DATAGRAM frame** — quinn's `send_datagram` takes an owned `Bytes` and frees it on its own task, so it cannot be pooled — plus, at most, one copy into a per-session/per-association staging buffer that is never reallocated. Batching amortizes the frame over up to 16 payloads; a fragmented payload costs one frame per fragment.
+- **Hot paths kept razor-thin**: zero-copy TCP ↔ QUIC pump (`write_chunk`/`read_chunks` hand owned buffers to quinn, one vectored write to TCP), lock-free thread-local memos (DNS, session, egress), and reused staging buffers. A relayed UDP payload costs **one exact-fit frame allocation per outgoing QUIC DATAGRAM frame** — quinn's `send_datagram` takes an owned `Bytes`, and the encoders fill the buffer to capacity so `Bytes::from(Vec)` adopts the allocation in place (no copy, no control block) — plus, at most, one copy into a per-session/per-association staging buffer that is never reallocated. Batching amortizes the frame over up to 16 payloads; a fragmented payload costs one frame per fragment. Recycling frames through a pool was implemented and measured away: `Bytes::from_owner` boxes a control block per frame and a fixed-capacity pool can never hit the exact-fit adoption path, so it lost by 39–52% same-thread and 128–324% cross-thread per frame (`cargo run --release --example frame_bench`; the numbers and the rejected design live there).
 - **Modern congestion control**: BBR by default (Cubic as an escape hatch), ECN + adaptive PMTU, and GSO/GRO batched I/O — a single connection can saturate the link.
 - **Built for high latency**: default transport parameters are tuned for long-haul links and prioritize low queued latency.
 - **Connection-level isolation**: TCP, interactive UDP and bulk UDP each keep their own congestion window — no bandwidth fights, no queuing behind each other. Every client pool slot dials from **its own QUIC endpoint** (own UDP socket, CID table and receive loop), and on Linux the server runs `quic_endpoints` endpoints sharing `listen` through `SO_REUSEPORT` (one per usable core by default) with the kernel spreading connections across them — no single receive loop serves the whole process.
@@ -510,7 +511,8 @@ MyQUIC2/
 │   └── bin/
 │       ├── myquic2-client/    # pool · egress · hub · dispatcher · socks · assoc · auth · reporter
 │       └── myquic2-server/    # accept · auth · table · memo · forward · reader · tcp · pin · reporter
-├── examples/                  # zero_rtt_probe · hotpath_bench
+├── examples/                  # zero_rtt_probe · hotpath_bench · frame_bench
+├── scripts/                   # pgo.sh (profile-guided release builds)
 └── dist/openwrt-x86_64/       # sample configs (the v1–v4 musl binaries are build outputs, gitignored)
 ```
 
@@ -528,15 +530,15 @@ Per-file map:
 - `time/coarse.rs`, `mono.rs`
 - `bin/myquic2-client/{main,pool,egress,hub,dispatcher,assoc,socks,auth,reporter,util}.rs`
 - `bin/myquic2-server/{main,accept,auth,table,memo,forward,reader,tcp,pin,reporter}.rs`
-- `examples/hotpath_bench.rs` (TCP/UDP load + correctness harness), `zero_rtt_probe.rs` (0-RTT downgrade + token-replay guard probe)
+- `examples/hotpath_bench.rs` (TCP/UDP load + correctness harness), `zero_rtt_probe.rs` (0-RTT downgrade + token-replay guard probe), `frame_bench.rs` (frame-buffer lifecycle: the measured reason frames are not pooled)
 
 ---
 
 ## ✅ Verification
 
-- `cargo test --all-targets`: **220 passed / 0 failed** (lib 113 + client 56 + server 51)
+- `cargo test --all-targets`: **221 passed / 0 failed** (lib 113 + client 56 + server 52)
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`: clean (no cargo features are defined)
-- Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅
+- Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅ · sharded ingress (`quic_endpoints` 1 and 2) and the `MYQUIC2_SHARD_RUNTIME=0` fallback both serve the same sweep with a clean `SIGTERM` exit (0.05 s measured) ✅
 - UDP N=1 soak (`hotpath_bench udpps`, single association, IPv4 target, macOS dev box): open-loop 128 B blast delivers **~40k recv pps** at ~66k sent pps (was ~2.6k recv pps before the last-hop batching pass); closed-loop windowed holds **~30k pps / 0 loss**; `udpraw` loopback control ~82k pps
 - Cost-critical invariants are pinned by unit tests, not just by the numbers above: byte-identity of every encoder fast path against its reference implementation, one address validation per steady destination (`prefix_cache_steady_state_one_validation`), exact reassembly/`held` accounting on every operation (including that a completed generation costs only its compact replay guard), the batch decoder's up-front validation over every truncated prefix, the reply/uplink staging paths with their fallback and exactly-once drop accounting, and the admission arithmetic.
 
@@ -548,6 +550,11 @@ Per-file map:
 cargo build --release          # native (toolchain pinned to 1.99.0 via rust-toolchain.toml, edition 2024)
 cargo test --all-targets       # tests
 ```
+
+Release builds are crash-only and size-lean: `[profile.release]` sets `panic = "abort"` (a panicking task kills the process for a supervisor restart instead of unwinding that task — the fail-fast posture the ingress and the client's reconnect loops already have), fat LTO, one codegen unit, stripped symbols. Two optional, measured-at-your-host tunings:
+
+- **Profile-guided builds**: `scripts/pgo.sh` instruments, trains on loopback (TCP echo + UDP sweep + a short `udpps` burst through a real server/client pair) and rebuilds with PGO; `scripts/pgo.sh bolt` adds BOLT on Linux. Requires `cargo-pgo` + `llvm-tools-preview` (see the script header). On a loopback dev box the win is in the noise — evaluate on the CPU-bound Linux exit node, where the deep quinn/rustls/relay call stacks are what the profile orders.
+- **Allocator huge pages**: `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` in the service environment lets mimalloc back the frame churn with large pages where the kernel supports it (less TLB pressure on the UDP paths). Measure on the target; it is a pure env change.
 
 <details>
 <summary><b>Cross-compile static musl for OpenWrt (v1–v4)</b> — click to expand</summary>
@@ -584,7 +591,7 @@ done
 - `foldhash` (DoS-resistant short-key tables) + `arc-swap` + `parking_lot` + `quanta`: hot-path sync/clocks.
 - `moka(future)` + `hickory-resolver(system-config/tokio)`: DNS cache/single-flight + cancellable upstream (replaces blocking `getaddrinfo`).
 - `ipnet`: CIDR egress policy (replaces hand-rolled masks); `happy-eyeballs(tokio)`: RFC 8305 racing; `backon(std)`: reconnect backoff; `fast-socks5`: SOCKS constants only (MIT).
-- `rustix(net/std/time)` + `nix(socket/uio/net/time)` + `socket2`: `sendmmsg`/`recvmmsg`/`SO_*BUFFORCE` without `libc` unsafe.
+- `rustix(net/std/time)` + `nix(socket/uio/net/time/sched)` + `socket2`: `sendmmsg`/`recvmmsg`/`SO_*BUFFORCE` without `libc` unsafe, plus the Linux core pinning of the server's ingress shards.
 - `subtle` + `zeroize(alloc)`: constant-time token compare + wipe; `tracing` + `metrics`: logs + scrapable counters.
 
 </details>

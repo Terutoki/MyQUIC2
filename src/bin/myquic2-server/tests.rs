@@ -2718,3 +2718,25 @@ async fn distinct_source_runs_flush_in_order_as_separate_frames() {
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
 }
+
+/// `MYQUIC2_SHARD_RUNTIME` parsing: only the documented "off" spellings put
+/// the ingress back on the shared runtime; unset or anything else keeps the
+/// sharded (default) topology. The decision itself is asserted at startup by
+/// the logged topology line; this pins the parser so a typo cannot silently
+/// flip the runtime model.
+#[test]
+fn shard_runtime_env_parses_the_off_spellings() {
+    for off in ["0", "false", "FALSE", "off", " off ", "no"] {
+        assert!(
+            !parse_shard_runtime_env(Some(off)),
+            "{off:?} must select the shared runtime"
+        );
+    }
+    for on in ["1", "true", "on", "yes", "", "  ", "banana"] {
+        assert!(
+            parse_shard_runtime_env(Some(on)),
+            "{on:?} must keep sharding enabled"
+        );
+    }
+    assert!(parse_shard_runtime_env(None), "unset default is sharded");
+}

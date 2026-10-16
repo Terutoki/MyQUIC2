@@ -146,16 +146,6 @@ async fn main() -> Result<()> {
              ingress parallelism"
         );
     }
-    let mut eps = Vec::with_capacity(ep_count);
-    for _ in 0..ep_count {
-        let sock = udp_socket_dual_for_ingress(&c.listen, ep_count > 1)?;
-        eps.push(quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            Some(scfg.clone()),
-            rt.wrap_udp_socket(sock)?,
-            rt.clone(),
-        )?);
-    }
     info!(
         "server listening on {listen} congestion={} gso_auto={} endpoints={ep_count} (quinn-udp probes UDP_SEGMENT/GRO)",
         Congestion::from_config(&c.congestion),
@@ -283,10 +273,68 @@ async fn main() -> Result<()> {
         allow_private: c.allow_private,
         cap,
     });
-    let mut accepts = tokio::task::JoinSet::new();
-    for ep in &eps {
-        accepts.spawn(accept_loop(ep.clone(), st.clone()));
-    }
+    // Orderly-shutdown flag shared with every accept loop: closing an endpoint
+    // makes `accept` resolve `None`, which without this flag is
+    // indistinguishable from a dead driver (see `accept_loop`).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Ingress topology. Sharded (the default; `MYQUIC2_SHARD_RUNTIME=0`
+    // disables): every endpoint is created *inside* its own pinned
+    // current-thread runtime, so its driver, accept loop, connection tasks and
+    // all of their thread-local state (DNS/session memos, the burst buffer)
+    // stay on one core — which is what the REUSEPORT group is for. Shared
+    // (the pre-sharding topology): every endpoint runs on the multi-thread
+    // runtime and work-stealing may migrate tasks between workers.
+    let (eps, mut shard_joins, mut accepts, mut fail_rx) = if shard_runtime_enabled() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<quinn::Endpoint, String>>();
+        let (fail_tx, fail_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let mut joins = Vec::with_capacity(ep_count);
+        for idx in 0..ep_count {
+            let sock = udp_socket_dual_for_ingress(&c.listen, ep_count > 1)?;
+            joins.push(spawn_ingress_shard(
+                idx,
+                sock,
+                scfg.clone(),
+                rt.clone(),
+                st.clone(),
+                shutdown_rx.clone(),
+                ready_tx.clone(),
+                fail_tx.clone(),
+            )?);
+        }
+        // A shard always reports once (Ok with its endpoint, or Err when it
+        // cannot start); a disconnect instead of a report means the thread
+        // died before that, and both are fatal at startup.
+        drop(ready_tx);
+        let mut eps = Vec::with_capacity(ep_count);
+        for idx in 0..ep_count {
+            match ready_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(ep)) => eps.push(ep),
+                Ok(Err(e)) => anyhow::bail!("ingress shard {idx} failed to start: {e}"),
+                Err(e) => anyhow::bail!("ingress shard {idx} did not report ready: {e}"),
+            }
+        }
+        info!(
+            "ingress runtime: {ep_count} sharded current-thread runtime(s), one endpoint each \
+             (Linux: pinned one per core; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)"
+        );
+        (eps, joins, tokio::task::JoinSet::new(), Some(fail_rx))
+    } else {
+        let mut eps = Vec::with_capacity(ep_count);
+        for _ in 0..ep_count {
+            let sock = udp_socket_dual_for_ingress(&c.listen, ep_count > 1)?;
+            eps.push(quinn::Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                Some(scfg.clone()),
+                rt.wrap_udp_socket(sock)?,
+                rt.clone(),
+            )?);
+        }
+        let mut accepts = tokio::task::JoinSet::new();
+        for ep in &eps {
+            accepts.spawn(accept_loop(ep.clone(), st.clone(), shutdown_rx.clone()));
+        }
+        (eps, Vec::new(), accepts, None)
+    };
     // SIGTERM/SIGINT: stop accepting and close every endpoint so all peers get
     // an immediate CONNECTION_CLOSE and redial, instead of a silent blackhole
     // until their watchdogs fire. No drain window — in-flight flows restart
@@ -294,35 +342,184 @@ async fn main() -> Result<()> {
     // flush the close frames, shared as one deadline across all endpoints so a
     // wide ingress cannot multiply the shutdown delay.
     let mut shutdown = std::pin::pin!(shutdown_signal());
-    let driver_lost = tokio::select! {
-        _ = &mut shutdown => {
-            info!("shutdown signal received: closing endpoints so peers redial immediately");
-            false
+    let driver_lost = if let Some(fail_rx) = fail_rx.as_mut() {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutdown signal received: closing endpoints so peers redial immediately");
+                false
+            }
+            ended = fail_rx.recv() => {
+                // A shard's accept loop ended before any shutdown was
+                // requested: its endpoint driver stopped (socket failure) or
+                // the loop panicked. That share of the ingress is permanently
+                // dark, so fail fast: exiting non-zero lets a supervisor
+                // restart the process instead of silently serving from a
+                // fraction of the socket group.
+                error!("QUIC ingress shard {ended:?} stopped (driver failure?); exiting");
+                true
+            }
         }
-        ended = accepts.join_next() => {
-            // An endpoint's driver stopped (socket failure) or its loop
-            // panicked. That share of the ingress is permanently dark, so fail
-            // fast: exiting non-zero lets a supervisor restart the process
-            // instead of silently serving from a fraction of the socket group.
-            error!("QUIC endpoint accept loop ended ({ended:?}); exiting");
-            true
+    } else {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutdown signal received: closing endpoints so peers redial immediately");
+                false
+            }
+            ended = accepts.join_next() => {
+                // An endpoint's driver stopped (socket failure) or its loop
+                // panicked. That share of the ingress is permanently dark, so fail
+                // fast: exiting non-zero lets a supervisor restart the process
+                // instead of silently serving from a fraction of the socket group.
+                error!("QUIC endpoint accept loop ended ({ended:?}); exiting");
+                true
+            }
         }
     };
+    // Set the flag before anything can make `accept` resolve `None`: each loop
+    // can then tell "endpoint closed for shutdown" from "driver died".
+    let _ = shutdown_tx.send(true);
     // Stop the accept loops *before* closing the endpoints: a closed endpoint
     // makes `accept` resolve `None`, the same shape as a dead socket, and the
     // loops would report this orderly shutdown as a driver failure.
     accepts.shutdown().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     for ep in &eps {
         ep.close(0u32.into(), b"shutdown");
     }
-    for ep in &eps {
-        let _ = tokio::time::timeout_at(deadline, ep.wait_idle()).await;
+    if shard_joins.is_empty() {
+        // Shared-runtime ingress: one deadline for every endpoint's close
+        // flush, as before.
+        let deadline = tokio::time::Instant::now() + SHARD_DRAIN_TIMEOUT;
+        for ep in &eps {
+            let _ = tokio::time::timeout_at(deadline, ep.wait_idle()).await;
+        }
+    } else {
+        // Sharded ingress: each shard owns its endpoint's drain (it keeps its
+        // runtime — and with it the driver that flushes the close frames —
+        // alive until `wait_idle` resolves or the same budget expires), so
+        // joining is bounded by that budget, not by a multiplied one.
+        for j in shard_joins.drain(..) {
+            let _ = j.join();
+        }
     }
     if driver_lost {
         anyhow::bail!("QUIC ingress endpoint driver stopped; exiting for a supervisor restart");
     }
     Ok(())
+}
+
+/// How long a shard keeps its endpoint's driver alive after the endpoint is
+/// closed, so quinn can flush CONNECTION_CLOSE frames to every peer. Same
+/// budget the shared-runtime path spends in one `wait_idle` timeout.
+const SHARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `MYQUIC2_SHARD_RUNTIME=0` (also `false`/`off`/`no`) puts every ingress
+/// endpoint back on the shared multi-thread runtime — the pre-sharding
+/// topology — for A/B measurement or as an escape hatch; consulted once per
+/// startup.
+fn shard_runtime_enabled() -> bool {
+    parse_shard_runtime_env(std::env::var("MYQUIC2_SHARD_RUNTIME").ok().as_deref())
+}
+
+/// Pure flag parser (testable without mutating the process environment):
+/// only the documented "off" spellings disable sharding; unset or any other
+/// value keeps it on.
+pub(crate) fn parse_shard_runtime_env(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+/// Best-effort core pinning for one shard thread (Linux only; macOS has no
+/// meaningful affinity control, so the thread just floats there).
+/// `available_parallelism` respects a cgroup's CPU limit; a cpuset that
+/// excludes `idx % cores` makes the call fail `EINVAL` and the shard simply
+/// runs unpinned — a lost hint, never an error.
+fn pin_to_core(idx: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sched::{CpuSet, sched_setaffinity};
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut set = CpuSet::new();
+        if set.set(idx % cores).is_ok() {
+            let _ = sched_setaffinity(None, &set);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = idx;
+}
+
+/// One ingress shard: a dedicated OS thread that owns a QUIC endpoint end to
+/// end — its own current-thread tokio runtime (pinned to one core on Linux),
+/// UDP socket, CID table, driver task, accept loop and connection tasks. All
+/// of the per-packet thread-local state the connection handlers keep then
+/// lives on the core that serves it, instead of migrating between
+/// work-stealing workers and going cold at each hop.
+///
+/// The endpoint is created on this thread because quinn spawns its driver
+/// onto the *ambient* runtime: building it on the shared runtime would pin
+/// the driver there and leave the shard serving nothing. The handle is sent
+/// back over `ready` for main to close at shutdown; `fail` reports a
+/// pre-shutdown exit of `accept_loop` (a dead driver), which main treats as
+/// fatal — the same contract the shared-runtime path has via its `JoinSet`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_ingress_shard(
+    idx: usize,
+    sock: std::net::UdpSocket,
+    scfg: quinn::ServerConfig,
+    rt: Arc<quinn::TokioRuntime>,
+    st: Arc<AcceptState>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    ready: std::sync::mpsc::Sender<Result<quinn::Endpoint, String>>,
+    fail: tokio::sync::mpsc::UnboundedSender<usize>,
+) -> Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("myquic2-ingress-{idx}"))
+        .spawn(move || {
+            pin_to_core(idx);
+            let rt_thread = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = ready.send(Err(format!("current-thread runtime: {e}")));
+                    return;
+                }
+            };
+            rt_thread.block_on(async move {
+                let ep = match rt.wrap_udp_socket(sock) {
+                    Ok(sock) => match quinn::Endpoint::new_with_abstract_socket(
+                        quinn::EndpointConfig::default(),
+                        Some(scfg),
+                        sock,
+                        rt.clone(),
+                    ) {
+                        Ok(ep) => ep,
+                        Err(e) => {
+                            let _ = ready.send(Err(format!("endpoint: {e}")));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = ready.send(Err(format!("socket: {e}")));
+                        return;
+                    }
+                };
+                let _ = ready.send(Ok(ep.clone()));
+                if accept_loop(ep.clone(), st, shutdown).await {
+                    // Driver failure: report promptly so main can fail fast;
+                    // the drain below still bounds this thread's exit.
+                    let _ = fail.send(idx);
+                }
+                // Keep this runtime — and with it the driver that flushes
+                // CONNECTION_CLOSE frames — alive until the endpoint is idle
+                // or the drain budget expires; the runtime and any straggler
+                // task are then dropped with the thread.
+                let _ = tokio::time::timeout(SHARD_DRAIN_TIMEOUT, ep.wait_idle()).await;
+            });
+        })
+        .context("spawn ingress shard")
 }
 
 /// Everything an endpoint's accept loop needs. The admission semaphores and
@@ -345,13 +542,26 @@ struct AcceptState {
 /// Accept loop for one ingress endpoint: admit a connection (or refuse it)
 /// and hand it to its own task, so one slow/malicious handshake never stalls
 /// the accept path — of this endpoint or any other.
-async fn accept_loop(ep: quinn::Endpoint, st: Arc<AcceptState>) {
+///
+/// Returns `true` when the endpoint ended *without* a shutdown being
+/// requested — a dead driver (socket failure) worth a supervisor restart.
+/// `shutdown` is only ever read on that exit path, so it costs the loop
+/// nothing per accept.
+async fn accept_loop(
+    ep: quinn::Endpoint,
+    st: Arc<AcceptState>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> bool {
     loop {
         let incoming = match ep.accept().await {
             Some(i) => i,
             None => {
+                // A closed endpoint and a dead driver both resolve `None`.
+                if *shutdown.borrow() {
+                    return false;
+                }
                 error!("QUIC endpoint driver stopped (socket failure?)");
-                return;
+                return true;
             }
         };
         let permit = match st.conn_limit.clone().try_acquire_owned() {

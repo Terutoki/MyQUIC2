@@ -53,14 +53,23 @@ pub fn encode_datagram_with_limit(
 /// Same as [`encode_datagram_with_limit`] but takes the borrowed address form,
 /// keeping the per-packet path free of domain `String` allocations.
 ///
-/// quinn's `send_datagram` takes an owned `Bytes`, so one allocation per
-/// outbound datagram is inherent to the API — and it cannot be pooled: the
-/// driver frees that allocation on its own task once the datagram is
-/// transmitted, where no reservation could ever hand it back. What this
-/// function does avoid is *reallocation*: the address header is validated and
-/// measured up front so the buffer is `with_capacity`ed to the exact final
-/// size and then filled in a single pass, instead of starting at 40 bytes and
-/// growing (copying the payload) on the way.
+/// quinn's `send_datagram` takes an owned `Bytes`, so one frame buffer per
+/// outbound datagram is inherent to the API — the driver frees it on its own
+/// task once the datagram is transmitted. What this function does is make
+/// that one allocation as cheap as the allocator allows: the address header
+/// is validated and measured up front, and the buffer is filled to *exactly*
+/// its capacity in a single pass, so `Bytes::from(Vec)` takes its
+/// `len == capacity` fast path (`into_boxed_slice` in place — no copy, no
+/// second control-block allocation).
+///
+/// Frame pooling was measured and rejected (see `examples/frame_bench.rs`):
+/// `Bytes::from_owner` — the only way to run code when quinn drops the frame —
+/// boxes a control block per frame, and a pooled `Vec` can never satisfy the
+/// exact-fit fast path above (a pool has fixed capacity, frames vary), so
+/// both pooling routes pay an extra allocation per frame *and* add cross-core
+/// queue traffic for buffers that mimalloc already recycles on the thread
+/// that allocated them. Measured on the dev box: +39..52% per frame
+/// same-thread, +128..324% cross-thread, against this shape.
 pub fn encode_datagram_ref_with_limit(
     sess: u32,
     addr: &TargetAddrRef<'_>,
@@ -104,13 +113,12 @@ pub(crate) fn encode_datagram_with_header(
 ///
 /// **Single copy, by construction.** The buffer is `with_capacity`ed to the
 /// exact final size, the payload is copied into it once, and `Bytes::from(Vec)`
-/// takes that allocation over (`len == capacity`, so no reallocation and no
-/// copy). An earlier revision staged the frame through a thread-local
-/// `BytesMut` and then `Bytes::copy_from_slice`d it out, which paid a *second*
-/// full payload memcpy per relayed datagram. The staging saved nothing: the
-/// `Bytes` handed to quinn must own a private allocation regardless, because
-/// quinn's driver frees it on its own task, where no reservation could ever
-/// hand it back (see `encode_datagram_ref_with_limit`).
+/// takes that allocation over (`len == capacity`, so no reallocation, no copy
+/// and no control-block allocation). Frame pooling on top of this was measured
+/// and rejected (see `encode_datagram_ref_with_limit` and
+/// `examples/frame_bench.rs`): every pooling route costs an extra allocation
+/// per frame, while this shape is already one exact-size allocation recycled
+/// by the thread-local allocator.
 pub(crate) fn encode_datagram_with_prefix(
     prefix: &[u8],
     payload: &[u8],
