@@ -412,48 +412,6 @@ async fn main() -> Result<()> {
 /// budget the shared-runtime path spends in one `wait_idle` timeout.
 const SHARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// `MYQUIC2_SHARD_RUNTIME=0` (also `false`/`off`/`no`) puts every ingress
-/// endpoint back on the shared multi-thread runtime — the pre-sharding
-/// topology — for A/B measurement or as an escape hatch; consulted once per
-/// startup.
-fn shard_runtime_enabled() -> bool {
-    parse_shard_runtime_env(std::env::var("MYQUIC2_SHARD_RUNTIME").ok().as_deref())
-}
-
-/// Pure flag parser (testable without mutating the process environment):
-/// only the documented "off" spellings disable sharding; unset or any other
-/// value keeps it on.
-pub(crate) fn parse_shard_runtime_env(v: Option<&str>) -> bool {
-    !matches!(
-        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("0") | Some("false") | Some("off") | Some("no")
-    )
-}
-
-/// Best-effort core pinning for one shard thread (Linux only; macOS has no
-/// meaningful affinity control, so the thread just floats there).
-/// `available_parallelism` respects a cgroup's CPU limit; a cpuset that
-/// excludes `idx % cores` makes the call fail `EINVAL` and the shard simply
-/// runs unpinned — a lost hint, never an error.
-fn pin_to_core(idx: usize) {
-    #[cfg(target_os = "linux")]
-    {
-        use nix::sched::{CpuSet, sched_setaffinity};
-        use nix::unistd::Pid;
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let mut set = CpuSet::new();
-        if set.set(idx % cores).is_ok() {
-            // nix 0.31 takes a thread id; `Pid::from_raw(0)` is its documented
-            // spelling for "the calling thread" (nix's own doctest uses it).
-            // `Pid::this()` would be `getpid()` — the *main* thread's tid —
-            // and would pin the wrong thread.
-            let _ = sched_setaffinity(Pid::from_raw(0), &set);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = idx;
-}
-
 /// One ingress shard: a dedicated OS thread that owns a QUIC endpoint end to
 /// end — its own current-thread tokio runtime (pinned to one core on Linux),
 /// UDP socket, CID table, driver task, accept loop and connection tasks. All
@@ -481,7 +439,7 @@ fn spawn_ingress_shard(
     std::thread::Builder::new()
         .name(format!("myquic2-ingress-{idx}"))
         .spawn(move || {
-            pin_to_core(idx);
+            myquic2::linux::pin_to_core(idx);
             let rt_thread = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

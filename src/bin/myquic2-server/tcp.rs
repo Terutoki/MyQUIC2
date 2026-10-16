@@ -154,7 +154,10 @@ pub(crate) async fn handle_tcp_stream(
         }
     };
     drop(_dial_permit);
-    let _ = tcp.set_nodelay(true);
+    // Relay-TCP posture: nodelay always, plus Linux TCP_NOTSENT_LOWAT so the
+    // kernel send buffer cannot stack megabytes of unsent bytes ahead of the
+    // QUIC stream that already paces this flow (see `linux::tune_relay_tcp`).
+    myquic2::linux::tune_relay_tcp(&tcp);
     // MQP-2: report the bound address of the dialed socket so the
     // client can answer SOCKS with the real BND.ADDR/PORT (RFC 1928)
     // instead of a placeholder.
@@ -289,7 +292,7 @@ pub(crate) async fn dial_happy_eyeballs(
         .await
         {
             Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
+                myquic2::linux::tune_relay_tcp(&s);
                 Some(s)
             }
             _ => None,
@@ -303,7 +306,7 @@ pub(crate) async fn dial_happy_eyeballs(
     .await;
     match res {
         Ok(Ok(s)) => {
-            let _ = s.set_nodelay(true);
+            myquic2::linux::tune_relay_tcp(&s);
             Some(s)
         }
         _ => None,

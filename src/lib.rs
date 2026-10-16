@@ -27,6 +27,7 @@ macro_rules! stats_only {
 
 pub mod config;
 pub mod dns;
+pub mod linux;
 pub mod mqp;
 pub mod stats;
 pub mod sync;
@@ -259,6 +260,38 @@ fn clamp_sess_socket_buf(v: usize) -> usize {
     v.clamp(SESS_SOCKET_BUF_MIN, SESS_SOCKET_BUF_MAX)
 }
 
+/// The env var that disables the sharded runtime topology, shared by both
+/// binaries (see [`shard_runtime_enabled`]).
+pub const SHARD_RUNTIME_ENV: &str = "MYQUIC2_SHARD_RUNTIME";
+
+/// Whether the per-slot sharded runtime topology is enabled (the default).
+///
+/// With sharding on, the server's ingress endpoints and the client's pool
+/// slots each run inside their own pinned current-thread runtime, so the
+/// endpoint driver, its accept/reconnect loop, its dispatcher and all of the
+/// per-packet thread-local state they own stay on one core (see the server's
+/// `spawn_ingress_shard` and the client's `spawn_slot_shard`). With
+/// `MYQUIC2_SHARD_RUNTIME=0` (also `false`/`off`/`no`) both fall back to the
+/// shared multi-thread runtime and work-stealing may migrate those tasks.
+///
+/// Read once per process: the topology is chosen at startup and a supervisor
+/// restart is what applies a change, exactly like `quic_endpoints`.
+#[must_use]
+pub fn shard_runtime_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_off_flag(std::env::var(SHARD_RUNTIME_ENV).ok().as_deref()))
+}
+
+/// Pure flag parser (testable without mutating the process environment):
+/// only the documented "off" spellings disable the feature; unset or any
+/// other value keeps it on.
+fn parse_off_flag(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
 /// Per-session / relay sockets: see [`SESS_SOCKET_BUF`] / [`sess_socket_buf`].
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
     udp_socket_dual_with_size(bind, sess_socket_buf())
@@ -341,6 +374,10 @@ fn udp_socket_dual_impl(bind: &str, buf: usize, reuse_port: bool) -> Result<std:
         warn_buf_clamped("recv", actual, buf);
     }
     s.bind(&addr.into())?;
+    // Linux-only, best-effort socket tuning (see `linux::tune_udp_socket`):
+    // busy polling when `MYQUIC2_BUSY_POLL` opted in, applied to every UDP
+    // socket this crate creates — QUIC endpoints, relay and session sockets.
+    linux::tune_udp_socket(&s);
     Ok(s.into())
 }
 
@@ -390,6 +427,12 @@ pub fn tcp_listener_dual(bind: &str) -> Result<std::net::TcpListener> {
     s.set_reuse_address(true)?;
     s.set_nonblocking(true)?;
     s.bind(&addr.into())?;
+    // Linux-only, best-effort listener tuning (`linux::tune_tcp_listener`):
+    // TCP_DEFER_ACCEPT=1s plus a TCP_FASTOPEN listener queue, armed between
+    // bind and listen. SOCKS is client-first, so the deferred accept is free;
+    // fast open only takes effect when `net.ipv4.tcp_fastopen` allows server
+    // mode, and the kernel's refusal is logged once and ignored.
+    linux::tune_tcp_listener(&s);
     s.listen(1024)?;
     Ok(s.into())
 }
@@ -479,6 +522,28 @@ mod tests {
         assert_eq!(clamp_sess_socket_buf(usize::MAX), SESS_SOCKET_BUF_MAX);
         assert_eq!(clamp_sess_socket_buf(96 * 1024), 96 * 1024);
         assert_eq!(SESS_SOCKET_BUF, 64 * 1024);
+    }
+
+    /// `MYQUIC2_SHARD_RUNTIME` parsing: only the documented "off" spellings
+    /// put the slot tasks back on the shared runtime; unset or anything else
+    /// keeps the sharded (default) topology in both binaries. The decision
+    /// itself is asserted at startup by each binary's topology log line; this
+    /// pins the parser so a typo cannot silently flip the runtime model.
+    #[test]
+    fn shard_runtime_off_spellings_parse() {
+        for off in ["0", "false", "FALSE", "off", " off ", "no"] {
+            assert!(
+                !parse_off_flag(Some(off)),
+                "{off:?} must select the shared runtime"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "", "  ", "banana"] {
+            assert!(
+                parse_off_flag(Some(on)),
+                "{on:?} must keep sharding enabled"
+            );
+        }
+        assert!(parse_off_flag(None), "unset default is sharded");
     }
 
     /// The retry pool outlives the runtime that first needed it.

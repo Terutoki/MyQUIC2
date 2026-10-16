@@ -123,17 +123,7 @@ async fn main() -> Result<()> {
     // a second; now every connection's ingress is its own. Client endpoints
     // dial with an explicit config (`connect_with` in `dial_once`), so they
     // need no default client config.
-    let rt = Arc::new(quinn::TokioRuntime);
-    let mut eps: Vec<quinn::Endpoint> = Vec::with_capacity(pool.slots_total());
-    for _ in 0..pool.slots_total() {
-        let sock = udp_socket_dual("[::]:0")?;
-        eps.push(quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            None,
-            rt.wrap_udp_socket(sock)?,
-            rt.clone(),
-        )?);
-    }
+    //
     // `quic_conns` extra connections: one per UDP egress class, plus the bulk
     // shards, so the TCP pool keeps its documented meaning and the dedicated
     // UDP connections never take a congestion window away from the bulk TCP
@@ -172,30 +162,97 @@ async fn main() -> Result<()> {
     // associations have connections no bulk flow can queue on.
     let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
     let watchdog_silence = Duration::from_secs(keep_alive_secs.saturating_mul(4).max(20));
-    for i in 0..pool.slots_total() {
-        spawn_dispatcher(pool.slot(i), hub.clone());
-    }
-    for (i, ep) in eps.iter().enumerate() {
-        // Per-slot transport preset (see `slot_uses_bulk_preset`): only the
-        // dedicated bulk UDP class connection gets the coarse bulk preset;
-        // the TCP pool and the interactive UDP class keep the tuned 2/5 ms
-        // one. Each slot now has its own endpoint and dials with this config
-        // explicitly (`connect_with`), so this is the only per-class switch.
-        let cfg = if slot_uses_bulk_preset(&pool, i) {
-            ccfg_bulk.clone()
-        } else {
-            ccfg_interactive.clone()
-        };
-        spawn_conn_loop(
-            ep.clone(),
-            cfg,
-            server_str.clone(),
-            c.server_name.clone(),
-            c.auth_token.clone(),
-            pool.slot(i),
-            watchdog_silence,
+    // Orderly-shutdown flag for the sharded topology: each slot shard parks on
+    // it and then drains its own endpoint (see `spawn_slot_shard`); the
+    // shared-runtime topology ignores it and is closed from here.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Runtime topology. Sharded (the default; `MYQUIC2_SHARD_RUNTIME=0`
+    // disables): every pool slot runs inside its own pinned current-thread
+    // runtime, so its endpoint driver, DATAGRAM dispatcher and reconnect loop
+    // — and all of their thread-local state (the dispatch cache and
+    // reassembler, the per-slot watch generation, the receive buffers) — stay
+    // on one core instead of migrating between work-stealing workers. Shared
+    // (the pre-sharding topology): every slot runs on the multi-thread
+    // runtime and work-stealing may migrate those tasks.
+    let (eps, shard_joins) = if shard_runtime_enabled() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let mut joins = Vec::with_capacity(pool.slots_total());
+        for i in 0..pool.slots_total() {
+            let sock = udp_socket_dual("[::]:0")?;
+            // Per-slot transport preset (see `slot_uses_bulk_preset`): only
+            // the dedicated bulk UDP class connection gets the coarse bulk
+            // preset; the TCP pool and the interactive UDP class keep the
+            // tuned 2/5 ms one.
+            let cfg = if slot_uses_bulk_preset(&pool, i) {
+                ccfg_bulk.clone()
+            } else {
+                ccfg_interactive.clone()
+            };
+            joins.push(spawn_slot_shard(
+                i,
+                sock,
+                cfg,
+                server_str.clone(),
+                c.server_name.clone(),
+                c.auth_token.clone(),
+                pool.slot(i),
+                hub.clone(),
+                watchdog_silence,
+                shutdown_rx.clone(),
+                ready_tx.clone(),
+            )?);
+        }
+        // A shard always reports once (Ok after its endpoint exists and its
+        // tasks are spawned, or Err when it cannot start); a disconnect
+        // instead of a report means the thread died before that, and both are
+        // fatal at startup.
+        drop(ready_tx);
+        for i in 0..pool.slots_total() {
+            match ready_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => anyhow::bail!("client slot {i} failed to start: {e}"),
+                Err(e) => anyhow::bail!("client slot {i} did not report ready: {e}"),
+            }
+        }
+        info!(
+            "client runtime: {} sharded current-thread runtime(s), one pool slot each \
+             (Linux: pinned up to the core count; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)",
+            pool.slots_total()
         );
-    }
+        (Vec::new(), joins)
+    } else {
+        let rt = Arc::new(quinn::TokioRuntime);
+        let mut eps: Vec<quinn::Endpoint> = Vec::with_capacity(pool.slots_total());
+        for _ in 0..pool.slots_total() {
+            let sock = udp_socket_dual("[::]:0")?;
+            eps.push(quinn::Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                None,
+                rt.wrap_udp_socket(sock)?,
+                rt.clone(),
+            )?);
+        }
+        for i in 0..pool.slots_total() {
+            spawn_dispatcher(pool.slot(i), hub.clone());
+        }
+        for (i, ep) in eps.iter().enumerate() {
+            let cfg = if slot_uses_bulk_preset(&pool, i) {
+                ccfg_bulk.clone()
+            } else {
+                ccfg_interactive.clone()
+            };
+            spawn_conn_loop(
+                ep.clone(),
+                cfg,
+                server_str.clone(),
+                c.server_name.clone(),
+                c.auth_token.clone(),
+                pool.slot(i),
+                watchdog_silence,
+            );
+        }
+        (eps, Vec::new())
+    };
 
     let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
     let li = tokio::net::TcpListener::from_std(tcp_listener_dual(&c.socks_listen)?)?;
@@ -225,19 +282,35 @@ async fn main() -> Result<()> {
             },
             _ = &mut shutdown => {
                 info!("shutdown signal received: closing endpoints so conns drop and peers can reconnect");
+                // Sharded slots own their endpoints: the flag wakes each
+                // shard, which closes its endpoint and drains it under its own
+                // bounded deadline (see `spawn_slot_shard`).
+                let _ = shutdown_tx.send(true);
                 for e in &eps {
                     e.close(0u32.into(), b"shutdown");
                 }
-                // One deadline for the whole group: a wide pool must not
-                // multiply the shutdown delay.
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-                for e in &eps {
-                    let _ = tokio::time::timeout_at(deadline, e.wait_idle()).await;
+                if shard_joins.is_empty() {
+                    // Shared-runtime pool: one deadline for the whole group,
+                    // so a wide pool must not multiply the shutdown delay.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                    for e in &eps {
+                        let _ = tokio::time::timeout_at(deadline, e.wait_idle()).await;
+                    }
+                } else {
+                    // Sharded pool: each shard drains under its own deadline,
+                    // so joining cannot multiply the delay either.
+                    for j in shard_joins {
+                        let _ = j.join();
+                    }
                 }
                 break;
             }
         };
-        let _ = sock.set_nodelay(true);
+        // Relay-TCP posture on the accepted SOCKS socket: nodelay plus (on
+        // Linux) TCP_NOTSENT_LOWAT, so the kernel send buffer cannot stack
+        // unsent bytes ahead of the QUIC stream that already paces this flow
+        // (see `linux::tune_relay_tcp`).
+        linux::tune_relay_tcp(&sock);
         let permit = match socks_conn_limiter().clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -256,4 +329,99 @@ async fn main() -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// How long a slot shard keeps its endpoint's driver alive after closing it,
+/// so quinn can flush `CONNECTION_CLOSE` frames to the server. Same budget the
+/// shared-runtime path spends in one `wait_idle` timeout.
+const SLOT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// One client pool slot: a dedicated OS thread that owns its QUIC endpoint end
+/// to end — its own current-thread tokio runtime (pinned to one core on
+/// Linux), UDP socket, CID table, driver task, DATAGRAM dispatcher and
+/// reconnect loop. All of the per-packet thread-local state those tasks keep
+/// then lives on the core that serves it, instead of migrating between
+/// work-stealing workers and going cold at each hop — the same locality the
+/// server's ingress shards get.
+///
+/// The endpoint is created on this thread because quinn spawns its driver
+/// onto the *ambient* runtime: built on the shared runtime, the driver (and
+/// every receive syscall and CID lookup it performs) would stay there. This
+/// thread's future parks on the shutdown flag for the process lifetime, which
+/// is what holds the runtime — and with it the driver — until main asks the
+/// pool to drain. `ready` reports startup success or failure; there is no
+/// per-slot failure channel, unlike the server's shards: a client endpoint
+/// driver that dies only fails that slot's dials, and the reconnect loop
+/// already owns retrying them, so there is nothing to fail the process over.
+#[allow(clippy::too_many_arguments)]
+fn spawn_slot_shard(
+    idx: usize,
+    sock: std::net::UdpSocket,
+    cfg: quinn::ClientConfig,
+    server: String,
+    server_name: String,
+    auth: String,
+    slot: ConnSlot,
+    hub: Arc<UdpHub>,
+    watchdog_silence: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("myquic2-slot-{idx}"))
+        .spawn(move || {
+            // Pin the first `cores` slots; a pool wider than the machine
+            // leaves its extra slots unpinned so the scheduler can balance
+            // them (pinning two threads to one core would force sharing).
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            if idx < cores {
+                myquic2::linux::pin_to_core(idx);
+            }
+            let rt_thread = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = ready.send(Err(format!("current-thread runtime: {e}")));
+                    return;
+                }
+            };
+            rt_thread.block_on(async move {
+                let qrt = Arc::new(quinn::TokioRuntime);
+                let ep = match qrt.wrap_udp_socket(sock) {
+                    Ok(sock) => match quinn::Endpoint::new_with_abstract_socket(
+                        quinn::EndpointConfig::default(),
+                        None,
+                        sock,
+                        qrt.clone(),
+                    ) {
+                        Ok(ep) => ep,
+                        Err(e) => {
+                            let _ = ready.send(Err(format!("endpoint: {e}")));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = ready.send(Err(format!("socket: {e}")));
+                        return;
+                    }
+                };
+                spawn_dispatcher(slot.clone(), hub);
+                spawn_conn_loop(
+                    ep.clone(),
+                    cfg,
+                    server,
+                    server_name,
+                    auth,
+                    slot,
+                    watchdog_silence,
+                );
+                let _ = ready.send(Ok(()));
+                let _ = shutdown.wait_for(|v| *v).await;
+                ep.close(0u32.into(), b"shutdown");
+                let _ = tokio::time::timeout(SLOT_DRAIN_TIMEOUT, ep.wait_idle()).await;
+            });
+        })
+        .context("spawn client slot shard")
 }
