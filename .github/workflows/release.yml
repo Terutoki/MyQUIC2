@@ -5,6 +5,19 @@ name: Release
 # Trigger: push a tag like `v0.1.0`, or run the workflow manually and pass
 # the tag (the tag is created from the selected commit if it does not exist).
 #
+# Builds are profile-guided (PGO): a training job per target triple builds
+# instrumented server/client binaries (plus the bench harness), runs the same
+# loopback workload `scripts/pgo.sh` uses on a dev box — byte-verified TCP
+# echo, a TCP connect burst, the UDP sweep (fragment path included) and a
+# short `udpps` blast — merges the raw profiles with llvm-profdata and hands
+# the merged `.profdata` to the packaging jobs via `-Cprofile-use`. Training
+# deliberately uses a *generic* x86-64 instrumented build even for the v2..v4
+# legs: instrumentation profiles are function-hash based, so LLVM simply
+# drops functions whose control flow differs under another `target-cpu`,
+# while a v3/v4 instrumented binary would SIGILL on runner CPUs without
+# AVX-512. Profiles are per-triple by construction — musl and gnu each train
+# their own, and none is ever reused across architectures.
+#
 # Assets:
 #   myquic2-<tag>-x86_64-unknown-linux-musl.tar.gz   static, any x86_64 Linux
 #   myquic2-<tag>-x86_64-unknown-linux-gnu.tar.gz    glibc build (2.36+ floor)
@@ -50,9 +63,165 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+  # One PGO training job per target triple. The instrumented binaries are
+  # static musl / dynamically linked gnu, so they run directly on the runner;
+  # the merged profile artifact is the only thing the packaging legs consume.
+  pgo-musl:
+    name: PGO training (static musl)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools-preview
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: pgo-musl
+      - name: Build instrumented binaries and training harness
+        env:
+          PROFILE_DIR: ${{ runner.temp }}/pgo-musl
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROFILE_DIR"
+          cargo zigbuild --release \
+            --target x86_64-unknown-linux-musl \
+            --config "target.x86_64-unknown-linux-musl.rustflags=[\"-C\", \"profile-generate=$PROFILE_DIR\"]" \
+            --bin myquic2-server --bin myquic2-client --example hotpath_bench
+      - name: Train on loopback
+        env:
+          PROFILE_DIR: ${{ runner.temp }}/pgo-musl
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release
+          bench="$bin/examples/hotpath_bench"
+
+          "$bench" echo 19290 >/dev/null 2>&1 & echo_pid=$!
+          "$bench" techo 19291 >/dev/null 2>&1 & techo_pid=$!
+          RUST_LOG=warn "$bin/myquic2-server" --config config-server.toml >server.log 2>&1 & server_pid=$!
+          sleep 1
+          RUST_LOG=warn "$bin/myquic2-client" --config config-client.toml >client.log 2>&1 & client_pid=$!
+          sleep 2
+          cleanup() { kill "$server_pid" "$client_pid" "$echo_pid" "$techo_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          "$bench" tcpecho 127.0.0.1:1080 127.0.0.1:19291 262144 | tail -n1
+          "$bench" tcp 127.0.0.1:1080 127.0.0.1:19291 200 4 | tail -n1
+          "$bench" udpsweep 127.0.0.1:1080 127.0.0.1:19290 64 8,512,2000,8000 1 | tail -n1
+          "$bench" udpps 127.0.0.1:1080 127.0.0.1:19290 2 128 | tail -n1
+
+          # Both binaries handle SIGTERM by returning from main, which is what
+          # makes the profile runtime flush their .profraw files.
+          kill -TERM "$server_pid" "$client_pid"
+          wait "$server_pid" || true
+          wait "$client_pid" || true
+          cleanup
+          trap - EXIT
+          ls -l "$PROFILE_DIR"
+      - name: Merge profile data
+        env:
+          PROFILE_DIR: ${{ runner.temp }}/pgo-musl
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          count=$(ls "$PROFILE_DIR"/*.profraw | wc -l)
+          echo "raw profiles: $count"
+          [ "$count" -ge 2 ] || { echo "expected profiles from both server and client"; exit 1; }
+          "$profdata" merge -o "$PROFILE_DIR/merged.profdata" "$PROFILE_DIR"/*.profraw
+          ls -l "$PROFILE_DIR/merged.profdata"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pgo-profile-musl
+          path: ${{ runner.temp }}/pgo-musl/merged.profdata
+          if-no-files-found: error
+          retention-days: 1
+
+  pgo-gnu:
+    name: PGO training (gnu)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: pgo-gnu
+      - name: Build instrumented binaries and training harness
+        env:
+          PROFILE_DIR: ${{ runner.temp }}/pgo-gnu
+          # An explicit --target keeps host units (build scripts, proc
+          # macros) out of the instrumented build; the runner's own glibc is
+          # irrelevant to the profile.
+          RUSTFLAGS: -C profile-generate=${{ runner.temp }}/pgo-gnu
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROFILE_DIR"
+          cargo build --release \
+            --target x86_64-unknown-linux-gnu \
+            --bin myquic2-server --bin myquic2-client --example hotpath_bench
+      - name: Train on loopback
+        env:
+          PROFILE_DIR: ${{ runner.temp }}/pgo-gnu
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-gnu/release
+          bench="$bin/examples/hotpath_bench"
+
+          "$bench" echo 19290 >/dev/null 2>&1 & echo_pid=$!
+          "$bench" techo 19291 >/dev/null 2>&1 & techo_pid=$!
+          RUST_LOG=warn "$bin/myquic2-server" --config config-server.toml >server.log 2>&1 & server_pid=$!
+          sleep 1
+          RUST_LOG=warn "$bin/myquic2-client" --config config-client.toml >client.log 2>&1 & client_pid=$!
+          sleep 2
+          cleanup() { kill "$server_pid" "$client_pid" "$echo_pid" "$techo_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          "$bench" tcpecho 127.0.0.1:1080 127.0.0.1:19291 262144 | tail -n1
+          "$bench" tcp 127.0.0.1:1080 127.0.0.1:19291 200 4 | tail -n1
+          "$bench" udpsweep 127.0.0.1:1080 127.0.0.1:19290 64 8,512,2000,8000 1 | tail -n1
+          "$bench" udpps 127.0.0.1:1080 127.0.0.1:19290 2 128 | tail -n1
+
+          kill -TERM "$server_pid" "$client_pid"
+          wait "$server_pid" || true
+          wait "$client_pid" || true
+          cleanup
+          trap - EXIT
+          ls -l "$PROFILE_DIR"
+      - name: Merge profile data
+        env:
+          PROFILE_DIR: ${{ runner.temp }}/pgo-gnu
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          count=$(ls "$PROFILE_DIR"/*.profraw | wc -l)
+          echo "raw profiles: $count"
+          [ "$count" -ge 2 ] || { echo "expected profiles from both server and client"; exit 1; }
+          "$profdata" merge -o "$PROFILE_DIR/merged.profdata" "$PROFILE_DIR"/*.profraw
+          ls -l "$PROFILE_DIR/merged.profdata"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pgo-profile-gnu
+          path: ${{ runner.temp }}/pgo-gnu/merged.profdata
+          if-no-files-found: error
+          retention-days: 1
+
   build-musl:
     name: Static musl OpenWrt x86_64 (${{ matrix.level }})
-    needs: verify
+    needs: [verify, pgo-musl]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -85,11 +254,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: openwrt-${{ matrix.level }}
-      - name: Build static binaries (target-cpu=${{ matrix.cpu }})
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: pgo-profile-musl
+          path: ${{ runner.temp }}/pgo-musl
+      - name: Build static binaries (PGO, target-cpu=${{ matrix.cpu }})
+        env:
+          PGO_PROFILE: ${{ runner.temp }}/pgo-musl/merged.profdata
         run: |
           cargo zigbuild --release \
             --target x86_64-unknown-linux-musl \
-            --config 'target.x86_64-unknown-linux-musl.rustflags=["-C", "target-cpu=${{ matrix.cpu }}"]' \
+            --config "target.x86_64-unknown-linux-musl.rustflags=[\"-C\", \"target-cpu=${{ matrix.cpu }}\", \"-C\", \"profile-use=$PGO_PROFILE\"]" \
             --bin myquic2-server --bin myquic2-client
       - name: Package tarballs
         run: |
@@ -128,7 +303,7 @@ jobs:
 
   build-gnu:
     name: x86_64-unknown-linux-gnu
-    needs: verify
+    needs: [verify, pgo-gnu]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -152,7 +327,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: release-gnu
-      - name: Build release binaries (glibc 2.36 floor)
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: pgo-profile-gnu
+          path: ${{ runner.temp }}/pgo-gnu
+      - name: Build release binaries (PGO, glibc 2.36 floor)
+        env:
+          # RUSTFLAGS (rather than a per-target config array) because the
+          # versioned `.2.36` zigbuild target would need the version in the
+          # config key; with an explicit --target, RUSTFLAGS reaches exactly
+          # the target artifacts and leaves host build scripts untouched.
+          RUSTFLAGS: -C profile-use=${{ runner.temp }}/pgo-gnu/merged.profdata
         run: |
           cargo zigbuild --release \
             --target x86_64-unknown-linux-gnu.2.36 \
