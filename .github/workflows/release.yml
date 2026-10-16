@@ -16,7 +16,10 @@ name: Release
 # drops functions whose control flow differs under another `target-cpu`,
 # while a v3/v4 instrumented binary would SIGILL on runner CPUs without
 # AVX-512. Profiles are per-triple by construction — musl and gnu each train
-# their own, and none is ever reused across architectures.
+# their own, and none is ever reused across architectures. The musl training
+# link goes through rust-lld because zig's cc driver mangles the
+# `-u __llvm_profile_runtime` pair rustc emits under `-Cprofile-generate`
+# (see the job's step comment); the packaging legs keep the zig linker.
 #
 # Assets:
 #   myquic2-<tag>-x86_64-unknown-linux-musl.tar.gz   static, any x86_64 Linux
@@ -92,6 +95,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$PROFILE_DIR"
+          # `-Cprofile-generate` makes rustc pass `-u __llvm_profile_runtime`
+          # to the linker, and zig's cc driver mangles that pair — lld then
+          # treats the bare symbol as an input file ("unrecognized file
+          # extension"). Only the *Rust* link step is therefore overridden to
+          # rust-lld: cargo-zigbuild injects its wrapper with
+          # `add_env_if_missing`, so a pre-set CARGO_TARGET_*_LINKER is left
+          # alone, while CC_/AR_ stay on zig cc for the C dependencies. The
+          # musl libc/crt for rust-lld come from rustc's self-contained
+          # directory (no musl toolchain needed to link).
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$(rustc --print sysroot)/lib/rustlib/$host/bin/rust-lld"
           cargo zigbuild --release \
             --target x86_64-unknown-linux-musl \
             --config "target.x86_64-unknown-linux-musl.rustflags=[\"-C\", \"profile-generate=$PROFILE_DIR\"]" \
