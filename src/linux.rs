@@ -267,7 +267,7 @@ fn set_raw_int(
 
 /// Read back an integer-valued socket option; the test hook for everything
 /// this module sets (and a useful diagnostic).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn get_raw_int(
     fd: RawFd,
     level: std::os::raw::c_int,
@@ -404,17 +404,16 @@ mod tests {
     /// `tune_relay_tcp` sets `TCP_NOTSENT_LOWAT` from the effective value on a
     /// connected pair (Linux-gated; runs in CI).
     #[cfg(target_os = "linux")]
-    #[test]
-    fn tune_relay_tcp_arms_notsent_lowat() {
+    #[tokio::test]
+    async fn tune_relay_tcp_arms_notsent_lowat() {
         use nix::libc::{IPPROTO_TCP, TCP_NOTSENT_LOWAT};
-        let li = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let li = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = li.local_addr().unwrap();
-        let client = std::net::TcpStream::connect(addr).unwrap();
-        let (server, _) = li.accept().unwrap();
-        let stream = tokio::net::TcpStream::from_std(server).unwrap();
-        tune_relay_tcp(&stream);
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = li.accept().await.unwrap();
+        tune_relay_tcp(&server);
         let want = tcp_notsent_lowat();
-        let got = get_raw_int(stream.as_raw_fd(), IPPROTO_TCP, TCP_NOTSENT_LOWAT).unwrap();
+        let got = get_raw_int(server.as_raw_fd(), IPPROTO_TCP, TCP_NOTSENT_LOWAT).unwrap();
         if want == 0 {
             assert_eq!(got, 0, "no override means the kernel default stays");
         } else {
