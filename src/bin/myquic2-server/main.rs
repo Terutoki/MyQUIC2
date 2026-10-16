@@ -439,10 +439,15 @@ fn pin_to_core(idx: usize) {
     #[cfg(target_os = "linux")]
     {
         use nix::sched::{CpuSet, sched_setaffinity};
+        use nix::unistd::Pid;
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let mut set = CpuSet::new();
         if set.set(idx % cores).is_ok() {
-            let _ = sched_setaffinity(None, &set);
+            // nix 0.31 takes a thread id; `Pid::from_raw(0)` is its documented
+            // spelling for "the calling thread" (nix's own doctest uses it).
+            // `Pid::this()` would be `getpid()` — the *main* thread's tid —
+            // and would pin the wrong thread.
+            let _ = sched_setaffinity(Pid::from_raw(0), &set);
         }
     }
     #[cfg(not(target_os = "linux"))]
