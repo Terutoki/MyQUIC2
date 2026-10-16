@@ -1,5 +1,14 @@
 # MyQUIC2 server config
 listen = "[::]:8443"
+# Ingress endpoints: QUIC sockets sharing `listen` through SO_REUSEPORT, each
+# with its own receive loop, CID table and accept path. Default: one per usable
+# core on Linux, where the kernel spreads a connection's packets across the
+# group by 4-tuple; 1 on other platforms (macOS delivers a REUSEPORT group to a
+# single member, so extra endpoints there only cost sockets — the server warns
+# when you ask for them anyway). Set 1 for the strict single socket.
+# Trade-off: a member is pinned by the client's 4-tuple, so a client NAT rebind
+# loses the connection (it redials) instead of migrating. Clamped to 1..=8.
+# quic_endpoints = 4
 cert_file = "server-cert.pem"
 key_file = "server-key.pem"
 server_name = "test.com"

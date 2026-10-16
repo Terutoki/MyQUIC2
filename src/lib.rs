@@ -40,8 +40,9 @@ pub use config::{
     client_conf::ClientConf,
     server_conf::ServerConf,
     tuning::{
-        DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN,
-        MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_UDP_ASSOCS, TransportTuning, load_toml,
+        DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, INITIAL_RTT_MS_MAX,
+        INITIAL_RTT_MS_MIN, MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_QUIC_ENDPOINTS,
+        MAX_UDP_ASSOCS, MAX_UDP_EGRESS_CONNS, TransportTuning, default_quic_endpoints, load_toml,
         per_connection_memory_bytes, per_session_memory_bytes, session_pool_memory_bytes,
     },
 };
@@ -128,6 +129,82 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
     udp_socket_dual_with_size(bind, 4 * 1024 * 1024)
 }
 
+/// One member of a `SO_REUSEPORT` group: a multi-endpoint server ingress
+/// binds several of these on the same address and lets the kernel spread
+/// datagrams across them.
+///
+/// Not the same thing as `SO_REUSEADDR` (which this crate deliberately does
+/// not set on QUIC sockets — see [`udp_socket_dual_impl`]): REUSEPORT lets
+/// several sockets of the *same* process bind one address and has the kernel
+/// load-balance the datagrams between them. Each member is a full quinn
+/// `Endpoint` with its own CID table, receive queue and driver task, so `n`
+/// members move the server's receive syscalls and per-packet routing off one
+/// core.
+///
+/// The kernel's spread policy decides whether this buys anything. Linux
+/// hashes by connection 4-tuple, so every packet of one QUIC connection keeps
+/// landing on the same member — which is what makes this work at all with
+/// CID-routed endpoints — and distinct connections fan out across members.
+/// macOS does not spread: measured on this codebase, it delivers the whole
+/// group's traffic to the most recently bound member (see
+/// [`default_quic_endpoints`]). The 4-tuple pinning has consequences worth
+/// stating even where it works: a connection whose client changes its 4-tuple
+/// (a NAT rebind) is re-hashed to another member whose CID table does not know
+/// it and cannot follow it, and any process on the host that also sets
+/// REUSEPORT could join the group. Both are why the connection-owning side
+/// keeps this opt-in: bind it only when the endpoint count is > 1.
+///
+/// Returns `EADDRINUSE` on a second bind when REUSEPORT is unavailable; call
+/// [`reuse_port_ingress_supported`] first.
+#[cfg(all(
+    unix,
+    not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+))]
+pub fn udp_socket_dual_reuseport(bind: &str) -> Result<std::net::UdpSocket> {
+    udp_socket_dual_impl(bind, 4 * 1024 * 1024, true)
+}
+
+/// Whether [`udp_socket_dual_reuseport`] exists on this target. Mirrors the
+/// cfg gate of the function itself (rustix's `SO_REUSEPORT` support), so a
+/// caller can pick a port-sharing ingress at compile time on every platform.
+pub const fn reuse_port_ingress_supported() -> bool {
+    cfg!(all(
+        unix,
+        not(any(
+            target_os = "solaris",
+            target_os = "illumos",
+            target_os = "cygwin"
+        ))
+    ))
+}
+
+/// Bind one QUIC ingress socket: a [`udp_socket_dual_reuseport`] group member
+/// when `group` is set and the platform supports it, the strict
+/// [`udp_socket_dual`] singleton otherwise.
+///
+/// `group` on a platform without REUSEPORT is a caller bug (a second grouped
+/// bind would fail EADDRINUSE before reaching here), so it is debug-asserted
+/// and quietly downgraded to the singleton in release builds rather than
+/// panicking a server's startup.
+pub fn udp_socket_dual_for_ingress(bind: &str, group: bool) -> Result<std::net::UdpSocket> {
+    #[cfg(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+    ))]
+    if group {
+        return udp_socket_dual_reuseport(bind);
+    }
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+    )))]
+    debug_assert!(
+        !group,
+        "caller must gate the group bind behind reuse_port_ingress_supported()"
+    );
+    udp_socket_dual(bind)
+}
+
 /// Per-session / relay socket buffer, per direction (the default; see
 /// [`sess_socket_buf`] for the effective value).
 ///
@@ -187,7 +264,13 @@ pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
     udp_socket_dual_with_size(bind, sess_socket_buf())
 }
 
+/// Dual-stack UDP socket with an explicit buffer size. See
+/// [`udp_socket_dual_impl`] for the socket's contract.
 pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::UdpSocket> {
+    udp_socket_dual_impl(bind, buf, false)
+}
+
+fn udp_socket_dual_impl(bind: &str, buf: usize, reuse_port: bool) -> Result<std::net::UdpSocket> {
     let addr: SocketAddr = bind.parse()?;
     let domain = if addr.is_ipv6() {
         socket2::Domain::IPV6
@@ -198,8 +281,31 @@ pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::Udp
     if addr.is_ipv6() {
         s.set_only_v6(false)?;
     }
-    // No SO_REUSEADDR here: the QUIC socket is a singleton and reuse would let
-    // a second instance bind the same port and silently steal packets.
+    // No SO_REUSEADDR here: the singleton QUIC socket would let a second
+    // instance bind the same port and silently steal packets. REUSEPORT —
+    // deliberately *not* REUSEADDR: the two have historically shared a name in
+    // configuration files but not semantics — is the one exception, and only
+    // when the caller asks for a group member (`reuse_port`); it is set here
+    // so it is in force before the bind below.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+    ))]
+    if reuse_port {
+        rustix::net::sockopt::set_socket_reuseport(&s, true)
+            .map_err(|e| anyhow::anyhow!("SO_REUSEPORT on {bind}: {e}"))?;
+    }
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+    )))]
+    {
+        debug_assert!(
+            !reuse_port,
+            "callers must gate a REUSEPORT group behind reuse_port_ingress_supported()"
+        );
+        let _ = reuse_port;
+    }
     s.set_nonblocking(true)?;
     if s.set_send_buffer_size(buf).is_err() {
         tracing::debug!("udp send buffer {buf} unavailable (raise net.core.wmem_max)");
@@ -2996,6 +3102,120 @@ mod tests {
         let err = toml::from_str::<ServerConf>(&format!("{server}allow_priv = true\n"))
             .expect_err("a typo must not silently flip the SSRF policy");
         assert!(err.to_string().contains("allow_priv"), "{err}");
+        // ... and the same guard covers the multi-endpoint ingress knob.
+        assert!(toml::from_str::<ServerConf>(&format!("{server}quic_endpoint = 2\n")).is_err());
+    }
+
+    /// `quic_endpoints` defaults per [`default_quic_endpoints`] (cores on
+    /// Linux, 1 elsewhere — see the fn for the measured reason), and an
+    /// explicit value clamps into `1..=MAX_QUIC_ENDPOINTS`.
+    #[test]
+    fn server_quic_endpoints_defaults_and_clamps() {
+        let server = "listen = '[::]:8443'\ncert_file = 'c'\nkey_file = 'k'\nserver_name = 's'\n";
+        let conf =
+            |extra: &str| -> ServerConf { toml::from_str(&format!("{server}{extra}")).unwrap() };
+        assert_eq!(
+            conf("").endpoint_count(),
+            default_quic_endpoints(),
+            "unset means the platform's default rule"
+        );
+        assert!(
+            conf("").endpoint_count() <= MAX_QUIC_ENDPOINTS,
+            "the default may never exceed the socket-group cap"
+        );
+        assert_eq!(conf("quic_endpoints = 1\n").endpoint_count(), 1);
+        assert_eq!(conf("quic_endpoints = 3\n").endpoint_count(), 3);
+        assert_eq!(
+            conf("quic_endpoints = 0\n").endpoint_count(),
+            1,
+            "clamped up"
+        );
+        assert_eq!(
+            conf("quic_endpoints = 999\n").endpoint_count(),
+            MAX_QUIC_ENDPOINTS,
+            "a config typo cannot spawn an unbounded socket group"
+        );
+    }
+
+    /// REUSEPORT group ingress: two sockets bind the *same* address, every
+    /// datagram lands on exactly one member, and the platform's spread
+    /// behavior is pinned as measured — Linux hashes by connection 4-tuple
+    /// (the property the multi-endpoint server relies on), while macOS hands
+    /// the whole group to one member (most recently bound), which is why
+    /// [`default_quic_endpoints`] is 1 there. A kernel that changed either way
+    /// would make this test state loudly instead of the default quietly going
+    /// wrong.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+    ))]
+    #[test]
+    fn udp_reuseport_group_shares_the_port_with_measured_spread() {
+        assert!(reuse_port_ingress_supported());
+        let a = udp_socket_dual_reuseport("127.0.0.1:0").expect("first group member");
+        let port = a.local_addr().expect("bound address").port();
+        let b = udp_socket_dual_reuseport(&format!("127.0.0.1:{port}"))
+            .expect("second group member must bind the same port");
+        // A singleton cannot share the port while the group holds it: that is
+        // exactly why the grouped bind is opt-in and `quic_endpoints = 1`
+        // keeps the strict single socket.
+        assert!(
+            udp_socket_dual(&format!("127.0.0.1:{port}")).is_err(),
+            "only REUSEPORT holders may share the port"
+        );
+
+        // 64 datagrams, each from a fresh source socket, kept alive: 64
+        // distinct connection 4-tuples, which is what a flow hash spreads on.
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut sources = Vec::with_capacity(64);
+        for i in 0..64u8 {
+            let src = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            src.send_to(&[i, i, i], addr).unwrap();
+            sources.push(src);
+        }
+        let drain = |s: &std::net::UdpSocket| {
+            let mut n = 0usize;
+            let mut buf = [0u8; 64];
+            while s.recv_from(&mut buf).is_ok() {
+                n += 1;
+            }
+            n
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let (mut a_hits, mut b_hits) = (0usize, 0usize);
+        while a_hits + b_hits < 64 && std::time::Instant::now() < deadline {
+            a_hits += drain(&a);
+            b_hits += drain(&b);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            a_hits + b_hits,
+            64,
+            "every datagram must land on exactly one member"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            a_hits > 0 && b_hits > 0,
+            "Linux spreads the group by connection 4-tuple (a={a_hits}, b={b_hits}); \
+             without this, multiple server endpoints would not scale"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            // Measured on macOS: the whole group's traffic goes to one member
+            // (the most recently bound socket), with no spreading at all.
+            // `default_quic_endpoints` returning 1 on this platform is based
+            // on exactly this; if a future macOS starts spreading, this
+            // assertion tells us the default can be raised again.
+            assert!(
+                a_hits == 0 || b_hits == 0,
+                "macOS is not expected to spread a REUSEPORT group (a={a_hits}, b={b_hits})"
+            );
+            assert_eq!(
+                (a_hits, b_hits),
+                (0, 64),
+                "the most recently bound member receives the whole group"
+            );
+        }
     }
 
     /// `dns_ip_preference` accepts exactly "ipv6"/"ipv4", defaults to the
@@ -3131,6 +3351,22 @@ mod tests {
             MAX_POOL_CONNS,
             "a config typo cannot spawn an unbounded dial loop"
         );
+        // Bulk UDP sharding: unset falls back to the shipped default, and the
+        // value clamps to the dial-fan-out cap like `quic_conns` does.
+        assert_eq!(c.udp_egress_cnt(), DEFAULT_UDP_EGRESS_CONNS);
+        assert_eq!(conf("udp_egress_conns = 1\n").udp_egress_cnt(), 1);
+        assert_eq!(
+            conf("udp_egress_conns = 0\n").udp_egress_cnt(),
+            1,
+            "the bulk class always owns at least one dedicated connection"
+        );
+        assert_eq!(
+            conf("udp_egress_conns = 999\n").udp_egress_cnt(),
+            MAX_UDP_EGRESS_CONNS,
+            "a config typo cannot dial an unbounded shard fan-out"
+        );
+        // Unknown keys stay a hard error: the new field must not open a hole.
+        assert!(toml::from_str::<ClientConf>(&format!("{base}udp_egress_conn = 2\n")).is_err());
     }
 
     /// Window sizing invariant: the documented **opt-in** 300Mb/s configuration

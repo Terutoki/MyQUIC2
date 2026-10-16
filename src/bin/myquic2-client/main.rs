@@ -105,46 +105,57 @@ async fn main() -> Result<()> {
     let server_str = c.server_addr.clone();
     let server_str_log = server_str.clone();
 
-    let rt = Arc::new(quinn::TokioRuntime);
-    let std_sock = udp_socket_dual("[::]:0")?;
-    let mut ep = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        None,
-        rt.wrap_udp_socket(std_sock)?,
-        rt.clone(),
-    )?;
-    ep.set_default_client_config(ccfg_interactive.clone());
-    let mut ep_udp = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        None,
-        rt.wrap_udp_socket(udp_socket_dual("[::]:0")?)?,
-        rt,
-    )?;
-    ep_udp.set_default_client_config(ccfg_bulk.clone());
-
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();
     let udp_split = c.udp_split();
-    let pool = ConnPool::new(conns, c.interactive_port_list(), udp_fail_closed, udp_split);
-    // One extra connection per UDP egress class, so `quic_conns` keeps meaning
-    // "TCP pool size" and the dedicated UDP connections never take a congestion
-    // window away from the bulk TCP class.
+    let udp_egress = c.udp_egress_cnt();
+    let pool = ConnPool::new(
+        conns,
+        c.interactive_port_list(),
+        udp_fail_closed,
+        udp_split,
+        udp_egress,
+    );
+    // One QUIC endpoint per pool slot — one UDP socket, CID table and driver
+    // task each — so no slot's receive syscalls, CID lookups and task wakeups
+    // queue behind another slot's. The old shape had the whole TCP pool plus
+    // the interactive UDP class on one shared endpoint and the bulk shards on
+    // a second; now every connection's ingress is its own. Client endpoints
+    // dial with an explicit config (`connect_with` in `dial_once`), so they
+    // need no default client config.
+    let rt = Arc::new(quinn::TokioRuntime);
+    let mut eps: Vec<quinn::Endpoint> = Vec::with_capacity(pool.slots_total());
+    for _ in 0..pool.slots_total() {
+        let sock = udp_socket_dual("[::]:0")?;
+        eps.push(quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            rt.wrap_udp_socket(sock)?,
+            rt.clone(),
+        )?);
+    }
+    // `quic_conns` extra connections: one per UDP egress class, plus the bulk
+    // shards, so the TCP pool keeps its documented meaning and the dedicated
+    // UDP connections never take a congestion window away from the bulk TCP
+    // class.
     info!(
-        "quic pool: {conns} TCP connection(s){} + {} dedicated UDP connection(s) ({}){} (endpoints: TCP vs UDP split, one socket each)",
+        "quic pool: {conns} TCP connection(s){} + {} dedicated UDP connection(s) ({}){} (endpoints: one UDP socket per slot)",
         if conns > 1 {
             " (bulk round-robin + interactive pin)"
         } else {
             " (single connection: interactive and bulk share slot 0)"
         },
-        if udp_split { 2 } else { 1 },
+        if udp_split { 1 + udp_egress } else { 1 },
         if udp_split {
+            let first_shard = pool.udp_global_slot(1);
             format!(
-                "interactive slot {}, bulk slot {}",
-                pool.udp_slot(EgressClass::Interactive),
-                pool.udp_slot(EgressClass::Bulk)
+                "interactive slot {}, bulk shards {}..{}",
+                pool.udp_global_slot(0),
+                first_shard,
+                first_shard + udp_egress - 1
             )
         } else {
-            format!("shared slot {}", pool.udp_slot(EgressClass::Interactive))
+            format!("shared slot {}", pool.udp_global_slot(0))
         },
         if udp_fail_closed {
             ", UDP is fail-closed: dropped rather than shared while it reconnects"
@@ -164,26 +175,19 @@ async fn main() -> Result<()> {
     for i in 0..pool.slots_total() {
         spawn_dispatcher(pool.slot(i), hub.clone());
     }
-    let tcp_slots = pool.tcp_slots();
-    for i in 0..pool.slots_total() {
-        let use_ep = if i < tcp_slots {
-            ep.clone()
-        } else {
-            ep_udp.clone()
-        };
+    for (i, ep) in eps.iter().enumerate() {
         // Per-slot transport preset (see `slot_uses_bulk_preset`): only the
         // dedicated bulk UDP class connection gets the coarse bulk preset;
         // the TCP pool and the interactive UDP class keep the tuned 2/5 ms
-        // one. The endpoint default cannot express this for the two UDP
-        // classes, which share `ep_udp` — the old code handed both the bulk
-        // preset via that default, silently degrading the interactive class.
+        // one. Each slot now has its own endpoint and dials with this config
+        // explicitly (`connect_with`), so this is the only per-class switch.
         let cfg = if slot_uses_bulk_preset(&pool, i) {
             ccfg_bulk.clone()
         } else {
             ccfg_interactive.clone()
         };
         spawn_conn_loop(
-            use_ep,
+            ep.clone(),
             cfg,
             server_str.clone(),
             c.server_name.clone(),
@@ -201,10 +205,11 @@ async fn main() -> Result<()> {
     );
     spawn_udp_reporter();
     let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
-    // SIGTERM/SIGINT: close the endpoint so every pooled connection drops and
-    // in-flight SOCKS flows end with a reset instead of being silently killed
-    // with the process. There is no drain window; the reconnect loops would
-    // redial if the process stayed alive, and process exit follows immediately.
+    // SIGTERM/SIGINT: close every slot's endpoint so all pooled connections
+    // drop and in-flight SOCKS flows end with a reset instead of being
+    // silently killed with the process. There is no drain window; the
+    // reconnect loops would redial if the process stayed alive, and process
+    // exit follows immediately.
     let mut shutdown = std::pin::pin!(shutdown_signal());
     loop {
         let (sock, peer) = tokio::select! {
@@ -219,11 +224,16 @@ async fn main() -> Result<()> {
                 }
             },
             _ = &mut shutdown => {
-                info!("shutdown signal received: closing endpoint so conns drop and peers can reconnect");
-                ep.close(0u32.into(), b"shutdown");
-                ep_udp.close(0u32.into(), b"shutdown");
-                let _ = tokio::time::timeout(Duration::from_secs(1), ep.wait_idle()).await;
-                let _ = tokio::time::timeout(Duration::from_secs(1), ep_udp.wait_idle()).await;
+                info!("shutdown signal received: closing endpoints so conns drop and peers can reconnect");
+                for e in &eps {
+                    e.close(0u32.into(), b"shutdown");
+                }
+                // One deadline for the whole group: a wide pool must not
+                // multiply the shutdown delay.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                for e in &eps {
+                    let _ = tokio::time::timeout_at(deadline, e.wait_idle()).await;
+                }
                 break;
             }
         };

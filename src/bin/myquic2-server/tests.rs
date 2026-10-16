@@ -1472,10 +1472,11 @@ fn one_connection_cannot_hold_the_whole_stream_pool() {
     assert!(MIN_STREAM_SHARE <= MAX_BIDI_STREAMS_PER_CONN as usize);
 }
 
-/// Live loopback QUIC pair driving the production transport config, so the
-/// stream-admission tests below run `handle_tcp_stream` against real
-/// streams instead of a mock.
-async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
+/// Server and client QUIC configs for a loopback pair, sharing one generated
+/// self-signed cert and the production transport tuning. Split out of
+/// `stream_test_pair` so ingress-shape tests can build their own endpoints
+/// around the same configuration.
+fn loopback_tls() -> (quinn::ServerConfig, quinn::ClientConfig) {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let params = rcgen::CertificateParams::new(vec!["test.com".to_string()]).unwrap();
     let cert = params.self_signed(&key).unwrap();
@@ -1493,7 +1494,6 @@ async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(scfg).unwrap();
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
     server_cfg.transport_config(build_transport(Congestion::Bbr, 5));
-    let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
 
     let mut ccfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -1508,9 +1508,17 @@ async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(ccfg).unwrap();
     let mut ccfg = quinn::ClientConfig::new(Arc::new(qcc));
     ccfg.transport_config(build_transport(Congestion::Bbr, 5));
+    (server_cfg, ccfg)
+}
+
+/// Live loopback QUIC pair driving the production transport config, so the
+/// stream-admission tests below run `handle_tcp_stream` against real
+/// streams instead of a mock.
+async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
+    let (server_cfg, ccfg) = loopback_tls();
+    let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client.set_default_client_config(ccfg);
-
     let server_addr = server.local_addr().unwrap();
     let accept = tokio::spawn(async move {
         let incoming = server.accept().await.unwrap();
@@ -1523,6 +1531,102 @@ async fn stream_test_pair() -> (quinn::Connection, quinn::Connection) {
         .unwrap();
     let server_conn = accept.await.unwrap();
     (client_conn, server_conn)
+}
+
+/// The `quic_endpoints` ingress shape end to end: two QUIC endpoints sharing
+/// one `SO_REUSEPORT` socket group accept, handshake and carry a stream
+/// exactly like a single endpoint does. Which member receives the client's
+/// flow is the kernel's choice — on macOS always the most recently bound
+/// member, on Linux a per-4-tuple hash; the spread behavior itself is pinned
+/// in the lib tests. What this test adds is that quinn over a grouped socket
+/// is a working server ingress on every member, and that a single client
+/// flow lands on exactly one member (never split across two CID tables).
+#[cfg(all(
+    unix,
+    not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
+))]
+#[tokio::test]
+async fn reuseport_group_endpoints_serve_a_stream() {
+    let (server_cfg, client_cfg) = loopback_tls();
+    let a = udp_socket_dual_reuseport("127.0.0.1:0").expect("first group member");
+    let addr = a.local_addr().expect("bound address");
+    let b = udp_socket_dual_reuseport(&addr.to_string()).expect("second group member");
+    let rt = Arc::new(quinn::TokioRuntime);
+    let ep_a = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_cfg.clone()),
+        rt.wrap_udp_socket(a).unwrap(),
+        rt.clone(),
+    )
+    .unwrap();
+    let ep_b = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_cfg),
+        rt.wrap_udp_socket(b).unwrap(),
+        rt.clone(),
+    )
+    .unwrap();
+    // Each member's accept path must *accept* what it receives and hold it,
+    // not just observe it: quinn only starts a server handshake once the
+    // application accepts the `Incoming`, and dropping the `Incoming` or the
+    // `Connection` refuses/closes it — either way the client hangs or dies.
+    // The member that receives the client's flow echoes its payload back, so
+    // the round trip below proves it carried real stream data.
+    let mut acc_a = tokio::spawn(serve_one_group_member(ep_a));
+    let mut acc_b = tokio::spawn(serve_one_group_member(ep_b));
+
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(client_cfg);
+    let conn = client.connect(addr, "test.com").unwrap().await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"grouped ingress").await.unwrap();
+    send.finish().unwrap();
+    assert_eq!(recv.read_to_end(64).await.unwrap(), b"grouped ingress");
+    conn.close(0u32.into(), b"done");
+
+    // Exactly one member accepted the connection (true = handshake completed
+    // and the stream round-tripped through it) while the other keeps waiting
+    // because the whole flow went to its sibling.
+    let a = tokio::time::timeout(Duration::from_millis(500), &mut acc_a).await;
+    let b = tokio::time::timeout(Duration::from_millis(500), &mut acc_b).await;
+    let served = |r: Result<
+        Result<(bool, quinn::Endpoint), tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    >| { matches!(r, Ok(Ok((true, _)))) };
+    assert_eq!(
+        served(a) as usize + served(b) as usize,
+        1,
+        "one client flow must land on exactly one group member, handshake and stream there"
+    );
+    acc_a.abort();
+    acc_b.abort();
+}
+
+/// One group member's whole accept path: accept whichever client flow the
+/// kernel hands this member, echo the client's first bidi stream back (so a
+/// completed round trip proves real stream data crossed this member, not just
+/// the handshake) and hold the connection until the client closes. `true`
+/// means this member served a flow; `false` means its driver stopped or the
+/// handshake failed.
+async fn serve_one_group_member(ep: quinn::Endpoint) -> (bool, quinn::Endpoint) {
+    let incoming = match ep.accept().await {
+        Some(incoming) => incoming,
+        None => return (false, ep), // driver stopped
+    };
+    let conn = match incoming.await {
+        Ok(conn) => conn,
+        Err(_) => return (false, ep), // handshake failed
+    };
+    if let Ok((mut send, mut recv)) = conn.accept_bi().await
+        && let Ok(data) = recv.read_to_end(64).await
+    {
+        let _ = send.write_all(&data).await;
+        let _ = send.finish();
+    }
+    // Keep the connection alive until the client closes it: dropping the last
+    // handle would close it (code 0) possibly before the echo is acknowledged.
+    conn.closed().await;
+    (true, ep)
 }
 
 async fn read_reset_code(recv: &mut quinn::RecvStream) -> u64 {

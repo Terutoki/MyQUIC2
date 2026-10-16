@@ -40,9 +40,40 @@ pub const DEFAULT_QUIC_CONNS: usize = 4;
 /// connection (dial loop, DATAGRAM dispatcher, keepalives, its own 0-RTT ticket
 /// state), so this cap — not the config parser — is what bounds the per-client
 /// cost a `quic_conns` typo can request. The UDP egress slots are beyond this:
-/// a client's worst case is `MAX_POOL_CONNS + 2` with `udp_split` (the default)
-/// and `MAX_POOL_CONNS + 1` without it.
-pub const MAX_POOL_CONNS: usize = 8;
+/// a client's worst case is `MAX_POOL_CONNS + 1 + MAX_UDP_EGRESS_CONNS` with
+/// `udp_split` (the default) and `MAX_POOL_CONNS + 1` without it.
+///
+/// 16 rather than 8: separate congestion windows are the only per-flow
+/// isolation quinn 0.11 offers (no stream priorities), so the pool width is
+/// what a many-core client's bulk TCP uplink scales with — one connection per
+/// core is a reasonable ceiling, and the cap only bounds what a config can
+/// request. The server is what ultimately pays for a wide pool, and it already
+/// prices each connection through its admission budget, so a raised
+/// `quic_conns` consumes that budget instead of multiplying anything silently.
+pub const MAX_POOL_CONNS: usize = 16;
+
+/// Default number of dedicated **bulk** UDP egress connections ("shards") the
+/// client dials with `udp_split` on.
+///
+/// Every UDP association is bound to one shard for life (see
+/// `ConnPool::udp_bind`), so the shard count is how many of the client's
+/// connections — and, on the server, how many per-connection DATAGRAM readers
+/// and `ConnectionDriver` tasks — the bulk association population spreads
+/// across. One bulk connection was the measured aggregate ceiling on
+/// multi-association UDP loads (all associations funneled into one
+/// connection's encrypt/ACK/send pipeline and one server-side reader); two is
+/// the shipped default because it doubles that ceiling at the cost of one
+/// extra dial, and many-core hosts should raise it toward cores/2 up to
+/// [`MAX_UDP_EGRESS_CONNS`]. 1 restores the single bulk connection.
+pub const DEFAULT_UDP_EGRESS_CONNS: usize = 2;
+
+/// Hard cap on the bulk UDP egress shards. Each shard is a full QUIC
+/// connection in both directions (its own congestion window, DATAGRAM buffers,
+/// dispatcher task, and a server-side connection + reader), so the cap keeps a
+/// `udp_egress_conns` typo from dialing an unbounded fan-out. Sized to the TCP
+/// pool's order of magnitude; on a host with more usable cores than this, the
+/// remaining parallelism comes from the TCP pool and per-association tasks.
+pub const MAX_UDP_EGRESS_CONNS: usize = 8;
 
 /// Concurrent bidirectional streams one QUIC connection may carry.
 ///
@@ -82,6 +113,49 @@ pub const MAX_BIDI_STREAMS_PER_CONN: u32 = 8192;
 /// that shares a server must size its per-client capacity against the shared
 /// budget, not this number.
 pub const MAX_UDP_ASSOCS: usize = 4032;
+
+/// Hard cap on a server's QUIC ingress endpoints (`quic_endpoints`).
+///
+/// Each endpoint is a full quinn `Endpoint`: its own UDP socket (a
+/// `SO_REUSEPORT` group member), receive buffer, CID table and driver task.
+/// On Linux the kernel spreads incoming connections across the group, which
+/// is how the server's packet ingress — one `recv`-loop task and one CID
+/// lookup per datagram before this — uses more than one core; platforms that
+/// do not spread default to a single endpoint, so see
+/// [`default_quic_endpoints`] for the real rule. The cap bounds the kernel
+/// receive-buffer footprint (`cap × rmem_max`) and the per-endpoint driver
+/// wakeups an overloaded host pays; past it the extra parallelism is better
+/// spent on per-connection tasks. Sized to the same order as the client's
+/// connection fan-out: 8 shards of a 10-core box is more than enough to take
+/// ingress off any single core.
+pub const MAX_QUIC_ENDPOINTS: usize = 8;
+
+/// Default [`ServerConf::quic_endpoints`] when the key is unset.
+///
+/// Linux spreads a `SO_REUSEPORT` group across its members by connection
+/// 4-tuple, so one endpoint per usable core is the useful default there —
+/// bounded by [`MAX_QUIC_ENDPOINTS`], and derived from
+/// `available_parallelism` so a cgroup's CPU limit is respected rather than
+/// the host's core count.
+///
+/// Everywhere else the default is 1, because every other platform we can
+/// measure does not spread at all: macOS (verified on this codebase, see the
+/// `udp_reuseport_group_*` tests) delivers the whole group's traffic to a
+/// single member — the most recently bound one — so extra members there are
+/// sockets and idle driver tasks, not ingress parallelism. An explicit
+/// `quic_endpoints > 1` is still honored on those platforms (the server warns
+/// that it buys nothing) rather than silently ignored, because the
+/// measurement is a property of the kernel, not of this binary.
+pub fn default_quic_endpoints() -> usize {
+    if cfg!(target_os = "linux") {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, MAX_QUIC_ENDPOINTS)
+    } else {
+        1
+    }
+}
 
 /// Default RTT seed in ms for the loss-detection estimator before the first
 /// measured sample (see `TransportTuning::initial_rtt`). 190 is the tuned

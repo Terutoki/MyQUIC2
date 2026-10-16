@@ -111,17 +111,53 @@ async fn main() -> Result<()> {
     let tuning = c.tuning();
     let congestion = Congestion::from_config(&c.congestion);
     scfg.transport_config(build_transport_tuned(congestion, c.keep_alive_secs, tuning));
-    // Dual-stack QUIC socket: explicit V6ONLY=0 so [::] also serves IPv4-mapped clients.
+    // QUIC ingress: `quic_endpoints` endpoints, each bound to `listen` with
+    // its own receive loop — on Linux they share the port as a `SO_REUSEPORT`
+    // group and the kernel spreads connections across it (the default there;
+    // see `default_quic_endpoints` for the platform rule). The first
+    // per-packet cost on the server was single-threaded — one endpoint driver
+    // did every receive syscall, version check and CID lookup for the whole
+    // process — and the group is what moves it off one core; the kernel pins
+    // each connection to one member by its 4-tuple (see
+    // `udp_socket_dual_reuseport` for the NAT-rebind and same-host-group
+    // caveats). A single-endpoint deployment keeps the strict singleton
+    // socket, no REUSEPORT at all.
     let rt = Arc::new(quinn::TokioRuntime);
-    let std_sock = udp_socket_dual(&c.listen)?;
-    let ep = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        Some(scfg),
-        rt.wrap_udp_socket(std_sock)?,
-        rt,
-    )?;
+    let want_endpoints = c.endpoint_count();
+    if want_endpoints > 1 && !reuse_port_ingress_supported() {
+        warn!(
+            "quic_endpoints={want_endpoints} requested but this platform has no SO_REUSEPORT; \
+             using a single ingress endpoint"
+        );
+    }
+    let ep_count = if reuse_port_ingress_supported() {
+        want_endpoints
+    } else {
+        1
+    };
+    if ep_count > 1 && !cfg!(target_os = "linux") {
+        // Explicit request on a platform whose kernel does not spread a
+        // REUSEPORT group (measured on macOS: the whole group's traffic goes
+        // to the most recently bound member; the default there is already 1,
+        // so this only fires for an explicit setting).
+        warn!(
+            "quic_endpoints={ep_count} on a platform that delivers a REUSEPORT group to a \
+             single member: the extra endpoints add sockets and idle driver tasks, not \
+             ingress parallelism"
+        );
+    }
+    let mut eps = Vec::with_capacity(ep_count);
+    for _ in 0..ep_count {
+        let sock = udp_socket_dual_for_ingress(&c.listen, ep_count > 1)?;
+        eps.push(quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(scfg.clone()),
+            rt.wrap_udp_socket(sock)?,
+            rt.clone(),
+        )?);
+    }
     info!(
-        "server listening on {listen} congestion={} gso_auto={} (quinn-udp probes UDP_SEGMENT/GRO)",
+        "server listening on {listen} congestion={} gso_auto={} endpoints={ep_count} (quinn-udp probes UDP_SEGMENT/GRO)",
         Congestion::from_config(&c.congestion),
         c.gso
     );
@@ -234,33 +270,98 @@ async fn main() -> Result<()> {
         info!("client token authentication enabled");
     }
     spawn_udp_reporter();
-    // SIGTERM/SIGINT: stop accepting and close the endpoint so every peer gets
-    // an immediate CONNECTION_CLOSE and redials, instead of a silent blackhole
-    // until its watchdog fires. No drain window — in-flight flows restart via
-    // the client's reconnect loops; the bounded wait is only for quinn to flush
-    // the close frames.
+    // One accept loop per endpoint, all sharing the admission budgets — the
+    // connection cap is process-wide, not per-endpoint. The loops are
+    // independent from here on: each pulls from its own endpoint's incoming
+    // queue, so a peer stuck mid-handshake (or a full accept queue) on one
+    // endpoint cannot stall another endpoint's accepts.
+    let st = Arc::new(AcceptState {
+        conn_limit: conn_limit.clone(),
+        pending_limit: pending_limit.clone(),
+        auth_token,
+        auth_enabled,
+        allow_private: c.allow_private,
+        cap,
+    });
+    let mut accepts = tokio::task::JoinSet::new();
+    for ep in &eps {
+        accepts.spawn(accept_loop(ep.clone(), st.clone()));
+    }
+    // SIGTERM/SIGINT: stop accepting and close every endpoint so all peers get
+    // an immediate CONNECTION_CLOSE and redial, instead of a silent blackhole
+    // until their watchdogs fire. No drain window — in-flight flows restart
+    // via the client's reconnect loops; the bounded wait is only for quinn to
+    // flush the close frames, shared as one deadline across all endpoints so a
+    // wide ingress cannot multiply the shutdown delay.
     let mut shutdown = std::pin::pin!(shutdown_signal());
+    let driver_lost = tokio::select! {
+        _ = &mut shutdown => {
+            info!("shutdown signal received: closing endpoints so peers redial immediately");
+            false
+        }
+        ended = accepts.join_next() => {
+            // An endpoint's driver stopped (socket failure) or its loop
+            // panicked. That share of the ingress is permanently dark, so fail
+            // fast: exiting non-zero lets a supervisor restart the process
+            // instead of silently serving from a fraction of the socket group.
+            error!("QUIC endpoint accept loop ended ({ended:?}); exiting");
+            true
+        }
+    };
+    // Stop the accept loops *before* closing the endpoints: a closed endpoint
+    // makes `accept` resolve `None`, the same shape as a dead socket, and the
+    // loops would report this orderly shutdown as a driver failure.
+    accepts.shutdown().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    for ep in &eps {
+        ep.close(0u32.into(), b"shutdown");
+    }
+    for ep in &eps {
+        let _ = tokio::time::timeout_at(deadline, ep.wait_idle()).await;
+    }
+    if driver_lost {
+        anyhow::bail!("QUIC ingress endpoint driver stopped; exiting for a supervisor restart");
+    }
+    Ok(())
+}
+
+/// Everything an endpoint's accept loop needs. The admission semaphores and
+/// the credential are shared across endpoints on purpose: the documented
+/// connection cap is what the *process* admits, however many ingress
+/// endpoints run.
+struct AcceptState {
+    /// Process-wide admitted-connection budget.
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    /// Pre-auth (handshake-in-flight) budget: bounds receive-window memory a
+    /// peer that never sends a token can pin; see the loop.
+    pending_limit: Arc<tokio::sync::Semaphore>,
+    auth_token: Arc<Vec<u8>>,
+    auth_enabled: bool,
+    allow_private: bool,
+    /// Effective admission cap, for logs and `handle_conn`'s stream-pool share.
+    cap: usize,
+}
+
+/// Accept loop for one ingress endpoint: admit a connection (or refuse it)
+/// and hand it to its own task, so one slow/malicious handshake never stalls
+/// the accept path — of this endpoint or any other.
+async fn accept_loop(ep: quinn::Endpoint, st: Arc<AcceptState>) {
     loop {
-        let incoming = tokio::select! {
-            accepted = ep.accept() => match accepted {
-                Some(i) => i,
-                None => {
-                    error!("QUIC endpoint driver stopped (socket failure?); exiting");
-                    break;
-                }
-            },
-            _ = &mut shutdown => {
-                info!("shutdown signal received: closing endpoint so peers redial immediately");
-                ep.close(0u32.into(), b"shutdown");
-                let _ = tokio::time::timeout(Duration::from_secs(3), ep.wait_idle()).await;
-                break;
+        let incoming = match ep.accept().await {
+            Some(i) => i,
+            None => {
+                error!("QUIC endpoint driver stopped (socket failure?)");
+                return;
             }
         };
-        let permit = match conn_limit.clone().try_acquire_owned() {
+        let permit = match st.conn_limit.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 if warn_once_per_sec() {
-                    warn!("connection limit {cap} reached; refusing new connection");
+                    warn!(
+                        "connection limit {} reached; refusing new connection",
+                        st.cap
+                    );
                 }
                 drop(incoming); // implicit refuse
                 continue;
@@ -269,8 +370,8 @@ async fn main() -> Result<()> {
         // Bound pre-auth receive-window memory: a peer that never sends a
         // token must not pin the whole MAX_CONNECTIONS budget. Released as
         // soon as `authenticate` returns.
-        let pending = if auth_enabled {
-            match pending_limit.clone().try_acquire_owned() {
+        let pending = if st.auth_enabled {
+            match st.pending_limit.clone().try_acquire_owned() {
                 Ok(p) => Some(p),
                 Err(_) => {
                     if warn_once_per_sec() {
@@ -285,11 +386,12 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let allow_private = c.allow_private;
-        let auth_token = auth_token.clone();
+        let allow_private = st.allow_private;
+        let auth_token = st.auth_token.clone();
         // Read by `handle_conn` to size this connection's share of the
         // process-wide stream-task pool (a clone per accepted connection).
-        let conn_limit_for_conn = conn_limit.clone();
+        let conn_limit_for_conn = st.conn_limit.clone();
+        let cap = st.cap;
         // One deadline for the handshake while a slot is held (see
         // `PRE_AUTH_TIMEOUT`); without a token there is no slot to free and the
         // more generous handshake budget applies. The token exchange below gets
@@ -364,5 +466,4 @@ async fn main() -> Result<()> {
             }
         });
     }
-    Ok(())
 }

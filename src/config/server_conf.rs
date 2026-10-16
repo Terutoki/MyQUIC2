@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::tuning::{d_bbr, d_false, d_keepalive, d_true};
+use super::tuning::{
+    MAX_QUIC_ENDPOINTS, d_bbr, d_false, d_keepalive, d_true, default_quic_endpoints,
+};
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
 
@@ -81,10 +83,42 @@ pub struct ServerConf {
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
     pub alpn: Option<String>,
+    /// Number of QUIC ingress endpoints (UDP sockets sharing `listen` through
+    /// `SO_REUSEPORT`) to run, and with them the number of accept loops, CID
+    /// tables and receive queues serving this address.
+    ///
+    /// Unset means [`default_quic_endpoints`]: every usable core on Linux,
+    /// where the kernel spreads a REUSEPORT group by connection 4-tuple, so
+    /// the first per-packet cost — one driver doing every `recv` syscall,
+    /// version check and CID lookup for the process before any connection
+    /// task runs — scales with the cores. On a platform that delivers the
+    /// whole group to a single member (macOS; the default there is 1) extra
+    /// endpoints buy nothing, and the server logs that when they are
+    /// requested anyway. 1 restores the strict singleton socket (no REUSEPORT
+    /// is set at all). Clamped to `1..=MAX_QUIC_ENDPOINTS`; forced to 1 (with
+    /// a warning) on platforms without REUSEPORT, where the second bind would
+    /// fail.
+    ///
+    /// The trade-offs are REUSEPORT's, and are worth knowing before raising
+    /// this: the kernel pins a connection to one member by its 4-tuple, so a
+    /// client that changes its source address/port (NAT rebind) loses the
+    /// connection instead of being followed to the endpoint that still knows
+    /// its CIDs, and any other process on the host that sets REUSEPORT could
+    /// bind the same address and take a share of the datagrams.
+    #[serde(default)]
+    pub quic_endpoints: Option<usize>,
 }
 
 impl ServerConf {
     pub fn alpn_bytes(&self) -> Vec<u8> {
         normalize_alpn(self.alpn.as_deref())
+    }
+
+    /// Effective QUIC ingress endpoint count: see [`ServerConf::quic_endpoints`]
+    /// for the default rule and the clamps.
+    pub fn endpoint_count(&self) -> usize {
+        self.quic_endpoints
+            .unwrap_or_else(default_quic_endpoints)
+            .clamp(1, MAX_QUIC_ENDPOINTS)
     }
 }

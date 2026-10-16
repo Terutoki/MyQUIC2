@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use super::tuning::{DEFAULT_QUIC_CONNS, MAX_POOL_CONNS, d_5, d_bbr, d_keepalive, d_true};
+use super::tuning::{
+    DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, MAX_POOL_CONNS, MAX_UDP_EGRESS_CONNS, d_5, d_bbr,
+    d_keepalive, d_true,
+};
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
 
@@ -69,13 +72,26 @@ pub struct ClientConf {
     /// class (default `true`). Destinations in `interactive_ports`, and
     /// associations whose first datagram is no larger than 512 B
     /// (STUN/DTLS/RTP-sized media, DNS, games), ride the **interactive** UDP
-    /// connection; everything else rides the **bulk** one — so a bulk flow's
-    /// congestion window and 1 MB DATAGRAM send buffer cannot starve a
-    /// latency-sensitive flow. A client with the split dials `quic_conns + 2`
-    /// connections; `false` restores the single shared UDP connection
-    /// (`quic_conns + 1`).
+    /// connection; everything else rides one of the **bulk** shards — so a
+    /// bulk flow's congestion window and 1 MB DATAGRAM send buffer cannot
+    /// starve a latency-sensitive flow. A client with the split dials
+    /// `quic_conns + 1 + udp_egress_conns` connections; `false` restores the
+    /// single shared UDP connection (`quic_conns + 1`) and disables sharding.
     #[serde(default)]
     pub udp_split: Option<bool>,
+    /// Number of dedicated **bulk** UDP egress connections ("shards").
+    ///
+    /// Every bulk association is assigned one shard from its first datagram
+    /// and keeps it for life (see `ConnPool::udp_bind`), so N bulk
+    /// associations spread over min(N, k) connections — on both ends: the
+    /// client gets k encrypt/ACK/send pipelines and k dispatcher tasks, and
+    /// the server k per-connection DATAGRAM readers. On a many-core host
+    /// raise it toward half the cores (up to 8); 1 restores the single bulk
+    /// connection. Unset = `DEFAULT_UDP_EGRESS_CONNS` (2). The interactive
+    /// class is never sharded (it must stay one stable connection), and
+    /// `udp_split = false` ignores this value.
+    #[serde(default)]
+    pub udp_egress_conns: Option<usize>,
     /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
@@ -90,6 +106,17 @@ impl ClientConf {
         self.quic_conns
             .unwrap_or(DEFAULT_QUIC_CONNS)
             .clamp(1, MAX_POOL_CONNS)
+    }
+
+    /// Bulk UDP egress shard count: [`DEFAULT_UDP_EGRESS_CONNS`] (2) when
+    /// `udp_egress_conns` is unset, clamped to
+    /// `1..=`[`MAX_UDP_EGRESS_CONNS`]. The interactive class always keeps its
+    /// single dedicated connection; this number multiplies the bulk class
+    /// only, and only while `udp_split` is on.
+    pub fn udp_egress_cnt(&self) -> usize {
+        self.udp_egress_conns
+            .unwrap_or(DEFAULT_UDP_EGRESS_CONNS)
+            .clamp(1, MAX_UDP_EGRESS_CONNS)
     }
 
     pub fn interactive_port_list(&self) -> Vec<u16> {

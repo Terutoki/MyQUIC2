@@ -1,4 +1,4 @@
-//! Shared UDP egress cache (per-class single-flight, generation-tagged memo).
+//! Shared UDP egress cache (per-binding single-flight, generation-tagged memo).
 use super::*;
 
 /// Egress freshness window in ms, mirroring the old 1 s `EGRESS_REFRESH`.
@@ -10,9 +10,10 @@ pub(crate) const EGRESS_REFRESH_MS: u64 = 1000;
 /// The relay loop calls [`SharedEgress::with_fresh`] per outbound datagram.
 /// A `quinn::Connection` clone is an Arc refcount RMW on a cache line shared
 /// with quinn's connection driver, so doing it per packet ping-pongs that line
-/// across every relay task. The memo pins one clone per worker thread and
-/// serves it with no lock and no refcount traffic; a generation bump (any
-/// successful `cached` mutation) invalidates it without touching other threads.
+/// across every relay task. The memo pins one clone per worker thread per
+/// binding and serves it with no lock and no refcount traffic; a generation
+/// bump (any successful `cached` mutation) invalidates it without touching
+/// other threads.
 pub(crate) struct EgressMemo {
     pub(crate) generation: u64,
     pub(crate) conn: quinn::Connection,
@@ -20,9 +21,14 @@ pub(crate) struct EgressMemo {
     pub(crate) stamp_ms: u64,
 }
 
+/// Init shim for the thread-local memo array: `[None; N]` needs a const item
+/// for a non-`Copy` element.
+const NO_MEMO: Option<EgressMemo> = None;
+
 thread_local! {
-    static EGRESS_MEMO: std::cell::RefCell<[Option<EgressMemo>; EgressClass::COUNT]> =
-        const { std::cell::RefCell::new([None, None]) };
+    static EGRESS_MEMO: std::cell::RefCell<[Option<EgressMemo>; MAX_UDP_SLOTS]> = const {
+        std::cell::RefCell::new([NO_MEMO; MAX_UDP_SLOTS])
+    };
 }
 
 /// The process-wide egress handle plus the freshness stamp it was published
@@ -46,34 +52,35 @@ pub(crate) struct SharedEgress {
     /// `ArcSwap::store` is lock-free and always commits, which deletes that
     /// whole failure mode: every publish lands and carries a real stamp.
     ///
-    /// One element per [`EgressClass`] (index `class.index()`): the classes have
-    /// separate caches and separate single-flight gates, so a refresh for one
-    /// class can never *write* the other's slot. They can still end up holding
-    /// the same connection: with `udp_fail_closed = false` the slot scan falls
-    /// back to the other class's UDP connection (and then to the TCP slots), and
+    /// One element per **egress binding** (index = [`UdpBind::index`]): the
+    /// interactive class's slot and each bulk shard have separate caches and
+    /// separate single-flight gates, so a refresh for one shard can never
+    /// *write* another's slot. They can still end up holding the same
+    /// connection: with `udp_fail_closed = false` the slot scan falls back to
+    /// sibling shards, the other class (and then to the TCP slots), and
     /// stickiness then keeps it there while that connection lives — see
     /// [`SharedEgress::egress_order`].
-    pub(crate) cached: [ArcSwapOption<EgressCache>; EgressClass::COUNT],
+    pub(crate) cached: [ArcSwapOption<EgressCache>; MAX_UDP_SLOTS],
     pub(crate) warned: std::sync::atomic::AtomicBool,
-    /// Single-flight refresh gate, per class: only one association task pays
+    /// Single-flight refresh gate, per binding: only one association task pays
     /// the two quinn locks (`close_reason` + `max_datagram_size`) per refresh
     /// window. The rest fail fast (UDP drop semantics) instead of herding on
     /// the same mutexes the moment the 1 s window expires on 4096 associations
     /// at once.
-    pub(crate) refreshing: [std::sync::atomic::AtomicBool; EgressClass::COUNT],
-    /// Bumped (Release) after every mutation of that class's `cached` — the
+    pub(crate) refreshing: [std::sync::atomic::AtomicBool; MAX_UDP_SLOTS],
+    /// Bumped (Release) after every mutation of that binding's `cached` — the
     /// publish in `refresh_global` and the clear in `invalidate`. With
     /// `ArcSwap` a mutation can no longer be lost, so this is bumped exactly
     /// once per mutation and never spuriously. The thread-local memo tags
     /// itself with the generation observed *before* its cached read, so a
     /// mutation concurrent with an acquire invalidates every thread's memo at
     /// once without a lock or a per-thread scan.
-    pub(crate) generation: [std::sync::atomic::AtomicU64; EgressClass::COUNT],
-    /// Last `TooLarge` budget re-read per class (coarse epoch). The re-read
+    pub(crate) generation: [std::sync::atomic::AtomicU64; MAX_UDP_SLOTS],
+    /// Last `TooLarge` budget re-read per binding (coarse epoch). The re-read
     /// takes quinn's connection-state lock, so a PMTU shrink must not cost
     /// one lock per oversized datagram for the whole memo window: at most one
     /// re-read per interval, the rest keep the last known budget.
-    pub(crate) budget_probed_ms: [std::sync::atomic::AtomicU64; EgressClass::COUNT],
+    pub(crate) budget_probed_ms: [std::sync::atomic::AtomicU64; MAX_UDP_SLOTS],
 }
 
 impl Default for SharedEgress {
@@ -97,8 +104,9 @@ impl SharedEgress {
     ///
     /// N=1 CONTRACT (client egress): a memo hit followed by `frag.send` pays
     /// exactly one quinn take per frame — the `SendDatagram::poll` lock inside
-    /// `try_send_datagram`. The 1 s memo (`EGRESS_REFRESH_MS`), the per-class
-    /// single-flight gate, and the 100 ms `refresh_budget` probe exist to keep
+    /// `try_send_datagram`. The 1 s memo (`EGRESS_REFRESH_MS`), the
+    /// per-binding single-flight gate, and the 100 ms `refresh_budget` probe
+    /// exist to keep
     /// every auxiliary take (`close_reason` / `max_datagram_size`) off this
     /// path: refresh winner only, once per window; losers fail fast;
     /// `TooLarge` re-probes at most once per 100 ms; `Unsupported` never
@@ -124,14 +132,14 @@ impl SharedEgress {
     /// this hot path).
     pub(crate) fn with_fresh<R>(
         &self,
-        class: EgressClass,
+        bind: UdpBind,
         now_ms: u64,
         f: impl FnOnce(&quinn::Connection, usize) -> R,
     ) -> Option<R> {
-        let generation = self.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
+        let generation = self.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
         EGRESS_MEMO.with(|slots| {
             let memo = slots.borrow();
-            let entry = memo[class.index()].as_ref()?;
+            let entry = memo[bind.index].as_ref()?;
             if entry.generation == generation
                 && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS
             {
@@ -148,14 +156,14 @@ impl SharedEgress {
     /// stale memo entry behind.
     pub(crate) fn memo_store(
         &self,
-        class: EgressClass,
+        bind: UdpBind,
         generation: u64,
         conn: &quinn::Connection,
         limit: usize,
         stamp_ms: u64,
     ) {
         EGRESS_MEMO.with(|slots| {
-            slots.borrow_mut()[class.index()] = Some(EgressMemo {
+            slots.borrow_mut()[bind.index] = Some(EgressMemo {
                 generation,
                 conn: conn.clone(),
                 limit,
@@ -166,8 +174,8 @@ impl SharedEgress {
 
     /// Drop this thread's memo entry (releasing a stale `Connection` promptly
     /// when the cache has no usable handle at all).
-    pub(crate) fn memo_clear(&self, class: EgressClass) {
-        EGRESS_MEMO.with(|slots| slots.borrow_mut()[class.index()] = None);
+    pub(crate) fn memo_clear(&self, bind: UdpBind) {
+        EGRESS_MEMO.with(|slots| slots.borrow_mut()[bind.index] = None);
     }
 
     /// Resolve a usable `(connection, limit, stamp)` from the process-wide
@@ -178,22 +186,26 @@ impl SharedEgress {
     pub(crate) fn acquire(
         &self,
         pool: &ConnPool,
-        class: EgressClass,
+        bind: UdpBind,
         now_ms: u64,
     ) -> Option<(quinn::Connection, usize, u64)> {
-        let cached = &self.cached[class.index()];
+        let cached = &self.cached[bind.index];
         if let Some(c) = cached.load().as_ref() {
-            // A fail-closed pool only ever publishes that class's UDP slot (see
+            // A fail-closed pool only ever publishes a slot of this class (see
             // `egress_order`), so this is an invariant check, not a filter.
             debug_assert!(
-                !pool.udp_fail_closed() || c.slot == pool.udp_slot(class),
-                "fail-closed egress must never cache a shared TCP slot"
+                !pool.udp_fail_closed()
+                    || (c.slot >= pool.tcp_slots
+                        && pool
+                            .udp_class_slots(bind.class)
+                            .contains(&(c.slot - pool.tcp_slots))),
+                "fail-closed egress must never cache another class's (or a TCP) slot"
             );
             if now_ms.saturating_sub(c.stamp_ms) < EGRESS_REFRESH_MS {
                 return Some((c.conn.clone(), c.limit, c.stamp_ms));
             }
         }
-        if let Some((c, m, stamp)) = self.refresh_global(pool, class, now_ms) {
+        if let Some((c, m, stamp)) = self.refresh_global(pool, bind, now_ms) {
             return Some((c, m, stamp));
         }
         // Stale-while-revalidate: an expired (or contended) handle is reused
@@ -207,65 +219,76 @@ impl SharedEgress {
             if c.conn.close_reason().is_none() {
                 return Some((c.conn.clone(), c.limit, c.stamp_ms));
             }
-            self.invalidate(class);
+            self.invalidate(bind);
         }
-        self.memo_clear(class);
+        self.memo_clear(bind);
         None
     }
 
-    /// Slot scan order for `class`: its own UDP slot first, then — fail-open
-    /// only — the other UDP class's slot, then the TCP slots.
+    /// Slot scan order for `bind`: its own slot first, then — the fail-closed
+    /// boundary — the rest of its class's dedicated slots, then, fail-open
+    /// only, the other class's slots and the TCP slots.
     ///
-    /// A fail-closed pool stops after the first entry, which is what makes UDP
-    /// independent of TCP: when the dedicated connection is down the datagram is
+    /// A fail-closed pool stops after the class's own UDP slots, which is what
+    /// makes UDP independent of TCP: when a dedicated connection is down the
+    /// datagram fails over inside its class's shard set (a sibling bulk shard
+    /// is still a UDP-only connection — the isolation contract is
+    /// UDP-vs-TCP, not shard-vs-shard) and, when even that is empty, is
     /// dropped rather than queued on a connection whose congestion window and
-    /// packet payload it would compete with (quinn writes DATAGRAM frames before
-    /// STREAM frames, so a bulk UDP flow on a shared connection starves the TCP
-    /// streams on it). The shared order is kept for operators who would rather
-    /// lose isolation than lose packets, via `udp_fail_closed = false`.
+    /// packet payload it would compete with (quinn writes DATAGRAM frames
+    /// before STREAM frames, so a bulk UDP flow on a shared connection starves
+    /// the TCP streams on it). The wider order is kept for operators who would
+    /// rather lose isolation than lose packets, via `udp_fail_closed = false`.
     ///
     /// Stack-array, not a `Vec`: this runs once per refresh window on the
     /// single-flight winner, and the pool's slot count bounds it.
     pub(crate) fn egress_order(
         &self,
         pool: &ConnPool,
-        class: EgressClass,
-    ) -> ([usize; MAX_POOL_CONNS + EgressClass::COUNT], usize) {
-        let mut order = [0usize; MAX_POOL_CONNS + EgressClass::COUNT];
-        let own = pool.udp_slot(class);
+        bind: UdpBind,
+    ) -> ([usize; MAX_POOL_CONNS + MAX_UDP_SLOTS], usize) {
+        let mut order = [0usize; MAX_POOL_CONNS + MAX_UDP_SLOTS];
+        let own = pool.udp_global_slot(bind.index);
         order[0] = own;
         let mut k = 1;
+        let push =
+            |slot: usize, order: &mut [usize; MAX_POOL_CONNS + MAX_UDP_SLOTS], k: &mut usize| {
+                if slot != own && !order[..*k].contains(&slot) {
+                    order[*k] = slot;
+                    *k += 1;
+                }
+            };
+        // Same-class siblings first: the rest of this class's dedicated slots.
+        for i in pool.udp_class_slots(bind.class) {
+            push(pool.udp_global_slot(i), &mut order, &mut k);
+        }
         if !pool.udp_fail_closed() {
-            // UDP-over-UDP beats UDP-over-TCP, so the other class comes first.
-            let other = pool.udp_slot(class.other());
-            if other != own {
-                order[k] = other;
-                k += 1;
+            // UDP-over-UDP beats UDP-over-TCP, so the other class comes before
+            // the TCP slots.
+            for i in 0..pool.udp_slot_count() {
+                push(pool.udp_global_slot(i), &mut order, &mut k);
             }
             for i in 0..pool.tcp_slots() {
-                if i != own {
-                    order[k] = i;
-                    k += 1;
-                }
+                push(i, &mut order, &mut k);
             }
         }
         (order, k)
     }
 
-    /// Refresh `class`'s cache under its single-flight gate. Returns the fresh
+    /// Refresh `bind`'s cache under its single-flight gate. Returns the fresh
     /// handle and the stamp to tag it with, which is always `now_ms`:
     /// `ArcSwap::store` cannot lose, so there is no unpublished-handle case to
     /// keep cold.
     pub(crate) fn refresh_global(
         &self,
         pool: &ConnPool,
-        class: EgressClass,
+        bind: UdpBind,
         now_ms: u64,
     ) -> Option<(quinn::Connection, usize, u64)> {
         // Single-flight: a loser drops fast (UDP semantics) instead of paying
         // the quinn locks while a winner is already refreshing. The losing
         // datagram is counted in `dgram_drops::NO_EGRESS` by the caller.
-        if self.refreshing[class.index()].swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if self.refreshing[bind.index].swap(true, std::sync::atomic::Ordering::AcqRel) {
             return None;
         }
         struct RefreshGuard<'a>(&'a std::sync::atomic::AtomicBool);
@@ -274,8 +297,8 @@ impl SharedEgress {
                 self.0.store(false, std::sync::atomic::Ordering::Release);
             }
         }
-        let _guard = RefreshGuard(&self.refreshing[class.index()]);
-        let cached = &self.cached[class.index()];
+        let _guard = RefreshGuard(&self.refreshing[bind.index]);
+        let cached = &self.cached[bind.index];
         // Stickiness first: while the cached connection is still usable, keep it
         // and only re-read its DATAGRAM budget (the path MTU can have changed
         // under it). Re-running the slot scan here instead is what used to move
@@ -283,7 +306,7 @@ impl SharedEgress {
         // slot recovered — a second target-side source-port change (and a new
         // server-side session) for a flow that had already failed over, i.e.
         // exactly the flap-back churn the docs promise not to do. A fail-closed
-        // pool can only have published that class's UDP slot, so stickiness
+        // pool can only have published a slot of this class, so stickiness
         // cannot keep it on a TCP connection.
         let current = cached.load();
         if let Some(c) = current.as_ref()
@@ -296,13 +319,13 @@ impl SharedEgress {
                 stamp_ms: now_ms,
                 slot: c.slot,
             })));
-            self.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
             return Some((c.conn.clone(), m, now_ms));
         }
         drop(current);
         // The cached connection is gone (or lost DATAGRAM support): walk the
         // egress order above.
-        let (order, k) = self.egress_order(pool, class);
+        let (order, k) = self.egress_order(pool, bind);
         for &i in &order[..k] {
             let Some(slot) = pool.slots.get(i) else {
                 continue;
@@ -321,7 +344,7 @@ impl SharedEgress {
                             stamp_ms: now_ms,
                             slot: i,
                         })));
-                        self.generation[class.index()]
+                        self.generation[bind.index]
                             .fetch_add(1, std::sync::atomic::Ordering::Release);
                         return Some(((**c).clone(), m, now_ms));
                     }
@@ -338,10 +361,10 @@ impl SharedEgress {
         None
     }
 
-    pub(crate) fn invalidate(&self, class: EgressClass) {
-        self.cached[class.index()].store(None);
+    pub(crate) fn invalidate(&self, bind: UdpBind) {
+        self.cached[bind.index].store(None);
         // The clear always lands, so the memo invalidation is never skipped.
-        self.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Re-read the live DATAGRAM budget on the cached handle, keeping it.
@@ -357,7 +380,7 @@ impl SharedEgress {
     /// A no-op when the budget has not actually moved, which is the case for
     /// every payload past `MQP_FRAG_MAX_PAYLOAD` (the fragmenter rejects those
     /// before quinn ever sees them, and its `limit` was already correct).
-    pub(crate) fn refresh_budget(&self, class: EgressClass) {
+    pub(crate) fn refresh_budget(&self, bind: UdpBind) {
         const BUDGET_PROBE_INTERVAL_MS: u64 = 100;
         // Precise clock for the throttle: `coarse_millis` advances in 1 s
         // steps, so a 100 ms interval measured on it is really 0~1 s and a
@@ -368,7 +391,7 @@ impl SharedEgress {
         // counts from process start, so a verdict inside the first millisecond
         // must still arm the throttle instead of probing once per datagram.
         let now = mono_millis().max(1);
-        let probed = &self.budget_probed_ms[class.index()];
+        let probed = &self.budget_probed_ms[bind.index];
         // Zero means never probed: the mono epoch counts from process start,
         // so a small `now` must not read as "probed 0 ms ago".
         let last = probed.load(std::sync::atomic::Ordering::Relaxed);
@@ -376,7 +399,7 @@ impl SharedEgress {
             return;
         }
         probed.store(now, std::sync::atomic::Ordering::Relaxed);
-        let cached = &self.cached[class.index()];
+        let cached = &self.cached[bind.index];
         let current = cached.load();
         let Some(c) = current.as_ref() else {
             return;
@@ -393,6 +416,6 @@ impl SharedEgress {
             stamp_ms: coarse_millis(),
             slot: c.slot,
         })));
-        self.generation[class.index()].fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }

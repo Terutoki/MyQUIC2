@@ -27,20 +27,28 @@ auth_token = ""
 # Connection isolation (optional; omit = 4 TCP connections, the code default).
 # quic_conns=4 spreads bulk TCP round-robin across three bulk cwnds while
 # interactive_ports pin to the first. UDP is never one of those slots: it gets
-# its own dedicated connection (slot quic_conns), so TCP and UDP never share a
-# congestion window or a packet. 1 restores the legacy single shared TCP
-# connection (UDP stays separate); clamped to 1..=8.
+# its own dedicated connections past the TCP range (interactive + bulk shards),
+# so TCP and UDP never share a congestion window or a packet. 1 restores the
+# legacy single shared TCP connection (UDP stays separate); clamped to 1..=16.
 quic_conns = 4
 # UDP egress policy while its dedicated connection reconnects. true (default)
 # drops the datagram (counted in the 60s "udp budget" line) rather than sharing
-# a TCP connection; false restores the fallback onto the interactive connection.
+# a TCP connection; false lets it fail over to the other UDP connections first
+# and then the TCP pool.
 # udp_fail_closed = true
-# Split UDP egress into two dedicated connections by class (default true):
+# Split UDP egress into dedicated connections by class (default true):
 # interactive_ports destinations and flows whose first datagram is <= 512 B
 # (STUN/DTLS/RTP-sized media, DNS, games) ride the interactive connection,
 # everything else the bulk one, so a bulk flow cannot starve a
 # latency-sensitive flow. false = one shared UDP connection (one fewer dial).
 # udp_split = true
+# Number of dedicated **bulk** UDP connections (default 2, clamped 1..=8).
+# Every bulk association is bound to one shard for life, so N associations
+# spread over min(N, k) connections on both ends — k client send/encrypt
+# pipelines and k server-side DATAGRAM readers instead of one. Raise toward
+# half the cores on many-core hosts; 1 restores the single bulk connection.
+# Ignored with udp_split = false.
+# udp_egress_conns = 2
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the

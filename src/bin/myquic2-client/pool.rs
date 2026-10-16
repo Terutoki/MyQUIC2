@@ -1,6 +1,10 @@
 //! Client connection pool: ConnSlot, ConnPool, EgressClass, shared constants.
 use super::*;
 
+/// Width of the UDP egress range the egress cache and the pool's scratch
+/// arrays must cover: the interactive slot plus the largest shard set.
+pub(crate) const MAX_UDP_SLOTS: usize = 1 + MAX_UDP_EGRESS_CONNS;
+
 /// The pool slot's published connection.
 ///
 /// `ArcSwapOption` replaces the `tokio::sync::RwLock` this used to be: readers
@@ -229,7 +233,7 @@ impl ConnSlot {
 /// connection behind it.
 ///
 /// `live` describes the **TCP** slots only. The dedicated UDP egress slot lives
-/// outside this range (see [`ConnPool::udp_slot`]) and is never a TCP target.
+/// outside this range (see [`ConnPool::udp_bind`]) and is never a TCP target.
 pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     debug_assert!(!live.is_empty(), "the pool always has at least one slot");
     let n = live.len();
@@ -253,9 +257,25 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     if live[0] { 0 } else { preferred }
 }
 
+/// A resolved UDP egress binding: which dedicated UDP connection an
+/// association's datagrams ride, fixed from its first datagram for the
+/// association's life (see [`ConnPool::udp_bind`]).
+///
+/// `index` addresses the UDP **range**, not the pool: `0` is the interactive
+/// slot, `1..=bulk_shards` the bulk shards, and [`ConnPool::udp_global_slot`]
+/// maps it to a pool slot. The egress cache in `SharedEgress` is keyed by the
+/// same index, so once an association has bound, its datagrams (and all
+/// fragments of a payload — they must stay on one connection) never consult
+/// the class again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UdpBind {
+    pub(crate) class: EgressClass,
+    pub(crate) index: usize,
+}
+
 /// UDP egress class: which dedicated connection an association's datagrams ride.
 ///
-/// The bulk connection carries large or steady flows (HTTP/3, WireGuard, big
+/// The bulk class carries large or steady flows (HTTP/3, WireGuard, big
 /// transfers); the interactive one carries latency-sensitive flows. Without the
 /// split every association shares one connection, and quinn drops the *newest*
 /// datagram when that connection's 1 MB DATAGRAM send buffer fills and lets
@@ -263,8 +283,9 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
 /// latency-sensitive one with no isolation at all.
 ///
 /// An association is classified once, from its first datagram, and keeps its
-/// class for life: switching mid-flow would move the server session to another
-/// connection and change the source port the target sees.
+/// class — and, for bulk, one of several shard connections — for life:
+/// switching mid-flow would move the server session to another connection and
+/// change the source port the target sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EgressClass {
     /// An `interactive_ports` destination, or a first payload no larger than
@@ -275,24 +296,6 @@ pub(crate) enum EgressClass {
 }
 
 impl EgressClass {
-    /// Number of classes, i.e. how many dedicated UDP slots `udp_split` dials.
-    pub(crate) const COUNT: usize = 2;
-
-    /// Slot offset within the UDP range.
-    pub(crate) fn index(self) -> usize {
-        match self {
-            EgressClass::Interactive => 0,
-            EgressClass::Bulk => 1,
-        }
-    }
-
-    pub(crate) fn other(self) -> Self {
-        match self {
-            EgressClass::Interactive => EgressClass::Bulk,
-            EgressClass::Bulk => EgressClass::Interactive,
-        }
-    }
-
     pub(crate) fn name(self) -> &'static str {
         match self {
             EgressClass::Interactive => "interactive",
@@ -314,8 +317,8 @@ impl EgressClass {
 pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 
 /// The client's QUIC connection pool: `n` TCP slots indexed `0..n`, where
-/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`), plus one or two
-/// **dedicated UDP egress slots** past the TCP range.
+/// `n = ClientConf::conn_count()` (4 by default, `quic_conns`), plus a
+/// **dedicated UDP egress range** past the TCP slots.
 ///
 /// Slot 0 is the interactive connection: every port in `interactive_ports` rides
 /// it, and it is the sole TCP slot when `quic_conns == 1`. The other TCP slots
@@ -323,7 +326,7 @@ pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 /// queue instead of all of it. quinn 0.11 has no per-stream priority, so separate
 /// congestion windows are the isolation mechanism.
 ///
-/// The UDP slots are *additional*, not carved out of the TCP range: making UDP
+/// The UDP range is *additional*, not carved out of the TCP range: making UDP
 /// independent must not cost TCP a congestion window, and `quic_conns` keeps its
 /// documented meaning ("TCP pool size"). UDP and TCP on one connection is not a
 /// theoretical concern — quinn fills every packet with queued DATAGRAM frames
@@ -333,10 +336,15 @@ pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 /// datagram hit the 1 MiB datagram-send-buffer `Blocked` drop. One connection per
 /// class is the only isolation QUIC gives without stream priorities.
 ///
-/// With `udp_split` (the default) there are **two** UDP slots, one per
-/// [`EgressClass`], so a bulk UDP flow's congestion window and DATAGRAM buffer
-/// cannot starve a latency-sensitive flow either; `udp_split = false` restores
-/// the single shared UDP slot and one fewer dial.
+/// With `udp_split` (the default) the UDP range starts with the **interactive**
+/// class's single slot (index 0) followed by `udp_egress_conns` **bulk** shards
+/// (indices 1..), so a bulk UDP flow's congestion window and DATAGRAM buffer
+/// cannot starve a latency-sensitive flow, and the bulk association population
+/// spreads across several connections instead of funneling every bulk flow into
+/// one connection's driver, dispatcher and server-side reader. A bulk
+/// association is assigned its shard once, from its first datagram
+/// ([`ConnPool::udp_bind`]); `udp_split = false` restores the single shared UDP
+/// slot (index 0) and disables sharding.
 ///
 /// The slots live in a plain `Arc<Vec<ConnSlot>>` indexed by slot number. The
 /// set is fixed at startup and never mutated, so a routing read is one indexed
@@ -346,40 +354,55 @@ pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 pub(crate) struct ConnPool {
     pub(crate) slots: Arc<Vec<ConnSlot>>,
     pub(crate) rr: Arc<std::sync::atomic::AtomicUsize>,
+    /// Round-robin cursor for bulk shard assignment (see [`ConnPool::udp_bind`]).
+    pub(crate) udp_rr: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) interactive_ports: Arc<std::collections::HashSet<u16, foldhash::fast::RandomState>>,
     /// TCP slots: the routing range is `0..tcp_slots` (0 interactive, rest
-    /// bulk). Never includes the UDP slots.
+    /// bulk). Never includes the UDP range.
     pub(crate) tcp_slots: usize,
-    /// Whether UDP egress is split into one dedicated connection per
-    /// [`EgressClass`] (the default) or shares a single one.
+    /// Whether UDP egress is split into one dedicated connection for the
+    /// interactive class plus `bulk_shards` for the bulk class (the default)
+    /// or shares a single one.
     pub(crate) udp_split: bool,
-    /// When set, UDP only ever uses its class's dedicated slot: if that
-    /// connection is down the datagram is dropped (counted in
+    /// Bulk UDP shards (indices `1..1 + bulk_shards` of the UDP range). 1 when
+    /// `udp_split` is off, in which case the single shared slot is index 0.
+    pub(crate) bulk_shards: usize,
+    /// When set, UDP only ever uses dedicated UDP slots *of its own class*: if
+    /// every one of them is down the datagram is dropped (counted in
     /// `dgram_drops::NO_EGRESS`) instead of sharing a TCP connection's
     /// congestion window.
     pub(crate) udp_fail_closed: bool,
 }
 
 impl ConnPool {
-    /// Build the process pool: `tcp` TCP slots indexed `0..tcp`, then one
-    /// dedicated UDP slot per egress class (one with `udp_split` off).
-    /// `tcp` is re-clamped here so no caller can build a pool wider than the
-    /// stack liveness array the routing path uses to describe it.
+    /// Build the process pool: `tcp` TCP slots indexed `0..tcp`, then the UDP
+    /// range — with `udp_split` on, the interactive class's slot at UDP index
+    /// 0 plus `udp_bulk_shards` bulk shards at `1..`, clamped here so no
+    /// caller can build a pool wider than the scratch arrays the routing and
+    /// egress paths size from [`MAX_POOL_CONNS`] / [`MAX_UDP_SLOTS`].
     pub(crate) fn new(
         n: usize,
         interactive_ports: Vec<u16>,
         udp_fail_closed: bool,
         udp_split: bool,
+        udp_bulk_shards: usize,
     ) -> Self {
         let tcp = n.clamp(1, MAX_POOL_CONNS);
-        let udp_slots = if udp_split { EgressClass::COUNT } else { 1 };
+        let bulk_shards = if udp_split {
+            udp_bulk_shards.clamp(1, MAX_UDP_EGRESS_CONNS)
+        } else {
+            1
+        };
+        let udp_slots = if udp_split { 1 + bulk_shards } else { 1 };
         let slots: Vec<ConnSlot> = (0..tcp + udp_slots).map(|_| ConnSlot::fresh()).collect();
         Self {
             slots: Arc::new(slots),
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            udp_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
             tcp_slots: tcp,
             udp_split,
+            bulk_shards,
             udp_fail_closed,
         }
     }
@@ -389,26 +412,68 @@ impl ConnPool {
         self.tcp_slots
     }
 
-    /// Every slot, TCP first then the UDP egress slots: the range to walk when
-    /// spawning per-slot tasks or scanning the registry.
-    pub(crate) fn slots_total(&self) -> usize {
-        self.tcp_slots
-            + if self.udp_split {
-                EgressClass::COUNT
-            } else {
-                1
-            }
+    /// UDP-range width: the interactive slot plus the bulk shards with the
+    /// split on, a single shared slot with it off.
+    pub(crate) fn udp_slot_count(&self) -> usize {
+        if self.udp_split {
+            1 + self.bulk_shards
+        } else {
+            1
+        }
     }
 
-    /// The dedicated UDP egress slot for `class`. One past the TCP range (so
-    /// never a TCP routing target); with `udp_split` off both classes map to
-    /// the same slot.
-    pub(crate) fn udp_slot(&self, class: EgressClass) -> usize {
-        if self.udp_split {
-            self.tcp_slots + class.index()
-        } else {
-            self.tcp_slots
+    /// Pool slot holding UDP-range index `index`.
+    pub(crate) fn udp_global_slot(&self, index: usize) -> usize {
+        self.tcp_slots + index
+    }
+
+    /// UDP-range indices carrying `class`. The interactive class is always the
+    /// single index 0; the bulk class is `1..` with the split on and the
+    /// shared index 0 with it off. This is the fail-closed boundary: a
+    /// datagram may fail over inside its own class's set but never leaves it.
+    pub(crate) fn udp_class_slots(&self, class: EgressClass) -> std::ops::Range<usize> {
+        match class {
+            EgressClass::Interactive => 0..1,
+            EgressClass::Bulk if self.udp_split => 1..self.udp_slot_count(),
+            EgressClass::Bulk => 0..1,
         }
+    }
+
+    /// Every slot, TCP first then the UDP range: the range to walk when
+    /// spawning per-slot tasks or scanning the registry.
+    pub(crate) fn slots_total(&self) -> usize {
+        self.tcp_slots + self.udp_slot_count()
+    }
+
+    /// Bind `class` to a UDP-range index: the interactive class is always
+    /// index 0; bulk associations rotate over the shards. Called once per
+    /// association, from its first datagram — see [`UdpBind`].
+    ///
+    /// Rotation (not hashing): associations arrive in an arbitrary order and
+    /// live for a long time, so a cursor spreads them as evenly as a hash
+    /// would while staying one relaxed fetch_add and trivially testable.
+    pub(crate) fn udp_bind(&self, class: EgressClass) -> UdpBind {
+        let shard = match class {
+            EgressClass::Interactive => 0,
+            EgressClass::Bulk if self.udp_split => self
+                .udp_rr
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            EgressClass::Bulk => 0,
+        };
+        self.udp_bind_shard(class, shard)
+    }
+
+    /// The explicit-shard form of [`ConnPool::udp_bind`]: `shard` is reduced
+    /// modulo the class's shard count, so callers that carry their own stable
+    /// association key (and tests) never need the cursor. Interactive
+    /// bindings always resolve to index 0 — the class is never sharded.
+    pub(crate) fn udp_bind_shard(&self, class: EgressClass, shard: usize) -> UdpBind {
+        let index = match class {
+            EgressClass::Interactive => 0,
+            EgressClass::Bulk if self.udp_split => 1 + shard % self.bulk_shards,
+            EgressClass::Bulk => 0,
+        };
+        UdpBind { class, index }
     }
 
     /// Egress class for a UDP association, from its first datagram: a known
@@ -502,12 +567,16 @@ impl ConnPool {
 /// (ACK threshold 8 / 10 ms delay / 2 MB DATAGRAM buffers) instead of the
 /// tuned interactive one (2 / 5 ms / 1 MB).
 ///
-/// Exactly the dedicated bulk UDP class connection does. The TCP pool and
-/// the *interactive* UDP class — whose whole point is latency-sensitive
-/// flows — keep the tuned preset, as `build_transport_tuned_class`
-/// documents. With `udp_split` off the two UDP classes share one slot,
-/// which keeps the bulk preset it had before the per-class split (same
-/// index as `udp_slot(Bulk)`).
+/// Exactly the bulk UDP shards do. The TCP pool and the *interactive* UDP
+/// class — whose whole point is latency-sensitive flows — keep the tuned
+/// preset, as `build_transport_tuned_class` documents. With `udp_split` off
+/// the single shared UDP slot keeps the bulk preset it had before the
+/// per-class split.
 pub(crate) fn slot_uses_bulk_preset(pool: &ConnPool, i: usize) -> bool {
-    i == pool.udp_slot(EgressClass::Bulk)
+    if i < pool.tcp_slots {
+        return false;
+    }
+    // UDP range: with the split, index 0 is the interactive slot and every
+    // shard after it is bulk; without it, the single shared slot is bulk.
+    !pool.udp_split || i > pool.tcp_slots
 }

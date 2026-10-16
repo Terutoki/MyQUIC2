@@ -90,6 +90,7 @@ key_file = "server-key.pem"
 server_name = "test.com"       # certificate SAN + expected SNI
 congestion = "bbr"             # bbr | cubic
 keep_alive_secs = 5            # 1–300; idle = max(3x, 15s)
+# quic_endpoints = 4           # SO_REUSEPORT ingress endpoints, 1–8 (default: one per core on Linux, 1 elsewhere)
 # dns_ip_preference = "ipv6"   # ipv6 (default) | ipv4: family tried first for resolved targets
 allow_private = false          # keep false on public exit nodes
 auth_token = ""                # shared secret; must match the client (empty = no auth; firewall otherwise)
@@ -115,9 +116,10 @@ keep_alive_secs = 5
 reconnect_timeout_secs = 5
 # dns_ip_preference = "ipv6"           # ipv6 (default) | ipv4: family tried first (incl. server_addr)
 auth_token = ""                       # must match the server
-quic_conns = 4                        # TCP pool size, 1–8 (UDP has its own connections)
+quic_conns = 4                        # TCP pool size, 1–16 (UDP has its own connections)
 
 # udp_split = true                    # split interactive/bulk UDP egress (default on)
+# udp_egress_conns = 2                # bulk UDP shards, 1–8: N associations spread over min(N, k) connections per end
 # udp_fail_closed = true              # drop rather than degrade when UDP has no connection
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
 ```
@@ -127,8 +129,9 @@ quic_conns = 4                        # TCP pool size, 1–8 (UDP has its own co
 | Note | Detail |
 |---|---|
 | 🔐 `auth_token` | Strongly recommended; an empty token makes the server an open relay (firewall isolation only). At most 256 B on the wire (a longer token can never authenticate and is rejected at startup) |
-| 🧵 `quic_conns` | TCP pool size; interactive ports (DNS/NTP/STUN) pin to slot 0; UDP gets 2 class-split connections |
+| 🧵 `quic_conns` | TCP pool size; interactive ports (DNS/NTP/STUN) pin to slot 0; UDP gets its own connections: one interactive plus `udp_egress_conns` (2 by default) bulk shards. Every slot dials from its own QUIC endpoint (own UDP socket and receive path) |
 | 🛡️ `allow_private` | Whether private/loopback targets may be dialed (default `false`) |
+| 🚦 `quic_endpoints` | Server ingress parallelism: QUIC sockets sharing `listen` through `SO_REUSEPORT`, each with its own receive loop, CID table and accept path. Default is one per usable core on Linux (kernel spreads connections across the group); 1 on other platforms, where a REUSEPORT group is delivered to a single member. A connection is pinned to its member by 4-tuple, so a client NAT rebind drops it (the client redials) |
 | 🌐 `dns_ip_preference` | Family tried first for resolved names: `"ipv6"` (default, RFC 6724-style) or `"ipv4"`; applies to exit-side targets and the client's `server_addr` |
 | 🧮 `max_peer_memory_mb` | Optional admission cap. The ~1.06 GiB UDP session pool is charged first, then the remainder is divided by the 8.25 MiB per-connection transport figure — see [Limits & memory](#-limits--memory) |
 
@@ -166,9 +169,9 @@ Auth                           uni stream carrying the token bytes verbatim (sen
 - **Hot paths kept razor-thin**: zero-copy TCP ↔ QUIC pump (`write_chunk`/`read_chunks` hand owned buffers to quinn, one vectored write to TCP), lock-free thread-local memos (DNS, session, egress), and reused staging buffers. A relayed UDP payload costs **one frame allocation per outgoing QUIC DATAGRAM frame** — quinn's `send_datagram` takes an owned `Bytes` and frees it on its own task, so it cannot be pooled — plus, at most, one copy into a per-session/per-association staging buffer that is never reallocated. Batching amortizes the frame over up to 16 payloads; a fragmented payload costs one frame per fragment.
 - **Modern congestion control**: BBR by default (Cubic as an escape hatch), ECN + adaptive PMTU, and GSO/GRO batched I/O — a single connection can saturate the link.
 - **Built for high latency**: default transport parameters are tuned for long-haul links and prioritize low queued latency.
-- **Connection-level isolation**: TCP, interactive UDP and bulk UDP each keep their own congestion window — no bandwidth fights, no queuing behind each other.
-- **Socket buffers that hold on Linux**: the QUIC endpoint asks for 4 MB and session sockets 64 KiB of `SO_RCVBUF`/`SO_SNDBUF` (`MYQUIC2_SESS_SOCKET_BUF=32768` on RAM-tight routers, `=131072` for the zero-loss point the burst test measured; clamped to 16 KiB–4 MiB); where `net.core.{r,w}mem_max` clamps that (OpenWrt ships ~208 KiB), the service retries with `SO_*BUFFFORCE` whenever it holds `CAP_NET_ADMIN` — root-run OpenWrt included — so burst headroom survives stock sysctls; a clamp warning names the sysctl otherwise.
-- **Signal-driven shutdown**: SIGTERM/SIGINT closes the QUIC endpoint at once, so peers receive CONNECTION_CLOSE and redial within seconds instead of waiting out the ~20 s silence watchdog; in-flight flows restart through the reconnect loops (no drain window).
+- **Connection-level isolation**: TCP, interactive UDP and bulk UDP each keep their own congestion window — no bandwidth fights, no queuing behind each other. Every client pool slot dials from **its own QUIC endpoint** (own UDP socket, CID table and receive loop), and on Linux the server runs `quic_endpoints` endpoints sharing `listen` through `SO_REUSEPORT` (one per usable core by default) with the kernel spreading connections across them — no single receive loop serves the whole process.
+- **Socket buffers that hold on Linux**: every QUIC endpoint socket (one per client pool slot, `quic_endpoints` of them on the server) asks for 4 MB and session sockets 64 KiB of `SO_RCVBUF`/`SO_SNDBUF` (`MYQUIC2_SESS_SOCKET_BUF=32768` on RAM-tight routers, `=131072` for the zero-loss point the burst test measured; clamped to 16 KiB–4 MiB); where `net.core.{r,w}mem_max` clamps that (OpenWrt ships ~208 KiB), the service retries with `SO_*BUFFFORCE` whenever it holds `CAP_NET_ADMIN` — root-run OpenWrt included — so burst headroom survives stock sysctls; a clamp warning names the sysctl otherwise.
+- **Signal-driven shutdown**: SIGTERM/SIGINT closes the QUIC endpoints at once, so peers receive CONNECTION_CLOSE and redial within seconds instead of waiting out the ~20 s silence watchdog; in-flight flows restart through the reconnect loops (no drain window).
 - **Tunable ceiling**: widen the transport windows on both ends to match your link's BDP and push throughput higher; pure TOML, no rebuild required — see [Limits & memory](#-limits--memory).
 
 ---
@@ -188,6 +191,7 @@ Numbers are for the shipped defaults (2/4/2 MB windows, 64 KiB session buffers);
 | UDP sessions | 8192 process-wide, 4032 per client process | global semaphore, and `fair_sess_cap()` = `clamp(8192 / session-holding connections, 1024, 4096)` per connection |
 | Concurrent TCP flows | 8192 per client, 16384 stream tasks process-wide on the server | `MAX_SOCKS_CONNS` / `MAX_STREAM_TASKS`, with a 1024 floor per connection |
 | QUIC connections | 4096 with a token, 256 without | `max_connections` / `max_peer_memory_mb`; the tokenless cap is what keeps an unauthenticated peer from pinning the full transport budget (256 × 8.25 MiB ≈ 2.06 GiB) |
+| QUIC endpoint sockets | client: one per pool slot (up to 16); server: `quic_endpoints` (up to 8; Linux default = usable cores) | distinct ingress/egress receive loops; each socket asks for 4 MB `SO_RCVBUF` + 4 MB `SO_SNDBUF` that the kernel can reclaim |
 
 `max_peer_memory_mb` charges the session pool **once**, globally, and only then divides what is left by the per-connection figure — so the startup log's "worst case" line is the memory this process can actually pin, not just the transport share. A budget at or below the session pool admits exactly one connection and says so explicitly in the log.
 

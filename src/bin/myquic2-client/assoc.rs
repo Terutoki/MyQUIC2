@@ -187,11 +187,11 @@ pub(crate) async fn udp_associate_inner(
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
     let mut published_app: Option<SocketAddr> = None;
-    // Egress class, fixed by the first datagram that reaches the send path and
-    // kept for the association's life (see [`EgressClass`]); until then every
-    // datagram would classify from itself, which cannot happen because the
-    // first send classifies before it goes out.
-    let mut class: Option<EgressClass> = None;
+    // Egress binding (class + shard), fixed by the first datagram that reaches
+    // the send path and kept for the association's life (see [`UdpBind`]);
+    // until then every datagram would bind from itself, which cannot happen
+    // because the first send binds before it goes out.
+    let mut bind: Option<UdpBind> = None;
     // Opportunistic 2-pack staging: one small payload held across drain
     // iterations so two consecutive same-destination small datagrams go out as
     // a single BATCH frame (one quinn lock + one AEAD instead of two). Never
@@ -357,22 +357,24 @@ pub(crate) async fn udp_associate_inner(
                 // old `min(1350)` made every UDP payload above 1338 B vanish on
                 // a 1472 B path (see `dgram_payload_cap`). Payloads past a single
                 // frame are split by the fragmenter rather than dropped.
-                // A first datagram may not be classified yet (an earlier one may
+                // A first datagram may not be bound yet (an earlier one may
                 // have failed framing validation); the send path pins it.
-                let class = *class.get_or_insert_with(|| {
+                let bind = *bind.get_or_insert_with(|| {
                     let c = pool.udp_class(&addr, payload.len());
+                    let b = pool.udp_bind(c);
                     tracing::debug!(
-                        "udp assoc {sess}: egress class {} (first payload {} B)",
+                        "udp assoc {sess}: egress class {} shard {} (first payload {} B)",
                         c.name(),
+                        b.index,
                         payload.len()
                     );
-                    c
+                    b
                 });
-                let sent = match egress_shared.with_fresh(class, now, |c, limit| {
+                let sent = match egress_shared.with_fresh(bind, now, |c, limit| {
                     {
                         if payload.len() <= BATCH_SMALL_MAX {
                             if let Some(p) = pending_pack.take() {
-                                if p.class == class && pending_addr.as_ref() == addr {
+                                if p.bind == bind && pending_addr.as_ref() == addr {
                                     let pair: [&[u8]; 2] = [&pending_buf[..p.len], payload];
                                     match send_udp_batch(c, sess, &addr, &pair, limit) {
                                         DatagramSend::Sent => {
@@ -405,7 +407,7 @@ pub(crate) async fn udp_associate_inner(
                                         }
                                     }
                                 }
-                                // Different destination or class: hand the
+                                // Different destination or binding: hand the
                                 // staged payload to the single-datagram path
                                 // first, then stage this one below.
                                 let pa = pending_addr.as_ref();
@@ -419,7 +421,7 @@ pub(crate) async fn udp_associate_inner(
                             pending_buf.clear();
                             pending_buf.extend_from_slice(payload);
                             pending_pack = Some(PendingPack {
-                                class,
+                                bind,
                                 len: payload.len(),
                             });
                             return PayloadSend {
@@ -443,19 +445,19 @@ pub(crate) async fn udp_associate_inner(
                         // mutation concurrent with `acquire` then bumps past
                         // this tag, so the memo below is never served for a
                         // value the mutation replaced.
-                        let generation = egress_shared.generation[class.index()]
+                        let generation = egress_shared.generation[bind.index]
                             .load(std::sync::atomic::Ordering::Acquire);
-                        match egress_shared.acquire(&pool, class, now) {
+                        match egress_shared.acquire(&pool, bind, now) {
                             Some((conn, limit, stamp)) => {
-                                egress_shared.memo_store(class, generation, &conn, limit, stamp);
+                                egress_shared.memo_store(bind, generation, &conn, limit, stamp);
                                 frag.send(&conn, sess, &addr, payload, limit)
                             }
                             None => {
                                 // No isolated egress connection right now: this
-                                // class's dedicated UDP slot has not come up, is
-                                // reconnecting, or another thread owns the
-                                // refresh gate. Counted *exactly* (this counter is
-                                // not batched) and warned once per
+                                // binding's dedicated UDP slot(s) have not come
+                                // up, are reconnecting, or another thread owns
+                                // the refresh gate. Counted *exactly* (this
+                                // counter is not batched) and warned once per
                                 // `DROP_WARN_INTERVAL_MS`, because "is
                                 // `udp_fail_closed` costing me anything" is only
                                 // answerable if a short outage is visible at all.
@@ -468,11 +470,12 @@ pub(crate) async fn udp_associate_inner(
                                     n,
                                     || {
                                         format!(
-                                            "; class={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
-                                            class.name(),
+                                            "; class={} bind={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                                            bind.class.name(),
+                                            bind.index,
                                             pool.udp_fail_closed(),
-                                            pool.slot(pool.udp_slot(class)).is_live(),
-                                            egress_shared.refreshing[class.index()]
+                                            pool.slot(pool.udp_global_slot(bind.index)).is_live(),
+                                            egress_shared.refreshing[bind.index]
                                                 .load(std::sync::atomic::Ordering::Relaxed),
                                         )
                                     },
@@ -515,7 +518,7 @@ pub(crate) async fn udp_associate_inner(
                         tracing::debug!(
                             "client datagram dropped: past the path's DATAGRAM budget"
                         );
-                        egress_shared.refresh_budget(class);
+                        egress_shared.refresh_budget(bind);
                     }
                     DatagramSend::ConnectionLost => {
                         tracing::debug!("client egress stale, invalidating shared cache");
@@ -523,9 +526,9 @@ pub(crate) async fn udp_associate_inner(
                         dgram_drops::warn_egress_drop(
                             dgram_drops::EgressDrop::ConnectionLost,
                             n,
-                            || format!("; class={}, send outcome {outcome:?}, cached handle invalidated", class.name()),
+                            || format!("; class={}, send outcome {outcome:?}, cached handle invalidated", bind.class.name()),
                         );
-                        egress_shared.invalidate(class);
+                        egress_shared.invalidate(bind);
                     }
                     DatagramSend::Unsupported => {
                         tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
@@ -552,7 +555,7 @@ pub(crate) async fn udp_associate_inner(
                         &pool,
                         &mut frag,
                         sess,
-                        p.class,
+                        p.bind,
                         &pending_addr.as_ref(),
                         &pending_buf[..p.len],
                     );
@@ -628,7 +631,7 @@ pub(crate) async fn udp_associate_inner(
 /// (`len` bytes) and the destination in its `pending_addr` slot, so nothing
 /// here allocates.
 pub(crate) struct PendingPack {
-    pub(crate) class: EgressClass,
+    pub(crate) bind: UdpBind,
     pub(crate) len: usize,
 }
 
@@ -669,13 +672,13 @@ pub(crate) fn flush_deferred_pair(
     pool: &ConnPool,
     frag: &mut DgramFragmenter,
     sess: u32,
-    class: EgressClass,
+    bind: UdpBind,
     addr: &TargetAddrRef<'_>,
     payload: &[u8],
 ) {
     let now_flush = coarse_millis();
     if egress_shared
-        .with_fresh(class, now_flush, |c, limit| {
+        .with_fresh(bind, now_flush, |c, limit| {
             frag.send(c, sess, addr, payload, limit)
         })
         .is_some()
@@ -685,16 +688,16 @@ pub(crate) fn flush_deferred_pair(
     // Generation read before the cached read, the same contract the
     // per-datagram miss path in `udp_associate_inner` documents.
     let generation =
-        egress_shared.generation[class.index()].load(std::sync::atomic::Ordering::Acquire);
-    match egress_shared.acquire(pool, class, now_flush) {
+        egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+    match egress_shared.acquire(pool, bind, now_flush) {
         Some((conn, limit, stamp)) => {
-            egress_shared.memo_store(class, generation, &conn, limit, stamp);
+            egress_shared.memo_store(bind, generation, &conn, limit, stamp);
             frag.send(&conn, sess, addr, payload, limit);
         }
         None => {
             let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
             dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, n, || {
-                format!("; class={} (deferred 2-pack flush)", class.name())
+                format!("; class={} (deferred 2-pack flush)", bind.class.name())
             });
         }
     }
