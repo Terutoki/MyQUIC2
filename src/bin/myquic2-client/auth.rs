@@ -27,6 +27,17 @@ fn reconnect_backoff() -> impl Iterator<Item = Duration> {
         .build()
 }
 
+/// How often the silence watchdog re-reads `ConnectionStats`.
+///
+/// Detection granularity is this tick on top of the silence window, so the old
+/// hard-coded 5 s poll made a 10 s watchdog fire at ~15 s — i.e. at the QUIC
+/// idle timeout it is supposed to beat, quietly turning it back into the dead
+/// code the old `4x/20 s` window made it. One second keeps a 10 s window a
+/// ~11 s detector; the tick costs one `ConnectionStats` snapshot per second per
+/// connection (the same quinn state-lock acquisition the 5 s tick paid, just
+/// more often — still nowhere near the per-packet path).
+const WATCHDOG_POLL: Duration = Duration::from_secs(1);
+
 pub(crate) fn spawn_conn_loop(
     ep: quinn::Endpoint,
     cfg: quinn::ClientConfig,
@@ -61,6 +72,15 @@ pub(crate) fn spawn_conn_loop(
                     // as health: keepalives and retransmits keep `udp_tx`
                     // advancing into a dead path, so an `rx || tx` reset
                     // blinds the detector exactly when the downlink dies.
+                    //
+                    // `watchdog_silence` is derived from the same clamped
+                    // keepalive as the transport's idle timeout and is
+                    // `max(2x keepalive, 8 s)`, provably strictly below
+                    // `max(3x keepalive, 15 s)` (see its unit test). So these
+                    // detectors really fire first and force the reconnect,
+                    // instead of the old `4x/20 s` window that the idle timer
+                    // always beat — which made them dead code and pinned path
+                    // death at ~15 s. `WATCHDOG_POLL` bounds the overshoot.
                     let watchdog = async {
                         let s0 = conn.stats();
                         // (a) Downlink / full blackhole: inbound datagrams
@@ -86,16 +106,16 @@ pub(crate) fn spawn_conn_loop(
                         // stalled, without waiting for a loss declaration, so
                         // transient loss with recovering ACKs resets the
                         // baseline and can never trip it.
-                        // Worst case if (b)'s gates somehow never line up:
-                        // the server's idle timeout (3x keepalive, >= 15 s)
-                        // fires first on the unanswered path and its
-                        // CONNECTION_CLOSE converges us.
+                        // Backstop only: a path where (b)'s gates never line
+                        // up (no ack-eliciting traffic sent) still falls to
+                        // the *idle* timeout, which is strictly above this
+                        // window and can therefore no longer mask it.
                         let mut last_ack = s0.frame_rx.acks;
                         let mut ack_since = std::time::Instant::now();
                         let mut ack_window_sent = s0.path.sent_packets;
                         info!("watchdog armed rx={last_rx} silence_limit={watchdog_silence:?}");
                         loop {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(WATCHDOG_POLL).await;
                             if conn.close_reason().is_some() {
                                 break;
                             }

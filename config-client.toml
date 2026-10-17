@@ -24,6 +24,15 @@ auth_token = ""
 # measured sample (default 190). Set it to the link RTT, e.g. 140 on a 140 ms
 # link, to shorten first-flight loss recovery (~575 -> ~435 ms first PTO).
 # initial_rtt_ms = 140
+# Path MTU (max UDP payload) every new connection starts from, bytes, default
+# 1400 (clamped 1200..=1472). quinn starts at the 1200-byte QUIC floor and its
+# PMTU discovery is opportunistic, so a busy connection can spend a long time
+# there: 18-23% more packets, and UDP payloads above 1150 B split into two MQP
+# fragments. 1400 is safe on Ethernet/PPPoE/tunnels; IPv4-only paths can use
+# 1472 (no discovery ramp, and 1400-1420-byte UDP payloads stay one frame).
+# Mirror on both ends. A too-high value costs a loss burst until quinn's
+# black-hole detector drops back to the 1200-byte floor.
+# initial_mtu = 1400
 # Connection isolation (optional; omit = 4 TCP connections, the code default).
 # quic_conns=4 spreads bulk TCP round-robin across three bulk cwnds while
 # interactive_ports pin to the first. UDP is never one of those slots: it gets
@@ -50,6 +59,13 @@ quic_conns = 4
 # Ignored with udp_split = false.
 # udp_egress_conns = 2
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
+# Destination UDP ports always treated as bulk egress, whatever their first
+# packet size (default [51820, 1194] = WireGuard, OpenVPN). Needed because the
+# egress class is fixed by the association's first datagram and a tunnel's
+# first packet is small (WireGuard handshake 148 B), which the size heuristic
+# alone would otherwise put on the single interactive connection next to
+# DNS/STUN/games. Ports in interactive_ports keep their interactive class.
+# udp_bulk_ports = [51820, 1194]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the
 # versioned identifier; set the same value on both sides.

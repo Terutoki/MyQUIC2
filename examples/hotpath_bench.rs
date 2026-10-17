@@ -58,6 +58,41 @@
 //!                                 loss); the N-pack staging exists to move
 //!                                 exactly this ceiling.
 //!
+//!   `lat <socks> <host:port> <n> [payload]`
+//!                                 serial UDP round trip: one UDP ASSOCIATE,
+//!                                 then `n` request datagrams one at a time,
+//!                                 each timed from send to the matching reply
+//!                                 of the `echo` target. The request payload
+//!                                 carries the iteration index and each reply
+//!                                 is checked against it, so a late reply from
+//!                                 a timed-out iteration is never booked as the
+//!                                 current RTT. Reports samples/lost plus
+//!                                 p50/p90/p99/p999/max/mean in µs.
+//!                                 `<host:port>` must be an IPv4 literal (like
+//!                                 `udp`); domain-encoded targets are covered by
+//!                                 `udpdomain`.
+//!
+//!   `lattcp <socks> <host:port> <n> [bytes]`
+//!                                 per-iteration stream setup plus first byte:
+//!                                 one fresh SOCKS5 CONNECT per iteration,
+//!                                 timed up to the success reply, then a
+//!                                 `bytes`-byte payload written and echoed back
+//!                                 by the `techo` target and timed as a second,
+//!                                 independent round trip. Reports
+//!                                 p50/p90/p99/p999/max/mean for CONNECT and for
+//!                                 the first echo.
+//!
+//! The throughput/pps/loss modes cannot see transport latency at all: a
+//! loopback path has ~0 RTT, so congestion control, buffers, ACK delay and the
+//! initial-MTU choice move no number there. Shape the path before trusting a
+//! `lat`/`lattcp` sample, e.g. on Linux:
+//!   tc qdisc add dev lo root netem delay 70ms loss 0.5%
+//!   cargo run --release --example hotpath_bench -- \
+//!       lat 127.0.0.1:1080 127.0.0.1:9000 500
+//!   cargo run --release --example hotpath_bench -- \
+//!       lattcp 127.0.0.1:1080 127.0.0.1:9000 200
+//!   tc qdisc del dev lo root
+//!
 //!   `chan <n> [depth]`
 //!                                 per-datagram cost of the client's inbound
 //!                                 hand-off (`tokio::sync::mpsc` bounded
@@ -140,6 +175,18 @@ fn main() {
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128),
             args.get(6).and_then(|s| s.parse().ok()).unwrap_or(20_000),
         ),
+        Some("lat") => lat(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
+        Some("lattcp") => lattcp(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
         Some("chan") => chan(
             args[2].parse().unwrap(),
             args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256),
@@ -166,7 +213,7 @@ fn main() {
         ),
         _ => {
             eprintln!(
-                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpps|udppaced|udpsweep|tcpecho|chan|server|reply|bulk> ..."
+                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpps|udppaced|lat|lattcp|udpsweep|tcpecho|chan|server|reply|bulk> ..."
             );
             std::process::exit(2);
         }
@@ -738,6 +785,214 @@ fn udp(socks: &str, target: &str, n: usize, batch: usize) {
         dt.as_secs_f64(),
         recv as f64 / dt.as_secs_f64()
     );
+}
+
+/// Nearest-rank percentile of an ascending-sorted sample set, shared by both
+/// latency modes so a percentile means the same thing on both lines.
+///
+/// Nearest rank, not interpolation: the question a latency benchmark answers is
+/// "how bad was the worst 1 request in 100", and that is an *observed* request.
+/// An interpolated value between two samples would smooth over exactly the tail
+/// the benchmark exists to expose (netem loss + retransmission spikes).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (sorted.len() as f64 * p).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+/// One latency distribution as a `p50=...`-style fragment in µs.
+///
+/// Sorts `samples` in place once and then indexes it through [`percentile`], so
+/// both latency modes pay one sort per distribution and print the same set of
+/// statistics. An empty set is reported explicitly instead of as zeros: an
+/// all-lost run must not look like a fast one.
+fn latency_summary(samples: &mut [f64]) -> String {
+    if samples.is_empty() {
+        return "no samples".to_string();
+    }
+    samples.sort_unstable_by(f64::total_cmp);
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    format!(
+        "p50={:.0} p90={:.0} p99={:.0} p999={:.0} max={:.0} mean={:.0} µs",
+        percentile(samples, 0.50),
+        percentile(samples, 0.90),
+        percentile(samples, 0.99),
+        percentile(samples, 0.999),
+        percentile(samples, 1.00),
+        mean
+    )
+}
+
+/// Serial UDP request/response latency: one SOCKS5 UDP ASSOCIATE, then `n`
+/// request datagrams to the `echo` target one at a time, each timed from
+/// `send_to` to the matching reply. This is the shape transport tuning shows up
+/// in — the throughput modes (`udp`, `udpps`) cannot see it, and loopback has
+/// ~0 RTT, so run it on a netem-shaped path (see the module docs).
+///
+/// One outstanding datagram is not the same as in-order replies: a datagram
+/// whose wait timed out may still be retransmitted on the QUIC path and land
+/// during a later iteration, so the payload carries the iteration index and a
+/// reply is only accepted when it matches. Otherwise a late reply would be
+/// booked as the *current* RTT and the whole distribution would drift low.
+/// A full-payload compare additionally rejects corruption, counted separately
+/// because a mismatch and a loss have completely different causes.
+fn lat(socks: &str, target: &str, n: usize, payload: usize) {
+    /// Iteration marker at the front of the payload, big-endian u64.
+    const MARKER: usize = 8;
+    /// A request lost on the QUIC path still has a retransmission to lose before
+    /// it is a loss; this bounds how long the harness waits for that. It only
+    /// costs wall time on a genuinely lost sample.
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    let (host, port) = split_host(target);
+    // The marker is the minimum payload that can carry the iteration index.
+    let payload = payload.max(MARKER);
+    let (_control, relay) = socks_associate(socks).unwrap();
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    u.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut pkt = udp_request(&host, port, payload);
+    // Payload starts here; the header is constant, so later iterations rewrite
+    // only the marker and the loop measures the tunnel, not header encoding.
+    let data = pkt.len() - payload;
+    let mut buf = vec![0u8; 65535];
+    let mut samples = Vec::with_capacity(n);
+    let (mut lost, mut stale, mut bad) = (0usize, 0usize, 0usize);
+    let t0 = Instant::now();
+    for i in 0..n {
+        pkt[data..data + MARKER].copy_from_slice(&(i as u64).to_be_bytes());
+        let started = Instant::now();
+        if u.send_to(&pkt, relay).is_err() {
+            lost += 1;
+            continue;
+        }
+        loop {
+            let (k, _) = match u.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(_) => {
+                    // No reply inside the window: count it lost and move on. A
+                    // late answer is rejected by the marker check below rather
+                    // than being attributed to a later iteration.
+                    lost += 1;
+                    break;
+                }
+            };
+            // Reply framing: 3 reserved bytes, ATYP, address, port, payload.
+            let hlen = match buf.get(3) {
+                Some(1) => 10,
+                Some(4) => 22,
+                _ => {
+                    bad += 1;
+                    continue;
+                }
+            };
+            if k < hlen || k - hlen != payload {
+                bad += 1;
+                continue;
+            }
+            if buf[hlen..hlen + MARKER] != pkt[data..data + MARKER] {
+                // A reply from an earlier timed-out iteration: not this RTT.
+                stale += 1;
+                continue;
+            }
+            if buf[hlen..k] != pkt[data..] {
+                // Right marker, wrong bytes: corruption, not latency.
+                bad += 1;
+                continue;
+            }
+            samples.push(started.elapsed().as_secs_f64() * 1e6);
+            break;
+        }
+    }
+    let wall = t0.elapsed();
+    println!(
+        "lat n={n} payload={payload} samples={} lost={lost} stale={stale} bad={bad} \
+         wall={:.3}s {}",
+        samples.len(),
+        wall.as_secs_f64(),
+        latency_summary(&mut samples)
+    );
+    if samples.is_empty() {
+        eprintln!(
+            "lat FAIL: no reply verified (proxy down, or the target is not the `echo` server)"
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Per-iteration SOCKS5 CONNECT plus first-byte latency, one fresh stream per
+/// iteration. The CONNECT sample is dial + SOCKS handshake up to the success
+/// reply; the echo sample is a small payload written and echoed back by the
+/// `techo` target, timed separately. The two measure different paths: stream
+/// setup is dominated by the client's optimistic CONNECT answer and the proxy
+/// dial, while the first echo carries the server-side dial result plus the first
+/// QUIC stream round trip.
+///
+/// A fresh connection per iteration is deliberate. Reusing one stream would
+/// only measure the tunnel's per-datagram cost and hide every per-flow setup
+/// change (pool hit rate, handshake cost, stream open), which is the half of the
+/// latency budget CONNECT is here to report.
+fn lattcp(socks: &str, target: &str, n: usize, bytes: usize) {
+    let (host, port) = split_host(target);
+    let bytes = bytes.max(1);
+    // Position-dependent payload: a shifted, truncated or duplicated echo cannot
+    // match, so a wrong reply is reported instead of silently timing it.
+    let payload: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    let mut connect = Vec::with_capacity(n);
+    let mut echo = Vec::with_capacity(n);
+    let (mut connect_lost, mut echo_lost, mut bad) = (0usize, 0usize, 0usize);
+    let mut buf = vec![0u8; 64 * 1024];
+    let t0 = Instant::now();
+    for _ in 0..n {
+        let started = Instant::now();
+        let Ok(mut s) = socks_connect(socks, &host, port) else {
+            connect_lost += 1;
+            continue;
+        };
+        connect.push(started.elapsed().as_secs_f64() * 1e6);
+        // Time from the first byte written to the last byte echoed: the round
+        // trip the tunnel adds to a stream that is already open.
+        let started = Instant::now();
+        let mut got = 0usize;
+        let mut corrupt = false;
+        if s.write_all(&payload).is_ok() {
+            while got < payload.len() {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => {
+                        if k > payload.len() - got || buf[..k] != payload[got..got + k] {
+                            corrupt = true;
+                            break;
+                        }
+                        got += k;
+                    }
+                }
+            }
+        }
+        drop(s);
+        if got == payload.len() {
+            echo.push(started.elapsed().as_secs_f64() * 1e6);
+        } else {
+            echo_lost += 1;
+            if corrupt {
+                bad += 1;
+            }
+        }
+    }
+    let wall = t0.elapsed();
+    println!(
+        "lattcp n={n} bytes={bytes} connect_ok={} connect_lost={connect_lost} \
+         echo_ok={} echo_lost={echo_lost} bad={bad} wall={:.3}s | connect {} | echo {}",
+        connect.len(),
+        echo.len(),
+        wall.as_secs_f64(),
+        latency_summary(&mut connect),
+        latency_summary(&mut echo)
+    );
+    if connect.is_empty() {
+        eprintln!("lattcp FAIL: no SOCKS5 CONNECT completed (proxy down or target unreachable)");
+        std::process::exit(1);
+    }
 }
 
 /// One UDP ASSOCIATE whose datagrams alternate between two *different* domain

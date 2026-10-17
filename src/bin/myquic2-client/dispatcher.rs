@@ -100,11 +100,29 @@ fn stage_reply(
     }
 }
 
-fn lookup_entry(
-    cache: &mut [DispatchSlot; DISPATCH_CACHE],
-    hub: &UdpHub,
-    sess: u32,
-) -> Option<(Arc<AssocEntry>, SocketAddr)> {
+/// Result of resolving a session id for a batch frame.
+///
+/// `lookup_entry` used to return `Option`, so the batch path could not tell
+/// "no such association" from "association has no app address yet" and bumped
+/// `udp_write::no_app` for both — while the unknown-session case was already
+/// counted in `dgram_drops::UNKNOWN_SESS` inside the hub probe. That reported
+/// `no-app` for replies to associations this process had already torn down,
+/// which is the ordinary late-reply race, not a missing app address. The split
+/// keeps the 60 s `udp write` line honest; the single-frame path already
+/// distinguishes the two and is unchanged.
+enum Lookup {
+    /// Live association and its app address.
+    Hit(Arc<AssocEntry>, SocketAddr),
+    /// No such association: never published, already released, or a dead entry
+    /// the hub still serves. The drop is counted where it is decided (the hub
+    /// probe bumps `UNKNOWN_SESS`); the call site only drops.
+    NoEntry,
+    /// The association is live but has no recorded app address yet, so a reply
+    /// has nowhere to go: count it in `udp_write::no_app`.
+    NoApp,
+}
+
+fn lookup_entry(cache: &mut [DispatchSlot; DISPATCH_CACHE], hub: &UdpHub, sess: u32) -> Lookup {
     let idx = (sess as usize) & (DISPATCH_CACHE - 1);
     let cached = if cache[idx].sess == sess {
         cache[idx]
@@ -132,7 +150,7 @@ fn lookup_entry(
                     app: None,
                 };
                 dgram_drops::bump(&dgram_drops::UNKNOWN_SESS);
-                return None;
+                return Lookup::NoEntry;
             };
             if !fresh.is_alive() {
                 cache[idx] = DispatchSlot {
@@ -140,7 +158,7 @@ fn lookup_entry(
                     entry: None,
                     app: None,
                 };
-                return None;
+                return Lookup::NoEntry;
             }
             let app = fresh.app();
             cache[idx] = DispatchSlot {
@@ -151,7 +169,10 @@ fn lookup_entry(
             (fresh, app)
         }
     };
-    app.map(|a| (entry, a))
+    match app {
+        Some(app) => Lookup::Hit(entry, app),
+        None => Lookup::NoApp,
+    }
 }
 
 /// Batch-capable staging: routes one QUIC DATAGRAM that may hold 1 app payload
@@ -174,9 +195,15 @@ pub(crate) fn dispatch_stage_multi(
             dgram_drops::bump(&dgram_drops::REFUSED);
             return 0;
         }
-        let Some((entry, app)) = lookup_entry(cache, hub, sess) else {
-            udp_write::no_app();
-            return 0;
+        let (entry, app) = match lookup_entry(cache, hub, sess) {
+            Lookup::Hit(entry, app) => (entry, app),
+            // `lookup_entry` already counted the unknown session; both drop
+            // arms stage nothing and the caller returns 0.
+            Lookup::NoEntry => return 0,
+            Lookup::NoApp => {
+                udp_write::no_app();
+                return 0;
+            }
         };
         match b.addr {
             TargetAddrRef::Ip(dst) => {
@@ -462,8 +489,11 @@ pub(crate) fn dispatch_one(
 /// Each run shares one `sendmmsg` on Linux (one `try_send_to` per frame on the
 /// portable fallback); runs flush in encounter order, so reply order is
 /// preserved exactly. `hdrs`/`offs` are reused across bursts (cleared, never
-/// freed) and the `refs` array lives on the stack, so the steady path allocates
-/// nothing per reply.
+/// freed), so the steady path allocates nothing per reply. A run of one — the
+/// common shape, since replies arrive one per drain burst — skips the
+/// 32-entry `refs` array entirely and passes a 1-element `[SendFrame; 1]`:
+/// building and zero-initializing the full array cost 512 B of stack stores
+/// plus a fill loop per single reply, with no grouping to pay for it.
 ///
 /// **Only the ≤22-byte SOCKS5 header is staged, never the payload.** The frame
 /// handed to [`udp_try_send_grouped`] is `(header, payload)` and Linux sends the
@@ -513,6 +543,16 @@ pub(crate) fn flush_staged(
                 let start = hdrs.len();
                 encode_reply_header(hdrs, s.dst);
                 offs.push((start, hdrs.len() - start));
+            }
+            if n == 1 {
+                // Single-reply run: one header, one payload, one frame. No
+                // `refs` array to initialize or fill — this is the path a
+                // session that receives one reply per burst always takes.
+                let (o, l) = offs[0];
+                let frame: [SendFrame<'_>; 1] = [(&hdrs[o..o + l], &staged[k].payload[..])];
+                udp_try_send_grouped(run_sock, map_for_dual(run_app), &frame);
+                k += 1;
+                continue;
             }
             let mut refs: [SendFrame<'_>; LAST_HOP_DRAIN] = [(&[], &[]); LAST_HOP_DRAIN];
             for ((r, (o, l)), s) in refs.iter_mut().zip(offs.iter()).zip(&staged[k..k + n]) {

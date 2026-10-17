@@ -643,18 +643,29 @@ pub(crate) fn sendmmsg_frames(
     // call, no manual `mmsghdr` layout.
     let mut iovs: [MaybeUninit<IoSlice<'_>>; 2 * LAST_HOP_DRAIN] =
         [const { MaybeUninit::uninit() }; 2 * LAST_HOP_DRAIN];
-    let mut cmsgs: [_; LAST_HOP_DRAIN] = std::array::from_fn(|_| SendAncillaryBuffer::default());
+    // `n` control buffers, not 32: a `SendAncillaryBuffer` is a zero-length
+    // `&mut []` plus a length, so the eager version was a handful of dead
+    // stores per call rather than the ~2.7 KB the pre-rustix fixed arrays cost
+    // — but this call is issued once per same-destination run, and a run of
+    // length 1 is the multi-session steady state, so even those stores were on
+    // the hot path for no benefit. `MaybeUninit` keeps it sound without
+    // `assume_init`: `write` initialises exactly slot `i` immediately before
+    // its header borrows it, and the kernel only ever sees `0..n`.
+    let mut cmsgs: [MaybeUninit<SendAncillaryBuffer<'static, 'static, 'static>>; LAST_HOP_DRAIN] =
+        [const { MaybeUninit::uninit() }; LAST_HOP_DRAIN];
     let mut msgs: [MaybeUninit<MMsgHdr<'_>>; LAST_HOP_DRAIN] =
         [const { MaybeUninit::uninit() }; LAST_HOP_DRAIN];
     // One destination shared by every message: all frames in this call go to
     // `dst`, and `SocketAddrAny` owns its storage, so one `msg_name` serves
     // the whole run.
     let sa = SocketAddrAny::from(*dst);
-    // `zip(cmsgs.iter_mut())`: each message needs its own `&mut
-    // SendAncillaryBuffer` for as long as the `MMsgHdr` lives, and indexing
-    // the array per message would reborrow the whole array each time (E0499);
-    // `iter_mut` hands out disjoint items instead.
-    for (i, (cmsg, (hdr, body))) in cmsgs.iter_mut().zip(frames[..n].iter()).enumerate() {
+    // `iter_mut` over exactly the used prefix: each message needs its own `&mut
+    // SendAncillaryBuffer` for as long as the `MMsgHdr` lives, and indexing the
+    // array per message would reborrow the whole array each time (E0499);
+    // `iter_mut` hands out disjoint items instead. The `cmsgs[..n]` subslice is
+    // the whole point of the `MaybeUninit` array: the entries past `n` are
+    // never touched.
+    for (i, (cmsg_slot, (hdr, body))) in cmsgs[..n].iter_mut().zip(frames[..n].iter()).enumerate() {
         // A zero-length header must not become a zero-length *separate* iovec
         // (the kernel would still join them, but skipping it keeps the common
         // server case — no header — at exactly one iovec, as before).
@@ -671,6 +682,10 @@ pub(crate) fn sendmmsg_frames(
         // range is inside the array, and each iovec borrows a frame that
         // outlives the syscall.
         let iov = unsafe { std::slice::from_raw_parts(iovs[2 * i].as_ptr(), nios) };
+        // SAFETY-adjacent (safe API): `write` initialises this slot before the
+        // header takes its `&mut`, and no `assume_init` of the other slots ever
+        // happens.
+        let cmsg = cmsg_slot.write(SendAncillaryBuffer::default());
         msgs[i].write(MMsgHdr::new_with_addr(&sa, iov, cmsg));
     }
     // SAFETY: exactly `n` messages were written, at `0..n`, and only `0..n` is

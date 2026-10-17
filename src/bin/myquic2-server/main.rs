@@ -594,11 +594,15 @@ async fn accept_loop(
                         match tokio::time::timeout_at(deadline, accepted_fut).await {
                             Ok(_) if c.close_reason().is_none() => c,
                             Ok(_) => {
-                                warn!("client handshake failed: {:?}", c.close_reason());
+                                if let Some(sup) = claim_server_log(ServerLog::HandshakeFailed) {
+                                    warn!("client handshake failed: {:?}{sup}", c.close_reason());
+                                }
                                 return;
                             }
                             Err(_) => {
-                                warn!("handshake timed out after {handshake_budget:?}");
+                                if let Some(sup) = claim_server_log(ServerLog::HandshakeTimeout) {
+                                    warn!("handshake timed out after {handshake_budget:?}{sup}");
+                                }
                                 return;
                             }
                         }
@@ -606,17 +610,23 @@ async fn accept_loop(
                     Err(connecting) => match tokio::time::timeout_at(deadline, connecting).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => {
-                            warn!("accept err: {e:#}");
+                            if let Some(sup) = claim_server_log(ServerLog::AcceptError) {
+                                warn!("accept err: {e:#}{sup}");
+                            }
                             return;
                         }
                         Err(_) => {
-                            warn!("handshake timed out after {handshake_budget:?}");
+                            if let Some(sup) = claim_server_log(ServerLog::HandshakeTimeout) {
+                                warn!("handshake timed out after {handshake_budget:?}{sup}");
+                            }
                             return;
                         }
                     },
                 },
                 Err(e) => {
-                    warn!("accept err: {e:#}");
+                    if let Some(sup) = claim_server_log(ServerLog::AcceptError) {
+                        warn!("accept err: {e:#}{sup}");
+                    }
                     return;
                 }
             };
@@ -627,7 +637,9 @@ async fn accept_loop(
             )
             .await
             {
-                warn!("auth failed from {}: {e:#}", conn.remote_address());
+                if let Some(sup) = claim_server_log(ServerLog::AuthFailure) {
+                    warn!("auth failed from {}: {e:#}{sup}", conn.remote_address());
+                }
                 conn.close(0x01u32.into(), b"unauthorized");
                 return;
             }

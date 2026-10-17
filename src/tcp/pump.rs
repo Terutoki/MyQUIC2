@@ -414,6 +414,15 @@ async fn copy_tcp_quic_inner(
                         "quic>tcp tcp write failed after {total}B down: {e:#}"
                     ));
                 }
+                // The written slots are dead now: they are slices of quinn
+                // assembler chunks, and the next `read_chunks` only overwrites
+                // them if it returns at least as many. A flow that stops after
+                // one batch (HTTP keep-alive body done, ssh idle, a paused
+                // download) would otherwise pin them — up to ~8 chunks — until
+                // its next data event or the 300 s idle reap.
+                for written in batch[..n].iter_mut() {
+                    *written = Bytes::new();
+                }
                 total += batch_bytes as u64;
                 let now = coarse_millis();
                 touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);

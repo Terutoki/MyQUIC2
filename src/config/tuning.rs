@@ -168,6 +168,27 @@ pub const INITIAL_RTT_MS_MIN: u64 = 1;
 /// typo and would postpone first-flight loss recovery absurdly.
 pub const INITIAL_RTT_MS_MAX: u64 = 3_000;
 
+/// Default path MTU (max UDP payload) every new connection starts from before
+/// PMTU discovery runs, in bytes.
+///
+/// quinn's default is the 1200-byte QUIC floor, and its discovery is
+/// *opportunistic*: probes are only emitted from a transmit poll that builds
+/// no payload packet (`quinn-proto connection/mod.rs`), so a busy connection
+/// can spend a long time at whatever value it started at. Starting at 1400
+/// removes most of that ramp and is safe on every typical path (IPv4
+/// 1400+8+20 = 1428 B, IPv6 1400+8+40 = 1448 B, both inside a 1500-byte
+/// Ethernet MTU and inside PPPoE's 1492). It is still 1420 B short of what a
+/// WireGuard-like 1420-byte UDP payload needs to stay a single MQP-2 frame;
+/// IPv4-only deployments can raise it to 1472 (see the field docs). A path
+/// smaller than the configured start is handled by quinn's black-hole
+/// detector, which resets to `min_mtu` (1200) on suspicious loss.
+pub const DEFAULT_INITIAL_MTU: u16 = 1400;
+/// Lower clamp for `initial_mtu`: the QUIC minimum.
+pub const INITIAL_MTU_MIN: u16 = 1200;
+/// Upper clamp for `initial_mtu`: quinn's default endpoint
+/// `max_udp_payload_size` (1500 - 28). Larger values would only be a typo.
+pub const INITIAL_MTU_MAX: u16 = 1472;
+
 /// Runtime transport tuning resolved from optional TOML fields.
 /// Defaults are the low-latency preset for ~140 ms links (2/4/2 MB windows,
 /// ACK every 2nd, 5 ms delay): ~114 Mb/s @140 ms with minimal loaded queue.
@@ -185,6 +206,11 @@ pub struct TransportTuning {
     /// RTT (e.g. 140 on a 140 ms link) to shorten first-flight loss recovery;
     /// steady state re-measures and ignores the seed.
     pub initial_rtt: Duration,
+    /// Path MTU (max UDP payload) a connection uses before PMTU discovery
+    /// starts, in bytes: `INITIAL_MTU_MIN..=INITIAL_MTU_MAX`. See
+    /// [`DEFAULT_INITIAL_MTU`] for why starting above quinn's 1200-byte floor
+    /// is a direct latency/throughput win.
+    pub initial_mtu: u16,
 }
 
 impl Default for TransportTuning {
@@ -196,6 +222,7 @@ impl Default for TransportTuning {
             ack_threshold: 2,
             max_ack_delay: Duration::from_millis(5),
             initial_rtt: Duration::from_millis(DEFAULT_INITIAL_RTT_MS),
+            initial_mtu: DEFAULT_INITIAL_MTU,
         }
     }
 }
@@ -205,6 +232,11 @@ fn initial_rtt_from_ms(v: Option<u64>) -> Duration {
         v.unwrap_or(DEFAULT_INITIAL_RTT_MS)
             .clamp(INITIAL_RTT_MS_MIN, INITIAL_RTT_MS_MAX),
     )
+}
+
+fn initial_mtu_from(v: Option<u16>) -> u16 {
+    v.unwrap_or(DEFAULT_INITIAL_MTU)
+        .clamp(INITIAL_MTU_MIN, INITIAL_MTU_MAX)
 }
 
 fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
@@ -256,9 +288,23 @@ pub fn per_connection_memory_bytes(tuning: &TransportTuning) -> u64 {
 /// target that answers faster than the reader drains, or many sessions whose
 /// readers are starved); the send direction fills only against a black-holed
 /// route or a full qdisc. `MYQUIC2_SESS_SOCKET_BUF` lowers both.
+///
+/// **Linux doubles the value.** `setsockopt(SO_RCVBUF/SO_SNDBUF, n)` stores
+/// `2 * n` inside the kernel (bookkeeping overhead) and `getsockopt` returns
+/// the doubled value, so the socket memory cap actually pinned per session is
+/// `4 * sess_socket_buf()` on Linux — must be charged here or the admission
+/// bound under-counts the pool by ~2x (`session_pool_memory_bytes`), which is
+/// exactly the kind of under-count an OOM on a 128 MiB router rides in on.
+/// Other platforms keep the requested value.
 #[must_use]
 pub fn per_session_memory_bytes() -> u64 {
-    (2 * crate::sess_socket_buf() + crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK) as u64
+    let socket_terms = if cfg!(target_os = "linux") {
+        // SO_RCVBUF and SO_SNDBUF, each doubled by the kernel.
+        2 * (2 * crate::sess_socket_buf())
+    } else {
+        2 * crate::sess_socket_buf()
+    };
+    (socket_terms + crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK) as u64
 }
 
 /// Worst-case memory the *whole* UDP session pool can pin: the process-wide
@@ -284,6 +330,7 @@ impl ServerConf {
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
             initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
+            initial_mtu: initial_mtu_from(self.initial_mtu),
         }
     }
 }
@@ -297,6 +344,7 @@ impl ClientConf {
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
             initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
+            initial_mtu: initial_mtu_from(self.initial_mtu),
         }
     }
 }

@@ -157,6 +157,9 @@ pub(crate) async fn handle_tcp_stream(
     // Relay-TCP posture: nodelay always, plus Linux TCP_NOTSENT_LOWAT so the
     // kernel send buffer cannot stack megabytes of unsent bytes ahead of the
     // QUIC stream that already paces this flow (see `linux::tune_relay_tcp`).
+    // This is the single owner of that tuning: `dial_happy_eyeballs` used to
+    // apply it inside the dial as well, duplicating the `setsockopt`s on every
+    // TCP flow.
     myquic2::linux::tune_relay_tcp(&tcp);
     // MQP-2: report the bound address of the dialed socket so the
     // client can answer SOCKS with the real BND.ADDR/PORT (RFC 1928)
@@ -248,10 +251,11 @@ pub(crate) async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<Targ
 /// Connect to the first candidate that succeeds.
 ///
 /// `cands` is borrowed so the IP-literal path allocates nothing. Filtering
-/// (`allow_private`) and the 8-candidate cap stay here; the staggered racing
-/// itself is `happy-eyeballs` (RFC 8305, 250 ms stagger internally) instead of
-/// the hand-rolled `JoinSet` + `watch` cancellation. Total budget 4 s is kept
-/// via `timeout` so the client-side ACK wait still covers it.
+/// (`allow_private`) and the 8-candidate cap stay here; the staggered
+/// alternating-family racing itself is `happy-eyeballs` (RFC 8305, 250 ms
+/// stagger internally) instead of the hand-rolled `JoinSet` + `watch`
+/// cancellation. Total budget 4 s is kept via `timeout` so the client-side ACK
+/// wait still covers it.
 ///
 /// Single-candidate fast path: IP-literal targets (the dominant case, and the
 /// reason the old hand-rolled version special-cased them) get one direct
@@ -259,6 +263,12 @@ pub(crate) async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<Targ
 /// no attempt/delay task spawns. The crate is only consulted when there is
 /// actually a race to run; delegating the single case to it re-introduced
 /// several allocations and two task spawns per TCP flow for nothing.
+///
+/// Socket options are the **caller's**: `handle_tcp_stream` calls
+/// [`myquic2::linux::tune_relay_tcp`] once on the returned socket. This function
+/// used to call it on both arms as well, so every dial paid the `setsockopt`s
+/// twice — and the single-candidate arm (every IP-literal flow) tuned a socket
+/// before it had even been returned. One owner, one tuning.
 ///
 /// Note: `happy-eyeballs` re-interleaves v6/v4 (v6-first per RFC 8305) after
 /// `lookup_host`, so a `dns_ip_preference = "ipv4"` deployment still resolves
@@ -291,10 +301,7 @@ pub(crate) async fn dial_happy_eyeballs(
         )
         .await
         {
-            Ok(Ok(s)) => {
-                myquic2::linux::tune_relay_tcp(&s);
-                Some(s)
-            }
+            Ok(Ok(s)) => Some(s),
             _ => None,
         };
     }
@@ -305,10 +312,7 @@ pub(crate) async fn dial_happy_eyeballs(
     )
     .await;
     match res {
-        Ok(Ok(s)) => {
-            myquic2::linux::tune_relay_tcp(&s);
-            Some(s)
-        }
+        Ok(Ok(s)) => Some(s),
         _ => None,
     }
 }

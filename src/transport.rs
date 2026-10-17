@@ -4,7 +4,7 @@ pub mod limits;
 pub(crate) use build::clamp_keep_alive;
 pub use build::{
     Congestion, KEEP_ALIVE_MAX_SECS, build_transport, build_transport_tuned,
-    build_transport_tuned_class,
+    build_transport_tuned_class, idle_timeout_secs, watchdog_silence_secs,
 };
 pub(crate) use limits::{DATAGRAM_BUFFER, MQP_DGRAM_MAX};
 pub use limits::{

@@ -41,9 +41,10 @@ pub use config::{
     client_conf::ClientConf,
     server_conf::ServerConf,
     tuning::{
-        DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, INITIAL_RTT_MS_MAX,
-        INITIAL_RTT_MS_MIN, MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_QUIC_ENDPOINTS,
-        MAX_UDP_ASSOCS, MAX_UDP_EGRESS_CONNS, TransportTuning, default_quic_endpoints, load_toml,
+        DEFAULT_INITIAL_MTU, DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS,
+        INITIAL_MTU_MAX, INITIAL_MTU_MIN, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN,
+        MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_QUIC_ENDPOINTS, MAX_UDP_ASSOCS,
+        MAX_UDP_EGRESS_CONNS, TransportTuning, default_quic_endpoints, load_toml,
         per_connection_memory_bytes, per_session_memory_bytes, session_pool_memory_bytes,
     },
 };
@@ -77,7 +78,8 @@ pub use tls::{
 pub use transport::{
     Congestion, DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW,
     STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT,
-    build_transport, build_transport_tuned, build_transport_tuned_class,
+    build_transport, build_transport_tuned, build_transport_tuned_class, idle_timeout_secs,
+    watchdog_silence_secs,
 };
 // `MQP_DGRAM_MAX` / `clamp_keep_alive` are exercised by the unit tests below
 // through `use super::*` (`DATAGRAM_BUFFER` is also read by `config::tuning`).
@@ -1389,6 +1391,28 @@ mod tests {
             !claim_drop_warning(&slot),
             "a second claim inside the window is refused"
         );
+    }
+
+    /// A never-claimed per-second log slot must claim immediately: the mono
+    /// epoch starts near zero, so a 0-initialised slot would swallow the
+    /// process's first one-second window — exactly the startup/reconnect burst
+    /// the TCP-abort line exists for.
+    #[test]
+    fn log_window_claims_the_first_second() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let slot = AtomicU64::new(NEVER_WARNED);
+        assert!(claim_log_window(&slot, 0), "first window always claims");
+        assert!(!claim_log_window(&slot, 500), "same window: refused");
+        assert!(claim_log_window(&slot, 1_000), "next window: claims");
+        let counted = AtomicU64::new(NEVER_WARNED);
+        let suppressed = AtomicU64::new(0);
+        assert_eq!(
+            claim_log_window_counted(&counted, &suppressed, 0),
+            Some(0),
+            "the counted variant claims the first window too"
+        );
+        assert_eq!(claim_log_window_counted(&counted, &suppressed, 5), None);
+        assert_eq!(suppressed.load(Ordering::Relaxed), 1);
     }
 
     /// Encode `payload` the way [`DgramFragmenter`] does, for reassembler tests
@@ -3309,9 +3333,13 @@ mod tests {
         assert!(err.to_string().contains("v4"), "{err}");
     }
 
-    /// The keepalive clamp bounds the derived detection window: idle is `3x`
-    /// and the client watchdog `4x`, so the old 3600 clamp put silent-path
-    /// detection hours out. A sane value must pass through untouched.
+    /// The keepalive clamp bounds the derived detection window: the QUIC idle
+    /// timeout is `3x` and the client silence watchdog `2x`, so the old 3600
+    /// clamp put silent-path detection hours out. A sane value must pass
+    /// through untouched. The watchdog must stay strictly below the idle
+    /// timeout for every legal keepalive — that invariant is what makes the
+    /// watchdog an *independent* detector instead of dead code the idle timer
+    /// always beats.
     #[test]
     fn keepalive_clamp_bounds_the_detection_window() {
         assert_eq!(clamp_keep_alive(3600), KEEP_ALIVE_MAX_SECS);
@@ -3322,9 +3350,25 @@ mod tests {
         assert_eq!(clamp_keep_alive(17), 17);
         assert_eq!(clamp_keep_alive(0), 1, "a zero keepalive cannot disable it");
         assert!(
-            KEEP_ALIVE_MAX_SECS.saturating_mul(4) <= 1200,
+            watchdog_silence_secs(KEEP_ALIVE_MAX_SECS) <= 1200,
             "the watchdog must stay inside 20 minutes"
         );
+        // `watchdog < idle` over the whole accepted range, including the
+        // clamp's low end: the client's detector has to fire before quinn's
+        // idle timer (or the peer's CONNECTION_CLOSE) can.
+        for k in 0..=KEEP_ALIVE_MAX_SECS {
+            let watchdog = watchdog_silence_secs(k);
+            let idle = idle_timeout_secs(k);
+            assert!(
+                watchdog < idle,
+                "keepalive {k}s: watchdog {watchdog}s must fire before idle {idle}s"
+            );
+        }
+        // The shipped default detects path death at ~10 s (2 x 5 s), and the
+        // floors keep a 1 s keepalive from producing a hair-trigger detector.
+        assert_eq!(watchdog_silence_secs(5), 10);
+        assert_eq!(watchdog_silence_secs(1), 8);
+        assert_eq!(idle_timeout_secs(1), 15);
     }
 
     /// The admission bound multiplies this figure by the admitted connection
@@ -3366,10 +3410,18 @@ mod tests {
             "4096 x 8.25 MB is the 33 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
+        // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested
+        // value, so each session's socket cap is 4 x 64 KiB there and the
+        // pool term is ~2.06 GiB instead of the requested ~1.03 GiB.
+        let pool_mib = if cfg!(target_os = "linux") {
+            2112
+        } else {
+            1088
+        };
         assert_eq!(
             pool / (1024 * 1024),
-            1088,
-            "the session pool is its own ~1.06 GiB term"
+            pool_mib,
+            "the session pool term must charge the kernel's doubled socket caps on Linux"
         );
         assert!(
             pool > 512 * 1024 * 1024,
@@ -3389,6 +3441,10 @@ mod tests {
         assert_eq!(t.ack_threshold, 2);
         assert_eq!(t.max_ack_delay, Duration::from_millis(5));
         assert_eq!(t.initial_rtt, Duration::from_millis(DEFAULT_INITIAL_RTT_MS));
+        assert_eq!(
+            t.initial_mtu, DEFAULT_INITIAL_MTU,
+            "the MTU a connection starts from must reach the transport builder"
+        );
         assert_eq!(c.conn_count(), 4, "pool default is four connections");
         assert_eq!(DEFAULT_QUIC_CONNS, 4);
         let conf =
@@ -3407,6 +3463,36 @@ mod tests {
             conf("initial_rtt_ms = 999_999\n").tuning().initial_rtt,
             Duration::from_millis(INITIAL_RTT_MS_MAX),
             "a typo must not postpone first-flight loss recovery absurdly"
+        );
+        // Initial MTU: unset takes the shipped default, explicit values reach
+        // the builder, and a typo clamps into quinn's accepted range instead
+        // of being passed through (a value below 1200 would be rejected by
+        // quinn; above 1472 can only be a mistake).
+        assert_eq!(
+            conf("initial_mtu = 1472\n").tuning().initial_mtu,
+            1472,
+            "the IPv4-only zero-ramp value must reach the builder"
+        );
+        assert_eq!(
+            conf("initial_mtu = 0\n").tuning().initial_mtu,
+            INITIAL_MTU_MIN
+        );
+        assert_eq!(
+            conf("initial_mtu = 1500\n").tuning().initial_mtu,
+            INITIAL_MTU_MAX
+        );
+        // The VPN port list classifies a tunnel by port before the
+        // first-packet-size heuristic can put it on the interactive class.
+        assert_eq!(c.udp_bulk_port_list(), vec![51820, 1194]);
+        assert_eq!(
+            conf("udp_bulk_ports = [51820, 1234]\n").udp_bulk_port_list(),
+            vec![51820, 1234]
+        );
+        assert!(
+            conf("udp_bulk_ports = []\n")
+                .udp_bulk_port_list()
+                .is_empty(),
+            "an explicit empty list restores the pure size heuristic"
         );
         assert_eq!(conf("quic_conns = 1\n").conn_count(), 1);
         assert_eq!(conf("quic_conns = 3\n").conn_count(), 3);

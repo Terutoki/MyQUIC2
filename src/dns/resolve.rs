@@ -3,33 +3,45 @@
 //!
 //! Layering:
 //!
-//! - **sync fast path** ([`lookup_cached_fast`]): thread-local memo only. The
-//!   packet path (server egress `resolve_pin`/`forward_server_dgram`, client
-//!   `dispatch_stage*`) is synchronous in its staging phase and must not await;
-//!   a memo hit costs two atomic loads and a byte compare, and a memo *miss*
-//!   is reported as [`CachedLookup::Unknown`] so the caller takes the
-//!   limiter-gated spawn path. `moka::future::Cache` has no synchronous read
-//!   view, and one atomic Arc clone per hit to fetch a full address set from
-//!   the memo would tax this path for a case (filtered first record) that the
-//!   async slow path already handles — one datagram per session, after which
-//!   the session destination memo and the pin serve the flow.
+//! - **sync fast path** ([`lookup_cached_fast`]): thread-local memo only, keyed
+//!   by `(host, port)` (`dns::key`). The packet path (server egress
+//!   `resolve_pin`/`forward_server_dgram`, client `dispatch_stage*`) is
+//!   synchronous in its staging phase and must not await; a memo hit costs two
+//!   atomic loads and a byte compare, and a memo *miss* is reported as
+//!   [`CachedLookup::Unknown`] so the caller takes the limiter-gated spawn
+//!   path. `moka::future::Cache` has no synchronous read view, and one atomic
+//!   Arc clone per hit to fetch a full address set from the memo would tax this
+//!   path for a case (filtered first record) that the async slow path already
+//!   handles — one datagram per session, after which the session destination
+//!   memo and the pin serve the flow. The memo stores the full `SocketAddr`, so
+//!   its key must carry the port; a *new* port of a known name is a memo miss
+//!   and is answered by the shared host-keyed cache below.
 //! - **async path** ([`resolve_all_cached`]): positive-cache single flight via
-//!   `try_get_with_by_ref`. Moka evaluates the init future exactly once per
-//!   key among concurrent callers and wakes the rest with the same result; a
-//!   cancelled or panicked owner hands the initialization to a waiter
+//!   `try_get_with_by_ref`, keyed by the normalized host *only* — A/AAAA
+//!   records are port-independent, so every port of one name shares one entry
+//!   and one upstream query, and the caller's port is attached when the set is
+//!   returned. Moka evaluates the init future exactly once per key among
+//!   concurrent callers and wakes the rest with the same result; a cancelled or
+//!   panicked owner hands the initialization to a waiter
 //!   (`src/future/value_initializer.rs`, `EnclosingFutureAborted`), so the old
 //!   `OwnerReset`/`InflightCleanup` guard pair is not needed. The negative
-//!   cache is checked first and written explicitly on failure — `try_get_with`
-//!   shares errors with concurrent waiters but never caches them.
+//!   cache is checked first by the same host key and written explicitly on
+//!   failure — `try_get_with` shares errors with concurrent waiters but never
+//!   caches them. Negative verdicts are per name too: a dead name is dead for
+//!   all ports, so port-diverse traffic to it learns the verdict once instead
+//!   of once per port (each learning holding a `dns_slow_path_limiter` permit
+//!   for the lookup budget).
 //! - **upstream**: hickory, cancellable and TTL-clamped to the same windows.
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::key::{DNS_KEY_BUF, dns_key, dns_key_owned};
+use super::key::{
+    DNS_HOST_KEY_BUF, DNS_KEY_BUF, dns_host_key, dns_host_key_owned, dns_key, dns_key_owned,
+};
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
 use super::store::{DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, negatives, positives};
 use crate::coarse_millis;
@@ -58,9 +70,18 @@ impl IpPreference {
     /// stable, so the resolver's own order within a family is preserved.
     #[inline]
     pub(crate) fn sort_key(self, addr: SocketAddr) -> u8 {
+        self.sort_key_ip(addr.ip())
+    }
+
+    /// [`sort_key`](Self::sort_key) for a port-free address: family is an
+    /// `IpAddr` property, so this is what the shared positive cache (which
+    /// stores `IpAddr`s) sorts by. Kept in terms of one predicate so the two
+    /// forms can never disagree about which family is preferred.
+    #[inline]
+    pub(crate) fn sort_key_ip(self, ip: IpAddr) -> u8 {
         match self {
-            IpPreference::Ipv6 => u8::from(addr.is_ipv4()),
-            IpPreference::Ipv4 => u8::from(!addr.is_ipv4()),
+            IpPreference::Ipv6 => u8::from(ip.is_ipv4()),
+            IpPreference::Ipv4 => u8::from(!ip.is_ipv4()),
         }
     }
 }
@@ -102,9 +123,41 @@ pub async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await
 }
 
+/// Uncached `(host, port)` resolution: the upstream lookup plus the caller's
+/// port attached to every address.
+///
+/// This is the path for callers that must not be served a cached answer (the
+/// client's `server_addr` dial) and for [`resolve_server_addr`]. The shared
+/// caches only ever hold port-free addresses, so this composes the same
+/// [`resolve_ips`] primitive the cache-fill path uses and materializes the
+/// caller's port on the way out.
 async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>> {
-    let addrs = tokio::time::timeout(timeout, async {
-        let mut v: Vec<SocketAddr> = match upstream_resolver() {
+    let ips = resolve_ips(host, port, timeout).await?;
+    let mut addrs: Vec<SocketAddr> = ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    // Preferred family first; the stable sort keeps the resolver's order
+    // within each family (see [`IpPreference`]).
+    let pref = ip_preference();
+    addrs.sort_by_key(|addr| pref.sort_key(*addr));
+    Ok(addrs)
+}
+
+/// Resolve just the addresses of `host` — no port — in the resolver's own
+/// order.
+///
+/// This is the upstream primitive behind both the uncached resolution path and
+/// the host-keyed positive cache's init future: A/AAAA answers are independent
+/// of the port the caller asked about, so the port is only carried along as the
+/// `getaddrinfo` fallback's service hint (its returned ports are discarded).
+/// The preference sort is applied by the callers, on their final address form —
+/// `SocketAddr`s for the uncached path, `IpAddr`s before the cache insert — so
+/// a cache hit always hands back a set in the same family order a fresh
+/// resolution would.
+async fn resolve_ips(host: &str, port: u16, timeout: Duration) -> Result<Vec<IpAddr>> {
+    let ips = tokio::time::timeout(timeout, async {
+        let ips: Vec<IpAddr> = match upstream_resolver() {
             // The IP-literal case is handled inside `lookup_ip` directly, and
             // the system hosts file is consulted before any upstream query
             // (`ResolveHosts::Auto` is the default), so `localhost` and other
@@ -114,25 +167,24 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
                     .lookup_ip(host)
                     .await
                     .map_err(|e| anyhow::anyhow!("dns lookup failed: {e}"))?;
-                lookup.iter().map(|ip| SocketAddr::new(ip, port)).collect()
+                lookup.iter().collect()
             }
             // The platform DNS configuration could not be read (see
             // `upstream_resolver`): degrade to the previous blocking
             // `getaddrinfo` path instead of losing name resolution entirely.
             Err(why) => {
                 tracing::debug!("hickory resolver unavailable ({why}); using getaddrinfo");
-                tokio::net::lookup_host((host, port)).await?.collect()
+                tokio::net::lookup_host((host, port))
+                    .await?
+                    .map(|sa| sa.ip())
+                    .collect()
             }
         };
-        // Preferred family first; the stable sort keeps the resolver's order
-        // within each family (see [`IpPreference`]).
-        let pref = ip_preference();
-        v.sort_by_key(|s| pref.sort_key(*s));
-        Ok::<Vec<SocketAddr>, anyhow::Error>(v)
+        Ok::<Vec<IpAddr>, anyhow::Error>(ips)
     })
     .await
     .context("dns lookup timed out")??;
-    Ok(addrs)
+    Ok(ips)
 }
 
 /// Process-wide upstream resolver, built once from the platform's own DNS
@@ -198,6 +250,12 @@ pub enum CachedLookup {
 /// clock read (the deadline is compared in the coarse epoch) — it never
 /// touches a lock at all. A memo miss is `Unknown`: the async path re-checks
 /// the shared caches (warm entries there resolve without an upstream query).
+///
+/// The memo key stays per-`(host, port)` even though the shared caches are
+/// host-keyed: the memo's value is a full `SocketAddr` for the port that was
+/// resolved, so a hit can answer with the right port and no work. A *new* port
+/// of a known name is deliberately a miss here; `resolve_all_cached` answers it
+/// from the host-keyed cache and then memoizes that port.
 pub fn lookup_cached_fast(host: &str, port: u16) -> CachedLookup {
     lookup_cached_fast_with_ttl(host, port).0
 }
@@ -267,82 +325,129 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 
 /// Resolve `(host, port)` through the shared caches with single-flight.
 ///
-/// Concurrent callers for the same key are coalesced by moka: the first call
-/// evaluates the resolution inside `try_get_with_by_ref`, all others wait and
-/// receive the same `Arc<[SocketAddr]>` (or the same error). Cache warming and
-/// the thread memo happen **inside the init future, before it returns**, so
-/// every waiter that observes the outcome also observes a warmed cache and a
-/// failed lookup is negatively cached before any waiter can retry (the old
-/// publish-order contract, kept).
+/// Both moka caches are keyed by the normalized **host only**: A/AAAA records
+/// carry no port, so a second port of a name must hit the same positive entry
+/// (and join the same in-flight upstream query) instead of paying a fresh
+/// lookup, and a negative verdict is a property of the name — a dead name is
+/// dead for every port. The caller's port is attached when the address set is
+/// returned; every address in the set gets it.
+///
+/// Concurrent callers for the same *name* are coalesced by moka even when they
+/// ask for different ports: the first call evaluates the resolution inside
+/// `try_get_with_by_ref`, all others wait and receive the same `Arc<[IpAddr]>`
+/// (or the same error). Cache warming happens inside the init future, and the
+/// per-`(host, port)` *positive* memo is written on every caller's return path
+/// — the `Ok` arm below runs for the init owner and every waiter alike — so a
+/// caller that observes the outcome also observes a warmed cache. A failed
+/// lookup is negatively cached (host verdict + this port's memo) inside the
+/// init, before the error is published to any waiter: the old publish-order
+/// contract, kept.
 ///
 /// `Err` covers three cases with distinct meanings for the caller: a live
 /// negative entry ("dns negative cached" — a policy refusal), a genuine
-/// resolution failure, and (via [`resolve_all_timeout`]) a timeout.
+/// resolution failure, and (via the init's timeout) a timeout.
 pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
-    // Stack-built key: no allocation while the key is present in the caches.
-    // The fallback only triggers for hosts longer than the 255-byte wire limit.
+    // Stack-built per-(host, port) key for this thread's memo. The fallback
+    // only triggers for hosts longer than the 255-byte wire limit.
     let mut kbuf = [0u8; DNS_KEY_BUF];
     let owned;
-    let key: &str = match dns_key(host, port, &mut kbuf) {
+    let memo_key: &str = match dns_key(host, port, &mut kbuf) {
         Some(k) => k,
         None => {
             owned = dns_key_owned(host, port);
             &owned
         }
     };
+    // Stack-built host-only key for the shared caches. Separate buffer: both
+    // borrowed keys are live across the awaits below.
+    let mut hbuf = [0u8; DNS_HOST_KEY_BUF];
+    let host_owned;
+    let host_key: &str = match dns_host_key(host, &mut hbuf) {
+        Some(k) => k,
+        None => {
+            host_owned = dns_host_key_owned(host);
+            &host_owned
+        }
+    };
     // The negative check comes first: a known-bad name must be refused without
     // touching the single-flight machinery, and (unlike a positive sentinel in
     // the same keyspace) a present negative entry can never be returned by
-    // `try_get_with` as a resolution result.
-    if negatives().get(key).await.is_some() {
+    // `try_get_with` as a resolution result. Host-keyed, so a verdict learned
+    // for one port refuses all of them.
+    //
+    // Warm *this* thread's per-(host, port) memo with the verdict's remaining
+    // life before bailing. Only the init that learned the failure memoized its
+    // own port, so without this a refused name reached through any other port
+    // would miss the sync memo on every datagram and spawn a resolver task
+    // each time, forever (the slow-path limiter bounds concurrency, not the
+    // per-datagram task rate). The deadline cannot outlive the shared entry:
+    // it is derived from the entry's own insertion instant, which the negative
+    // cache stores for exactly this reason.
+    if let Some(inserted_at) = negatives().get(host_key).await {
+        let remaining = DNS_NEG_TTL.saturating_sub(inserted_at.elapsed());
+        memo_put(memo_key, None, Instant::now() + remaining);
         anyhow::bail!("dns negative cached");
     }
     let outcome = positives()
-        .try_get_with_by_ref(key, async {
-            match resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await {
-                Ok(v) => {
+        .try_get_with_by_ref(host_key, async {
+            match resolve_ips(host, port, DNS_LOOKUP_TIMEOUT).await {
+                Ok(mut ips) => {
                     let now = Instant::now();
-                    let v: Arc<[SocketAddr]> = Arc::from(v);
+                    // The cache's invariant: every stored set is ordered with
+                    // the configured preferred family first (the resolver's own
+                    // order within a family is kept by the stable sort), so a
+                    // hit for another port hands back the same order a fresh
+                    // resolution would.
+                    let pref = ip_preference();
+                    ips.sort_by_key(|ip| pref.sort_key_ip(*ip));
+                    let ips: Arc<[IpAddr]> = Arc::from(ips);
                     // A success clears the negative entry (the name resolves
                     // now) and bumps the epoch so other threads' stale
                     // negative memos stop refusing. Done before returning, so
                     // it precedes every waiter wake-up.
-                    if negatives().remove(key).await.is_some() {
+                    if negatives().remove(host_key).await.is_some() {
                         bump_neg_epoch();
                     }
-                    if let Some(a) = v.first().copied() {
-                        memo_put(key, Some(a), now + DNS_CACHE_TTL);
-                    }
-                    Ok((now, v))
+                    Ok((now, ips))
                 }
                 Err(e) => {
-                    let now = Instant::now();
-                    negatives().insert(key.to_owned(), ()).await;
-                    memo_put(key, None, now + DNS_NEG_TTL);
+                    // Negatively cache the *name*, so every port of it is
+                    // refused after one failure, and memoize this port too so
+                    // the sync packet path refuses this exact target without
+                    // spawning a resolver. Other ports hit the shared host
+                    // verdict above, which memoizes their own port there.
+                    record_negative(host_key, memo_key).await;
                     Err(format!("{e:#}"))
                 }
             }
         })
         .await;
     match outcome {
-        Ok((inserted, v)) => {
-            // Warm *this* thread's memo even on a shared-cache **hit**. The init
-            // future above is the only other writer, and moka runs it once per
-            // key per TTL, on whichever thread missed first — so without this a
-            // caller that finds the entry already in moka still reads
-            // `lookup_cached_fast*` as `Unknown` and takes the slow path again.
-            // On the server's UDP ingress that slow path is a spawned resolver
-            // task *per datagram* for a domain target (see
-            // `forward_server_dgram`), which is precisely the per-packet cost the
-            // session destination memo and the connection pin exist to remove.
-            // Never extends the entry's own deadline.
-            if let Some(first) = v.first().copied() {
+        Ok((inserted, ips)) => {
+            // Materialize this call's `SocketAddr`s: the shared entry is
+            // port-free, so the port is attached last, when the answer is
+            // returned. Attaching it does not reorder the set — the init path
+            // already sorted it preferred-family-first.
+            let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+            // Warm *this* thread's memo even on a shared-cache **hit**. The
+            // init future above is the only writer for a given TTL, and moka
+            // runs it once per key on whichever thread missed first — so
+            // without this a caller that finds the entry already in moka still
+            // reads `lookup_cached_fast*` as `Unknown` and takes the slow path
+            // again. On the server's UDP ingress that slow path is a spawned
+            // resolver task *per datagram* for a domain target (see
+            // `forward_server_dgram`), which is precisely the per-packet cost
+            // the session destination memo and the connection pin exist to
+            // remove. Never extends the entry's own deadline. On a host-keyed
+            // hit for a *new* port this is what makes that port answerable by
+            // the sync probe from now on.
+            if let Some(first) = addrs.first().copied() {
                 let deadline = inserted + DNS_CACHE_TTL;
                 if deadline > Instant::now() {
-                    memo_put(key, Some(first), deadline);
+                    memo_put(memo_key, Some(first), deadline);
                 }
             }
-            Ok(v)
+            Ok(Arc::from(addrs))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
@@ -352,9 +457,14 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
 ///
 /// Bin unit tests need this to exercise a DNS-hit path without a live
 /// resolver; production always warms the cache through `resolve_all_cached`.
+///
+/// The shared positive entry is **host-keyed** and stores only `addr.ip()`, so
+/// a lookup for a different port of `host` hits the same entry and gets *its*
+/// port attached; the per-`(host, port)` memo stores the full `addr` verbatim,
+/// so the sync probe for the seeded `port` answers exactly `addr`.
 #[doc(hidden)]
 pub async fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
-    dns_cache_seed_aged(host, port, addr, Duration::ZERO).await;
+    seed_positive(host, port, vec![addr.ip()], Some(addr), Duration::ZERO).await;
 }
 
 /// [`dns_cache_seed`] with an explicit entry age, so a test can drive the
@@ -365,84 +475,87 @@ pub async fn dns_cache_seed(host: &str, port: u16, addr: SocketAddr) {
 /// clamp has to react to.
 #[doc(hidden)]
 pub async fn dns_cache_seed_aged(host: &str, port: u16, addr: SocketAddr, age: Duration) {
-    let mut kbuf = [0u8; DNS_KEY_BUF];
-    let owned;
-    let key: &str = match dns_key(host, port, &mut kbuf) {
-        Some(k) => k,
-        None => {
-            owned = dns_key_owned(host, port);
-            &owned
-        }
-    };
-    let now = Instant::now();
-    let inserted = now.checked_sub(age).unwrap_or(now);
-    positives()
-        .insert(key.to_owned(), (inserted, Arc::from([addr])))
-        .await;
-    if negatives().remove(key).await.is_some() {
-        bump_neg_epoch();
-    }
-    memo_put(key, Some(addr), inserted + DNS_CACHE_TTL);
+    seed_positive(host, port, vec![addr.ip()], Some(addr), age).await;
 }
 
 /// Seed the negative cache as if `host:port` had just failed to resolve.
 ///
 /// Same test-only purpose as [`dns_cache_seed`], for the other verdict: without
 /// it a negative *memo* entry can only be produced by a real (network) resolver
-/// failure, so the memo's coherence rules would be untestable.
+/// failure, so the memo's coherence rules would be untestable. The shared
+/// verdict is host-keyed (every port refuses), and the per-port memo makes the
+/// seeded port refuse synchronously.
 #[doc(hidden)]
 pub async fn dns_neg_cache_seed(host: &str, port: u16) {
-    let mut kbuf = [0u8; DNS_KEY_BUF];
-    let owned;
-    let key: &str = match dns_key(host, port, &mut kbuf) {
-        Some(k) => k,
-        None => {
-            owned = dns_key_owned(host, port);
-            &owned
-        }
-    };
-    record_negative(key).await;
+    let host_key = dns_host_key_owned(host);
+    let memo_key = dns_key_owned(host, port);
+    record_negative(&host_key, &memo_key).await;
 }
 
 /// Seed the positive cache with a full multi-record set, first record first.
 /// Same test-only purpose as [`dns_cache_seed`]: the fast probe serves only
 /// the first address, so a filtered-first multi-record name cannot be
 /// exercised without seeding more than one.
+///
+/// Like every positive entry this one is host-keyed and port-free: a lookup
+/// for any port of `host` gets the set with *that* port attached, so seed
+/// addresses of a different port are still served as their IPs.
 #[doc(hidden)]
 pub async fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
     let Some(first) = addrs.first().copied() else {
         return;
     };
-    let mut kbuf = [0u8; DNS_KEY_BUF];
-    let owned;
-    let key: &str = match dns_key(host, port, &mut kbuf) {
-        Some(k) => k,
-        None => {
-            owned = dns_key_owned(host, port);
-            &owned
-        }
-    };
-    let now = Instant::now();
-    positives()
-        .insert(key.to_owned(), (now, Arc::from(addrs)))
-        .await;
-    if negatives().remove(key).await.is_some() {
-        bump_neg_epoch();
-    }
-    memo_put(key, Some(first), now + DNS_CACHE_TTL);
+    seed_positive(
+        host,
+        port,
+        addrs.iter().map(|a| a.ip()).collect(),
+        Some(first),
+        Duration::ZERO,
+    )
+    .await;
 }
 
-/// Record that resolving `key` failed, so the packet paths can refuse it
-/// without spawning a resolver per datagram. Runs inside
-/// [`resolve_all_cached`]'s init future, before the error is published to
-/// waiters; the single-flight serialization is what makes the write safe —
-/// no live positive entry can exist while the init that writes this runs (the
-/// old "never downgrade a live positive" probe guarded a contention window
-/// that no longer exists).
-async fn record_negative(key: &str) {
+/// Shared body of the positive seeding helpers: insert the host-keyed positive
+/// entry holding `ips` as of `age` ago, clear any negative verdict for the
+/// name (bumping [`NEG_EPOCH`](super::memo::neg_epoch) so other threads' stale
+/// negative memos stop refusing), and memoize `memo_addr` under the caller's
+/// per-`(host, port)` key.
+async fn seed_positive(
+    host: &str,
+    port: u16,
+    ips: Vec<IpAddr>,
+    memo_addr: Option<SocketAddr>,
+    age: Duration,
+) {
+    let host_key = dns_host_key_owned(host);
+    let memo_key = dns_key_owned(host, port);
     let now = Instant::now();
-    negatives().insert(key.to_owned(), ()).await;
-    memo_put(key, None, now + DNS_NEG_TTL);
+    let inserted = now.checked_sub(age).unwrap_or(now);
+    positives()
+        .insert(host_key.clone(), (inserted, Arc::from(ips)))
+        .await;
+    if negatives().remove(host_key.as_str()).await.is_some() {
+        bump_neg_epoch();
+    }
+    if let Some(addr) = memo_addr {
+        memo_put(&memo_key, Some(addr), inserted + DNS_CACHE_TTL);
+    }
+}
+
+/// Record that resolving the name `host_key` failed, so the packet paths can
+/// refuse it without spawning a resolver per datagram: the shared verdict is
+/// host-keyed (every port refuses), and `memo_key` is this thread's
+/// per-`(host, port)` memo entry.
+///
+/// Runs inside [`resolve_all_cached`]'s init future, before the error is
+/// published to waiters; the single-flight serialization is what makes the
+/// write safe — no live positive entry can exist while the init that writes
+/// this runs (the old "never downgrade a live positive" probe guarded a
+/// contention window that no longer exists).
+async fn record_negative(host_key: &str, memo_key: &str) {
+    let now = Instant::now();
+    negatives().insert(host_key.to_owned(), now).await;
+    memo_put(memo_key, None, now + DNS_NEG_TTL);
 }
 
 /// Accept `IP:port` or `hostname:port` for the QUIC server address.
@@ -461,6 +574,8 @@ pub async fn resolve_server_addr(s: &str) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::key::dns_key_owned;
+    use super::super::memo::MEMO_KEY_BYTES;
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
@@ -477,6 +592,18 @@ mod tests {
 
         assert!(IpPreference::Ipv6.sort_key(v6) < IpPreference::Ipv6.sort_key(v4));
         assert!(IpPreference::Ipv4.sort_key(v4) < IpPreference::Ipv4.sort_key(v6));
+
+        // The port-free form the host-keyed positive cache sorts by must agree
+        // with the `SocketAddr` form on the family ordering.
+        for (addr, pref) in [
+            (v4, IpPreference::Ipv6),
+            (v6, IpPreference::Ipv6),
+            (v4, IpPreference::Ipv4),
+            (v6, IpPreference::Ipv4),
+        ] {
+            assert_eq!(pref.sort_key(addr), pref.sort_key_ip(addr.ip()));
+        }
+        assert!(IpPreference::Ipv6.sort_key_ip(v6.ip()) < IpPreference::Ipv6.sort_key_ip(v4.ip()));
 
         let mut addrs = [v4, v6];
         addrs.sort_by_key(|s| IpPreference::Ipv6.sort_key(*s));
@@ -497,6 +624,153 @@ mod tests {
         let v = resolve_all_cached(host, port).await.expect("seeded hit");
         assert_eq!(&v[..], &[addr]);
         assert_eq!(lookup_cached_fast(host, port), CachedLookup::Addr(addr));
+    }
+
+    /// A/AAAA answers are port-independent, so a name seeded for one port must
+    /// answer a *different* port from the same host-keyed entry — no resolver
+    /// init (a network lookup of the `.test` name would fail) — and the hit
+    /// must memoize that new port for the sync packet path.
+    ///
+    /// This is the port-amplifier fix: before host-keying, a new port of an
+    /// already-resolved name missed the positive cache, the single-flight and
+    /// the memo, and paid a fresh upstream query before the first
+    /// datagram/CONNECT.
+    #[tokio::test]
+    async fn a_second_port_reuses_the_host_keyed_positive_entry() {
+        let host = "port-shared.resolve.test";
+        let seeded_port = 19_711u16;
+        let other_port = 19_712u16;
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let seeded: SocketAddr = SocketAddr::new(ip, seeded_port);
+        dns_cache_seed(host, seeded_port, seeded).await;
+
+        // The shared entry is keyed by the host alone, and the seed's memo is
+        // keyed by the seeded port.
+        assert!(
+            positives().get(host).await.is_some(),
+            "the positive cache entry must be keyed by the host, not (host, port)"
+        );
+        assert_eq!(
+            lookup_cached_fast(host, seeded_port),
+            CachedLookup::Addr(seeded)
+        );
+        // The memo stays per-(host, port): a new port is a sync miss even while
+        // the host's shared entry is warm, so the packet path falls through to
+        // the async path exactly once.
+        assert_eq!(
+            lookup_cached_fast(host, other_port),
+            CachedLookup::Unknown,
+            "the thread memo must stay per-(host, port): it stores a full SocketAddr"
+        );
+
+        // The async path answers the new port from the host-keyed entry (the
+        // `.test` name would fail if an init ran) and attaches its port.
+        let want = SocketAddr::new(ip, other_port);
+        let v = resolve_all_cached(host, other_port)
+            .await
+            .expect("a host-keyed cache hit must not need an upstream query");
+        assert_eq!(&v[..], &[want], "the hit must attach the caller's port");
+        assert_eq!(
+            lookup_cached_fast(host, other_port),
+            CachedLookup::Addr(want),
+            "a shared-cache hit for a new port must memoize that port"
+        );
+        // ... and it must not have disturbed the seeded port's answer.
+        assert_eq!(
+            lookup_cached_fast(host, seeded_port),
+            CachedLookup::Addr(seeded)
+        );
+    }
+
+    /// A negative verdict is a property of the name, so one failed port must
+    /// refuse the others without spawning a resolver for them.
+    #[tokio::test]
+    async fn a_negative_verdict_refuses_every_port_of_the_name() {
+        let host = "host-negative.resolve.test";
+        let port_a = 19_721u16;
+        let port_b = 19_722u16;
+        dns_neg_cache_seed(host, port_a).await;
+
+        assert!(
+            negatives().get(host).await.is_some(),
+            "the negative verdict must be keyed by the host, not (host, port)"
+        );
+        assert_eq!(lookup_cached_fast(host, port_a), CachedLookup::Negative);
+        assert_eq!(
+            lookup_cached_fast(host, port_b),
+            CachedLookup::Unknown,
+            "premise: the other port's memo is cold (the verdict is shared)"
+        );
+        let err = resolve_all_cached(host, port_b).await.unwrap_err();
+        assert!(
+            err.to_string().contains("dns negative cached"),
+            "a host-keyed negative entry must refuse another port, got: {err:#}"
+        );
+        // The refusing call must warm this port's thread memo, or every
+        // datagram for that port would spawn a resolver task forever: the
+        // shared verdict is only reachable from the async path, and only the
+        // init that learned the failure can memoize a port it was asked about.
+        assert_eq!(
+            lookup_cached_fast(host, port_b),
+            CachedLookup::Negative,
+            "a host-keyed negative hit must memoize the queried port"
+        );
+    }
+
+    /// A full multi-record set is cached port-free, so every port of the name
+    /// gets the whole set with its own port attached, in the seeded order.
+    #[tokio::test]
+    async fn a_seeded_set_serves_every_port_with_the_whole_answer() {
+        let host = "set-shared.resolve.test";
+        let seeded_port = 19_741u16;
+        let other_port = 19_742u16;
+        let a: SocketAddr = "203.0.113.10:19741".parse().unwrap();
+        let b: SocketAddr = "203.0.113.11:19741".parse().unwrap();
+        dns_cache_seed_set(host, seeded_port, &[a, b]).await;
+
+        let v = resolve_all_cached(host, other_port)
+            .await
+            .expect("host-keyed set hit");
+        assert_eq!(
+            &v[..],
+            &[
+                SocketAddr::new(a.ip(), other_port),
+                SocketAddr::new(b.ip(), other_port),
+            ],
+            "the whole set must survive a port change, each address re-ported"
+        );
+        assert_eq!(lookup_cached_fast(host, seeded_port), CachedLookup::Addr(a));
+    }
+
+    /// The memo must store wire-length names (> the old 64-byte inline budget)
+    /// instead of silently refusing them — a refused name re-entered the
+    /// spawned-resolver path on every datagram.
+    #[tokio::test]
+    async fn a_long_name_is_memoized() {
+        // 99-byte host (two legal labels + `.test`), past the old 64-byte slot
+        // budget but well under the 255-byte wire limit.
+        let host = format!("{}.{}.test", "a".repeat(60), "b".repeat(33));
+        assert!(
+            host.len() > 64 && host.len() <= 255,
+            "premise: a long-but-legal name, got {} B",
+            host.len()
+        );
+        let port = 19_751u16;
+        let addr: SocketAddr = "203.0.113.12:19751".parse().unwrap();
+        dns_cache_seed(&host, port, addr).await;
+
+        let memo_key = dns_key_owned(&host, port);
+        assert!(memo_key.len() > 64 && memo_key.len() <= MEMO_KEY_BYTES);
+        assert_eq!(
+            lookup_cached_fast(&host, port),
+            CachedLookup::Addr(addr),
+            "a {} B (host, port) key must fit the widened memo slot",
+            memo_key.len()
+        );
+        let v = resolve_all_cached(&host, port)
+            .await
+            .expect("long name resolves from the host-keyed cache");
+        assert_eq!(&v[..], &[addr]);
     }
 
     /// A shared-cache **hit** must warm this thread's memo.
@@ -582,7 +856,7 @@ mod tests {
             "the literal must resolve to itself"
         );
         assert!(
-            negatives().get("127.0.0.1\u{0}19703").await.is_none(),
+            negatives().get(host).await.is_none(),
             "a success must not leave a negative entry"
         );
     }

@@ -1,4 +1,5 @@
-//! DNS thread-local memo — verbatim extraction from `src/lib.rs` (zero logic change).
+//! DNS thread-local memo — extracted from `src/lib.rs`, since widened to hold
+//! full wire-length `(host, port)` keys (see [`MEMO_KEY_BYTES`]).
 //! Symbols: DnsMemoSlot / MEMO_* / NEG_EPOCH / neg_epoch / bump_neg_epoch /
 //! dns_memo_hash / dns_memo_set / MemoHit / memo_peek_both / memo_put (+ DNS_MEMO,
 //! coarse_deadline as memo-internal helpers).
@@ -22,18 +23,31 @@ use crate::coarse_millis;
 /// and 64 domains per thread drops to 0 % and ~5 %, for 6.8 ns/op versus
 /// 15.5 ns/op at 32 domains and 8.1 ns versus 25.8 ns at 64.
 ///
-/// Keys are stored as a hash plus up to 64 inline bytes, so the table stays
-/// small enough to afford 128 slots. A key longer than 64 bytes simply never
+/// Keys are stored as a hash plus up to 261 inline bytes — the whole
+/// `(host, port)` key: a 255-byte wire-max host name, the NUL separator and up
+/// to five decimal port digits ([`MEMO_KEY_BYTES`]). The slot grew from the
+/// old 64-byte inline budget because that silently refused every 65..255-byte
+/// name: POSIX allows names up to 255 bytes, the wire format carries them, and
+/// for those names *every datagram* re-entered the spawned-resolver path
+/// because no layer (this memo, the shared cache by virtue of the memo-only
+/// sync probe) could answer it. A key longer than 261 bytes — only reachable
+/// from a non-DNS-name string, since the wire cap is 255 — still simply never
 /// populates the memo and takes the shared-cache path every time: that is a
-/// miss, never a mis-serve. Domain names are capped at 255 bytes on the wire,
-/// so this deliberately trades a rare slow path for a smaller slot.
+/// miss, never a mis-serve.
+///
+/// The footprint is the price: `size_of::<DnsMemoSlot>()` is 320 B on 64-bit
+/// targets (most of it the inline key array), so the 128-slot table is 40 KiB
+/// per thread — materialized lazily, only on the worker threads that actually
+/// resolve names, and still a one-time cost against per-packet allocations.
 #[derive(Clone, Copy)]
 pub(crate) struct DnsMemoSlot {
     hash: u64,
     empty: bool,
     /// `None` = negatively cached (NXDOMAIN / lookup failure).
     addr: Option<SocketAddr>,
-    len: u8,
+    /// `u16`, not `u8`: the key budget is 261 bytes (see [`MEMO_KEY_BYTES`]),
+    /// which no longer fits the old byte.
+    len: u16,
     key: [u8; MEMO_KEY_BYTES],
     /// Same deadline expressed in the [`coarse_millis`] epoch, so the per-packet
     /// hit path compares two atomics instead of reading the clock.
@@ -60,10 +74,18 @@ pub(crate) struct DnsMemoSlot {
     neg_epoch: u64,
 }
 
-/// Keys longer than this are not memoized (see [`DnsMemoSlot`]).
-pub(crate) const MEMO_KEY_BYTES: usize = 64;
+/// Longest `(host, port)` memo key that fits a slot: 255-byte wire-max host +
+/// NUL separator + up to 5 decimal port digits. Sized to the per-(host, port)
+/// key in `dns::key`, not to an arbitrary inline budget — see [`DnsMemoSlot`].
+pub(crate) const MEMO_KEY_BYTES: usize = 255 + 1 + 5;
 pub(crate) const MEMO_SETS: usize = 64;
 pub(crate) const MEMO_WAYS: usize = 2;
+
+/// Compile-time guard for the footprint stated on [`DnsMemoSlot`]: the slot is
+/// a 261-byte inline key plus a hash, two `u64`s, a length, a flag and an
+/// `Option<SocketAddr>`, i.e. 320 B today. Fail the build (not a comment) if a
+/// field change ever silently outgrows it.
+const _: () = assert!(std::mem::size_of::<DnsMemoSlot>() <= 328);
 
 /// Epoch of the process-wide negative DNS cache's *good* verdicts.
 ///
@@ -106,7 +128,7 @@ impl DnsMemoSlot {
         s.empty = false;
         s.hash = hash;
         s.addr = addr;
-        s.len = key.len() as u8;
+        s.len = key.len() as u16;
         s.key[..key.len()].copy_from_slice(key.as_bytes());
         s.expires_ms = coarse_deadline(expires);
         // Only a negative slot needs the tag: a positive hit is never

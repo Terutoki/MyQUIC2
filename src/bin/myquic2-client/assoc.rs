@@ -400,6 +400,15 @@ pub(crate) async fn udp_associate_inner(
                                             return frag.send(c, sess, &addr, payload, limit);
                                         }
                                         other => {
+                                            // One BATCH verdict for both staged
+                                            // payloads: `frames: 0` says neither
+                                            // went out, and the outer caller's
+                                            // `recover_send_outcome` counts the
+                                            // event once (`EGRESS_DEAD` is per
+                                            // dead connection, not per lost
+                                            // datagram) — deliberately, so a
+                                            // 2-pack loss cannot double-count or
+                                            // double-invalidate.
                                             return PayloadSend {
                                                 frames: 0,
                                                 failed: Some(other),
@@ -492,62 +501,12 @@ pub(crate) async fn udp_associate_inner(
                         sent.frames
                     );
                 }
-                let outcome = sent.outcome();
-                match outcome {
-                    DatagramSend::Sent => {}
-                    // `Blocked`/`TooLarge` are counted where they are decided —
-                    // `DgramFragmenter::send` for the protocol's own size caps,
-                    // `send_encoded` for quinn's path-budget verdict — each with
-                    // its own rate-limited size warning.
-                    DatagramSend::Blocked => {
-                        tracing::debug!("client datagram dropped: send buffer full");
-                    }
-                    // A **size** verdict, not a connection fault: either the
-                    // payload is past the protocol's fragmentation cap or the
-                    // path's DATAGRAM budget shrank since this handle was
-                    // memoized. Both are already counted as size drops. The
-                    // recovery is to re-read the live budget so the next datagram
-                    // is encoded against it — and emphatically *not* to
-                    // invalidate: this arm used to be folded in with
-                    // `ConnectionLost`, so one oversized payload flushed the
-                    // process-wide egress cache (costing every thread two quinn
-                    // state-mutex acquisitions), bumped the connection-lost
-                    // counter, and logged "udp egress connection lost at send"
-                    // about a connection that was perfectly healthy.
-                    DatagramSend::TooLarge => {
-                        tracing::debug!(
-                            "client datagram dropped: past the path's DATAGRAM budget"
-                        );
-                        egress_shared.refresh_budget(bind);
-                    }
-                    DatagramSend::ConnectionLost => {
-                        tracing::debug!("client egress stale, invalidating shared cache");
-                        let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
-                        dgram_drops::warn_egress_drop(
-                            dgram_drops::EgressDrop::ConnectionLost,
-                            n,
-                            || format!("; class={}, send outcome {outcome:?}, cached handle invalidated", bind.class.name()),
-                        );
-                        egress_shared.invalidate(bind);
-                    }
-                    DatagramSend::Unsupported => {
-                        tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
-                        let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
-                        dgram_drops::warn_egress_drop(
-                            dgram_drops::EgressDrop::Unsupported,
-                            n,
-                            String::new,
-                        );
-                        // Deliberately *not* invalidated. The condition is static
-                        // for the life of the connection, so a re-acquire cannot
-                        // find a better slot — but it does pay two quinn
-                        // state-mutex acquisitions per datagram, which is strictly
-                        // more than the failed send this arm is reacting to.
-                        // Keeping the handle memoized leaves each datagram at one
-                        // send attempt and one counted drop, and the dedicated
-                        // warning class above keeps the cause visible.
-                    }
-                }
+                // Exactly one place for a send verdict's recovery, shared with
+                // the deferred 2-pack flush below. `Blocked`/`TooLarge` are
+                // already counted where they are decided; `ConnectionLost`/
+                // `Unsupported` are the states the memo hit path deliberately
+                // defers to the send's verdict.
+                recover_send_outcome(&egress_shared, bind, sent);
                 }
                 if let Some(p) = pending_pack.take() {
                     flush_deferred_pair(
@@ -657,6 +616,57 @@ pub(crate) fn pending_retarget(slot: &mut TargetAddr, addr: &TargetAddrRef<'_>) 
     }
 }
 
+/// Shared recovery for one send verdict on `bind`: the per-datagram path and
+/// the deferred 2-pack flush both route through here, so the two cannot drift.
+///
+/// `Blocked`/`TooLarge` are counted where they are decided —
+/// `DgramFragmenter::send` for the protocol's own size caps, `send_encoded` for
+/// quinn's path-budget verdict — each with its own rate-limited size warning,
+/// and must not be counted again. `TooLarge` re-reads the live DATAGRAM budget
+/// so the next datagram is encoded against it; it is a **size** verdict, never a
+/// connection fault, so it emphatically does not invalidate (folding it into
+/// `ConnectionLost` used to flush the process-wide egress cache, bump the
+/// connection-lost counter and log about a healthy connection).
+///
+/// `ConnectionLost`/`Unsupported` are the two states the memo hit path
+/// deliberately leaves to the send's verdict (see `SharedEgress::with_fresh`):
+/// both are counted in `EGRESS_DEAD`, **one bump per event** — a single verdict
+/// can lose several staged payloads (a failed BATCH carries two), and the outage
+/// is one fault, not one per payload. A lost connection invalidates the shared
+/// cache so the next datagram re-acquires; `Unsupported` is static for the
+/// connection's life, so re-acquiring cannot find a better slot and would only
+/// add two quinn state-mutex acquisitions per datagram — it deliberately does
+/// not invalidate.
+pub(crate) fn recover_send_outcome(egress_shared: &SharedEgress, bind: UdpBind, sent: PayloadSend) {
+    let outcome = sent.outcome();
+    match outcome {
+        DatagramSend::Sent => {}
+        DatagramSend::Blocked => {
+            tracing::debug!("client datagram dropped: send buffer full");
+        }
+        DatagramSend::TooLarge => {
+            tracing::debug!("client datagram dropped: past the path's DATAGRAM budget");
+            egress_shared.refresh_budget(bind);
+        }
+        DatagramSend::ConnectionLost => {
+            tracing::debug!("client egress stale, invalidating shared cache");
+            let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+            dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::ConnectionLost, n, || {
+                format!(
+                    "; class={}, send outcome {outcome:?}, cached handle invalidated",
+                    bind.class.name()
+                )
+            });
+            egress_shared.invalidate(bind);
+        }
+        DatagramSend::Unsupported => {
+            tracing::debug!("client datagram dropped: peer does not support DATAGRAM");
+            let n = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+            dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::Unsupported, n, String::new);
+        }
+    }
+}
+
 /// Send the deferred 2-pack payload once, or drop it with accounting.
 ///
 /// The payload is never returned: parking it back for a later iteration is
@@ -667,6 +677,15 @@ pub(crate) fn pending_retarget(slot: &mut TargetAddr, addr: &TargetAddrRef<'_>) 
 /// a reconnect or budget probe) therefore falls back to the same acquire a
 /// datagram takes on a memo miss, exactly once; a genuine no-egress outcome
 /// drops the payload and counts it. Either way the deferred queue empties.
+///
+/// The send **verdict** is not thrown away: this used to end in
+/// `with_fresh(..).is_some()`, so a cached handle that died between staging and
+/// the flush produced a `ConnectionLost` that was neither counted in
+/// `EGRESS_DEAD` nor invalidated the cache — the loss stayed invisible and the
+/// dead handle kept being served for the rest of the memo window (every later
+/// datagram paying one failed send, and every flush silently dropping its
+/// payload). Both the memo-hit and the re-acquire send now go through
+/// `recover_send_outcome`, exactly like the per-datagram path.
 pub(crate) fn flush_deferred_pair(
     egress_shared: &SharedEgress,
     pool: &ConnPool,
@@ -677,12 +696,10 @@ pub(crate) fn flush_deferred_pair(
     payload: &[u8],
 ) {
     let now_flush = coarse_millis();
-    if egress_shared
-        .with_fresh(bind, now_flush, |c, limit| {
-            frag.send(c, sess, addr, payload, limit)
-        })
-        .is_some()
-    {
+    if let Some(sent) = egress_shared.with_fresh(bind, now_flush, |c, limit| {
+        frag.send(c, sess, addr, payload, limit)
+    }) {
+        recover_send_outcome(egress_shared, bind, sent);
         return;
     }
     // Generation read before the cached read, the same contract the
@@ -692,7 +709,11 @@ pub(crate) fn flush_deferred_pair(
     match egress_shared.acquire(pool, bind, now_flush) {
         Some((conn, limit, stamp)) => {
             egress_shared.memo_store(bind, generation, &conn, limit, stamp);
-            frag.send(&conn, sess, addr, payload, limit);
+            recover_send_outcome(
+                egress_shared,
+                bind,
+                frag.send(&conn, sess, addr, payload, limit),
+            );
         }
         None => {
             let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);

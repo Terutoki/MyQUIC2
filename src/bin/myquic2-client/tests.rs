@@ -325,13 +325,25 @@ fn slot_routing_table() {
         assert_eq!(select_slot(false, rr, &[true; 4]), 1 + rr % 3);
         assert_eq!(select_slot(true, rr, &[true; 4]), 0);
     }
-    // Four slots, 0 down: pinned and bulk both fail over to the first live.
+    // Four slots, 0 down: the pinned class no longer has its home, so it
+    // spreads over the bulk set with the same rotation cursor instead of
+    // collapsing onto the first live slot: rr 0 -> 1, 1 -> 2, 2 -> 3, 3 -> 1.
     assert_eq!(select_slot(true, 0, &[false, true, true, true]), 1);
+    assert_eq!(select_slot(true, 1, &[false, true, true, true]), 2);
+    assert_eq!(select_slot(true, 2, &[false, true, true, true]), 3);
+    assert_eq!(select_slot(true, 3, &[false, true, true, true]), 1);
+    // ...while bulk keeps its own live preference.
     assert_eq!(select_slot(false, 0, &[false, true, true, true]), 1);
-    // ...but a live preference is never abandoned just because a lower slot
-    // is dead: rr = 2 prefers slot 3 and keeps it.
+    // A live preference is never abandoned just because a lower slot is
+    // dead: rr = 2 prefers slot 3 and keeps it.
     assert_eq!(select_slot(false, 2, &[false, true, true, true]), 3);
+    // A dead bulk preference continues the rotation to the *next* live bulk
+    // slot (3), not to the lowest live sibling (1).
+    assert_eq!(select_slot(false, 1, &[true, true, false, true]), 3);
+    // Only one bulk slot is left: both classes converge on it when their
+    // rotation reaches it.
     assert_eq!(select_slot(true, 0, &[false, false, true, false]), 2);
+    assert_eq!(select_slot(true, 1, &[false, false, true, false]), 2);
     // Every slot down: the round-robin preference is kept, so each flow
     // waits on a real slot and fails fast rather than picking a random one.
     assert_eq!(select_slot(false, 0, &[false; 4]), 1);
@@ -385,18 +397,26 @@ fn pool_round_robins_bulk_over_every_non_interactive_slot() {
     for _ in 0..4 {
         assert_eq!(pool.pick_tcp_index(&interactive), 0, "pinned to slot 0");
     }
-    // Slot 0 down: both pinned and bulk fail over to the first live slot,
-    // and `pick_tcp` hands back that slot's handle rather than slot 0's.
+    // Slot 0 down: the pinned class falls back over the bulk set with the
+    // same rotation cursor `pick_tcp_index` advances on every flow — pinned
+    // ones included — so successes/failures spread instead of piling every
+    // interactive flow onto slot 1 (the pre-fix `(0..n).find` behaviour).
     pool.slot(0)
         .live
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(pool.pick_tcp_index(&interactive), 1);
-    // rr has advanced to 8 by now, so the bulk preference is slot 3 — still
-    // live, so it is kept rather than collapsed onto slot 1.
-    assert_eq!(pool.pick_tcp_index(&bulk), 3);
+    assert_eq!(pool.pick_tcp_index(&interactive), 2);
+    assert_eq!(pool.pick_tcp_index(&interactive), 3);
+    assert_eq!(pool.pick_tcp_index(&interactive), 1, "the rotation wraps");
+    // A live bulk preference is still kept: the cursor is at 4, so the bulk
+    // preference is `1 + 4 % 3` = slot 2.
+    assert_eq!(pool.pick_tcp_index(&bulk), 2);
+    // `pick_tcp` hands back the *selected* slot's handle, not slot 0's. The
+    // cursor is at 5 now, so the pinned fallback starts at 1 + 5 % 3 = slot 3.
     assert!(Arc::ptr_eq(
         &pool.pick_tcp(&interactive).live,
-        &pool.slot(1).live
+        &pool.slot(3).live
     ));
 }
 
@@ -410,18 +430,22 @@ fn pool_round_robins_bulk_over_every_non_interactive_slot() {
 fn bulk_failover_never_takes_the_interactive_slot() {
     // Slots 0 (interactive), 1 (bulk), 3 (bulk) live; slot 2 (bulk) down.
     let live = [true, true, false, true];
-    // rr = 1 prefers slot 2, which is down: fail over inside the bulk class.
-    assert_eq!(select_slot(false, 1, &live), 1);
-    assert_eq!(select_slot(false, 4, &live), 1);
+    // rr = 1 prefers slot 2, which is down: fail over *forward* inside the
+    // bulk class — to slot 3, the dead slot's rotation successor — not back
+    // to the lowest live sibling (slot 1), which is what `(1..n).find` did.
+    assert_eq!(select_slot(false, 1, &live), 3);
+    assert_eq!(select_slot(false, 4, &live), 3);
     // A live preference is still kept.
     assert_eq!(select_slot(false, 0, &live), 1);
     assert_eq!(select_slot(false, 2, &live), 3);
     // Only when *no* bulk slot is live does slot 0 become the fallback.
     assert_eq!(select_slot(false, 1, &[true, false, false, false]), 0);
     assert_eq!(select_slot(false, 1, &[false, false, false, false]), 2);
-    // ...and a pinned flow still prefers slot 0 or the first live slot.
+    // ...and a pinned flow still prefers slot 0, and when slot 0 is down it
+    // rotates over the live bulk set instead of collapsing onto slot 1.
     assert_eq!(select_slot(true, 0, &live), 0);
     assert_eq!(select_slot(true, 0, &[false, true, false, true]), 1);
+    assert_eq!(select_slot(true, 1, &[false, true, false, true]), 3);
     // The pool-level form of the same case.
     let pool = ConnPool::new(4, vec![], true, true, 1);
     for i in [0usize, 1, 3] {
@@ -440,6 +464,67 @@ fn bulk_failover_never_takes_the_interactive_slot() {
     assert_eq!(hits[2], 0, "the dead bulk slot is never selected");
     assert!(hits[1] > 0 && hits[3] > 0, "both live bulk slots are used");
     assert!(rr0 < pool.rr.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+/// The rotated failover must not dump a dead bulk slot's round-robin share
+/// onto the lowest live sibling: the pre-fix `(1..n).find` sent every flow
+/// whose preference was dead to slot 1, so one reconnect could double that
+/// slot's load while the rest of the bulk class idled. The rotation continues
+/// from the dead preference to the next live slot, and `pick_tcp_index`
+/// advances the cursor for pinned flows too, so their fallback (slot 0 down)
+/// spreads over the whole live set as well.
+#[test]
+fn dead_bulk_slots_share_rotates_across_live_siblings() {
+    // 0 interactive, 1..=4 bulk; slot 3 reconnecting.
+    let pool = ConnPool::new(5, vec![], true, true, 1);
+    for i in [0usize, 1, 2, 4] {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    let interactive = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+    // Divisible by the four bulk slots, so each `rr % 4` position appears
+    // exactly FLOWS / 4 times.
+    const FLOWS: usize = 400;
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut hits = [0usize; 5];
+    for _ in 0..FLOWS {
+        let i = pool.pick_tcp_index(&bulk);
+        assert_ne!(i, 0, "bulk never falls back to the interactive slot");
+        assert_ne!(i, 3, "the dead bulk slot is never selected");
+        hits[i] += 1;
+    }
+    // Each live bulk slot keeps its own share; the dead slot's share is
+    // redirected to its rotation successor (slot 4), never to the lowest
+    // sibling. Pre-fix slot 1 got its own share *plus* every dead preference.
+    assert_eq!(hits[1], FLOWS / 4, "slot 1 keeps only its own share");
+    assert_eq!(hits[2], FLOWS / 4);
+    assert_eq!(
+        hits[4],
+        FLOWS / 2,
+        "the dead slot's RR share lands on its successor"
+    );
+    // Slot 0 down: the pinned class uses the same rotation (and the pinned
+    // flow's fetch_add), so every live bulk sibling is used instead of every
+    // interactive flow landing on slot 1.
+    pool.slot(0)
+        .live
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut pinned_hits = [0usize; 5];
+    for _ in 0..FLOWS {
+        pinned_hits[pool.pick_tcp_index(&interactive)] += 1;
+    }
+    assert_eq!(pinned_hits[0], 0);
+    assert_eq!(pinned_hits[3], 0);
+    assert_eq!(
+        pinned_hits[1],
+        FLOWS / 4,
+        "no collapse of the pinned fallback onto slot 1"
+    );
+    assert_eq!(pinned_hits[2], FLOWS / 4);
+    assert_eq!(pinned_hits[4], FLOWS / 2);
 }
 
 /// L2 stale-live regression: a bulk preference whose QUIC connection died
@@ -688,6 +773,40 @@ fn udp_class_splits_by_port_and_first_payload() {
         pool.udp_class(&TargetAddrRef::Domain("example.com", 3478), 1200),
         EgressClass::Interactive
     );
+}
+
+/// `udp_bulk_ports` forces the bulk class regardless of the first payload
+/// size: a VPN tunnel's handshake is small (WireGuard's first packet is 148 B),
+/// so the size heuristic alone would keep the whole tunnel on the single
+/// interactive connection next to DNS/STUN/games, where it can never use the
+/// bulk shards. `interactive_ports` keeps precedence, and an empty bulk list
+/// restores the pure size heuristic.
+#[test]
+fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
+    let ip = |port| TargetAddrRef::Ip(SocketAddr::from(([203, 0, 113, 7], port)));
+    let pool = ConnPool::new_with_bulk_ports(1, vec![53, 3478], vec![51820, 1194], true, true, 1);
+    // WireGuard's 148 B handshake must not be mistaken for interactive.
+    assert_eq!(pool.udp_class(&ip(51820), 148), EgressClass::Bulk);
+    // ...OpenVPN's data port too, and a full-size payload stays bulk anyway.
+    assert_eq!(pool.udp_class(&ip(1194), 148), EgressClass::Bulk);
+    assert_eq!(pool.udp_class(&ip(1194), 1200), EgressClass::Bulk);
+    // The same small payload on an unknown port keeps the size heuristic.
+    assert_eq!(pool.udp_class(&ip(51999), 148), EgressClass::Interactive);
+    // Interactive precedence: a port listed in both classes stays interactive
+    // (the operator's explicit latency-sensitive intent wins).
+    let both = ConnPool::new_with_bulk_ports(1, vec![443], vec![443], true, true, 1);
+    assert_eq!(both.udp_class(&ip(443), 1200), EgressClass::Interactive);
+    // A domain target classifies by its port the same way.
+    assert_eq!(
+        pool.udp_class(&TargetAddrRef::Domain("vpn.example.com", 51820), 148),
+        EgressClass::Bulk
+    );
+    // `ConnPool::new` passes an empty bulk list: the override is off and the
+    // same WireGuard-sized payload keeps the pre-existing size classification.
+    let plain = ConnPool::new(1, vec![53], true, true, 1);
+    assert_eq!(plain.udp_class(&ip(51820), 148), EgressClass::Interactive);
+    assert_eq!(plain.udp_class(&ip(1194), 148), EgressClass::Interactive);
+    assert_eq!(plain.udp_class(&ip(51820), 1200), EgressClass::Bulk);
 }
 
 /// Bulk associations rotate over the shard set and never onto another
@@ -2345,8 +2464,14 @@ async fn association_reservation_survives_a_panicking_body() {
     assert_eq!(hub.len.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
+/// Serializes the tests that assert exact `dgram_drops::UNKNOWN_SESS` deltas:
+/// the counter is process-wide, and the absent-session dispatch here is the one
+/// other test that bumps it.
+static UNKNOWN_SESS_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn dispatch_absent_slot_reprobes_the_hub() {
+    let _counter_guard = UNKNOWN_SESS_COUNTER_LOCK.lock().await;
     let hub = UdpHub::new();
     let a = test_assoc().await;
     let sess = 7777u32;
@@ -2376,6 +2501,68 @@ async fn dispatch_absent_slot_reprobes_the_hub() {
         &recv_reply(&a.app).await.expect("reply after publish")[REPLY_HDR_V4..],
         b"y"
     );
+}
+
+/// The batch path must not conflate "no such association" with "association
+/// has no app address yet": `lookup_entry` used to return `Option` and
+/// `dispatch_stage_multi` bumped `udp_write::no_app` for both, so a late reply
+/// for a session this process had already torn down (an ordinary race, already
+/// counted in `UNKNOWN_SESS` by the hub probe) was also reported as a missing
+/// app address. Only the live-but-address-less association is a `no_app` drop.
+#[tokio::test]
+async fn batch_lookup_separates_unknown_sess_from_no_app() {
+    let _counter_guard = UNKNOWN_SESS_COUNTER_LOCK.lock().await;
+    let hub = UdpHub::new();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let addr = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+    let unknown = 0x0BAD_F00Du32;
+
+    // (a) No association at all: UNKNOWN_SESS, never NO_APP.
+    let frame = encode_batch(unknown, &addr.as_ref(), &[b"x"], 1400).unwrap();
+    let before_d = dgram_drops::snapshot();
+    let before_w = udp_write::snapshot();
+    assert_eq!(
+        dispatch_stage_multi(&mut cache, &hub, unknown, frame, &mut reasm, &mut out,),
+        0
+    );
+    assert!(out.is_empty());
+    assert!(
+        dgram_drops::snapshot().since(&before_d).unknown_sess >= 1,
+        "the absent session is counted where the hub probe decides it"
+    );
+    assert_eq!(
+        udp_write::snapshot().no_app,
+        before_w.no_app,
+        "an unknown session is not an association without an app address"
+    );
+
+    // (b) A live association whose app has not sent yet is the real no-app
+    // case: counted there, not as an unknown session.
+    let relay = tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap();
+    let appless = Arc::new(AssocEntry::new(Arc::new(relay)));
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, appless);
+    let frame = encode_batch(sess, &addr.as_ref(), &[b"y"], 1400).unwrap();
+    let before_d = dgram_drops::snapshot();
+    let before_w = udp_write::snapshot();
+    assert_eq!(
+        dispatch_stage_multi(&mut cache, &hub, sess, frame, &mut reasm, &mut out),
+        0
+    );
+    assert!(out.is_empty());
+    assert_eq!(
+        udp_write::snapshot().no_app,
+        before_w.no_app + 1,
+        "the live association with no app address is the no_app drop"
+    );
+    assert_eq!(
+        dgram_drops::snapshot().since(&before_d).unknown_sess,
+        0,
+        "a known session must not be charged to UNKNOWN_SESS"
+    );
+    hub.release(sess);
 }
 
 #[tokio::test]
@@ -3077,5 +3264,249 @@ async fn deferred_2pack_flush_drops_once_instead_of_parking() {
         dgram_drops::NO_EGRESS.load(Ordering::Relaxed),
         before.no_egress + 1,
         "exactly one bookkeeping event for one lost payload"
+    );
+}
+
+/// Serializes the egress-verdict counter tests: `EGRESS_DEAD` and
+/// `udp_write::no_app` are process-wide, so two tests that assert exact
+/// deltas must not overlap. (Only these tests bump `EGRESS_DEAD`; the rest of
+/// the file uses live loopback connections.)
+static EGRESS_VERDICT_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The send-verdict recovery is one shared handler for the per-datagram path
+/// and the deferred 2-pack flush, and it must count exactly once per event:
+/// `ConnectionLost` invalidates the shared cache and bumps `EGRESS_DEAD`;
+/// `Unsupported` only counts; `Blocked`/`TooLarge` are already counted where
+/// they are decided (inside `send_encoded`) and must not be counted again.
+#[tokio::test]
+async fn send_verdict_recovery_is_counted_once_and_shared() {
+    use std::sync::atomic::Ordering;
+    let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let (conn, _client, _server) = real_connection().await;
+    let egress = SharedEgress::default();
+    let bind = UdpBind {
+        class: EgressClass::Bulk,
+        index: 1,
+    };
+    let cached = || EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: coarse_millis(),
+        slot: 0,
+    };
+
+    // A success changes nothing.
+    egress.cached[bind.index].store(Some(Arc::new(cached())));
+    recover_send_outcome(
+        &egress,
+        bind,
+        PayloadSend {
+            frames: 1,
+            failed: None,
+        },
+    );
+    assert!(egress.cached[bind.index].load().is_some());
+
+    // `Blocked` / `TooLarge`: counted inside `send_encoded`, not here, and
+    // never a reason to drop the cached handle. (`TooLarge` re-reads the
+    // budget, which keeps the handle.)
+    let before = dgram_drops::snapshot();
+    recover_send_outcome(
+        &egress,
+        bind,
+        PayloadSend {
+            frames: 0,
+            failed: Some(DatagramSend::Blocked),
+        },
+    );
+    recover_send_outcome(
+        &egress,
+        bind,
+        PayloadSend {
+            frames: 0,
+            failed: Some(DatagramSend::TooLarge),
+        },
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        (d.egress_dead, d.buffer_full, d.too_large),
+        (0, 0, 0),
+        "size/backpressure verdicts are counted where they are decided, not here"
+    );
+    assert!(
+        egress.cached[bind.index].load().is_some(),
+        "a size/backpressure verdict must not invalidate the handle"
+    );
+
+    // `ConnectionLost`: one `EGRESS_DEAD` for the event — even when a single
+    // BATCH verdict lost two staged payloads (`frames` is not consulted) —
+    // and the cached handle goes, so the next datagram re-acquires.
+    egress.cached[bind.index].store(Some(Arc::new(cached())));
+    let gen_before = egress.generation[bind.index].load(Ordering::Acquire);
+    let before = dgram_drops::snapshot();
+    recover_send_outcome(
+        &egress,
+        bind,
+        PayloadSend {
+            frames: 0,
+            failed: Some(DatagramSend::ConnectionLost),
+        },
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.egress_dead, 1,
+        "one EGRESS_DEAD per event, not per lost datagram"
+    );
+    assert!(
+        egress.cached[bind.index].load().is_none(),
+        "a lost connection must invalidate the shared cache"
+    );
+    assert!(
+        egress.generation[bind.index].load(Ordering::Acquire) > gen_before,
+        "the invalidation must bump the generation so every thread's memo misses"
+    );
+
+    // `Unsupported`: counted, but deliberately not invalidated — the condition
+    // is static for the connection's life, so a re-acquire cannot find a
+    // better slot and would only add two quinn locks per datagram.
+    egress.cached[bind.index].store(Some(Arc::new(cached())));
+    let gen_before = egress.generation[bind.index].load(Ordering::Acquire);
+    let before = dgram_drops::snapshot();
+    recover_send_outcome(
+        &egress,
+        bind,
+        PayloadSend {
+            frames: 0,
+            failed: Some(DatagramSend::Unsupported),
+        },
+    );
+    assert_eq!(
+        dgram_drops::snapshot().since(&before).egress_dead,
+        1,
+        "Unsupported is a counted egress drop"
+    );
+    assert!(
+        egress.cached[bind.index].load().is_some(),
+        "Unsupported must not invalidate the handle"
+    );
+    assert_eq!(
+        egress.generation[bind.index].load(Ordering::Acquire),
+        gen_before,
+        "Unsupported must not churn the generation"
+    );
+}
+
+/// Regression for the deferred 2-pack flush dropping its send verdict: a memo
+/// hit whose cached handle died between staging and the flush must run the same
+/// recovery as the per-datagram path — one `EGRESS_DEAD`, cache invalidated —
+/// instead of silently losing the payload with `.is_some()`.
+#[tokio::test]
+async fn deferred_2pack_flush_recovers_a_dead_egress_verdict() {
+    use std::sync::atomic::Ordering;
+    let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let pool = ConnPool::new(1, vec![], true, true, 1);
+    let egress = SharedEgress::default();
+    let mut frag = DgramFragmenter::new();
+    let addr = TargetAddr::Ip("127.0.0.1:53".parse().unwrap());
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+
+    // A live memo pointing at a connection that is closed by the time of the
+    // flush: exactly the stale-handle window the memo deliberately serves.
+    let (conn, _client, _server) = real_connection().await;
+    conn.close(0u32.into(), b"test");
+    assert!(
+        conn.close_reason().is_some(),
+        "premise: the cached handle is dead"
+    );
+    let now = coarse_millis();
+    let generation = egress.generation[bind.index].load(Ordering::Acquire);
+    egress.memo_store(bind, generation, &conn, 1200, now);
+    egress.cached[bind.index].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: now,
+        slot: 0,
+    })));
+    assert!(
+        egress.with_fresh(bind, now, |_, _| ()).is_some(),
+        "premise: the memo is fresh, so the flush takes the hit path"
+    );
+
+    let before = dgram_drops::snapshot();
+    let gen_before = egress.generation[bind.index].load(Ordering::Acquire);
+    flush_deferred_pair(
+        &egress,
+        &pool,
+        &mut frag,
+        7,
+        bind,
+        &addr.as_ref(),
+        b"deferred-query",
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.egress_dead, 1,
+        "a dead handle on the deferred flush is counted, not swallowed"
+    );
+    assert_eq!(
+        d.no_egress, 0,
+        "the send reached the connection: this is not a no-egress drop"
+    );
+    assert!(
+        egress.cached[bind.index].load().is_none(),
+        "the dead cached handle must be invalidated for the next datagram"
+    );
+    assert!(
+        egress.generation[bind.index].load(Ordering::Acquire) > gen_before,
+        "the invalidation must wake every thread's memo"
+    );
+}
+
+/// The sharded topology pins cores by *priority*, not by slot index: TCP slot
+/// 0 (interactive) gets the lowest core, then the dedicated interactive UDP
+/// slot, then the remaining TCP slots, then the bulk shards. The old
+/// `idx < cores` shape left the interactive UDP slot unpinned on hosts with
+/// fewer cores than TCP slots + 1 — exactly the slot every small-datagram
+/// association rides.
+#[test]
+fn slot_pinning_prioritizes_the_interactive_pair() {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let pool = ConnPool::new(4, vec![], true, true, 2);
+    let pin_cores = priority_pin_cores(&pool);
+    assert_eq!(pin_cores.len(), pool.slots_total());
+    // Rank 0 is always pinned (there is at least one core).
+    assert_eq!(
+        pin_cores[0],
+        Some(0),
+        "the interactive TCP slot is the top priority"
+    );
+    if cores >= 2 {
+        assert_eq!(
+            pin_cores[pool.udp_global_slot(0)],
+            Some(1),
+            "the interactive UDP slot is the second priority"
+        );
+    }
+    if cores >= 3 {
+        assert_eq!(
+            pin_cores[1],
+            Some(2),
+            "the remaining TCP slots follow the interactive pair"
+        );
+    }
+    // Every pinned rank is a real core, and past the core count slots float.
+    let mut ranks: Vec<usize> = pin_cores.iter().flatten().copied().collect();
+    ranks.sort_unstable();
+    assert_eq!(
+        ranks,
+        (0..cores.min(pool.slots_total())).collect::<Vec<_>>(),
+        "pins are a bijection onto the first `min(cores, slots)` ranks"
+    );
+    // A pool wider than the machine leaves the lowest-priority tail floating:
+    // the number of pinned slots is exactly the usable core count.
+    assert_eq!(
+        pin_cores.iter().flatten().count(),
+        cores.min(pool.slots_total()),
+        "exactly `min(cores, slots)` slots are pinned"
     );
 }

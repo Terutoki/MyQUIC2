@@ -47,6 +47,17 @@ pub struct ClientConf {
     /// first-flight loss recovery is affected. Clamped 1..=3000.
     #[serde(default)]
     pub initial_rtt_ms: Option<u64>,
+    /// Path MTU every new connection starts from, in bytes (clamped
+    /// 1200..=1472; default 1400). quinn starts at the 1200-byte QUIC floor
+    /// and PMTU discovery is opportunistic, so a busy connection can spend a
+    /// long time there: 18-23% more packets and every UDP payload above
+    /// 1150 B split into two MQP-2 fragments. 1400 is safe on Ethernet,
+    /// PPPoE and typical tunnels; IPv4-only deployments can raise it to 1472
+    /// (zero discovery ramp, and 1420-byte UDP payloads stay a single frame).
+    /// Mind the path when raising it: a too-high value costs a loss burst
+    /// until quinn's black-hole detector resets to the 1200-byte floor.
+    #[serde(default)]
+    pub initial_mtu: Option<u16>,
     // ---- Connection isolation ----
     // TCP pool size: bulk TCP spreads round-robin across the bulk slots while
     // ports in `interactive_ports` pin to slot 0, so a latency probe never
@@ -60,6 +71,20 @@ pub struct ClientConf {
     pub quic_conns: Option<usize>,
     #[serde(default)]
     pub interactive_ports: Option<Vec<u16>>,
+    /// Destination UDP ports that always ride the **bulk** egress class,
+    /// whatever their first payload size is (clamped to the interactive
+    /// ports' precedence: a port in `interactive_ports` stays interactive).
+    ///
+    /// The egress class is fixed by the association's first datagram, and a
+    /// tunnel's first packet is small (WireGuard handshake initiation is
+    /// 148 B, OpenVPN control packets 14-60 B), so the size heuristic alone
+    /// would bind a whole VPN tunnel to the single interactive connection —
+    /// sharing one congestion window and DATAGRAM buffer with DNS/STUN/games,
+    /// exactly the starvation the split exists to prevent. Unset = the
+    /// shipped VPN list `[51820, 1194]` (WireGuard, OpenVPN). Set it to `[]`
+    /// to restore the pure size heuristic, or add the ports a tunnel runs on.
+    #[serde(default)]
+    pub udp_bulk_ports: Option<Vec<u16>>,
     /// What UDP egress does when its dedicated connection is down. `true`
     /// (default) drops the datagram — counted in `dgram_drops::NO_EGRESS` —
     /// instead of putting it on a TCP connection's congestion window. `false`
@@ -123,6 +148,16 @@ impl ClientConf {
         self.interactive_ports
             .clone()
             .unwrap_or_else(|| vec![53, 123, 3478, 3479, 3480, 3481])
+    }
+
+    /// Destination ports forced to the bulk egress class regardless of first
+    /// payload size (see [`ClientConf::udp_bulk_ports`]): the shipped default
+    /// is the two common VPN data ports, so a WireGuard/OpenVPN tunnel is
+    /// never mistaken for a small-packet interactive flow.
+    pub fn udp_bulk_port_list(&self) -> Vec<u16> {
+        self.udp_bulk_ports
+            .clone()
+            .unwrap_or_else(|| vec![51820, 1194])
     }
 
     /// Whether UDP egress is confined to its dedicated connection. Default

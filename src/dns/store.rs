@@ -13,23 +13,34 @@
 //!   re-resolve). Two caches keep the refusal check a plain `get` and make
 //!   "resolution failed" and "resolution succeeded" writes disjoint.
 //!
+//! Both caches are keyed by the **normalized host only** (`dns::key`'s
+//! [`dns_host_key`](super::key::dns_host_key)), never by `(host, port)`: A/AAAA
+//! answers carry no port, so every port of one name must share the same entry
+//! *and* the same `try_get_with` single-flight init. Keying by port meant a new
+//! port of an already-resolved name missed both and paid a fresh upstream
+//! query, and — for the negative cache — that a dead name had to be learned
+//! once per port, each learning holding a `dns_slow_path_limiter` permit for
+//! the lookup timeout. The caller's port is attached to the cached IPs when
+//! `resolve_all_cached` returns the set.
+//!
 //! Both caches use `foldhash::fast::RandomState` (the crate-wide choice for
 //! short, peer-influenced keys — see Cargo.toml): a per-instance random seed,
 //! ~1-2 ns per short-key hash.
-use std::net::SocketAddr;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use moka::future::Cache;
 
-/// Owned cache key: `host` + NUL + decimal port, normalized by `dns::key`.
+/// Owned cache key: the normalized host, no port — see the module docs.
 pub(crate) type DnsCacheKey = String;
 
-/// `(inserted at, address set)`: the `Arc<[SocketAddr]>` makes a cache hit and
+/// `(inserted at, address set)`: the `Arc<[IpAddr]>` makes a cache hit and
 /// every single-flight waiter clone a refcount instead of the vector, and the
 /// insertion instant keeps the TTL-exposing lookups honest (moka has no
-/// per-entry remaining-life API).
-pub(crate) type DnsCacheVal = (Instant, Arc<[SocketAddr]>);
+/// per-entry remaining-life API). The addresses are **port-free** on purpose;
+/// `resolve_all_cached` materializes `SocketAddr`s with the caller's port.
+pub(crate) type DnsCacheVal = (Instant, Arc<[IpAddr]>);
 
 /// Positive DNS cache TTL, in milliseconds. The `Duration` below is derived
 /// from it so the two can never drift, and callers that arm their own deadline
@@ -50,7 +61,9 @@ pub(crate) const DNS_NEG_TTL: Duration = Duration::from_secs(10);
 /// positives (separate cache). The positive bound was raised with the TTL —
 /// entries live twice as long, so the resident working set roughly doubles —
 /// while the negative cache keeps its smaller budget, which fits its 10 s
-/// entries.
+/// entries. Host-only keys make each entry span every port of its name, so the
+/// same capacities cover strictly more traffic than the per-port keys they
+/// replaced.
 pub(crate) const DNS_CACHE_MAX: usize = 10_240;
 pub(crate) const DNS_NEG_MAX: usize = 4096;
 /// Wall-clock budget for a single upstream DNS lookup. Client-side dial
@@ -59,7 +72,13 @@ pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 type DnsHasher = foldhash::fast::RandomState;
 pub(crate) type PosCache = Cache<DnsCacheKey, DnsCacheVal, DnsHasher>;
-pub(crate) type NegCache = Cache<DnsCacheKey, (), DnsHasher>;
+/// Negative verdicts. The value is the instant the failure was recorded, not
+/// `()`: a resolver that finds a host-keyed verdict while asking about a
+/// *different* port must memoize that port with the verdict's **remaining**
+/// life, so the sync packet path refuses it without spawning a resolver task
+/// per datagram, while the memo can never outlive the shared entry it was
+/// derived from.
+pub(crate) type NegCache = Cache<DnsCacheKey, Instant, DnsHasher>;
 
 pub(crate) fn positives() -> &'static PosCache {
     static CACHES: std::sync::OnceLock<PosCache> = std::sync::OnceLock::new();

@@ -79,6 +79,13 @@ pub struct ServerConf {
     /// Clamped 1..=3000.
     #[serde(default)]
     pub initial_rtt_ms: Option<u64>,
+    /// Path MTU every new connection starts from, in bytes (clamped
+    /// 1200..=1472; default 1400). Mirror the client's value: the tunnel's
+    /// path is shared, and starting above quinn's 1200-byte floor removes the
+    /// 4-probe-RTT ramp every connection pays before it can send 1472-byte
+    /// packets. See `ClientConf::initial_mtu`.
+    #[serde(default)]
+    pub initial_mtu: Option<u16>,
     /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]

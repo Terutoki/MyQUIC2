@@ -76,11 +76,12 @@ pub fn build_transport(
 /// Upper clamp for `keep_alive_secs`.
 ///
 /// The idle timeout is `3 x keepalive` and the client's silence watchdog
-/// `4 x keepalive`, so an unbounded value (the clamp used to be 3600) put
+/// `2 x keepalive`, so an unbounded value (the clamp used to be 3600) put
 /// silent-path detection 3-4 *hours* out — a black hole on a router, and a
-/// silent contradiction of the documented ~15-20 s detection. 300 s bounds the
-/// window at 15/20 minutes while leaving every sane NAT keepalive alone; larger
-/// values are clamped **and warned about**, never obeyed silently.
+/// silent contradiction of the documented ~8-15 s detection. 300 s bounds the
+/// `2 x` watchdog at 10 minutes and the `3 x` idle timeout at 15 minutes while
+/// leaving every sane NAT keepalive alone; larger values are clamped **and
+/// warned about**, never obeyed silently.
 pub const KEEP_ALIVE_MAX_SECS: u64 = 300;
 
 /// One definition of the keepalive bound, testable without a `TransportConfig`
@@ -90,10 +91,40 @@ pub(crate) fn clamp_keep_alive(keep_alive_secs: u64) -> u64 {
     if keep_alive_secs > KEEP_ALIVE_MAX_SECS {
         tracing::warn!(
             "keep_alive_secs {keep_alive_secs} exceeds the {KEEP_ALIVE_MAX_SECS} s cap; \
-             clamped (silent-path detection scales 3-4x with it)"
+             clamped (silent-path detection scales 2-3x with it)"
         );
     }
     keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS)
+}
+
+/// QUIC idle timeout derived from the keepalive interval: `3 x keepalive`,
+/// floor 15 s (quinn requires the idle timeout to stay well above the
+/// keepalive interval, and a lower floor would let a few lost keepalives kill
+/// a healthy connection).
+///
+/// Shared with the client binary so its silence watchdog can be derived from
+/// the *same* clamped keepalive value and proven to fire first — see
+/// [`watchdog_silence_secs`].
+#[must_use]
+pub fn idle_timeout_secs(keep_alive_secs: u64) -> u64 {
+    clamp_keep_alive(keep_alive_secs).saturating_mul(3).max(15)
+}
+
+/// Client silence-watchdog budget derived from the keepalive interval:
+/// `2 x keepalive`, floor 8 s.
+///
+/// It is deliberately **strictly below** [`idle_timeout_secs`] for every legal
+/// keepalive: the watchdog used to be `4 x keepalive` with a 20 s floor while
+/// the peer/QUIC idle timeout was `3 x keepalive` with a 15 s floor, so the
+/// watchdog could never fire first — it was dead code and path death was
+/// always detected by the idle timer instead (~15 s). With `2 x`/8 s the two
+/// independent detectors in the client's reconnect loop (downlink silence and
+/// ACK stall) actually bound failover, and the idle timeout can later be
+/// re-tuned upward without slowing recovery. A build-time/unit-test invariant
+/// proves `watchdog < idle` across the whole clamp range.
+#[must_use]
+pub fn watchdog_silence_secs(keep_alive_secs: u64) -> u64 {
+    clamp_keep_alive(keep_alive_secs).saturating_mul(2).max(8)
 }
 
 pub fn build_transport_tuned(
@@ -203,19 +234,31 @@ pub fn build_transport_tuned_class(
     // Raise the PMTU search ceiling from quinn's 1452 to 1472 (the endpoint's
     // `max_udp_payload_size` default, so this is the hard limit anyway): 20
     // more bytes per packet is ~1.4% fewer packets for the same payload, which
-    // a single-threaded sender pays directly. The search still starts at the
-    // 1200B QUIC minimum and only climbs on successful probes, so a smaller
-    // path MTU is still discovered correctly.
+    // a single-threaded sender pays directly.
     let mut mtud = quinn::MtuDiscoveryConfig::default();
     mtud.upper_bound(1472);
     t.mtu_discovery_config(Some(mtud));
+    // Start at the configured path MTU instead of quinn's 1200-byte QUIC
+    // floor. This is the other half of the PMTU story and the larger one:
+    // quinn's discovery is a binary search that needs one probe/ACK round trip
+    // per step (1200 -> 1336 -> 1404 -> 1438 -> 1472), and probes are only
+    // emitted from a transmit poll that builds no payload packet
+    // (`quinn-proto connection/mod.rs`), so a busy connection can sit at its
+    // start value for a long time. While it does, every packet carries up to
+    // ~19% fewer payload bytes and quinn's DATAGRAM budget is
+    // `mtu - 38` (1162 at 1200), so every UDP payload above 1150 B splits into
+    // two MQP-2 fragments. `min_mtu` stays at the 1200-byte QUIC floor and
+    // quinn's black-hole detector drops back to it if the configured start is
+    // larger than the real path, so a too-high value is a recoverable loss
+    // burst, not a wedge.
+    t.initial_mtu(tuning.initial_mtu);
     let keep_alive_secs = clamp_keep_alive(keep_alive_secs);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs)));
     // Idle timeout derives from keepalive so custom keep_alive_secs can never
     // self-kill a healthy connection: idle must stay well above the keepalive
     // interval (QUIC requires inbound traffic before idle fires). 15s floor
     // preserves the old silent-blackhole bound; larger keepalives scale up.
-    let idle_secs = (keep_alive_secs.saturating_mul(3)).max(15);
+    let idle_secs = idle_timeout_secs(keep_alive_secs);
     t.max_idle_timeout(Some(
         Duration::from_secs(idle_secs)
             .try_into()

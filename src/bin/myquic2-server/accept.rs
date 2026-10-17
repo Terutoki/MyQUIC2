@@ -135,6 +135,13 @@ pub(crate) struct StagedSend {
 /// [`LAST_HOP_DRAIN`] and cleared per burst, so the queue can never grow
 /// unbounded. Each frame keeps exactly-once accounting through
 /// [`udp_try_send_grouped`].
+///
+/// A run of length 1 takes the per-frame path directly: one connection
+/// multiplexes every UDP association of its egress class, so the normal
+/// multi-session drain burst stages a *single* frame per `(sock, dst)` run.
+/// Filling the 32-entry refs array for it and re-entering the grouped-send
+/// machinery (which, for a single frame, is the per-frame path anyway) was
+/// pure setup on the common shape.
 pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
     let mut i = 0;
     while i < staged.len() {
@@ -145,13 +152,18 @@ pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
         {
             j += 1;
         }
+        // No header: an MQP-2 target send is the raw payload, so every frame is
+        // a single borrowed iovec and nothing is copied here.
+        if j - i == 1 {
+            let one: [SendFrame<'_>; 1] = [(&[], &staged[i].payload[..])];
+            udp_try_send_grouped(&staged[i].sock, staged[i].dst, &one);
+            i = j;
+            continue;
+        }
         // Zero-alloc steady state: stack refs sized to the staging bound
         // (mirrors the client's `flush_staged`). Staging is bounded by
         // LAST_HOP_DRAIN, but the chunk loop keeps a defensive split so a
         // future caller with a longer run cannot silently drop frames.
-        //
-        // No header: an MQP-2 target send is the raw payload, so every frame is
-        // a single borrowed iovec and nothing is copied here.
         let mut refs: [SendFrame<'_>; LAST_HOP_DRAIN] = [(&[], &[]); LAST_HOP_DRAIN];
         let mut k = i;
         while k < j {
@@ -354,13 +366,35 @@ pub(crate) fn arm_fast(
     }
 }
 
+/// Test-only count of BATCH-ingress slow-path results published into a
+/// connection's fast table.
+///
+/// The table itself lives on `handle_conn`'s datagram-reader task and is
+/// invisible from outside, so this is what lets the regression test prove the
+/// two BATCH arms reach [`arm_fast`] instead of discarding the
+/// `Some((dst, life))` that [`forward_server_dgram`] returns — the P1 defect:
+/// a bursty small-packet flow (the exact shape MQP-2 BATCH exists for) never
+/// armed the table, so it paid the whole slow path per datagram forever.
+#[cfg(test)]
+pub(crate) static BATCH_FAST_ARMS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) async fn handle_conn(
     conn: quinn::Connection,
     allow_private: bool,
     conn_limit: Arc<tokio::sync::Semaphore>,
     conn_cap: usize,
 ) -> Result<()> {
-    info!("new QUIC conn from {}", conn.remote_address());
+    // Peer-driven rate: a line per admitted connection is the right operational
+    // granularity, but a churn/handshake flood makes it one formatted line per
+    // event — through tracing's process-wide writer lock, on the thread that
+    // owns a whole ingress shard's QUIC driver. One line per second per class is
+    // plenty; the window's losers are counted and folded into the winner's line
+    // (`reporter::claim_server_log`). Formatting is inside the gate too: only the
+    // winner pays for the address/time formatting.
+    if let Some(sup) = claim_server_log(ServerLog::NewConn) {
+        info!("new QUIC conn from {}{sup}", conn.remote_address());
+    }
     let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
     // ASSOCIATEs sharing this QUIC connection never cross-talk.
@@ -430,7 +464,18 @@ pub(crate) async fn handle_conn(
         // itself then pays the single irreducible `SendDatagram::poll` take.
         // The slow path (`forward_server_dgram` → `get_or_create_sess`) takes
         // at most one `max_datagram_size` per new session (creation only, off
-        // the memo), never per packet.
+        // the memo), never per packet — and only *after* the cheap fair-share
+        // gates, so a forged session id over the connection's share never
+        // reaches that lock at all (reader.rs).
+        //
+        // **Every ingress frame kind arms it.** The fragment branch and the
+        // single-datagram branch always did; both BATCH (0x06) arms used to
+        // discard `forward_server_dgram`'s `Some((dst, life))` with `let _ =`,
+        // so the one path built for bursty small-packet flows — each BATCH
+        // frame carries up to 16 target sends — never installed the fast slot
+        // and re-ran the entire slow path (session memo probe, shard read
+        // lock, unbatched send) for every payload of every frame, forever.
+        // Arm from the first answer the slow path returns.
         //
         // **Why a table and not one slot.** A single `(session, dst)` pair was
         // the largest defect on this path. The client multiplexes every UDP
@@ -594,8 +639,12 @@ pub(crate) async fn handle_conn(
                                         allow_private,
                                         &mut staged,
                                     ) {
+                                        // See the single-datagram branch: flush
+                                        // staged sends before the slow path's
+                                        // immediate send so a flow's datagrams
+                                        // keep their staging order on the wire.
                                         flush_staged_sends(&mut staged);
-                                        let _ = forward_server_dgram(
+                                        let used = forward_server_dgram(
                                             &ss,
                                             &cd,
                                             conn_id,
@@ -605,6 +654,15 @@ pub(crate) async fn handle_conn(
                                             allow_private,
                                         )
                                         .await;
+                                        // Arm from the slow path's answer, so the
+                                        // *next* frame for this session hits the
+                                        // fast table (see the table comment).
+                                        if let Some((dst2, life)) = used {
+                                            arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
+                                            #[cfg(test)]
+                                            BATCH_FAST_ARMS
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                     }
                                 }
                                 continue;
@@ -615,7 +673,7 @@ pub(crate) async fn handle_conn(
                                     let off = p.as_ptr() as usize - d.as_ptr() as usize;
                                     let payload = d.slice(off..off + p.len());
                                     udp_stats::payload(p.len());
-                                    let _ = forward_server_dgram(
+                                    let used = forward_server_dgram(
                                         &ss,
                                         &cd,
                                         conn_id,
@@ -625,6 +683,19 @@ pub(crate) async fn handle_conn(
                                         allow_private,
                                     )
                                     .await;
+                                    // Same arm as the `Some(dst)` arm above: an
+                                    // unarmed table is exactly why `want` was
+                                    // `None`, and the slow path's answer is what
+                                    // installs the slot for the rest of the
+                                    // burst. Discarding it (the old `let _ =`)
+                                    // kept every payload of every BATCH frame on
+                                    // the slow path.
+                                    if let Some((dst2, life)) = used {
+                                        arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
+                                        #[cfg(test)]
+                                        BATCH_FAST_ARMS
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                                 continue;
                             }

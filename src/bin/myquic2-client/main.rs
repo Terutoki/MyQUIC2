@@ -109,9 +109,10 @@ async fn main() -> Result<()> {
     let udp_fail_closed = c.udp_fail_closed();
     let udp_split = c.udp_split();
     let udp_egress = c.udp_egress_cnt();
-    let pool = ConnPool::new(
+    let pool = ConnPool::new_with_bulk_ports(
         conns,
         c.interactive_port_list(),
+        c.udp_bulk_port_list(),
         udp_fail_closed,
         udp_split,
         udp_egress,
@@ -161,7 +162,15 @@ async fn main() -> Result<()> {
     // Each connection carries its own class: the interactive ports and the UDP
     // associations have connections no bulk flow can queue on.
     let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
-    let watchdog_silence = Duration::from_secs(keep_alive_secs.saturating_mul(4).max(20));
+    // The silence watchdog window is derived from the same clamped keepalive
+    // the transport's idle timeout uses: `watchdog_silence_secs` is 2x
+    // keepalive with an 8 s floor and is unit-proven strictly below QUIC's 3x /
+    // 15 s idle timeout. The previous `4x keepalive, 20 s floor` was *always*
+    // above the idle timeout, so the watchdog in `spawn_conn_loop` could never
+    // fire first — dead code, with path death detected only when QUIC's idle
+    // timer expired (~15 s). Now detection is ~10 s with the shipped 5 s
+    // keepalive.
+    let watchdog_silence = Duration::from_secs(myquic2::watchdog_silence_secs(keep_alive_secs));
     // Orderly-shutdown flag for the sharded topology: each slot shard parks on
     // it and then drains its own endpoint (see `spawn_slot_shard`); the
     // shared-runtime topology ignores it and is closed from here.
@@ -177,7 +186,12 @@ async fn main() -> Result<()> {
     let (eps, shard_joins) = if shard_runtime_enabled() {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let mut joins = Vec::with_capacity(pool.slots_total());
-        for i in 0..pool.slots_total() {
+        // Core assignment by priority, not by slot index: see
+        // `priority_pin_cores`. Computed before spawning so the interactive
+        // pair claims the low cores even on a host with fewer cores than pool
+        // slots.
+        let pin_cores = priority_pin_cores(&pool);
+        for (i, &pin_core) in pin_cores.iter().enumerate() {
             let sock = udp_socket_dual("[::]:0")?;
             // Per-slot transport preset (see `slot_uses_bulk_preset`): only
             // the dedicated bulk UDP class connection gets the coarse bulk
@@ -190,6 +204,7 @@ async fn main() -> Result<()> {
             };
             joins.push(spawn_slot_shard(
                 i,
+                pin_core,
                 sock,
                 cfg,
                 server_str.clone(),
@@ -216,7 +231,8 @@ async fn main() -> Result<()> {
         }
         info!(
             "client runtime: {} sharded current-thread runtime(s), one pool slot each \
-             (Linux: pinned up to the core count; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)",
+             (Linux: pinned in priority order — interactive TCP, interactive UDP, then the \
+             rest — up to the core count; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)",
             pool.slots_total()
         );
         (Vec::new(), joins)
@@ -336,8 +352,36 @@ async fn main() -> Result<()> {
 /// shared-runtime path spends in one `wait_idle` timeout.
 const SLOT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Core assignment for the sharded topology: rank every pool slot by how much
+/// its latency matters, then pin rank `r < usable_cores` to core `r`.
+///
+/// The old shape pinned by slot index (`idx < cores`), so on a host with fewer
+/// cores than `tcp_slots + 1` the interactive **UDP** slot (index `tcp_slots`,
+/// which carries every small-datagram and interactive-port association) was
+/// left unpinned and floated between cores while a bulk TCP slot kept a core.
+/// Priority order: TCP slot 0 (interactive) first, then the interactive UDP
+/// slot, then the remaining TCP slots, then the remaining UDP (bulk) shards.
+/// Slots past the core count get `None` and float, so a pool wider than the
+/// machine is still balanced by the scheduler.
+fn priority_pin_cores(pool: &ConnPool) -> Vec<Option<usize>> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut order: Vec<usize> = Vec::with_capacity(pool.slots_total());
+    order.push(0);
+    order.push(pool.udp_global_slot(0));
+    order.extend(1..pool.tcp_slots());
+    order.extend((1..pool.udp_slot_count()).map(|i| pool.udp_global_slot(i)));
+    debug_assert_eq!(order.len(), pool.slots_total());
+    let mut pin_cores = vec![None; pool.slots_total()];
+    for (rank, &slot) in order.iter().enumerate() {
+        if rank < cores {
+            pin_cores[slot] = Some(rank);
+        }
+    }
+    pin_cores
+}
+
 /// One client pool slot: a dedicated OS thread that owns its QUIC endpoint end
-/// to end — its own current-thread tokio runtime (pinned to one core on
+/// to end — its own current-thread tokio runtime (pinned to `pin_core` on
 /// Linux), UDP socket, CID table, driver task, DATAGRAM dispatcher and
 /// reconnect loop. All of the per-packet thread-local state those tasks keep
 /// then lives on the core that serves it, instead of migrating between
@@ -356,6 +400,7 @@ const SLOT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[allow(clippy::too_many_arguments)]
 fn spawn_slot_shard(
     idx: usize,
+    pin_core: Option<usize>,
     sock: std::net::UdpSocket,
     cfg: quinn::ClientConfig,
     server: String,
@@ -370,12 +415,12 @@ fn spawn_slot_shard(
     std::thread::Builder::new()
         .name(format!("myquic2-slot-{idx}"))
         .spawn(move || {
-            // Pin the first `cores` slots; a pool wider than the machine
-            // leaves its extra slots unpinned so the scheduler can balance
-            // them (pinning two threads to one core would force sharing).
-            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            if idx < cores {
-                myquic2::linux::pin_to_core(idx);
+            // Pinned before the runtime is built, so the runtime thread itself,
+            // its endpoint driver and every task it spawns stay on the core.
+            // `None` means this slot is past the machine's core count (see
+            // `priority_pin_cores`) and is left to the scheduler.
+            if let Some(core) = pin_core {
+                myquic2::linux::pin_to_core(core);
             }
             let rt_thread = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()

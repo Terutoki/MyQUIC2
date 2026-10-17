@@ -87,11 +87,23 @@ pub(crate) struct DestMemo {
     pub(crate) expires: u64,
 }
 
-/// Domain names up to this length are stored inline in a [`DestMemo`]. Longer
-/// names are simply never memoized and take the DNS path every time — a miss,
-/// never a mis-route. 64 bytes covers all but a vanishing fraction of real
-/// names, and a name longer than the 255-byte wire limit cannot occur here.
-pub(crate) const DEST_KEY_BYTES: usize = 64;
+/// Domain names up to this length are stored inline in a [`DestMemo`]; longer
+/// names are never memoized and take the DNS path every time — a miss, never a
+/// mis-route.
+///
+/// The bound is the **wire-format maximum**, not a compromise: `host_len` is a
+/// `u8` length prefix, so 255 bytes is the longest name MQP-2 can carry and the
+/// field can hold it exactly. It used to be 64 ("covers all but a vanishing
+/// fraction of real names"), which was the wrong trade for this path: a name in
+/// 65..=255 was never memoized, so every one of its datagrams re-entered the
+/// spawned-resolver slow path (`forward_server_dgram`'s spawn arm cannot return
+/// `Some`, so the connection fast table could never arm either) — a per-packet
+/// resolution where a single store would have made the next packet a compare.
+/// The cost of the wider key is 191 B inline per *session entry*
+/// (`DestMemo` is embedded in `SessEntry`), bounded by the global
+/// `MAX_SESSIONS_GLOBAL` = 8192 session cap, i.e. ~1.5 MiB in the pathological
+/// all-255-byte-names case — paid once per session, not per packet.
+pub(crate) const DEST_KEY_BYTES: usize = 255;
 
 /// What a memoized destination is valid *for*: the port always, and the
 /// normalized target name when the target was a domain.

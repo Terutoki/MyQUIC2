@@ -97,7 +97,10 @@ fn reply_addr_len(src: SocketAddr) -> usize {
 }
 
 /// Payload bytes (length prefixes included) one BATCH frame can carry for
-/// `src` at the current path budget.
+/// `src` at the current path budget: the path budget minus the fixed part
+/// `encode_batch` spends (`BATCH_PREFIX_LEN + addr header + count byte`).
+/// [`reply_stage`] charges each staged item's `2 + len` against it; a run that
+/// is admitted is therefore guaranteed to encode.
 ///
 /// Staging against this is what keeps the staging copy from being paid for
 /// nothing: the previous shape staged *every* small reply into its own `Bytes`
@@ -116,6 +119,19 @@ fn reply_batch_budget(limit: usize, src: SocketAddr) -> usize {
 /// no room left in the frame budget. The caller flushes the run and retries; a
 /// reply that still cannot be staged on its own is sent as a single datagram.
 ///
+/// The budget check charges **every** item's 2-byte length prefix, not just the
+/// one being added. `encode_batch` spends `BATCH_PREFIX_LEN + addr + 1 +
+/// Σ(2 + len)`, and [`reply_batch_budget`] already subtracts the fixed part, so
+/// a run that would hold `staged.len() + 1` items costs
+/// `arena.len() + BATCH_ITEM_OVERHEAD * (staged.len() + 1) + payload.len()`.
+/// Charging a single prefix (the previous shape) under-counted an N-item run by
+/// `2 * N` bytes: 16 x 88 B replies need `5 + 7 + 1 + 16 x 90 = 1453 B`, so at
+/// a 1452 B path budget the 16th was admitted and `encode_batch` then refused
+/// the frame — the flush degraded to 16 per-reply sends and the staging copy had
+/// been paid for nothing, which is exactly the waste this budget exists to
+/// prevent. Saturating arithmetic: `limit` is a live path budget and this runs
+/// under panic=abort, so an absurd value must clamp, not wrap.
+///
 /// The arena is reused across bursts and cleared on every flush, so the steady
 /// state allocates nothing per reply — the copy into the arena is the only one
 /// the caller pays, and `encode_batch` reads the payloads straight out of it.
@@ -130,9 +146,11 @@ pub(crate) fn reply_stage(
     if staged_src.is_some_and(|s| s != src) || staged.len() >= MAX_BATCH_ITEMS {
         return false;
     }
+    let prefixes = BATCH_ITEM_OVERHEAD.saturating_mul(staged.len().saturating_add(1));
     if arena
         .len()
-        .saturating_add(BATCH_ITEM_OVERHEAD + payload.len())
+        .saturating_add(prefixes)
+        .saturating_add(payload.len())
         > reply_batch_budget(limit, src)
     {
         return false;
@@ -651,13 +669,6 @@ pub(crate) async fn get_or_create_sess(
             return Some(sock);
         }
     }
-    // No DATAGRAM support on this path: refuse before pinning a global permit,
-    // a kernel socket and a reader task for a session whose replies would all
-    // be dropped (`limit == 0` in the reader). Negotiated at the handshake, so
-    // it never flaps mid-connection — and since a hit above can only be a
-    // session that passed this check already, it stays off the per-packet path
-    // instead of taking the connection-state lock for every datagram.
-    cd.max_datagram_size()?;
     // Fair share first: one connection must not grow past an equal split of the
     // process-wide budget while others live. Only expired sessions are
     // reclaimed here; live ones keep their sockets and the global semaphore
@@ -693,6 +704,22 @@ pub(crate) async fn get_or_create_sess(
             return None;
         }
     }
+    // No DATAGRAM support on this path: refuse before pinning a global permit,
+    // a kernel socket and a reader task for a session whose replies would all
+    // be dropped (`limit == 0` in the reader). Negotiated at the handshake, so
+    // it never flaps mid-connection — and since a hit above can only be a
+    // session that passed this check already, it stays off the per-packet path
+    // instead of taking the connection-state lock for every datagram.
+    //
+    // Deliberately *after* the cheap fair-share gates: `max_datagram_size`
+    // takes quinn's connection-state mutex, and a peer can force this branch
+    // once per packet with a fabricated session id. The gates above need no
+    // quinn lock, so a forged id that is over the connection's fair share is
+    // refused without ever touching the mutex; only a datagram that could
+    // really create a session pays the probe. (Before this move the probe ran
+    // first, i.e. a forged-id flood took the state lock per packet to reach a
+    // refusal that needed no lock at all.)
+    cd.max_datagram_size()?;
     // Check the global pool BEFORE creating the socket: once every session slot
     // is held there is no point paying socket()+setsockopt()+bind() per packet.
     let permit = match session_limiter().clone().try_acquire_owned() {

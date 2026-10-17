@@ -277,13 +277,15 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
 ///
 /// Up to [`LAST_HOP_DRAIN`](super::batch::LAST_HOP_DRAIN) frames share a single
 /// `sendmmsg` syscall on Linux; everywhere else (macOS, `ENOSYS` kernels) this
-/// is one `try_send_to` per frame. Either way each frame keeps exactly-once
-/// accounting: delivered frames count `sent`, and every unsent frame rejoins
-/// the per-frame [`udp_try_send_slice`] path below, so `WouldBlock` still
-/// queues into the detached-retry pool (with the owned copy paid only there),
-/// a full shard still drops under `dropped_no_permit` + one `Budget` warning,
-/// and hard errors still count `failed`. Never blocks, never spawns: an
-/// `EAGAIN` or short send stops the fast path at the first unsent frame.
+/// is one `try_send_to` per frame. A one-frame group skips the machinery and
+/// goes straight to the per-frame path (see the n == 1 note below). Either way
+/// each frame keeps exactly-once accounting: delivered frames count `sent`, and
+/// every unsent frame rejoins the per-frame [`udp_try_send_slice`] path below,
+/// so `WouldBlock` still queues into the detached-retry pool (with the owned
+/// copy paid only there), a full shard still drops under `dropped_no_permit` +
+/// one `Budget` warning, and hard errors still count `failed`. Never blocks,
+/// never spawns: an `EAGAIN` or short send stops the fast path at the first
+/// unsent frame.
 ///
 /// Each frame is a [`SendFrame`] — `(header, payload)`, sent as one datagram.
 /// On Linux the two are separate iovecs of one message, so a protocol header in
@@ -299,6 +301,17 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
 /// burst spanning several sessions is legitimately one run per frame — the
 /// batching pays off for the single hot flow, and cannot be widened further
 /// without merging sessions onto one socket.
+///
+/// A **one-frame group is not a group**: it takes the per-frame path directly
+/// (`udp_try_send_frame` + one `record_extra_syscalls`) instead of the
+/// `sendmmsg` machinery. With one frame there is no syscall to amortize, and a
+/// burst spanning several sessions produces exactly that shape once per run, so
+/// building the 32-slot iovec/cmsg/mmsghdr scratch for it was pure setup on the
+/// multi-session steady state. Accounting stays exact: the frame books its own
+/// terminal outcome (`sent`/`retried`/`dropped`/`failed`) through the per-frame
+/// path, one syscall is booked via `record_extra_syscalls` (the same convention
+/// as a `sendmmsg` tail), and **no `send_group` histogram observation is
+/// recorded** — a size-1 "group" would only pollute the batch histogram.
 pub fn udp_try_send_grouped(
     sock: &Arc<tokio::net::UdpSocket>,
     dst: SocketAddr,
@@ -308,6 +321,13 @@ pub fn udp_try_send_grouped(
         LAST_HOP_DRAIN, record_extra_syscalls, record_send_group, sendmmsg_available,
     };
     if frames.is_empty() {
+        return;
+    }
+    // See the n == 1 note above: the common per-run shape, and it must not pay
+    // the grouped-send setup.
+    if frames.len() == 1 {
+        udp_try_send_frame(sock, dst, frames[0]);
+        record_extra_syscalls(1);
         return;
     }
     let n = frames.len().min(LAST_HOP_DRAIN);
@@ -448,7 +468,9 @@ fn warn_udp_write(kind: UdpWriteDrop, total: u64, detail: impl FnOnce() -> Strin
 ///   (Linux only; portable one-`try_send_to`-per-frame fallback elsewhere,
 ///   bounded by `LAST_HOP_DRAIN` = 32). Per-frame outcomes are identical to
 ///   the slice variant above; a short send or `EAGAIN` rejoins the per-frame
-///   path, so batching changes the syscall count, never the outcome.
+///   path, so batching changes the syscall count, never the outcome. A
+///   one-frame group takes the per-frame path directly: one syscall booked
+///   through `record_extra_syscalls`, no `send_group` histogram observation.
 ///
 /// NOTE (last-hop batching, production): grouped sends are on the hot path
 /// for same-destination reply bursts. Still no `UDP_SEGMENT` options
@@ -729,6 +751,80 @@ mod contract_tests {
             }
         }
         assert_eq!(seen, N, "every grouped frame must arrive: {seen}/{N}");
+    }
+
+    /// A one-frame group is not a group: it must take the per-frame path,
+    /// deliver header+payload as one datagram, book exactly one `sent`, and
+    /// record **no** `send_group` histogram observation (one syscall is booked
+    /// through `record_extra_syscalls` instead).
+    ///
+    /// The grouped machinery used to be entered for n == 1 as well, and that is
+    /// the shape a drain burst spanning several sessions produces — one run per
+    /// frame. On Linux it zeroed a 32-entry iovec/cmsg/mmsghdr scratch and
+    /// issued a `sendmmsg` for a single datagram; the send-group histogram also
+    /// gained a size-1 sample per such frame, which is noise in a report whose
+    /// job is to show whether grouping amortizes.
+    #[tokio::test]
+    async fn single_frame_group_takes_the_per_frame_path() {
+        /// The size-1 bucket of the 60 s send-group histogram (`send[1:..]`).
+        fn size_one_groups() -> u64 {
+            let r = crate::batch_report();
+            let hist = r.split("send[").nth(1).expect("send hist in batch report");
+            let first = hist.split_whitespace().next().expect("size-1 bucket");
+            first
+                .strip_prefix("1:")
+                .expect("first bucket is the size-1 bucket")
+                .parse()
+                .expect("bucket count")
+        }
+
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // Prime writable readiness so the measured send takes the `Ok` arm.
+        sock.send_to(b"prime", dst).await.unwrap();
+        let mut b = [0u8; 64];
+        tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("priming datagram must arrive")
+            .unwrap();
+
+        const HDR: &[u8] = &[0x02, 0, 0, 1, 2, 3, 4];
+        let body = [0x5Au8; 6];
+        let one: [SendFrame<'_>; 1] = [(HDR, &body)];
+        // The size-1 bucket has no other writer once this path is a per-frame
+        // send (the other grouped tests use n = 6/10/40), so a delta here is
+        // exactly "a one-frame group was recorded".
+        let groups_before = size_one_groups();
+        let d = {
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            let before = udp_write::snapshot();
+            udp_try_send_grouped(&sock, dst, &one);
+            udp_write::snapshot().since(&before)
+        };
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut b))
+            .await
+            .expect("the single-frame group must arrive directly")
+            .unwrap();
+        assert_eq!(
+            n,
+            HDR.len() + body.len(),
+            "header and payload must arrive as one datagram"
+        );
+        assert_eq!(&b[..HDR.len()], HDR, "header must come first");
+        assert_eq!(&b[HDR.len()..n], &body[..]);
+        assert_eq!(d.sent, 1, "one frame must book exactly one sent: {d:?}");
+        assert_eq!(d.retried, 0, "a primed loopback send must not retry: {d:?}");
+        assert_eq!(
+            d.dropped_no_permit, 0,
+            "a primed loopback send must not drop: {d:?}"
+        );
+        assert_eq!(d.failed, 0, "a primed loopback send must not fail: {d:?}");
+        assert_eq!(
+            size_one_groups(),
+            groups_before,
+            "a one-frame group must not record a send_group histogram observation"
+        );
     }
 
     /// `record_extra_syscalls` corrects only the syscall tally: it must not move

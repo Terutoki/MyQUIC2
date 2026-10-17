@@ -271,16 +271,20 @@ pub(crate) async fn handle_socks(
             // KNOWN LIMITATION (not a regression, deliberately left as-is): this
             // flow is not retried on a sibling slot. A connection that blackholes
             // *after* `pick_tcp` selected it still accepts `open_bi`/`write_all`
-            // locally, so the header goes nowhere and the failure surfaces here —
-            // bounded by `TCP_DIAL_ACK_TIMEOUT` or, sooner, by the reconnect
-            // loop's silence watchdog force-closing the connection. Retrying
-            // transparently is impossible after the optimistic SOCKS success
-            // reply has been sent, and marking the slot dead on an ACK timeout
-            // alone would stall every later flow behind a reconnect when the
-            // connection is merely slow. A real fix needs a connection-health
-            // signal at *selection* time (e.g. a published last-received stamp),
-            // which is not worth the misconfiguration risk against mismatched
-            // keepalive intervals yet.
+            // locally, so the header goes nowhere and the failure surfaces here,
+            // bounded by `TCP_DIAL_ACK_TIMEOUT`. The slot itself is no longer left
+            // silently dead until QUIC's idle timer: the reconnect loop's silence
+            // watchdog is `max(2x keepalive, 8 s)` — ~10 s with the shipped 5 s
+            // keepalive — and provably strictly below the `max(3x keepalive, 15 s)`
+            // idle timeout it used to lose against, so it force-closes the dead
+            // connection, redials, and new flows are assigned to a live slot within
+            // ~2x keepalive (+ the 1 s poll granularity). Retrying transparently is
+            // impossible after the optimistic SOCKS success reply has been sent,
+            // and marking the slot dead on an ACK timeout alone would stall every
+            // later flow behind a reconnect when the connection is merely slow. A
+            // real fix needs a connection-health signal at *selection* time (e.g. a
+            // published last-received stamp), which is not worth the
+            // misconfiguration risk against mismatched keepalive intervals yet.
             if tcp_abort_log_due() {
                 let st = conn.stats();
                 tracing::warn!(

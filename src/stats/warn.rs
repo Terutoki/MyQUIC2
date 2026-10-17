@@ -96,6 +96,16 @@ pub(crate) fn budget_detail(limit: usize, cap: usize) -> String {
 /// [`claim_log_window_counted`]).
 pub const LOG_WINDOW_MS: u64 = 1_000;
 
+/// Whether a per-second window is open at `now` for a slot last claimed at
+/// `prev`. [`NEVER_WARNED`] means the slot has never been claimed, which is
+/// always due: the mono epoch starts near zero, so a 0-initialised slot
+/// swallows the process's first window — for the TCP-abort line that is
+/// exactly the startup/reconnect burst the diagnostic exists for.
+#[inline]
+fn log_window_due(prev: u64, now: u64) -> bool {
+    prev == NEVER_WARNED || now.saturating_sub(prev) >= LOG_WINDOW_MS
+}
+
 /// Claim a one-per-[`LOG_WINDOW_MS`] window on `slot`; the caller supplies the
 /// clock reading, so the shared clock choice stays at the call site.
 ///
@@ -105,7 +115,7 @@ pub const LOG_WINDOW_MS: u64 = 1_000;
 pub fn claim_log_window(slot: &std::sync::atomic::AtomicU64, now: u64) -> bool {
     use std::sync::atomic::Ordering;
     let prev = slot.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < LOG_WINDOW_MS {
+    if !log_window_due(prev, now) {
         return false;
     }
     slot.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
@@ -123,7 +133,7 @@ pub fn claim_log_window_counted(
 ) -> Option<u64> {
     use std::sync::atomic::Ordering;
     let prev = slot.load(Ordering::Relaxed);
-    if now.saturating_sub(prev) < LOG_WINDOW_MS {
+    if !log_window_due(prev, now) {
         suppressed.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -148,7 +158,7 @@ pub fn claim_log_window_counted(
 /// byte-identical copies of this state machine before it moved here.
 pub fn tcp_abort_log_due() -> bool {
     use std::sync::atomic::AtomicU64;
-    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_WARNED);
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
     match claim_log_window_counted(&LAST, &SUPPRESSED, crate::mono_millis()) {
         None => false,

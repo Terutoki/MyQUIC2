@@ -346,24 +346,76 @@ async fn session_dest_memo_distinguishes_ip_and_domain_targets() {
     );
 }
 
-/// A name too long for the inline key must not be memoized at all: storing
-/// it truncated would let a different name sharing the prefix match it.
+/// Every name the wire can carry must be memoizable; only a name longer than
+/// the `u8` length prefix can (255 bytes) may be refused, and it must be
+/// refused rather than truncated — storing a prefix would let a different name
+/// sharing it match.
+///
+/// The key used to be 64 bytes, so every name in 65..=255 was silently never
+/// memoized: `forward_server_dgram` could not return `Some`, the connection
+/// fast table never armed, and each datagram of such a flow re-entered the
+/// spawned-resolver path forever. The 65..255 range is real (long service
+/// names, DNS-SD-ish labels), not a corner case.
 #[tokio::test]
-async fn session_dest_memo_refuses_names_it_cannot_key() {
+async fn session_dest_memo_stores_every_wire_legal_name() {
+    let dst: SocketAddr = "10.0.0.1:443".parse().unwrap();
     let (ss, _sock) = sess_with_dest(None);
-    let long = "x".repeat(DEST_KEY_BYTES + 1);
-    sess_dest_store(
-        &ss,
-        7,
-        &long,
-        443,
-        "10.0.0.1:443".parse().unwrap(),
-        DNS_CACHE_TTL_MS,
+
+    // The bound is the wire maximum, not a compromise: `host_len` is a `u8`
+    // length prefix, so 255 must fit exactly.
+    assert_eq!(
+        DEST_KEY_BYTES, 255,
+        "the inline key must cover the MQP-2 wire maximum (u8 length prefix)"
     );
-    assert_eq!(sess_dest_lookup(&ss, mono_millis(), 7, &long, 443), None);
-    // A name sharing that prefix must miss too.
-    let prefix = "x".repeat(DEST_KEY_BYTES);
-    assert_eq!(sess_dest_lookup(&ss, mono_millis(), 7, &prefix, 443), None);
+    let longest = "x".repeat(DEST_KEY_BYTES);
+    assert!(
+        PortKey::new(&longest, 443).is_some(),
+        "a 255-byte name is the wire maximum and must key"
+    );
+    sess_dest_store(&ss, 7, &longest, 443, dst, DNS_CACHE_TTL_MS);
+    assert_eq!(
+        sess_dest_lookup(&ss, mono_millis(), 7, &longest, 443),
+        Some(dst),
+        "the wire-max name must be memoized and matched"
+    );
+
+    // A 100-byte name — deep inside the range the old 64-byte key refused —
+    // stores and matches, and a prefix of it does not (the key is exact).
+    let mid = "m".repeat(100);
+    let mid_dst: SocketAddr = "10.0.0.2:443".parse().unwrap();
+    sess_dest_store(&ss, 7, &mid, 443, mid_dst, DNS_CACHE_TTL_MS);
+    assert_eq!(
+        sess_dest_lookup(&ss, mono_millis(), 7, &mid, 443),
+        Some(mid_dst)
+    );
+    assert_eq!(
+        sess_dest_lookup(&ss, mono_millis(), 7, &mid[..mid.len() - 1], 443),
+        None,
+        "a name sharing the stored prefix must not match"
+    );
+
+    // One byte past the wire maximum: `PortKey::new` refuses it (never
+    // truncates), so the store is a no-op and the lookup misses.
+    let over = "x".repeat(DEST_KEY_BYTES + 1);
+    assert!(
+        PortKey::new(&over, 443).is_none(),
+        "a name longer than the wire maximum must not key"
+    );
+    let over_dst: SocketAddr = "10.0.0.3:443".parse().unwrap();
+    sess_dest_store(&ss, 7, &over, 443, over_dst, DNS_CACHE_TTL_MS);
+    assert_eq!(sess_dest_lookup(&ss, mono_millis(), 7, &over, 443), None);
+    // ...and the stored 255-byte prefix is untouched by that refused store.
+    assert_eq!(
+        sess_dest_lookup(&ss, mono_millis(), 7, &longest, 443),
+        None,
+        "the previous store (mid) still owns the memo; over-length must not write"
+    );
+    sess_dest_store(&ss, 7, &longest, 443, dst, DNS_CACHE_TTL_MS);
+    assert_eq!(
+        sess_dest_lookup(&ss, mono_millis(), 7, &longest, 443),
+        Some(dst),
+        "the wire-max name still round-trips"
+    );
 }
 
 /// Storing into a session that no longer exists is a no-op, not a panic or a
@@ -531,18 +583,30 @@ async fn resolve_pin_defers_filtered_first_record_to_the_slow_path() {
         pin.is_none(),
         "a deferred first record must not arm the pin either"
     );
-    // The slow path's data source: the full set, with a usable record.
-    let full = resolve_all_cached(host, port).await.expect("cached set");
-    assert_eq!(&full[..], &[private, public]);
-    assert!(
-        full.iter().any(|a| is_global_ip(a.ip())),
-        "the set the slow path picks from must contain an allowed address"
-    );
     // allow_private callers still get the first record straight from the memo.
+    // Checked *before* the slow-path probe below, which warms this thread's
+    // per-(host, port) memo with the port-attached set it returns and would
+    // overwrite the seeded verbatim address.
     assert_eq!(
         resolve_pin(&ss, &mut pin, 7, 7, host, port, true),
         Some(private),
         "allow_private must still serve the first record"
+    );
+    // The slow path's data source: the full set, with a usable record. The
+    // shared positive cache is keyed by the normalized **host** and stores
+    // port-free IPs (a port change of one name must hit the same entry, and a
+    // cached A/AAAA record carries no port), so the caller's port is attached
+    // when the set is returned — the seeded `:443` records come back on the
+    // queried port. The set's IPs and order are what the slow path picks from.
+    let full = resolve_all_cached(host, port).await.expect("cached set");
+    let want = [
+        SocketAddr::new(private.ip(), port),
+        SocketAddr::new(public.ip(), port),
+    ];
+    assert_eq!(&full[..], &want);
+    assert!(
+        full.iter().any(|a| is_global_ip(a.ip())),
+        "the set the slow path picks from must contain an allowed address"
     );
 }
 
@@ -804,6 +868,106 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
          the slot owner's socket"
     );
     assert!(staged.is_empty(), "a miss must not stage anything");
+}
+
+/// A BATCH (0x06) ingress frame must arm the connection fast table.
+///
+/// Both BATCH arms used to `let _ = forward_server_dgram(...)`, discarding the
+/// `Some((dst, life))` that [`arm_fast`] needs. The one ingress shape built for
+/// bursty small-packet flows therefore never installed the fast slot, so every
+/// payload of every BATCH frame re-ran the whole slow path (session memo probe,
+/// shard read lock, unbatched target send) forever — the `+8.8%` server CPU per
+/// datagram the fast table exists to remove.
+///
+/// The payloads are delivered with or without the fix, so only the test-only
+/// `BATCH_FAST_ARMS` counter can tell the fixed path from the buggy one. One
+/// frame with two payloads is enough: the first payload takes the slow path and
+/// arms the slot, the second then hits the fast path — so the expected delta is
+/// exactly 1, and a second increment would mean the slot was not armed.
+///
+/// The session this creates makes the table a process-wide holder, so the test
+/// serializes on [`HOLDER_TEST_LOCK`] and waits for the connection-close sweeper
+/// to drain it before releasing, leaving the exact holder count untouched.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn batch_ingress_arms_the_connection_fast_table() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    // Loopback target: `allow_private = true` passes the SSRF gate, and a v4 IP
+    // target needs no DNS, so the slow path's first answer is inline.
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let limit = client_conn
+        .max_datagram_size()
+        .expect("DATAGRAM is negotiated by the test transport");
+    let addr = TargetAddr::Ip(dst);
+    let payloads: [&[u8]; 2] = [b"batch-1", b"batch-2"];
+    let frame = encode_batch(1, &addr.as_ref(), &payloads, limit).expect("encode one BATCH frame");
+
+    let server_task = tokio::spawn(handle_conn(
+        server_conn,
+        true,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        MAX_CONNECTIONS,
+    ));
+    let arms_before = BATCH_FAST_ARMS.load(Ordering::Relaxed);
+    client_conn.send_datagram(frame).unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut got = Vec::new();
+    for _ in &payloads {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+            .await
+            .expect("every payload of the BATCH frame must be relayed")
+            .unwrap();
+        got.push(buf[..n].to_vec());
+    }
+    // Delivery, not wire order: the session socket is fresh, and tokio may
+    // report `WouldBlock` on its first send without issuing the syscall
+    // (`udp_try_send`'s retry-pool note), so either payload can be delivered by
+    // a detached retry task and the two can invert. The BATCH frame's *staging*
+    // order is pinned on the reply side by
+    // `reply_batch_frame_carries_every_staged_reply_in_order`.
+    got.sort();
+    assert_eq!(
+        got,
+        vec![b"batch-1".to_vec(), b"batch-2".to_vec()],
+        "every payload of the BATCH frame must be relayed"
+    );
+
+    // The arm happens after the slow path's send, so poll rather than race the
+    // target's receive: the assertion is about "the batch arm reached
+    // `arm_fast`", not about the instant it did.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let arms = loop {
+        let now = BATCH_FAST_ARMS.load(Ordering::Relaxed) - arms_before;
+        if now >= 1 || tokio::time::Instant::now() >= deadline {
+            break now;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        arms, 1,
+        "the BATCH arm must arm the fast table exactly once: the first payload \
+         takes the slow path, the second must then hit the newly armed slot"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_task.abort();
+    // The connection-close sweeper drains the session; wait for the holder
+    // count to come back so this test leaves the process-global counter exactly
+    // where it found it (the [`HOLDER_TEST_LOCK`] contract).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session_holders().load(Ordering::Relaxed) != holders_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session holder count must return after the connection closes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// The reader's task-local mirror of the reply allowlist must be validated
@@ -1377,10 +1541,20 @@ fn admission_cap_bounds_connections_by_memory() {
         "2/4/2 MB windows + 2 x 1 MB packets + the per-connection reassembly budget"
     );
     let per_session = per_session_memory_bytes();
+    // Linux stores and reports SO_RCVBUF/SO_SNDBUF at 2x the requested value,
+    // so a session's socket cap there is 4 x `sess_socket_buf()` (both
+    // directions doubled); other platforms charge the requested caps. The
+    // admission formula must charge what the kernel actually pins, not what was
+    // asked for — otherwise `max_peer_memory_mb` under-counts the pool by ~2x.
+    let socket_terms = if cfg!(target_os = "linux") {
+        2 * (2 * sess_socket_buf())
+    } else {
+        2 * sess_socket_buf()
+    };
     assert_eq!(
         per_session,
-        (2 * sess_socket_buf() + UDP_RECV_MAX + UDP_RECV_SLACK) as u64,
-        "a session's two kernel caps plus its reader's userspace buffer"
+        (socket_terms + UDP_RECV_MAX + UDP_RECV_SLACK) as u64,
+        "a session's kernel caps (doubled on Linux) plus its reader's userspace buffer"
     );
     let pool = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
     assert_eq!(pool, MAX_SESSIONS_GLOBAL as u64 * per_session);
@@ -2556,15 +2730,170 @@ async fn reply_batch_frame_carries_every_staged_reply_in_order() {
     server_conn.close(0u32.into(), b"done");
 }
 
+/// Staging must charge **every** reply's 2-byte length prefix, so an accepted
+/// run always encodes: the old check added a single `BATCH_ITEM_OVERHEAD` and
+/// compared the bodies-only arena against the budget, under-counting an N-item
+/// run by `2 * N` bytes.
+///
+/// The boundary is exact and matches `encode_batch`'s arithmetic: an IPv4
+/// source costs a 7-byte header, so a BATCH frame spends
+/// `5 + 7 + 1 + Σ(2 + len)`. Sixteen 88-byte replies need
+/// `13 + 16 x 90 = 1453 B`:
+///
+/// - at 1452 B the 16th reply does not fit (`90 x 16 = 1440 > 1452 - 13 = 1439`)
+///   and must be refused **during staging** — the old accounting admitted it, the
+///   flush then found the frame unencodable and degraded to per-reply sends after
+///   the staging copy had already been paid for. That is precisely the waste the
+///   budget exists to prevent;
+/// - at 1453 B all sixteen fit, and both the 15-item and the 16-item accepted
+///   runs must encode (asserted against `encode_batch` itself, not against a
+///   copied formula).
+#[test]
+fn reply_stage_prefix_charge_makes_every_accepted_run_encodable() {
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let body = [0xA5u8; 88];
+    let addr = TargetAddr::Ip(src);
+    let aref = addr.as_ref();
+
+    // 1452 B: the 16th 88-byte reply is over budget and is refused at staging.
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
+    let mut staged_n = 0usize;
+    while reply_stage(&mut arena, &mut staged, &mut staged_src, src, &body, 1452) {
+        staged_n += 1;
+        assert!(
+            staged_n <= MAX_BATCH_ITEMS,
+            "the run must stay item-bounded"
+        );
+    }
+    assert_eq!(
+        staged_n, 15,
+        "16 x 88 B replies need 1453 B, so the 1452 B budget must refuse the 16th"
+    );
+    assert_eq!(staged.len(), 15);
+    assert_eq!(arena.len(), 15 * 88, "the arena holds bodies only");
+    let refs: Vec<&[u8]> = staged.iter().map(|(o, l)| &arena[*o..*o + *l]).collect();
+    let frame = encode_batch(7, &aref, &refs, 1452)
+        .expect("every staged run must encode — this is the invariant the under-count broke");
+    assert_eq!(
+        frame.len(),
+        13 + 15 * 90,
+        "frame = prefix + addr header + count byte + Σ(2 + len)"
+    );
+
+    // 1453 B: the wire size of the 16-item frame, so all sixteen fit and encode.
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
+    let mut staged_n = 0usize;
+    while staged_n < MAX_BATCH_ITEMS
+        && reply_stage(&mut arena, &mut staged, &mut staged_src, src, &body, 1453)
+    {
+        staged_n += 1;
+    }
+    assert_eq!(staged_n, MAX_BATCH_ITEMS, "the full run fits 1453 B");
+    let refs: Vec<&[u8]> = staged.iter().map(|(o, l)| &arena[*o..*o + *l]).collect();
+    let frame = encode_batch(7, &aref, &refs, 1453).expect("the full 16-item run must encode");
+    assert_eq!(frame.len(), 1453);
+}
+
+/// The end-to-end shape of the accounting fix: a full run that staging accepts
+/// flushes as exactly **one** 0x06 frame.
+///
+/// Sizes are derived from the live path budget instead of the 1452/1453 literal
+/// boundary above, because the frame is actually sent through quinn here (a
+/// frame larger than `max_datagram_size` would be `TooLarge` and legitimately
+/// take the per-reply fallback — a different test). The point is that the
+/// budget-aware staging fills a run to the last byte and the flush still emits
+/// one grouped frame: before the fix the last item's prefixes were unaccounted
+/// and the frame overflowed.
+#[tokio::test]
+async fn a_staging_full_reply_run_flushes_as_one_batch_frame() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let mut frag = DgramFragmenter::new();
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let limit = server_conn.max_datagram_size().unwrap();
+    // IPv4 source: the fixed part is BATCH_PREFIX_LEN + 7 + 1.
+    let fixed = BATCH_PREFIX_LEN + 7 + 1;
+    let per_item = (limit - fixed) / MAX_BATCH_ITEMS;
+    assert!(
+        per_item > BATCH_ITEM_OVERHEAD,
+        "the test transport must carry a batch frame: limit {limit} B"
+    );
+    let body_len = per_item - BATCH_ITEM_OVERHEAD;
+    let bodies: Vec<Vec<u8>> = (0..MAX_BATCH_ITEMS)
+        .map(|i| vec![i as u8; body_len])
+        .collect();
+
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
+    for body in &bodies {
+        assert!(
+            reply_stage(&mut arena, &mut staged, &mut staged_src, src, body, limit),
+            "a run sized to the budget must stage in full"
+        );
+    }
+    assert_eq!(staged.len(), MAX_BATCH_ITEMS);
+    // The staged run is at most one frame by construction; this is the property
+    // the old under-count violated.
+    assert!(
+        fixed + staged.len() * per_item <= limit,
+        "an accepted run must never exceed the path budget"
+    );
+
+    let mut limit_slot = limit;
+    let mut last_probe = 0u64;
+    flush_reply_batch(
+        &server_conn,
+        7,
+        &mut frag,
+        &mut arena,
+        &mut staged,
+        &mut staged_src,
+        &mut limit_slot,
+        &mut last_probe,
+    );
+    assert!(
+        staged.is_empty() && staged_src.is_none(),
+        "the flush must drain the run"
+    );
+
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the batch frame must arrive")
+        .unwrap();
+    assert!(is_batch(&d), "a staged-full run must ride one BATCH frame");
+    let b = decode_batch_ref(&d).expect("the frame must decode as a batch");
+    assert_eq!(b.sess, 7);
+    assert_eq!(b.payloads.len(), MAX_BATCH_ITEMS);
+    for (got, want) in b.payloads.iter().zip(&bodies) {
+        assert_eq!(*got, want.as_slice(), "payloads must survive in order");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), client_conn.read_datagram())
+            .await
+            .is_err(),
+        "a staged-full run must produce exactly one frame, never a degraded tail"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
 /// A batch frame that does not fit the path must not take its replies down
 /// with it: every reply goes out as its own `0x02` frame, in order, and each
 /// keeps its own accounting.
 ///
-/// Reached today only when the path budget **shrinks after staging**: staging
-/// itself is budget-aware (`reply_stage` refuses an item that would not fit),
-/// so a run is only ever flushed into a frame that could hold it. The shrink is
-/// exactly the case the fallback exists for — a PMTU reduction between the
-/// staging and the flush must not lose N replies that each still fit alone.
+/// Reached only when the path budget **shrinks after staging**: `reply_stage`
+/// now charges every item's 2-byte length prefix (see
+/// `reply_stage_prefix_charge_makes_every_accepted_run_encodable`), so a run
+/// that staging accepted always encodes and a shrink is exactly the case this
+/// fallback exists for — a PMTU reduction between the staging and the flush
+/// must not lose N replies that each still fit alone. Before the accounting
+/// fix this fallback also masked the staging gate's own over-admission (an
+/// under-counted run was flushed into a frame it could not fit), at the cost of
+/// the whole staged copy.
 #[tokio::test]
 async fn reply_batch_falls_back_to_per_reply_frames_when_it_cannot_fit() {
     let (client_conn, server_conn) = stream_test_pair().await;
@@ -2722,3 +3051,100 @@ async fn distinct_source_runs_flush_in_order_as_separate_frames() {
 // The `MYQUIC2_SHARD_RUNTIME` parser now lives with the flag itself
 // (`myquic2::shard_runtime_enabled`, pinned by the lib's
 // `shard_runtime_off_spellings_parse` test) because both binaries read it.
+
+/// The peer-driven server lines must log their first event immediately and then
+/// go quiet inside the one-second window; the window's losers are counted and
+/// folded into the next winner's line.
+///
+/// A `0`-initialised slot would swallow the first event instead (the mono epoch
+/// starts at process start, so `now - 0 < 1000 ms` for the first second) —
+/// exactly the startup/handshake burst these lines exist for. The bin mirrors
+/// the crate-private lib sentinel with [`NEVER_LOGGED`] = `u64::MAX`; the
+/// cross-crate half of that contract is pinned by
+/// `never_logged_sentinel_claims_immediately` below.
+///
+/// Only this test claims these four classes (the fifth, [`ServerLog::NewConn`],
+/// is exercised by `batch_ingress_arms_the_connection_fast_table` through
+/// `handle_conn`), so their statics are deterministic here.
+#[test]
+fn peer_driven_server_logs_never_swallow_the_first_line() {
+    let classes = [
+        ServerLog::HandshakeFailed,
+        ServerLog::HandshakeTimeout,
+        ServerLog::AcceptError,
+        ServerLog::AuthFailure,
+    ];
+    for class in classes {
+        let first = claim_server_log(class)
+            .unwrap_or_else(|| panic!("{class:?} must log its first event immediately"));
+        assert!(
+            first.to_string().is_empty(),
+            "nothing has been suppressed before the first window: {class:?}"
+        );
+        assert!(
+            claim_server_log(class).is_none(),
+            "{class:?} must stay silent inside its one-second window"
+        );
+    }
+    // Distinct slots: every class above claimed on its very first call, even
+    // though the others had already opened their windows. (A shared slot would
+    // let a handshake-failure flood silence the auth-failure line.)
+    for class in classes {
+        assert!(
+            claim_server_log(class).is_none(),
+            "{class:?} must still be inside its own window"
+        );
+    }
+    // The folded suffix the winner's line carries.
+    assert!(
+        Suppressed(0).to_string().is_empty(),
+        "a clean window must leave the line byte-identical to the old one"
+    );
+    assert_eq!(
+        Suppressed(7).to_string(),
+        " (7 similar suppressed in the last second)"
+    );
+}
+
+/// Cross-crate lock on the `NEVER_LOGGED` sentinel: the lib's
+/// `claim_log_window_counted` must treat `u64::MAX` as "never claimed" and hand
+/// the first caller the window even at the process's first millisecond, then
+/// report the suppressed count once the next window opens.
+#[test]
+fn never_logged_sentinel_claims_immediately() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // `NEVER_LOGGED` mirrors `myquic2::stats::warn::NEVER_WARNED` (crate-private
+    // to the lib); this fails the moment the lib changes the sentinel value.
+    let last = AtomicU64::new(NEVER_LOGGED);
+    let suppressed = AtomicU64::new(0);
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 0),
+        Some(0),
+        "an unclaimed slot must claim immediately, even at mono t=0"
+    );
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 0),
+        None,
+        "a second event in the same millisecond is suppressed and counted"
+    );
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 999),
+        None,
+        "the window is 1000 ms wide"
+    );
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 1_000),
+        Some(2),
+        "the next window's winner must report the two events it swallowed"
+    );
+    assert_eq!(
+        last.load(Ordering::Relaxed),
+        1_000,
+        "the claim stores the real timestamp it was given"
+    );
+    assert_eq!(
+        suppressed.load(Ordering::Relaxed),
+        0,
+        "claiming must reset the suppressed count"
+    );
+}

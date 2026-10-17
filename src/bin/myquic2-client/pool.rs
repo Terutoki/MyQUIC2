@@ -220,17 +220,21 @@ impl ConnSlot {
 /// behind a bulk queue — which is exactly what `rr % n` used to do for one flow
 /// in every n, making the isolation the pool exists for only (n-1)/n effective.
 ///
-/// Failover is class-preserving. A dead bulk preference falls back to another
-/// **bulk** slot first, and only a pool with no live bulk slot at all falls back
-/// to slot 0. The first version of this function scanned `0..n` and therefore
-/// took slot 0 whenever the round-robin preference happened to be the dead slot,
-/// even with two live bulk slots available: any single bulk reconnect put
-/// `1/(n-1)` of new bulk flows onto the interactive connection, i.e. it broke the
-/// isolation precisely when a connection was already degraded. For a two-slot
-/// pool the two rules coincide, so the old dual-pool truth table still holds.
-/// When nothing is live the preference is kept, so `wait_conn` bounds the stall
-/// and fails the flow fast instead of the pool inventing a slot that has no
-/// connection behind it.
+/// Failover is class-preserving **and rotated**. A dead preference continues the
+/// rotation over the live slots of the class instead of collapsing onto the
+/// first live one: the pre-fix `(0..n).find`/`(1..n).find` shape put every
+/// interactive flow on bulk slot 1 while slot 0 reconnected, and dumped a dead
+/// bulk slot's whole round-robin share on the lowest live sibling — i.e. it
+/// broke the isolation precisely when a connection was already degraded. Both
+/// classes share the rotation position `1 + rr % (n - 1)` over the bulk slots,
+/// so a bulk flow continues from its own preference while a pinned flow (slot 0
+/// down) starts at the shared cursor; `pick_tcp_index` advances that cursor on
+/// every flow, pinned ones included, so successive fallbacks start at
+/// successive bulk slots. A bulk class with no live slot at all falls back to
+/// slot 0 (and only if it is actually carrying traffic); the pinned class has
+/// nowhere else to go. When nothing is live the preference is kept, so
+/// `wait_conn` bounds the stall and fails the flow fast instead of the pool
+/// inventing a slot that has no connection behind it.
 ///
 /// `live` describes the **TCP** slots only. The dedicated UDP egress slot lives
 /// outside this range (see [`ConnPool::udp_bind`]) and is never a TCP target.
@@ -240,21 +244,27 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     if n == 1 {
         return 0;
     }
-    let preferred = if pinned { 0 } else { 1 + rr % (n - 1) };
+    let bulk = n - 1;
+    let preferred = if pinned { 0 } else { 1 + rr % bulk };
     if live[preferred] {
         return preferred;
     }
-    if pinned {
-        // The interactive class has nowhere else to go: first live slot.
-        return (0..n).find(|&i| live[i]).unwrap_or(preferred);
+    // Rotated scan over the bulk set from the shared rotation position. For a
+    // bulk flow that position is the dead preference itself; for a pinned flow
+    // it is the common cursor, so its fallbacks spread over slots 1..n instead
+    // of all taking the first live one. Continuing forward (rather than
+    // restarting at the lowest index) is what moves a reconnect's flows to the
+    // dead slot's successor instead of doubling the lowest sibling.
+    for k in 0..bulk {
+        let i = 1 + (rr + k) % bulk;
+        if live[i] {
+            return i;
+        }
     }
-    // Bulk stays in its own class while any bulk slot is live.
-    if let Some(i) = (1..n).find(|&i| live[i]) {
-        return i;
-    }
-    // Every bulk slot is down: share the interactive connection rather than
-    // stall, but only if it is actually carrying traffic.
-    if live[0] { 0 } else { preferred }
+    // No bulk slot is live. Bulk shares the interactive connection rather than
+    // stall, but only if it is actually carrying traffic; pinned keeps slot 0
+    // (the preference) so `wait_conn` fails the flow fast.
+    if !pinned && live[0] { 0 } else { preferred }
 }
 
 /// A resolved UDP egress binding: which dedicated UDP connection an
@@ -289,9 +299,11 @@ pub(crate) struct UdpBind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EgressClass {
     /// An `interactive_ports` destination, or a first payload no larger than
-    /// [`UDP_INTERACTIVE_MAX`] (STUN/DTLS/RTP-sized media, DNS, games).
+    /// [`UDP_INTERACTIVE_MAX`] on any other port (STUN/DTLS/RTP-sized media,
+    /// DNS, games).
     Interactive,
-    /// Everything else.
+    /// Everything else, plus every destination port in `udp_bulk_ports`: a VPN
+    /// tunnel is steady bulk traffic whose first packet is small.
     Bulk,
 }
 
@@ -357,6 +369,13 @@ pub(crate) struct ConnPool {
     /// Round-robin cursor for bulk shard assignment (see [`ConnPool::udp_bind`]).
     pub(crate) udp_rr: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) interactive_ports: Arc<std::collections::HashSet<u16, foldhash::fast::RandomState>>,
+    /// Destination ports forced to the **bulk** class whatever their first
+    /// payload size (see [`ConnPool::udp_class`]). A VPN tunnel's first packet
+    /// is small — WireGuard's handshake is 148 B — so the size heuristic alone
+    /// would keep the whole tunnel on the single interactive connection next to
+    /// DNS/STUN/games, where it can never use the bulk shards. Empty from the
+    /// size-only test constructor, i.e. the pure size heuristic.
+    pub(crate) bulk_ports: Arc<std::collections::HashSet<u16, foldhash::fast::RandomState>>,
     /// TCP slots: the routing range is `0..tcp_slots` (0 interactive, rest
     /// bulk). Never includes the UDP range.
     pub(crate) tcp_slots: usize,
@@ -375,14 +394,44 @@ pub(crate) struct ConnPool {
 }
 
 impl ConnPool {
+    /// The pre-bulk-port-constructor pool shape: the same slots as
+    /// [`ConnPool::new_with_bulk_ports`] with the bulk-port override list
+    /// empty, i.e. the pure size heuristic every existing test was written
+    /// against. Test-only because production always passes the configured
+    /// list — keeping it as the single implementation of the slot layout is
+    /// what makes "no bulk ports" a supported configuration rather than a
+    /// second code path.
+    #[cfg(test)]
+    pub(crate) fn new(
+        n: usize,
+        interactive_ports: Vec<u16>,
+        udp_fail_closed: bool,
+        udp_split: bool,
+        udp_bulk_shards: usize,
+    ) -> Self {
+        Self::new_with_bulk_ports(
+            n,
+            interactive_ports,
+            Vec::new(),
+            udp_fail_closed,
+            udp_split,
+            udp_bulk_shards,
+        )
+    }
+
     /// Build the process pool: `tcp` TCP slots indexed `0..tcp`, then the UDP
     /// range — with `udp_split` on, the interactive class's slot at UDP index
     /// 0 plus `udp_bulk_shards` bulk shards at `1..`, clamped here so no
     /// caller can build a pool wider than the scratch arrays the routing and
     /// egress paths size from [`MAX_POOL_CONNS`] / [`MAX_UDP_SLOTS`].
-    pub(crate) fn new(
+    ///
+    /// `bulk_ports` is the destination-port override list (see
+    /// [`ConnPool::udp_class`]): ports classified as bulk whatever their first
+    /// payload size. It only affects classification, never the slot layout.
+    pub(crate) fn new_with_bulk_ports(
         n: usize,
         interactive_ports: Vec<u16>,
+        bulk_ports: Vec<u16>,
         udp_fail_closed: bool,
         udp_split: bool,
         udp_bulk_shards: usize,
@@ -400,6 +449,7 @@ impl ConnPool {
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             udp_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
+            bulk_ports: Arc::new(bulk_ports.into_iter().collect()),
             tcp_slots: tcp,
             udp_split,
             bulk_shards,
@@ -476,15 +526,29 @@ impl ConnPool {
         UdpBind { class, index }
     }
 
-    /// Egress class for a UDP association, from its first datagram: a known
-    /// interactive port or a small first payload is the interactive class,
-    /// everything else is bulk. See [`EgressClass`] and [`UDP_INTERACTIVE_MAX`].
+    /// Egress class for a UDP association, from its first datagram. Precedence:
+    /// a known interactive port, then a known bulk port (a VPN data port is
+    /// bulk whatever the first payload size — its handshake is small), then
+    /// the first-payload heuristic (see [`EgressClass`] and
+    /// [`UDP_INTERACTIVE_MAX`]).
     pub(crate) fn udp_class(&self, addr: &TargetAddrRef<'_>, first_payload: usize) -> EgressClass {
         let port = match *addr {
             TargetAddrRef::Ip(s) => s.port(),
             TargetAddrRef::Domain(_, p) => p,
         };
-        if self.interactive_ports.contains(&port) || first_payload <= UDP_INTERACTIVE_MAX {
+        // Interactive first: an operator who lists a port in both sets has
+        // stated it is latency-sensitive, and the explicit class must win.
+        if self.interactive_ports.contains(&port) {
+            return EgressClass::Interactive;
+        }
+        // The bulk override exists because the size heuristic cannot see the
+        // protocol behind the port: WireGuard's 148 B handshake, OpenVPN's
+        // small control packets, i.e. the flows most likely to be steady bulk
+        // traffic are exactly the ones that look like a STUN binding request.
+        if self.bulk_ports.contains(&port) {
+            return EgressClass::Bulk;
+        }
+        if first_payload <= UDP_INTERACTIVE_MAX {
             EgressClass::Interactive
         } else {
             EgressClass::Bulk
@@ -526,11 +590,13 @@ impl ConnPool {
             *l = self.slots.get(i).is_some_and(ConnSlot::is_live);
         }
         let pinned = self.is_interactive(t);
-        let rr = if pinned {
-            0
-        } else {
-            self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        };
+        // The cursor advances on every flow, pinned ones included. The pinned
+        // class does not consult it while slot 0 is live, but when slot 0 is
+        // down its fallback rotation does — and a cursor only bulk flows
+        // advanced would restart every pinned fallback at the same bulk slot
+        // instead of spreading over the live set. One relaxed RMW per flow is
+        // the same cost the old bulk-only increment paid.
+        let rr = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let preferred = select_slot(pinned, rr, &live[..n]);
         // L2 stale-live failover: `live` is only a hint, so a slot whose QUIC
         // connection died in the window before the conn loop clears the bit
