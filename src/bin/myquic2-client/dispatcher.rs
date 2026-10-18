@@ -13,10 +13,12 @@ use futures_util::future::FutureExt as _;
 /// than `DISPATCH_CACHE` live associations collide by pigeonhole. Sized at 4096
 /// (`MAX_UDP_ASSOCS` 4032 rounded up to a power of two) so a full house averages
 /// one id per slot instead of four: round-robin hit rate goes from ~2% to ~37%
-/// under churn, 100% for a fresh consecutive window. Costs 64 KiB per
-/// dispatcher (`DispatchSlot` is a `u32` plus an `Option<Weak>`, 16 B with
-/// padding, x 4096) — noise against the ~64 KiB of kernel socket caps each
-/// association already carries.
+/// under churn, 100% for a fresh consecutive window. Costs ~192 KiB per
+/// dispatcher: `DispatchSlot` is a `u32`, an `Option<Weak>` and the pinned
+/// `Option<SocketAddr>` app address — about 48 B with padding, x 4096. (The
+/// table is sized for the default cap; a lowered `max_udp_assocs` only leaves
+/// it over-sized, never under.) Still noise against the ~256 KiB of kernel
+/// socket caps each live association already carries.
 /// Must be a power of two (the index is a mask).
 pub(crate) const DISPATCH_CACHE: usize = 4096;
 

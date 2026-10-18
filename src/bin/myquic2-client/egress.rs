@@ -13,7 +13,9 @@ pub(crate) const EGRESS_REFRESH_MS: u64 = 1000;
 /// across every relay task. The memo pins one clone per worker thread per
 /// binding and serves it with no lock and no refcount traffic; a generation
 /// bump (any successful `cached` mutation) invalidates it without touching
-/// other threads.
+/// other threads. An entry that has gone stale is *released* on the miss path
+/// (`with_fresh`), so a dead generation's handle cannot be pinned here by a
+/// binding that stops sending — see [`SharedEgress::forget_slot`].
 pub(crate) struct EgressMemo {
     pub(crate) generation: u64,
     pub(crate) conn: quinn::Connection,
@@ -100,7 +102,10 @@ impl SharedEgress {
     ///
     /// `f` runs synchronously against the borrowed handle, so the hot path
     /// costs one generation load and one `RefCell` borrow — no Arc RMW, no
-    /// quinn lock. A miss leaves the memo untouched; the caller re-acquires.
+    /// quinn lock. A *fresh* miss leaves the memo untouched; a stale entry
+    /// (generation mismatch or expired refresh window) is released on the miss
+    /// path so its cloned `Connection` cannot outlive its generation on this
+    /// thread — the hit path keeps its exact shape and pays nothing.
     ///
     /// N=1 CONTRACT (client egress): a memo hit followed by `frag.send` pays
     /// exactly one quinn take per frame — the `SendDatagram::poll` lock inside
@@ -128,8 +133,9 @@ impl SharedEgress {
     /// a death reports `ConnectionLost`, and the cache is invalidated with the
     /// same exactly-once accounting as before. The stale window is at most one
     /// datagram, and that datagram was going to be dropped either way.
-    /// `with_fresh` never invalidates itself (avoids write amplification on
-    /// this hot path).
+    /// `with_fresh` never invalidates the *shared* cache (avoids write
+    /// amplification on this hot path); it only drops its own thread-local
+    /// stale entry, on the miss path.
     pub(crate) fn with_fresh<R>(
         &self,
         bind: UdpBind,
@@ -138,15 +144,23 @@ impl SharedEgress {
     ) -> Option<R> {
         let generation = self.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
         EGRESS_MEMO.with(|slots| {
-            let memo = slots.borrow();
+            let mut memo = slots.borrow_mut();
             let entry = memo[bind.index].as_ref()?;
             if entry.generation == generation
                 && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS
             {
-                Some(f(&entry.conn, entry.limit))
-            } else {
-                None
+                return Some(f(&entry.conn, entry.limit));
             }
+            // Stale (generation bump or expired refresh window): release this
+            // thread's clone of the handle before returning None. The clone is
+            // what used to pin a dead generation's quinn state after a redial
+            // when the binding saw no further datagrams (see `forget_slot` and
+            // the note on [`EgressMemo`]). The caller re-acquires here and
+            // `memo_store` re-populates the slot with the fresh handle, so the
+            // hit path above is unchanged and the stale path pays only the
+            // write it was already about to pay in `memo_store`.
+            memo[bind.index] = None;
+            None
         })
     }
 
@@ -367,6 +381,32 @@ impl SharedEgress {
         self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
+    /// Drop every cached handle that was published from pool slot `slot`.
+    ///
+    /// Called on the dead-connection path (`spawn_conn_loop`) once
+    /// [`ConnSlot::clear_if_and_mark_dead`] has committed the redial: the
+    /// per-binding `cached` slots are the only place outside the pool that hold
+    /// a strong `quinn::Connection`, and a generation that dies while its
+    /// binding sees no further datagrams is otherwise never invalidated — the
+    /// dead handle, and the whole `quinn-proto` connection state behind it,
+    /// would outlive the redial for the process lifetime. The clear is scoped
+    /// by [`EgressCache::slot`], so a healthy slot's cache is untouched; the
+    /// generation bump is the same one [`Self::invalidate`] performs, so every
+    /// thread-local memo tied to a cleared binding misses and re-acquires on
+    /// its next datagram.
+    pub(crate) fn forget_slot(&self, slot: usize) {
+        for i in 0..MAX_UDP_SLOTS {
+            if self.cached[i]
+                .load()
+                .as_ref()
+                .is_some_and(|e| e.slot == slot)
+            {
+                self.cached[i].store(None);
+                self.generation[i].fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
     /// Re-read the live DATAGRAM budget on the cached handle, keeping it.
     ///
     /// The recovery for a `TooLarge` send. That outcome is a **size** verdict,
@@ -418,4 +458,14 @@ impl SharedEgress {
         })));
         self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// Test hook: whether this thread's memo slot for `bind` is empty.
+///
+/// The memo is private to this module, and the retention fix is precisely "a
+/// stale entry must release its cloned handle", so a test has to observe the
+/// slot itself, not just the shared cache.
+#[cfg(test)]
+pub(crate) fn memo_is_empty(bind: UdpBind) -> bool {
+    EGRESS_MEMO.with(|slots| slots.borrow()[bind.index].is_none())
 }

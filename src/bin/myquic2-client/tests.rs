@@ -3870,3 +3870,167 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
         "exactly `min(cores, slots)` slots are pinned"
     );
 }
+
+// ---- Memory-retention fixes: egress dead-handle release, UDP-assoc cap ----
+
+/// `UdpHub::with_capacity` is the client's UDP-association memory knob: it must
+/// refuse the `max + 1`-th reservation, hand a slot back on `release`, and
+/// clamp (0 -> 1 so UDP can never be silently switched off; a usize::MAX typo
+/// -> the default cap so the protocol budget is never exceeded).
+#[test]
+fn hub_with_capacity_bounds_alloc_and_release_reopens() {
+    let hub = UdpHub::with_capacity(2);
+    let a = hub.alloc_sess().expect("first association");
+    let b = hub.alloc_sess().expect("second association");
+    assert_eq!(
+        hub.len.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "both reservations must be counted"
+    );
+    assert!(
+        hub.alloc_sess().is_none(),
+        "a capacity-2 hub must refuse the third association"
+    );
+    hub.release(a);
+    let c = hub
+        .alloc_sess()
+        .expect("release must free the reservation for reuse");
+    assert_ne!(b, c, "the freed slot must hand out the next live id");
+    hub.release(b);
+    hub.release(c);
+    assert_eq!(
+        hub.len.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "every reservation must come back"
+    );
+
+    let floor = UdpHub::with_capacity(0);
+    assert_eq!(floor.max, 1, "0 clamps to 1, never disables UDP");
+    assert!(floor.alloc_sess().is_some());
+    assert!(floor.alloc_sess().is_none());
+
+    let ceiling = UdpHub::with_capacity(usize::MAX);
+    assert_eq!(
+        ceiling.max, MAX_UDP_ASSOCS,
+        "an oversize value clamps to the default cap"
+    );
+}
+
+/// Minimal client config with only the four required fields, for the
+/// `max_udp_assocs` parsing/clamping test.
+fn client_conf_with(extra: &str) -> ClientConf {
+    let base = concat!(
+        "socks_listen = \"[::]:1080\"\n",
+        "server_addr = \"127.0.0.1:8443\"\n",
+        "server_name = \"test.com\"\n",
+        "server_cert_file = \"server-cert.pem\"\n",
+    );
+    toml::from_str(&format!("{base}{extra}")).expect("minimal client config parses")
+}
+
+/// `max_udp_assocs`: unset = default (4032), explicit honored, 0/oversize
+/// clamped. This is the config surface behind the hub cap above.
+#[test]
+fn client_udp_assoc_cap_defaults_and_clamps() {
+    assert_eq!(MAX_UDP_ASSOCS, 4032, "the documented default");
+    let unset = client_conf_with("");
+    assert!(
+        unset.max_udp_assocs.is_none(),
+        "unset must stay None so the default is decided in one place"
+    );
+    assert_eq!(unset.udp_assoc_count(), MAX_UDP_ASSOCS);
+
+    let explicit = client_conf_with("max_udp_assocs = 128\n");
+    assert_eq!(explicit.max_udp_assocs, Some(128));
+    assert_eq!(explicit.udp_assoc_count(), 128);
+
+    assert_eq!(
+        client_conf_with("max_udp_assocs = 0\n").udp_assoc_count(),
+        1,
+        "0 clamps to 1, never disables UDP associations"
+    );
+    assert_eq!(
+        client_conf_with("max_udp_assocs = 999999\n").udp_assoc_count(),
+        MAX_UDP_ASSOCS,
+        "an oversize value clamps to the default cap"
+    );
+}
+
+/// A redial must release the dead generation's `quinn::Connection` clones held
+/// by the egress caches, or a binding that goes idle pins the whole quinn-proto
+/// connection state for the process lifetime. `forget_slot` must be scoped to
+/// the dead pool slot: a healthy slot's cached handle stays.
+#[tokio::test]
+async fn forget_slot_releases_only_that_slots_handles() {
+    let (conn, _client, _server) = real_connection().await;
+    let e = SharedEgress::default();
+    let now = mono_millis();
+    for (i, slot) in [(0usize, 3usize), (1, 4)] {
+        e.cached[i].store(Some(Arc::new(EgressCache {
+            conn: conn.clone(),
+            limit: 1200,
+            stamp_ms: now,
+            slot,
+        })));
+    }
+    let other_gen = e.generation[1].load(std::sync::atomic::Ordering::Acquire);
+
+    e.forget_slot(3);
+
+    assert!(
+        e.cached[0].load().is_none(),
+        "the dead slot's cached handle must be released"
+    );
+    assert_eq!(
+        e.generation[0].load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the clear must bump the generation so every thread's memo misses"
+    );
+    assert!(
+        e.cached[1].load().is_some(),
+        "a healthy slot's cached handle must be untouched"
+    );
+    assert_eq!(
+        e.generation[1].load(std::sync::atomic::Ordering::Acquire),
+        other_gen,
+        "a healthy slot's generation must be untouched"
+    );
+}
+
+/// A stale thread-local memo entry (generation mismatch, i.e. redial or
+/// invalidation) must release its cloned `Connection` on the miss path; the
+/// fresh-hit path is unchanged and must not drop the entry.
+#[tokio::test]
+async fn stale_egress_memo_releases_the_connection() {
+    let (conn, _client, _server) = real_connection().await;
+    let e = SharedEgress::default();
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let now = mono_millis();
+    e.memo_store(bind, 0, &conn, 1200, now);
+    assert!(!memo_is_empty(bind), "premise: the memo holds a handle");
+
+    // Fresh hit: served, and the hit path must not clear the memo.
+    assert!(
+        e.with_fresh(bind, now, |c, limit| (c.stable_id(), limit))
+            .is_some(),
+        "a fresh memo entry must be served"
+    );
+    assert!(
+        !memo_is_empty(bind),
+        "a fresh hit must not release the thread-local memo"
+    );
+
+    // Generation bump (invalidate/forget_slot): the stale entry must be freed.
+    e.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert!(
+        e.with_fresh(bind, now, |_, _| ()).is_none(),
+        "a stale memo entry must not be served"
+    );
+    assert!(
+        memo_is_empty(bind),
+        "a stale memo entry must release its cloned Connection"
+    );
+}

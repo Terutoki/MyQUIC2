@@ -176,31 +176,42 @@ async fn main() -> Result<()> {
         })
         .clamp(1, MAX_CONNECTIONS);
     let per_conn_bytes = per_connection_memory_bytes(&tuning);
-    // The UDP session pool is a process-wide term, not a per-connection one:
-    // every session owns a kernel socket (two directions) plus its reader's
-    // userspace buffer, and `MAX_SESSIONS_GLOBAL` permits are shared by every
-    // peer. Charging it once against the budget is what makes the "worst case"
-    // line below the memory this process can actually pin — before this the
-    // budget covered only the transport windows and the printed figure was off
-    // by the whole session pool.
+    // Three process-wide *fixed* terms, charged once against the memory budget
+    // before the remainder is divided into connections — none of them scales
+    // with the admitted-connection count, so charging them per connection (or
+    // not at all, as the endpoint and relay-pump terms previously were) would
+    // understate what the process can actually pin:
+    // - the UDP session pool: every session owns a kernel socket (two
+    //   directions, doubled by the Linux kernel) plus its reply reader's
+    //   userspace buffer, and `MAX_SESSIONS_GLOBAL` permits are shared by every
+    //   peer;
+    // - every QUIC ingress endpoint's resident userspace receive buffer plus
+    //   its kernel socket caps;
+    // - the TCP relay pump buffers of the whole process-wide stream-task pool
+    //   (two 16 KiB buffers per active relay flow).
+    // This is also what the "worst case" line below now prints, so the printed
+    // figure matches the bound the admission cap was computed from.
     let per_session_bytes = per_session_memory_bytes();
     let session_pool_bytes = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
-    let cap = admission_cap(
-        conn_cap,
-        c.max_peer_memory_mb,
-        per_conn_bytes,
-        session_pool_bytes,
-    );
+    let endpoint_bytes = endpoint_memory_bytes(ep_count);
+    let pump_bytes = stream_pump_memory_bytes(MAX_STREAM_TASKS);
+    let fixed_bytes = session_pool_bytes
+        .saturating_add(endpoint_bytes)
+        .saturating_add(pump_bytes);
+    let cap = admission_cap(conn_cap, c.max_peer_memory_mb, per_conn_bytes, fixed_bytes);
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(cap));
     let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS.min(cap)));
     let transport_mib = (per_conn_bytes as u128 * cap as u128) / (1024 * 1024);
     let session_mib = session_pool_bytes / (1024 * 1024);
-    let worst_mib = transport_mib + session_mib as u128;
+    let endpoint_mib = endpoint_bytes / (1024 * 1024);
+    let pump_mib = pump_bytes / (1024 * 1024);
+    let worst_mib = transport_mib + (session_mib + endpoint_mib + pump_mib) as u128;
     info!(
         "admission: up to {cap} connection(s); worst case {worst_mib} MiB pinned \
          ({transport_mib} MiB transport at {per_conn_bytes} B/connection + {session_mib} MiB \
-         session pool for {MAX_SESSIONS_GLOBAL} sessions at {per_session_bytes} B each; \
-         auth={}, configured cap={conn_cap}{})",
+         UDP session pool for {MAX_SESSIONS_GLOBAL} sessions at {per_session_bytes} B each + \
+         {endpoint_mib} MiB for {ep_count} QUIC ingress endpoint(s) + {pump_mib} MiB TCP relay \
+         pump buffers for {MAX_STREAM_TASKS} flows; auth={}, configured cap={conn_cap}{})",
         if auth_enabled { "on" } else { "off" },
         match c.max_peer_memory_mb {
             Some(mb) => format!(", memory budget {mb} MiB"),
@@ -210,7 +221,8 @@ async fn main() -> Result<()> {
     if worst_mib > 1024 {
         warn!(
             "admission: worst case {worst_mib} MiB of peer-pinnable memory at {cap} \
-             connection(s); set max_peer_memory_mb (e.g. 128) on a host with less RAM than that"
+             connection(s); set max_peer_memory_mb (e.g. 128) on a host with less RAM than \
+             that, or lower the windows, MYQUIC2_SESS_SOCKET_BUF, or quic_endpoints"
         );
     }
     if !auth_enabled
@@ -227,16 +239,18 @@ async fn main() -> Result<()> {
         if cap < conn_cap {
             info!(
                 "memory budget {mb} MiB binds the connection cap: {cap} of {conn_cap} \
-                 admitted (raise max_peer_memory_mb, lower the windows, or lower \
-                 MYQUIC2_SESS_SOCKET_BUF to admit more)"
+                 admitted (raise max_peer_memory_mb, lower the windows, lower \
+                 MYQUIC2_SESS_SOCKET_BUF, or lower quic_endpoints to admit more)"
             );
         }
-        if session_pool_bytes >= budget {
+        if fixed_bytes >= budget {
+            let fixed_mib = fixed_bytes / (1024 * 1024);
             warn!(
-                "memory budget {mb} MiB is at or below the {session_mib} MiB UDP session pool \
-                 ({MAX_SESSIONS_GLOBAL} sessions x {per_session_bytes} B), so only one connection \
-                 is admitted: raise max_peer_memory_mb above the pool, or lower \
-                 MYQUIC2_SESS_SOCKET_BUF on a RAM-tight host"
+                "memory budget {mb} MiB is at or below the {fixed_mib} MiB process-wide fixed \
+                 term (UDP session pool {session_mib} MiB + {endpoint_mib} MiB ingress sockets + \
+                 {pump_mib} MiB TCP relay pump buffers), so only one connection is admitted: \
+                 raise max_peer_memory_mb above the fixed term, or lower \
+                 MYQUIC2_SESS_SOCKET_BUF / quic_endpoints on a RAM-tight host"
             );
         }
     }

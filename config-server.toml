@@ -24,17 +24,20 @@ auth_token = ""
 # pre-auth budget. Clamped to 1..=4096; raising it tokenless is warned about.
 # max_connections = 4096
 # Optional cap, in MiB, on the peer-pinnable memory the admitted connections may
-# represent. The process-wide UDP session pool is charged first — MAX_SESSIONS_
-# GLOBAL (8192) x (2 x MYQUIC2_SESS_SOCKET_BUF + its reader buffer) = ~1.03 GiB
-# at the shipped 64 KiB buffers on non-Linux, ~2.06 GiB on Linux (the kernel
-# stores/returns SO_*BUF at twice the requested value, and the admission math
-# charges that) — and what is left is divided by
-# receive window + send budget + both DATAGRAM buffers + the reassembly budget
-# = 14.25 MiB with the default 4/8/4 MB windows. Raising the windows therefore
-# admits fewer connections instead of multiplying the memory ceiling, and a
-# budget at or below the session pool admits exactly one connection (warned
-# about at startup). The worst case (session pool + connections x
-# per-connection figure) is logged at startup either way.
+# represent. The fixed process-wide terms are charged first — the UDP session
+# pool: MAX_SESSIONS_GLOBAL (8192) x (2 x MYQUIC2_SESS_SOCKET_BUF + its reader
+# buffer) = ~1.06 GiB at the shipped 64 KiB buffers on non-Linux, ~2.06 GiB on
+# Linux (the kernel stores/returns SO_*BUF at twice the requested value); the
+# per-endpoint buffers: ~19 MiB each (quinn's 2.875 MiB userspace receive
+# scratch + 16 MiB Linux kernel socket caps) x quic_endpoints; and the TCP pump
+# buffers: 2 x 16 KiB per active stream x MAX_STREAM_TASKS = ~512 MiB — and
+# what is left is divided by receive window + send budget + both DATAGRAM
+# buffers + the reassembly budget = 14.25 MiB with the default 4/8/4 MB
+# windows. Raising the windows therefore admits fewer connections instead of
+# multiplying the memory ceiling, and a budget at or below the fixed terms
+# admits exactly one connection (warned about at startup). The worst case
+# (fixed terms + connections x per-connection figure) is logged at startup
+# either way.
 # max_peer_memory_mb = 512
 # Default 4/8/4 MB matches code defaults; must mirror the client (download
 # capped by receiver, upload by sender, so change both sides together).

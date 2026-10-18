@@ -42,6 +42,7 @@ fn reconnect_backoff() -> impl Iterator<Item = Duration> {
 /// inbound-progress stamp: one keepalive interval plus this sampling tick.
 pub(crate) const WATCHDOG_POLL: Duration = Duration::from_secs(1);
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_conn_loop(
     ep: quinn::Endpoint,
     cfg: quinn::ClientConfig,
@@ -50,6 +51,8 @@ pub(crate) fn spawn_conn_loop(
     auth: String,
     slot: ConnSlot,
     watchdog_silence: Duration,
+    idx: usize,
+    egress: std::sync::Arc<super::egress::SharedEgress>,
 ) {
     tokio::spawn(async move {
         let mut backoff = reconnect_backoff();
@@ -191,6 +194,15 @@ pub(crate) fn spawn_conn_loop(
                     // nothing changed); holding None means the `open_bi` path
                     // already cleared and bumped, so there is nothing to do.
                     if slot.clear_if_and_mark_dead(&conn) {
+                        // A dead generation must not outlive the redial in the
+                        // shared egress caches: they hold strong
+                        // `quinn::Connection` clones per binding, and a dead
+                        // handle there is only reclaimed by a later datagram
+                        // or send verdict on that binding — i.e. never, if the
+                        // binding has gone idle. Release this slot's handles
+                        // before the next dial publishes a fresh one. Scoped to
+                        // this pool slot, so healthy slots keep their caches.
+                        egress.forget_slot(idx);
                         bump_gen(&slot.gen_tx);
                     }
                     if connected_at.elapsed() >= Duration::from_secs(5) {

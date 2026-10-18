@@ -99,10 +99,12 @@ pub(crate) struct DestMemo {
 /// spawned-resolver slow path (`forward_server_dgram`'s spawn arm cannot return
 /// `Some`, so the connection fast table could never arm either) — a per-packet
 /// resolution where a single store would have made the next packet a compare.
-/// The cost of the wider key is 191 B inline per *session entry*
-/// (`DestMemo` is embedded in `SessEntry`), bounded by the global
-/// `MAX_SESSIONS_GLOBAL` = 8192 session cap, i.e. ~1.5 MiB in the pathological
-/// all-255-byte-names case — paid once per session, not per packet.
+/// The cost of the wider key is the inline `PortKey` in every `DestMemo`
+/// (`DestMemo` is embedded in `SessEntry`): `u8` length + 255-byte host +
+/// `u16` port = 258 B, so `DestMemo` (key + `SocketAddr` + deadline) is
+/// ~304 B. Bounded by the global `MAX_SESSIONS_GLOBAL` = 8192 session cap,
+/// i.e. ~2.4 MiB in the pathological all-255-byte-names case — paid once per
+/// session, not per packet.
 pub(crate) const DEST_KEY_BYTES: usize = 255;
 
 /// What a memoized destination is valid *for*: the port always, and the

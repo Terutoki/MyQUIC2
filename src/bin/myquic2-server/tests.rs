@@ -27,6 +27,17 @@ fn holder_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Serializes the tests that drain or assert on the process-global
+/// [`header_task_limiter`]. One test holds all [`HEADER_TASK_CREDIT`] permits
+/// to drive the exhausted-credit path; a parallel test's
+/// `try_acquire_owned().unwrap()` would panic if the drain were concurrent.
+static HEADER_CREDIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire [`HEADER_CREDIT_TEST_LOCK`] for the header-stage credit tests.
+async fn header_credit_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    HEADER_CREDIT_TEST_LOCK.lock().await
+}
+
 fn hdr(atyp: u8, body: &[u8]) -> Vec<u8> {
     let mut v = vec![atyp];
     v.extend_from_slice(body);
@@ -1527,11 +1538,11 @@ fn fair_shard_trigger_fires_below_the_static_shard_cap() {
 }
 
 /// The admission cap must be a real memory bound: raising the transport
-/// windows has to admit fewer connections, the process-wide UDP session pool
-/// has to be charged against the budget exactly once (it is not per
-/// connection), a budget too small for one connection still admits one (so the
-/// endpoint is diagnosable), and no configuration may exceed the hard
-/// connection cap.
+/// windows has to admit fewer connections, the process-wide fixed term (UDP
+/// session pool + ingress endpoint buffers + relay pump buffers) has to be
+/// charged against the budget exactly once (none of it is per connection), a
+/// budget too small for one connection still admits one (so the endpoint is
+/// diagnosable), and no configuration may exceed the hard connection cap.
 #[test]
 fn admission_cap_bounds_connections_by_memory() {
     let per_conn = per_connection_memory_bytes(&TransportTuning::default());
@@ -1562,32 +1573,61 @@ fn admission_cap_bounds_connections_by_memory() {
         pool > 512 * 1024 * 1024,
         "the session pool alone must be a term worth charging (got {pool} B)"
     );
+    // The fixed term (charged once, before connections are divided out) is not
+    // just the session pool any more: every QUIC ingress endpoint pins a
+    // resident userspace receive buffer plus its socket caps, and the whole
+    // process-wide stream-task pool can hold two 16 KiB relay-pump buffers per
+    // flow. Neither scales with the admitted-connection count, so both belong
+    // here — without them `max_peer_memory_mb` understated the pinnable memory.
+    let endpoint = endpoint_memory_bytes(1);
+    let pump = stream_pump_memory_bytes(MAX_STREAM_TASKS);
+    assert!(
+        endpoint >= 8 * 1024 * 1024,
+        "one endpoint must charge its resident receive buffer + socket caps (got {endpoint} B)"
+    );
+    assert_eq!(
+        pump,
+        MAX_STREAM_TASKS as u64 * 2 * 16 * 1024,
+        "two COPY_CHUNK (16 KiB) buffers per concurrent relay flow"
+    );
+    assert!(pump > 256 * 1024 * 1024, "pump term must be a real bound");
+    let fixed = pool + endpoint + pump;
+    assert!(fixed > pool, "endpoint + pump terms are charged on top");
 
     // No budget: the count cap stands, clamped to the hard cap.
     assert_eq!(
-        admission_cap(MAX_CONNECTIONS, None, per_conn, pool),
+        admission_cap(MAX_CONNECTIONS, None, per_conn, fixed),
         MAX_CONNECTIONS
     );
-    assert_eq!(admission_cap(1, None, per_conn, pool), 1);
+    assert_eq!(admission_cap(1, None, per_conn, fixed), 1);
 
-    // A 4 GiB budget: the session pool comes off the top, the rest is divided
+    // A 4 GiB budget: the fixed term comes off the top, the rest is divided
     // by the per-connection figure.
     let budget = 4096 * 1024 * 1024u64;
-    let expected = ((budget - pool) / per_conn) as usize;
+    let expected = ((budget - fixed) / per_conn) as usize;
     assert_eq!(
-        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool),
+        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
         expected
     );
     assert!(
         expected > 100,
         "a 4 GiB budget must still admit a useful pool (got {expected})"
     );
-    // Charging the pool is the whole point: without it the same budget would
-    // admit `budget / per_conn` connections and pin that much *plus* the pool.
+    // Charging the fixed term is the whole point: without it the same budget
+    // would admit `budget / per_conn` connections and pin that much *plus* the
+    // session pool, endpoint buffers and relay pump buffers.
     assert!(
         admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, 0)
-            > admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool),
-        "the session pool must reduce the admitted count"
+            > admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
+        "the fixed term must reduce the admitted count"
+    );
+    // The endpoint + pump terms are additional to the session pool and must
+    // tighten the cap further; a formula that only charged the pool would let
+    // the same budget admit more.
+    assert!(
+        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool)
+            > admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
+        "endpoint + relay-pump terms must reduce the admitted count"
     );
     // Raising the windows must lower the admitted count for the same budget.
     let wide = TransportTuning {
@@ -1599,20 +1639,21 @@ fn admission_cap_bounds_connections_by_memory() {
     let per_conn_wide = per_connection_memory_bytes(&wide);
     assert!(per_conn_wide > per_conn);
     assert!(
-        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn_wide, pool)
-            < admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool),
+        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn_wide, fixed)
+            < admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
         "the same budget must admit fewer wide-window connections"
     );
     // Count cap still wins when it is the smaller of the two.
-    assert_eq!(admission_cap(8, Some(4096), per_conn, pool), 8);
+    assert_eq!(admission_cap(8, Some(4096), per_conn, fixed), 8);
     // A budget too small for even one connection admits exactly one, and a
-    // budget at or below the session pool is the same case rather than zero.
-    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn, pool), 1);
+    // budget at or below the fixed term is the same case rather than zero.
+    assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn, fixed), 1);
     assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn, 0), 1);
+    let fixed_mib = fixed / (1024 * 1024);
     assert_eq!(
-        admission_cap(MAX_CONNECTIONS, Some(1088), per_conn, pool),
+        admission_cap(MAX_CONNECTIONS, Some(fixed_mib), per_conn, fixed),
         1,
-        "a budget equal to the session pool leaves nothing for connections"
+        "a budget equal to the fixed term leaves nothing for connections"
     );
     // No division by zero for a degenerate per-connection figure: the
     // divisor floors at one byte, so the count cap still binds.
@@ -1812,16 +1853,20 @@ async fn read_reset_code(recv: &mut quinn::RecvStream) -> u64 {
 }
 
 /// H7 pin: a stream that never *finishes* its header must wait out the 5 s
-/// header budget holding NO stream-task permit. With every permit drained,
-/// the old order (permit before header) reset `0x05` immediately without
-/// reading; the new order reads first and resets `0x01` on the header
-/// timeout. Either the code or the elapsed time falsifies a regression.
+/// header budget holding NO stream-task permit and NO share slot. With every
+/// permit drained, the old order (permit before header) reset `0x05`
+/// immediately without reading; the new order reads first and resets `0x01` on
+/// the header timeout. Either the code or the elapsed time falsifies a
+/// regression. The caller still holds the header-stage credit (that is the
+/// whole point of the header stage — it is returned when the read resolves),
+/// so this also pins that the credit is dropped on the timeout path.
 ///
 /// One header byte is sent deliberately: a QUIC stream only becomes visible
 /// to the peer once a frame carries its id, so a stream that sends nothing
 /// at all would leave `accept_bi` — and this test — hanging forever.
 #[tokio::test]
 async fn header_wait_holds_no_stream_task_permit() {
+    let _header_credit_guard = header_credit_test_guard().await;
     // Drain the process-wide pool. No other test in this binary touches
     // `stream_task_limiter`, so this cannot starve parallel tests.
     let _drained = stream_task_limiter()
@@ -1840,11 +1885,16 @@ async fn header_wait_holds_no_stream_task_permit() {
     let (srv_send, srv_recv) = server_conn.accept_bi().await.unwrap();
 
     let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let header_credit = header_task_limiter()
+        .clone()
+        .try_acquire_owned()
+        .expect("header credit");
     let t0 = std::time::Instant::now();
     // The header never completes: the 5 s budget must elapse first.
     handle_tcp_stream(
         srv_send,
         srv_recv,
+        header_credit,
         streams_held.clone(),
         MAX_STREAM_TASKS,
         1,
@@ -1877,6 +1927,7 @@ async fn header_wait_holds_no_stream_task_permit() {
 /// permit could not dial anywhere surprising.
 #[tokio::test]
 async fn admission_after_header_still_fails_fast() {
+    let _header_credit_guard = header_credit_test_guard().await;
     let _drained = stream_task_limiter()
         .clone()
         .acquire_many_owned(MAX_STREAM_TASKS as u32)
@@ -1895,10 +1946,15 @@ async fn admission_after_header_still_fails_fast() {
     let (srv_send, srv_recv) = server_conn.accept_bi().await.unwrap();
 
     let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let header_credit = header_task_limiter()
+        .clone()
+        .try_acquire_owned()
+        .expect("header credit");
     let t0 = std::time::Instant::now();
     handle_tcp_stream(
         srv_send,
         srv_recv,
+        header_credit,
         streams_held.clone(),
         MAX_STREAM_TASKS,
         1,
@@ -1923,6 +1979,117 @@ async fn admission_after_header_still_fails_fast() {
     );
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
+}
+
+/// The two-stage stream bound, end to end through the real accept loop:
+///
+/// 1. a stream that carries a complete header gives its [`HEADER_TASK_CREDIT`]
+///    back before it starts relaying — with a live relay flow holding the
+///    stream-task permit and a TCP target connection, the whole header credit
+///    is available again (nothing long-lived sits on it);
+/// 2. with the header credit fully drained, the next stream is reset `0x05`
+///    *before* any task is spawned (no header read, no 5 s wait) and the
+///    refusal counter moves;
+/// 3. once the drain is released, another stream is admitted again — the
+///    limiter returns credits rather than leaking them.
+#[tokio::test]
+async fn header_credit_bounds_header_tasks_and_is_returned() {
+    use std::sync::atomic::Ordering;
+
+    let _header_credit_guard = header_credit_test_guard().await;
+    assert_eq!(
+        header_task_limiter().available_permits(),
+        HEADER_TASK_CREDIT,
+        "the header credit must start and end full"
+    );
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let server_task = tokio::spawn(handle_conn(
+        server_conn,
+        true,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        MAX_CONNECTIONS,
+    ));
+
+    // A local target that holds the relayed connection open, so the flow
+    // survives past its header and would keep a header credit if the handler
+    // failed to return it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = listener.local_addr().unwrap();
+    let accepted = tokio::spawn(async move { listener.accept().await });
+
+    // Stream 1: complete header. The dial must happen (proves the handler got
+    // past the header stage), and the relay must then hold no header credit.
+    let (mut cli_send, _cli_recv) = client_conn.open_bi().await.unwrap();
+    let mut hdr = vec![0x01, 127, 0, 0, 1];
+    hdr.extend_from_slice(&target_addr.port().to_be_bytes());
+    cli_send.write_all(&hdr).await.unwrap();
+    let (_target_stream, _) = tokio::time::timeout(Duration::from_secs(5), accepted)
+        .await
+        .expect("the header must reach the dial")
+        .unwrap()
+        .expect("the target must accept the relayed connection");
+    // Poll: the credit is dropped right after the header read, marginally
+    // before the dial completes, so a full set is expected shortly.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while header_task_limiter().available_permits() != HEADER_TASK_CREDIT {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a live relay flow must not hold header credit (available {})",
+            header_task_limiter().available_permits()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Stream 2: exhaust the header credit, then open another stream. The accept
+    // loop must refuse it after `accept_bi` (a reset is observable) and before
+    // the handler's header read: `0x05` is only sent by the credit refusal.
+    let drained = header_task_limiter()
+        .clone()
+        .acquire_many_owned(HEADER_TASK_CREDIT as u32)
+        .await
+        .unwrap();
+    assert_eq!(header_task_limiter().available_permits(), 0);
+    let refused_before = HEADER_TASK_REFUSED.load(Ordering::Relaxed);
+    let (mut cli_send, mut cli_recv) = client_conn.open_bi().await.unwrap();
+    cli_send.write_all(&hdr).await.unwrap();
+    let took = std::time::Instant::now();
+    let code = tokio::time::timeout(Duration::from_secs(2), read_reset_code(&mut cli_recv))
+        .await
+        .expect("an exhausted header credit must refuse without the 5 s header wait");
+    assert_eq!(code, 0x05, "header-credit refusal resets 0x05");
+    assert!(
+        took.elapsed() < Duration::from_secs(2),
+        "the refusal must be fail-fast, took {:?}",
+        took.elapsed()
+    );
+    assert!(
+        HEADER_TASK_REFUSED.load(Ordering::Relaxed) > refused_before,
+        "the header-credit refusal must be counted"
+    );
+    assert_eq!(header_task_limiter().available_permits(), 0);
+
+    // Release the drain: the credit is returned rather than leaked, and a
+    // fresh stream gets through the header stage again (invalid atyp, so the
+    // handler resets 0x01 immediately and returns the credit).
+    drop(drained);
+    let (mut cli_send, mut cli_recv) = client_conn.open_bi().await.unwrap();
+    cli_send.write_all(&[0x09]).await.unwrap();
+    let code = tokio::time::timeout(Duration::from_secs(2), read_reset_code(&mut cli_recv))
+        .await
+        .expect("a re-admitted stream must run its header read");
+    assert_eq!(code, 0x01, "an invalid header resets 0x01");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while header_task_limiter().available_permits() != HEADER_TASK_CREDIT {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "header credit must be returned when the handler ends (available {})",
+            header_task_limiter().available_permits()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    client_conn.close(0u32.into(), b"done");
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
 }
 
 /// The shard sweep never kills a *live* session, however far over the fair

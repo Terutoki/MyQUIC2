@@ -86,34 +86,105 @@ pub(crate) fn stream_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_STREAM_TASKS)))
 }
 
+/// Process-wide credit for streams that are **only** reading their MQP-2
+/// header.
+///
+/// The transport lets one connection open [`MAX_BIDI_STREAMS_PER_CONN`] (8192)
+/// concurrent bidi streams, and the accept loop has to spawn a task for each
+/// one *before* the header arrives (the 5 s header budget runs inside the
+/// task). With the tokenless default 256 connections that was up to 2.1M
+/// parked tasks — several GiB of task futures and quinn stream state — because
+/// neither the per-connection share nor [`MAX_STREAM_TASKS`] can be charged
+/// before the header is read: both must cover the dial/relay work, and a
+/// trickling header must not be able to exhaust them (see [`handle_tcp_stream`]).
+/// This credit bounds the *header stage* on its own. Concurrent header reads
+/// are first-RTT and short-lived, so 4096 is far more than any real client
+/// population produces; a stream that cannot get a credit is reset fail-fast
+/// (`0x05`) exactly like an exhausted [`stream_task_limiter`].
+///
+/// **Two-stage bound.** A task must hold a header credit to run the 5 s header
+/// read, then hands it back and takes a share slot + [`MAX_STREAM_TASKS`]
+/// permit that cover the dial and the whole relay, so a long-lived flow can
+/// never occupy header credit and a parked header task can never occupy the
+/// stream pool.
+pub(crate) const HEADER_TASK_CREDIT: usize = 4_096;
+
+/// Header-stage refusals (see [`HEADER_TASK_CREDIT`]). Split out so an
+/// exhausted header credit is distinguishable from a stream-share or
+/// stream-pool refusal in the logs and in tests.
+pub(crate) static HEADER_TASK_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn header_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(HEADER_TASK_CREDIT)))
+}
+
+/// Rate-limited (one line per second, with a suppressed count) warning for an
+/// exhausted [`HEADER_TASK_CREDIT`].
+///
+/// `total` is the caller's refusal counter *after* its increment. The line is
+/// formatted only by the window's winner: a header-credit flood is one wakeup
+/// and one formatted line per second here, not one per refused stream (the
+/// same argument as [`warn_stream_share_refused`]).
+pub(crate) fn warn_header_credit_refused(total: u64) {
+    use std::sync::atomic::AtomicU64;
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    match myquic2::claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()) {
+        None => {}
+        Some(n) => {
+            warn!(
+                "{HEADER_TASK_CREDIT} concurrent header reads busy; resetting new TCP stream \
+                 ({total} refused so far{})",
+                if n > 0 {
+                    format!(", {n} suppressed in the last second")
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+}
+
 /// Connection cap actually admitted, i.e. `conn_cap` bounded by the optional
 /// peer-memory budget.
 ///
 /// `per_conn_bytes` is [`per_connection_memory_bytes`] for this server's
 /// effective transport tuning (windows, DATAGRAM buffers, reassembly), so
 /// raising the windows admits proportionally fewer connections instead of
-/// silently multiplying the memory ceiling. `session_pool_bytes` is
-/// [`session_pool_memory_bytes`] for the process-wide session cap: UDP session
-/// sockets and their reader buffers are a **global** term (the session
-/// semaphore is shared by every peer), so it is charged against the budget once
-/// rather than per connection — which is exactly what makes the printed worst
-/// case match what the process can actually pin. A budget too small for even
-/// one connection clamps to one rather than zero: an endpoint that admits
-/// nothing cannot be diagnosed from the outside.
+/// silently multiplying the memory ceiling.
+///
+/// `fixed_bytes` is the **process-wide fixed term**: every cost that does not
+/// scale with the admitted-connection count and is therefore charged once,
+/// before the remainder is divided into connections —
+/// - the UDP session pool ([`session_pool_memory_bytes`]: session sockets'
+///   kernel caps plus each reply reader's userspace buffer; the session
+///   semaphore is shared by every peer),
+/// - every QUIC ingress endpoint's resident receive buffer and socket caps
+///   ([`endpoint_memory_bytes`]),
+/// - the TCP relay pump buffers of the whole process-wide stream-task pool
+///   ([`stream_pump_memory_bytes`]).
+///
+/// Charging all three here is what makes the printed worst case match what the
+/// process can actually pin; charging only the session pool left the endpoint
+/// and relay-buffer terms invisible to `max_peer_memory_mb`. A budget too small
+/// for even one connection clamps to one rather than zero: an endpoint that
+/// admits nothing cannot be diagnosed from the outside.
 ///
 /// Pure so the arithmetic is testable without a live endpoint.
 pub(crate) fn admission_cap(
     conn_cap: usize,
     budget_mb: Option<u64>,
     per_conn_bytes: u64,
-    session_pool_bytes: u64,
+    fixed_bytes: u64,
 ) -> usize {
     let by_count = conn_cap.max(1);
     match budget_mb {
         None => by_count,
         Some(mb) => {
             let budget = mb.clamp(1, 1 << 20).saturating_mul(1024 * 1024);
-            let for_connections = budget.saturating_sub(session_pool_bytes);
+            let for_connections = budget.saturating_sub(fixed_bytes);
             let by_memory = (for_connections / per_conn_bytes.max(1)).max(1);
             by_count.min(usize::try_from(by_memory).unwrap_or(usize::MAX))
         }
@@ -767,20 +838,40 @@ pub(crate) async fn handle_conn(
     // process-wide (not per connection) so many connections cannot exhaust fds
     // together.
     //
-    // The *stream-task* pool is process-wide too, and one connection may open
+    // Admission is **two-stage**, and each stage has its own process-wide pool:
+    // 1. a [`HEADER_TASK_CREDIT`] is taken before the spawn and released once
+    //    the 5 s header read has returned (success or failure) — this is what
+    //    bounds parked header tasks, which the transport's per-connection
+    //    stream credit (8192 x admitted connections) does not;
+    // 2. the share slot and [`MAX_STREAM_TASKS`] permit are taken *after* the
+    //    header, inside `handle_tcp_stream`, and cover the dial plus the whole
+    //    relay — so a trickling header cannot exhaust the stream pool and a
+    //    long-lived flow cannot sit on header credit.
+    // The stream-task pool is process-wide, and one connection may open
     // `MAX_BIDI_STREAMS_PER_CONN` (8192) streams — more than the whole pool — so
     // each connection also has to stay inside its own share of it. Without this,
     // the first two peers to arrive hold every permit while their flows sit idle
     // and every other client's CONNECT is reset after its SOCKS success
-    // reply — with nothing logged server-side. The 5 s header read runs before
-    // either pool is touched (see `handle_tcp_stream`), so a stream that never
-    // sends its header parks only its own task for the budget instead of a
-    // permit plus a share slot, and the trickle treadmill is no longer cheap.
+    // reply — with nothing logged server-side.
     let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
-        let (send, recv) = match conn.accept_bi().await {
+        let (mut send, recv) = match conn.accept_bi().await {
             Ok(x) => x,
             Err(_) => break,
+        };
+        // Header-stage credit, taken *before* the spawn: the task that reads
+        // the header is the memory a peer floods for (8192 x connections
+        // parked tasks), so it is charged here and returned as soon as the
+        // read resolves. Fail-fast 0x05: a stream the host cannot afford to
+        // park is reset immediately, exactly like an exhausted stream pool.
+        let header_credit = match header_task_limiter().clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let n = HEADER_TASK_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                warn_header_credit_refused(n);
+                send.reset(0x05u32.into()).ok();
+                continue;
+            }
         };
         // Admitted connections (the accept loop holds one permit each). The
         // denominator is this endpoint's actual cap, which the admission budget
@@ -790,12 +881,14 @@ pub(crate) async fn handle_conn(
             .max(1);
         let share = stream_share(admitted);
         let stat_conn = conn.clone();
-        // One task per accepted stream, bounded by the transport's
-        // per-connection stream credit — never by the pools below. The task
-        // reads the header before touching either pool.
+        // One task per accepted stream, bounded by [`HEADER_TASK_CREDIT`] for
+        // the header stage. Inside, the task trades the credit for the share
+        // slot + process-wide stream permit before dialing (see
+        // `handle_tcp_stream`).
         tokio::spawn(handle_tcp_stream(
             send,
             recv,
+            header_credit,
             streams_held.clone(),
             share,
             admitted,

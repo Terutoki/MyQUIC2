@@ -324,6 +324,54 @@ pub fn session_pool_memory_bytes(max_sessions: usize) -> u64 {
     (max_sessions as u64).saturating_mul(per_session_memory_bytes())
 }
 
+/// Bytes of userspace receive buffer quinn allocates per QUIC endpoint at
+/// construction, before any connection exists: `max_udp_payload_size (1472) x
+/// GRO segments x BATCH_SIZE`. On Linux quinn-udp 0.5.16 enables `UDP_GRO` and
+/// sizes its receive scratch for `UDP_GRO_CNT_MAX` = 64 segments x 32-message
+/// `recvmmsg` batches (`unix.rs`), i.e. 1472 x 64 x 32 = **3,014,656 B
+/// (2.875 MiB) per endpoint**. Other platforms do not GRO (one segment), so the
+/// charge there is a single datagram. This is a *resident* allocation made by
+/// `Endpoint::new_with_abstract_socket`, not a per-connection cap, and
+/// `per_connection_memory_bytes` does not cover it — admission charges
+/// [`endpoint_memory_bytes`] as a process-wide fixed term instead.
+pub const fn endpoint_recv_buffer_bytes() -> u64 {
+    if cfg!(target_os = "linux") {
+        1472 * 64 * 32
+    } else {
+        1472
+    }
+}
+
+/// Worst-case memory one QUIC endpoint pins: its resident userspace receive
+/// buffer plus both kernel socket caps at the Linux-doubled
+/// [`ENDPOINT_SOCKET_BUF`](crate::ENDPOINT_SOCKET_BUF) (4 MiB requested per
+/// direction x 2 for the kernel doubling x 2 directions = 16 MiB on Linux).
+///
+/// These are caps, not reservations, except the userspace buffer which is
+/// `vec![0; ...]` at construction. Charged once per endpoint (client pool slot
+/// / server `quic_endpoints` member) because neither is covered by the
+/// per-connection term.
+#[must_use]
+pub fn endpoint_memory_bytes(count: usize) -> u64 {
+    let socket_caps = if cfg!(target_os = "linux") {
+        2 * (2 * crate::ENDPOINT_SOCKET_BUF)
+    } else {
+        2 * crate::ENDPOINT_SOCKET_BUF
+    };
+    (count as u64).saturating_mul(endpoint_recv_buffer_bytes() + socket_caps as u64)
+}
+
+/// Worst-case buffers held by `max_streams` concurrent TCP <-> QUIC pump
+/// flows: two [`COPY_CHUNK`](crate::tcp::pump::COPY_CHUNK) buffers per flow
+/// (the c2s double buffer, held for the flow's whole life). The flow count is
+/// bounded by the server's `MAX_STREAM_TASKS` / the client's `MAX_SOCKS_CONNS`,
+/// and these buffers are *not* part of `per_connection_memory_bytes`, so
+/// admission charges them as a process-wide fixed term.
+#[must_use]
+pub fn stream_pump_memory_bytes(max_streams: usize) -> u64 {
+    (max_streams as u64).saturating_mul(2 * crate::tcp::pump::COPY_CHUNK as u64)
+}
+
 impl ServerConf {
     pub fn tuning(&self) -> TransportTuning {
         TransportTuning {

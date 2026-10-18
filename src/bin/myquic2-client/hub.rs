@@ -219,21 +219,48 @@ pub(crate) struct UdpHub {
     ///
     /// Writes are clone-on-publish (`rcu`), which is affordable because they
     /// happen once per association open / close and each shard holds at most
-    /// `MAX_UDP_ASSOCS / HUB_SHARDS` entries.
+    /// `max / HUB_SHARDS` entries.
     pub(crate) subs: Vec<arc_swap::ArcSwap<SubMap>>,
     pub(crate) next: std::sync::atomic::AtomicU32,
     /// Exact process-wide association count across all shards.
     pub(crate) len: std::sync::atomic::AtomicUsize,
+    /// Process-wide concurrent-association cap (`1..=MAX_UDP_ASSOCS`), fixed at
+    /// construction. `MAX_UDP_ASSOCS` is the default; a RAM-tight deployment
+    /// lowers it with the client config's
+    /// `max_udp_assocs`, because each admitted association owns a relay socket
+    /// whose kernel buffer caps dominate its cost.
+    pub(crate) max: usize,
 }
 
 impl UdpHub {
+    /// The historical full-capacity hub: `MAX_UDP_ASSOCS` concurrent
+    /// associations. Test-only now — production always passes the configured
+    /// cap through [`Self::with_capacity`] — but kept as the single definition
+    /// of the default so existing tests and the config's unset default cannot
+    /// drift apart.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_capacity(MAX_UDP_ASSOCS)
+    }
+
+    /// Hub with an explicit concurrent-association cap, clamped to
+    /// `1..=MAX_UDP_ASSOCS`.
+    ///
+    /// The cap is a process-wide *budget*, not a reservation: what it bounds is
+    /// how many relay sockets (each with its kernel send/receive buffer caps
+    /// and an ~8 KiB userspace reader buffer) can exist at once. The clamp
+    /// keeps `0` from silently disabling UDP and a typo from exceeding the
+    /// protocol's/default association budget; the test-only `new` is the
+    /// historical full-capacity shape.
+    pub(crate) fn with_capacity(max: usize) -> Self {
+        let max = max.clamp(1, MAX_UDP_ASSOCS);
         Self {
             subs: (0..HUB_SHARDS)
                 .map(|_| arc_swap::ArcSwap::from_pointee(SubMap::default()))
                 .collect(),
             next: std::sync::atomic::AtomicU32::new(1),
             len: std::sync::atomic::AtomicUsize::new(0),
+            max,
         }
     }
 
@@ -243,6 +270,9 @@ impl UdpHub {
 
     /// Reserves a process-wide association slot and a free session id. `None`
     /// when the cap is reached (caller replies SOCKS5 REP=0x01).
+    ///
+    /// The cap is [`Self::max`]: `MAX_UDP_ASSOCS` for `new`, a lowered value
+    /// from [`Self::with_capacity`] otherwise.
     ///
     /// Allocation and publication are split because the relay socket has to
     /// exist before an entry can name it: the id is reserved here, the socket is
@@ -259,14 +289,15 @@ impl UdpHub {
     /// lives for the RTT plus the server's session lifetime, seconds at most, so
     /// reaching the wrap needs on the order of 4.3e9 associations inside that
     /// window — more than a million associations per second sustained for an
-    /// hour, against a 4032-association cap. The live-id check below (`contains_key`)
+    /// hour, against the configured association cap (4032 by default). The
+    /// live-id check below (`contains_key`)
     /// covers the remaining case where the previous owner is still published.
     pub(crate) fn alloc_sess(&self) -> Option<u32> {
         use std::sync::atomic::Ordering;
         // Reserve a global slot first so the cap stays exact across shards.
         loop {
             let cur = self.len.load(Ordering::Relaxed);
-            if cur >= MAX_UDP_ASSOCS {
+            if cur >= self.max {
                 return None;
             }
             if self

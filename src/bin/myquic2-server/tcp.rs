@@ -7,13 +7,16 @@ use super::*;
 /// process-wide stream-task permit, and holds neither: a stream that trickles
 /// one byte per 4.9 s parks only its own task for the budget instead of a
 /// `MAX_STREAM_TASKS` permit plus a share slot, so a slowloris treadmill can
-/// no longer exhaust the pool. Spawning is still bounded — one task per
-/// accepted stream, capped by the transport's per-connection stream credit —
-/// and the share/permit are taken fail-fast (`try_acquire`, `0x05` reset) once
-/// the header is in, so they bound only the dial/auth work.
+/// no longer exhaust the pool. The task itself is bounded by the caller's
+/// [`HEADER_TASK_CREDIT`] for that header stage, and it **returns that credit
+/// as soon as the header read resolves** so a long-lived relay flow never
+/// occupies header-stage credit; the share/permit are then taken fail-fast
+/// (`try_acquire`, `0x05` reset) and bound only the dial/auth work.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_tcp_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    header_credit: tokio::sync::OwnedSemaphorePermit,
     streams_held: Arc<std::sync::atomic::AtomicUsize>,
     share: usize,
     admitted: usize,
@@ -28,6 +31,12 @@ pub(crate) async fn handle_tcp_stream(
                 return;
             }
         };
+    // Header done: hand the header-stage credit back *before* taking the share
+    // slot / stream permit. This is the whole point of the two-stage bound — a
+    // stream that is about to relay for up to 300 s must not hold one of the
+    // [`HEADER_TASK_CREDIT`] slots that exist for the next first-RTT header
+    // read. (The failure arm above returns, dropping the permit the same way.)
+    drop(header_credit);
     // Reserve a share slot atomically. `fetch_add` returns the *pre-increment*
     // value, so the reservation is exact under concurrency: the previous
     // `load() >= share` check followed by a later `fetch_add(1)` was a TOCTOU

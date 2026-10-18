@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::tuning::{
-    DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, MAX_POOL_CONNS, MAX_UDP_EGRESS_CONNS, d_5, d_bbr,
-    d_keepalive, d_true,
+    DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, MAX_POOL_CONNS, MAX_UDP_ASSOCS,
+    MAX_UDP_EGRESS_CONNS, d_5, d_bbr, d_keepalive, d_true,
 };
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
@@ -119,6 +119,17 @@ pub struct ClientConf {
     /// `udp_split = false` ignores this value.
     #[serde(default)]
     pub udp_egress_conns: Option<usize>,
+    /// Concurrent UDP-association cap for this client process. Unset =
+    /// [`MAX_UDP_ASSOCS`] (4032); clamped to `1..=MAX_UDP_ASSOCS`.
+    ///
+    /// Each association owns its own relay socket — whose kernel send/receive
+    /// buffer caps dominate its memory cost (~256 KiB on Linux after the
+    /// kernel's `SO_*BUF` doubling) — plus an ~8 KiB userspace reader buffer,
+    /// so a RAM-tight router lowers this instead of paying for the full set.
+    /// Past the cap a UDP ASSOCIATE is refused with SOCKS5 `REP=0x01` and
+    /// logged once per window, like the SOCKS admission cap.
+    #[serde(default)]
+    pub max_udp_assocs: Option<usize>,
     /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
@@ -144,6 +155,16 @@ impl ClientConf {
         self.udp_egress_conns
             .unwrap_or(DEFAULT_UDP_EGRESS_CONNS)
             .clamp(1, MAX_UDP_EGRESS_CONNS)
+    }
+
+    /// Concurrent UDP-association cap: [`MAX_UDP_ASSOCS`] (4032) when
+    /// `max_udp_assocs` is unset, clamped to `1..=MAX_UDP_ASSOCS`. This is the
+    /// process-wide budget the hub enforces and the reason it exists is the
+    /// per-association relay-socket memory noted on [`Self::max_udp_assocs`].
+    pub fn udp_assoc_count(&self) -> usize {
+        self.max_udp_assocs
+            .unwrap_or(MAX_UDP_ASSOCS)
+            .clamp(1, MAX_UDP_ASSOCS)
     }
 
     pub fn interactive_port_list(&self) -> Vec<u16> {

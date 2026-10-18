@@ -179,7 +179,16 @@ async fn main() -> Result<()> {
             ", UDP may fall back to a TCP connection while it reconnects"
         }
     );
-    let hub: Arc<UdpHub> = Arc::new(UdpHub::new());
+    // Concurrent UDP-association cap: process-wide, default `MAX_UDP_ASSOCS`
+    // (4032). Each association owns its own relay socket whose kernel
+    // send/receive buffer caps dominate its cost (~256 KiB on Linux after the
+    // kernel's SO_*BUF doubling) plus an ~8.3 KiB userspace reader buffer, so a
+    // RAM-tight router lowers `max_udp_assocs` instead of paying for the full
+    // set. Past the cap a UDP ASSOCIATE is refused with SOCKS REP=0x01 (one
+    // rate-limited warn line per window, like the SOCKS admission cap).
+    let udp_assocs = c.udp_assoc_count();
+    let hub: Arc<UdpHub> = Arc::new(UdpHub::with_capacity(udp_assocs));
+    info!("udp associations: max {udp_assocs} concurrent (max_udp_assocs)");
     let egress_shared: Arc<SharedEgress> = Arc::new(SharedEgress::default());
     // One DATAGRAM dispatcher and one reconnect loop per pool slot.
     // Every slot keeps its own reassembler, which is correct because a
@@ -227,6 +236,7 @@ async fn main() -> Result<()> {
                 c.auth_token.clone(),
                 pool.slot(i),
                 hub.clone(),
+                egress_shared.clone(),
                 watchdog_silence,
                 shutdown_rx.clone(),
                 ready_tx.clone(),
@@ -280,6 +290,8 @@ async fn main() -> Result<()> {
                 c.auth_token.clone(),
                 pool.slot(i),
                 watchdog_silence,
+                i,
+                egress_shared.clone(),
             );
         }
         (eps, Vec::new())
@@ -503,6 +515,7 @@ fn spawn_slot_shard(
     auth: String,
     slot: ConnSlot,
     hub: Arc<UdpHub>,
+    egress: Arc<SharedEgress>,
     watchdog_silence: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
@@ -556,6 +569,8 @@ fn spawn_slot_shard(
                     auth,
                     slot,
                     watchdog_silence,
+                    idx,
+                    egress,
                 );
                 let _ = ready.send(Ok(()));
                 let _ = shutdown.wait_for(|v| *v).await;

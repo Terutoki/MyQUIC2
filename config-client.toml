@@ -68,6 +68,12 @@ quic_conns = 4
 # alone would otherwise put on the single interactive connection next to
 # DNS/STUN/games. Ports in interactive_ports keep their interactive class.
 # udp_bulk_ports = [51820, 1194]
+# Max concurrent UDP associations (default 4032, clamped 1..=4032). Each
+# association owns a relay socket whose kernel buffer caps dominate its cost
+# (~256 KiB on Linux after the kernel's SO_*BUF doubling) plus an ~8.3 KiB
+# userspace reader buffer, so a RAM-tight router lowers this; past the cap a
+# UDP ASSOCIATE is refused with SOCKS REP=0x01.
+# max_udp_assocs = 4032
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/3" restores the
 # versioned identifier; set the same value on both sides.

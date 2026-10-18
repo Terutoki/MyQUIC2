@@ -44,8 +44,9 @@ pub use config::{
         DEFAULT_INITIAL_MTU, DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS,
         INITIAL_MTU_MAX, INITIAL_MTU_MIN, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN,
         MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_QUIC_ENDPOINTS, MAX_UDP_ASSOCS,
-        MAX_UDP_EGRESS_CONNS, TransportTuning, default_quic_endpoints, load_toml,
-        per_connection_memory_bytes, per_session_memory_bytes, session_pool_memory_bytes,
+        MAX_UDP_EGRESS_CONNS, TransportTuning, default_quic_endpoints, endpoint_memory_bytes,
+        endpoint_recv_buffer_bytes, load_toml, per_connection_memory_bytes,
+        per_session_memory_bytes, session_pool_memory_bytes, stream_pump_memory_bytes,
     },
 };
 pub use time::{coarse::coarse_millis, mono::mono_millis};
@@ -125,11 +126,20 @@ pub(crate) use udp::{
     under_retry_deadline,
 };
 
+/// Requested `SO_SNDBUF`/`SO_RCVBUF` for every QUIC **endpoint** socket (one
+/// per client pool slot, `quic_endpoints` of them on the server). The kernel
+/// stores twice the requested value on Linux, so the real cap is
+/// `2 x this` per direction; [`endpoint_memory_bytes`](crate::endpoint_memory_bytes)
+/// is what admission charges for it. Session/relay sockets use the much smaller
+/// [`sess_socket_buf`] instead: this size times thousands of sessions would OOM
+/// a router.
+pub const ENDPOINT_SOCKET_BUF: usize = 4 * 1024 * 1024;
+
 /// Dual-stack UDP socket (V6ONLY=0 when bound to ::). Buffer enlarged for GSO bursts.
 /// `sess` sockets (per UDP association) should use the small variant to avoid
 /// OOM on routers: 4MB x N sessions of kernel memory adds up fast (P3).
 pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
-    udp_socket_dual_with_size(bind, 4 * 1024 * 1024)
+    udp_socket_dual_with_size(bind, ENDPOINT_SOCKET_BUF)
 }
 
 /// One member of a `SO_REUSEPORT` group: a multi-endpoint server ingress
@@ -164,7 +174,7 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
     not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
 ))]
 pub fn udp_socket_dual_reuseport(bind: &str) -> Result<std::net::UdpSocket> {
-    udp_socket_dual_impl(bind, 4 * 1024 * 1024, true)
+    udp_socket_dual_impl(bind, ENDPOINT_SOCKET_BUF, true)
 }
 
 /// Whether [`udp_socket_dual_reuseport`] exists on this target. Mirrors the
@@ -3424,6 +3434,30 @@ mod tests {
             pool > 512 * 1024 * 1024,
             "the pool has to be a term worth charging"
         );
+    }
+
+    /// The endpoint and TCP-pump terms are process-wide fixed costs the
+    /// admission math used to omit. Pin their arithmetic so the startup
+    /// worst-case line cannot silently drift from the code.
+    #[test]
+    fn process_fixed_memory_terms_match_the_code() {
+        let recv = endpoint_recv_buffer_bytes();
+        let caps = if cfg!(target_os = "linux") {
+            // 4 MiB requested per direction, stored at 2x by the kernel, both
+            // directions.
+            2 * (2 * ENDPOINT_SOCKET_BUF)
+        } else {
+            2 * ENDPOINT_SOCKET_BUF
+        };
+        if cfg!(target_os = "linux") {
+            assert_eq!(recv, 1472 * 64 * 32, "quinn-udp GRO receive scratch");
+        } else {
+            assert_eq!(recv, 1472, "no GRO: one datagram of scratch");
+        }
+        assert_eq!(endpoint_memory_bytes(1), recv + caps as u64);
+        assert_eq!(endpoint_memory_bytes(16), 16 * endpoint_memory_bytes(1));
+        // Two 16 KiB pump buffers per active TCP relay flow.
+        assert_eq!(stream_pump_memory_bytes(8192), 8192 * 32 * 1024);
     }
 
     #[test]

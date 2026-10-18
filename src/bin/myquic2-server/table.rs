@@ -32,9 +32,11 @@ pub(crate) struct SessEntry {
     /// outbound path pushes into it, and those are two different tasks of the
     /// same session — so a mutex there made the download hot path and the upload
     /// hot path ping-pong one cache line. Readers now take a hazard-pointer
-    /// snapshot (no lock), and writers publish a new 136-byte snapshot through
-    /// `rcu`, which also means two concurrent pushes can no longer lose each
-    /// other's insert.
+    /// snapshot (no lock), and writers publish a new snapshot through `rcu`,
+    /// which also means two concurrent pushes can no longer lose each other's
+    /// insert. The snapshot is 280 B: `[Option<IpAddr>; 16]` is 272 B
+    /// (`IpAddr` is 17 B, `Option<IpAddr>` has no niche) plus the `usize`
+    /// write position (`RecentAddrs`).
     pub(crate) recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
     /// Bumped by every [`remember_dst`] for this session — including the push a
     /// spawned DNS resolver task makes from *its own* task
@@ -264,8 +266,11 @@ pub(crate) fn take_idle(w: &mut SessMap, keys: &[u32], now: u64) -> Vec<SessEntr
 }
 /// Process-wide UDP session cap. Each session owns a kernel socket with a
 /// `SESS_SOCKET_BUF` send buffer and the same again for receive (see
-/// `udp_socket_dual_small`), i.e. 64 KiB per direction by default, so 8192
-/// sessions bound the kernel side to ~1 GiB worst case instead of ~4 GiB.
+/// `udp_socket_dual_small`), i.e. 64 KiB per direction by default. Linux
+/// stores/reports `SO_*BUF` at **twice** the requested value, so a full house
+/// (8192 sessions x 2 directions x 2 x 64 KiB) is ~2.06 GiB of kernel caps
+/// there, and ~1.03 GiB where the kernel keeps the requested value;
+/// `per_session_memory_bytes` charges the doubled figure on Linux.
 /// These are caps, not reservations: the kernel only accounts for what is
 /// actually queued, but the cap is what a burst can pin.
 ///
