@@ -138,7 +138,9 @@ pub fn build_transport_tuned(
 /// Per-class transport builder.
 /// `is_bulk` selects the bulk preset (ACK threshold 8, 10ms delay; 2MB DATAGRAM
 /// buffers) that trades reverse-path CPU for coarser feedback; interactive
-/// keeps the tuned values (default 2/5ms) and 1MB DATAGRAM buffers.
+/// keeps the tuned values (default ACK threshold 2 / 5 ms) and 1MB DATAGRAM
+/// buffers. Flow-control windows come from `tuning` unchanged (default
+/// 4/8/4 MB).
 pub fn build_transport_tuned_class(
     congestion: Congestion,
     keep_alive_secs: u64,
@@ -196,8 +198,11 @@ pub fn build_transport_tuned_class(
     t.max_concurrent_uni_streams(100u32.into());
     // Window sizing: every flow-control window must exceed the target BDP, or
     // it -- not the congestion controller -- becomes the throughput ceiling.
-    // The numbers live in named constants so `tcp_windows_cover_the_300mb_s_bdp`
-    // can prove the invariant instead of restating it.
+    // The shipped defaults are 4/8/4 MB (stream/connection/send) from
+    // `TransportTuning::default()`, ~240Mb/s on the target 140ms link, and
+    // operators tune them per side. The opt-in 8/16/8 MB preset lives in named
+    // constants (`transport::limits`) so `tcp_windows_cover_the_300mb_s_bdp`
+    // can prove its invariant instead of restating it.
     t.stream_receive_window(quinn::VarInt::from_u32(
         u32::try_from(tuning.stream_receive_window).expect("stream window fits a VarInt"),
     ));
@@ -239,9 +244,13 @@ pub fn build_transport_tuned_class(
     mtud.upper_bound(1472);
     t.mtu_discovery_config(Some(mtud));
     // Start at the configured path MTU instead of quinn's 1200-byte QUIC
-    // floor. This is the other half of the PMTU story and the larger one:
-    // quinn's discovery is a binary search that needs one probe/ACK round trip
-    // per step (1200 -> 1336 -> 1404 -> 1438 -> 1472), and probes are only
+    // floor. The default start is 1360 B (DEFAULT_INITIAL_MTU), which is
+    // 1388/1408 wire bytes after the IPv4/IPv6 + UDP headers and therefore
+    // safe on WireGuard-1420 and similar tunnel paths; a known 1500-byte
+    // Ethernet path can raise it to 1400/1472. This is the other half of the
+    // PMTU story and the larger one: quinn's discovery is a binary search that
+    // needs one probe/ACK round trip per step (starting at the floor:
+    // 1200 -> 1336 -> 1404 -> 1438 -> 1472), and probes are only
     // emitted from a transmit poll that builds no payload packet
     // (`quinn-proto connection/mod.rs`), so a busy connection can sit at its
     // start value for a long time. While it does, every packet carries up to

@@ -27,7 +27,7 @@ use crate::udp_stats;
 /// every other packet-adjacent table in this crate uses (see the `foldhash`
 /// note in Cargo.toml).
 ///
-/// The key is six bytes of peer-chosen session id and fragment id, and one
+/// The key is eight bytes of peer-chosen session id and fragment id, and one
 /// fragment probes the tables five to eight times (stale-replay probe, count
 /// cap, payload cap, restart probe, `entry`, removal, tombstone insert), so
 /// key hashing must be a fast fold rather than SipHash — and because the keys
@@ -36,7 +36,7 @@ use crate::udp_stats;
 /// instance independently (one `HashMap::default()` per field below), and a
 /// collision still only costs a probe: the map compares the full key and can
 /// never mis-serve.
-type FragMap<V> = HashMap<(u32, u16), V, foldhash::fast::RandomState>;
+type FragMap<V> = HashMap<(u32, u32), V, foldhash::fast::RandomState>;
 
 /// A partially reassembled datagram.
 pub(crate) struct Partial {
@@ -335,7 +335,7 @@ impl DgramReassembler {
     /// disposition identical to the pre-tombstone code when memory is tight.
     fn remember(
         &mut self,
-        key: (u32, u16),
+        key: (u32, u32),
         total: u8,
         address: TargetAddr,
         prints: Box<[Option<ChunkFp>]>,
@@ -461,7 +461,7 @@ impl DgramReassembler {
             // a completed mix would deliver to the older target. That needs
             // the same key twice inside one reassembly window with no
             // occupied-slot overlap at all, which a sender can now only
-            // produce by wrapping the 16-bit id at ~22k fragmented
+            // produce by wrapping the 32-bit id at >1.4M fragmented
             // payloads/s; the sender refuses to do that (see
             // `FRAG_ID_SAFE_WINDOW_MS` and `DgramFragmenter::send`), so the
             // residue is unreachable from a conforming peer.
@@ -749,7 +749,7 @@ mod tests {
 
         // Eviction flood: ~1.5 KiB per partial, so the byte cap binds before
         // the count cap; both bounds must hold with `held` still exact.
-        for id in 0..(FRAG_MAX_PARTIALS as u16 + 40) {
+        for id in 0..(FRAG_MAX_PARTIALS as u32 + 40) {
             let body = encode_fragment(1, id, 0, 4, &aref, &[9u8; 1400], 64 * 1024).unwrap();
             assert!(!push_bytes(&mut r, &body, 2_000));
         }
@@ -764,9 +764,7 @@ mod tests {
             let fs: Vec<Bytes> = big
                 .chunks(1300)
                 .enumerate()
-                .map(|(i, c)| {
-                    encode_fragment(7, id as u16, i as u8, 6, &aref, c, 64 * 1024).unwrap()
-                })
+                .map(|(i, c)| encode_fragment(7, id, i as u8, 6, &aref, c, 64 * 1024).unwrap())
                 .collect();
             assert_eq!(fs.len(), 6);
             let mut done = false;
@@ -779,9 +777,7 @@ mod tests {
             let fs: Vec<Bytes> = big
                 .chunks(1300)
                 .enumerate()
-                .map(|(i, c)| {
-                    encode_fragment(7, id as u16, i as u8, 6, &aref, c, 64 * 1024).unwrap()
-                })
+                .map(|(i, c)| encode_fragment(7, id, i as u8, 6, &aref, c, 64 * 1024).unwrap())
                 .collect();
             for f in fs.iter().take(3) {
                 assert!(!push_bytes(&mut r, f, 3_000));
@@ -829,7 +825,7 @@ mod tests {
         let aref = addr.as_ref();
         let first = pattern(3000);
         let second: Vec<u8> = first.iter().map(|b| b ^ 0xFF).collect();
-        let mk = |id: u16, payload: &[u8]| -> Vec<Bytes> {
+        let mk = |id: u32, payload: &[u8]| -> Vec<Bytes> {
             payload
                 .chunks(1400)
                 .enumerate()
@@ -978,7 +974,7 @@ mod tests {
         // through, and twenty tombstones must remain — at `total x 24 B` each,
         // 2.9 KiB in all, where the old representation charged ~156 KiB and
         // would have been evicting live partials within four more payloads.
-        for id in 0..20u16 {
+        for id in 0..20u32 {
             let mut done = false;
             for (i, c) in chunks.iter().enumerate() {
                 let body = encode_fragment(3, id, i as u8, total, &aref, c, 64 * 1024).unwrap();

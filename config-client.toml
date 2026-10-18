@@ -11,13 +11,14 @@ reconnect_timeout_secs = 5
 # Set a private random shared secret here and on the server.
 # Empty on BOTH sides disables auth (firewall isolation only).
 auth_token = ""
-# Default 2/4/2 MB matches code defaults (low-latency preset, ~114 Mb/s @140ms).
-# For ~240 Mb/s use 4/8/4 MB; for 300 Mb/s peak use 8/16/8 MB at ~4x loaded
-# latency with ack_threshold=8 + max_ack_delay_ms=10 to save reverse-path CPU.
-# Omit all five to use defaults.
-# stream_receive_window_mb = 2
-# receive_window_mb = 4
-# send_window_mb = 2
+# Default 4/8/4 MB matches code defaults (high-throughput preset, ~240 Mb/s
+# @140 ms). The 2/4/2 MB low-memory preset (~114 Mb/s, 8.25 MiB per-connection
+# transport term) is the RAM-tight alternative; 8/16/8 MB reaches 300 Mb/s peak
+# at ~4x loaded latency with ack_threshold=8 + max_ack_delay_ms=10 to save
+# reverse-path CPU. Omit all five to use defaults.
+# stream_receive_window_mb = 4
+# receive_window_mb = 8
+# send_window_mb = 4
 # ack_threshold = 2
 # max_ack_delay_ms = 5
 # RTT seed in ms used for the first PTO / initial pacing before the first
@@ -25,14 +26,15 @@ auth_token = ""
 # link, to shorten first-flight loss recovery (~575 -> ~435 ms first PTO).
 # initial_rtt_ms = 140
 # Path MTU (max UDP payload) every new connection starts from, bytes, default
-# 1400 (clamped 1200..=1472). quinn starts at the 1200-byte QUIC floor and its
+# 1360 (clamped 1200..=1472). quinn starts at the 1200-byte QUIC floor and its
 # PMTU discovery is opportunistic, so a busy connection can spend a long time
 # there: 18-23% more packets, and UDP payloads above 1150 B split into two MQP
-# fragments. 1400 is safe on Ethernet/PPPoE/tunnels; IPv4-only paths can use
-# 1472 (no discovery ramp, and 1400-1420-byte UDP payloads stay one frame).
-# Mirror on both ends. A too-high value costs a loss burst until quinn's
-# black-hole detector drops back to the 1200-byte floor.
-# initial_mtu = 1400
+# fragments. 1360 is 1388/1408 wire bytes after the IP+UDP headers, so it is
+# safe on WireGuard-1420 and similar tunnel paths; on a known 1500-byte
+# Ethernet path set 1400 or 1472 (no discovery ramp, and 1420-byte UDP payloads
+# stay one frame at 1472). Mirror on both ends. A too-high value costs a loss
+# burst until quinn's black-hole detector drops back to the 1200-byte floor.
+# initial_mtu = 1360
 # Connection isolation (optional; omit = 4 TCP connections, the code default).
 # quic_conns=4 spreads bulk TCP round-robin across three bulk cwnds while
 # interactive_ports pin to the first. UDP is never one of those slots: it gets
@@ -67,6 +69,6 @@ quic_conns = 4
 # DNS/STUN/games. Ports in interactive_ports keep their interactive class.
 # udp_bulk_ports = [51820, 1194]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
-# (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the
+# (cert+MQP framing stay fingerprintable). alpn="myquic2/3" restores the
 # versioned identifier; set the same value on both sides.
 # alpn = "h3"

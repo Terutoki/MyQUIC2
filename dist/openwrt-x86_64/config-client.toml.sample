@@ -14,7 +14,7 @@ dns_ip_preference = "ipv6"
 # Set a private random shared secret here and on the server.
 # Empty on BOTH sides disables auth (firewall isolation only).
 auth_token = ""
-# Latency-first preset for a 200M/140ms link (W_total ~= BDP): 2/4/2 MB
+# Low-memory preset for a 200M/140ms link (shipped default is 4/8/4 MB): 2/4/2 MB
 # windows + 4 TCP connections (plus the dedicated UDP connections). Single-thread
 # caps at ~114M; multi-thread still fills 200M with loaded ping ~= 150-160ms.
 stream_receive_window_mb = 2
@@ -22,7 +22,7 @@ receive_window_mb = 4
 send_window_mb = 2
 ack_threshold = 2
 max_ack_delay_ms = 5
-# Transport tuning (all optional; omit = 2/4/2 MB windows, ACK 2/5ms).
+# Transport tuning (all optional; omit = 4/8/4 MB windows, ACK 2/5ms).
 # For ~240 Mb/s use 4/8/4 MB; for 300 Mb/s peak use 8/16/8 MB at ~4x loaded latency; ack_threshold=8 +
 # max_ack_delay_ms=10 saves reverse-path CPU at coarser RTT feedback.
 # Connection isolation (optional; omit = 4 TCP connections, the code default).
@@ -52,6 +52,6 @@ quic_conns = 4
 # udp_egress_conns = 2
 # interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
 # ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
-# (cert+MQP framing stay fingerprintable). alpn="myquic2/2" restores the
+# (cert+MQP framing stay fingerprintable). alpn="myquic2/3" restores the
 # versioned identifier; set the same value on both sides.
 # alpn = "h3"

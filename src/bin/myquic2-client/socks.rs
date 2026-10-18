@@ -268,23 +268,26 @@ pub(crate) async fn handle_socks(
             // Sampled: `stats()` takes the quinn lock, so an abort storm must
             // not pay it per flow.
             //
-            // KNOWN LIMITATION (not a regression, deliberately left as-is): this
-            // flow is not retried on a sibling slot. A connection that blackholes
-            // *after* `pick_tcp` selected it still accepts `open_bi`/`write_all`
-            // locally, so the header goes nowhere and the failure surfaces here,
-            // bounded by `TCP_DIAL_ACK_TIMEOUT`. The slot itself is no longer left
-            // silently dead until QUIC's idle timer: the reconnect loop's silence
-            // watchdog is `max(2x keepalive, 8 s)` — ~10 s with the shipped 5 s
-            // keepalive — and provably strictly below the `max(3x keepalive, 15 s)`
-            // idle timeout it used to lose against, so it force-closes the dead
-            // connection, redials, and new flows are assigned to a live slot within
-            // ~2x keepalive (+ the 1 s poll granularity). Retrying transparently is
-            // impossible after the optimistic SOCKS success reply has been sent,
-            // and marking the slot dead on an ACK timeout alone would stall every
-            // later flow behind a reconnect when the connection is merely slow. A
-            // real fix needs a connection-health signal at *selection* time (e.g. a
-            // published last-received stamp), which is not worth the
-            // misconfiguration risk against mismatched keepalive intervals yet.
+            // Selection-time path health: `pick_tcp_index` now re-picks a slot
+            // away when the reconnect loop's published inbound-progress stamp
+            // is older than `data_stale_threshold_ms` (~7 s with the shipped
+            // 5 s keepalive, strictly below the `max(2x keepalive, 8 s)` ~10 s
+            // silence watchdog). A connection that blackholes *before* this
+            // flow's `pick_tcp` therefore stops receiving new flows at the
+            // first selection after its stamp goes stale, instead of swallowing
+            // every CONNECT for the whole ~10 s watchdog window. The selection
+            // gate changes routing only: the watchdog remains the authority
+            // that force-closes the dead connection and redials it.
+            //
+            // The residual limitation is the in-flight flow: once the
+            // optimistic SOCKS success reply above has been sent, a flow that
+            // was assigned to the slot before it blackholed cannot be retried
+            // on a sibling — the only truthful signal left is to tear the flow
+            // down (the pump RSTs), because the application already believes
+            // the CONNECT succeeded. Retrying before the reply would mortgage
+            // every connection's latency for a rare outage; recovering at
+            // selection time is what keeps a blackhole from claiming flows at
+            // all.
             if tcp_abort_log_due() {
                 let st = conn.stats();
                 tracing::warn!(

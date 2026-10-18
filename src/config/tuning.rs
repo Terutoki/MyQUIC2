@@ -126,9 +126,10 @@ pub const MAX_UDP_ASSOCS: usize = 4032;
 /// receive-buffer footprint (`cap × rmem_max`) and the per-endpoint driver
 /// wakeups an overloaded host pays; past it the extra parallelism is better
 /// spent on per-connection tasks. Sized to the same order as the client's
-/// connection fan-out: 8 shards of a 10-core box is more than enough to take
-/// ingress off any single core.
-pub const MAX_QUIC_ENDPOINTS: usize = 8;
+/// connection fan-out (`MAX_POOL_CONNS`, 16): on Linux the default is already
+/// one endpoint per usable core, so the cap only binds on hosts with more than
+/// 16 cores (and bounds what an explicit `quic_endpoints` may request).
+pub const MAX_QUIC_ENDPOINTS: usize = 16;
 
 /// Default [`ServerConf::quic_endpoints`] when the key is unset.
 ///
@@ -172,17 +173,18 @@ pub const INITIAL_RTT_MS_MAX: u64 = 3_000;
 /// PMTU discovery runs, in bytes.
 ///
 /// quinn's default is the 1200-byte QUIC floor, and its discovery is
-/// *opportunistic*: probes are only emitted from a transmit poll that builds
+/// opportunistic: probes are only emitted from a transmit poll that builds
 /// no payload packet (`quinn-proto connection/mod.rs`), so a busy connection
-/// can spend a long time at whatever value it started at. Starting at 1400
-/// removes most of that ramp and is safe on every typical path (IPv4
-/// 1400+8+20 = 1428 B, IPv6 1400+8+40 = 1448 B, both inside a 1500-byte
-/// Ethernet MTU and inside PPPoE's 1492). It is still 1420 B short of what a
-/// WireGuard-like 1420-byte UDP payload needs to stay a single MQP-2 frame;
-/// IPv4-only deployments can raise it to 1472 (see the field docs). A path
-/// smaller than the configured start is handled by quinn's black-hole
-/// detector, which resets to `min_mtu` (1200) on suspicious loss.
-pub const DEFAULT_INITIAL_MTU: u16 = 1400;
+/// can spend a long time at whatever value it started at. Starting at 1360
+/// removes most of that ramp and is safe on tunnel paths too: 1360 B of
+/// payload is 1388 wire bytes with IPv4+UDP overhead and 1408 with IPv6+UDP,
+/// both inside the 1420-byte WireGuard interface MTU (and inside PPPoE's 1492
+/// and a 1500-byte Ethernet MTU). It is not a claim that every path is 1500:
+/// operators on a known 1500-byte Ethernet path can raise `initial_mtu` to
+/// 1400 or 1472. A path smaller than the configured start is handled by
+/// quinn's black-hole detector, which resets to `min_mtu` (1200) on
+/// suspicious loss.
+pub const DEFAULT_INITIAL_MTU: u16 = 1360;
 /// Lower clamp for `initial_mtu`: the QUIC minimum.
 pub const INITIAL_MTU_MIN: u16 = 1200;
 /// Upper clamp for `initial_mtu`: quinn's default endpoint
@@ -190,10 +192,11 @@ pub const INITIAL_MTU_MIN: u16 = 1200;
 pub const INITIAL_MTU_MAX: u16 = 1472;
 
 /// Runtime transport tuning resolved from optional TOML fields.
-/// Defaults are the low-latency preset for ~140 ms links (2/4/2 MB windows,
-/// ACK every 2nd, 5 ms delay): ~114 Mb/s @140 ms with minimal loaded queue.
-/// Raise the windows to 4/8/4 MB for ~240 Mb/s or 8/16/8 MB for 300 Mb/s peak
-/// throughput at the cost of ~2x/4x loaded latency.
+/// Defaults are the high-throughput preset for ~140 ms links (4/8/4 MB
+/// windows, ACK threshold 2, 5 ms delay): ~240 Mb/s @140 ms with a modest
+/// loaded queue. The old 2/4/2 MB low-memory preset (~114 Mb/s) is available
+/// by setting all three windows explicitly, and 8/16/8 MB reaches ~300 Mb/s
+/// peak at the cost of ~2x/4x loaded latency.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportTuning {
     pub stream_receive_window: u64,
@@ -216,9 +219,9 @@ pub struct TransportTuning {
 impl Default for TransportTuning {
     fn default() -> Self {
         Self {
-            stream_receive_window: 2 * 1024 * 1024,
-            receive_window: 4 * 1024 * 1024,
-            send_window: 2 * 1024 * 1024,
+            stream_receive_window: 4 * 1024 * 1024,
+            receive_window: 8 * 1024 * 1024,
+            send_window: 4 * 1024 * 1024,
             ack_threshold: 2,
             max_ack_delay: Duration::from_millis(5),
             initial_rtt: Duration::from_millis(DEFAULT_INITIAL_RTT_MS),
@@ -324,9 +327,9 @@ pub fn session_pool_memory_bytes(max_sessions: usize) -> u64 {
 impl ServerConf {
     pub fn tuning(&self) -> TransportTuning {
         TransportTuning {
-            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 2),
-            receive_window: clamp_window_mb(self.receive_window_mb, 4),
-            send_window: clamp_window_mb(self.send_window_mb, 2),
+            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 4),
+            receive_window: clamp_window_mb(self.receive_window_mb, 8),
+            send_window: clamp_window_mb(self.send_window_mb, 4),
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
             initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
@@ -338,9 +341,9 @@ impl ServerConf {
 impl ClientConf {
     pub fn tuning(&self) -> TransportTuning {
         TransportTuning {
-            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 2),
-            receive_window: clamp_window_mb(self.receive_window_mb, 4),
-            send_window: clamp_window_mb(self.send_window_mb, 2),
+            stream_receive_window: clamp_window_mb(self.stream_receive_window_mb, 4),
+            receive_window: clamp_window_mb(self.receive_window_mb, 8),
+            send_window: clamp_window_mb(self.send_window_mb, 4),
             ack_threshold: self.ack_threshold.unwrap_or(2).clamp(1, 32),
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
             initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),

@@ -58,10 +58,11 @@ pub struct ServerConf {
     /// bound; the worst case is logged at startup either way.
     #[serde(default)]
     pub max_peer_memory_mb: Option<u64>,
-    // ---- Transport tuning (all optional; None = low-latency default) ----
-    // Larger windows trade loaded latency for peak throughput: 4/8/4 MB
-    // reaches ~240 Mb/s @140 ms and 8/16/8 MB reaches ~300 Mb/s, against the
-    // 2/4/2 MB default (~114 Mb/s). ACK threshold 8 + 10 ms delay saves
+    // ---- Transport tuning (all optional; None = shipped default) ----
+    // Shipped default windows are 4/8/4 MB, sized for the target ~140 ms link:
+    // ~240 Mb/s single-flow. The 2/4/2 MB low-memory preset (~114 Mb/s) halves
+    // the per-connection transport term, and 8/16/8 MB reaches ~300 Mb/s peak
+    // at ~2x/4x loaded latency. ACK threshold 8 + 10 ms delay saves
     // reverse-path CPU at the cost of coarser RTT/loss feedback.
     #[serde(default)]
     pub stream_receive_window_mb: Option<u64>,
@@ -80,13 +81,16 @@ pub struct ServerConf {
     #[serde(default)]
     pub initial_rtt_ms: Option<u64>,
     /// Path MTU every new connection starts from, in bytes (clamped
-    /// 1200..=1472; default 1400). Mirror the client's value: the tunnel's
+    /// 1200..=1472; default 1360). Mirror the client's value: the tunnel's
     /// path is shared, and starting above quinn's 1200-byte floor removes the
     /// 4-probe-RTT ramp every connection pays before it can send 1472-byte
-    /// packets. See `ClientConf::initial_mtu`.
+    /// packets. 1360 is 1388/1408 wire bytes after the IPv4/IPv6 + UDP
+    /// headers, so it is safe on WireGuard-1420 and similar tunnel paths;
+    /// operators on a known 1500-byte Ethernet path can set 1400 or 1472.
+    /// See `ClientConf::initial_mtu`.
     #[serde(default)]
     pub initial_mtu: Option<u16>,
-    /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
+    /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
     pub alpn: Option<String>,

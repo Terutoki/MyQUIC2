@@ -36,7 +36,11 @@ fn reconnect_backoff() -> impl Iterator<Item = Duration> {
 /// ~11 s detector; the tick costs one `ConnectionStats` snapshot per second per
 /// connection (the same quinn state-lock acquisition the 5 s tick paid, just
 /// more often — still nowhere near the per-packet path).
-const WATCHDOG_POLL: Duration = Duration::from_secs(1);
+///
+/// `pub(crate)` because the pool's selection-time path-health threshold
+/// ([`data_stale_threshold_ms`]) is derived from the worst-case age of an
+/// inbound-progress stamp: one keepalive interval plus this sampling tick.
+pub(crate) const WATCHDOG_POLL: Duration = Duration::from_secs(1);
 
 pub(crate) fn spawn_conn_loop(
     ep: quinn::Endpoint,
@@ -64,6 +68,13 @@ pub(crate) fn spawn_conn_loop(
                 Ok(conn) => {
                     info!("QUIC connected to {server}");
                     slot.publish(&conn);
+                    // Establishment is inbound progress: seed the routing
+                    // stamp before publishing the live hint, so the first
+                    // selections of the new generation never read the previous
+                    // one's (or the initial 0) age. `0` is treated as
+                    // "unknown, not stale" as a belt-and-braces, but seeding
+                    // here is what makes the gate meaningful from the start.
+                    slot.note_rx_progress();
                     slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
                     bump_gen(&slot.gen_tx);
                     let connected_at = std::time::Instant::now();
@@ -124,6 +135,15 @@ pub(crate) fn spawn_conn_loop(
                             if rx != last_rx {
                                 last_rx = rx;
                                 quiet_since = std::time::Instant::now();
+                                // Publish the downlink-progress stamp the
+                                // routing path's health gate reads (see
+                                // `ConnSlot::is_data_stale`). Only an actual
+                                // advance refreshes it — that is exactly the
+                                // signal that freezes on a blackholed path
+                                // while `live` still reads true; the watchdog
+                                // below remains the authority that closes and
+                                // redials the connection.
+                                slot.note_rx_progress();
                             } else if quiet_since.elapsed() >= watchdog_silence {
                                 warn!(
                                     "QUIC path silent (downlink) rx={rx} tx={} {watchdog_silence:?}, force-closing {server}",

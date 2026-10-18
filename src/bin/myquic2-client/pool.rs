@@ -36,6 +36,21 @@ pub(crate) struct ConnSlot {
     /// `pick_tcp` would otherwise pay twice per TCP flow. `wait_conn` remains
     /// the authority that fails a flow fast.
     pub(crate) live: Arc<std::sync::atomic::AtomicBool>,
+    /// Inbound-progress stamp (coarse-epoch milliseconds), published by the
+    /// reconnect loop's 1 Hz silence watchdog whenever its `ConnectionStats`
+    /// snapshot shows `udp_rx.datagrams` advanced, and seeded at connection
+    /// establishment. `udp_rx.datagrams` grows on every inbound datagram
+    /// (ACKs, keepalive PINGs, stream data), so a healthy — even completely
+    /// idle — connection advances the stamp at least once per keepalive
+    /// interval, while a blackholed path (NAT rebind, Wi-Fi handover,
+    /// SIGKILLed peer) freezes the counter and the stamp with it. That freeze
+    /// is the signal `live` cannot express: a blackholed connection still has
+    /// no `close_reason()` and keeps `live` true until the watchdog's
+    /// `max(2x keepalive, 8 s)` window expires. `0` means "no progress observed
+    /// yet" and is treated as *not* stale (see [`ConnSlot::is_data_stale`]):
+    /// the clear path resets it on death, so a restored live hint can never
+    /// pair a fresh generation with the previous one's stale stamp.
+    pub(crate) last_rx_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConnSlot {
@@ -46,11 +61,47 @@ impl ConnSlot {
             gen_tx,
             gen_rx,
             live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     pub(crate) fn is_live(&self) -> bool {
         self.live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish "inbound progress observed now". Called at connection
+    /// establishment (the handshake just delivered inbound datagrams) and then
+    /// from the reconnect loop's watchdog tick whenever `udp_rx.datagrams`
+    /// moved. The coarse clock is the right one here: the value is compared
+    /// against a seconds-scale threshold, and the write runs on the 1 Hz
+    /// reconnect loop while the read runs once per new TCP flow.
+    pub(crate) fn note_rx_progress(&self) {
+        self.last_rx_ms
+            .store(coarse_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Forget the previous generation's progress stamp (`0` = unknown, never
+    /// stale). Called only on the path that commits a connection to `None`,
+    /// next to the `live = false` store: leaving a stale stamp behind for the
+    /// next generation would make a healthy redial look dead to one selection.
+    /// The unknown default is the safe direction — a slot with no live
+    /// connection cannot be selected anyway, and the publisher seeds the stamp
+    /// before setting `live`.
+    pub(crate) fn reset_rx_progress(&self) {
+        self.last_rx_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when this slot's inbound progress has been frozen for at least
+    /// `threshold_ms` as of `now_ms`: the path-health gate
+    /// [`ConnPool::pick_tcp_index`] applies to a `live` slot. A `0` stamp
+    /// ("unknown", never observed since the last clear) is not stale — only the
+    /// death path leaves it at `0`, where the `live` bit already excludes the
+    /// slot, and treating it as fresh keeps the clear/publish race from
+    /// rejecting a just-installed generation.
+    pub(crate) fn is_data_stale(&self, now_ms: u64, threshold_ms: u64) -> bool {
+        let stamp = self.last_rx_ms.load(std::sync::atomic::Ordering::Relaxed);
+        stamp != 0 && now_ms.saturating_sub(stamp) >= threshold_ms
     }
 
     /// Synchronous dead-handle probe for the routing path: true when the slot
@@ -132,6 +183,10 @@ impl ConnSlot {
                 cleared = true;
                 marked = true;
                 self.live.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Same decision, same commit: the dead generation's inbound
+                // stamp must not outlive it, or the next generation's first
+                // selections would re-pick off a stamp that never described it.
+                self.reset_rx_progress();
                 None
             } else {
                 cleared = false;
@@ -267,6 +322,41 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
     if !pinned && live[0] { 0 } else { preferred }
 }
 
+/// Selection-time path-health threshold in milliseconds: how long a `live`
+/// slot's inbound progress may be frozen before [`ConnPool::pick_tcp_index`]
+/// stops preferring it (see [`ConnSlot::is_data_stale`]).
+///
+/// Derived from the same clamped keepalive the transport and the reconnect
+/// loop's silence watchdog use, as the midpoint between the two bounds that
+/// matter:
+///
+/// - **Lower bound — a healthy idle connection must never be rejected.** The
+///   shipped 5 s keepalive makes the peer's ACKs and keepalive PINGs arrive at
+///   least every keepalive interval, and the 1 Hz watchdog samples
+///   `udp_rx.datagrams` after at most one `WATCHDOG_POLL` tick, so the stamp's
+///   age on a healthy idle connection stays below `keepalive + poll`.
+/// - **Upper bound — the gate must win while the slot is still live.** The
+///   watchdog force-closes at `max(2x keepalive, 8 s)` (and needs a poll tick
+///   to notice), so a threshold at or above that would never be reached while
+///   the blackholed slot was still selectable.
+///
+/// The midpoint is provably strictly between the bounds for every legal
+/// keepalive, 1..=300 s (locked by
+/// `data_stale_threshold_sits_between_healthy_idle_and_watchdog`): it keeps the
+/// healthy-idle case at least one poll tick of margin and still stops selecting
+/// a blackholed slot minutes before the watchdog on large keepalives. With the
+/// shipped 5 s keepalive (10 s watchdog window) it is 7 s, so a path that
+/// blackholes stops receiving *new* flows ~3 s before the watchdog would even
+/// notice, instead of accepting every CONNECT for the whole ~10 s window.
+pub(crate) fn data_stale_threshold_ms(keep_alive_secs: u64) -> u64 {
+    // Same clamp the transport applies (`clamp_keep_alive`); no warning here —
+    // `main` clamped and validated the configured value already, and this is
+    // also called from the tests' default constructor.
+    let keepalive = keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
+    let watchdog_secs = watchdog_silence_secs(keepalive);
+    (keepalive + watchdog_secs) / 2 * 1_000
+}
+
 /// A resolved UDP egress binding: which dedicated UDP connection an
 /// association's datagrams ride, fixed from its first datagram for the
 /// association's life (see [`ConnPool::udp_bind`]).
@@ -391,6 +481,13 @@ pub(crate) struct ConnPool {
     /// `dgram_drops::NO_EGRESS`) instead of sharing a TCP connection's
     /// congestion window.
     pub(crate) udp_fail_closed: bool,
+    /// Selection-time path-health threshold in coarse-epoch milliseconds (see
+    /// [`data_stale_threshold_ms`]): a `live` TCP slot whose published
+    /// inbound-progress stamp ([`ConnSlot::last_rx_ms`]) is older than this is
+    /// re-picked away from in [`ConnPool::pick_tcp_index`]. Computed once at
+    /// startup from the clamped keepalive, so the routing path's check is two
+    /// relaxed loads and a cached-clock read.
+    pub(crate) data_stale_ms: u64,
 }
 
 impl ConnPool {
@@ -416,6 +513,11 @@ impl ConnPool {
             udp_fail_closed,
             udp_split,
             udp_bulk_shards,
+            // The shipped default keepalive (5 s) drives the selection-time
+            // path-health threshold, so the routing table the existing tests
+            // were written against keeps its shape. Tests that exercise the
+            // gate set `pool.data_stale_ms` (and the slots' stamps) directly.
+            data_stale_threshold_ms(5),
         )
     }
 
@@ -428,6 +530,10 @@ impl ConnPool {
     /// `bulk_ports` is the destination-port override list (see
     /// [`ConnPool::udp_class`]): ports classified as bulk whatever their first
     /// payload size. It only affects classification, never the slot layout.
+    ///
+    /// `data_stale_ms` is the selection-time path-health threshold (see
+    /// [`data_stale_threshold_ms`]), derived by `main` from the same clamped
+    /// keepalive as the transport and the watchdog.
     pub(crate) fn new_with_bulk_ports(
         n: usize,
         interactive_ports: Vec<u16>,
@@ -435,6 +541,7 @@ impl ConnPool {
         udp_fail_closed: bool,
         udp_split: bool,
         udp_bulk_shards: usize,
+        data_stale_ms: u64,
     ) -> Self {
         let tcp = n.clamp(1, MAX_POOL_CONNS);
         let bulk_shards = if udp_split {
@@ -454,6 +561,7 @@ impl ConnPool {
             udp_split,
             bulk_shards,
             udp_fail_closed,
+            data_stale_ms,
         }
     }
 
@@ -578,16 +686,62 @@ impl ConnPool {
 
     /// Index of the TCP slot a new TCP flow should use (see [`select_slot`]).
     ///
-    /// `n` indexed liveness reads and a stack liveness array: no lock, no
-    /// per-flow allocation, and no `close_reason()` (which takes quinn's
-    /// connection-state mutex) — the maintained `live` bit is what routing
-    /// reads, and `wait_conn` remains the authority that fails a flow fast.
+    /// `n` indexed liveness reads and two stack arrays: no lock, no per-flow
+    /// allocation, and no `close_reason()` per slot (which takes quinn's
+    /// connection-state mutex) — the maintained `live` bit and the reconnect
+    /// loop's inbound-progress stamp are what routing reads, and `wait_conn`
+    /// remains the authority that fails a flow fast.
+    ///
+    /// Two failovers, each a single re-pick over the same class rules, so a
+    /// flow can never oscillate and an all-unusable pool keeps the preference
+    /// for the bounded `wait_conn` stall:
+    ///
+    /// 1. **Dead handle (L2)**: `live` is only a hint, so a slot whose QUIC
+    ///    connection died in the window before the conn loop clears the bit
+    ///    still reads true; `close_reason()` is the authority.
+    /// 2. **Path health (L3)**: a *blackholed* connection has no close reason
+    ///    and still reads live — NAT rebind, Wi-Fi handover, SIGKILLed peer —
+    ///    so `close_reason()` cannot see it until the silence watchdog fires
+    ///    (`max(2x keepalive, 8 s)` later). Its published inbound-progress
+    ///    stamp goes stale first (see [`ConnSlot::is_data_stale`] and
+    ///    [`data_stale_threshold_ms`]), so a `live` preference whose progress
+    ///    is stale is re-picked over the live-and-fresh set. This changes
+    ///    *selection only*: the slot stays live, the watchdog stays the
+    ///    authority that force-closes and redials, and nothing here can trigger
+    ///    a reconnect.
     pub(crate) fn pick_tcp_index(&self, t: &TargetAddr) -> usize {
+        self.pick_tcp_index_inner(t, coarse_millis())
+    }
+
+    /// Test seam for the path-health gate: [`ConnPool::pick_tcp_index`] with the
+    /// caller-supplied coarse-epoch reading, so a unit test can place a slot's
+    /// stamp seconds in the past without sleeping out a seconds-scale threshold
+    /// (the coarse clock only advances in ~1 s upkeep steps, so a real sleep
+    /// would make these tests slow and flaky). Production goes through
+    /// `pick_tcp_index`, whose only extra job is to supply the clock — so a
+    /// test and the real path can never disagree about which clock the stamps
+    /// use.
+    #[cfg(test)]
+    pub(crate) fn pick_tcp_index_at(&self, t: &TargetAddr, now_ms: u64) -> usize {
+        self.pick_tcp_index_inner(t, now_ms)
+    }
+
+    /// The routing decision itself; `now_ms` is the coarse-epoch reading the
+    /// inbound-progress stamps are compared against.
+    fn pick_tcp_index_inner(&self, t: &TargetAddr, now_ms: u64) -> usize {
         let n = self.tcp_slots();
         debug_assert!(n <= MAX_POOL_CONNS);
         let mut live = [false; MAX_POOL_CONNS];
-        for (i, l) in live[..n].iter_mut().enumerate() {
-            *l = self.slots.get(i).is_some_and(ConnSlot::is_live);
+        // `live` with the inbound-progress gate applied: the set the L3
+        // re-pick rotates over. Kept alongside `live` because `select_slot`'s
+        // class rules (interactive pin, bulk fallback to slot 0) must hold for
+        // both sets.
+        let mut fresh = [false; MAX_POOL_CONNS];
+        for i in 0..n {
+            let slot = self.slots.get(i);
+            let l = slot.is_some_and(ConnSlot::is_live);
+            live[i] = l;
+            fresh[i] = l && slot.is_some_and(|s| !s.is_data_stale(now_ms, self.data_stale_ms));
         }
         let pinned = self.is_interactive(t);
         // The cursor advances on every flow, pinned ones included. The pinned
@@ -598,14 +752,14 @@ impl ConnPool {
         // the same cost the old bulk-only increment paid.
         let rr = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let preferred = select_slot(pinned, rr, &live[..n]);
-        // L2 stale-live failover: `live` is only a hint, so a slot whose QUIC
-        // connection died in the window before the conn loop clears the bit
-        // still reads true and `select_slot` keeps preferring it. `wait_conn`
-        // would then sit on that slot's generation until the reconnect timeout
-        // even with live bulk siblings available. Confirm the preference with
-        // `close_reason()` and, when it holds a dead handle, re-pick once with
-        // the same `rr` and that slot overlaid dead — class rules unchanged,
-        // and an all-dead pool keeps the preference for the bounded stall.
+        // L2 stale-live failover: a slot whose QUIC connection died in the
+        // window before the conn loop clears the bit still reads true and
+        // `select_slot` keeps preferring it. `wait_conn` would then sit on that
+        // slot's generation until the reconnect timeout even with live bulk
+        // siblings available. Confirm the preference with `close_reason()` and,
+        // when it holds a dead handle, re-pick once with the same `rr` and that
+        // slot overlaid dead — class rules unchanged, and an all-dead pool
+        // keeps the preference for the bounded stall.
         if live[preferred]
             && self
                 .slots
@@ -614,6 +768,17 @@ impl ConnPool {
         {
             live[preferred] = false;
             return select_slot(pinned, rr, &live[..n]);
+        }
+        // L3 path-health gate: the preference is live but its inbound progress
+        // has been frozen for the threshold — a blackholed path that
+        // `close_reason()` cannot see yet. Re-pick once over the
+        // live-and-fresh set with the same `rr` and class rules. When every
+        // live slot is stale (a whole-pool outage, or a stalled clock) keep the
+        // preference: a stale sibling would stall just the same, and
+        // `wait_conn` bounds the wait. Nothing is written here — the watchdog
+        // remains the only authority that closes and redials a slot.
+        if live[preferred] && !fresh[preferred] && fresh[..n].iter().any(|&f| f) {
+            return select_slot(pinned, rr, &fresh[..n]);
         }
         preferred
     }

@@ -613,6 +613,340 @@ async fn stale_true_preference_repicks_to_a_live_bulk_sibling() {
     );
 }
 
+/// Path-health gate, healthy case: a live slot whose inbound-progress stamp is
+/// fresh is the *normal* state of an idle healthy connection (keepalives keep
+/// `udp_rx.datagrams` moving at least every keepalive interval, and the
+/// reconnect loop republishes the stamp on every advance), so routing must be
+/// byte-identical to the pre-gate table for both classes.
+#[test]
+fn stale_gate_keeps_healthy_idle_slot() {
+    let mut pool = ConnPool::new(4, vec![53], true, true, 1);
+    assert_eq!(
+        pool.data_stale_ms,
+        data_stale_threshold_ms(5),
+        "the test constructor derives the threshold from the shipped 5 s keepalive"
+    );
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        pool.slot(i).note_rx_progress();
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    let interactive = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+    // The gate must not perturb the rotation or the interactive pin.
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    let seq: Vec<usize> = (0..4).map(|_| pool.pick_tcp_index(&bulk)).collect();
+    assert_eq!(seq, vec![1, 2, 3, 1], "healthy pool keeps the RR rotation");
+    assert_eq!(
+        pool.pick_tcp_index(&interactive),
+        0,
+        "pinned stays on slot 0"
+    );
+    pool.data_stale_ms = 60_000;
+    // A healthy idle slot is never rejected even with a wide threshold.
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(pool.pick_tcp_index(&bulk), 1);
+}
+
+/// Path-health gate, bulk class: the rr preference is a live slot whose inbound
+/// progress froze past the threshold — the blackholed-NAT shape, where
+/// `close_reason()` is still empty and `live` still reads true. Selection must
+/// re-pick once over the live-and-fresh bulk set (continuing the rotation, like
+/// the L2 dead-handle failover) instead of handing the new flow a dead path.
+#[test]
+fn stale_gate_re_picks_bulk_away_from_a_blackholed_preference() {
+    let pool = ConnPool::new(4, vec![53], true, true, 1);
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let now = 1_000_000;
+    let stale = now - pool.data_stale_ms - 1;
+    // rr = 0 prefers bulk slot 1; freeze only that slot's progress.
+    pool.slot(1)
+        .last_rx_ms
+        .store(stale, std::sync::atomic::Ordering::Relaxed);
+    for i in [0usize, 2, 3] {
+        pool.slot(i)
+            .last_rx_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    // The rotation continues inside the bulk class from the stale preference:
+    // 1 + (0 + 1) % 3 = slot 2.
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        2,
+        "a stale bulk preference must fail over to a fresh bulk sibling"
+    );
+    assert!(
+        pool.slot(1).is_live(),
+        "the gate changes selection only: a blackholed slot stays live for the watchdog to own"
+    );
+    // Cursor 1: preference slot 2 is fresh, so the rotation is untouched.
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        2,
+        "a fresh live preference is kept"
+    );
+}
+
+/// Path-health gate, interactive/pinned class: slot 0 is the only home of an
+/// `interactive_ports` flow, so a stale slot 0 must fall into the live-and-fresh
+/// bulk set with the shared rotation — the fallback the class already uses when
+/// slot 0 is dead — rather than pin the flow to a blackholed path.
+#[test]
+fn stale_gate_re_picks_pinned_away_from_a_blackholed_slot_zero() {
+    let pool = ConnPool::new(4, vec![53], true, true, 1);
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let now = 1_000_000;
+    let stale = now - pool.data_stale_ms - 1;
+    pool.slot(0)
+        .last_rx_ms
+        .store(stale, std::sync::atomic::Ordering::Relaxed);
+    for i in [1usize, 2, 3] {
+        pool.slot(i)
+            .last_rx_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+    let interactive = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&interactive, now),
+        1,
+        "a stale pin must rotate into the fresh bulk set, not stall the flow"
+    );
+    // The shared cursor moves the next fallback on to the next fresh bulk slot,
+    // exactly as it does when slot 0 is merely dead.
+    assert_eq!(
+        pool.pick_tcp_index_at(&interactive, now),
+        2,
+        "pinned fallbacks keep spreading over the fresh set"
+    );
+}
+
+/// Path-health gate, bounded-stall rule: when every live slot is stale (a
+/// pool-wide outage, or a stalled coarse clock) there is no better sibling to
+/// re-pick, so the preference is kept — `wait_conn` bounds the wait, and a
+/// random stale sibling would only move the same failure elsewhere.
+#[test]
+fn stale_gate_keeps_the_preference_when_every_slot_is_stale() {
+    let pool = ConnPool::new(4, vec![53], true, true, 1);
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let now = 1_000_000;
+    let stale = now - pool.data_stale_ms - 1;
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .last_rx_ms
+            .store(stale, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    let interactive = TargetAddr::Ip("203.0.113.7:53".parse().unwrap());
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        1,
+        "all-stale keeps the bulk preference for the bounded stall"
+    );
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&interactive, now),
+        0,
+        "all-stale keeps the pinned slot 0"
+    );
+}
+
+/// The gate is an overlay on the liveness table, not a replacement: liveness
+/// failover still wins first, and unseeded stamps (`0` = "no progress observed
+/// yet", the shape of every slot built by the test constructor and of a slot
+/// whose clear just committed) read as fresh, so the pre-gate routing table is
+/// unchanged.
+#[test]
+fn stale_gate_overlays_liveness_without_changing_it() {
+    let pool = ConnPool::new(4, vec![], true, true, 1);
+    // Slots 0, 1 and 3 live; slot 2 down. No stamps at all.
+    for i in [0usize, 1, 3] {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    // rr = 1 prefers dead slot 2: the liveness rotation picks slot 3.
+    pool.rr.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(pool.pick_tcp_index(&bulk), 3, "liveness failover unchanged");
+    // The same shape with fresh stamps: still slot 3.
+    let now = 1_000_000;
+    for i in [0usize, 1, 3] {
+        pool.slot(i)
+            .last_rx_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+    pool.rr.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        3,
+        "fresh stamps leave the liveness rotation alone"
+    );
+}
+
+/// The gate reads the threshold the pool was built with, not a hard-coded
+/// window: the same 10 s-old stamp is stale under the shipped 7 s threshold and
+/// fresh under a 60 s one.
+#[test]
+fn stale_gate_uses_the_configured_threshold() {
+    let mut pool = ConnPool::new(3, vec![], true, true, 1);
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let now = 1_000_000;
+    pool.slot(1)
+        .last_rx_ms
+        .store(now - 10_000, std::sync::atomic::Ordering::Relaxed);
+    for i in [0usize, 2] {
+        pool.slot(i)
+            .last_rx_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        2,
+        "10 s old is stale at the shipped 7 s threshold"
+    );
+    pool.data_stale_ms = 60_000;
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        1,
+        "10 s old is fresh at a 60 s threshold, so the preference is kept"
+    );
+}
+
+/// `ConnSlot::is_data_stale` semantics the routing gate depends on: boundary
+/// inclusive, a `0` stamp is "unknown, never stale", and a clock that goes
+/// backwards can never manufacture staleness.
+#[test]
+fn slot_data_staleness_semantics() {
+    use std::sync::atomic::Ordering;
+    let slot = ConnSlot::fresh();
+    assert!(
+        !slot.is_data_stale(1_000_000, 7_000),
+        "no progress ever observed: unknown, not stale"
+    );
+    slot.last_rx_ms.store(993_000, Ordering::Relaxed);
+    assert!(
+        !slot.is_data_stale(999_999, 7_000),
+        "6.999 s old is still inside the window"
+    );
+    assert!(
+        slot.is_data_stale(1_000_000, 7_000),
+        "exactly at the threshold is stale"
+    );
+    assert!(
+        !slot.is_data_stale(900_000, 7_000),
+        "a backwards clock reading is not staleness"
+    );
+    slot.reset_rx_progress();
+    assert_eq!(
+        slot.last_rx_ms.load(Ordering::Relaxed),
+        0,
+        "the death path clears the generation's stamp"
+    );
+    assert!(!slot.is_data_stale(u64::MAX, 7_000));
+    slot.note_rx_progress();
+    assert!(
+        !slot.is_data_stale(coarse_millis(), 7_000),
+        "a freshly published stamp is never stale"
+    );
+}
+
+/// The selection threshold must sit strictly between "a healthy idle
+/// connection is never rejected" and "the gate can win before the watchdog
+/// closes the slot" for every legal keepalive — the invariant the whole gate
+/// rests on.
+#[test]
+fn data_stale_threshold_sits_between_healthy_idle_and_watchdog() {
+    // The shipped shape: 5 s keepalive -> 10 s watchdog window -> 7 s gate.
+    assert_eq!(data_stale_threshold_ms(5), 7_000);
+    for keepalive in 1..=KEEP_ALIVE_MAX_SECS {
+        let threshold = data_stale_threshold_ms(keepalive);
+        // Lower bound: a healthy idle connection's stamp ages by at most one
+        // keepalive interval plus one watchdog poll tick before the next
+        // sample; the gate must never fire inside that.
+        let healthy_idle_worst_ms = (keepalive + WATCHDOG_POLL.as_secs()) * 1_000;
+        assert!(
+            threshold > healthy_idle_worst_ms,
+            "keepalive={keepalive}: threshold {threshold} <= healthy-idle age {healthy_idle_worst_ms}"
+        );
+        // Upper bound: strictly below the silence watchdog, so a blackholed
+        // slot is rejected while it is still live and selectable.
+        let watchdog_ms = watchdog_silence_secs(keepalive) * 1_000;
+        assert!(
+            threshold < watchdog_ms,
+            "keepalive={keepalive}: threshold {threshold} >= watchdog {watchdog_ms}"
+        );
+    }
+    // Out-of-range inputs use the same clamp as the transport, without warning.
+    assert_eq!(data_stale_threshold_ms(0), data_stale_threshold_ms(1));
+    assert_eq!(
+        data_stale_threshold_ms(u64::MAX),
+        data_stale_threshold_ms(KEEP_ALIVE_MAX_SECS)
+    );
+}
+
+/// `claim_log_window_counted` must treat the bin's `NEVER_LOGGED` sentinel as
+/// "never claimed": a `0`-initialised slot would swallow the first window, and
+/// the client's per-connection failure lines exist for exactly the
+/// startup/reconnect burst. The same contract the server bin locks from
+/// `reporter::NEVER_LOGGED`.
+#[test]
+fn never_logged_sentinel_claims_immediately() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let last = AtomicU64::new(NEVER_LOGGED);
+    let suppressed = AtomicU64::new(0);
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 0),
+        Some(0),
+        "the first event must always log"
+    );
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 999),
+        None,
+        "the rest of the window is suppressed"
+    );
+    assert_eq!(suppressed.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        claim_log_window_counted(&last, &suppressed, 1_000),
+        Some(1),
+        "the next window reports the suppressed count"
+    );
+}
+
+/// The suppressed suffix is empty for a clean window, so callers append it
+/// unconditionally and the common line reads exactly as before.
+#[test]
+fn suppressed_suffix_is_empty_for_a_clean_window() {
+    assert_eq!(Suppressed(0).to_string(), "");
+    assert_eq!(
+        Suppressed(3).to_string(),
+        " (3 similar suppressed in the last second)"
+    );
+}
+
 /// A one-slot pool is the legacy single-TCP-connection mode: every flow,
 /// pinned or bulk, resolves to slot 0 no matter what the liveness bit says.
 /// UDP still gets its own connection(s) past the TCP range, so even the
@@ -784,7 +1118,15 @@ fn udp_class_splits_by_port_and_first_payload() {
 #[test]
 fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
     let ip = |port| TargetAddrRef::Ip(SocketAddr::from(([203, 0, 113, 7], port)));
-    let pool = ConnPool::new_with_bulk_ports(1, vec![53, 3478], vec![51820, 1194], true, true, 1);
+    let pool = ConnPool::new_with_bulk_ports(
+        1,
+        vec![53, 3478],
+        vec![51820, 1194],
+        true,
+        true,
+        1,
+        data_stale_threshold_ms(5),
+    );
     // WireGuard's 148 B handshake must not be mistaken for interactive.
     assert_eq!(pool.udp_class(&ip(51820), 148), EgressClass::Bulk);
     // ...OpenVPN's data port too, and a full-size payload stays bulk anyway.
@@ -794,7 +1136,15 @@ fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
     assert_eq!(pool.udp_class(&ip(51999), 148), EgressClass::Interactive);
     // Interactive precedence: a port listed in both classes stays interactive
     // (the operator's explicit latency-sensitive intent wins).
-    let both = ConnPool::new_with_bulk_ports(1, vec![443], vec![443], true, true, 1);
+    let both = ConnPool::new_with_bulk_ports(
+        1,
+        vec![443],
+        vec![443],
+        true,
+        true,
+        1,
+        data_stale_threshold_ms(5),
+    );
     assert_eq!(both.udp_class(&ip(443), 1200), EgressClass::Interactive);
     // A domain target classifies by its port the same way.
     assert_eq!(
@@ -2632,7 +2982,7 @@ async fn dispatch_reassembles_fragments_for_two_interleaved_sessions() {
                 cache: &mut [DispatchSlot; DISPATCH_CACHE],
                 pkt: &mut bytes::BytesMut,
                 sess: u32,
-                id: u16,
+                id: u32,
                 total: u8,
                 idx: u8,
                 chunk: &[u8]| {
@@ -3123,6 +3473,10 @@ fn assoc_recv_buf_pool_is_bounded_and_exactly_sized() {
 /// final probe detects.
 #[tokio::test(start_paused = true)]
 async fn udp_associate_serves_its_first_datagram_without_a_startup_sleep() {
+    // The first datagram takes the counted NO_EGRESS path (no egress is
+    // published in this harness), so serialize with the tests that assert
+    // exact deltas on that process-wide counter.
+    let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
     let spinner = tokio::spawn(async {
         loop {
             tokio::task::yield_now().await;
@@ -3240,6 +3594,10 @@ fn only_the_dedicated_bulk_udp_shards_use_the_bulk_preset() {
 #[tokio::test]
 async fn deferred_2pack_flush_drops_once_instead_of_parking() {
     use std::sync::atomic::Ordering;
+    // NO_EGRESS is process-wide and this test asserts an exact delta, so it
+    // must not overlap any other test that can bump it (the same lock the
+    // other egress-verdict counter tests hold).
+    let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
     let pool = ConnPool::new(1, vec![], true, true, 1);
     let egress = SharedEgress::default();
     let mut frag = DgramFragmenter::new();
@@ -3267,10 +3625,12 @@ async fn deferred_2pack_flush_drops_once_instead_of_parking() {
     );
 }
 
-/// Serializes the egress-verdict counter tests: `EGRESS_DEAD` and
-/// `udp_write::no_app` are process-wide, so two tests that assert exact
-/// deltas must not overlap. (Only these tests bump `EGRESS_DEAD`; the rest of
-/// the file uses live loopback connections.)
+/// Serializes the tests that assert exact deltas on the process-wide egress
+/// drop counters: `EGRESS_DEAD`, `NO_EGRESS` and `udp_write::no_app`. The
+/// tests that bump them on purpose take this lock too, so a parallel test
+/// cannot inflate the delta another test is asserting (`deferred_2pack_flush_
+/// drops_once_instead_of_parking` and the UDP-associate startup test were the
+/// two missing holders; the rest of the file uses live loopback connections).
 static EGRESS_VERDICT_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The send-verdict recovery is one shared handler for the per-datagram path

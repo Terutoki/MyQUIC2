@@ -1418,7 +1418,7 @@ mod tests {
     /// Encode `payload` the way [`DgramFragmenter`] does, for reassembler tests
     /// that need no connection. The limit is generous so only `chunk` splits.
     fn frag_frames(
-        id: u16,
+        id: u32,
         sess: u32,
         addr: &TargetAddrRef<'_>,
         payload: &[u8],
@@ -1604,13 +1604,13 @@ mod tests {
     #[test]
     fn the_fragment_count_reaches_the_udp_maximum_at_the_minimum_mtu() {
         let min_chunk = MIN_PATH_DGRAM_BUDGET - FRAG_PREFIX_LEN - (1 + 16 + 2);
-        assert_eq!(min_chunk, 1134, "1200 B path, IPv6 target");
+        assert_eq!(min_chunk, 1132, "1200 B path, IPv6 target");
         assert_eq!(UDP_PAYLOAD_MAX.div_ceil(min_chunk), 58);
         assert!(UDP_PAYLOAD_MAX.div_ceil(min_chunk) <= MQP_FRAG_MAX_TOTAL as usize);
 
         // A full Ethernet path needs fewer, but the worst case is what bounds it.
         let eth_chunk = 1434 - FRAG_PREFIX_LEN - (1 + 4 + 2);
-        assert_eq!(eth_chunk, 1418);
+        assert_eq!(eth_chunk, 1416);
         assert_eq!(UDP_PAYLOAD_MAX.div_ceil(eth_chunk), 47);
     }
 
@@ -1811,7 +1811,7 @@ mod tests {
         let addr = TargetAddr::Domain("a".repeat(255), 53);
         let chunk = [0u8; 8];
         let total = 64u8;
-        let fed = 200u16;
+        let fed = 200u32;
         let mut r = DgramReassembler::new();
         let mut completed = 0;
         for id in 0..fed {
@@ -1890,55 +1890,49 @@ mod tests {
         // invariant is asserted at the constant itself.
     }
 
-    /// The invariant the id guard actually exists to protect: whenever an id is
-    /// reissued, at least [`FRAG_ID_SAFE_WINDOW_MS`] has passed since it was
-    /// last used. Asserting the *loss profile* instead is not enough — a looser
-    /// reference (the previous cycle's start, or an interpolated per-id estimate)
-    /// drives refusals to zero while quietly letting ids be reused inside the
-    /// window, which is a datagram splice. This test therefore tracks every id's
-    /// true last-use time independently and checks the gap.
+    /// The 32-bit id space is what removed the old 16-bit reuse cliff: the
+    /// guard must not fire at any rate a single sending context sustains, and
+    /// it must still fire when the space genuinely wraps inside the window.
     ///
-    /// Pure, so it runs without a live connection; it calls
-    /// `try_claim_id` — the production gate — once per payload.
+    /// Pure, so it runs without a live connection; it calls `try_claim_id` —
+    /// the production gate — once per payload.
     #[test]
-    fn id_reuse_never_lands_inside_the_reassembly_window() {
-        // `per_ms` payloads issued within one millisecond. The dangerous regime
-        // is a *high* value: the id space then retires in less than
-        // `FRAG_ID_SAFE_WINDOW_MS`, so a gate that references anything older than
-        // the current cycle's start starts reissuing ids inside the window.
-        // Production logic, not a copy — an earlier revision re-implemented the
-        // gate inline and therefore passed with the unsafe variant in place.
-        let mut refused_when_impossible = 0usize;
-        for per_ms in [1usize, 4, 16, 64, 256, 1024] {
-            let mut f = DgramFragmenter::new();
-            let mut last_use = vec![0u64; u16::MAX as usize + 1];
-            let mut now = 1_000_000u64;
-            let mut refused = 0usize;
-            for n in 0..3 * (u16::MAX as u64 + 1) {
-                match f.try_claim_id(now) {
-                    None => refused += 1,
-                    Some(id) => {
-                        let prev = last_use[id as usize];
-                        assert!(
-                            prev == 0 || now.saturating_sub(prev) >= FRAG_ID_SAFE_WINDOW_MS,
-                            "id {id} reissued after {}ms (< {FRAG_ID_SAFE_WINDOW_MS}) at \
-                             {per_ms} payloads/ms — that is a splice",
-                            now.saturating_sub(prev)
-                        );
-                        last_use[id as usize] = now;
-                    }
-                }
-                if (n as usize + 1).is_multiple_of(per_ms) {
-                    now += 1;
-                }
-            }
-            if per_ms >= 64 {
-                refused_when_impossible += refused;
+    fn id_reuse_guard_is_a_backstop_not_a_periodic_pause() {
+        // A realistic high-rate context: 100k fragmented payloads/s (far above
+        // any real association) for a full second. The old 16-bit space retired
+        // in 0.65 s at this rate, so the guard dropped ~90% of oversized
+        // payloads; the 32-bit space does not wrap at all.
+        let mut f = DgramFragmenter::new();
+        let mut now = 1_000_000u64;
+        let start = f.next_id;
+        for n in 0..100_000u64 {
+            assert!(
+                f.try_claim_id(now).is_some(),
+                "the guard must not fire at 100k fragmented payloads/s"
+            );
+            if (n + 1).is_multiple_of(100) {
+                now += 1;
             }
         }
-        assert!(
-            refused_when_impossible > 0,
-            "a cycle shorter than the window must be refused, so the guard is not vacuous"
+        assert_eq!(f.next_id, start.wrapping_add(100_000));
+        assert_eq!(f.last_wrap_ms, 0, "100k ids cannot wrap a 32-bit space");
+
+        // A genuine wrap: seed the counter at the end of the space and drive it
+        // over. The instant the counter wraps, the window starts and claims are
+        // refused until it elapses — the splice-free disposition.
+        let mut f = DgramFragmenter::new();
+        f.next_id = u32::MAX - 1;
+        let now = 1_000_000u64;
+        assert_eq!(f.try_claim_id(now), Some(u32::MAX - 1));
+        assert_eq!(f.try_claim_id(now), Some(u32::MAX)); // this claim wraps
+        // The wrap stamp is set as the counter becomes 0; ids of the new cycle
+        // are refused until the receiver's whole window has passed.
+        assert!(f.try_claim_id(now).is_none());
+        assert!(f.try_claim_id(now + FRAG_ID_SAFE_WINDOW_MS - 1).is_none());
+        assert_eq!(
+            f.try_claim_id(now + FRAG_ID_SAFE_WINDOW_MS),
+            Some(0),
+            "the first id of the new cycle is claimable once the window elapses"
         );
     }
 
@@ -1971,7 +1965,10 @@ mod tests {
         // The id space just wrapped: the ids of the new cycle were all in use a
         // moment ago, so reusing one could splice. `next_id` is mid-cycle so the
         // stamp this arm sets is not immediately overwritten by the next wrap.
-        frag.last_wrap_ms = mono_millis();
+        // `max(1)`: the mono epoch's own first read is 0, and 0 is the "never
+        // wrapped" sentinel — a test that seeded it raw could run before any
+        // other clock read and silently disable the guard it is testing.
+        frag.last_wrap_ms = mono_millis().max(1);
         frag.next_id = 7;
         let refused = frag.send(&conn, 1, &addr.as_ref(), &payload, limit);
         assert_eq!(refused.frames, 0);
@@ -1981,7 +1978,7 @@ mod tests {
             "a refusal that loses an oversized payload must be counted"
         );
 
-        frag.last_wrap_ms = mono_millis().saturating_sub(FRAG_ID_SAFE_WINDOW_MS);
+        frag.last_wrap_ms = mono_millis().max(1).saturating_sub(FRAG_ID_SAFE_WINDOW_MS);
         let sent = frag.send(&conn, 1, &addr.as_ref(), &payload, limit);
         assert!(
             sent.complete() && sent.frames > 1,
@@ -2130,7 +2127,7 @@ mod tests {
         // "fragment", which the reassembler rightly refuses).
         let big_frames = frag_frames(1, 1, &addr.as_ref(), &pattern(7000), 4000);
         assert_eq!(big_frames.len(), 2);
-        for id in 0..200u16 {
+        for id in 0..200u32 {
             let mut f = decode_fragment(&big_frames[0]).unwrap();
             f.id = id;
             assert!(r.push(&f, 0).is_none());
@@ -2171,7 +2168,7 @@ mod tests {
         // A flood of full-width, never-completing partials must therefore be
         // evicted by the *byte* bound, not merely parked under the count cap.
         let mut r = DgramReassembler::new();
-        for id in 0..(FRAG_MAX_PARTIALS as u16 + 50) {
+        for id in 0..(FRAG_MAX_PARTIALS as u32 + 50) {
             let body = encode_fragment(1, id, 0, 64, &addr.as_ref(), &[], 1200).unwrap();
             let f = decode_fragment(&body).unwrap();
             assert!(r.push(&f, 0).is_none());
@@ -3167,7 +3164,7 @@ mod tests {
             server_name = 'test.com'\nserver_cert_file = 'x'\n";
         let c: ClientConf = toml::from_str(base).unwrap();
         assert_eq!(c.alpn_bytes(), b"h3");
-        let c2: ClientConf = toml::from_str(&format!("{base}alpn = 'myquic2/2'\n")).unwrap();
+        let c2: ClientConf = toml::from_str(&format!("{base}alpn = 'myquic2/3'\n")).unwrap();
         assert_eq!(c2.alpn_bytes(), MQP_ALPN);
         assert_eq!(normalize_alpn(Some("")), b"h3");
         assert_eq!(normalize_alpn(None), b"h3");
@@ -3378,12 +3375,12 @@ mod tests {
     #[test]
     fn per_connection_memory_tracks_the_windows() {
         let d = per_connection_memory_bytes(&TransportTuning::default());
-        // 4 MB receive + 2 MB send + 2 x 1 MB DATAGRAM buffers + the
+        // 8 MB receive + 4 MB send + 2 x 1 MB DATAGRAM buffers + the
         // per-connection reassembly budget.
         assert_eq!(
             d,
-            4 * 1024 * 1024
-                + 2 * 1024 * 1024
+            8 * 1024 * 1024
+                + 4 * 1024 * 1024
                 + 2 * DATAGRAM_BUFFER as u64
                 + FRAG_MAX_HELD_BYTES as u64
         );
@@ -3392,7 +3389,7 @@ mod tests {
             send_window: 8 * 1024 * 1024,
             ..TransportTuning::default()
         };
-        assert_eq!(per_connection_memory_bytes(&wide) - d, 18 * 1024 * 1024);
+        assert_eq!(per_connection_memory_bytes(&wide) - d, 12 * 1024 * 1024);
         // The per-stream window is bounded by the connection window and must not
         // be charged twice.
         let narrow_streams = TransportTuning {
@@ -3400,14 +3397,14 @@ mod tests {
             ..TransportTuning::default()
         };
         assert_eq!(per_connection_memory_bytes(&narrow_streams), d);
-        // A full house of the shipped defaults: 4096 x (transport 8 MB +
+        // A full house of the shipped defaults: 4096 x (transport 14 MB +
         // reassembly 256 KiB). The UDP session pool is a *separate*, global term
         // (`session_pool_memory_bytes`), charged once by the admission bound
         // rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            33792,
-            "4096 x 8.25 MB is the 33 GiB worst case for the default windows"
+            58368,
+            "4096 x 14.25 MB is the 57 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested
@@ -3435,9 +3432,9 @@ mod tests {
             server_name = 'test.com'\nserver_cert_file = 'x'\n";
         let c: ClientConf = toml::from_str(base).unwrap();
         let t = c.tuning();
-        assert_eq!(t.stream_receive_window, 2 * 1024 * 1024);
-        assert_eq!(t.receive_window, 4 * 1024 * 1024);
-        assert_eq!(t.send_window, 2 * 1024 * 1024);
+        assert_eq!(t.stream_receive_window, 4 * 1024 * 1024);
+        assert_eq!(t.receive_window, 8 * 1024 * 1024);
+        assert_eq!(t.send_window, 4 * 1024 * 1024);
         assert_eq!(t.ack_threshold, 2);
         assert_eq!(t.max_ack_delay, Duration::from_millis(5));
         assert_eq!(t.initial_rtt, Duration::from_millis(DEFAULT_INITIAL_RTT_MS));
@@ -3585,12 +3582,13 @@ mod tests {
         );
         assert!(t.send_window >= TARGET_BDP_BYTES);
         assert!(t.receive_window >= 2 * TARGET_BDP_BYTES);
-        // And the shipped default must stay the *low-latency* preset the README
-        // and the sample configs document, not silently drift into the opt-in.
+        // And the shipped default must be the high-throughput 4/8/4 preset the
+        // README and the sample configs document; 2/4/2 is the low-memory
+        // alternative, and 8/16/8 stays the explicit opt-in tested above.
         let default_conf: ClientConf = toml::from_str(base).unwrap();
         let d = default_conf.tuning();
-        assert_eq!(d.stream_receive_window, 2 * 1024 * 1024);
-        assert_eq!(d.receive_window, 4 * 1024 * 1024);
-        assert_eq!(d.send_window, 2 * 1024 * 1024);
+        assert_eq!(d.stream_receive_window, 4 * 1024 * 1024);
+        assert_eq!(d.receive_window, 8 * 1024 * 1024);
+        assert_eq!(d.send_window, 4 * 1024 * 1024);
     }
 }

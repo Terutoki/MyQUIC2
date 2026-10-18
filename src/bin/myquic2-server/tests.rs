@@ -1537,8 +1537,8 @@ fn admission_cap_bounds_connections_by_memory() {
     let per_conn = per_connection_memory_bytes(&TransportTuning::default());
     assert_eq!(
         per_conn,
-        8 * 1024 * 1024 + FRAG_MAX_HELD_BYTES as u64,
-        "2/4/2 MB windows + 2 x 1 MB packets + the per-connection reassembly budget"
+        14 * 1024 * 1024 + FRAG_MAX_HELD_BYTES as u64,
+        "4/8/4 MB windows + 2 x 1 MB packets + the per-connection reassembly budget"
     );
     let per_session = per_session_memory_bytes();
     // Linux stores and reports SO_RCVBUF/SO_SNDBUF at 2x the requested value,

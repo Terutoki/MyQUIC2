@@ -525,9 +525,11 @@ pub(crate) async fn handle_conn(
                     // `FRAG_TIMEOUT_MS` (2 s) or the 500 ms sweep throttle, so a
                     // 1 s-quantized sample of the same epoch is sufficient — and
                     // `mono_millis()` was a vDSO `clock_gettime` per *fragment*
-                    // on the receive path. (`DgramFragmenter`'s 16-bit id-reuse
+                    // on the receive path. (`DgramFragmenter`'s 32-bit id-reuse
                     // guard keeps its precise clock: that one is a splice-safety
-                    // bound, and it runs per fragmented payload, not per packet.)
+                    // bound, and it runs per fragmented payload, not per packet.
+                    // It is a backstop now — a 32-bit space cannot wrap inside
+                    // the window at any sustained rate.)
                     reasm.expire(coarse_millis());
                     continue;
                 }

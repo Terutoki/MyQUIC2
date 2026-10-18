@@ -48,12 +48,14 @@ pub struct ClientConf {
     #[serde(default)]
     pub initial_rtt_ms: Option<u64>,
     /// Path MTU every new connection starts from, in bytes (clamped
-    /// 1200..=1472; default 1400). quinn starts at the 1200-byte QUIC floor
+    /// 1200..=1472; default 1360). quinn starts at the 1200-byte QUIC floor
     /// and PMTU discovery is opportunistic, so a busy connection can spend a
     /// long time there: 18-23% more packets and every UDP payload above
-    /// 1150 B split into two MQP-2 fragments. 1400 is safe on Ethernet,
-    /// PPPoE and typical tunnels; IPv4-only deployments can raise it to 1472
-    /// (zero discovery ramp, and 1420-byte UDP payloads stay a single frame).
+    /// 1150 B split into two MQP-2 fragments. 1360 keeps the wire size at
+    /// 1388 B (IPv4) / 1408 B (IPv6) after the IP+UDP headers, so it is safe
+    /// on WireGuard-1420 and similar tunnel paths; operators on a known
+    /// 1500-byte Ethernet path can raise it to 1400 or 1472 (zero discovery
+    /// ramp, and 1420-byte UDP payloads stay a single frame at 1472).
     /// Mind the path when raising it: a too-high value costs a loss burst
     /// until quinn's black-hole detector resets to the 1200-byte floor.
     #[serde(default)]
@@ -117,7 +119,7 @@ pub struct ClientConf {
     /// `udp_split = false` ignores this value.
     #[serde(default)]
     pub udp_egress_conns: Option<usize>,
-    /// ALPN override (e.g. `myquic2/2` to restore the versioned identifier).
+    /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
     pub alpn: Option<String>,

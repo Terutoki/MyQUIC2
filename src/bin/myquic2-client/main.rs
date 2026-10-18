@@ -8,7 +8,7 @@ use quinn::Runtime;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 use tokio::{
@@ -105,6 +105,30 @@ async fn main() -> Result<()> {
     let server_str = c.server_addr.clone();
     let server_str_log = server_str.clone();
 
+    // Clamped once, because everything timing-related derives from it: the
+    // transport's keepalive/idle timeout (inside `build_transport_tuned_class`),
+    // the reconnect loop's silence watchdog, and the pool's selection-time
+    // path-health threshold. Clamping here keeps the three from disagreeing
+    // about what "keepalive" means.
+    let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
+    // The silence watchdog window is derived from the same clamped keepalive
+    // the transport's idle timeout uses: `watchdog_silence_secs` is 2x
+    // keepalive with an 8 s floor and is unit-proven strictly below QUIC's 3x /
+    // 15 s idle timeout. The previous `4x keepalive, 20 s floor` was *always*
+    // above the idle timeout, so the watchdog in `spawn_conn_loop` could never
+    // fire first — dead code, with path death detected only when QUIC's idle
+    // timer expired (~15 s). Now detection is ~10 s with the shipped 5 s
+    // keepalive.
+    let watchdog_silence = Duration::from_secs(myquic2::watchdog_silence_secs(keep_alive_secs));
+    // Selection-time path health: how long a live slot's inbound progress may
+    // be frozen before `pick_tcp_index` re-picks a new flow away from it. It is
+    // strictly above a healthy idle connection's worst-case stamp age
+    // (keepalive + one watchdog poll tick) and strictly below the silence
+    // watchdog, so a blackholed slot stops receiving *new* flows a few seconds
+    // before the watchdog force-closes it (7 s vs 10 s with the shipped 5 s
+    // keepalive; see `data_stale_threshold_ms`).
+    let data_stale_ms = data_stale_threshold_ms(keep_alive_secs);
+
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();
     let udp_split = c.udp_split();
@@ -116,6 +140,7 @@ async fn main() -> Result<()> {
         udp_fail_closed,
         udp_split,
         udp_egress,
+        data_stale_ms,
     );
     // One QUIC endpoint per pool slot — one UDP socket, CID table and driver
     // task each — so no slot's receive syscalls, CID lookups and task wakeups
@@ -161,16 +186,6 @@ async fn main() -> Result<()> {
     // payload's fragments all travel on the connection that carried them.
     // Each connection carries its own class: the interactive ports and the UDP
     // associations have connections no bulk flow can queue on.
-    let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
-    // The silence watchdog window is derived from the same clamped keepalive
-    // the transport's idle timeout uses: `watchdog_silence_secs` is 2x
-    // keepalive with an 8 s floor and is unit-proven strictly below QUIC's 3x /
-    // 15 s idle timeout. The previous `4x keepalive, 20 s floor` was *always*
-    // above the idle timeout, so the watchdog in `spawn_conn_loop` could never
-    // fire first — dead code, with path death detected only when QUIC's idle
-    // timer expired (~15 s). Now detection is ~10 s with the shipped 5 s
-    // keepalive.
-    let watchdog_silence = Duration::from_secs(myquic2::watchdog_silence_secs(keep_alive_secs));
     // Orderly-shutdown flag for the sharded topology: each slot shard parks on
     // it and then drains its own endpoint (see `spawn_slot_shard`); the
     // shared-runtime topology ignores it and is closed from here.
@@ -290,8 +305,14 @@ async fn main() -> Result<()> {
                 Ok(x) => x,
                 Err(e) => {
                     // Transient accept errors (EMFILE/ECONNABORTED) must not kill
-                    // the proxy for every other client.
-                    warn!("accept failed: {e:#}; continuing");
+                    // the proxy for every other client. Rate-limited: this loop
+                    // fires up to 20x/s while fds are exhausted, and formatting
+                    // one line per failure would pay tracing's process-wide
+                    // writer lock plus a blocking stdout write on the same
+                    // runtime as the TCP pumps.
+                    if let Some(sup) = claim_accept_failed_log() {
+                        warn!("accept failed: {e:#}; continuing{sup}");
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -330,7 +351,13 @@ async fn main() -> Result<()> {
         let permit = match socks_conn_limiter().clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                warn!("socks connection limit {MAX_SOCKS_CONNS} reached; dropping {peer}");
+                // Admission cap: peer-driven, one drop per accepted connection
+                // while the cap is held. Rate-limited like the server's
+                // "refusing new connection" line so a local flood cannot make
+                // the logging the bottleneck it is reporting on.
+                if let Some(sup) = claim_socks_limit_log() {
+                    warn!("socks connection limit {MAX_SOCKS_CONNS} reached; dropping {peer}{sup}");
+                }
                 continue; // socket closes on drop
             }
         };
@@ -340,11 +367,79 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_socks(sock, pool, hub, egress_shared, timeout).await {
-                warn!("socks {peer} end: {e:#}");
+                // Rate-limited: `handle_socks` returns an error once per failed
+                // TCP flow, and during a pool outage that is once per accepted
+                // connection. The line (and the `{e:#}` chain formatting behind
+                // it) is built only by the window's winner.
+                warn_socks_end(peer, &e);
             }
         });
     }
     Ok(())
+}
+
+/// Never-claimed sentinel for the per-window log slots below.
+///
+/// The lib's `NEVER_WARNED` is crate-private and a bin cannot name it; a
+/// `0`-initialised slot instead swallows the process's first window, because
+/// the mono epoch starts at process start and `now - 0 < LOG_WINDOW_MS` holds
+/// for the first second — which is exactly the startup/reconnect burst these
+/// peer-driven lines exist for. The helper's contract (`u64::MAX` means never
+/// claimed) is locked from here by `never_logged_sentinel_claims_immediately`
+/// in the client tests, the same way the server bin locks its copy.
+const NEVER_LOGGED: u64 = u64::MAX;
+
+/// Display form for a rate-limited line's suppressed count, mirroring the
+/// server's `reporter::Suppressed`: empty in the common window with no losers,
+/// so a caller can append it unconditionally and the normal case reads exactly
+/// as before.
+struct Suppressed(u64);
+
+impl std::fmt::Display for Suppressed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == 0 {
+            return Ok(());
+        }
+        write!(f, " ({} similar suppressed in the last second)", self.0)
+    }
+}
+
+/// Claim the one-per-window slot for the `accept`-error line.
+///
+/// Split from the message so the error chain is formatted only when the line
+/// will actually be emitted: an fd-exhaustion loop otherwise pays a blocking
+/// stdout write (under tracing's process-wide writer lock) up to 20x/s on the
+/// runtime serving the TCP pumps. `None` means this call was counted and must
+/// stay silent.
+fn claim_accept_failed_log() -> Option<Suppressed> {
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_LOGGED);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()).map(Suppressed)
+}
+
+/// Claim the one-per-window slot for the SOCKS admission-cap drop line. A
+/// separate slot from [`claim_accept_failed_log`]: the two are different
+/// faults, and a flood of one must not silence the other.
+fn claim_socks_limit_log() -> Option<Suppressed> {
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_LOGGED);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()).map(Suppressed)
+}
+
+/// Rate-limited per-connection SOCKS failure line: one line per window, with
+/// the number of failures the previous window swallowed folded into it.
+///
+/// `handle_socks` returns an error once per failed flow, so during a pool
+/// outage this is one formatted line per accepted connection — and the
+/// formatting plus the blocking stdout write run on the same runtime as the TCP
+/// pumps, the exact cost this line is trying to report. The only work a
+/// suppressed call does is two relaxed atomic ops.
+fn warn_socks_end(peer: SocketAddr, err: &anyhow::Error) {
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_LOGGED);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    if let Some(n) = claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()) {
+        warn!("socks {peer} end: {err:#}{}", Suppressed(n));
+    }
 }
 
 /// How long a slot shard keeps its endpoint's driver alive after closing it,

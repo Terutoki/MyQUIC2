@@ -14,7 +14,19 @@ use bytes::Bytes;
 pub const MQP_DGRAM_FRAG: u8 = 0x05;
 
 /// Fixed part of a fragment header: `type | sess | id | idx | total`.
-pub const FRAG_PREFIX_LEN: usize = 1 + 4 + 2 + 1 + 1;
+///
+/// The fragment id is a **u32**, not the u16 the frame size would suggest. A
+/// u16 id space retires every 65536 fragmented payloads, and the sender's only
+/// wire-compatible way to keep a retired id from landing in the receiver's
+/// still-live partial is to pause all fragmentation for the reassembly window
+/// (see [`FRAG_ID_SAFE_WINDOW_MS`]) — which cost 4% of oversized payloads at
+/// 1000/s, 15% at 4000/s and 50% at 21845/s, i.e. a real loss cliff on
+/// fragmented bulk traffic (WireGuard-scale 1420 B payloads on a 1400 B path
+/// fragment into two MQP-2 frames each). Two extra wire bytes per fragment buy
+/// a 2^32-id cycle, which no single sending context can retire inside the 3 s
+/// window, so that pause is now a theoretical backstop instead of a periodic
+/// cliff.
+pub const FRAG_PREFIX_LEN: usize = 1 + 4 + 4 + 1 + 1;
 
 /// Largest UDP payload the protocol will carry or reassemble.
 ///
@@ -103,7 +115,7 @@ pub const FRAG_TIMEOUT_MS: u64 = 2_000;
 /// a partial's life to `FRAG_TIMEOUT_MS + FRAG_SWEEP_INTERVAL_MS`.
 pub const FRAG_SWEEP_INTERVAL_MS: u64 = 500;
 
-/// How long a sending context must wait after exhausting the 16-bit fragment id
+/// How long a sending context must wait after exhausting the 32-bit fragment id
 /// space before it may reuse an id.
 ///
 /// Must cover the receiver's *whole* partial lifetime (a partial expires at
@@ -114,20 +126,22 @@ pub const FRAG_SWEEP_INTERVAL_MS: u64 = 500;
 /// generation marker, and which delivers the mix to the older target. See
 /// [`DgramFragmenter::send`].
 ///
-/// **This is a per-cycle pause, not a rate limit.** Every wrap refuses *every*
+/// **The wider id is what makes this window harmless.** A wrap refuses *every*
 /// oversized payload for this long, because the guard's reference must be an
 /// upper bound on when each id in the new cycle was last used, and only the
-/// cycle's own start is such a bound without a per-id timestamp ring. The
-/// resulting loss is `W / (65536 * 1000 / payloads_per_s + W)`: ~0.5% at 100
-/// fragmented payloads/s, ~4% at 1000/s, ~8% at 2000/s, ~15% at 4000/s, and
-/// 50% at `65536 / W` = 21845/s — the number often mistaken for a clean
-/// ceiling, but where half the oversized payloads are dropped. No rate avoids
-/// it entirely; it only becomes negligible at very high rates.
+/// cycle's own start is such a bound without a per-id timestamp ring. With the
+/// shipped 32-bit id the resulting loss is
+/// `W / (2^32 * 1000 / payloads_per_s + W)` — under 0.01% below ~1.4M
+/// fragmented payloads/s and under 1% at ~14M/s, rates no single sending
+/// context (one association or one session reader) can reach. It is kept as the
+/// correctness backstop for a sender that somehow does exhaust the space inside
+/// the window: pausing is still the only splice-free move.
 ///
-/// So `65536 / FRAG_ID_SAFE_WINDOW_MS` is **not** a throughput ceiling: it is
-/// the rate at which this guard costs half of all oversized payloads. Closing
-/// that gap needs a generation counter on the wire (or 65536 timestamps per
-/// sending context), not a different constant.
+/// History: the id was 16-bit in earlier revisions. That made the pause
+/// periodic — `65536 / W` = 21845/s was the rate at which it dropped half of
+/// all oversized payloads (4% at 1k/s, 15% at 4k/s) — a real loss cliff on
+/// fragmented bulk traffic. Widening the wire id to u32 removed the cliff
+/// without a separate generation byte, at the cost of two bytes per fragment.
 pub const FRAG_ID_SAFE_WINDOW_MS: u64 = FRAG_TIMEOUT_MS + FRAG_SWEEP_INTERVAL_MS + 500;
 
 const _: () = assert!(
@@ -169,7 +183,7 @@ pub const FRAG_MAX_PARTIALS: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentRef<'a> {
     pub sess: u32,
-    pub id: u16,
+    pub id: u32,
     pub idx: u8,
     pub total: u8,
     pub address: TargetAddrRef<'a>,
@@ -203,7 +217,7 @@ pub fn fragment_chunk_len(limit: usize, address: &TargetAddrRef<'_>) -> usize {
 /// Encode one fragment. Returns `None` if the chunk does not fit `limit`.
 pub fn encode_fragment(
     sess: u32,
-    id: u16,
+    id: u32,
     idx: u8,
     total: u8,
     address: &TargetAddrRef<'_>,
@@ -218,7 +232,7 @@ pub fn encode_fragment(
 /// `encode_datagram_with_header` for why it exists.
 pub(crate) fn encode_fragment_with_header(
     sess: u32,
-    id: u16,
+    id: u32,
     idx: u8,
     total: u8,
     header: &AddrHeader<'_>,
@@ -250,8 +264,8 @@ pub fn decode_fragment(b: &[u8]) -> Result<FragmentRef<'_>, MqpError> {
         return Err(MqpError::Malformed("bad fragment"));
     }
     let sess = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
-    let id = u16::from_le_bytes([b[5], b[6]]);
-    let (idx, total) = (b[7], b[8]);
+    let id = u32::from_le_bytes([b[5], b[6], b[7], b[8]]);
+    let (idx, total) = (b[9], b[10]);
     let (address, n) = TargetAddrRef::decode(&b[FRAG_PREFIX_LEN..])?;
     Ok(FragmentRef {
         sess,

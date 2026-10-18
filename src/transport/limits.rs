@@ -18,23 +18,24 @@ pub const TARGET_BDP_BYTES: u64 = TARGET_LINK_BYTES_PER_SEC * 140 / 1000;
 // `window / RTT`, applied before BBR's cwnd is consulted.
 //
 // **These are the opt-in 300Mb/s preset, not the shipped default.** The shipped
-// default is `TransportTuning::default()`'s low-latency 2/4/2 MB preset
-// (~114Mb/s at 140ms), documented in `config-*.toml` and the README limits
-// table; operators raise it with `stream_receive_window_mb = 8`,
-// `receive_window_mb = 16`, `send_window_mb = 8` (plus `ack_threshold = 8`,
-// `max_ack_delay_ms = 10`) on **both** sides. The constants exist so that opt-in
-// configuration has one definition and a guard test that actually exercises the
-// config path (`tcp_windows_cover_the_300mb_s_bdp`); an earlier revision of this
-// comment claimed they "supersede" the defaults, which no code read.
+// default is `TransportTuning::default()`'s 4/8/4 MB preset (~240Mb/s at 140ms),
+// documented in `config-*.toml` and the README limits table; the 2/4/2 MB
+// low-memory preset (~114Mb/s) is the RAM-tight alternative. Operators raise it
+// with `stream_receive_window_mb = 8`, `receive_window_mb = 16`,
+// `send_window_mb = 8` (plus `ack_threshold = 8`, `max_ack_delay_ms = 10`) on
+// **both** sides. The constants exist so that opt-in configuration has one
+// definition and a guard test that actually exercises the config path
+// (`tcp_windows_cover_the_300mb_s_bdp`); an earlier revision of this comment
+// claimed they "supersede" the defaults, which no code read.
 //
 // KNOWN COST of the wide preset: quinn kills a connection once a single stream's
 // reassembly holds `MAX_CHUNKS = 1024` distinct spans. A larger window allows
 // more packets in flight per RTT (~6200 at 1350B, ~3700 at the 1472B PMTU
-// ceiling), so a burst-loss or reordering episode has more room than 2MB did to
-// approach that cliff. A clean path is unaffected; on a lossy one, step this
-// preset's `SEND_WINDOW` and `STREAM_RECEIVE_WINDOW` back to 4MB (=240Mb/s)
-// rather than reverting the ACK-frequency and PMTU work, which is
-// loss-independent.
+// ceiling), so a burst-loss or reordering episode has more room than the 4MB
+// default did to approach that cliff. A clean path is unaffected; on a lossy
+// one, step this preset's `SEND_WINDOW` and `STREAM_RECEIVE_WINDOW` back to 4MB
+// (=240Mb/s, the shipped default) rather than reverting the ACK-frequency and
+// PMTU work, which is loss-independent.
 
 /// Per-stream receive window. 8MB rather than the 5.25MB BDP: quinn only
 /// announces a `MAX_STREAM_DATA` once the advertised window is short by

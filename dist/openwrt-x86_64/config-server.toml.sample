@@ -7,7 +7,7 @@ listen = "[::]:8443"
 # single member, so extra endpoints there only cost sockets — the server warns
 # when you ask for them anyway). Set 1 for the strict single socket.
 # Trade-off: a member is pinned by the client's 4-tuple, so a client NAT rebind
-# loses the connection (it redials) instead of migrating. Clamped to 1..=8.
+# loses the connection (it redials) instead of migrating. Clamped to 1..=16.
 # quic_endpoints = 4
 cert_file = "server-cert.pem"
 key_file = "server-key.pem"
@@ -25,7 +25,7 @@ auth_token = ""
 # without one: a tokenless endpoint admits every peer, so its connection budget
 # *is* the pre-auth budget. max_peer_memory_mb caps the peer-pinnable memory the
 # admitted connections may represent (connections x (receive window + send budget
-# + 2 x 1 MB DATAGRAM buffers) = 8 MiB with the 2/4/2 MB windows below), so
+# + 2 x 1 MB DATAGRAM buffers) = 14.25 MiB with the 4/8/4 MB windows below), so
 # raising the windows admits fewer connections instead of multiplying the
 # ceiling. Both are logged at startup, with the worst-case footprint.
 # max_connections = 4096
@@ -37,9 +37,9 @@ receive_window_mb = 4
 send_window_mb = 2
 ack_threshold = 2
 max_ack_delay_ms = 5
-# Transport tuning (all optional; omit = 2/4/2 MB windows, ACK 2/5ms).
+# Transport tuning (all optional; omit = 4/8/4 MB windows, ACK 2/5ms).
 # Must mirror the client's intent: download is capped by the receiver's
 # window, upload by the sender's, so change both sides together.
 # ALPN (optional; omit = h3 masquerade). Must match the client;
-# alpn="myquic2/2" restores the versioned identifier + skew fail-closed guard.
+# alpn="myquic2/3" restores the versioned identifier + skew fail-closed guard.
 # alpn = "h3"

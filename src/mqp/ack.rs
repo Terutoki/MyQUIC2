@@ -1,18 +1,19 @@
 use super::error::MqpError;
 use std::net::{IpAddr, SocketAddr};
 
-/// Versioned ALPN identifier. Bumped to `/2` together with the MQP-2 TCP-open
-/// ACK (status byte + bound address); a version-skewed peer now fails the TLS
-/// handshake with a clear error instead of misparsing the ACK as app data.
-/// The default config ALPN is now `h3` (see `normalize_alpn`); set
-/// `alpn = "myquic2/2"` explicitly to restore this identifier and its
+/// Versioned ALPN identifier. Bumped to `/3` together with the 32-bit fragment
+/// id (the MQP-2 fragment header is now 11 bytes, not 9); a version-skewed peer
+/// fails the TLS handshake with a clear error instead of decoding a fragment
+/// frame at the wrong offsets. (`/2` was the MQP-2 TCP-open ACK bump.)
+/// The default config ALPN is `h3` (see `normalize_alpn`); set
+/// `alpn = "myquic2/3"` explicitly to restore this identifier and its
 /// fail-closed skew guard.
-pub const MQP_ALPN: &[u8] = b"myquic2/2";
+pub const MQP_ALPN: &[u8] = b"myquic2/3";
 
 /// Resolve the configured ALPN: empty/unset keeps the default `h3`
 /// masquerade. `h3` hides only the ALPN label — the self-signed cert and the
 /// MQP framing stay fingerprintable, so this is obfuscation, not a full
-/// HTTP/3 disguise. Explicit `myquic2/2` restores the versioned identifier
+/// HTTP/3 disguise. Explicit `myquic2/3` restores the versioned identifier
 /// (and its fail-closed skew guard against real HTTP/3 peers); either way
 /// both sides must run the same value.
 pub fn normalize_alpn(configured: Option<&str>) -> Vec<u8> {

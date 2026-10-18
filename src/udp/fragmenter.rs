@@ -30,7 +30,7 @@ use crate::{dgram_drops, udp_stats};
 /// receiver reassembles on.
 #[derive(Debug, Default)]
 pub struct DgramFragmenter {
-    pub(crate) next_id: u16,
+    pub(crate) next_id: u32,
     /// [`mono_millis`] when `next_id` last wrapped (0 = it never has). See
     /// [`FRAG_ID_SAFE_WINDOW_MS`].
     pub(crate) last_wrap_ms: u64,
@@ -47,14 +47,16 @@ pub struct DgramFragmenter {
 /// `last_wrap_ms` must be an **upper bound on the previous use of every id in
 /// the cycle now starting**; the ids of a cycle are all issued before the
 /// current cycle's first id, so the cycle's own start is the only such bound
-/// available without a per-id timestamp ring (65536 entries per sending
-/// context). That is why this is deliberately the *conservative* choice: a
-/// looser reference (e.g. the previous cycle's start, or an interpolated
-/// per-id estimate) over-estimates how long ago each id was last used and
-/// therefore lets an id be reused inside the window — a datagram splice. The
-/// cost is the 3 s pause after each wrap documented on
-/// [`FRAG_ID_SAFE_WINDOW_MS`], which is inherent to a 16-bit id with no wire
-/// generation marker, not an artefact of this reference.
+/// available without a per-id timestamp ring. That is why this is deliberately
+/// the *conservative* choice: a looser reference (e.g. the previous cycle's
+/// start, or an interpolated per-id estimate) over-estimates how long ago each
+/// id was last used and therefore lets an id be reused inside the window — a
+/// datagram splice.
+///
+/// The cycle is 2^32 ids wide (see [`FRAG_PREFIX_LEN`]), so the 3 s pause after
+/// each wrap documented on [`FRAG_ID_SAFE_WINDOW_MS`] is unreachable at any
+/// rate a single sending context sustains; it remains as the correctness
+/// backstop rather than a periodic cost.
 ///
 /// Split out of [`DgramFragmenter::send`] so the window logic is testable
 /// without a live connection; `now_ms` is the [`mono_millis`] epoch.
@@ -67,7 +69,7 @@ impl DgramFragmenter {
         Self::default()
     }
 
-    /// Claim the next fragment id, or `None` when the 16-bit id space cannot be
+    /// Claim the next fragment id, or `None` when the 32-bit id space cannot be
     /// cycled yet without risking a splice (see [`FRAG_ID_SAFE_WINDOW_MS`]).
     ///
     /// The gate, the advance and the wrap stamp live here rather than inline in
@@ -78,7 +80,7 @@ impl DgramFragmenter {
     /// start instead of this one does exactly that, driving refusals to zero and
     /// splicing datagrams. `id_reuse_never_lands_inside_the_reassembly_window`
     /// exists to catch that shape.
-    pub(crate) fn try_claim_id(&mut self, now_ms: u64) -> Option<u16> {
+    pub(crate) fn try_claim_id(&mut self, now_ms: u64) -> Option<u32> {
         if frag_id_reuse_blocked(self.last_wrap_ms, now_ms) {
             return None;
         }
@@ -104,14 +106,38 @@ impl DgramFragmenter {
         // N=1 fast path: serve the steady destination from the pre-encoded
         // prefix (no `header()` validation, no re-encode). A refused address
         // reports exactly like the old `header().is_err()` branch below.
-        // The small prefix is copied to the stack (12 B steady-state IPv4) so
-        // the cache borrow ends before the send.
-        let mut prefix_buf = [0u8; DgramPrefixCache::PREFIX_MAX];
-        let prefix_len = match self.prefix_cache.prefix_for(sess, address) {
+        //
+        // The cache slice is used **directly**: it only needs to live through
+        // `send_udp_datagram_with_prefix`, and the fast path returns before
+        // anything needs `&mut self`. The earlier shape copied it into a
+        // 264-byte stack array on every datagram, which LLVM lowers to a
+        // full-width memset even though at most 19 bytes are ever read (a
+        // per-packet store no length check can elide).
+        let cap = match self.prefix_cache.prefix_for(sess, address) {
             Some(p) => {
-                let n = p.len();
-                prefix_buf[..n].copy_from_slice(p);
-                n
+                let cap = limit.saturating_sub(p.len());
+                if payload.len() <= cap {
+                    let failed = match send_udp_datagram_with_prefix(conn, p, payload, limit) {
+                        DatagramSend::Sent => {
+                            // Counted only on an accepted send: counting before
+                            // the size refusals inflated
+                            // `datagrams`/`bytes`/`max_payload` with payloads
+                            // that were never queued, and `max_payload` is
+                            // documented as the empirical check on the 8 KiB
+                            // cap, so a refused oversized datagram could move
+                            // the very number that is supposed to describe
+                            // delivered traffic.
+                            udp_stats::payload(payload.len());
+                            None
+                        }
+                        other => Some(other),
+                    };
+                    return PayloadSend {
+                        frames: u8::from(failed.is_none()),
+                        failed,
+                    };
+                }
+                cap
             }
             None => {
                 let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
@@ -127,31 +153,6 @@ impl DgramFragmenter {
                 };
             }
         };
-        let cap = limit.saturating_sub(prefix_len);
-        if payload.len() <= cap {
-            let failed = match send_udp_datagram_with_prefix(
-                conn,
-                &prefix_buf[..prefix_len],
-                payload,
-                limit,
-            ) {
-                DatagramSend::Sent => {
-                    // Counted only on an accepted send: counting before the
-                    // size refusals inflated `datagrams`/`bytes`/`max_payload`
-                    // with payloads that were never queued, and `max_payload` is
-                    // documented as the empirical check on the 8 KiB cap, so a
-                    // refused oversized datagram could move the very number that
-                    // is supposed to describe delivered traffic.
-                    udp_stats::payload(payload.len());
-                    None
-                }
-                other => Some(other),
-            };
-            return PayloadSend {
-                frames: u8::from(failed.is_none()),
-                failed,
-            };
-        }
 
         // Fragment path below: `payload.len() > cap` was proven above, and the
         // cached prefix length agrees with a fresh validation by construction,
@@ -199,14 +200,16 @@ impl DgramFragmenter {
                 failed: Some(DatagramSend::TooLarge),
             };
         }
-        // The 16-bit id must not be reused while the receiver can still hold a
+        // The 32-bit id must not be reused while the receiver can still hold a
         // partial for it: an id that comes around again feeds a second payload's
         // fragments into the first payload's partial, and a fragment landing on
         // an *empty* slot completes a spliced datagram that is delivered to the
         // older generation's target (see the note on the restart heuristic in
         // `DgramReassembler::push_with_chunk`). Refusing to fragment while the
         // whole id space has been consumed faster than the receiver forgets is
-        // the only wire-compatible way to rule that out.
+        // the only wire-compatible way to rule that out. The space is 2^32 ids
+        // wide, so with the shipped reassembly window this gate cannot trip
+        // below ~1.4M fragmented payloads/s per sending context.
         let Some(id) = self.try_claim_id(mono_millis()) else {
             let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
             warn_datagram_drop(
@@ -215,12 +218,12 @@ impl DgramFragmenter {
                 n,
                 || {
                     format!(
-                        "; all 65536 fragment ids were retired within {FRAG_ID_SAFE_WINDOW_MS} ms, \
-                         so the receiver may still hold a partial for the id this payload needs — \
-                         dropped rather than spliced. Expected cost is \
-                         {FRAG_ID_SAFE_WINDOW_MS} / (cycle + {FRAG_ID_SAFE_WINDOW_MS}) of \
-                         oversized payloads: ~4% at 1000/s, ~8% at 2000/s, 50% at 21845/s. This is \
-                         inherent to a 16-bit id with no wire generation marker, not a tuning knob"
+                        "; all 4294967296 fragment ids were retired within \
+                         {FRAG_ID_SAFE_WINDOW_MS} ms, so the receiver may still hold a partial \
+                         for the id this payload needs — dropped rather than spliced. This is \
+                         the 32-bit id space's correctness backstop; it needs >1.4M fragmented \
+                         payloads/s from this one sending context to trip, so a deployment that \
+                         reaches it is far outside the protocol's operating envelope"
                     )
                 },
             );
