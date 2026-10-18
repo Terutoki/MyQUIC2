@@ -40,31 +40,46 @@ SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-2 protocol · built
 ### System overview
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
 flowchart LR
-    subgraph ClientEdge["🧑‍💻 Client Edge"]
+    subgraph EDGE["💻  Client edge"]
         direction TB
-        APP["🖥️ Apps<br/>curl · browser · games"]
-        CLI["🚀 myquic2-client<br/>:1080 SOCKS5 ingress"]
+        APPS["🧑‍💻 Apps<br/>curl · browser · games"]
+        SOCKS["🧦 SOCKS5 ingress<br/>CONNECT · UDP ASSOCIATE<br/>:1080"]
+        POOL["🎰 ConnPool<br/>4 × TCP + 3 × UDP slots<br/>one Endpoint per slot"]
+        APPS -->|"TCP / UDP"| SOCKS
+        SOCKS -->|"5 s budgets"| POOL
     end
-    subgraph Tunnel["⚡ QUIC Tunnel · TLS 1.3 · MQP-2"]
-        Q["🔒 BBR + ECN + GSO/GRO<br/>streams + DATAGRAMs"]
-    end
-    subgraph ExitSide["🛰️ Exit Side"]
+    subgraph TUNNEL["⚡  QUIC tunnel"]
         direction TB
-        SRV["🛰️ myquic2-server<br/>:8443 QUIC ingress"]
-        NET["🌐 Targets<br/>TCP / UDP"]
+        TLS["🔐 TLS 1.3<br/>pinned Ed25519"]
+        MQP["📡 MQP-2<br/>streams · DATAGRAMs · FRAG"]
+        CC["🚄 BBR + ECN<br/>GSO / GRO"]
+        TLS --- MQP --- CC
     end
-    APP -->|"SOCKS5<br/>CONNECT / ASSOCIATE"| CLI
-    CLI -->|"4×TCP + 3×UDP conns<br/>one Endpoint per slot"| Q
-    Q -->|"token auth → dial-out"| SRV
-    SRV -->|"happy-eyeballs · session socket"| NET
-
-    classDef edge fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#065f46
-    classDef tunnel fill:#eff6ff,stroke:#38bdf8,stroke-width:2px,color:#0c4a6e
-    classDef exit fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    class APP,CLI edge
-    class Q tunnel
-    class SRV,NET exit
+    subgraph EXIT["🛰️  Exit side"]
+        direction TB
+        ING["🚪 QUIC ingress<br/>:8443 · SO_REUSEPORT<br/>1 endpoint / core · ≤ 16"]
+        AUTH["🔑 token gate<br/>5 s / 5 s / 10 s"]
+        ROUTE["🧭 dispatch<br/>TCP dial-out · UDP sessions"]
+        TARGETS["🎯 Targets<br/>TCP / UDP"]
+        ING --> AUTH
+        AUTH --> ROUTE
+        ROUTE --> TARGETS
+    end
+    EDGE ==>|"① 4 TCP + 3 UDP<br/>QUIC connections"| TUNNEL
+    TUNNEL ==>|"② encrypted<br/>MQP-2 frames"| EXIT
+    style EDGE fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
+    style TUNNEL fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#1e1b4b
+    style EXIT fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef tun fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class APPS app
+    class SOCKS,POOL edge
+    class TLS,MQP,CC tun
+    class ING,AUTH,ROUTE,TARGETS exit
 ```
 
 Three crates in one package (`Cargo.toml`: lib `myquic2` + two binaries):
@@ -83,35 +98,46 @@ Three crates in one package (`Cargo.toml`: lib `myquic2` + two binaries):
 ### End-to-end module map
 
 ```mermaid
-flowchart TB
-    subgraph Client["🚀 myquic2-client · pool-first"]
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+flowchart LR
+    subgraph CLI["🚀  myquic2-client · pool-first"]
         direction TB
         SOCKS["🧦 socks.rs<br/>CONNECT / ASSOCIATE"]
-        POOL["🎰 pool.rs<br/>ConnPool + per-slot Endpoint"]
-        EGRESS["🧭 egress.rs<br/>SharedEgress + memo"]
-        HUB["🗂️ hub.rs<br/>UdpHub · 4032 sess"]
-        DISP["📥 dispatcher.rs<br/>per-slot DATAGRAM reader"]
+        POOL["🎰 pool.rs<br/>ConnPool · per-slot Endpoint<br/>selection-time path health"]
+        EGRESS["🧭 egress.rs<br/>SharedEgress + thread memo"]
+        HUB["🗂️ hub.rs<br/>UdpHub · 4032 sessions"]
         ASSOC["🔁 assoc.rs<br/>app ↔ QUIC relay"]
-        AUTHC["📞 auth.rs<br/>dial + watchdog"]
+        DISP["📥 dispatcher.rs<br/>per-slot DATAGRAM reader"]
+        AUTHC["📞 auth.rs<br/>dial · backoff · watchdog"]
+        SOCKS --> POOL
+        SOCKS --> ASSOC
+        POOL --> AUTHC
+        ASSOC --> HUB
+        HUB --> DISP
+        EGRESS -.-> ASSOC
     end
-    subgraph Server["🛰️ myquic2-server · admission-first"]
+    subgraph SRV["🛰️  myquic2-server · admission-first"]
         direction TB
         ACC["🚪 accept.rs<br/>accept + handle_conn"]
-        AUTHX["🔑 auth.rs<br/>token gate · 5s/5s/10s"]
-        TABLE["🗃️ table.rs<br/>ShardedSessTable 8× · 8192"]
-        FWD["➡️ forward.rs + reader.rs<br/>uplink / reply batch"]
+        AUTHX["🔑 auth.rs<br/>constant-time token gate"]
+        TABLE["🗃️ table.rs<br/>ShardedSessTable · 8 shards"]
+        FWD["➡️ forward.rs + reader.rs<br/>uplink · staged BATCH reply"]
         TCPS["🌐 tcp.rs<br/>happy-eyeballs dial-out"]
-        PIN["📌 pin.rs<br/>ConnPin + DestMemo"]
+        PIN["📌 pin.rs<br/>ConnPin · DestMemo"]
+        ACC --> AUTHX
+        AUTHX --> TABLE
+        TABLE --> FWD
+        FWD --> TCPS
+        FWD -.-> PIN
     end
-    SOCKS --> POOL --> EGRESS --> AUTHC
-    ASSOC <--> HUB <--> DISP
-    AUTHC ==>|"QUIC streams / DATAGRAMs<br/>TLS 1.3 · MQP-2"| ACC
-    ACC --> AUTHX --> TABLE --> FWD --> TCPS
-    FWD <--> PIN
-
-    classDef cli fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#065f46
-    classDef srv fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    class SOCKS,POOL,EGRESS,HUB,DISP,ASSOC,AUTHC cli
+    CLI ==>|"QUIC streams ⟷ DATAGRAMs<br/>TLS 1.3 · MQP-2"| SRV
+    style CLI fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
+    style SRV fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef cli fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef cli2 fill:#ecfeff,stroke:#0891b2,stroke-width:1.5px,color:#164e63
+    classDef srv fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class SOCKS,POOL,AUTHC cli
+    class EGRESS,HUB,ASSOC,DISP cli2
     class ACC,AUTHX,TABLE,FWD,TCPS,PIN srv
 ```
 
@@ -121,42 +147,57 @@ UDP `ASSOCIATE`: `assoc.rs` relay socket → `hub.alloc_sess` (cap 4032) → `eg
 #### 🎰 Connection pool panorama — every slot is a full QUIC endpoint
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
 flowchart TB
-    subgraph Pool["🎰 ConnPool · default 4 TCP + 1 interactive UDP + 2 bulk UDP shards"]
+    subgraph APPS["🧑‍💻  application flows"]
         direction LR
-        subgraph TCPs["🔵 TCP pool · quic_conns = 4"]
-            T0["slot 0<br/>📌 interactive<br/>53/123/3478-81"]
+        APP2["🎮 DNS · game<br/>interactive"]
+        APP1["🖥️ bulk TCP flow"]
+        APP4["🔍 small UDP assoc<br/>≤ 512 B"]
+        APP3["📞 bulk UDP assoc<br/>VPN · media"]
+        APP2 ~~~ APP1 ~~~ APP4 ~~~ APP3
+    end
+    subgraph POOL["🎰  ConnPool · 7 connections by default"]
+        direction TB
+        subgraph UDPR["🟠 UDP range · udp_split on"]
+            direction LR
+            U0["slot 4<br/>⚡ interactive UDP<br/>≤ 512 B flows"]
+            U1["slot 5<br/>📦 bulk shard 0"]
+            U2["slot 6<br/>📦 bulk shard 1"]
+            U0 ~~~ U1 ~~~ U2
+        end
+        subgraph TCP["🔵 TCP pool · quic_conns = 4"]
+            direction LR
+            T0["slot 0<br/>📌 interactive<br/>DNS · NTP · STUN"]
             T1["slot 1<br/>📦 bulk RR"]
             T2["slot 2<br/>📦 bulk RR"]
             T3["slot 3<br/>📦 bulk RR"]
-        end
-        subgraph UDPs["🟠 UDP range · udp_split on"]
-            U0["slot 4<br/>⚡ interactive UDP<br/>≤512 B flows"]
-            U1["slot 5<br/>📦 bulk shard 0"]
-            U2["slot 6<br/>📦 bulk shard 1"]
+            T0 ~~~ T1 ~~~ T2 ~~~ T3
         end
     end
-    subgraph SlotInternals["🔧 Inside every slot — no shared receive path"]
-        EP["🔌 Endpoint<br/>own UDP socket + CID table + driver"]
-        CN["🔗 Connection<br/>ArcSwap + live + watch gen"]
-        DL["📥 dispatcher<br/>DATAGRAM reader + reassembler"]
-        LP["📞 conn_loop<br/>dial + backoff + watchdog"]
+    subgraph SLOT["🔧  inside every slot — no shared receive path"]
+        direction LR
+        EP["🔌 Endpoint<br/>own UDP socket · CID table · driver"]
+        CN["🔗 Connection<br/>ArcSwap · live bit · watch generation"]
+        DL["📥 dispatcher<br/>DATAGRAM reader · reassembler"]
+        LP["📞 conn_loop<br/>dial · backoff · silence watchdog"]
         EP --- CN --- DL --- LP
     end
-    T0 --- EP
-    T1 --- EP
-    U1 --- EP
-    APP1["🖥️ bulk TCP flow"] -->|round-robin 1..3| T1
-    APP2["🎮 DNS / game"] -->|pinned| T0
-    APP3["📞 bulk UDP assoc"] -->|bound for life<br/>min N,k| U1
-    APP4["🔍 small UDP assoc"] -->|first pkt ≤512 B| U0
-
-    classDef tcp fill:#eff6ff,stroke:#38bdf8,stroke-width:2px,color:#0c4a6e
-    classDef udp fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef infra fill:#f5f3ff,stroke:#8b5cf6,stroke-width:2px,color:#4c1d95
+    APPS ==>|"pick_tcp → pinned / round-robin<br/>udp_bind → interactive / shard"| POOL
+    POOL -.->|"every slot expands to"| SLOT
+    style APPS fill:#f8fafc,stroke:#cbd5e1,stroke-width:1.5px,color:#0f172a
+    style POOL fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    style TCP fill:#eff6ff,stroke:#60a5fa,stroke-width:2px,color:#1e3a8a
+    style UDPR fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    style SLOT fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
+    classDef tcp fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef udp fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    classDef infra fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
     class T0,T1,T2,T3 tcp
     class U0,U1,U2 udp
     class EP,CN,DL,LP infra
+    class APP1,APP2,APP3,APP4 app
 ```
 
 > `pick_tcp`: interactive ports → slot 0, bulk → `1 + rr % (n-1)`; failover continues the rotation over the live set, so a reconnect spreads flows instead of piling them onto slot 1. `udp_bind`: first datagram decides for life (interactive port or ≤512 B → interactive; a port in `udp_bulk_ports` forces bulk regardless of size, so a VPN tunnel — first packet 148 B — does not share the interactive connection with DNS/STUN/games; else round-robin shard). `SharedEgress` hot path is a thread-local memo (generation + 1000 ms stamp, zero locks); `udp_fail_closed = true` never spills UDP onto a TCP cwnd.
@@ -164,128 +205,258 @@ flowchart TB
 #### 🔵 TCP ECHO path — one SOCKS connection, one QUIC stream
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
     autonumber
-    participant App as 🖥️ App
-    participant Socks as 🧦 socks.rs
-    participant Pool as 🎰 pool.rs
-    participant QC as 🚀 QUIC client
-    participant QS as 🛰️ QUIC server
-    participant Dial as 🌐 tcp.rs dial-out
-    participant Tgt as 🎯 Target
-    App->>Socks: CONNECT atyp + addr + port
-    Socks->>Pool: pick_tcp(target)
-    Pool-->>Socks: slot (0 pinned / RR bulk)
-    Socks->>QC: wait_conn + open_bi (5 s)
-    Socks->>QC: write AddrHeader (7/19/259 B)
-    Socks-->>App: ✅ 0.0.0.0:0 SUCCESS (optimistic, no dial wait)
-    QC->>QS: STREAM head + raw bytes (zero-copy past head)
-    QS->>Dial: read target 5s + stream-task share
-    Dial->>Dial: DNS 8 candidates + happy-eyeballs 250ms stagger
-    Dial->>Tgt: TCP connect + set_nodelay
-    Dial-->>QS: ACK MQ + bnd addr (5 s)
-    QS-->>QC: ACK frame
-    QC-->>Socks: read_mqp_ack (25 s budget)
-    loop copy_tcp_quic_idle 300s
-        App->>Tgt: c2s write_chunk ≥8 KiB zero-copy
-        Tgt->>App: s2c read_chunks 8 + write_vectored
+    box rgb(236, 253, 245) Client edge
+        participant App as 🖥️ App
+        participant Socks as 🧦 socks.rs
+        participant Pool as 🎰 pool.rs
+        participant QC as 🚀 QUIC client
     end
-    Note over Socks,Dial: failure → RST (SO_LINGER=0) + reset/stop 0x04
+    box rgb(255, 247, 237) Exit side
+        participant QS as 🛰️ QUIC server
+        participant Dial as 🌐 tcp.rs
+        participant Tgt as 🎯 Target
+    end
+    rect rgb(240, 253, 244)
+        Note over App,Socks: ① SOCKS5 CONNECT · atyp + addr + port
+        App->>Socks: CONNECT atyp + addr + port
+        Socks->>Pool: pick_tcp(target)
+        Pool-->>Socks: slot 0 (pinned) or RR bulk slot
+    end
+    rect rgb(238, 242, 255)
+        Note over Socks,QC: ② stream setup · optimistic success
+        Socks->>QC: wait_conn + open_bi (5 s budgets)
+        Socks->>QC: write AddrHeader (7 / 19 / 259 B)
+        Socks-->>App: ✅ 0.0.0.0:0 SUCCESS (optimistic, no dial wait)
+        QC->>QS: STREAM head + raw bytes (zero-copy past head)
+    end
+    rect rgb(255, 247, 237)
+        Note over QS,Tgt: ③ exit-side dial · ACK
+        QS->>Dial: read target (5 s) + stream-task share
+        Dial->>Dial: DNS 8 candidates + happy-eyeballs 250 ms stagger
+        Dial->>Tgt: TCP connect + set_nodelay
+        Dial-->>QS: ACK MQ + bound address (5 s)
+        QS-->>QC: ACK frame
+        QC-->>Socks: read_mqp_ack (25 s budget)
+    end
+    rect rgb(236, 254, 255)
+        Note over App,Tgt: ④ bidirectional bulk copy · copy_tcp_quic_idle (300 s)
+        loop every chunk
+            App->>Tgt: c2s write_chunk ≥ 8 KiB zero-copy
+            Tgt->>App: s2c read_chunks(8) + write_vectored
+        end
+    end
+    Note over Socks,Dial: any failure → RST (SO_LINGER=0) + reset/stop 0x04
 ```
 
 #### 🟠 UDP ECHO path — one ASSOCIATE, one session id, three frame shapes
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
     autonumber
-    participant App as 🎮 App
-    participant Assoc as 🔁 assoc.rs relay
-    participant Hub as 🗂️ hub.rs
-    participant Egr as 🧭 egress.rs
-    participant QC as 🚀 QUIC client
-    participant QS as 🛰️ QUIC server
-    participant Sess as 🔌 session socket
-    participant Tgt as 🎯 Target
-    participant Disp as 📥 dispatcher.rs
-    App->>Assoc: SOCKS ASSOCIATE + BND request
-    Assoc->>Hub: alloc_sess (cap 4032)
-    Assoc-->>App: BND relay ip:port
-    App->>Assoc: UDP datagram (RSV/FRAG checked)
-    Assoc->>Assoc: lock app ip + port on 1st valid pkt
-    Assoc->>Egr: with_fresh(bind: memo 1000ms / acquire)
-    alt small pair ≤512 B same dst
-        Egr->>QC: BATCH 0x06 · up to 16 payloads, 1 lock + 1 AEAD
-    else large payload > live budget
-        Egr->>QC: FRAG 0x05 × N · each self-describing
-    else normal
-        Egr->>QC: DATAGRAM 0x02 · sess + addr + payload
+    box rgb(236, 253, 245) Client edge
+        participant App as 🎮 App
+        participant Assoc as 🔁 assoc.rs
+        participant Hub as 🗂️ hub.rs
+        participant Egr as 🧭 egress.rs
+        participant Disp as 📥 dispatcher.rs
     end
-    QC->>QS: QUIC DATAGRAM (no HoL blocking)
-    QS->>QS: FastSess 16 / reassemble 2s / resolve fast→slow
-    QS->>Sess: get_or_create_sess + udp_try_send
-    Sess->>Tgt: UDP payload (sendmmsg burst ≤32)
-    Tgt-->>Sess: reply (allowlist: IP-only, 16 entries)
-    Sess->>QS: recvmmsg burst ≤32
-    alt small replies ≤512 B
-        QS->>QC: BATCH 0x06 staged reply frame
-    else large reply
-        QS->>QC: FRAG 0x05 × N
+    box rgb(238, 242, 255) QUIC tunnel
+        participant QC as 🚀 QUIC client
+        participant QS as 🛰️ QUIC server
     end
-    QC->>Disp: read_datagram + 4096 cache + reassemble
-    Disp->>Assoc: StagedReply run + sendmmsg (zero payload copy)
-    Assoc->>App: UDP datagram to locked app addr
+    box rgb(255, 247, 237) Exit side
+        participant Sess as 🔌 session socket
+        participant Tgt as 🎯 Target
+    end
+    rect rgb(240, 253, 244)
+        Note over App,Hub: ① association setup
+        App->>Assoc: SOCKS5 UDP ASSOCIATE
+        Assoc->>Hub: alloc_sess (cap 4032)
+        Assoc-->>App: BND relay ip:port
+        App->>Assoc: UDP datagram (RSV / FRAG checked)
+        Assoc->>Assoc: lock app ip + port on 1st valid packet
+    end
+    rect rgb(238, 242, 255)
+        Note over Assoc,QC: ② pick a frame shape · egress binding
+        Assoc->>Egr: with_fresh(bind)
+        alt small pair ≤ 512 B, same destination
+            Egr->>QC: 0x06 BATCH · ≤ 16 payloads · 1 lock + 1 AEAD
+        else payload larger than one frame
+            Egr->>QC: 0x05 FRAG × N · each self-describing
+        else normal
+            Egr->>QC: 0x02 DATAGRAM · sess + addr + payload
+        end
+        QC->>QS: QUIC DATAGRAM (unreliable, no head-of-line blocking)
+    end
+    rect rgb(255, 247, 237)
+        Note over QS,Tgt: ③ exit-side fan-out
+        QS->>QS: FastSess 16 · reassemble 2 s · resolve fast → slow
+        QS->>Sess: get_or_create_sess + udp_try_send
+        Sess->>Tgt: UDP payload (sendmmsg burst ≤ 32)
+        Tgt-->>Sess: reply (IP-only allowlist · 16 entries)
+        Sess->>QS: recvmmsg burst ≤ 32
+    end
+    rect rgb(236, 254, 255)
+        Note over QS,App: ④ staged reply path
+        alt small replies ≤ 512 B
+            QS->>QC: 0x06 BATCH staged reply frame
+        else large reply
+            QS->>QC: 0x05 FRAG × N
+        end
+        QC->>Disp: read_datagram · 4096-entry cache · reassemble
+        Disp->>Assoc: StagedReply runs + sendmmsg (zero payload copy)
+        Assoc->>App: UDP datagram to the locked app address
+    end
 ```
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
 flowchart LR
-    P["📦 payload + dst"] --> C{budget fit?}
-    C -->|≤ live max_datagram| S["0x02 single<br/>1 frame · 1 lock"]
-    C -->|pair ≤512 B<br/>same dst| B["0x06 batch<br/>≤16 in 1 frame"]
-    C -->|larger| F["0x05 fragments<br/>self-describing · whole-or-drop"]
-    S --> Q["🚀 send_datagram"]
-    B --> Q
-    F --> Q
-    Q -->|Blocked| D["drop newest<br/>never drop-oldest"]
-    Q -->|TooLarge| R["re-read budget<br/>100 ms throttle"]
-
-    classDef ok fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#065f46
-    classDef warn fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    class S,B ok
-    class F,D,R warn
+    P(["📦 payload +<br/>destination"]) --> Q{"does it fit<br/>one frame?"}
+    Q -->|"yes · within live<br/>DATAGRAM budget"| S["0x02 DATAGRAM<br/>1 frame · 1 lock"]
+    Q -->|"no · small pair ≤ 512 B<br/>same destination"| B["0x06 BATCH<br/>≤ 16 payloads · 1 frame"]
+    Q -->|"no · larger payload"| F["0x05 FRAG × N<br/>self-describing fragments"]
+    S --> SEND["🚀 send_datagram"]
+    B --> SEND
+    F --> SEND
+    SEND -->|"queued"| OK(["✅ delivered whole<br/>or dropped whole"])
+    SEND -->|"Blocked"| DROP["🗑️ drop newest<br/>never drop-oldest"]
+    SEND -->|"TooLarge"| RE["🔄 re-read live budget<br/>100 ms throttle"]
+    RE -.-> Q
+    style P fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    classDef decision fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef frame fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef send fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    class Q decision
+    class S,B,F frame
+    class SEND send
+    class OK ok
+    class DROP,RE warn
 ```
 
 #### 🚪 Server ingress & session lifecycle — admission before work
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
 flowchart TB
-    L["[::]:8443<br/>SO_REUSEPORT group<br/>1 per core Linux · ≤8"] --> A["🚪 accept_loop × N<br/>each: own socket + CID + driver"]
-    A --> G{conn_limit?<br/>4096 token / 256 bare}
-    G -->|full| RF["🚫 implicit refuse<br/>1/s warn"]
-    G -->|permit| H["🤝 handshake<br/>PRE_AUTH 5s · HANDSHAKE 10s"]
-    H --> T{token gate?<br/>const-time · 256 B · Zeroizing}
-    T -->|fail| C1["✂️ close 0x01"]
-    T -->|pass / empty| HC["📡 handle_conn<br/>sweep 60s + uni drain + reader"]
-    HC --> R["📥 DATAGRAM reader<br/>head await + drain 32<br/>FastSess 16 + reassembler"]
-    R --> F{IP or domain?}
-    F -->|IP| SS["🛡️ is_global_ip_cached?<br/>allow_private gate"]
-    F -->|domain| DN["📌 ConnPin → DestMemo 30s → memo<br/>→ moka 120s → hickory 5s single-flight"]
-    SS --> GS["🗃️ get_or_create_sess<br/>memo → fair-share → limiter → socket"]
-    DN --> GS
-    GS --> SO["🔌 session socket 64 KiB<br/>+ reader task<br/>recvmmsg ≤32"]
-    SO --> RP["↩️ reply: BATCH ≤512 B<br/>else FRAG · IP allowlist 16"]
-    RP -->|idle 180s / conn closed| BYE["🧹 take_idle + drain_all"]
-
+    subgraph G1["🚪  Ingress · admission before work"]
+        direction LR
+        L["[::]:8443<br/>SO_REUSEPORT<br/>1 endpoint / core · ≤ 16"]
+        A["accept_loop × N<br/>own socket · CID table · driver"]
+        G{"conn limit?<br/>4096 token · 256 bare"}
+        H["🤝 handshake<br/>PRE_AUTH 5 s · HANDSHAKE 10 s"]
+        T{"token gate<br/>constant time · 256 B"}
+        RF["🚫 implicit refuse<br/>1 / s warn"]
+        C1["✂️ close 0x01"]
+        L --> A --> G
+        G -->|"permit"| H
+        G -->|"full"| RF
+        H --> T
+        T -->|"fail"| C1
+    end
+    subgraph G2["📡  Session · per connection"]
+        direction LR
+        HC["handle_conn<br/>sweep 60 s<br/>uni drain · reader"]
+        R["DATAGRAM reader<br/>await head · drain 32<br/>FastSess 16 · reassembler"]
+        F{"target form?"}
+        DN["📌 domain<br/>ConnPin → DestMemo 30 s<br/>→ moka 120 s → hickory 5 s"]
+        SS["🛡️ IP gate<br/>is_global_ip_cached<br/>allow_private"]
+        HC --> R --> F
+        F -->|"domain"| DN
+        F -->|"IP"| SS
+    end
+    subgraph G3["🔌  Egress · UDP sessions"]
+        direction LR
+        GS["get_or_create_sess<br/>memo → fair share<br/>→ limiter → socket"]
+        SO["session socket 64 KiB<br/>+ reader task<br/>recvmmsg ≤ 32"]
+        RP["↩️ reply<br/>BATCH ≤ 512 B · else FRAG<br/>IP allowlist 16"]
+        BYE["🧹 teardown<br/>take_idle · drain_all"]
+        GS --> SO --> RP
+        RP -->|"idle 180 s / conn closed"| BYE
+    end
+    G1 ==>|"pass / empty token"| G2
+    G2 ==>|"resolved · gated<br/>get_or_create_sess"| G3
+    style G1 fill:#eff6ff,stroke:#60a5fa,stroke-width:2px,color:#1e3a8a
+    style G2 fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
+    style G3 fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
     classDef gate fill:#fef2f2,stroke:#f87171,stroke-width:2px,color:#7f1d1d
-    classDef good fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#065f46
-    classDef infra fill:#eff6ff,stroke:#38bdf8,stroke-width:2px,color:#0c4a6e
-    class G,T,F,SS gate
+    classDef good fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef infra fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
+    classDef deny fill:#fff1f2,stroke:#e11d48,stroke-width:1.5px,color:#881337
+    class G,T,F gate
     class GS,SO,RP good
-    class L,A,H,HC,R,DN infra
+    class L,A,H,HC,R,DN,SS infra
+    class RF,C1,BYE deny
 ```
 
 ### Shared library (`src/`): layered design
 
 `src/lib.rs` is only a facade (re-exports) plus socket/shutdown primitives: dual-stack UDP with 4 MiB QUIC buffers vs 64 KiB session buffers (`SESS_SOCKET_BUF`, overridable via `MYQUIC2_SESS_SOCKET_BUF`, clamped 16 KiB–4 MiB), `SO_REUSEPORT` group helpers, `SO_*BUFFORCE` retry under `CAP_NET_ADMIN`, `shutdown_signal()` (SIGTERM/SIGINT → `CONNECTION_CLOSE`, no drain window), and `read_mqp_ack()`.
+
+**Layer cake** — a thin facade at the bottom, purpose-built layers above it, and
+the two binaries on top; each layer is unit-tested in isolation:
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+flowchart TB
+    subgraph L1["🪝  primitives · src/lib.rs facade"]
+        direction LR
+        S1["dual-stack UDP<br/>SO_REUSEPORT · SO_*BUFFORCE"]
+        S2["shutdown_signal<br/>SIGTERM / SIGINT"]
+        S3["packet clock<br/>coarse · mono"]
+        S1 ~~~ S2 ~~~ S3
+    end
+    subgraph L2["🧬  codecs · transport · policy"]
+        direction LR
+        C1["MQP-2 codec<br/>addr · datagram · frag · batch"]
+        C2["TLS 1.3<br/>pinned Ed25519 · 0-RTT"]
+        C3["config + admission<br/>tuning · memory math"]
+        C1 ~~~ C2 ~~~ C3
+    end
+    subgraph L3["⚡  data plane"]
+        direction LR
+        D1["UDP<br/>fragmenter · reassembler · retry"]
+        D2["TCP pump<br/>zero-copy · vectored"]
+        D3["DNS<br/>memo → moka → hickory"]
+        D1 ~~~ D2 ~~~ D3
+    end
+    subgraph L4["🔭  cross-cutting"]
+        direction LR
+        O1["stats<br/>drop warnings · throttles"]
+        O2["linux knobs<br/>busy poll · notsent-lowat"]
+        O3["time<br/>coarse · mono"]
+        O1 ~~~ O2 ~~~ O3
+    end
+    subgraph BIN["🚀  binaries"]
+        direction LR
+        B1["myquic2-client<br/>pool-first · SOCKS5 ingress"]
+        B2["myquic2-server<br/>admission-first · QUIC ingress"]
+        B1 ~~~ B2
+    end
+    L1 ==> L2 ==> L3 ==> BIN
+    L4 -.-> BIN
+    style L1 fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
+    style L2 fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#1e1b4b
+    style L3 fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    style L4 fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
+    style BIN fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
+    classDef prim fill:#dcfce7,stroke:#059669,stroke-width:1.5px,color:#064e3b
+    classDef codec fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
+    classDef data fill:#ffedd5,stroke:#ea580c,stroke-width:1.5px,color:#7c2d12
+    classDef cross fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    classDef bin fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc
+    class S1,S2,S3 prim
+    class C1,C2,C3 codec
+    class D1,D2,D3 data
+    class O1,O2,O3 cross
+    class B1,B2 bin
+```
 
 | Layer | Files | What it owns |
 |---|---|---|
