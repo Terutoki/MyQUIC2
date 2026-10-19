@@ -6,7 +6,7 @@ pub mod send;
 
 pub use batch::{
     BURST_SLOT, SendFrame, batch_backend, batch_report, burst_msg_copy, recv_burst,
-    recvmmsg_available, sendmmsg_available,
+    recvmmsg_available, sendmmsg_available, with_burst_msg,
 };
 pub use batch::{LAST_HOP_DRAIN, record_drain_batch, record_extra_syscalls, record_send_group};
 

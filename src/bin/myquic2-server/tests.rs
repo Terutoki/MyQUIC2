@@ -7,7 +7,7 @@ use super::*;
 /// Four tests touch the counter: the two exact-delta holder tests
 /// (`fair_share_counts_session_holders_not_live_connections`,
 /// `session_churn_holds_caps_without_leaking`),
-/// `l2_dns_singleflight_burst_delivers_server`, whose burst runs
+/// `l2_dns_burst_coalesces_to_one_waiter_per_session`, whose burst runs
 /// `forward_server_dgram` through the real `get_or_create_sess` creation
 /// path, and the full-cone e2e helper above `full_cone_forwards_unsolicited_reply_source`
 /// (it runs a real connection through `handle_conn`, which creates and reaps a
@@ -216,6 +216,10 @@ fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) ->
             recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     );
+    // Direct insert (not `get_or_create_sess`): keep the table's live count in
+    // step so `note_empty_state`/`drain_all` see this session in tests that
+    // assert on the fair-share holder denominator.
+    ss.note_live_insert();
     ss
 }
 
@@ -758,9 +762,10 @@ fn allowlist_contains(ss: &SessTable, s: u32, dst: SocketAddr) -> bool {
 /// upgrade plus three `Arc` clones each.
 ///
 /// Pinned at the level the defect lived: arm two sessions that map to different
-/// slots, then require a hit (and the allowlist record the fast path owes) from
-/// each, and a miss for a session that was never armed — the table is a cache,
-/// never a router.
+/// home slots, then require a hit (and the allowlist record the fast path owes)
+/// from each, and a miss for a session that was never armed — the table is a
+/// cache, never a router. The sparse-id sibling below pins the *probing* half
+/// (ids whose low bits collide must still both hit).
 #[tokio::test]
 async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
@@ -785,6 +790,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
         ss.shard(s).write().insert(s, entry);
+        ss.note_live_insert();
         sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
@@ -799,7 +805,10 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
             dst,
             DNS_CACHE_TTL_MS,
         );
-        assert!(fast[fast_slot(s)].is_some(), "arm must publish session {s}");
+        assert!(
+            fast_probe(&fast, s).is_some(),
+            "arm must publish session {s}"
+        );
     }
 
     // Both sessions must stage. The single-slot version could only ever serve
@@ -844,16 +853,19 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         "an unarmed session must fall through to the slow path"
     );
 
-    // The case that actually pins "a cache, never a router": a session whose id
-    // collides with an armed slot (same index, different session), with a live
-    // reader and an upgradable socket of its own. Dropping `slot.sess == s`
-    // would stage this datagram onto *session 1's* socket, and only this shape
-    // can catch that.
+    // The case that actually pins "a cache, never a router": a session whose
+    // home slot is occupied by a *different* armed session, with a live reader
+    // and an upgradable socket of its own, but which was never armed itself.
+    // Probing reads past the other session's slot and stops at the empty slot
+    // after it, so this is a miss; dropping the exact `sess == s` compare would
+    // stage the datagram onto session 1's socket, and only this shape can catch
+    // that. (A session that *has* been armed at a probed position hits — see
+    // the sparse-id test below.)
     let colliding = s1 + FAST_SESS_SLOTS as u32;
     assert_eq!(
         fast_slot(colliding),
         fast_slot(s1),
-        "the fixture must collide"
+        "the fixture must share a home slot"
     );
     {
         let entry = capped_session(0);
@@ -862,6 +874,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
         ss.shard(colliding).write().insert(colliding, entry);
+        ss.note_live_insert();
         sess_memo_put(conn_id, colliding, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
@@ -881,6 +894,146 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
          the slot owner's socket"
     );
     assert!(staged.is_empty(), "a miss must not stage anything");
+}
+
+/// Sparse session ids must both hit the probed table.
+///
+/// The client allocates session ids from a monotonic counter and never reuses
+/// them, so on a long-lived connection the live ids are a *sparse* subset of the
+/// id space rather than a dense `1..=N` interval. `1009` and `1025` share the
+/// home slot (`s & 15 == 1`) but are nowhere near `FAST_SESS_SLOTS` apart, which
+/// is exactly the shape the old direct map could only ever treat as a
+/// permanent collision: after a few hundred associations a real client's live
+/// ids land on the same low bits at random. Both must arm and both must hit —
+/// the second is published in the first free slot after its home — and a table
+/// that is genuinely over `FAST_SESS_SLOTS` live sessions must evict the
+/// quietest rather than grow or mis-route.
+#[tokio::test]
+async fn sparse_session_ids_both_hit_the_probed_fast_table() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let conn_id = next_conn_id();
+    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
+    let dst: SocketAddr = "198.51.100.7:53".parse().unwrap();
+
+    // Sparse ids from a counter that has run for a while. `s2`/`s3` collide on
+    // the home slot; none is `FAST_SESS_SLOTS` from another, i.e. no fixture
+    // relies on the old direct-map pigeonhole argument.
+    let (s1, s2, s3) = (1001u32, 1009u32, 1025u32);
+    assert_eq!(fast_slot(s2), fast_slot(s3), "fixture: same home slot");
+    assert_ne!(fast_slot(s1), fast_slot(s2));
+
+    let mut socks = Vec::new();
+    for s in [s1, s2, s3] {
+        let entry = capped_session(0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(s).write().insert(s, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
+        socks.push(sock);
+    }
+    for s in [s1, s2, s3] {
+        arm_fast(
+            &mut fast,
+            conn_id,
+            s,
+            TargetAddrRef::Ip(dst),
+            dst,
+            DNS_CACHE_TTL_MS,
+        );
+    }
+    // Re-arming a session whose home was occupied must update the probed slot
+    // in place, not append a second copy at some later free slot.
+    arm_fast(
+        &mut fast,
+        conn_id,
+        s3,
+        TargetAddrRef::Ip(dst),
+        dst,
+        DNS_CACHE_TTL_MS,
+    );
+    let i2 = fast_probe(&fast, s2).expect("s2 must be armed");
+    let i3 = fast_probe(&fast, s3).expect("s3 must be armed");
+    assert_ne!(
+        i2, i3,
+        "a shared home must probe to a free slot instead of evicting the other session"
+    );
+    assert_eq!(
+        fast.iter()
+            .filter(|slot| slot.as_ref().is_some_and(|x| x.sess == s3))
+            .count(),
+        1,
+        "re-arming must update the existing slot, never duplicate it"
+    );
+    for s in [s1, s2, s3] {
+        assert!(
+            try_stage(
+                &mut fast,
+                &ss,
+                conn_id,
+                s,
+                dst,
+                Bytes::from_static(b"fast"),
+                true,
+                &mut staged
+            )
+            .is_ok(),
+            "sparse session {s} must hit its probed slot"
+        );
+        staged.clear();
+    }
+
+    // Over capacity: `FAST_SESS_SLOTS + 1` new live sessions. The table is a
+    // fixed array, so the last arm must evict the quietest entry; the session
+    // it just armed is still present (nothing runs after it) and hits, and the
+    // table never exceeds its slot count.
+    let mut overflow = Vec::new();
+    for i in 0..(FAST_SESS_SLOTS as u32 + 1) {
+        let s = 5000 + i;
+        let entry = capped_session(0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(s).write().insert(s, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
+        overflow.push((s, sock));
+    }
+    for (s, _) in &overflow {
+        arm_fast(
+            &mut fast,
+            conn_id,
+            *s,
+            TargetAddrRef::Ip(dst),
+            dst,
+            DNS_CACHE_TTL_MS,
+        );
+    }
+    assert_eq!(
+        fast.iter().filter(|slot| slot.is_some()).count(),
+        FAST_SESS_SLOTS,
+        "the table is fixed-size: arming beyond it evicts, never grows"
+    );
+    let (last_s, _) = overflow.last().expect("overflow fixture is non-empty");
+    assert!(
+        try_stage(
+            &mut fast,
+            &ss,
+            conn_id,
+            *last_s,
+            dst,
+            Bytes::from_static(b"fast"),
+            true,
+            &mut staged
+        )
+        .is_ok(),
+        "the most recently armed session must still hit after the eviction"
+    );
+    socks.extend(overflow.into_iter().map(|(_, sock)| sock));
 }
 
 /// A BATCH (0x06) ingress frame must arm the connection fast table.
@@ -1032,6 +1185,59 @@ async fn the_allowlist_mirror_re_records_after_a_foreign_push() {
     assert!(
         allowlist_contains(&ss, 7, a),
         "a foreign push must force the mirror to re-record"
+    );
+}
+
+/// The allowlist epoch must move only when a push actually publishes a new
+/// snapshot.
+///
+/// `sess_reader_task` gates its `ArcSwap` reload on this epoch: a bump it can
+/// see costs the reply reader a `load_full` (hazard pointer + refcount RMW) on
+/// its next reply. The datagram path calls `remember_dst` for every slow-path
+/// packet, and for a steady single-target flow that call finds the destination
+/// already in the ring and publishes nothing — so an unconditional bump was
+/// pure cross-task cache-line traffic per packet, on exactly the flows the
+/// mirror is meant to make cheap.
+#[tokio::test]
+async fn remember_dst_bumps_the_epoch_only_on_a_real_push() {
+    use std::sync::atomic::Ordering;
+
+    let (ss, _sock) = sess_with_dest(None);
+    let epoch = ss.shard(7).read().get(&7).unwrap().recent_epoch.clone();
+    let a: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    let a_other_port: SocketAddr = "93.184.216.34:53".parse().unwrap();
+    let b: SocketAddr = "1.1.1.1:443".parse().unwrap();
+    assert_eq!(epoch.load(Ordering::Relaxed), 0);
+
+    remember_dst(&ss, 7, a);
+    assert_eq!(
+        epoch.load(Ordering::Relaxed),
+        1,
+        "a real push publishes a snapshot and must move the epoch"
+    );
+
+    // Steady flow: the destination is already in the ring, so the fast exit
+    // publishes nothing and must not move the epoch.
+    for _ in 0..8 {
+        remember_dst(&ss, 7, a);
+    }
+    assert_eq!(
+        epoch.load(Ordering::Relaxed),
+        1,
+        "a repeat destination must not bump: that forced the reply reader to \
+         reload its snapshot for every reply"
+    );
+    // The ring is IP-keyed, so a different port on a known host publishes
+    // nothing either.
+    remember_dst(&ss, 7, a_other_port);
+    assert_eq!(epoch.load(Ordering::Relaxed), 1);
+
+    // A new destination is a real change and must invalidate the mirror.
+    remember_dst(&ss, 7, b);
+    assert_eq!(
+        epoch.load(Ordering::Relaxed),
+        2,
+        "a new destination must bump the epoch"
     );
 }
 
@@ -1208,6 +1414,7 @@ async fn the_fair_share_gate_counts_inserts_since_the_sample() {
     for s in 0..8u32 {
         ss.shard(s).write().insert(s, capped_session(0));
         ss.note_insert();
+        ss.note_live_insert();
     }
     assert!(
         ss.len_upper_bound(now) >= 8,
@@ -1228,7 +1435,9 @@ async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
     let now = mono_millis();
     assert_eq!(ss.len_upper_bound(now), 0);
     ss.shard(7).write().insert(7, capped_session(0));
+    ss.note_live_insert();
     ss.shard(7).write().remove(&7);
+    ss.note_live_remove(1);
     assert_eq!(
         ss.len_upper_bound(now),
         0,
@@ -1236,8 +1445,10 @@ async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
     );
     ss.shard(7).write().insert(7, capped_session(0));
     ss.note_insert();
+    ss.note_live_insert();
     assert_eq!(ss.len_upper_bound(now), 1);
     ss.shard(7).write().remove(&7);
+    ss.note_live_remove(1);
 }
 
 /// Expired entries go through `take_idle` unbounded: 70 idle sessions are
@@ -2344,7 +2555,7 @@ fn ip_cache_collision_evicts_and_never_mis_serves() {
 /// The holder assertions are exact because every test that can register a
 /// non-empty table — this one,
 /// `fair_share_counts_session_holders_not_live_connections`, the
-/// `l2_dns_singleflight_burst_delivers_server` burst (which reaches
+/// `l2_dns_burst_coalesces_to_one_waiter_per_session` burst (which reaches
 /// `get_or_create_sess`'s creation arm), and the full-cone e2e helper
 /// (`unsolicited_reply_through_filter`, which runs a real connection through
 /// `handle_conn`) — serializes on `HOLDER_TEST_LOCK`; exact reads would
@@ -2361,6 +2572,7 @@ async fn session_churn_holds_caps_without_leaking() {
     for s in 1..=N as u32 {
         ss.shard(s).write().insert(s, capped_session(0));
         ss.note_insert();
+        ss.note_live_insert();
     }
     ss.note_empty_state();
     assert_eq!(ss.len(), N, "every churned session must be in the table");
@@ -2539,44 +2751,35 @@ async fn recv_loopback_burst(
     delivered
 }
 
-/// L2 DNS single-flight burst delivery (server egress).
+/// L2 DNS burst coalescing (server egress).
 ///
-/// A same-host cold burst must deliver every datagram. The first miss spawns
-/// a waiter, every follower whose lookup is still cold spawns its own, and
-/// moka coalesces all of them into one upstream query; each spawn-delivered
-/// waiter delivers its own payload once the resolution completes. No queue,
-/// no in-flight probe, no drop between the two. Phase 1 drives a 33-burst at
-/// a cold name (the spawning miss plus 32 followers); phase 2 re-sends 40 at
-/// the now-warm name. Both phases must land 100% of their datagrams on the
-/// loopback sockets with zero budget/policy counters moving.
+/// A same-host cold burst must **not** spawn one resolver waiter per datagram.
+/// The per-connection [`DnsGate`] admits one waiter per `(session, name, port)`;
+/// datagrams arriving while that resolution is in flight are dropped (ordinary
+/// UDP loss, counted as `REFUSED`), and any datagram arriving after the session
+/// destination memo was stored resolves inline. `DNS_WAITER_SPAWNS` is the
+/// contract the observable counters cannot express: delivery and `REFUSED` look
+/// the same whichever way a follower is disposed of, but the whole point of the
+/// gate is that the spawn count stays at one.
 ///
-/// `localhost` resolves via the hosts file (no network), and the ephemeral
-/// port keeps the `(host, port)` cache key cold: no other test can have
-/// seeded or resolved it. The limiter premise is asserted, never drained:
-/// each waiter holds one permit while it waits, so the burst needs budget
-/// available. Follower *disposition* (inline from a warm memo vs.
-/// spawn-delivered) is deliberately not pinned: the resolution runs on
-/// another task's thread, so a follower whose lookup finds the memo it
-/// warmed (this thread's fast memo, or the session destination memo the
-/// first waiter stored) is served inline, and both shapes deliver exactly
-/// once — the socket count below is the contract. Pinning the disposition
-/// (as this test once did) makes the burst fail whenever the runner is
-/// fast enough to complete the resolution mid-loop.
+/// Phase 1 drives a 33-burst at a cold name from a fresh session; phase 2 drives
+/// 40 at the now-warm name from a second fresh session (a new session has no
+/// destination memo yet, so it still goes through the gate even though the
+/// shared DNS cache is warm). Every datagram must be accounted for as
+/// delivered-or-refused with zero budget/session counters moving.
 ///
-/// The holder guard: the burst lands on `get_or_create_sess`'s *creation*
-/// path (sessions 11/12 are absent from the fresh table), which registers
-/// this table in the process-global holder count and only releases it when
-/// this test's runtime drops. Without the lock a concurrent
-/// `session_churn_holds_caps_without_leaking` or
-/// `fair_share_counts_session_holders_not_live_connections` reads two
-/// holders for its one-table delta — a flake the CI's 4-vCPU runner can hit
-/// whenever the two tests overlap. Holding a std guard across awaits is
-/// deliberate and safe here: each test owns its own runtime, so the guard
-/// only parks other tests' threads, never a task of this test, and the lock
-/// order (SLOW_PATH_COUNTER_LOCK first) is consistent with every user.
+/// `localhost` resolves via the hosts file (no network), `allow_private` keeps
+/// the loopback answer deliverable, and the ephemeral port keeps the
+/// `(host, port)` memo key cold. The holder guard: the burst lands on
+/// `get_or_create_sess`'s *creation* path (sessions 11/12 are absent from the
+/// fresh table), which registers this table in the process-global holder count
+/// and only releases it when this test's runtime drops. Holding std guards
+/// across awaits is deliberate and safe here: each test owns its own runtime.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn l2_dns_singleflight_burst_delivers_server() {
+async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
+    use std::sync::atomic::Ordering;
+
     let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
     let _holder_guard = holder_test_guard();
     let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -2593,7 +2796,7 @@ async fn l2_dns_singleflight_burst_delivers_server() {
     assert_eq!(
         lookup_cached_fast_with_ttl(host, port).0,
         CachedLookup::Unknown,
-        "premise: the (host, port) key is cold"
+        "premise: the (host, port) key is cold on this thread"
     );
     assert!(
         dns_slow_path_limiter().available_permits() > 0,
@@ -2606,23 +2809,18 @@ async fn l2_dns_singleflight_burst_delivers_server() {
     let addr = target.as_ref();
     let payload = Bytes::from_static(b"l2-burst");
 
+    // Phase 1: cold name, fresh session 11.
     let before = dgram_drops::snapshot();
-    // Datagram 1: the cold miss must spawn the resolving waiter and return
-    // `None` — the spawned task owns that payload. Followers are not pinned
-    // (see the disposition note above): while the resolver runs on another
-    // worker, a follower can find the memo it just warmed and deliver inline
-    // (`Some`, still exactly one delivery); a follower that still misses
-    // spawns its own waiter (`None`).
-    let first = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
-    assert!(
-        first.is_none(),
-        "the cold miss spawns its waiter and delivers inline nothing"
-    );
-    for _ in 1..33 {
-        let _ = forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true).await;
+    let spawns_before = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
+    let mut inline = 0usize;
+    for _ in 0..33 {
+        if forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true)
+            .await
+            .is_some()
+        {
+            inline += 1;
+        }
     }
-    // Every waiter delivers once the (single) resolution completes; the quiet
-    // period proves nothing else arrives.
     let delivered = recv_loopback_burst(
         [&v4, &v6],
         Duration::from_secs(5),
@@ -2630,23 +2828,47 @@ async fn l2_dns_singleflight_burst_delivers_server() {
     )
     .await;
     let d = dgram_drops::snapshot().since(&before);
+    let spawns = DNS_WAITER_SPAWNS.load(Ordering::Relaxed) - spawns_before;
+    assert_eq!(
+        spawns, 1,
+        "a cold burst must spawn exactly one waiter, not one per datagram"
+    );
     assert!(
-        delivered == 33,
-        "L2 burst delivery (server slow path): delivered={delivered}/33 \
-         dns_budget_delta={} session_full_delta={} refused_delta={} (want 33/0/0/0)",
+        delivered >= 1,
+        "the one waiter's payload must reach the target"
+    );
+    assert_eq!(
+        delivered as usize,
+        inline + 1,
+        "every datagram is delivered by the single waiter or inline; a \u{22}dropped\u{22} \
+         payload here means the gate lost one"
+    );
+    assert_eq!(
+        delivered as usize + d.refused as usize,
+        33,
+        "every burst datagram must be delivered or coalesced away: \
+         dns_budget_delta={} session_full_delta={} refused_delta={}",
         d.dns_budget,
         d.session_full,
         d.refused,
     );
     assert_eq!(d.session_full, 0, "budget was available throughout");
     assert_eq!(d.dns_budget, 0, "budget was available throughout");
-    assert_eq!(d.refused, 0, "localhost is not a policy refusal");
-    // The cold burst warmed the shared cache; a 40-burst at the warm name
-    // delivers 40/40 with zero slow-path counts (spawn or inline, whichever
-    // the checker thread observes).
+
+    // Phase 2: warm shared cache, fresh session 12 (no destination memo yet).
+    // Exactly one waiter again — unless this thread's DNS memo was warmed by a
+    // spawned waiter while this test awaited, in which case the whole burst is
+    // served inline (zero spawns) and every datagram is delivered.
     let before2 = dgram_drops::snapshot();
+    let spawns_before2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
+    let mut inline2 = 0usize;
     for _ in 0..40 {
-        let _ = forward_server_dgram(&ss, &server_conn, 0, 12, addr, payload.clone(), true).await;
+        if forward_server_dgram(&ss, &server_conn, 0, 12, addr, payload.clone(), true)
+            .await
+            .is_some()
+        {
+            inline2 += 1;
+        }
     }
     let delivered2 = recv_loopback_burst(
         [&v4, &v6],
@@ -2655,15 +2877,307 @@ async fn l2_dns_singleflight_burst_delivers_server() {
     )
     .await;
     let d2 = dgram_drops::snapshot().since(&before2);
-    client_conn.close(0u32.into(), b"done");
-    server_conn.close(0u32.into(), b"done");
+    let spawns2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed) - spawns_before2;
     assert!(
-        delivered2 == 40 && d2.dns_budget == 0 && d2.session_full == 0 && d2.refused == 0,
-        "warm 40-burst: delivered={delivered2}/40 dns_budget_delta={} \
-         session_full_delta={} refused_delta={} (want 40/0/0/0)",
+        spawns2 <= 1,
+        "a warm-name burst must coalesce to at most one waiter, spawned {spawns2}"
+    );
+    assert_eq!(
+        delivered2 as usize,
+        inline2 + spawns2 as usize,
+        "every datagram is delivered by the single waiter or inline"
+    );
+    assert_eq!(
+        delivered2 as usize + d2.refused as usize,
+        40,
+        "every warm-burst datagram must be delivered or coalesced away: \
+         dns_budget_delta={} session_full_delta={} refused_delta={}",
         d2.dns_budget,
         d2.session_full,
         d2.refused,
+    );
+    assert_eq!(d2.session_full, 0);
+    assert_eq!(d2.dns_budget, 0);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A domain whose records the SSRF filter rejects must be refused **inline**
+/// after one waiter, not re-spawned per datagram — the F1 defect.
+///
+/// `localhost` resolves via the hosts file to loopback addresses, which
+/// `allow_private = false` filters: every resolution yields "no usable address".
+/// Before the gate, the thread memo kept that (filtered) first address warm, so
+/// every datagram re-entered the spawn arm — one task, one `String`, two `Arc`
+/// clones, one limiter permit and two moka lookups per packet, drivable by any
+/// peer with a public name that resolves to a private address.
+///
+/// The assertions are the mechanism: the burst spawns exactly one waiter, the
+/// waiter publishes an `Unusable` verdict in the gate, and the second burst
+/// spawns **zero** waiters while still counting every datagram as `REFUSED`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filtered_domain_burst_is_refused_inline_after_one_waiter() {
+    use std::sync::atomic::Ordering;
+
+    let _counter_guard = SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let host = "localhost";
+    let port = 19755u16;
+    assert_eq!(
+        lookup_cached_fast_with_ttl(host, port).0,
+        CachedLookup::Unknown,
+        "premise: this (host, port) memo key is cold on this thread"
+    );
+    let target = TargetAddr::Domain(host.to_owned(), port);
+    let addr = target.as_ref();
+    let payload = Bytes::from_static(b"filtered-burst");
+
+    // Cold burst at a filtered name.
+    let before = dgram_drops::snapshot();
+    let spawns_before = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
+    for _ in 0..33 {
+        assert!(
+            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false)
+                .await
+                .is_none(),
+            "a filtered target never relays a datagram"
+        );
+    }
+    // The one waiter resolves, finds every record filtered and publishes the
+    // unusable verdict for the gate (recorded before it completes the claim).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ss.dns_gate.probe_for_test(21, host, port, coarse_millis()) == Some(true) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the waiter must publish an unusable verdict"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let d = dgram_drops::snapshot().since(&before);
+    let spawns = DNS_WAITER_SPAWNS.load(Ordering::Relaxed) - spawns_before;
+    assert_eq!(
+        spawns, 1,
+        "a filtered-name burst must spawn exactly one waiter"
+    );
+    assert!(
+        d.refused >= 33,
+        "every filtered datagram must count as refused (waiter plus coalesced \
+         followers), got {}",
+        d.refused
+    );
+    assert_eq!(d.dns_budget, 0, "no slow-path permit was ever exhausted");
+    assert_eq!(d.session_full, 0, "no session was ever created");
+
+    // Second burst, same verdict window: refused inline, zero new waiters.
+    let before2 = dgram_drops::snapshot();
+    let spawns_before2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
+    for _ in 0..40 {
+        assert!(
+            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false)
+                .await
+                .is_none(),
+            "a cached unusable verdict never relays"
+        );
+    }
+    let d2 = dgram_drops::snapshot().since(&before2);
+    let spawns2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed) - spawns_before2;
+    assert_eq!(
+        spawns2, 0,
+        "the cached unusable verdict must not spawn a waiter per datagram"
+    );
+    assert!(
+        d2.refused >= 40,
+        "every datagram in the cached verdict window must be refused inline, \
+         got {}",
+        d2.refused
+    );
+    assert_eq!(d2.dns_budget, 0);
+    assert_eq!(d2.session_full, 0);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// The gate's state machine, off the network: one claim per key, a completed
+/// claim publishes a short-lived unusable verdict, and a name is normalized the
+/// way DNS treats it so two spellings share one claim.
+#[test]
+fn dns_gate_coalesces_and_caches_unusable_verdicts() {
+    let gate = DnsGate::new();
+    let (s, host, port) = (7u32, "filtered.test", 443u16);
+    let t0 = 1_000u64;
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        _ => panic!("a cold key must be admitted"),
+    };
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + 1),
+        GateClaim::InFlight
+    ));
+    // Different session / name / port are independent claims.
+    assert!(matches!(
+        gate.claim(8, host, port, t0 + 1),
+        GateClaim::Proceed(_)
+    ));
+    assert!(matches!(
+        gate.claim(s, "other.test", port, t0 + 1),
+        GateClaim::Proceed(_)
+    ));
+    assert!(matches!(
+        gate.claim(s, host, port + 1, t0 + 1),
+        GateClaim::Proceed(_)
+    ));
+    // DNS names are case-insensitive and a trailing dot is absolute: both
+    // spellings must find the same in-flight claim.
+    assert!(matches!(
+        gate.claim(s, "FILTERED.test.", port, t0 + 1),
+        GateClaim::InFlight
+    ));
+    // A completed unusable verdict is remembered, and expires on its own.
+    gate.finish(s, host, port, token, true, t0 + 2);
+    assert_eq!(gate.probe_for_test(s, host, port, t0 + 2), Some(true));
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + 3),
+        GateClaim::Unusable
+    ));
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + 2 + DNS_GATE_UNUSABLE_TTL_MS + 1),
+        GateClaim::Proceed(_)
+    ));
+}
+
+/// The abandoned-waiter backstop, and why `finish` is generation-tagged: a
+/// waiter that outlived its claim (its runtime was torn down, or it panicked
+/// before finishing) must not clear a claim a *newer* waiter now owns for the
+/// same key.
+#[test]
+fn dns_gate_backstop_expires_and_a_stale_finish_is_ignored() {
+    let gate = DnsGate::new();
+    let (s, host, port) = (9u32, "slow.test", 53u16);
+    let t0 = 5_000u64;
+    let stale = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        _ => panic!("a cold key must be admitted"),
+    };
+    // The backstop expires the claim, and a fresh datagram claims again.
+    let fresh = match gate.claim(s, host, port, t0 + DNS_GATE_INFLIGHT_TTL_MS + 1) {
+        GateClaim::Proceed(token) => token,
+        _ => panic!("an expired claim must be admitted again"),
+    };
+    assert_ne!(stale, fresh);
+    // The abandoned waiter's late finish must not touch the fresh claim.
+    gate.finish(
+        s,
+        host,
+        port,
+        stale,
+        false,
+        t0 + DNS_GATE_INFLIGHT_TTL_MS + 2,
+    );
+    assert_eq!(
+        gate.probe_for_test(s, host, port, t0 + DNS_GATE_INFLIGHT_TTL_MS + 2),
+        Some(false),
+        "a stale finish must leave the newer in-flight claim alone"
+    );
+    // The current claim completes and clears its entry.
+    gate.finish(
+        s,
+        host,
+        port,
+        fresh,
+        false,
+        t0 + DNS_GATE_INFLIGHT_TTL_MS + 3,
+    );
+    assert_eq!(
+        gate.probe_for_test(s, host, port, t0 + DNS_GATE_INFLIGHT_TTL_MS + 3),
+        None
+    );
+}
+
+/// Slot overflow must only cost a lost claim (the evicted waiter still delivers
+/// its payload), never a stuck or wrong verdict: the newest claim is still
+/// enforced and the evicted key is admissible again.
+#[test]
+fn dns_gate_overflow_evicts_claims_without_sticking() {
+    let gate = DnsGate::new();
+    let t0 = 1_000u64;
+    let hosts: Vec<String> = (0..=DNS_GATE_SLOTS).map(|i| format!("n{i}.test")).collect();
+    for (i, host) in hosts.iter().enumerate() {
+        assert!(
+            matches!(
+                gate.claim(1, host, 1000, t0 + i as u64),
+                GateClaim::Proceed(_)
+            ),
+            "claim {i} must be admitted"
+        );
+    }
+    let newest = hosts.last().expect("overflow fixture is non-empty");
+    assert!(matches!(
+        gate.claim(1, newest, 1000, t0 + 100),
+        GateClaim::InFlight
+    ));
+    assert!(
+        matches!(
+            gate.claim(1, &hosts[0], 1000, t0 + 101),
+            GateClaim::Proceed(_)
+        ),
+        "the evicted claim's key must be admissible again, not stuck"
+    );
+}
+
+/// The F1 ordering fix, off the network: when this thread's DNS memo holds a
+/// **filtered** first record, the session's destination memo (which only ever
+/// stores filtered-passing addresses) must be consulted before deciding to take
+/// the spawned-resolver path.
+///
+/// Before this, the filtered branch fell straight through to the spawn arm, so
+/// a name whose first record was filtered spawned a resolver task per datagram
+/// forever even after one resolver pass had stored the usable address in the
+/// session memo — and because the slow path therefore never returned `Some`, the
+/// connection fast table could never arm either.
+#[tokio::test]
+async fn filtered_thread_memo_falls_back_to_the_session_dest_memo() {
+    let host = "filtered-fallback.test";
+    let port = 19801u16;
+    let private: SocketAddr = "10.9.9.9:19801".parse().unwrap();
+    let public: SocketAddr = "93.184.216.34:19801".parse().unwrap();
+    dns_cache_seed(host, port, private).await;
+    assert!(
+        matches!(
+            lookup_cached_fast_with_ttl(host, port).0,
+            CachedLookup::Addr(a) if a == private
+        ),
+        "premise: this thread's DNS memo holds the filtered first record"
+    );
+
+    let (ss, _sock) = sess_with_dest(None);
+    // Nothing memoized for the session yet: the slow path is the right answer.
+    assert_eq!(
+        resolve_forward_target(&ss, 7, host, port, false),
+        ForwardResolution::Unresolved
+    );
+    // A resolver pass stored the usable address in the session memo.
+    sess_dest_store(&ss, 7, host, port, public, DNS_CACHE_TTL_MS);
+    assert!(
+        matches!(
+            resolve_forward_target(&ss, 7, host, port, false),
+            ForwardResolution::Addr(a, life) if a == public && life > 0
+        ),
+        "the filtered thread memo must fall through to the session memo instead \
+         of re-entering the spawn arm"
+    );
+    // `allow_private` semantics are unchanged: it still trusts the filtered
+    // first record from the thread memo.
+    assert!(
+        matches!(
+            resolve_forward_target(&ss, 7, host, port, true),
+            ForwardResolution::Addr(a, _) if a == private
+        ),
+        "allow_private must still serve the memo's first record unchanged"
     );
 }
 
@@ -2822,6 +3336,73 @@ async fn a_session_dest_memo_answers_a_domain_target_inline() {
         again.map(|(a, _)| a),
         Some(dst),
         "the memo must keep serving"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A run of one reply must flush as a plain `0x02` DATAGRAM, not a BATCH frame.
+///
+/// Low-rate sessions (DNS-style request/response, keepalives) deliver exactly
+/// one reply per wakeup, so a run of one is their steady shape. Wrapping it in
+/// `0x06` buys a count byte, a per-item length prefix and one extra client-side
+/// decode for no grouping; the single-frame path is also the encoder the
+/// per-reply fallback already uses, so the answer is identical to an unbatched
+/// reply (and the batch debug line now only fires for real groups).
+#[tokio::test]
+async fn a_single_staged_reply_flushes_as_one_plain_datagram() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let mut frag = DgramFragmenter::new();
+    let mut arena: Vec<u8> = Vec::new();
+    let mut staged: Vec<(usize, usize)> = Vec::new();
+    let mut staged_src: Option<SocketAddr> = None;
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let mut last_probe = 0u64;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let body = &b"single-reply"[..];
+    assert!(
+        reply_stage(&mut arena, &mut staged, &mut staged_src, src, body, limit),
+        "a small reply must stage under a full path budget"
+    );
+
+    flush_reply_batch(
+        &server_conn,
+        7,
+        &mut frag,
+        &mut arena,
+        &mut staged,
+        &mut staged_src,
+        &mut limit,
+        &mut last_probe,
+    );
+    assert!(
+        staged.is_empty() && staged_src.is_none(),
+        "a flush must drain the queue and its source"
+    );
+
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the single reply must arrive")
+        .unwrap();
+    assert!(
+        !is_batch(&d),
+        "a run of one must not be wrapped in a BATCH frame"
+    );
+    let (sess, addr, payload) =
+        decode_datagram_ref(&d).expect("a plain reply must be a valid MQP-2 datagram");
+    assert_eq!(sess, 7);
+    assert_eq!(payload, body, "the reply payload must be sent verbatim");
+    match addr {
+        TargetAddrRef::Ip(a) => assert_eq!(a, src, "the reply must name its source"),
+        other => panic!("an IP target reply must stay IP-form: {other:?}"),
+    }
+    // Exactly one frame: a duplicate single-`0x02` send (a half-wired flush that
+    // also falls through to the BATCH path) would leave this probe firing.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), client_conn.read_datagram())
+            .await
+            .is_err(),
+        "one staged reply must produce exactly one frame"
     );
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");

@@ -571,6 +571,45 @@ pub fn burst_msg_copy(i: usize, dst: &mut [u8]) -> Option<(usize, std::net::Sock
     }
 }
 
+/// Borrow one staged `recvmmsg` burst message **in place**.
+///
+/// The caller's closure runs while the thread-local burst scratch is borrowed,
+/// so the payload never has to be copied out to a caller buffer: that is one
+/// full payload memcpy per drained datagram cheaper than [`burst_msg_copy`],
+/// which is the copy every caller used to pay before decoding/encoding it.
+///
+/// Contract: the closure runs synchronously. It must not `await`, nor call
+/// [`recv_burst`]/[`with_burst_msg`] re-entrantly (the scratch is a
+/// non-reentrant `RefCell` borrow). A caller that needs the payload to outlive
+/// the borrow — the server's slow DNS/dial path awaits — must copy it to an
+/// owned buffer *inside* the closure (or keep the old `burst_msg_copy` arm for
+/// that path) and return after the borrow ends.
+///
+/// `None` means no burst is staged on this thread (portable fallback / empty
+/// drain) or `i` is past the staged count. A zero-length message yields an
+/// empty slice, matching `recvfrom` semantics.
+pub fn with_burst_msg<R>(i: usize, f: impl FnOnce(&[u8], std::net::SocketAddr) -> R) -> Option<R> {
+    #[cfg(target_os = "linux")]
+    {
+        BURST.with(|cell| {
+            let b = cell.borrow();
+            let b = b.as_ref()?;
+            let len = *b.lens.get(i)?;
+            let src = *b.addrs.get(i)?;
+            let off = i * BURST_SLOT;
+            // `recvmmsg` writes at most `BURST_SLOT` bytes per message, so the
+            // range is in bounds by construction (lens and addrs are pushed
+            // together by `BurstRecv::recv`).
+            Some(f(&b.data[off..off + len], src))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (i, f);
+        None
+    }
+}
+
 /// Convert a nix `SockaddrStorage` (from `recvmmsg`) back to a std address.
 /// Safe: nix downcasts via `as_sockaddr_in/in6` instead of raw pointer casts.
 #[cfg(target_os = "linux")]

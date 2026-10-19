@@ -12,7 +12,7 @@
 //! `FRAG_MAX_PARTIALS`/`FRAG_TIMEOUT_MS`）、`stats`（`udp_stats::*`）
 //! 均经 `crate::` 绝对路径引用。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 
@@ -221,10 +221,25 @@ pub(crate) fn tombstone_bytes(total: u8) -> usize {
 #[derive(Default)]
 pub struct DgramReassembler {
     parts: FragMap<Partial>,
+    /// Insertion order of the live partials, oldest first — the order
+    /// [`evict_oldest`](Self::evict_oldest) reclaims in. `parts` is the
+    /// authority: a partial removed by completion, restart, over-cap discard or
+    /// expiry leaves its queue slot behind, and the eviction/expiry paths pop
+    /// such stale slots lazily (a slot is live only when the queued `first_ms`
+    /// still equals the live entry's), so maintaining the order costs no scan.
+    /// Because a partial's `first_ms` is set at insertion and the coarse epoch
+    /// never runs backwards, insertion order **is** the oldest-first order the
+    /// former `min_by_key` computed.
+    part_order: VecDeque<((u32, u32), u64)>,
     /// Recently completed or restarted generations by `(sess, id)` — see
     /// [`Tombstone`]. Never awaited, never delivered; consulted on every push
     /// and reaped by [`expire`](Self::expire) after [`FRAG_TIMEOUT_MS`].
     recent: FragMap<Tombstone>,
+    /// Insertion order of the live tombstones; same lazy-invalidation contract
+    /// as `part_order`, with the queued `at_ms` identifying the generation — a
+    /// key remembered again (a restart) leaves the older slot stale at the same
+    /// key, and only the slot whose `at_ms` still matches is live.
+    tomb_order: VecDeque<((u32, u32), u64)>,
     /// Retained bytes across all partials *and* tombstones — see
     /// [`Partial::retained`] and [`Tombstone`].
     held: usize,
@@ -356,6 +371,10 @@ impl DgramReassembler {
                 retained,
             },
         );
+        // The order queue keeps this generation's slot; a replaced generation's
+        // older slot at the same key stays behind and is skipped lazily when it
+        // reaches the front (its `at_ms` no longer matches the live entry).
+        self.tomb_order.push_back((key, now_ms));
         while self.recent.len() > FRAG_MAX_PARTIALS && self.evict_oldest_tombstone() {}
         while self.held > FRAG_MAX_HELD_BYTES && self.evict_oldest_tombstone() {}
     }
@@ -416,8 +435,9 @@ impl DgramReassembler {
         };
         // Count cap first: `held` misses the per-partial slot-table cost, so a
         // flood of tiny single-fragment partials would otherwise grow memory
-        // without ever tripping the byte bound. Evict-before-insert keeps the
-        // `min_by_key` scan bounded to FRAG_MAX_PARTIALS entries.
+        // without ever tripping the byte bound. Evict-before-insert pops the
+        // oldest insertion-order slot, so the cost is the stale slots ahead of
+        // the oldest live partial — not a full-map scan.
         if !present
             && self.parts.len() >= FRAG_MAX_PARTIALS
             && (!self.evict_oldest() || self.parts.len() >= FRAG_MAX_PARTIALS)
@@ -442,10 +462,16 @@ impl DgramReassembler {
                 let prints = self.prints_of(&old.chunks);
                 self.remember(key, total, old.address, prints, now_ms);
             }
-            let entry = self
-                .parts
-                .entry(key)
-                .or_insert_with(|| Partial::new(f.total, &f.address, now_ms));
+            let entry = match self.parts.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let p = e.insert(Partial::new(f.total, &f.address, now_ms));
+                    // Fresh partial: `first_ms` is the insertion time, so its
+                    // order slot goes at the back of the oldest-first queue.
+                    self.part_order.push_back((key, now_ms));
+                    p
+                }
+            };
             // A wrapped id reused with a different shape, or the same shape
             // but a different generation (the address changed, or this index
             // already holds different bytes — an identical chunk is a plain
@@ -586,49 +612,105 @@ impl DgramReassembler {
             live
         });
         self.held = self.held.saturating_sub(tomb_freed);
+        // Both order queues now hold slots for entries just removed here; drop
+        // them so a sweep bounds the queues' size (this is also what keeps a
+        // completion burst behind a long-lived head from accumulating slots
+        // past one timeout window).
+        self.prune_orders();
+    }
+
+    /// Pop stale slots off the front of both order queues until each front
+    /// names a live entry, then rebuild a queue whose stale tail outgrew its
+    /// live map. Stale = the key is gone, or the queued timestamp no longer
+    /// matches the live entry's (the key was re-inserted after that slot was
+    /// written). Amortized O(1) per slot: every slot is popped at most once.
+    fn prune_orders(&mut self) {
+        while let Some(&(key, first_ms)) = self.part_order.front() {
+            match self.parts.get(&key) {
+                Some(p) if p.first_ms == first_ms => break,
+                _ => {
+                    self.part_order.pop_front();
+                }
+            }
+        }
+        while let Some(&(key, at_ms)) = self.tomb_order.front() {
+            match self.recent.get(&key) {
+                Some(t) if t.at_ms == at_ms => break,
+                _ => {
+                    self.tomb_order.pop_front();
+                }
+            }
+        }
+        // A live head stops the pop loop, so completions (or replacements)
+        // behind it can outgrow the live map for up to one timeout window.
+        // Rebuild from the map, preserving the oldest-first order, when that
+        // tail is no longer worth carrying; the sort is over the live entries
+        // only, at most `FRAG_MAX_PARTIALS` of them.
+        if self.part_order.len() > self.parts.len().saturating_mul(2).saturating_add(64) {
+            let mut live: Vec<((u32, u32), u64)> = self
+                .parts
+                .iter()
+                .map(|(key, p)| (*key, p.first_ms))
+                .collect();
+            live.sort_unstable_by_key(|&(key, first_ms)| (first_ms, key));
+            self.part_order = live.into();
+        }
+        if self.tomb_order.len() > self.recent.len().saturating_mul(2).saturating_add(64) {
+            let mut live: Vec<((u32, u32), u64)> =
+                self.recent.iter().map(|(key, t)| (*key, t.at_ms)).collect();
+            live.sort_unstable_by_key(|&(key, at_ms)| (at_ms, key));
+            self.tomb_order = live.into();
+        }
     }
 
     /// Drop the oldest tombstone, giving its bytes back to `held`. Tombstones
     /// only — a live partial is never sacrificed for a remembered one.
     ///
-    /// "Oldest" is `at_ms`, which is the coarse 1 s epoch (see the call sites):
-    /// entries created inside one tick tie, and the `min_by_key` then takes
-    /// whichever the map yields first. That is a policy detail, never an
-    /// accounting one — the bound is still enforced exactly by the loops that
-    /// call this — and the tie cohort is homogeneous in the case that reaches
-    /// here (a burst of same-sized payloads), so the freed bytes are the same
-    /// either way. A monotonic insertion sequence would buy exact FIFO order
-    /// for the cost of a counter and a wider key on both maps; it is not worth
-    /// the extra state for entries that are equal in every respect that matters.
+    /// "Oldest" is insertion order: the record window is a fixed
+    /// [`FRAG_TIMEOUT_MS`] and every tombstone's `at_ms` is stamped at
+    /// insertion, so the front of [`Self::tomb_order`] is the oldest entry.
+    /// Stale slots (a tombstone replaced by a newer generation at the same key,
+    /// or already evicted through its own slot) are popped and skipped; every
+    /// slot is popped at most once, so this is amortized O(1) instead of the
+    /// former full-map `min_by_key` scan — which ran once per completed
+    /// fragmented payload as soon as the 256-entry count cap was saturated.
     fn evict_oldest_tombstone(&mut self) -> bool {
-        let Some(key) = self
-            .recent
-            .iter()
-            .min_by_key(|(_, t)| t.at_ms)
-            .map(|(k, _)| *k)
-        else {
-            return false;
-        };
-        if let Some(t) = self.recent.remove(&key) {
-            self.held = self.held.saturating_sub(t.retained);
+        loop {
+            let Some(&(key, at_ms)) = self.tomb_order.front() else {
+                return false;
+            };
+            self.tomb_order.pop_front();
+            match self.recent.get(&key) {
+                Some(t) if t.at_ms == at_ms => {}
+                // Stale slot: the queued generation is gone (or was replaced).
+                _ => continue,
+            }
+            if let Some(t) = self.recent.remove(&key) {
+                self.held = self.held.saturating_sub(t.retained);
+            }
+            return true;
         }
-        true
     }
 
+    /// Drop the oldest live partial (insertion order, see
+    /// [`Self::part_order`]), giving its retained bytes back to `held`.
     fn evict_oldest(&mut self) -> bool {
-        let Some(key) = self
-            .parts
-            .iter()
-            .min_by_key(|(_, p)| p.first_ms)
-            .map(|(k, _)| *k)
-        else {
-            return false;
-        };
-        if let Some(p) = self.parts.remove(&key) {
-            self.held = self.held.saturating_sub(p.retained);
-            udp_stats::reassembly_evicted();
+        loop {
+            let Some((key, first_ms)) = self.part_order.pop_front() else {
+                return false;
+            };
+            match self.parts.get(&key) {
+                Some(p) if p.first_ms == first_ms => {}
+                // Stale slot: the partial completed, restarted, was discarded or
+                // expired earlier; its slot is popped at most once.
+                _ => continue,
+            }
+            if let Some(p) = self.parts.remove(&key) {
+                self.held = self.held.saturating_sub(p.retained);
+                udp_stats::reassembly_evicted();
+            }
+            return true;
         }
-        true
     }
 }
 
@@ -1001,5 +1083,139 @@ mod tests {
             r.is_stale_replay(&f, 4_000),
             "a completed generation must stay refused inside the window"
         );
+    }
+
+    /// Both order queues must name every live entry with its current timestamp
+    /// stamp: the eviction order is derived from them, so a lost slot would
+    /// silently downgrade to "nothing to evict", and a wrong stamp would evict
+    /// the wrong generation.
+    fn assert_order_covers_maps(r: &DgramReassembler) {
+        for (key, p) in &r.parts {
+            assert!(
+                r.part_order
+                    .iter()
+                    .any(|&(k, first_ms)| k == *key && first_ms == p.first_ms),
+                "live partial {key:?} missing from part_order"
+            );
+        }
+        for (key, t) in &r.recent {
+            assert!(
+                r.tomb_order
+                    .iter()
+                    .any(|&(k, at_ms)| k == *key && at_ms == t.at_ms),
+                "live tombstone {key:?} missing from tomb_order"
+            );
+        }
+    }
+
+    /// FIFO eviction lock-in: the tombstone count cap (saturated at any real
+    /// fragmented rate) must reclaim the *oldest* generation, and the expiry
+    /// sweep must prune the order queue, not just the map — a tombstone's slot
+    /// is never popped by the map `retain`, so a leak there would grow the
+    /// queue for the connection's lifetime.
+    #[test]
+    fn tombstone_eviction_is_insertion_order_and_queues_are_pruned() {
+        let addr = v4();
+        let aref = addr.as_ref();
+        let mut r = DgramReassembler::new();
+        const GEN: u32 = FRAG_MAX_PARTIALS as u32 + 44;
+        // One completed 2-fragment generation per id, each with a distinct tick
+        // so insertion order is unambiguous.
+        for id in 0..GEN {
+            let now = 1_000 + u64::from(id);
+            for (i, c) in [&[1u8; 4][..], &[2u8; 4][..]].iter().enumerate() {
+                let body = encode_fragment(5, id, i as u8, 2, &aref, c, 64 * 1024).unwrap();
+                let f = decode_fragment(&body).unwrap();
+                let done = r.push(&f, now).is_some();
+                assert_eq!(
+                    done,
+                    i == 1,
+                    "generation {id} completes on its last fragment"
+                );
+            }
+        }
+        assert_order_covers_maps(&r);
+        assert_eq!(
+            r.recent.len(),
+            FRAG_MAX_PARTIALS,
+            "the count cap keeps exactly FRAG_MAX_PARTIALS tombstones"
+        );
+        let oldest_kept = GEN - FRAG_MAX_PARTIALS as u32;
+        for id in 0..GEN {
+            let kept = r.recent.contains_key(&(5, id));
+            assert_eq!(
+                kept,
+                id >= oldest_kept,
+                "tombstone {id}: eviction must be oldest-first"
+            );
+        }
+        assert!(
+            r.tomb_order.len() <= FRAG_MAX_PARTIALS + 64,
+            "the order queue must not grow past the live set: {} slots",
+            r.tomb_order.len()
+        );
+        // Expiry empties the map *and* prunes the queue.
+        r.expire(1_000 + u64::from(GEN) + FRAG_TIMEOUT_MS);
+        assert_held_exact(&r);
+        assert!(r.recent.is_empty(), "all tombstones age out together");
+        assert!(
+            r.tomb_order.is_empty(),
+            "expiry must prune the stale order slots, not just the map"
+        );
+        assert_eq!(r.held_bytes(), 0);
+    }
+
+    /// FIFO eviction lock-in for partials: the byte cap must reclaim the oldest
+    /// live partial (never a newer one), and the part-order queue must be
+    /// bounded and prunable. A completion leaves a stale queue slot behind, so
+    /// this also pins the lazy-invalidation path the eviction loop relies on.
+    #[test]
+    fn partial_eviction_is_insertion_order_and_queues_are_pruned() {
+        let addr = v4();
+        let aref = addr.as_ref();
+        let mut r = DgramReassembler::new();
+        // One 1400 B chunk each: the 256 KiB byte cap binds long before the
+        // 256-partial count cap.
+        const N: u32 = 300;
+        for id in 0..N {
+            let now = 2_000 + u64::from(id);
+            let body =
+                encode_fragment(9, 1_000 + id, 0, 2, &aref, &[0x5Au8; 1400], 64 * 1024).unwrap();
+            let f = decode_fragment(&body).unwrap();
+            assert!(r.push(&f, now).is_none());
+            assert!(r.held_bytes() <= FRAG_MAX_HELD_BYTES);
+        }
+        assert_order_covers_maps(&r);
+        let min_kept = r
+            .parts
+            .keys()
+            .map(|(_, id)| *id)
+            .min()
+            .expect("live partials");
+        assert!(
+            r.inflight() < N as usize,
+            "the byte cap evicted live partials"
+        );
+        assert_eq!(
+            min_kept,
+            1_000 + N - r.inflight() as u32,
+            "insertion order must be preserved: the newest suffix is kept"
+        );
+        for id in 1_000..(1_000 + N) {
+            assert_eq!(
+                r.parts.contains_key(&(9, id)),
+                id >= min_kept,
+                "partial {id}: eviction must be oldest-first"
+            );
+        }
+        // Expiry releases the partials and prunes the order queue.
+        r.expire(2_000 + u64::from(N) + FRAG_TIMEOUT_MS);
+        assert_held_exact(&r);
+        assert!(r.parts.is_empty());
+        assert!(
+            r.part_order.is_empty(),
+            "expiry must prune the stale order slots, not just the map"
+        );
+        assert_eq!(r.held_bytes(), 0);
     }
 }

@@ -42,12 +42,19 @@ pub(crate) async fn handle_udp_associate(
 /// a local address) degrades to the wildcard rather than failing the
 /// association.
 pub(crate) fn bind_relay(relay_ip: std::net::IpAddr) -> Result<tokio::net::UdpSocket> {
-    let bind = map_for_dual(SocketAddr::new(relay_ip, 0)).to_string();
-    let raw = match udp_socket_dual_small(&bind) {
+    // P3-6: bind from the address directly. The old shape formatted it to a
+    // `String` and parsed it back inside the constructor — two allocations plus
+    // the round trip on every association, for a value already in hand.
+    let bind = map_for_dual(SocketAddr::new(relay_ip, 0));
+    let raw = match udp_socket_dual_small_addr(bind) {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!("udp relay bind {bind} failed ({e:#}); falling back to the wildcard");
-            udp_socket_dual_small("[::]:0")?
+            // The dual-stack wildcard `"[::]:0"`, in address form.
+            udp_socket_dual_small_addr(SocketAddr::new(
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                0,
+            ))?
         }
     };
     Ok(tokio::net::UdpSocket::from_std(raw)?)
@@ -65,6 +72,12 @@ const _: () = assert!(
     MAX_UDP_ASSOCS * ASSOC_RECV_BUF_LEN <= 40 * 1024 * 1024,
     "4032 x ~8.5 KiB must stay a bounded worst case"
 );
+/// The recvmmsg scratch slot and the association buffer must stay the same
+/// size: that is what makes the borrowed burst arm's truncation predicate
+/// (`msg.len() >= ASSOC_RECV_BUF_LEN`) identical to the awaited head's
+/// (`n == buf.len()`) and to the copy-out fallback's, so moving a datagram
+/// between the two arms can never change whether it counts as oversized.
+const _: () = assert!(BURST_SLOT == ASSOC_RECV_BUF_LEN);
 
 /// Idle association buffers retained per worker thread. Same contract as the
 /// server's `SESS_BUF_POOL`: the live set is bounded by `MAX_UDP_ASSOCS`, only
@@ -105,6 +118,327 @@ pub(crate) fn assoc_recycle_buf(buf: Vec<u8>) {
 #[cfg(test)]
 pub(crate) fn assoc_buf_pool_len() -> usize {
     ASSOC_BUF_POOL.with(|p| p.borrow().len())
+}
+
+/// Control action one processed app datagram asks the association's drain loop
+/// to take.
+///
+/// The per-datagram body moved into [`AppDgramCtx::process`] so the recvmmsg
+/// burst arm can run it while the payload is still in the borrowed scratch
+/// buffer ([`with_burst_msg`]); an inline body could `continue`/`break 'assoc`
+/// directly, but a call cannot, so it reports the action instead.
+enum AppDgram {
+    /// Drop this datagram (or it was forwarded) and keep draining.
+    Continue,
+    /// End the association's relay loop. No framing or liveness arm ends the
+    /// whole association today — the awaited head's socket error, the only
+    /// `break 'assoc`, stays outside the body — so this variant has no producer
+    /// yet; it exists so a future fatal arm has an explicit action instead of
+    /// silently swallowing it.
+    #[allow(dead_code)]
+    BreakAssoc,
+}
+
+/// Mutable association state the per-datagram body reads and writes, bundled so
+/// the awaited head (`recv_from` into `buf`) and the zero-copy burst arm
+/// ([`with_burst_msg`]) share exactly one body.
+///
+/// Borrowed for one drain burst only. [`AppDgramCtx::process`] takes the
+/// message as a slice: the head's payload lives in `buf`, the burst's in the
+/// thread-local `recvmmsg` scratch, and neither needs an owned copy before it
+/// is encoded.
+struct AppDgramCtx<'a> {
+    sess: u32,
+    pool: &'a ConnPool,
+    egress_shared: &'a SharedEgress,
+    entry: &'a AssocEntry,
+    /// Pinned app source IP, from the SOCKS control connection's peer.
+    expected_app_ip: Option<IpAddr>,
+    published_app: &'a mut Option<SocketAddr>,
+    activity_stamp: &'a mut u64,
+    bind: &'a mut Option<UdpBind>,
+    pending_buf: &'a mut Vec<u8>,
+    pending_pack: &'a mut Option<PendingPack>,
+    pending_addr: &'a mut TargetAddr,
+    frag: &'a mut DgramFragmenter,
+}
+
+impl AppDgramCtx<'_> {
+    /// Validate and forward one SOCKS5-framed app datagram.
+    ///
+    /// `msg` is the datagram exactly as received from the relay socket:
+    /// `RSV | FRAG | ATYP | ADDR | PORT | payload`. Fully synchronous (no
+    /// `.await` anywhere in here), so the caller may hold the burst-scratch
+    /// borrow across the call.
+    fn process(&mut self, msg: &[u8], app: SocketAddr) -> AppDgram {
+        // Split the context into disjoint borrows once: the `with_fresh`
+        // closure below mutates the staging state while `egress_shared` is
+        // borrowed immutably, which this proves to the borrow checker. After
+        // inlining it costs nothing.
+        let pool = self.pool;
+        let egress_shared = self.egress_shared;
+        let entry = self.entry;
+        let expected_app_ip = self.expected_app_ip;
+        let sess = self.sess;
+        let published_app = &mut *self.published_app;
+        let activity_stamp = &mut *self.activity_stamp;
+        let bind = &mut *self.bind;
+        let pending_buf = &mut *self.pending_buf;
+        let pending_pack = &mut *self.pending_pack;
+        let pending_addr = &mut *self.pending_addr;
+        let frag = &mut *self.frag;
+
+        // The kernel truncates a datagram larger than the receive buffer and
+        // reports only the buffer length, so the excess is already gone. Both
+        // drain arms receive at most one full buffer, and the recvmmsg scratch
+        // slot is the same size as the association buffer (the const assert
+        // above), so `>= ASSOC_RECV_BUF_LEN` is exactly the old
+        // `n == buf.len()` predicate. Counted as oversized (the payload is past
+        // the protocol cap by construction) as well as warned — and the warning
+        // is rate-limited like every other drop: the app chooses this rate, and
+        // an unthrottled `warn!` here put a formatted line through tracing's
+        // process-wide writer lock once per datagram.
+        if msg.len() >= ASSOC_RECV_BUF_LEN {
+            let dropped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            dgram_drops::warn_oversize_recv(
+                dgram_drops::OversizeRecv::AppDatagram,
+                dropped,
+                || format!("; association {sess}, {} B buffer", msg.len()),
+            );
+            return AppDgram::Continue;
+        }
+        // Pin the source IP: any host that can reach the relay port could
+        // otherwise become "the app" and steal all replies.
+        if let Some(expected) = expected_app_ip
+            && unmap(app.ip()) != expected
+        {
+            tracing::debug!("udp assoc {sess}: datagram from unauthorized app {app} ignored");
+            return AppDgram::Continue;
+        }
+        // The coarse epoch: this value feeds the 1 s liveness throttle and the
+        // egress memo's 1 s freshness window, and both are whole seconds.
+        // `mono_millis()` here was a vDSO `clock_gettime` on every app datagram
+        // — the same cost the reply path already had removed for the same
+        // reason (see `AssocEntry::replied`).
+        let now = coarse_millis();
+        // Validate the SOCKS5 UDP framing *before* letting this packet claim
+        // the association. The relay port is reachable by any process on the
+        // control connection's IP, so locking on the first packet from any
+        // source let one unsolicited or malformed datagram — a single stray
+        // byte suffices — pin `entry.app` to the sender permanently: replies
+        // then went to that sender, the legitimate app's datagrams were dropped
+        // as a "changed source", and because dropped packets deliberately do
+        // not touch the liveness stamp the association also starved to death at
+        // 180 s. Only a well-formed RSV/FRAG + address frame may lock.
+        if msg.len() < 4 || msg[0] != 0 || msg[1] != 0 || msg[2] != 0x00 {
+            return AppDgram::Continue;
+        }
+        // Single decode: reuse header length for the payload offset.
+        let (addr, hdr_len) = match TargetAddrRef::decode(&msg[3..]) {
+            Ok((a, n)) => (a, n),
+            Err(_) => return AppDgram::Continue,
+        };
+        let payload_off = 3 + hdr_len;
+        if payload_off > msg.len() {
+            return AppDgram::Continue;
+        }
+        let payload = &msg[payload_off..];
+        if *published_app != Some(app) {
+            // Lock to the first app address: IP-only pinning would let a
+            // different socket on the same host (same IP, another port) take
+            // over the association and steal its replies. A legitimate client
+            // uses one UDP socket per association, so its source never changes;
+            // a changed source is a hijack attempt, not a rebinding, and is
+            // ignored instead of published — before the liveness stamp below,
+            // so dropped packets cannot keep a dead association alive.
+            if let Some(first) = *published_app {
+                tracing::debug!(
+                    "udp assoc {sess}: datagram from {app} ignored (locked to {first})"
+                );
+                return AppDgram::Continue;
+            }
+            entry.app.store(Some(Arc::new(app)));
+            *published_app = Some(app);
+        }
+        if now.saturating_sub(*activity_stamp) >= ASSOC_TOUCH_INTERVAL_MS {
+            *activity_stamp = now;
+            entry.touch(now);
+        }
+        // Shared egress: the common case is a thread-local memo hit (one
+        // generation load, zero Arc RMWs and zero quinn locks); the lock path
+        // runs only on a generation change or once the memo's stamp expires,
+        // and the single-flight winner still pays close_reason/
+        // max_datagram_size at most once per refresh window. Stale handles are
+        // reused optimistically behind one cheap `close_reason` gate: a dead
+        // one is invalidated and counted as NO_EGRESS instead of being sent.
+        //
+        // `limit` is the connection's live `max_datagram_size()`: the real
+        // DATAGRAM budget for the discovered path MTU, with the QUIC overhead
+        // already subtracted. It is deliberately NOT clamped — a hard cap here
+        // is really a *payload* cap, and the old `min(1350)` made every UDP
+        // payload above 1338 B vanish on a 1472 B path (see
+        // `dgram_payload_cap`). Payloads past a single frame are split by the
+        // fragmenter rather than dropped. A first datagram may not be bound yet
+        // (an earlier one may have failed framing validation); the send path
+        // pins it.
+        let bind = *bind.get_or_insert_with(|| {
+            let c = pool.udp_class(&addr, payload.len());
+            let b = pool.udp_bind(c);
+            tracing::debug!(
+                "udp assoc {sess}: egress class {} shard {} (first payload {} B)",
+                c.name(),
+                b.index,
+                payload.len()
+            );
+            b
+        });
+        let sent = match egress_shared.with_fresh(bind, now, |c, limit| {
+            {
+                if payload.len() <= BATCH_SMALL_MAX {
+                    if let Some(p) = pending_pack.take() {
+                        if p.bind == bind && pending_addr.as_ref() == addr {
+                            let pair: [&[u8]; 2] = [&pending_buf[..p.len], payload];
+                            match send_udp_batch(c, sess, &addr, &pair, limit) {
+                                DatagramSend::Sent => {
+                                    return PayloadSend {
+                                        frames: 1,
+                                        failed: None,
+                                    };
+                                }
+                                DatagramSend::TooLarge | DatagramSend::Blocked => {
+                                    let pa = pending_addr.as_ref();
+                                    let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
+                                    if s1.failed.is_some() {
+                                        let s2 = frag.send(c, sess, &addr, payload, limit);
+                                        return prefer_severe(s1, s2);
+                                    }
+                                    return frag.send(c, sess, &addr, payload, limit);
+                                }
+                                other => {
+                                    // One BATCH verdict for both staged
+                                    // payloads: `frames: 0` says neither went
+                                    // out, and the outer caller's
+                                    // `recover_send_outcome` counts the event
+                                    // once (`EGRESS_DEAD` is per dead
+                                    // connection, not per lost datagram) —
+                                    // deliberately, so a 2-pack loss cannot
+                                    // double-count or double-invalidate.
+                                    return PayloadSend {
+                                        frames: 0,
+                                        failed: Some(other),
+                                    };
+                                }
+                            }
+                        }
+                        // Different destination or binding: hand the staged
+                        // payload to the single-datagram path first, then stage
+                        // this one below.
+                        let pa = pending_addr.as_ref();
+                        let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
+                        if s1.failed.is_some() {
+                            let s2 = frag.send(c, sess, &addr, payload, limit);
+                            return prefer_severe(s1, s2);
+                        }
+                    }
+                    pending_retarget(pending_addr, &addr);
+                    pending_buf.clear();
+                    pending_buf.extend_from_slice(payload);
+                    *pending_pack = Some(PendingPack {
+                        bind,
+                        len: payload.len(),
+                    });
+                    return PayloadSend {
+                        frames: 1,
+                        failed: None,
+                    };
+                } else if let Some(p) = pending_pack.take() {
+                    let pa = pending_addr.as_ref();
+                    let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
+                    if s1.failed.is_some() {
+                        let s2 = frag.send(c, sess, &addr, payload, limit);
+                        return prefer_severe(s1, s2);
+                    }
+                }
+            }
+            frag.send(c, sess, &addr, payload, limit)
+        }) {
+            Some(s) => s,
+            None => {
+                // Load the generation *before* the cached read: any mutation
+                // concurrent with `acquire` then bumps past this tag, so the
+                // memo below is never served for a value the mutation replaced.
+                let generation =
+                    egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+                match egress_shared.acquire(pool, bind, now) {
+                    Some((conn, limit, stamp)) => {
+                        egress_shared.memo_store(bind, generation, &conn, limit, stamp);
+                        frag.send(&conn, sess, &addr, payload, limit)
+                    }
+                    None => {
+                        // No isolated egress connection right now: this
+                        // binding's dedicated UDP slot(s) have not come up, are
+                        // reconnecting, or another thread owns the refresh gate.
+                        // Counted *exactly* (this counter is not batched) and
+                        // warned once per `DROP_WARN_INTERVAL_MS`, because "is
+                        // `udp_fail_closed` costing me anything" is only
+                        // answerable if a short outage is visible at all. The
+                        // detail separates the three causes, which is the
+                        // difference between "the WAN is flapping" and "another
+                        // thread won the refresh race".
+                        let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+                        dgram_drops::warn_egress_drop(
+                            dgram_drops::EgressDrop::NoConnection,
+                            n,
+                            || {
+                                format!(
+                                    "; class={} bind={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                                    bind.class.name(),
+                                    bind.index,
+                                    pool.udp_fail_closed(),
+                                    pool.slot(pool.udp_global_slot(bind.index)).is_live(),
+                                    egress_shared.refreshing[bind.index]
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                )
+                            },
+                        );
+                        return AppDgram::Continue;
+                    }
+                }
+            }
+        };
+        if sent.fragmented() {
+            tracing::debug!(
+                "udp assoc {sess}: {} B sent as {} fragments",
+                payload.len(),
+                sent.frames
+            );
+        }
+        // Exactly one place for a send verdict's recovery, shared with the
+        // deferred 2-pack flush below. `Blocked`/`TooLarge` are already counted
+        // where they are decided; `ConnectionLost`/`Unsupported` are the states
+        // the memo hit path deliberately defers to the send's verdict.
+        recover_send_outcome(egress_shared, bind, sent);
+        AppDgram::Continue
+    }
+}
+
+/// Portable fallback for one recvmmsg-staged message: copy it out of the
+/// thread-local burst scratch into the association's `buf`, then run the shared
+/// body on it.
+///
+/// [`with_burst_msg`] only yields a borrow on Linux; every other build gets
+/// `None` and takes this path, which is byte-for-byte the pre-F6 behaviour (one
+/// copy out, then the same body). `None` means no message is staged, which ends
+/// the burst exactly like the old `burst_msg_copy` returning `None`.
+fn process_staged_copy(
+    ctx: &mut AppDgramCtx<'_>,
+    i: usize,
+    buf: &mut [u8],
+    drained: &mut usize,
+) -> Option<AppDgram> {
+    let (n, app) = burst_msg_copy(i, buf)?;
+    *drained += 1;
+    Some(ctx.process(&buf[..n], app))
 }
 
 pub(crate) async fn udp_associate_inner(
@@ -220,9 +554,14 @@ pub(crate) async fn udp_associate_inner(
                 // a kernel without it keeps the per-frame `try_recv_from` arm.
                 // Tokio keeps readiness set until a `WouldBlock`, so the
                 // remainder is picked up on the next poll; nothing queues in
-                // userspace (no HOL). `continue` below advances the drain —
-                // the same packet-skip as before; only the head error ends
-                // the association.
+                // userspace (no HOL). `AppDgram::Continue` below advances the
+                // drain — the same packet-skip as before; only the head error
+                // ends the association.
+                //
+                // F6: staged (recvmmsg) datagrams are processed **in place**
+                // through `with_burst_msg`, so they never pay the extra
+                // burst-scratch -> `buf` copy. The awaited head has no burst
+                // staging and keeps using `buf`.
                 let mut pending = match r {
                     Ok(x) => Some(x),
                     // A transient socket error must end this association only;
@@ -236,277 +575,97 @@ pub(crate) async fn udp_associate_inner(
                 // portable path, where the `try_recv_from` arm below runs.
                 let mut burst_n = 0usize;
                 let mut burst_i = 0usize;
+                // F6: the per-datagram body lives in `AppDgramCtx::process`, so
+                // the recvmmsg-staged arm can run it while the payload is still
+                // in the thread-local burst scratch (`with_burst_msg`) instead
+                // of copying it out to `buf` first. The context borrows the
+                // association state mutably; it is scoped to this drain burst
+                // and released before the deferred 2-pack flush below.
+                let mut ctx = AppDgramCtx {
+                    sess,
+                    pool: &pool,
+                    egress_shared: &egress_shared,
+                    entry: &entry,
+                    expected_app_ip,
+                    published_app: &mut published_app,
+                    activity_stamp: &mut activity_stamp,
+                    bind: &mut bind,
+                    pending_buf: &mut pending_buf,
+                    pending_pack: &mut pending_pack,
+                    pending_addr: &mut pending_addr,
+                    frag: &mut frag,
+                };
                 for _ in 0..LAST_HOP_DRAIN {
-                    let (n, app) = match pending.take() {
-                        Some(x) => x,
-                        None if burst_i < burst_n => {
-                            let i = burst_i;
-                            burst_i += 1;
-                            match burst_msg_copy(i, &mut buf) {
-                                Some(x) => x,
-                                None => break,
+                    // Resolve the next datagram and run the shared body while
+                    // it is still in place: `pending` is the awaited head
+                    // (first iteration only), the extras come from the burst
+                    // scratch without a copy, or from `try_recv_from` on
+                    // kernels without `recvmmsg`.
+                    let action = if let Some((n, app)) = pending.take() {
+                        drained += 1;
+                        ctx.process(&buf[..n], app)
+                    } else if burst_i < burst_n {
+                        let i = burst_i;
+                        burst_i += 1;
+                        match with_burst_msg(i, |msg, app| {
+                            drained += 1;
+                            ctx.process(msg, app)
+                        }) {
+                            Some(action) => action,
+                            // No burst scratch on this thread (every non-Linux
+                            // build, where `recvmmsg` is unavailable): keep the
+                            // portable copy-out path.
+                            None => {
+                                match process_staged_copy(&mut ctx, i, &mut buf, &mut drained) {
+                                    Some(action) => action,
+                                    None => break,
+                                }
                             }
                         }
-                        None => match recv_burst(&relay, LAST_HOP_DRAIN - drained) {
+                    } else {
+                        match recv_burst(&relay, LAST_HOP_DRAIN - drained) {
                             Some(0) => break,
                             Some(k) => {
                                 burst_n = k;
                                 burst_i = 1;
-                                match burst_msg_copy(0, &mut buf) {
-                                    Some(x) => x,
-                                    None => break,
+                                match with_burst_msg(0, |msg, app| {
+                                    drained += 1;
+                                    ctx.process(msg, app)
+                                }) {
+                                    Some(action) => action,
+                                    None => {
+                                        match process_staged_copy(
+                                            &mut ctx,
+                                            0,
+                                            &mut buf,
+                                            &mut drained,
+                                        ) {
+                                            Some(action) => action,
+                                            None => break,
+                                        }
+                                    }
                                 }
                             }
                             None => match relay.try_recv_from(&mut buf) {
-                                Ok(x) => x,
+                                Ok((n, app)) => {
+                                    drained += 1;
+                                    ctx.process(&buf[..n], app)
+                                }
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                                 // A drained-packet error ends the burst, not the
                                 // association: the head already proved the socket
                                 // live this poll.
                                 Err(_) => break,
                             },
-                        },
+                        }
                     };
-                    drained += 1;
-                if n == buf.len() {
-                    // The kernel truncates a datagram larger than the buffer and
-                    // reports only the buffer length, so the excess is already
-                    // gone. Counted as oversized (the payload is past the
-                    // protocol cap by construction) as well as warned — and the
-                    // warning is rate-limited like every other drop: the app
-                    // chooses this rate, and an unthrottled `warn!` here put a
-                    // formatted line through tracing's process-wide writer lock
-                    // once per datagram.
-                    let dropped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-                    dgram_drops::warn_oversize_recv(
-                        dgram_drops::OversizeRecv::AppDatagram,
-                        dropped,
-                        || format!("; association {sess}, {} B buffer", buf.len()),
-                    );
-                    continue;
-                }
-                // Pin the source IP: any host that can reach the relay port
-                // could otherwise become "the app" and steal all replies.
-                if let Some(expected) = expected_app_ip
-                    && unmap(app.ip()) != expected {
-                        tracing::debug!("udp assoc {sess}: datagram from unauthorized app {app} ignored");
-                        continue;
+                    match action {
+                        AppDgram::Continue => {}
+                        // No current body arm ends the association; the variant
+                        // keeps the drain's two control actions explicit so a
+                        // future fatal arm cannot silently swallow it.
+                        AppDgram::BreakAssoc => break 'assoc,
                     }
-                // The coarse epoch: this value feeds the 1 s liveness throttle
-                // and the egress memo's 1 s freshness window, and both are whole
-                // seconds. `mono_millis()` here was a vDSO `clock_gettime` on
-                // every app datagram — the same cost the reply path already had
-                // removed for the same reason (see `AssocEntry::replied`).
-                let now = coarse_millis();
-                // Validate the SOCKS5 UDP framing *before* letting this packet
-                // claim the association. The relay port is reachable by any
-                // process on the control connection's IP, so locking on the first
-                // packet from any source let one unsolicited or malformed
-                // datagram — a single stray byte suffices — pin `entry.app` to
-                // the sender permanently: replies then went to that sender, the
-                // legitimate app's datagrams were dropped as a "changed source",
-                // and because dropped packets deliberately do not touch the
-                // liveness stamp the association also starved to death at 180 s.
-                // Only a well-formed RSV/FRAG + address frame may lock.
-                if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
-                    continue;
-                }
-                // Single decode: reuse header length for the payload offset.
-                let (addr, hdr_len) = match TargetAddrRef::decode(&buf[3..n]) {
-                    Ok((a, n)) => (a, n),
-                    Err(_) => continue,
-                };
-                let payload_off = 3 + hdr_len;
-                if payload_off > n { continue; }
-                let payload = &buf[payload_off..n];
-                if published_app != Some(app) {
-                    // Lock to the first app address: IP-only pinning would let a
-                    // different socket on the same host (same IP, another port)
-                    // take over the association and steal its replies. A
-                    // legitimate client uses one UDP socket per association, so
-                    // its source never changes; a changed source is a hijack
-                    // attempt, not a rebinding, and is ignored instead of
-                    // published — before the liveness stamp below, so dropped
-                    // packets cannot keep a dead association alive.
-                    if let Some(first) = published_app {
-                        tracing::debug!(
-                            "udp assoc {sess}: datagram from {app} ignored (locked to {first})"
-                        );
-                        continue;
-                    }
-                    entry.app.store(Some(Arc::new(app)));
-                    published_app = Some(app);
-                }
-                if now.saturating_sub(activity_stamp) >= ASSOC_TOUCH_INTERVAL_MS {
-                    activity_stamp = now;
-                    entry.touch(now);
-                }
-                // Shared egress: the common case is a thread-local memo hit
-                // (one generation load, zero Arc RMWs and zero quinn locks);
-                // the lock path runs only on a generation change or once the
-                // memo's stamp expires, and the single-flight winner still
-                // pays close_reason/max_datagram_size at most once per refresh
-                // window. Stale handles are reused optimistically behind one
-                // cheap `close_reason` gate: a dead one is invalidated and
-                // counted as NO_EGRESS instead of being sent.
-                //
-                // `limit` is the connection's live `max_datagram_size()`: the
-                // real DATAGRAM budget for the discovered path MTU, with the
-                // QUIC overhead already subtracted. It is deliberately NOT
-                // clamped — a hard cap here is really a *payload* cap, and the
-                // old `min(1350)` made every UDP payload above 1338 B vanish on
-                // a 1472 B path (see `dgram_payload_cap`). Payloads past a single
-                // frame are split by the fragmenter rather than dropped.
-                // A first datagram may not be bound yet (an earlier one may
-                // have failed framing validation); the send path pins it.
-                let bind = *bind.get_or_insert_with(|| {
-                    let c = pool.udp_class(&addr, payload.len());
-                    let b = pool.udp_bind(c);
-                    tracing::debug!(
-                        "udp assoc {sess}: egress class {} shard {} (first payload {} B)",
-                        c.name(),
-                        b.index,
-                        payload.len()
-                    );
-                    b
-                });
-                let sent = match egress_shared.with_fresh(bind, now, |c, limit| {
-                    {
-                        if payload.len() <= BATCH_SMALL_MAX {
-                            if let Some(p) = pending_pack.take() {
-                                if p.bind == bind && pending_addr.as_ref() == addr {
-                                    let pair: [&[u8]; 2] = [&pending_buf[..p.len], payload];
-                                    match send_udp_batch(c, sess, &addr, &pair, limit) {
-                                        DatagramSend::Sent => {
-                                            return PayloadSend {
-                                                frames: 1,
-                                                failed: None,
-                                            };
-                                        }
-                                        DatagramSend::TooLarge | DatagramSend::Blocked => {
-                                            let pa = pending_addr.as_ref();
-                                            let s1 = frag.send(
-                                                c,
-                                                sess,
-                                                &pa,
-                                                &pending_buf[..p.len],
-                                                limit,
-                                            );
-                                            if s1.failed.is_some() {
-                                                let s2 =
-                                                    frag.send(c, sess, &addr, payload, limit);
-                                                return prefer_severe(s1, s2);
-                                            }
-                                            return frag.send(c, sess, &addr, payload, limit);
-                                        }
-                                        other => {
-                                            // One BATCH verdict for both staged
-                                            // payloads: `frames: 0` says neither
-                                            // went out, and the outer caller's
-                                            // `recover_send_outcome` counts the
-                                            // event once (`EGRESS_DEAD` is per
-                                            // dead connection, not per lost
-                                            // datagram) — deliberately, so a
-                                            // 2-pack loss cannot double-count or
-                                            // double-invalidate.
-                                            return PayloadSend {
-                                                frames: 0,
-                                                failed: Some(other),
-                                            };
-                                        }
-                                    }
-                                }
-                                // Different destination or binding: hand the
-                                // staged payload to the single-datagram path
-                                // first, then stage this one below.
-                                let pa = pending_addr.as_ref();
-                                let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
-                                if s1.failed.is_some() {
-                                    let s2 = frag.send(c, sess, &addr, payload, limit);
-                                    return prefer_severe(s1, s2);
-                                }
-                            }
-                            pending_retarget(&mut pending_addr, &addr);
-                            pending_buf.clear();
-                            pending_buf.extend_from_slice(payload);
-                            pending_pack = Some(PendingPack {
-                                bind,
-                                len: payload.len(),
-                            });
-                            return PayloadSend {
-                                frames: 1,
-                                failed: None,
-                            };
-                        } else if let Some(p) = pending_pack.take() {
-                            let pa = pending_addr.as_ref();
-                            let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
-                            if s1.failed.is_some() {
-                                let s2 = frag.send(c, sess, &addr, payload, limit);
-                                return prefer_severe(s1, s2);
-                            }
-                        }
-                    }
-                    frag.send(c, sess, &addr, payload, limit)
-                }) {
-                    Some(s) => s,
-                    None => {
-                        // Load the generation *before* the cached read: any
-                        // mutation concurrent with `acquire` then bumps past
-                        // this tag, so the memo below is never served for a
-                        // value the mutation replaced.
-                        let generation = egress_shared.generation[bind.index]
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        match egress_shared.acquire(&pool, bind, now) {
-                            Some((conn, limit, stamp)) => {
-                                egress_shared.memo_store(bind, generation, &conn, limit, stamp);
-                                frag.send(&conn, sess, &addr, payload, limit)
-                            }
-                            None => {
-                                // No isolated egress connection right now: this
-                                // binding's dedicated UDP slot(s) have not come
-                                // up, are reconnecting, or another thread owns
-                                // the refresh gate. Counted *exactly* (this
-                                // counter is not batched) and warned once per
-                                // `DROP_WARN_INTERVAL_MS`, because "is
-                                // `udp_fail_closed` costing me anything" is only
-                                // answerable if a short outage is visible at all.
-                                // The detail separates the three causes, which is
-                                // the difference between "the WAN is flapping" and
-                                // "another thread won the refresh race".
-                                let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
-                                dgram_drops::warn_egress_drop(
-                                    dgram_drops::EgressDrop::NoConnection,
-                                    n,
-                                    || {
-                                        format!(
-                                            "; class={} bind={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
-                                            bind.class.name(),
-                                            bind.index,
-                                            pool.udp_fail_closed(),
-                                            pool.slot(pool.udp_global_slot(bind.index)).is_live(),
-                                            egress_shared.refreshing[bind.index]
-                                                .load(std::sync::atomic::Ordering::Relaxed),
-                                        )
-                                    },
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                };
-                if sent.fragmented() {
-                    tracing::debug!(
-                        "udp assoc {sess}: {} B sent as {} fragments",
-                        payload.len(),
-                        sent.frames
-                    );
-                }
-                // Exactly one place for a send verdict's recovery, shared with
-                // the deferred 2-pack flush below. `Blocked`/`TooLarge` are
-                // already counted where they are decided; `ConnectionLost`/
-                // `Unsupported` are the states the memo hit path deliberately
-                // defers to the send's verdict.
-                recover_send_outcome(&egress_shared, bind, sent);
                 }
                 if let Some(p) = pending_pack.take() {
                     flush_deferred_pair(

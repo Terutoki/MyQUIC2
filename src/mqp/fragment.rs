@@ -165,8 +165,9 @@ const _: () = assert!(
 pub const FRAG_MAX_HELD_BYTES: usize = 256 * 1024;
 
 /// Reassembly partial-count bound per connection: a defense-in-depth backstop
-/// on top of [`FRAG_MAX_HELD_BYTES`], and the bound on the `min_by_key` eviction
-/// scan (at most 256 entries per eviction).
+/// on top of [`FRAG_MAX_HELD_BYTES`]. It bounds how many partials and retired
+/// tombstones one reassembler retains; eviction itself is insertion-ordered
+/// (O(1) amortized lazy FIFO in `DgramReassembler`), not a per-eviction scan.
 ///
 /// The byte bound already charges each partial's slot table, so a flood of
 /// never-completing partials is caught there first; this cap only matters if a

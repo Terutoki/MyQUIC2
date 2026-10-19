@@ -379,16 +379,17 @@ pub(crate) fn resolve_pin(
         && pin_is_for(pin, h, p)
         && pin.expires > now
     {
-        // SSRF recheck on the pin hit (allow_private=false only): a pin
-        // that now reads as non-global is treated as a miss and falls
-        // through to the memo/DNS re-resolve below (which scans the full
-        // cached set for a usable fallback), instead of being served
-        // stale for the rest of the pin life. Thread-local memoized, so
-        // the steady public flow pays one cached bool, no locks, no DNS
-        // reads; allow_private=true bypasses unchanged.
-        if allow_private || is_global_ip_cached(pin.addr.ip()) {
-            return Some(pin.addr);
-        }
+        // No SSRF recheck here. Every arm site filters *before* it pins
+        // (`resolve_pin`'s own two arms below, and `arm_fast` in accept.rs,
+        // whose dst always came through `forward_server_dgram`'s filter), the
+        // pinned address never changes for the pin's life, and `is_global_ip`
+        // is a pure function of that address — so a recheck could only ever
+        // re-derive `true`, at one thread-local hash per datagram on the
+        // steady domain path. `allow_private` is a per-connection constant, so
+        // neither branch can flip under a live pin either. (An earlier revision
+        // argued a pin "could now read as non-global"; a pure predicate over an
+        // immutable address cannot.)
+        return Some(pin.addr);
     }
     if let Some((dst, memo_life)) = sess_dest_lookup_ttl(ss, now, s, h, p) {
         if allow_private || is_global_ip_cached(dst.ip()) {
@@ -455,9 +456,24 @@ pub(crate) fn pin_life_ms(remaining_ms: u64) -> u64 {
 /// simply not updated and its next datagram recreates it. Normalization lives
 /// in [`RecentAddrs`] itself, so both sides of the comparison agree.
 ///
-/// The session's allowlist epoch moves with the push, whether it lands from the
-/// datagram reader's own task or from a spawned resolver task that the reader
-/// cannot see; that is what `fast_last_dst` is validated against.
+/// The session's allowlist epoch moves **only when the snapshot actually
+/// changes**, whether the push lands from the datagram reader's own task or from
+/// a spawned resolver task that the reader cannot see; that is what
+/// `fast_last_dst` is validated against. An earlier revision bumped it after
+/// every call — including the steady-flow call that finds `dst` already in the
+/// ring and publishes nothing — which defeated the epoch's whole purpose: the
+/// reply reader (`sess_reader_task`) then reloaded the `ArcSwap` snapshot with
+/// `load_full` on *every* reply instead of one relaxed load, and the datagram
+/// side paid a cross-task cache-line RMW per packet. That is exactly the
+/// slow-path flow the mirror exists to make cheap (multi-destination sessions,
+/// unarmed/colliding fast slots), so the redundant bump was pure loss.
+///
+/// A skip that publishes nothing cannot make a reader's mirror stale: the only
+/// way the mirrored `(session, dst, epoch)` triple stops describing the ring is
+/// an actual push (its eviction or its insertion), and the writer that performs
+/// that push is the one that bumps here. A racing writer's push therefore bumps
+/// the epoch before/while the skip is observed, so no real change goes
+/// unpublished.
 ///
 /// The push itself is a lock-free `rcu` publish: the reply reader loads a
 /// snapshot for every datagram, so writers must not take a lock the readers
@@ -469,12 +485,14 @@ pub(crate) fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
     if let Some(e) = sh.read().get(&s) {
         let ip = unmap(dst.ip());
         // Fast exit for the steady flow (one already-known destination): no
-        // clone, no allocation, no CAS — just the epoch move below. A concurrent
-        // push that evicts this very entry out of a full ring can slip between
-        // this check and the skip, which costs at most one refused reply batch:
-        // the epoch below still moves, so the reader's mirror re-records the
-        // destination on its next outbound datagram.
+        // clone, no allocation, no CAS, and — the point of this function's
+        // shape — no epoch RMW either.
         if !e.recent.load().slots.contains(&Some(ip)) {
+            // `rcu` may retry the closure; a retry that observes another
+            // writer's push and returns the current snapshot must still count as
+            // a change (one of the attempts pushed). The epoch is only ever
+            // over-bumped on that race, which is the safe direction.
+            let pushed = std::cell::Cell::new(false);
             e.recent.rcu(|cur| {
                 if cur.slots.contains(&Some(ip)) {
                     // Another writer got there first; keep its snapshot.
@@ -482,12 +500,15 @@ pub(crate) fn remember_dst(ss: &SessTable, s: u32, dst: SocketAddr) {
                 } else {
                     let mut next = (**cur).clone();
                     next.push(dst);
+                    pushed.set(true);
                     Arc::new(next)
                 }
             });
+            if pushed.get() {
+                e.recent_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
         }
-        e.recent_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

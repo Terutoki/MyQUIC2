@@ -337,11 +337,25 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 /// `try_get_with_by_ref`, all others wait and receive the same `Arc<[IpAddr]>`
 /// (or the same error). Cache warming happens inside the init future, and the
 /// per-`(host, port)` *positive* memo is written on every caller's return path
-/// — the `Ok` arm below runs for the init owner and every waiter alike — so a
-/// caller that observes the outcome also observes a warmed cache. A failed
+/// — `materialize_cached` runs for the init owner and every waiter alike — so
+/// a caller that observes the outcome also observes a warmed cache. A failed
 /// lookup is negatively cached (host verdict + this port's memo) inside the
 /// init, before the error is published to any waiter: the old publish-order
 /// contract, kept.
+///
+/// **Lookup order.** A warm positive entry is probed *first*: it is the common
+/// outcome for a name this process resolved in the last [`DNS_CACHE_TTL`], and
+/// it needs no negative verdict to disambiguate it. The positive and negative
+/// stores are disjoint by construction (a negative is only written by the
+/// single-flight init that ran because no positive entry existed, and a
+/// successful resolution clears it before publishing its entry — see
+/// `record_negative` and `seed_positive`), so probing positive first cannot
+/// serve an address for a refused name. The negative probe then runs only on a
+/// positive miss, where it keeps its job: refuse a known-bad name without
+/// touching the single-flight machinery. This removes one hashed `moka` probe
+/// from every warm hit — the store's whole reason to exist is that the slow
+/// path should answer without an upstream query, and the warm hit is what the
+/// per-thread DNS memo falls back to for a new port or after its TTL.
 ///
 /// `Err` covers three cases with distinct meanings for the caller: a live
 /// negative entry ("dns negative cached" — a policy refusal), a genuine
@@ -369,11 +383,18 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
             &host_owned
         }
     };
-    // The negative check comes first: a known-bad name must be refused without
-    // touching the single-flight machinery, and (unlike a positive sentinel in
-    // the same keyspace) a present negative entry can never be returned by
-    // `try_get_with` as a resolution result. Host-keyed, so a verdict learned
-    // for one port refuses all of them.
+    // Warm positive hit: one cache probe, no single-flight, no negative probe
+    // (see the lookup-order note above). The init future writes this entry, so
+    // every TTL window's answer is already here for the callers that did not
+    // own the init; they just attach their own port and warm their thread memo.
+    if let Some((inserted, ips)) = positives().get(host_key).await {
+        return Ok(materialize_cached(memo_key, inserted, &ips, port));
+    }
+    // The negative check comes before the single-flight machinery: a known-bad
+    // name must be refused without spawning a resolution, and (unlike a
+    // positive sentinel in the same keyspace) a present negative entry can
+    // never be returned by `try_get_with` as a resolution result. Host-keyed,
+    // so a verdict learned for one port refuses all of them.
     //
     // Warm *this* thread's per-(host, port) memo with the verdict's remaining
     // life before bailing. Only the init that learned the failure memoized its
@@ -423,34 +444,51 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         })
         .await;
     match outcome {
-        Ok((inserted, ips)) => {
-            // Materialize this call's `SocketAddr`s: the shared entry is
-            // port-free, so the port is attached last, when the answer is
-            // returned. Attaching it does not reorder the set — the init path
-            // already sorted it preferred-family-first.
-            let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
-            // Warm *this* thread's memo even on a shared-cache **hit**. The
-            // init future above is the only writer for a given TTL, and moka
-            // runs it once per key on whichever thread missed first — so
-            // without this a caller that finds the entry already in moka still
-            // reads `lookup_cached_fast*` as `Unknown` and takes the slow path
-            // again. On the server's UDP ingress that slow path is a spawned
-            // resolver task *per datagram* for a domain target (see
-            // `forward_server_dgram`), which is precisely the per-packet cost
-            // the session destination memo and the connection pin exist to
-            // remove. Never extends the entry's own deadline. On a host-keyed
-            // hit for a *new* port this is what makes that port answerable by
-            // the sync probe from now on.
-            if let Some(first) = addrs.first().copied() {
-                let deadline = inserted + DNS_CACHE_TTL;
-                if deadline > Instant::now() {
-                    memo_put(memo_key, Some(first), deadline);
-                }
-            }
-            Ok(Arc::from(addrs))
-        }
+        // The init owner and every single-flight waiter land here; the helper
+        // also runs for the warm-hit arm above, so the port attachment and the
+        // per-thread memo write can never drift between the two paths.
+        Ok((inserted, ips)) => Ok(materialize_cached(memo_key, inserted, &ips, port)),
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
+}
+
+/// Attach the caller's port to a cached, port-free address set and warm this
+/// thread's per-`(host, port)` memo from the entry's own deadline.
+///
+/// The shared positive entry is keyed by the host alone and stores only
+/// [`IpAddr`]s, so the port is attached last, when the answer is returned.
+/// Attaching it does not reorder the set — the init path already sorted it
+/// preferred-family-first.
+///
+/// The memo write is what makes the *next* datagram answerable by the sync
+/// probe ([`lookup_cached_fast`]). Moka runs the init once per key on whichever
+/// thread missed first, so a caller that merely finds the entry warm in moka
+/// would otherwise keep reading the memo as `Unknown` and take the slow path
+/// again: on the server's UDP ingress that is a spawned resolver task *per
+/// datagram* for a domain target (see `forward_server_dgram`), which is exactly
+/// the per-packet cost the session destination memo and the connection pin
+/// exist to remove. A host-keyed hit for a *new* port is what makes that port
+/// answerable by the sync probe from now on. The deadline is clamped to the
+/// entry's remaining life (never extended).
+fn materialize_cached(
+    memo_key: &str,
+    inserted: Instant,
+    ips: &[IpAddr],
+    port: u16,
+) -> Arc<[SocketAddr]> {
+    // Collect straight into the `Arc<[SocketAddr]>` slice: the `FromIterator`
+    // impl sizes and fills one allocation, where the previous
+    // `Vec` + `Arc::from(vec)` shape allocated twice and copied once for a
+    // value the caller only ever iterates (and usually only reads the first
+    // address of).
+    let addrs: Arc<[SocketAddr]> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+    if let Some(first) = addrs.first().copied() {
+        let deadline = inserted + DNS_CACHE_TTL;
+        if deadline > Instant::now() {
+            memo_put(memo_key, Some(first), deadline);
+        }
+    }
+    addrs
 }
 
 /// Seed the positive cache as if `host:port` had just resolved to `addr`.
@@ -858,6 +896,42 @@ mod tests {
         assert!(
             negatives().get(host).await.is_none(),
             "a success must not leave a negative entry"
+        );
+    }
+
+    /// The warm-hit lookup order (positive probe *before* the negative verdict)
+    /// is only sound because one name can never hold a positive and a negative
+    /// entry at once. Pin that invariant: if it ever broke, the warm path would
+    /// serve an address for a name the negative store still refuses.
+    #[tokio::test]
+    async fn positive_and_negative_stores_are_disjoint_per_name() {
+        let host = "disjoint.resolve.test";
+        let port = 19_761u16;
+        assert!(
+            positives().get(host).await.is_none() && negatives().get(host).await.is_none(),
+            "premise: a cold name starts in neither store"
+        );
+        dns_neg_cache_seed(host, port).await;
+        assert!(
+            negatives().get(host).await.is_some() && positives().get(host).await.is_none(),
+            "a failed resolution writes the negative store only"
+        );
+        let addr: SocketAddr = "203.0.113.77:19761".parse().unwrap();
+        dns_cache_seed(host, port, addr).await;
+        assert!(
+            negatives().get(host).await.is_none(),
+            "a successful resolution clears the negative verdict"
+        );
+        assert!(
+            positives().get(host).await.is_some(),
+            "the success is the only entry left for the name"
+        );
+        // The warm positive-first arm must serve that entry, port attached.
+        assert_eq!(
+            &resolve_all_cached(host, port)
+                .await
+                .expect("warm positive hit")[..],
+            &[addr]
         );
     }
 

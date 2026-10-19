@@ -112,6 +112,7 @@ pub use udp::{
     SendFrame, UdpWriteDrop, batch_backend, batch_report, burst_msg_copy, record_drain_batch,
     record_extra_syscalls, record_send_group, recv_burst, recvmmsg_available, send_udp_datagram,
     sendmmsg_available, try_send_datagram, udp_try_send, udp_try_send_grouped, udp_try_send_slice,
+    with_burst_msg,
 };
 // `pub(crate)` re-exports for the unit tests below (`use super::*`); unused in
 // the non-test build.
@@ -306,17 +307,34 @@ fn parse_off_flag(v: Option<&str>) -> bool {
 
 /// Per-session / relay sockets: see [`SESS_SOCKET_BUF`] / [`sess_socket_buf`].
 pub fn udp_socket_dual_small(bind: &str) -> Result<std::net::UdpSocket> {
-    udp_socket_dual_with_size(bind, sess_socket_buf())
+    udp_socket_dual_small_addr(bind.parse()?)
+}
+
+/// Per-session / relay sockets addressed by [`SocketAddr`].
+///
+/// Same contract as [`udp_socket_dual_small`], but for a caller that already
+/// holds the address it wants to bind: it removes the `SocketAddr` →
+/// `String` (format) → `parse` round trip that the string form forces on the
+/// per-association client relay path.
+pub fn udp_socket_dual_small_addr(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    udp_socket_dual_impl_addr(addr, sess_socket_buf(), false)
 }
 
 /// Dual-stack UDP socket with an explicit buffer size. See
-/// [`udp_socket_dual_impl`] for the socket's contract.
+/// [`udp_socket_dual_impl_addr`] for the socket's contract.
 pub fn udp_socket_dual_with_size(bind: &str, buf: usize) -> Result<std::net::UdpSocket> {
     udp_socket_dual_impl(bind, buf, false)
 }
 
 fn udp_socket_dual_impl(bind: &str, buf: usize, reuse_port: bool) -> Result<std::net::UdpSocket> {
-    let addr: SocketAddr = bind.parse()?;
+    udp_socket_dual_impl_addr(bind.parse()?, buf, reuse_port)
+}
+
+fn udp_socket_dual_impl_addr(
+    addr: SocketAddr,
+    buf: usize,
+    reuse_port: bool,
+) -> Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv6() {
         socket2::Domain::IPV6
     } else {
@@ -338,7 +356,7 @@ fn udp_socket_dual_impl(bind: &str, buf: usize, reuse_port: bool) -> Result<std:
     ))]
     if reuse_port {
         rustix::net::sockopt::set_socket_reuseport(&s, true)
-            .map_err(|e| anyhow::anyhow!("SO_REUSEPORT on {bind}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("SO_REUSEPORT on {addr}: {e}"))?;
     }
     #[cfg(not(all(
         unix,
@@ -352,45 +370,198 @@ fn udp_socket_dual_impl(bind: &str, buf: usize, reuse_port: bool) -> Result<std:
         let _ = reuse_port;
     }
     s.set_nonblocking(true)?;
+    // The buffer requests are always made: they are per-fd options. Only the
+    // *diagnostics* that used to follow them are process-cached, see
+    // [`probe_udp_socket_buffers`].
     if s.set_send_buffer_size(buf).is_err() {
         tracing::debug!("udp send buffer {buf} unavailable (raise net.core.wmem_max)");
     }
     if s.set_recv_buffer_size(buf).is_err() {
         tracing::debug!("udp recv buffer {buf} unavailable (raise net.core.rmem_max)");
     }
-    // Linux caps a plain SO_*BUF request at net.core.{r,w}mem_max (OpenWrt
-    // ships ~208 KiB). When that happened and the process holds
-    // CAP_NET_ADMIN — the norm for an OpenWrt service running as root — retry
-    // through SO_*BUFFFORCE, which ignores the sysctl. Best-effort: without
-    // the capability the retry fails EPERM and the clamp warning below still
-    // names the sysctl to raise.
-    #[cfg(target_os = "linux")]
-    {
-        let short = |actual: Option<usize>| actual.is_some_and(|a| a < buf);
-        if short(s.send_buffer_size().ok()) || short(s.recv_buffer_size().ok()) {
-            force_udp_buffers(&s, buf);
-        }
-    }
-    // Linux/macOS silently clamp to net.core.{w,r}mem_max; surface the real
-    // value once per process — these calls run for every UDP session socket,
-    // so warning per socket would flood the log on routers with default
-    // (small) rmem_max/wmem_max.
-    if let Ok(actual) = s.send_buffer_size()
-        && actual < buf
-    {
-        warn_buf_clamped("send", actual, buf);
-    }
-    if let Ok(actual) = s.recv_buffer_size()
-        && actual < buf
-    {
-        warn_buf_clamped("recv", actual, buf);
-    }
+    probe_udp_socket_buffers(&s, buf);
     s.bind(&addr.into())?;
     // Linux-only, best-effort socket tuning (see `linux::tune_udp_socket`):
     // busy polling when `MYQUIC2_BUSY_POLL` opted in, applied to every UDP
     // socket this crate creates — QUIC endpoints, relay and session sockets.
     linux::tune_udp_socket(&s);
     Ok(s.into())
+}
+
+/// Process-wide verdict on one UDP buffer-size request, learned from the first
+/// socket of that size and reused by every later one.
+///
+/// The kernel's clamp is `net.core.{w,r}mem_max` (a per-netns sysctl) plus, on
+/// the forcing path, whether the process holds `CAP_NET_ADMIN` — both are
+/// identical for every socket the process creates, so re-reading
+/// `SO_SNDBUF`/`SO_RCVBUF` on each new session socket paid 4-5 `getsockopt`s
+/// per new flow to re-learn an answer that cannot change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufVerdict {
+    /// The plain `SO_SNDBUF` request read back below the request.
+    send_clamped: bool,
+    /// The plain `SO_RCVBUF` request read back below the request.
+    recv_clamped: bool,
+    /// `SO_*BUFFFORCE` lifted both clamped directions to the request
+    /// (`CAP_NET_ADMIN` present). Only meaningful when [`Self::clamped`];
+    /// always false off Linux and when the capability is missing.
+    force_ok: bool,
+}
+
+impl BufVerdict {
+    /// A request is clamped if either direction comes back short.
+    #[inline]
+    fn clamped(self) -> bool {
+        self.send_clamped || self.recv_clamped
+    }
+
+    /// Whether a later socket of the same size must re-apply the force.
+    ///
+    /// `SO_*BUFFFORCE` is per-fd, so a size whose plain request is clamped
+    /// still needs the force on every new socket; a force that failed once
+    /// (no `CAP_NET_ADMIN`) is not retried — that is the two syscalls per
+    /// session socket the cache exists to remove.
+    #[inline]
+    fn needs_force(self) -> bool {
+        self.clamped() && self.force_ok
+    }
+}
+
+/// Pure first-socket classifier: `None` means the `getsockopt` failed, which is
+/// not evidence of a clamp (same `is_some_and` rule the old inline code used,
+/// so a kernel that merely refuses one read cannot page an operator).
+fn classify_buf_verdict(
+    buf: usize,
+    send_actual: Option<usize>,
+    recv_actual: Option<usize>,
+) -> BufVerdict {
+    let short = |actual: Option<usize>| actual.is_some_and(|a| a < buf);
+    BufVerdict {
+        send_clamped: short(send_actual),
+        recv_clamped: short(recv_actual),
+        force_ok: false,
+    }
+}
+
+/// Which process-wide probe slot a buffer size uses.
+///
+/// Only the two sizes production asks for are cached: the per-session/relay
+/// buffer ([`sess_socket_buf`], the per-new-flow hot path this exists for) and
+/// the QUIC endpoint buffer ([`ENDPOINT_SOCKET_BUF`], created once per
+/// endpoint). An arbitrary [`udp_socket_dual_with_size`] value keeps the full
+/// per-socket diagnostics — correct, just uncached; only tests and embedders
+/// reach it.
+fn buf_probe_slot(buf: usize) -> Option<&'static std::sync::OnceLock<BufVerdict>> {
+    static SESSION: std::sync::OnceLock<BufVerdict> = std::sync::OnceLock::new();
+    static ENDPOINT: std::sync::OnceLock<BufVerdict> = std::sync::OnceLock::new();
+    if buf == sess_socket_buf() {
+        Some(&SESSION)
+    } else if buf == ENDPOINT_SOCKET_BUF {
+        Some(&ENDPOINT)
+    } else {
+        None
+    }
+}
+
+/// Read both effective buffer sizes back; `None` when `getsockopt` failed.
+fn udp_socket_buffer_actual(s: &socket2::Socket) -> (Option<usize>, Option<usize>) {
+    (s.send_buffer_size().ok(), s.recv_buffer_size().ok())
+}
+
+/// Learn (once per process and buffer size) whether this host clamps a UDP
+/// buffer request, apply `SO_*BUFFFORCE` when the request is clamped and the
+/// capability is there, and warn once per direction if it stayed clamped.
+///
+/// First socket of a cached size pays the diagnostic reads (and the force when
+/// needed); every later socket of that size skips them entirely. A force that
+/// is known to work is re-applied per socket — it is a per-fd option — while a
+/// force that is known to fail is not retried. On Linux this removes up to
+/// 4-6 `getsockopt`/`setsockopt` calls from every new session/association
+/// socket; pre-change the same diagnostics ran per socket even though their
+/// answer is a per-netns + per-process constant.
+///
+/// Runtime `net.core.*mem_max` changes are not observed after the first
+/// socket of a size: the verdict is a process-lifetime cache, like the
+/// `MYQUIC2_SESS_SOCKET_BUF` override. A restart is what applies a sysctl
+/// change, which is the deployment model the clamp warning already names.
+fn probe_udp_socket_buffers(s: &socket2::Socket, buf: usize) {
+    let slot = buf_probe_slot(buf);
+    if let Some(cached) = slot.and_then(|slot| slot.get().copied()) {
+        // `SO_*BUFFFORCE` is a per-fd option: a size whose plain request the
+        // kernel clamps still needs the force on every new socket. A force
+        // that failed once (no `CAP_NET_ADMIN`) is never retried.
+        #[cfg(target_os = "linux")]
+        {
+            if cached.needs_force() {
+                force_udp_buffers(s, buf);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            debug_assert!(
+                !cached.needs_force(),
+                "SO_*BUFFFORCE is Linux-only; a non-Linux verdict must never ask for it"
+            );
+            let _ = cached;
+        }
+        return;
+    }
+    let (send_actual, recv_actual) = udp_socket_buffer_actual(s);
+    // `mut` is only needed by the Linux force path; keeping the declaration
+    // unconditional avoids cfg-splitting this whole block.
+    #[allow(unused_mut)]
+    let mut verdict = classify_buf_verdict(buf, send_actual, recv_actual);
+    // Linux caps a plain SO_*BUF request at net.core.{r,w}mem_max (OpenWrt
+    // ships a small rmem_max). When that happened and the process holds
+    // CAP_NET_ADMIN — the norm for an OpenWrt service running as root — retry
+    // through SO_*BUFFFORCE, which ignores the sysctl. Best-effort: without
+    // the capability the retry fails EPERM and the clamp warning below still
+    // names the sysctl to raise.
+    #[cfg(target_os = "linux")]
+    {
+        if verdict.clamped() {
+            force_udp_buffers(s, buf);
+            let (send_after, recv_after) = udp_socket_buffer_actual(s);
+            verdict.force_ok = !classify_buf_verdict(buf, send_after, recv_after).clamped();
+            // Warn from the post-force read: a host where the force worked must
+            // not warn (that is the old behaviour — the warning is for a
+            // request the process could not get). The pre-cache code did these
+            // same reads on every socket; only the first one per size does now.
+            if let Some(actual) = send_after
+                && actual < buf
+            {
+                warn_buf_clamped("send", actual, buf);
+            }
+            if let Some(actual) = recv_after
+                && actual < buf
+            {
+                warn_buf_clamped("recv", actual, buf);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if verdict.clamped() {
+            // No SO_*BUFFFORCE off Linux: the clamp is reported, never forced.
+            debug_assert!(
+                !verdict.force_ok,
+                "force_ok is only set on the Linux force path"
+            );
+            if let Some(actual) = send_actual
+                && actual < buf
+            {
+                warn_buf_clamped("send", actual, buf);
+            }
+            if let Some(actual) = recv_actual
+                && actual < buf
+            {
+                warn_buf_clamped("recv", actual, buf);
+            }
+        }
+    }
+    if let Some(slot) = slot {
+        let _ = slot.set(verdict);
+    }
 }
 
 fn warn_buf_clamped(which: &str, actual: usize, want: usize) {
@@ -534,6 +705,100 @@ mod tests {
         assert_eq!(clamp_sess_socket_buf(usize::MAX), SESS_SOCKET_BUF_MAX);
         assert_eq!(clamp_sess_socket_buf(96 * 1024), 96 * 1024);
         assert_eq!(SESS_SOCKET_BUF, 64 * 1024);
+    }
+
+    /// The process-level buffer probe classifies each direction on its own and
+    /// never treats a failed `getsockopt` as a clamp: the pre-cache code used
+    /// `is_some_and`, so a read error was already "not short", and a spurious
+    /// warning here would page operators about a clamp that is not there.
+    #[test]
+    fn buf_verdict_classifies_each_direction_and_ignores_read_errors() {
+        let send_only = classify_buf_verdict(64 * 1024, Some(16 * 1024), Some(128 * 1024));
+        assert!(send_only.send_clamped && !send_only.recv_clamped);
+        assert!(
+            send_only.clamped(),
+            "either short direction clamps the request"
+        );
+        assert!(
+            !send_only.needs_force(),
+            "a plain clamp is not a successful force"
+        );
+
+        let both_ok = classify_buf_verdict(64 * 1024, Some(128 * 1024), Some(128 * 1024));
+        assert!(!both_ok.clamped() && !both_ok.needs_force());
+
+        let unknown = classify_buf_verdict(4096, None, None);
+        assert!(
+            !unknown.clamped(),
+            "a failed read-back is not evidence of a clamp"
+        );
+
+        let forced = BufVerdict {
+            send_clamped: true,
+            recv_clamped: false,
+            force_ok: true,
+        };
+        assert!(
+            forced.needs_force(),
+            "a clamp with a working force must re-apply it per socket"
+        );
+        assert_eq!(
+            forced,
+            BufVerdict {
+                send_clamped: true,
+                recv_clamped: false,
+                force_ok: true
+            }
+        );
+    }
+
+    /// The cache covers exactly the sizes production creates: the per-session
+    /// buffer (per new flow) and the QUIC endpoint buffer (once per endpoint).
+    /// An arbitrary explicit size is deliberately uncached — its diagnostics
+    /// keep the pre-change cost and behaviour.
+    #[test]
+    fn buf_probe_cache_slots_cover_the_production_sizes() {
+        assert!(
+            buf_probe_slot(sess_socket_buf()).is_some(),
+            "the per-session size is the per-new-flow hot path"
+        );
+        assert!(
+            buf_probe_slot(ENDPOINT_SOCKET_BUF).is_some(),
+            "the QUIC endpoint buffer is cached for its repeated startup binds"
+        );
+        assert!(
+            buf_probe_slot(sess_socket_buf() + 1).is_none(),
+            "an arbitrary udp_socket_dual_with_size keeps the uncached path"
+        );
+        if sess_socket_buf() != ENDPOINT_SOCKET_BUF {
+            assert_ne!(
+                buf_probe_slot(sess_socket_buf()).map(std::ptr::from_ref),
+                buf_probe_slot(ENDPOINT_SOCKET_BUF).map(std::ptr::from_ref),
+                "distinct sizes must not share one verdict slot"
+            );
+        }
+    }
+
+    /// The address-taking session constructor must bind the same usable
+    /// dual-stack socket as the string form, and its second call (which takes
+    /// the cached-probe branch) must still produce a working socket.
+    #[test]
+    fn udp_socket_dual_small_addr_binds_like_the_string_form() {
+        let first = udp_socket_dual_small_addr("[::]:0".parse().unwrap())
+            .expect("first session socket (probe path)");
+        let string_form = udp_socket_dual_small("[::]:0").expect("string-form session socket");
+        let cached = udp_socket_dual_small_addr("[::]:0".parse().unwrap())
+            .expect("second session socket (cached-probe path)");
+        for s in [&first, &string_form, &cached] {
+            let local = s.local_addr().expect("bound address");
+            assert_eq!(local.ip(), "::".parse::<std::net::IpAddr>().unwrap());
+            assert_ne!(local.port(), 0, "the kernel must pick a real port");
+        }
+        // A v4 bind stays a v4 socket: the constructor keys the family off the
+        // address it was given and only the v6 wildcard goes dual-stack.
+        let v4 =
+            udp_socket_dual_small_addr("127.0.0.1:0".parse().unwrap()).expect("v4 session socket");
+        assert!(v4.local_addr().unwrap().is_ipv4());
     }
 
     /// `MYQUIC2_SHARD_RUNTIME` parsing: only the documented "off" spellings
@@ -1706,19 +1971,34 @@ mod tests {
     /// The counters must actually move, and `max_payload` must be a high-water
     /// mark rather than the most recent value — that is what makes it the
     /// empirical answer to "is the 8 KiB cap big enough here?".
+    ///
+    /// Also pins the batching contract of the two rarer counters: a
+    /// sub-threshold `fragmented`/`unsolicited` pending count must still be
+    /// published by a `snapshot` on the *counting* thread. That is what keeps a
+    /// one-event observation (and a reporter that runs on a relay thread) able
+    /// to see it; only the cross-thread case is subject to the documented 256
+    /// bound.
     #[test]
     fn udp_stats_records_payloads_and_sessions() {
         // Other tests drive `DgramFragmenter::send` concurrently, so assert
         // lower bounds rather than exact deltas.
         let before = udp_stats::snapshot();
         udp_stats::payload(1_472);
-        udp_stats::fragmented(3);
+        udp_stats::fragmented(3); // 1 pending: below the 256 flush threshold
         udp_stats::fragmented(1); // unfragmented: must not count
+        udp_stats::unsolicited(); // 1 pending: below the 256 flush threshold
         udp_stats::session();
         let after = udp_stats::snapshot();
         let d = after.since(&before);
         assert!(d.datagrams >= 1 && d.bytes >= 1_472);
-        assert!(d.fragmented >= 1);
+        assert!(
+            d.fragmented >= 1,
+            "a same-thread snapshot must flush the pending fragmented count"
+        );
+        assert!(
+            d.unsolicited >= 1,
+            "a same-thread snapshot must flush the pending unsolicited count"
+        );
         assert!(d.sessions >= 1);
         assert!(after.max_payload >= 1_472);
 

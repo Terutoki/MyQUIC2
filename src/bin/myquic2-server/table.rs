@@ -109,6 +109,22 @@ pub(crate) struct ShardedSessTable {
     /// conservative upper bound (removals only make it larger), so the gate is
     /// exact at the moment it matters; see `len_upper_bound`.
     pub(crate) inserts_since_sample: std::sync::atomic::AtomicUsize,
+    /// Per-connection DNS slow-path gate (see [`DnsGate`]): one spawned
+    /// resolver waiter per `(session, name, port)` instead of one per datagram.
+    pub(crate) dns_gate: DnsGate,
+    /// Live `SessEntry` count across all shards.
+    ///
+    /// `note_empty_state` used to answer "is this table empty?" by taking all
+    /// eight shard read locks and scanning them, and it runs on every insert
+    /// and every reader exit: eight locks per session create/teardown, on the
+    /// shard thread that also drives QUIC. The count is maintained by
+    /// [`Self::note_live_insert`] / [`Self::note_live_remove`], which callers
+    /// invoke while holding the affected shard's write guard (insert and every
+    /// removal already run under it), so the emptiness question is one relaxed
+    /// load. It only feeds the fair-share *holder denominator*: a transient
+    /// miscount can move a share, never a data path — the same failure surface
+    /// the old scan had when it raced a concurrent insert/removal.
+    pub(crate) live: std::sync::atomic::AtomicUsize,
 }
 
 impl ShardedSessTable {
@@ -122,6 +138,8 @@ impl ShardedSessTable {
             cached_len: std::sync::atomic::AtomicUsize::new(0),
             cached_len_ms: std::sync::atomic::AtomicU64::new(0),
             inserts_since_sample: std::sync::atomic::AtomicUsize::new(0),
+            live: std::sync::atomic::AtomicUsize::new(0),
+            dns_gate: DnsGate::new(),
         }
     }
 
@@ -139,21 +157,47 @@ impl ShardedSessTable {
     /// `8192 / (quic_conns + 1)` associations instead of the documented
     /// `MAX_UDP_ASSOCS`.
     ///
-    /// Must be called with **no** guard on any of `self.shards` held —
-    /// `is_empty()` takes the shard read locks, and `parking_lot::RwLock` is
-    /// not reentrant. Two concurrent calls can transiently mis-count by one (the
-    /// emptiness check and the `counted` swap are not one atomic step); the
-    /// error self-corrects on the next insert/removal and only ever moves the
-    /// share, never a data path.
+    /// Lock-free: the emptiness question is one relaxed load of the table's
+    /// [`Self::live`] count (the eight-shard scan this used to take ran on every
+    /// insert and every reader exit). Two concurrent calls can still transiently
+    /// mis-count by one (the load and the `counted` swap are not one atomic
+    /// step); the error self-corrects on the next insert/removal and only ever
+    /// moves the share, never a data path.
     pub(crate) fn note_empty_state(&self) {
         use std::sync::atomic::Ordering;
-        let any = self.shards.iter().any(|sh| !sh.read().is_empty());
+        let any = self.live.load(Ordering::Relaxed) > 0;
         if any {
             if !self.counted.swap(true, Ordering::AcqRel) {
                 session_holders().fetch_add(1, Ordering::AcqRel);
             }
         } else if self.counted.swap(false, Ordering::AcqRel) {
             session_holders().fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// One entry was inserted into a shard.
+    ///
+    /// Must be called **under that shard's write guard**, after the `insert` and
+    /// before the guard is dropped: a concurrent remover only ever observes the
+    /// entry after taking the same lock, so it finds the count already
+    /// incremented and the saturating subtraction below can never underflow.
+    pub(crate) fn note_live_insert(&self) {
+        self.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// `n` entries were removed from a shard (call under its write guard, or
+    /// immediately after the guard-protected removal completed).
+    ///
+    /// Saturating on purpose: a future refactor that misses a matching insert
+    /// must not wrap the count into "always non-empty", which would leak the
+    /// table into the process-wide holder denominator forever.
+    pub(crate) fn note_live_remove(&self, n: usize) {
+        if n != 0 {
+            let _ = self.live.try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| Some(v.saturating_sub(n)),
+            );
         }
     }
 
@@ -236,7 +280,11 @@ impl ShardedSessTable {
     pub(crate) fn drain_all(&self) -> Vec<SessEntry> {
         let mut out = Vec::new();
         for sh in &self.shards {
-            out.extend(sh.write().drain().map(|(_, v)| v));
+            let mut w = sh.write();
+            let n = w.len();
+            let drained: Vec<SessEntry> = w.drain().map(|(_, v)| v).collect();
+            self.note_live_remove(n);
+            out.extend(drained);
         }
         self.note_empty_state();
         out
@@ -259,7 +307,9 @@ impl ShardedSessTable {
                 continue;
             }
             let mut m = sh.write();
-            out.extend(take_idle(&mut m, &expired, now));
+            let evicted = take_idle(&mut m, &expired, now);
+            self.note_live_remove(evicted.len());
+            out.extend(evicted);
         }
         self.note_empty_state();
         out

@@ -167,6 +167,26 @@ pub(crate) fn send_udp_datagram_with_prefix(
     send_encoded(conn, d)
 }
 
+/// Book one DATAGRAM dropped because quinn's outgoing DATAGRAM buffer is full.
+///
+/// The single accounting site for `Blocked`: [`send_encoded`] reaches it from
+/// quinn's verdict on a frame, and
+/// [`DgramFragmenter::send`](crate::udp::DgramFragmenter) reaches it from the
+/// aggregate space pre-check that drops a multi-frame payload whole instead of
+/// queueing a prefix that the peer can never reassemble (see the gate in
+/// `fragmenter.rs`). One bump per lost payload either way — the pre-checked
+/// drop owns the frame that would have failed first, so the two paths are
+/// mutually exclusive.
+pub(crate) fn note_send_buffer_full() {
+    let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+    warn_datagram_drop(
+        DatagramDropKind::BufferFull,
+        "send buffer full",
+        n,
+        String::new,
+    );
+}
+
 /// Queue an already-encoded datagram body, counting a full send buffer.
 ///
 /// This is also the only place that sees quinn's own verdict on a body the
@@ -178,13 +198,7 @@ pub(crate) fn send_udp_datagram_with_prefix(
 pub(crate) fn send_encoded(conn: &quinn::Connection, body: Bytes) -> DatagramSend {
     let outcome = try_send_datagram(conn, body);
     if outcome == DatagramSend::Blocked {
-        let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-        warn_datagram_drop(
-            DatagramDropKind::BufferFull,
-            "send buffer full",
-            n,
-            String::new,
-        );
+        note_send_buffer_full();
     } else if outcome == DatagramSend::TooLarge {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
         warn_datagram_drop(
@@ -248,6 +262,16 @@ pub struct PayloadSend {
     /// The failure that stopped the send, if it did not complete. A partially
     /// sent payload is *not* rolled back: the peer discards it on reassembly
     /// timeout, which is the UDP answer to a lost fragment.
+    ///
+    /// A multi-frame payload is gated on the *aggregate* outgoing DATAGRAM
+    /// space before its first frame (see [`DgramFragmenter::send`]), so a full
+    /// send buffer drops it whole (`frames == 0`) instead of queueing frames
+    /// that can never reassemble. A prefix can still be queued only when the
+    /// gate's reading is invalidated by a concurrent sender on the same
+    /// connection between the probe and the frames, or on the first
+    /// fragmented payload after the buffer became full.
+    ///
+    /// [`DgramFragmenter::send`]: crate::udp::DgramFragmenter::send
     pub failed: Option<DatagramSend>,
 }
 
