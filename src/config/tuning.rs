@@ -125,11 +125,11 @@ pub const MAX_UDP_ASSOCS: usize = 4032;
 /// [`default_quic_endpoints`] for the real rule. The cap bounds the kernel
 /// receive-buffer footprint (`cap × rmem_max`) and the per-endpoint driver
 /// wakeups an overloaded host pays; past it the extra parallelism is better
-/// spent on per-connection tasks. Sized to the same order as the client's
-/// connection fan-out (`MAX_POOL_CONNS`, 16): on Linux the default is already
-/// one endpoint per usable core, so the cap only binds on hosts with more than
-/// 16 cores (and bounds what an explicit `quic_endpoints` may request).
-pub const MAX_QUIC_ENDPOINTS: usize = 16;
+/// spent on per-connection tasks. Sized to half the client's TCP pool cap
+/// (`MAX_POOL_CONNS`, 16): on Linux the default is already one
+/// endpoint per usable core, so the cap only binds on hosts with more than
+/// 8 cores (and bounds what an explicit `quic_endpoints` may request).
+pub const MAX_QUIC_ENDPOINTS: usize = 8;
 
 /// Default [`ServerConf::quic_endpoints`] when the key is unset.
 ///
@@ -170,22 +170,27 @@ pub const INITIAL_RTT_MS_MIN: u64 = 1;
 pub const INITIAL_RTT_MS_MAX: u64 = 3_000;
 
 /// Default path MTU (max UDP payload) every new connection starts from before
-/// PMTU discovery runs, in bytes.
+/// PMTU discovery runs, in bytes: the 1200-byte QUIC floor, the smallest start
+/// a QUIC endpoint may use.
 ///
-/// quinn's default is the 1200-byte QUIC floor, and its discovery is
-/// opportunistic: probes are only emitted from a transmit poll that builds
-/// no payload packet (`quinn-proto connection/mod.rs`), so a busy connection
-/// can spend a long time at whatever value it started at. Starting at 1360
-/// removes most of that ramp and is safe on tunnel paths too: 1360 B of
-/// payload is 1388 wire bytes with IPv4+UDP overhead and 1408 with IPv6+UDP,
-/// both inside the 1420-byte WireGuard interface MTU (and inside PPPoE's 1492
-/// and a 1500-byte Ethernet MTU). It is not a claim that every path is 1500:
-/// operators on a known 1500-byte Ethernet path can raise `initial_mtu` to
-/// 1400 or 1472. A path smaller than the configured start is handled by
-/// quinn's black-hole detector, which resets to `min_mtu` (1200) on
-/// suspicious loss.
-pub const DEFAULT_INITIAL_MTU: u16 = 1360;
-/// Lower clamp for `initial_mtu`: the QUIC minimum.
+/// QUIC cannot go below 1200: Initial packets are padded to at least 1200 B,
+/// smaller ones must be discarded, and `max_udp_payload_size` is only legal
+/// down to 1200 — quinn's `TransportConfig::initial_mtu()` raises anything
+/// lower, as does this crate's `initial_mtu_from`. Staying at the floor costs
+/// throughput until discovery climbs: quinn's PMTU discovery is opportunistic
+/// (probes are only emitted from a transmit poll that builds no payload packet,
+/// `quinn-proto connection/mod.rs`), so a busy connection can sit at 1200 for a
+/// long time — ~18-23% more packets, and every UDP payload above 1150 B splits
+/// into two MQP-2 fragments (the DATAGRAM budget is 1162 B at 1200).
+///
+/// A deployment whose path is known should raise it: 1360 B of payload is 1388
+/// wire bytes with IPv4+UDP overhead and 1408 with IPv6+UDP, both inside the
+/// 1420-byte WireGuard interface MTU (and inside PPPoE's 1492 and a 1500-byte
+/// Ethernet MTU); a known 1500-byte Ethernet path can use 1400 or 1472. A
+/// configured start above the real path is handled by quinn's black-hole
+/// detector, which resets to `min_mtu` (1200) on suspicious loss.
+pub const DEFAULT_INITIAL_MTU: u16 = 1200;
+/// Lower clamp for `initial_mtu`: the QUIC minimum, and the shipped default.
 pub const INITIAL_MTU_MIN: u16 = 1200;
 /// Upper clamp for `initial_mtu`: quinn's default endpoint
 /// `max_udp_payload_size` (1500 - 28). Larger values would only be a typo.
@@ -210,9 +215,9 @@ pub struct TransportTuning {
     /// steady state re-measures and ignores the seed.
     pub initial_rtt: Duration,
     /// Path MTU (max UDP payload) a connection uses before PMTU discovery
-    /// starts, in bytes: `INITIAL_MTU_MIN..=INITIAL_MTU_MAX`. See
-    /// [`DEFAULT_INITIAL_MTU`] for why starting above quinn's 1200-byte floor
-    /// is a direct latency/throughput win.
+    /// starts, in bytes: `INITIAL_MTU_MIN..=INITIAL_MTU_MAX`. The default is
+    /// the 1200-byte QUIC floor; see [`DEFAULT_INITIAL_MTU`] for what starting
+    /// at the floor costs and how to raise it on a known path.
     pub initial_mtu: u16,
 }
 

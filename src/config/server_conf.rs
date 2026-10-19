@@ -33,6 +33,27 @@ pub struct ServerConf {
     pub keep_alive_secs: u64,
     #[serde(default = "d_false")]
     pub allow_private: bool,
+    /// Full-cone NAT semantics for the per-association UDP relay.
+    ///
+    /// When `true`, a session's unconnected relay socket accepts and forwards
+    /// replies from **any** source address, not just the hosts this session has
+    /// sent to. That gives the client app the endpoint-independent filtering of
+    /// a full-cone NAT: a peer can initiate to the endpoint the app discovered
+    /// (e.g. via STUN through the tunnel) without the app having sent to that
+    /// peer first — the shape P2P games, WebRTC and peer-hosted sessions need.
+    ///
+    /// Off by default, because it exposes each client app's UDP endpoint to
+    /// unsolicited internet traffic (the relay becomes an ingress path into
+    /// that app) and because peers reaching the relay's ephemeral port are
+    /// outside the `auth_token` boundary. It only takes effect if the server's
+    /// relay UDP ports are actually reachable from those peers: a public server
+    /// whose host firewall or cloud security group drops high UDP ports does
+    /// **not** gain full-cone reachability from this flag alone.
+    ///
+    /// This relaxes the inbound reply filter only: [`Self::allow_private`]
+    /// still governs which *destinations* the server is willing to dial.
+    #[serde(default = "d_false")]
+    pub udp_full_cone: bool,
     /// Optional shared secret. When non-empty, every client must present it on
     /// connection setup; empty disables authentication (rely on network
     /// isolation / firewall).
@@ -81,13 +102,13 @@ pub struct ServerConf {
     #[serde(default)]
     pub initial_rtt_ms: Option<u64>,
     /// Path MTU every new connection starts from, in bytes (clamped
-    /// 1200..=1472; default 1360). Mirror the client's value: the tunnel's
-    /// path is shared, and starting above quinn's 1200-byte floor removes the
-    /// 4-probe-RTT ramp every connection pays before it can send 1472-byte
-    /// packets. 1360 is 1388/1408 wire bytes after the IPv4/IPv6 + UDP
-    /// headers, so it is safe on WireGuard-1420 and similar tunnel paths;
-    /// operators on a known 1500-byte Ethernet path can set 1400 or 1472.
-    /// See `ClientConf::initial_mtu`.
+    /// 1200..=1472; default 1200, the QUIC floor, and values below 1200 are
+    /// raised to it). Mirror the client's value: the tunnel's path is shared,
+    /// and raising it above the floor removes the 4-probe-RTT ramp every
+    /// connection pays before it can send 1472-byte packets. 1360 is 1388/1408
+    /// wire bytes after the IPv4/IPv6 + UDP headers, so it is safe on
+    /// WireGuard-1420 and similar tunnel paths; operators on a known 1500-byte
+    /// Ethernet path can set 1400 or 1472. See `ClientConf::initial_mtu`.
     #[serde(default)]
     pub initial_mtu: Option<u16>,
     /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).

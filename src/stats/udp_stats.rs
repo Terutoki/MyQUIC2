@@ -16,6 +16,7 @@ static MAX_PAYLOAD: AtomicU64 = AtomicU64::new(0);
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
 static REASSEMBLY_EXPIRED: AtomicU64 = AtomicU64::new(0);
 static REASSEMBLY_EVICTED: AtomicU64 = AtomicU64::new(0);
+static UNSOLICITED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static L_DATAGRAMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -97,6 +98,22 @@ pub fn fragmented(frames: u8) {
     let _ = frames;
 }
 
+/// An inbound relay datagram admitted by the server's `udp_full_cone` mode
+/// whose source is **not** on the session's recent-destination IP allowlist.
+///
+/// This is the unsolicited ingress a full-cone NAT forwards by definition. It
+/// is counted on the accepted (not dropped) path because the reader still
+/// classifies the source against the allowlist — every accepted reply is
+/// already in [`UdpSnapshot::datagrams`]; this counter separates the peer that
+/// answered from a peer that initiated, so a deployment can tell whether the
+/// exposure is actually being used. Always zero in the default
+/// (address-restricted) mode.
+pub fn unsolicited() {
+    stats_only! {
+        UNSOLICITED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A new UDP session (server) or SOCKS association (client) was established.
 pub fn session() {
     stats_only! {
@@ -145,6 +162,7 @@ pub fn snapshot() -> UdpSnapshot {
         fragmented: FRAGMENTED.load(Ordering::Relaxed),
         max_payload: MAX_PAYLOAD.load(Ordering::Relaxed),
         sessions: SESSIONS.load(Ordering::Relaxed),
+        unsolicited: UNSOLICITED.load(Ordering::Relaxed),
     }
 }
 
@@ -158,6 +176,9 @@ pub struct UdpSnapshot {
     /// maximum cannot be subtracted.
     pub max_payload: u64,
     pub sessions: u64,
+    /// Inbound replies admitted by `udp_full_cone` from sources this session had
+    /// never sent to (see [`unsolicited`]). Always zero in restricted mode.
+    pub unsolicited: u64,
 }
 
 impl UdpSnapshot {
@@ -170,6 +191,7 @@ impl UdpSnapshot {
             fragmented: self.fragmented.saturating_sub(prev.fragmented),
             max_payload: self.max_payload,
             sessions: self.sessions.saturating_sub(prev.sessions),
+            unsolicited: self.unsolicited.saturating_sub(prev.unsolicited),
         }
     }
 
@@ -188,6 +210,12 @@ impl std::fmt::Display for UdpSnapshot {
             self.datagrams,
             self.bytes as f64 / (1024.0 * 1024.0),
             self.fragmented
-        )
+        )?;
+        // Only in the opt-in mode, so the default 60 s relay line stays
+        // byte-identical to before the counter existed.
+        if self.unsolicited > 0 {
+            write!(f, ", {} unsolicited (full-cone)", self.unsolicited)?;
+        }
+        Ok(())
     }
 }

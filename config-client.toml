@@ -26,15 +26,16 @@ auth_token = ""
 # link, to shorten first-flight loss recovery (~575 -> ~435 ms first PTO).
 # initial_rtt_ms = 140
 # Path MTU (max UDP payload) every new connection starts from, bytes, default
-# 1360 (clamped 1200..=1472). quinn starts at the 1200-byte QUIC floor and its
-# PMTU discovery is opportunistic, so a busy connection can spend a long time
-# there: 18-23% more packets, and UDP payloads above 1150 B split into two MQP
-# fragments. 1360 is 1388/1408 wire bytes after the IP+UDP headers, so it is
-# safe on WireGuard-1420 and similar tunnel paths; on a known 1500-byte
-# Ethernet path set 1400 or 1472 (no discovery ramp, and 1420-byte UDP payloads
-# stay one frame at 1472). Mirror on both ends. A too-high value costs a loss
-# burst until quinn's black-hole detector drops back to the 1200-byte floor.
-# initial_mtu = 1360
+# 1200 = the QUIC floor (clamped 1200..=1472; lower values are raised to 1200,
+# since QUIC forbids smaller packets). PMTU discovery is opportunistic, so at
+# the default a busy connection sends 18-23% more packets and splits UDP
+# payloads above 1150 B into two MQP fragments. On a known path raise it: 1360
+# is 1388/1408 wire bytes after the IP+UDP headers, safe on WireGuard-1420 and
+# similar tunnels; a known 1500-byte Ethernet path can use 1400/1472 (no
+# discovery ramp, and 1420-byte UDP payloads stay one frame at 1472). Mirror
+# on both ends; a too-high value costs a loss burst until quinn's black-hole
+# detector drops back to 1200.
+# initial_mtu = 1400
 # Connection isolation (optional; omit = 4 TCP connections, the code default).
 # quic_conns=4 spreads bulk TCP round-robin across three bulk cwnds while
 # interactive_ports pin to the first. UDP is never one of those slots: it gets

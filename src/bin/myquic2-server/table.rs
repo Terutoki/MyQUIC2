@@ -59,8 +59,34 @@ pub(crate) type SessMap = HashMap<u32, SessEntry, foldhash::fast::RandomState>;
 
 pub(crate) const SESS_SHARDS: usize = 8;
 
+/// How a connection's session readers validate the source of inbound datagrams.
+///
+/// A session's relay socket is unconnected, so any host that reaches its
+/// ephemeral port could otherwise be forwarded to the client app as the
+/// target's answer. The shipped default is [`ReplyFilter::Restricted`]: only
+/// sources on the session's recent-destination IP list pass (an
+/// address-restricted cone; the port is deliberately not part of the key).
+///
+/// [`ReplyFilter::FullCone`] is the server's `udp_full_cone` opt-in: the relay
+/// accepts any source, which gives the client app the endpoint-independent
+/// filtering of a full-cone NAT — and exposes its UDP endpoint to unsolicited
+/// internet traffic, which is why it is off by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyFilter {
+    /// Only hosts this session has sent to may answer (default).
+    Restricted,
+    /// Any source may answer (`udp_full_cone = true`).
+    FullCone,
+}
+
 pub(crate) struct ShardedSessTable {
     pub(crate) shards: Vec<parking_lot::RwLock<SessMap>>,
+    /// Reply-source policy shared by every session in this table. A property of
+    /// the *connection* (the server-wide `udp_full_cone` is read once at startup
+    /// and snapshotted per connection at accept time): a changed config takes
+    /// effect after a server restart, and live connections keep the policy they
+    /// were accepted with.
+    pub(crate) reply_filter: ReplyFilter,
     /// Whether this table is currently counted in [`session_holders`]. Kept in
     /// step by [`ShardedSessTable::note_empty_state`] on every insert/removal
     /// that can change emptiness.
@@ -86,11 +112,12 @@ pub(crate) struct ShardedSessTable {
 }
 
 impl ShardedSessTable {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(reply_filter: ReplyFilter) -> Self {
         Self {
             shards: (0..SESS_SHARDS)
                 .map(|_| parking_lot::RwLock::new(SessMap::default()))
                 .collect(),
+            reply_filter,
             counted: std::sync::atomic::AtomicBool::new(false),
             cached_len: std::sync::atomic::AtomicUsize::new(0),
             cached_len_ms: std::sync::atomic::AtomicU64::new(0),

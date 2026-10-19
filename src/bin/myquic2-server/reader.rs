@@ -256,6 +256,7 @@ pub(crate) async fn sess_reader_task(
     last2: Arc<std::sync::atomic::AtomicU64>,
     recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
     recent_epoch: Arc<std::sync::atomic::AtomicU64>,
+    reply_filter: ReplyFilter,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -436,24 +437,42 @@ pub(crate) async fn sess_reader_task(
             let src = SocketAddr::new(unmap(src.ip()), src.port());
             // Reply-source validation: the socket is unconnected, so any source
             // that reaches the ephemeral port would otherwise be forwarded as the
-            // target's answer. Drop anything sent from a host this session never
-            // sent to (see `RecentAddrs`: the port is deliberately not part of the
-            // key, so a server answering from a different port still gets through).
-            // Epoch-gated mirror: the outbound path (and a spawned resolver
-            // task's foreign push) bumps `recent_epoch` on every allowlist
-            // mutation, so a steady flow validates against the task-local
-            // snapshot and only reloads it when something actually moved.
-            let epoch_now = recent_epoch.load(std::sync::atomic::Ordering::Relaxed);
-            if allow_epoch != epoch_now {
-                allow_snap = Some(recent.load_full());
-                allow_epoch = epoch_now;
-            }
-            let allowed = allow_snap
-                .as_ref()
-                .is_some_and(|r| !r.is_empty() && r.contains(&src));
-            if !allowed {
-                dgram_drops::bump(&dgram_drops::REFUSED);
-                continue;
+            // target's answer. The default drops anything sent from a host this
+            // session never sent to (see `RecentAddrs`: the port is deliberately
+            // not part of the key, so a server answering from a different port
+            // still gets through). `ReplyFilter::FullCone` (`udp_full_cone`) is
+            // the operator opt-in that behaves like a full-cone NAT's external
+            // endpoint — endpoint-independent filtering, any source admitted —
+            // which is what lets a peer initiate to a client app that has not
+            // sent to it yet.
+            //
+            // Full-cone still classifies the source against the allowlist (the
+            // same epoch-gated mirror, so a steady flow is one relaxed load plus
+            // the 16-slot scan): the classification only feeds the 60 s
+            // "unsolicited (full-cone)" counter. It is *not* a drop decision.
+            let on_allowlist = {
+                // Epoch-gated mirror: the outbound path (and a spawned resolver
+                // task's foreign push) bumps `recent_epoch` on every allowlist
+                // mutation, so a steady flow validates against the task-local
+                // snapshot and only reloads it when something actually moved.
+                let epoch_now = recent_epoch.load(std::sync::atomic::Ordering::Relaxed);
+                if allow_epoch != epoch_now {
+                    allow_snap = Some(recent.load_full());
+                    allow_epoch = epoch_now;
+                }
+                allow_snap
+                    .as_ref()
+                    .is_some_and(|r| !r.is_empty() && r.contains(&src))
+            };
+            if !on_allowlist {
+                if reply_filter == ReplyFilter::FullCone {
+                    // Admitted anyway; counted so an operator can see whether
+                    // (and how much) unsolicited traffic is actually arriving.
+                    udp_stats::unsolicited();
+                } else {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    continue;
+                }
             }
             // Reply batching: a small reply rides the run's BATCH frame
             // instead of its own DATAGRAM. A run is the consecutive replies
@@ -784,6 +803,7 @@ pub(crate) async fn get_or_create_sess(
         last_pre.clone(),
         recent_pre.clone(),
         recent_epoch.clone(),
+        ss.reply_filter,
     ));
     let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();

@@ -48,13 +48,14 @@ pub struct ClientConf {
     #[serde(default)]
     pub initial_rtt_ms: Option<u64>,
     /// Path MTU every new connection starts from, in bytes (clamped
-    /// 1200..=1472; default 1360). quinn starts at the 1200-byte QUIC floor
-    /// and PMTU discovery is opportunistic, so a busy connection can spend a
-    /// long time there: 18-23% more packets and every UDP payload above
-    /// 1150 B split into two MQP-2 fragments. 1360 keeps the wire size at
-    /// 1388 B (IPv4) / 1408 B (IPv6) after the IP+UDP headers, so it is safe
-    /// on WireGuard-1420 and similar tunnel paths; operators on a known
-    /// 1500-byte Ethernet path can raise it to 1400 or 1472 (zero discovery
+    /// 1200..=1472; default 1200, the QUIC floor). A configured value below
+    /// 1200 is raised to 1200 — QUIC forbids smaller packets. PMTU discovery
+    /// is opportunistic, so at the default a busy connection can spend a long
+    /// time at 1200: ~18-23% more packets and every UDP payload above 1150 B
+    /// split into two MQP-2 fragments. Raise it on a known path: 1360 keeps
+    /// the wire size at 1388 B (IPv4) / 1408 B (IPv6) after the IP+UDP
+    /// headers, so it is safe on WireGuard-1420 and similar tunnel paths; a
+    /// known 1500-byte Ethernet path can use 1400 or 1472 (zero discovery
     /// ramp, and 1420-byte UDP payloads stay a single frame at 1472).
     /// Mind the path when raising it: a too-high value costs a loss burst
     /// until quinn's black-hole detector resets to the 1200-byte floor.

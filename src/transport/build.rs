@@ -243,23 +243,23 @@ pub fn build_transport_tuned_class(
     let mut mtud = quinn::MtuDiscoveryConfig::default();
     mtud.upper_bound(1472);
     t.mtu_discovery_config(Some(mtud));
-    // Start at the configured path MTU instead of quinn's 1200-byte QUIC
-    // floor. The default start is 1360 B (DEFAULT_INITIAL_MTU), which is
-    // 1388/1408 wire bytes after the IPv4/IPv6 + UDP headers and therefore
-    // safe on WireGuard-1420 and similar tunnel paths; a known 1500-byte
-    // Ethernet path can raise it to 1400/1472. This is the other half of the
-    // PMTU story and the larger one: quinn's discovery is a binary search that
-    // needs one probe/ACK round trip per step (starting at the floor:
-    // 1200 -> 1336 -> 1404 -> 1438 -> 1472), and probes are only
-    // emitted from a transmit poll that builds no payload packet
-    // (`quinn-proto connection/mod.rs`), so a busy connection can sit at its
-    // start value for a long time. While it does, every packet carries up to
-    // ~19% fewer payload bytes and quinn's DATAGRAM budget is
+    // Start at the configured path MTU. The shipped default is the 1200-byte
+    // QUIC floor (`DEFAULT_INITIAL_MTU`) — the most conservative start a QUIC
+    // endpoint may use — and a deployment with a known path should raise it:
+    // 1360 B is 1388/1408 wire bytes after the IPv4/IPv6 + UDP headers and
+    // therefore safe on WireGuard-1420 and similar tunnel paths; a known
+    // 1500-byte Ethernet path can use 1400/1472. This is the larger half of the
+    // PMTU story: quinn's discovery is a binary search that needs one probe/ACK
+    // round trip per step (starting at the floor: 1200 -> 1336 -> 1404 -> 1438
+    // -> 1472), and probes are only emitted from a transmit poll that builds no
+    // payload packet (`quinn-proto connection/mod.rs`), so a busy connection can
+    // sit at its start value for a long time. While it does, every packet
+    // carries up to ~19% fewer payload bytes and quinn's DATAGRAM budget is
     // `mtu - 38` (1162 at 1200), so every UDP payload above 1150 B splits into
     // two MQP-2 fragments. `min_mtu` stays at the 1200-byte QUIC floor and
     // quinn's black-hole detector drops back to it if the configured start is
-    // larger than the real path, so a too-high value is a recoverable loss
-    // burst, not a wedge.
+    // larger than the real path, so a raised value is a recoverable loss burst,
+    // not a wedge.
     t.initial_mtu(tuning.initial_mtu);
     let keep_alive_secs = clamp_keep_alive(keep_alive_secs);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs)));

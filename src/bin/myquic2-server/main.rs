@@ -42,6 +42,19 @@ use crate::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Map the server config's `udp_full_cone` opt-in onto the session reply policy.
+///
+/// Pure so the config → policy edge (`udp_full_cone = true` ⇒
+/// [`ReplyFilter::FullCone`]) is pinned by a unit test below `main`, instead of
+/// being observable only through a live accept loop.
+fn reply_filter(c: &ServerConf) -> ReplyFilter {
+    if c.udp_full_cone {
+        ReplyFilter::FullCone
+    } else {
+        ReplyFilter::Restricted
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -273,6 +286,28 @@ async fn main() -> Result<()> {
     } else {
         info!("client token authentication enabled");
     }
+    if c.udp_full_cone {
+        warn!(
+            "udp_full_cone = true: every UDP association's relay socket forwards replies from \
+             ANY source (full-cone NAT semantics), so client apps' UDP endpoints accept \
+             unsolicited internet traffic: it is not covered by auth_token, there is no \
+             per-session inbound rate limit, and inbound traffic keeps the association alive; \
+             this only becomes externally reachable if the server's ephemeral relay UDP ports \
+             survive this host's firewall/NAT"
+        );
+        // Each half looks benign alone: full-cone admits any source, and
+        // allow_private lets a relay dial private/loopback destinations. Together
+        // they let an unsolicited or source-spoofed sender steer replies into
+        // local networks — the reflection shape a public exit node must not have.
+        if c.allow_private {
+            warn!(
+                "udp_full_cone + allow_private = true: an unsolicited or source-spoofed \
+                 datagram can make a client app reply toward private/loopback targets, so this \
+                 server can be steered to send UDP into local networks; keep allow_private = \
+                 false unless proxying those targets is the point"
+            );
+        }
+    }
     spawn_udp_reporter();
     // One accept loop per endpoint, all sharing the admission budgets — the
     // connection cap is process-wide, not per-endpoint. The loops are
@@ -285,6 +320,7 @@ async fn main() -> Result<()> {
         auth_token,
         auth_enabled,
         allow_private: c.allow_private,
+        reply_filter: reply_filter(&c),
         cap,
     });
     // Orderly-shutdown flag shared with every accept loop: closing an endpoint
@@ -512,6 +548,9 @@ struct AcceptState {
     auth_token: Arc<Vec<u8>>,
     auth_enabled: bool,
     allow_private: bool,
+    /// Reply-source policy for every session of every connection this process
+    /// admits (`udp_full_cone`): snapshot per connection at accept time.
+    reply_filter: ReplyFilter,
     /// Effective admission cap, for logs and `handle_conn`'s stream-pool share.
     cap: usize,
 }
@@ -574,6 +613,7 @@ async fn accept_loop(
             None
         };
         let allow_private = st.allow_private;
+        let reply_filter = st.reply_filter;
         let auth_token = st.auth_token.clone();
         // Read by `handle_conn` to size this connection's share of the
         // process-wide stream-task pool (a clone per accepted connection).
@@ -660,7 +700,9 @@ async fn accept_loop(
             // Authentication done: free the pre-auth slot so other new peers
             // can handshake while this connection lives on.
             drop(pending);
-            if let Err(e) = handle_conn(conn, allow_private, conn_limit_for_conn, cap).await {
+            if let Err(e) =
+                handle_conn(conn, allow_private, reply_filter, conn_limit_for_conn, cap).await
+            {
                 warn!("conn end: {e:#}");
             }
         });

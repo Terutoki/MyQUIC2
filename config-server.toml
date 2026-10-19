@@ -7,7 +7,7 @@ listen = "[::]:8443"
 # single member, so extra endpoints there only cost sockets — the server warns
 # when you ask for them anyway). Set 1 for the strict single socket.
 # Trade-off: a member is pinned by the client's 4-tuple, so a client NAT rebind
-# loses the connection (it redials) instead of migrating. Clamped to 1..=16.
+# loses the connection (it redials) instead of migrating. Clamped to 1..=8.
 # quic_endpoints = 4
 cert_file = "server-cert.pem"
 key_file = "server-key.pem"
@@ -16,6 +16,18 @@ congestion = "bbr"
 gso = true
 keep_alive_secs = 5
 allow_private = true
+# Full-cone NAT semantics for the UDP relay (default false). When true, every
+# UDP association's relay socket forwards replies from ANY source, not just the
+# hosts that association has sent to, so the client app gets a public UDP
+# endpoint that peers can initiate to (P2P games / WebRTC). This exposes that
+# app's endpoint to unsolicited internet traffic — unsolicited datagrams are
+# outside the auth_token boundary — and it only works if the server's ephemeral
+# relay UDP ports are reachable through this host's firewall/NAT. There is no
+# per-session inbound rate limit in this mode, and inbound traffic keeps the
+# association alive. With allow_private = true above, an unsolicited or
+# spoofed sender can also steer app replies toward private/loopback targets,
+# so keep allow_private = false on public/multi-user servers.
+# udp_full_cone = false
 # Shared secret clients must present (set on both sides).
 # Leave empty to disable auth (then rely on firewall/network isolation).
 auth_token = ""
@@ -53,12 +65,13 @@ auth_token = ""
 # the link RTT, e.g. 140 on a 140 ms link; steady state re-measures.
 # initial_rtt_ms = 140
 # Path MTU (max UDP payload) every new connection starts from, bytes, default
-# 1360 (clamped 1200..=1472). Mirror the client: starting above quinn's
-# 1200-byte floor removes the 4-probe-RTT ramp every connection pays before it
-# can send 1472-byte packets, and keeps large UDP payloads from fragmenting.
-# 1360 is 1388/1408 wire bytes after the IP+UDP headers, safe on WireGuard-1420
-# and similar tunnel paths; a known 1500-byte Ethernet path can use 1400/1472.
-# initial_mtu = 1360
+# 1200 = the QUIC floor (clamped 1200..=1472; lower values are raised to 1200,
+# since QUIC forbids smaller packets). PMTU discovery is opportunistic, so at
+# the default a busy connection sends 18-23% more packets and fragments UDP
+# payloads above 1150 B. On a known path raise it — 1360 is 1388/1408 wire
+# bytes after the IP+UDP headers, safe on WireGuard-1420 and similar tunnel
+# paths; a known 1500-byte Ethernet path can use 1400/1472. Mirror the client.
+# initial_mtu = 1400
 # ALPN (optional; omit = h3 masquerade). Must match the client;
 # alpn="myquic2/3" restores the versioned identifier + skew fail-closed guard.
 # alpn = "h3"

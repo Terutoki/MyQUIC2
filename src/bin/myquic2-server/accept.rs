@@ -453,6 +453,7 @@ pub(crate) static BATCH_FAST_ARMS: std::sync::atomic::AtomicU64 =
 pub(crate) async fn handle_conn(
     conn: quinn::Connection,
     allow_private: bool,
+    reply_filter: ReplyFilter,
     conn_limit: Arc<tokio::sync::Semaphore>,
     conn_cap: usize,
 ) -> Result<()> {
@@ -468,11 +469,13 @@ pub(crate) async fn handle_conn(
     }
     let conn_id = next_conn_id();
     // One UDP socket per sess_id: replies are inherently demuxed, concurrent
-    // ASSOCIATEs sharing this QUIC connection never cross-talk.
+    // ASSOCIATEs sharing this QUIC connection never cross-talk. The table
+    // carries the process's reply-source policy (`udp_full_cone`), snapshotted
+    // for this connection's sessions.
     // The connection joins the fair-share denominator only once it actually
     // holds a session (`ShardedSessTable::note_empty_state`); an idle TCP-only
     // connection must not dilute anyone's session budget.
-    let sess: SessTable = Arc::new(ShardedSessTable::new());
+    let sess: SessTable = Arc::new(ShardedSessTable::new(reply_filter));
     {
         let sess = sess.clone();
         let conn = conn.clone();

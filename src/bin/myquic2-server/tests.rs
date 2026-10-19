@@ -4,16 +4,18 @@ use super::*;
 /// Serializes the tests that mutate the process-global session-holder
 /// count, so their exact reads cannot race each other.
 ///
-/// Three tests touch the counter: the two exact-delta holder tests
+/// Four tests touch the counter: the two exact-delta holder tests
 /// (`fair_share_counts_session_holders_not_live_connections`,
-/// `session_churn_holds_caps_without_leaking`) and
+/// `session_churn_holds_caps_without_leaking`),
 /// `l2_dns_singleflight_burst_delivers_server`, whose burst runs
 /// `forward_server_dgram` through the real `get_or_create_sess` creation
-/// path — it registers its own table as a holder (and releases it only
-/// when the test's runtime drops), so without this lock a concurrent
-/// churn run could observe two holders for a one-table delta. This race
-/// predates the lock's third user: the count is process-global, so every
-/// test that can make a table non-empty must serialize here.
+/// path, and the full-cone e2e helper above `full_cone_forwards_unsolicited_reply_source`
+/// (it runs a real connection through `handle_conn`, which creates and reaps a
+/// session-holder table) — each registers its own table as a holder and
+/// releases it only when the connection closes, so without this lock a
+/// concurrent run could observe two holders for a one-table delta. The count is
+/// process-global, so every test that can make a table non-empty must serialize
+/// here.
 static HOLDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire [`HOLDER_TEST_LOCK`], recovering from poisoning. The lock guards
@@ -194,7 +196,7 @@ fn sess_with_dest(addr: Option<SocketAddr>) -> (SessTable, Arc<tokio::net::UdpSo
 /// reaching a v4 target needs the dual-stack socket production sessions use,
 /// while the DNS memo tests only need any bound socket.
 fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) -> SessTable {
-    let ss = Arc::new(ShardedSessTable::new());
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let last = Arc::new(std::sync::atomic::AtomicU64::new(mono_millis()));
     let h = tokio::spawn(std::future::pending::<()>());
     let permit = session_limiter().clone().try_acquire_owned().unwrap();
@@ -433,7 +435,7 @@ async fn session_dest_memo_stores_every_wire_legal_name() {
 /// phantom entry: the datagram path races session teardown by design.
 #[tokio::test]
 async fn session_dest_store_tolerates_a_vanished_session() {
-    let ss = Arc::new(ShardedSessTable::new());
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     sess_dest_store(
         &ss,
         7,
@@ -761,7 +763,7 @@ fn allowlist_contains(ss: &SessTable, s: u32, dst: SocketAddr) -> bool {
 /// never a router.
 #[tokio::test]
 async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
-    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let conn_id = next_conn_id();
     let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
     let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
@@ -921,6 +923,7 @@ async fn batch_ingress_arms_the_connection_fast_table() {
     let server_task = tokio::spawn(handle_conn(
         server_conn,
         true,
+        ReplyFilter::Restricted,
         Arc::new(tokio::sync::Semaphore::new(1)),
         MAX_CONNECTIONS,
     ));
@@ -1156,7 +1159,7 @@ async fn fair_share_counts_session_holders_not_live_connections() {
     // A table is counted only while non-empty.
     session_holders().store(prev, Ordering::Relaxed);
     let before = session_holders().load(Ordering::Relaxed);
-    let empty = ShardedSessTable::new();
+    let empty = ShardedSessTable::new(ReplyFilter::Restricted);
     empty.note_empty_state();
     assert_eq!(
         session_holders().load(Ordering::Relaxed),
@@ -1196,7 +1199,7 @@ async fn fair_share_counts_session_holders_not_live_connections() {
 /// 8-shard `len()` exactly where the peer is already over its share.
 #[tokio::test]
 async fn the_fair_share_gate_counts_inserts_since_the_sample() {
-    let ss = ShardedSessTable::new();
+    let ss = ShardedSessTable::new(ReplyFilter::Restricted);
     let now = mono_millis();
     // The first call measures and caches: nothing is held yet.
     assert_eq!(ss.len_upper_bound(now), 0);
@@ -1221,7 +1224,7 @@ async fn the_fair_share_gate_counts_inserts_since_the_sample() {
 
 #[tokio::test]
 async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
-    let ss = ShardedSessTable::new();
+    let ss = ShardedSessTable::new(ReplyFilter::Restricted);
     let now = mono_millis();
     assert_eq!(ss.len_upper_bound(now), 0);
     ss.shard(7).write().insert(7, capped_session(0));
@@ -2006,6 +2009,7 @@ async fn header_credit_bounds_header_tasks_and_is_returned() {
     let server_task = tokio::spawn(handle_conn(
         server_conn,
         true,
+        ReplyFilter::Restricted,
         Arc::new(tokio::sync::Semaphore::new(1)),
         MAX_CONNECTIONS,
     ));
@@ -2339,10 +2343,12 @@ fn ip_cache_collision_evicts_and_never_mis_serves() {
 ///
 /// The holder assertions are exact because every test that can register a
 /// non-empty table — this one,
-/// `fair_share_counts_session_holders_not_live_connections`, and the
+/// `fair_share_counts_session_holders_not_live_connections`, the
 /// `l2_dns_singleflight_burst_delivers_server` burst (which reaches
-/// `get_or_create_sess`'s creation arm) — serializes on `HOLDER_TEST_LOCK`;
-/// exact reads would otherwise race each other.
+/// `get_or_create_sess`'s creation arm), and the full-cone e2e helper
+/// (`unsolicited_reply_through_filter`, which runs a real connection through
+/// `handle_conn`) — serializes on `HOLDER_TEST_LOCK`; exact reads would
+/// otherwise race each other.
 #[tokio::test]
 async fn session_churn_holds_caps_without_leaking() {
     use std::sync::atomic::Ordering;
@@ -2351,7 +2357,7 @@ async fn session_churn_holds_caps_without_leaking() {
     const N: usize = 1024;
     let holders_before = session_holders().load(Ordering::Relaxed);
     let permits_before = session_limiter().available_permits();
-    let ss = Arc::new(ShardedSessTable::new());
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     for s in 1..=N as u32 {
         ss.shard(s).write().insert(s, capped_session(0));
         ss.note_insert();
@@ -2595,7 +2601,7 @@ async fn l2_dns_singleflight_burst_delivers_server() {
     );
 
     let (client_conn, server_conn) = stream_test_pair().await;
-    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let target = TargetAddr::Domain(host.to_owned(), port);
     let addr = target.as_ref();
     let payload = Bytes::from_static(b"l2-burst");
@@ -2688,7 +2694,7 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
     }
     assert_eq!(lim.available_permits(), 0, "the budget must be exhaustible");
     let (client_conn, server_conn) = stream_test_pair().await;
-    let ss: SessTable = Arc::new(ShardedSessTable::new());
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let target = TargetAddr::Domain(host.to_owned(), port);
     let addr = target.as_ref();
     let before = dgram_drops::snapshot();
@@ -3128,6 +3134,241 @@ async fn reply_batch_falls_back_to_per_reply_frames_when_it_cannot_fit() {
     );
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
+}
+
+/// Drive one outbound datagram through a live server connection, then answer it
+/// from a source the session never contacted, and return the reply as the
+/// client sees it (or `None` when the server dropped it).
+///
+/// The target is IPv4 loopback (`allow_private = true` passes the SSRF gate and
+/// an IP target needs no DNS, so the session is created inline), which records
+/// `127.0.0.1` as the session's only allowlisted destination. The stranger
+/// binds `[::1]`: a source the session never sent to. Using a different address
+/// family keeps the two sources distinct without binding a second loopback
+/// address (macOS cannot bind `127.0.0.2`), and the relay socket is dual-stack,
+/// so the same bound port answers on `[::1]`.
+///
+/// The reply is > `BATCH_SMALL_MAX`, so it takes the single `0x02` frame path
+/// and one `read_datagram` is exactly one reply.
+// The `HOLDER_TEST_LOCK` guard must span the awaits: this helper asserts the
+// process-global holder count returns after the connection closes, which is
+// the exact-delta contract that lock exists for (same shape as
+// `batch_ingress_arms_the_connection_fast_table`).
+#[allow(clippy::await_holding_lock)]
+async fn unsolicited_reply_through_filter(
+    reply_filter: ReplyFilter,
+) -> Option<(Vec<u8>, SocketAddr)> {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    // Loopback target: `allow_private = true` passes the SSRF gate, and a v4 IP
+    // target needs no DNS, so the slow path's first answer is inline.
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let limit = client_conn
+        .max_datagram_size()
+        .expect("DATAGRAM is negotiated by the test transport");
+    let addr = TargetAddr::Ip(dst);
+    let frame = encode_datagram_ref_with_limit(1, &addr.as_ref(), b"ping", limit)
+        .expect("the outbound datagram must encode");
+    let server_task = tokio::spawn(handle_conn(
+        server_conn,
+        true,
+        reply_filter,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        MAX_CONNECTIONS,
+    ));
+    client_conn.send_datagram(frame).unwrap();
+
+    // Capture results instead of asserting inside the live section: a panic
+    // while the session is live would leave the process-global holder count
+    // elevated and cascade into the other holder tests. Every check below runs
+    // after the connection is closed and the count restored.
+    let mut buf = [0u8; 2048];
+    let outbound = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    let mut outbound_payload_ok = false;
+    let mut raw_reply: Option<Bytes> = None;
+    let mut stranger_addr: Option<SocketAddr> = None;
+    let mut classified = false;
+    if let Some((n, relay)) = outbound {
+        outbound_payload_ok = &buf[..n] == b"ping";
+        let stranger = tokio::net::UdpSocket::bind("[::1]:0")
+            .await
+            .expect("this test needs an IPv6 loopback (::1) source");
+        stranger_addr = Some(stranger.local_addr().unwrap());
+        let relay_v6: SocketAddr = format!("[::1]:{}", relay.port()).parse().unwrap();
+        // Snapshot the classification counters before the stranger speaks, so
+        // the check below proves the reader *processed* the datagram instead of
+        // relying on a timeout to mean "dropped".
+        let refused_before = dgram_drops::snapshot().refused;
+        let unsolicited_before = udp_stats::snapshot().unsolicited;
+        let reply = [0x5A; 1000]; // > BATCH_SMALL_MAX: one 0x02 frame
+        stranger.send_to(&reply, relay_v6).await.unwrap();
+
+        let wait = if reply_filter == ReplyFilter::FullCone {
+            Duration::from_secs(5)
+        } else {
+            // Long enough for a wrongly admitted reply to cross loopback, short
+            // enough not to slow the suite down.
+            Duration::from_millis(500)
+        };
+        raw_reply = tokio::time::timeout(wait, client_conn.read_datagram())
+            .await
+            .ok()
+            .and_then(|d| d.ok());
+
+        // Deterministic path check: the reader runs on another task, so poll
+        // the classification counter (unsolicited accepted under full-cone,
+        // refused under the default) instead of letting a receive timeout be
+        // the only evidence. A late-forwarding regression cannot pass both this
+        // and the receive assertion below.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let seen = match reply_filter {
+                ReplyFilter::FullCone => udp_stats::snapshot().unsolicited > unsolicited_before,
+                ReplyFilter::Restricted => dgram_drops::snapshot().refused > refused_before,
+            };
+            if seen {
+                classified = true;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    client_conn.close(0u32.into(), b"done");
+    server_task.abort();
+    // The connection-close sweeper drains the session; wait for the
+    // process-global holder count to come back so this helper leaves it exactly
+    // where it found it (the [`HOLDER_TEST_LOCK`] contract).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session_holders().load(Ordering::Relaxed) != holders_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session holder count must return after the connection closes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        outbound_payload_ok,
+        "the target must see the app payload (the outbound datagram must be relayed)"
+    );
+    assert!(
+        classified,
+        "the stranger datagram must reach the session reader and be classified"
+    );
+    raw_reply.map(|d| {
+        let (sess, src, payload) =
+            decode_datagram_ref(&d).expect("the reply must be a valid MQP-2 datagram");
+        assert_eq!(sess, 1, "the reply must carry the session id");
+        let src = match src {
+            TargetAddrRef::Ip(a) => a,
+            other => panic!("a reply source must stay IP-form: {other:?}"),
+        };
+        assert_eq!(
+            src,
+            stranger_addr.expect("a reply can only exist after the stranger sent"),
+            "the app must see the stranger's own source address"
+        );
+        (payload.to_vec(), src)
+    })
+}
+
+/// `udp_full_cone = true` gives the relay endpoint-independent filtering: a
+/// peer the app has never sent to can still reach it, and the app sees that
+/// peer's real source address (the property P2P games/WebRTC need).
+#[tokio::test]
+async fn full_cone_forwards_unsolicited_reply_source() {
+    let (payload, src) = unsolicited_reply_through_filter(ReplyFilter::FullCone)
+        .await
+        .expect("full-cone mode must forward a reply from a never-contacted host");
+    assert_eq!(
+        payload,
+        vec![0x5A; 1000],
+        "the unsolicited reply payload must survive intact"
+    );
+    assert!(
+        src.is_ipv6() && src.ip().is_loopback(),
+        "the app must see the stranger's source address, got {src}"
+    );
+}
+
+/// The shipped default keeps the anti-spoofing property: a reply from a source
+/// the session never sent to is still dropped. This is exactly what
+/// `udp_full_cone` opts out of, so it must not regress.
+#[tokio::test]
+async fn restricted_filter_drops_unsolicited_reply_source() {
+    assert!(
+        unsolicited_reply_through_filter(ReplyFilter::Restricted)
+            .await
+            .is_none(),
+        "restricted mode must not forward a reply from a never-contacted host"
+    );
+}
+
+/// The config → policy edge must not be inverted: an unset (or false)
+/// `udp_full_cone` selects the restricted filter, and only an explicit `true`
+/// selects full-cone. Every other full-cone test enters through `handle_conn`,
+/// *below* this mapping, so this is what pins the part of the path the e2e
+/// tests cannot see.
+#[test]
+fn udp_full_cone_config_selects_the_reply_filter() {
+    let server = "listen = '[::]:8443'\ncert_file = 'c'\nkey_file = 'k'\nserver_name = 's'\n";
+    let conf = |extra: &str| -> ServerConf { toml::from_str(&format!("{server}{extra}")).unwrap() };
+    assert_eq!(reply_filter(&conf("")), ReplyFilter::Restricted);
+    assert_eq!(
+        reply_filter(&conf("udp_full_cone = false\n")),
+        ReplyFilter::Restricted
+    );
+    assert_eq!(
+        reply_filter(&conf("udp_full_cone = true\n")),
+        ReplyFilter::FullCone,
+        "an explicit true must reach the accept path"
+    );
+}
+
+/// Full-cone relaxes the inbound reply filter only: the outbound SSRF policy
+/// still refuses a loopback target when `allow_private = false`. This pins the
+/// property the two policies are easy to conflate — the mode admits any reply
+/// *source*, not any dial destination.
+#[tokio::test]
+async fn full_cone_does_not_relax_the_outbound_ssrf_filter() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let limit = client_conn
+        .max_datagram_size()
+        .expect("DATAGRAM is negotiated by the test transport");
+    let addr = TargetAddr::Ip(dst);
+    let frame = encode_datagram_ref_with_limit(1, &addr.as_ref(), b"must-not-leave", limit)
+        .expect("the outbound datagram must encode");
+    let server_task = tokio::spawn(handle_conn(
+        server_conn,
+        false, // allow_private = false: loopback is filtered on the outbound path
+        ReplyFilter::FullCone,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        MAX_CONNECTIONS,
+    ));
+    client_conn.send_datagram(frame).unwrap();
+    let mut buf = [0u8; 64];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), target.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "full-cone must not relax the outbound SSRF filter: a loopback target \
+         stays refused when allow_private = false"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_task.abort();
 }
 
 /// Distinct target sources must not share one batch frame, and a run's flush

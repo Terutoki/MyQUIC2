@@ -1654,6 +1654,7 @@ mod tests {
             fragmented: 4,
             max_payload: 1_400,
             sessions: 2,
+            unsolicited: 1,
         };
         let b = UdpSnapshot {
             datagrams: 130,
@@ -1661,11 +1662,18 @@ mod tests {
             fragmented: 6,
             max_payload: 1_900,
             sessions: 3,
+            unsolicited: 5,
         };
         let d = b.since(&a);
         assert_eq!(
-            (d.datagrams, d.bytes, d.fragmented, d.sessions),
-            (30, 3_000, 2, 1)
+            (
+                d.datagrams,
+                d.bytes,
+                d.fragmented,
+                d.sessions,
+                d.unsolicited
+            ),
+            (30, 3_000, 2, 1, 4)
         );
         assert_eq!(d.max_payload, 1_900, "a maximum cannot be differenced");
         assert!(!d.is_idle());
@@ -3233,6 +3241,24 @@ mod tests {
         );
     }
 
+    /// Full-cone UDP semantics are an explicit opt-in: the relay exposing a
+    /// client app's UDP endpoint to unsolicited internet traffic must never be
+    /// what an unset (or misspelled) config silently gets. A misspelled key is
+    /// already a hard parse error via `deny_unknown_fields` (see
+    /// `unknown_config_keys_are_rejected`).
+    #[test]
+    fn server_udp_full_cone_defaults_off() {
+        let server = "listen = '[::]:8443'\ncert_file = 'c'\nkey_file = 'k'\nserver_name = 's'\n";
+        let conf =
+            |extra: &str| -> ServerConf { toml::from_str(&format!("{server}{extra}")).unwrap() };
+        assert!(!conf("").udp_full_cone, "full-cone must stay opt-in");
+        assert!(!conf("udp_full_cone = false\n").udp_full_cone);
+        assert!(
+            conf("udp_full_cone = true\n").udp_full_cone,
+            "an explicit true must reach the server"
+        );
+    }
+
     /// REUSEPORT group ingress: two sockets bind the *same* address, every
     /// datagram lands on exactly one member, and the platform's spread
     /// behavior is pinned as measured — Linux hashes by connection 4-tuple
@@ -3476,6 +3502,10 @@ mod tests {
             t.initial_mtu, DEFAULT_INITIAL_MTU,
             "the MTU a connection starts from must reach the transport builder"
         );
+        assert_eq!(
+            DEFAULT_INITIAL_MTU, 1200,
+            "the shipped start is the QUIC floor: nothing smaller is legal"
+        );
         assert_eq!(c.conn_count(), 4, "pool default is four connections");
         assert_eq!(DEFAULT_QUIC_CONNS, 4);
         let conf =
@@ -3495,10 +3525,16 @@ mod tests {
             Duration::from_millis(INITIAL_RTT_MS_MAX),
             "a typo must not postpone first-flight loss recovery absurdly"
         );
-        // Initial MTU: unset takes the shipped default, explicit values reach
-        // the builder, and a typo clamps into quinn's accepted range instead
-        // of being passed through (a value below 1200 would be rejected by
-        // quinn; above 1472 can only be a mistake).
+        // Initial MTU: unset takes the shipped default (the 1200-byte QUIC
+        // floor), explicit values reach the builder, and anything outside
+        // quinn's accepted range clamps up/down instead of being passed
+        // through: below 1200 QUIC packets are illegal, and above 1472 can
+        // only be a typo.
+        assert_eq!(
+            conf("initial_mtu = 1000\n").tuning().initial_mtu,
+            INITIAL_MTU_MIN,
+            "a sub-QUIC start must clamp up to 1200, never reach the transport"
+        );
         assert_eq!(
             conf("initial_mtu = 1472\n").tuning().initial_mtu,
             1472,
