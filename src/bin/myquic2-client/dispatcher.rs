@@ -177,10 +177,51 @@ fn lookup_entry(cache: &mut [DispatchSlot; DISPATCH_CACHE], hub: &UdpHub, sess: 
     }
 }
 
+fn stage_v3_reply(
+    app: SocketAddr,
+    addr: TargetAddrRef<'_>,
+    payload: Bytes,
+    out: &mut Vec<StagedReply>,
+    head: &mut Option<Arc<tokio::net::UdpSocket>>,
+) -> bool {
+    match addr {
+        TargetAddrRef::Ip(dst) => {
+            udp_stats::payload(payload.len());
+            out.push(StagedReply {
+                sock: head.take(),
+                app,
+                dst,
+                payload,
+            });
+            true
+        }
+        TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
+            CachedLookup::Addr(dst) => {
+                udp_stats::payload(payload.len());
+                out.push(StagedReply {
+                    sock: head.take(),
+                    app,
+                    dst,
+                    payload,
+                });
+                true
+            }
+            // The server always echoes replies with an IP-form source address.
+            // A domain here is hostile or a future peer; resolve it only from
+            // this thread's positive cache, never by spawning a task per item.
+            CachedLookup::Negative | CachedLookup::Unknown => {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                false
+            }
+        },
+    }
+}
+
 /// Batch-capable staging: routes one QUIC DATAGRAM that may hold 1 app payload
-/// (0x02) or N packed payloads (0x06 BATCH). Single frames behave
-/// exactly like [`dispatch_stage`]; batch frames stage one reply per item.
-/// Returns the number of replies staged (0 = dropped or handed to a resolver).
+/// (0x02), N packed MQP-2 payloads (0x06 BATCH), or an MQP-3 SINGLE/TRAIN.
+/// Single frames behave exactly like [`dispatch_stage`]; packed frames stage
+/// one reply per item. Returns the number of replies staged (0 = dropped or
+/// handed to a resolver).
 pub(crate) fn dispatch_stage_multi(
     cache: &mut [DispatchSlot; DISPATCH_CACHE],
     hub: &UdpHub,
@@ -189,6 +230,119 @@ pub(crate) fn dispatch_stage_multi(
     reasm: &mut DgramReassembler,
     out: &mut Vec<StagedReply>,
 ) -> usize {
+    if is_v3(&d) {
+        let (entry, app) = match lookup_entry(cache, hub, sess) {
+            Lookup::Hit(entry, app) => (entry, app),
+            Lookup::NoEntry => return 0,
+            Lookup::NoApp => {
+                udp_write::no_app();
+                return 0;
+            }
+        };
+        let kind = d[0] & MQP3_KIND_MASK;
+        let mut staged = 0usize;
+        let mut head = Some(entry.relay.clone());
+        match kind {
+            MQP3_SINGLE => {
+                let Ok(s) = decode_single(&d) else {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    return 0;
+                };
+                if s.sess != sess {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    return 0;
+                }
+                let table = entry.flows.load();
+                let addr = match s.inline {
+                    Some(a) => Some(a),
+                    // A compressed downlink must name an IP flow: the client's
+                    // table entry for a domain is the *requested* name, not a
+                    // valid SOCKS reply source. The server never compresses a
+                    // domain flow; reject one that does instead of writing a
+                    // domain where the app expects an IP.
+                    None => match table.get(s.flow) {
+                        Some(a @ TargetAddr::Ip(_)) => Some(a.as_ref()),
+                        _ => None,
+                    },
+                };
+                let Some(addr) = addr else {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    return 0;
+                };
+                if stage_v3_reply(
+                    app,
+                    addr,
+                    {
+                        let off = s.payload.as_ptr() as usize - d.as_ptr() as usize;
+                        d.slice(off..off + s.payload.len())
+                    },
+                    out,
+                    &mut head,
+                ) {
+                    staged = 1;
+                    // A compressed downlink is only possible after the server
+                    // accepted an inline open; it is the implicit ACK that lets
+                    // the association compress this flow.
+                    if s.inline.is_none() {
+                        entry.confirm_flow(s.flow);
+                    }
+                }
+            }
+            MQP3_TRAIN => {
+                let Ok(t) = decode_train(&d) else {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    return 0;
+                };
+                if t.sess != sess {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    return 0;
+                }
+                let table = entry.flows.load();
+                for item in t.items() {
+                    let addr = match item.inline {
+                        Some(a) => Some(a),
+                        None => match table.get(item.flow) {
+                            Some(a @ TargetAddr::Ip(_)) => Some(a.as_ref()),
+                            _ => None,
+                        },
+                    };
+                    let Some(addr) = addr else {
+                        dgram_drops::bump(&dgram_drops::REFUSED);
+                        continue;
+                    };
+                    if stage_v3_reply(
+                        app,
+                        addr,
+                        {
+                            let off = item.payload.as_ptr() as usize - d.as_ptr() as usize;
+                            d.slice(off..off + item.payload.len())
+                        },
+                        out,
+                        &mut head,
+                    ) {
+                        staged += 1;
+                        if item.inline.is_none() {
+                            entry.confirm_flow(item.flow);
+                        }
+                    }
+                }
+            }
+            MQP3_FRAG => {
+                // Compact FRAG is decode-ready but not yet wired into the
+                // reassembler; the sender still uses MQP-2 fragments for large
+                // payloads. Count it rather than silently losing it if a peer
+                // enables the form early.
+                dgram_drops::bump(&dgram_drops::REFUSED);
+            }
+            _ => {}
+        }
+        if staged > 0 {
+            // One liveness flag per frame, not per item: every item shares the
+            // association and `mark_replied` is an idempotent relaxed store.
+            entry.mark_replied();
+        }
+        return staged;
+    }
     if is_batch(&d) {
         let Ok(b) = decode_batch(&d) else {
             return 0;
@@ -628,7 +782,8 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         // replies; a drained connection error breaks out after
                         // flushing what was staged.
                         let mut drained = 1usize;
-                        let sess_of = |d: &Bytes| dgram_sess(d).or_else(|| batch_sess(d));
+                        let sess_of =
+                            |d: &Bytes| dgram_sess(d).or_else(|| batch_sess(d)).or_else(|| v3_sess(d));
                         if let Some(sess) = sess_of(&head) {
                             if staged.len() < LAST_HOP_DRAIN * 2 {
                                 dispatch_stage_multi(

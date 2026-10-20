@@ -46,6 +46,14 @@ use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
 use super::store::{DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, negatives, positives};
 use crate::coarse_millis;
 
+/// Serializes the few cache tests that assert on a *negative* thread memo or
+/// deliberately bump the process-wide negative epoch. `NEG_EPOCH` is (by
+/// design) global, so a concurrent positive seed in another test would
+/// invalidate the memo under assertion. Production is unaffected; the lock is
+/// test-only.
+#[cfg(test)]
+pub(crate) static DNS_CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Address-family preference for DNS resolution results, from the
 /// `dns_ip_preference` config key (`"ipv6"` — the default — or `"ipv4"`).
 ///
@@ -724,6 +732,7 @@ mod tests {
     /// refuse the others without spawning a resolver for them.
     #[tokio::test]
     async fn a_negative_verdict_refuses_every_port_of_the_name() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
         let host = "host-negative.resolve.test";
         let port_a = 19_721u16;
         let port_b = 19_722u16;
@@ -851,6 +860,7 @@ mod tests {
     /// A live negative entry refuses without touching the resolver.
     #[tokio::test]
     async fn negative_entry_refuses_without_resolving() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
         let (host, port) = ("negative.resolve.test", 19702u16);
         dns_neg_cache_seed(host, port).await;
         let err = resolve_all_cached(host, port).await.unwrap_err();
@@ -905,6 +915,7 @@ mod tests {
     /// serve an address for a name the negative store still refuses.
     #[tokio::test]
     async fn positive_and_negative_stores_are_disjoint_per_name() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
         let host = "disjoint.resolve.test";
         let port = 19_761u16;
         assert!(

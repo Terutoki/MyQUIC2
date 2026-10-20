@@ -9,6 +9,7 @@ use super::server_conf::ServerConf;
 // split); refer to it at the crate root until it moves with that section.
 use crate::DATAGRAM_BUFFER;
 use crate::FRAG_MAX_HELD_BYTES;
+use crate::mqp::v3::MQP3_FLOW_TABLE_MAX_BYTES;
 
 pub(super) fn d_bbr() -> String {
     "bbr".into()
@@ -312,7 +313,7 @@ pub fn per_session_memory_bytes() -> u64 {
     } else {
         2 * crate::sess_socket_buf()
     };
-    (socket_terms + crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK) as u64
+    (socket_terms + crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK + MQP3_FLOW_TABLE_MAX_BYTES) as u64
 }
 
 /// Worst-case memory the *whole* UDP session pool can pin: the process-wide

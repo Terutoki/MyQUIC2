@@ -214,6 +214,7 @@ fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) ->
             }),
             recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
             recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
         },
     );
     // Direct insert (not `get_or_create_sess`): keep the table's live count in
@@ -737,6 +738,7 @@ fn capped_session(idle_ms: u64) -> SessEntry {
         dest: DestMemo::NONE,
         recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
         recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
     }
 }
 
@@ -799,6 +801,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     for s in [s1, s2] {
         arm_fast(
             &mut fast,
+            &ss,
             conn_id,
             s,
             TargetAddrRef::Ip(dst),
@@ -938,6 +941,7 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     for s in [s1, s2, s3] {
         arm_fast(
             &mut fast,
+            &ss,
             conn_id,
             s,
             TargetAddrRef::Ip(dst),
@@ -949,6 +953,7 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     // in place, not append a second copy at some later free slot.
     arm_fast(
         &mut fast,
+        &ss,
         conn_id,
         s3,
         TargetAddrRef::Ip(dst),
@@ -1006,6 +1011,7 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     for (s, _) in &overflow {
         arm_fast(
             &mut fast,
+            &ss,
             conn_id,
             *s,
             TargetAddrRef::Ip(dst),
@@ -1778,8 +1784,8 @@ fn admission_cap_bounds_connections_by_memory() {
     };
     assert_eq!(
         per_session,
-        (socket_terms + UDP_RECV_MAX + UDP_RECV_SLACK) as u64,
-        "a session's kernel caps (doubled on Linux) plus its reader's userspace buffer"
+        (socket_terms + UDP_RECV_MAX + UDP_RECV_SLACK + MQP3_FLOW_TABLE_MAX_BYTES) as u64,
+        "a session's kernel caps (doubled on Linux), its reader buffer, and its MQP-3 flow table"
     );
     let pool = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
     assert_eq!(pool, MAX_SESSIONS_GLOBAL as u64 * per_session);
@@ -3408,10 +3414,366 @@ async fn a_single_staged_reply_flushes_as_one_plain_datagram() {
     server_conn.close(0u32.into(), b"done");
 }
 
+/// MQP-3 reply path: a source that matches an inbound IP flow is compressed to
+/// a 5-byte SINGLE (the client already has the flow id from its outbound
+/// table).
+#[tokio::test]
+async fn reply_v3_known_ip_flow_is_compressed() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let flows = Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default()));
+    flows.rcu(|old| {
+        let mut t = (**old).clone();
+        assert!(t.insert_at_owned(0, TargetAddr::Ip(src)));
+        Arc::new(t)
+    });
+    let mut arena = Vec::new();
+    let mut staged = Vec::new();
+    let mut staged_wire = 0usize;
+    let mut last_flow = None;
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let mut last_probe = 0u64;
+    let body = &b"known-flow"[..];
+    assert!(reply_stage_v3(
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        flows.as_ref(),
+        &mut last_flow,
+        src,
+        body,
+        limit,
+    ));
+    flush_reply_train(
+        &server_conn,
+        7,
+        &mut DgramFragmenter::new(),
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        &mut limit,
+        &mut last_probe,
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the reply must arrive")
+        .unwrap();
+    let s = decode_single(&d).expect("known flow must use v3 SINGLE");
+    assert_eq!(s.sess, 7);
+    assert_eq!(s.flow, 0);
+    assert_eq!(s.inline, None, "the client already has the flow address");
+    assert_eq!(s.payload, body);
+    assert_eq!(d.len(), 5 + body.len());
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// One reply TRAIN can carry sources for two different flows; this is the
+/// server-side counterpart of the client's mixed-flow train.
+#[tokio::test]
+async fn reply_v3_train_mixes_sources() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let a: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let b: SocketAddr = "203.0.113.7:5353".parse().unwrap();
+    let flows = Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default()));
+    flows.rcu(|old| {
+        let mut t = (**old).clone();
+        assert!(t.insert_at_owned(0, TargetAddr::Ip(a)));
+        assert!(t.insert_at_owned(1, TargetAddr::Ip(b)));
+        Arc::new(t)
+    });
+    let mut arena = Vec::new();
+    let mut staged = Vec::new();
+    let mut staged_wire = 0usize;
+    let mut last_flow = None;
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    for (src, body) in [(a, &b"first"[..]), (b, b"second"), (a, b"third")] {
+        assert!(reply_stage_v3(
+            &mut arena,
+            &mut staged,
+            &mut staged_wire,
+            flows.as_ref(),
+            &mut last_flow,
+            src,
+            body,
+            limit,
+        ));
+    }
+    flush_reply_train(
+        &server_conn,
+        7,
+        &mut DgramFragmenter::new(),
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        &mut limit,
+        &mut 0u64,
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the train must arrive")
+        .unwrap();
+    let t = decode_train(&d).expect("known flows must use a v3 TRAIN");
+    let items: Vec<_> = t.items().collect();
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        items.iter().map(|i| i.flow).collect::<Vec<_>>(),
+        vec![0, 1, 0]
+    );
+    assert_eq!(items[0].payload, b"first");
+    assert_eq!(items[1].payload, b"second");
+    assert_eq!(items[2].payload, b"third");
+    assert!(items.iter().all(|i| i.inline.is_none()));
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A domain flow has no resolved IP in the client's flow table, so compressing
+/// a reply would make the SOCKS header claim the *domain* as the source. The
+/// server deliberately sends those sources inline (no-flow) instead.
+#[tokio::test]
+async fn reply_v3_domain_flow_stays_inline() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let src: SocketAddr = "203.0.113.7:53".parse().unwrap();
+    let flows = Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default()));
+    flows.rcu(|old| {
+        let mut t = (**old).clone();
+        assert!(t.insert_at_owned(0, TargetAddr::Domain("example.test".into(), 53)));
+        Arc::new(t)
+    });
+    let mut arena = Vec::new();
+    let mut staged = Vec::new();
+    let mut staged_wire = 0usize;
+    let mut last_flow = None;
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let body = &b"domain-reply"[..];
+    assert!(reply_stage_v3(
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        flows.as_ref(),
+        &mut last_flow,
+        src,
+        body,
+        limit,
+    ));
+    flush_reply_train(
+        &server_conn,
+        7,
+        &mut DgramFragmenter::new(),
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        &mut limit,
+        &mut 0u64,
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the inline reply must arrive")
+        .unwrap();
+    let s = decode_single(&d).expect("the reply must be a v3 SINGLE");
+    assert_eq!(s.flow, MQP3_NO_FLOW);
+    assert_eq!(s.inline, Some(TargetAddrRef::Ip(src)));
+    assert_eq!(s.payload, body);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// MQP-3 ingress: a TRAIN may open a flow inline and carry compressed payloads
+/// for that same flow later in the frame. The server must install the mapping
+/// after the first accepted item, then resolve the later item from it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn v3_train_open_then_compressed_reaches_the_target() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let limit = client_conn
+        .max_datagram_size()
+        .expect("DATAGRAM is negotiated by the test transport");
+    let addr = TargetAddr::Ip(dst);
+    let items = [
+        TrainItem {
+            flow: 0,
+            inline: Some(addr.as_ref()),
+            src_override: false,
+            payload: b"v3-open",
+        },
+        TrainItem {
+            flow: 0,
+            inline: None,
+            src_override: false,
+            payload: b"v3-compressed",
+        },
+    ];
+    let frame = encode_train(1, &items, limit).expect("encode a mixed open/compressed train");
+
+    let server_task = tokio::spawn(handle_conn(
+        server_conn,
+        true,
+        ReplyFilter::Restricted,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        MAX_CONNECTIONS,
+    ));
+    client_conn.send_datagram(frame).unwrap();
+
+    let mut buf = [0u8; 64];
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+            .await
+            .expect("both items must be relayed")
+            .unwrap();
+        got.push(buf[..n].to_vec());
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![b"v3-compressed".to_vec(), b"v3-open".to_vec()],
+        "the compressed item must resolve through the flow opened in the same train"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_task.abort();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session_holders().load(Ordering::Relaxed) != holders_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session holder count must return after the connection closes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A target that answers from a different port is not the flow's bound source.
+/// The server must send the actual `(ip, port)` inline rather than let the
+/// client reconstruct the wrong SOCKS5 response source from the flow id.
+#[tokio::test]
+async fn reply_v3_changed_source_port_stays_inline() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let bound: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let actual: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+    let flows = Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default()));
+    flows.rcu(|old| {
+        let mut t = (**old).clone();
+        assert!(t.insert_at_owned(0, TargetAddr::Ip(bound)));
+        Arc::new(t)
+    });
+    let mut arena = Vec::new();
+    let mut staged = Vec::new();
+    let mut staged_wire = 0usize;
+    let mut last_flow = None;
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let body = &b"port-changed"[..];
+    assert!(reply_stage_v3(
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        flows.as_ref(),
+        &mut last_flow,
+        actual,
+        body,
+        limit,
+    ));
+    flush_reply_train(
+        &server_conn,
+        7,
+        &mut DgramFragmenter::new(),
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        &mut limit,
+        &mut 0u64,
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the inline reply must arrive")
+        .unwrap();
+    let s = decode_single(&d).expect("the reply must be a v3 SINGLE");
+    assert_eq!(s.flow, MQP3_NO_FLOW);
+    assert_eq!(s.inline, Some(TargetAddrRef::Ip(actual)));
+    assert_eq!(s.payload, body);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A destination evicted from the 16-entry recent-IP ring must still be able to
+/// answer if its exact flow is live. This is the 32-resolver fanout shape: the
+/// ring cannot hold every source, but the session's flow table can.
+#[tokio::test]
+async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let (ss, _sock) = sess_with_dest(None);
+    let (last2, recent, recent_epoch, flows) = {
+        let r = ss.shard(7).read();
+        let e = r.get(&7).expect("session 7");
+        (
+            e.last.clone(),
+            e.recent.clone(),
+            e.recent_epoch.clone(),
+            e.flows.clone(),
+        )
+    };
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let other: SocketAddr = "203.0.113.7:53".parse().unwrap();
+    // The ring knows a different host only; `src` is not on the allowlist.
+    remember_dst(&ss, 7, other);
+    flows.rcu(|old| {
+        let mut t = (**old).clone();
+        assert!(t.insert_at_owned(0, TargetAddr::Ip(src)));
+        Arc::new(t)
+    });
+
+    let mut frag = DgramFragmenter::new();
+    let mut arena = Vec::new();
+    let mut staged = Vec::new();
+    let mut staged_wire = 0usize;
+    let mut last_flow = None;
+    let mut limit = server_conn.max_datagram_size().unwrap();
+    let mut probe = 0u64;
+    let mut last_touch = 0u64;
+    let mut last_refresh = coarse_millis();
+    let mut allow_snap = None;
+    let mut allow_epoch = u64::MAX;
+    let body = &b"evicted-source"[..];
+    let _ = handle_session_reply(
+        &server_conn,
+        7,
+        body,
+        src,
+        ReplyFilter::Restricted,
+        &mut frag,
+        &mut arena,
+        &mut staged,
+        &mut staged_wire,
+        flows.as_ref(),
+        &mut last_flow,
+        &mut limit,
+        &mut probe,
+        &mut last_touch,
+        &mut last_refresh,
+        last2.as_ref(),
+        recent.as_ref(),
+        recent_epoch.as_ref(),
+        &mut allow_snap,
+        &mut allow_epoch,
+    );
+    assert_eq!(staged.len(), 1, "the live flow must admit the reply");
+    assert_eq!(staged[0].flow, 0);
+    assert_eq!(staged[0].src, src);
+    assert_eq!(staged[0].len, body.len());
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
 /// Reply-path batching: one BATCH frame carries every staged small reply,
 /// in staging order, with the session id and the shared source address.
 ///
-/// This is the reply-path twin of the client association's 2-pack, driven
+/// This is the reply-path twin of the client association's N-pack, driven
 /// directly against a live loopback pair so the wire format is what is
 /// asserted — one `0x06` frame the client dispatcher already decodes into
 /// per-association replies, not N `0x02` frames.

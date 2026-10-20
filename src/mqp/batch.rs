@@ -8,6 +8,23 @@ pub const MAX_BATCH_ITEMS: usize = 16;
 pub const BATCH_ITEM_OVERHEAD: usize = 2;
 pub const BATCH_SMALL_MAX: usize = 512;
 
+/// Wire length of one BATCH frame carrying `items` payloads whose bodies total
+/// `payload_bytes`, for an address header of `header_len` bytes.
+///
+/// This is the single definition of the budget arithmetic: [`encode_batch_with_header`]
+/// uses it to decide whether the frame fits, and send-side stagers use it to
+/// avoid copying a payload into a run that the encoder would refuse later. All
+/// terms saturate, because `limit` is a live path budget and this runs under
+/// panic=abort; an absurd value must clamp rather than wrap.
+#[must_use]
+pub fn batch_frame_len(header_len: usize, items: usize, payload_bytes: usize) -> usize {
+    BATCH_PREFIX_LEN
+        .saturating_add(header_len)
+        .saturating_add(1)
+        .saturating_add(BATCH_ITEM_OVERHEAD.saturating_mul(items))
+        .saturating_add(payload_bytes)
+}
+
 pub fn is_batch(b: &[u8]) -> bool {
     b.first() == Some(&MQP_DGRAM_BATCH)
 }
@@ -38,10 +55,10 @@ pub fn encode_batch_with_header(
     if payloads.is_empty() || payloads.len() > MAX_BATCH_ITEMS {
         return None;
     }
-    let mut total = BATCH_PREFIX_LEN + header.len() + 1;
-    for p in payloads {
-        total = total.saturating_add(BATCH_ITEM_OVERHEAD + p.len());
-    }
+    let payload_bytes = payloads
+        .iter()
+        .fold(0usize, |n, p| n.saturating_add(p.len()));
+    let total = batch_frame_len(header.len(), payloads.len(), payload_bytes);
     if total > limit {
         return None;
     }
@@ -277,5 +294,29 @@ mod tests {
         let b = encode_batch(3, &r, &[p], 1472).expect("encode");
         let d = decode_batch_ref(&b).expect("decode");
         assert_eq!(d.payloads, vec![p]);
+    }
+
+    /// The budget helper and the encoder must agree byte-for-byte: every
+    /// accepted frame is exactly the predicted length, and a frame one byte
+    /// over the predicted limit is refused. This is the arithmetic the client
+    /// stager uses to decide whether to append before copying, so a drift here
+    /// would either waste a staging copy or stage a frame the encoder rejects.
+    #[test]
+    fn batch_frame_len_is_the_encoder_budget() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let header = addr.as_ref().header().unwrap();
+        let payloads: Vec<&[u8]> = vec![b"", b"a", &[0x5Au8; 28], b"query"];
+        let bytes: usize = payloads.iter().map(|p| p.len()).sum();
+        let want = batch_frame_len(header.len(), payloads.len(), bytes);
+
+        let body = encode_batch(7, &addr.as_ref(), &payloads, want).expect("exact fit");
+        assert_eq!(body.len(), want);
+        assert!(encode_batch(7, &addr.as_ref(), &payloads, want - 1).is_none());
+
+        // Empty/over-cap counts are refused by the encoder regardless of the
+        // (otherwise zero-sized) budget.
+        assert!(encode_batch(7, &addr.as_ref(), &[], usize::MAX).is_none());
+        let many: Vec<&[u8]> = vec![b"x"; MAX_BATCH_ITEMS + 1];
+        assert!(encode_batch(7, &addr.as_ref(), &many, usize::MAX).is_none());
     }
 }

@@ -302,6 +302,11 @@ pub(crate) struct FastSess {
     /// `fast_allow_cached`): steady single-target flows skip the re-derivation
     /// after the first datagram. Validated by the same epoch mechanism.
     allow: Option<(u32, SocketAddr, bool)>,
+    /// The session's MQP-3 flow table snapshot handle. Cached here so a steady
+    /// v3 frame resolves a compressed flow id without taking the session-table
+    /// shard lock; the snapshot itself is clone-on-write, so this handle stays
+    /// valid across flow opens.
+    flows: Arc<arc_swap::ArcSwap<FlowTable>>,
 }
 
 impl FastSess {
@@ -484,6 +489,7 @@ pub(crate) fn try_stage(
 /// sending into it.
 pub(crate) fn arm_fast(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
     conn_id: usize,
     s: u32,
     a: TargetAddrRef<'_>,
@@ -492,6 +498,12 @@ pub(crate) fn arm_fast(
 ) {
     match sess_memo_lookup(conn_id, s) {
         SessHit::Fresh(sock, last, abort, epoch) => {
+            let Some(flows) = session_flows(ss, s) else {
+                if let Some(idx) = fast_probe(fast, s) {
+                    fast[idx] = None;
+                }
+                return;
+            };
             let mut pin = None;
             let (ph, pp) = target_name(a);
             pin_arm(&mut pin, s, ph, pp, dst, life);
@@ -505,6 +517,7 @@ pub(crate) fn arm_fast(
                 pin,
                 last_dst: None,
                 allow: None,
+                flows,
             });
         }
         SessHit::Stale | SessHit::Miss => {
@@ -513,6 +526,234 @@ pub(crate) fn arm_fast(
             }
         }
     }
+}
+
+/// The session's flow table from its fast slot, without taking the session-table
+/// lock. A stale/dead slot falls through to the caller's `session_flows` probe.
+fn fast_flows(
+    fast: &[Option<FastSess>; FAST_SESS_SLOTS],
+    s: u32,
+) -> Option<Arc<arc_swap::ArcSwap<FlowTable>>> {
+    let idx = fast_probe(fast, s)?;
+    let slot = fast[idx].as_ref()?;
+    slot.is_live_for(s).then(|| slot.flows.clone())
+}
+
+/// Owned form used to unify an inline address borrowed from the DATAGRAM with a
+/// flow address borrowed from the session's clone-on-write table.
+enum V3Addr<'a> {
+    Inline(TargetAddrRef<'a>),
+    Flow(Arc<TargetAddr>),
+}
+
+impl V3Addr<'_> {
+    fn as_ref(&self) -> TargetAddrRef<'_> {
+        match self {
+            Self::Inline(a) => *a,
+            Self::Flow(a) => (**a).as_ref(),
+        }
+    }
+}
+
+/// Resolve, stage or forward one MQP-3 item. Returns whether the target accepted
+/// the payload (fast-stage or slow-path forward), which is the condition for
+/// installing a new flow mapping.
+#[allow(clippy::too_many_arguments)]
+async fn forward_v3_item(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    sess: u32,
+    a: TargetAddrRef<'_>,
+    payload: Bytes,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+) -> bool {
+    let want = resolve_fast(fast, ss, sess, a, allow_private);
+    let payload = match want {
+        Some(dst) => {
+            match try_stage(fast, ss, conn_id, sess, dst, payload, allow_private, staged) {
+                Ok(()) => return true,
+                Err(payload) => payload,
+            }
+        }
+        None => payload,
+    };
+    // Keep the per-flow wire order: staged fast-path sends go out before the
+    // slow path's immediate send.
+    flush_staged_sends(staged);
+    let used = forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private).await;
+    if let Some((dst, life)) = used {
+        arm_fast(fast, ss, conn_id, sess, a, dst, life);
+        true
+    } else {
+        false
+    }
+}
+
+/// Decode and route one MQP-3 SINGLE/TRAIN.
+///
+/// The first frame for a flow carries its address and installs `(sess, flow)`
+/// in the session's table after the target accepts it; a later frame can then
+/// be compressed. A TRAIN is processed in wire order, so an inline open and a
+/// compressed successor for the same flow in the same frame also work. A
+/// compressed item with no mapping is dropped and counted, never guessed.
+#[allow(clippy::too_many_arguments)]
+async fn handle_v3_ingress(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    d: Bytes,
+) {
+    let Some(sess) = v3_sess(&d) else {
+        dgram_drops::bump(&dgram_drops::REFUSED);
+        return;
+    };
+    let mut flows = fast_flows(fast, sess).or_else(|| session_flows(ss, sess));
+    let mut table = flows.as_ref().map(|f| f.load_full());
+    let kind = d[0] & MQP3_KIND_MASK;
+    match kind {
+        MQP3_SINGLE => {
+            let Ok(s) = decode_single(&d) else {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                return;
+            };
+            if s.sess != sess {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                return;
+            }
+            let addr = match s.inline {
+                Some(a) => Some(V3Addr::Inline(a)),
+                None => table
+                    .as_ref()
+                    .and_then(|t| t.get_arc(s.flow))
+                    .map(V3Addr::Flow),
+            };
+            let Some(addr) = addr else {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        "v3 SINGLE compressed flow missing: sess={sess} flow={} table={}",
+                        s.flow,
+                        table.as_ref().map_or(0, |t| t.len())
+                    );
+                }
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                return;
+            };
+            udp_stats::payload(s.payload.len());
+            let accepted = forward_v3_item(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                sess,
+                addr.as_ref(),
+                d.slice_ref(s.payload),
+                allow_private,
+                staged,
+            )
+            .await;
+            if accepted
+                && let Some(inline) = s.inline
+                && s.flow != MQP3_NO_FLOW
+            {
+                install_v3_flow(ss, &mut flows, &mut table, sess, s.flow, inline);
+            }
+        }
+        MQP3_TRAIN => {
+            let Ok(t) = decode_train(&d) else {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                return;
+            };
+            if t.sess != sess {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                return;
+            }
+            for item in t.items() {
+                let addr = match item.inline {
+                    Some(a) => Some(V3Addr::Inline(a)),
+                    None => table
+                        .as_ref()
+                        .and_then(|t| t.get_arc(item.flow))
+                        .map(V3Addr::Flow),
+                };
+                let Some(addr) = addr else {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::debug!(
+                            "v3 TRAIN compressed flow missing: sess={sess} flow={} table={}",
+                            item.flow,
+                            table.as_ref().map_or(0, |t| t.len())
+                        );
+                    }
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    continue;
+                };
+                udp_stats::payload(item.payload.len());
+                let accepted = forward_v3_item(
+                    fast,
+                    ss,
+                    cd,
+                    conn_id,
+                    sess,
+                    addr.as_ref(),
+                    d.slice_ref(item.payload),
+                    allow_private,
+                    staged,
+                )
+                .await;
+                if accepted
+                    && let Some(inline) = item.inline
+                    && item.flow != MQP3_NO_FLOW
+                {
+                    install_v3_flow(ss, &mut flows, &mut table, sess, item.flow, inline);
+                }
+            }
+        }
+        MQP3_FRAG => {
+            // The compact fragment codec exists, but the reassembler still
+            // keys MQP-2 fragments; large payloads keep using that form.
+            dgram_drops::bump(&dgram_drops::REFUSED);
+        }
+        _ => {}
+    }
+}
+
+/// Install an inline open into the session's flow table and refresh the local
+/// snapshot so a later item in the same TRAIN can use the compressed form.
+fn install_v3_flow(
+    ss: &SessTable,
+    flows: &mut Option<Arc<arc_swap::ArcSwap<FlowTable>>>,
+    table: &mut Option<Arc<FlowTable>>,
+    sess: u32,
+    flow: u8,
+    inline: TargetAddrRef<'_>,
+) {
+    if flows.is_none() {
+        *flows = session_flows(ss, sess);
+    }
+    let Some(handle) = flows.as_ref() else {
+        return;
+    };
+    let target = inline.into_owned();
+    handle.rcu(|old| {
+        let mut next = (**old).clone();
+        if !next.insert_at_owned(flow, target.clone()) {
+            // A reused id with a different address is not a legitimate reopen.
+            // Drop the old binding so a later compressed frame cannot be
+            // forwarded to the old (still authorized, but wrong) target.
+            next.remove(flow);
+        }
+        Arc::new(next)
+    });
+    *table = Some(handle.load_full());
 }
 
 /// Test-only count of BATCH-ingress slow-path results published into a
@@ -741,6 +982,11 @@ pub(crate) async fn handle_conn(
                 // `d` is already owned (from `read_datagram`), so payload slices borrow
                 // it directly: one refcount bump per slice, no extra clone per packet.
                 // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
+                if is_v3(&d) {
+                    handle_v3_ingress(&mut fast, &ss, &cd, conn_id, allow_private, &mut staged, d)
+                        .await;
+                    continue;
+                }
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
                     let Ok(f) = decode_fragment(&d) else {
                         dgram_drops::bump(&dgram_drops::REFUSED);
@@ -788,7 +1034,7 @@ pub(crate) async fn handle_conn(
                     )
                     .await;
                     if let Some((dst, life)) = used {
-                        arm_fast(&mut fast, conn_id, s, a.as_ref(), dst, life);
+                        arm_fast(&mut fast, &ss, conn_id, s, a.as_ref(), dst, life);
                     }
                 } else {
                     if is_batch(&d) {
@@ -833,7 +1079,9 @@ pub(crate) async fn handle_conn(
                                         // *next* frame for this session hits the
                                         // fast table (see the table comment).
                                         if let Some((dst2, life)) = used {
-                                            arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
+                                            arm_fast(
+                                                &mut fast, &ss, conn_id, s, b.addr, dst2, life,
+                                            );
                                             #[cfg(test)]
                                             BATCH_FAST_ARMS
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -866,7 +1114,7 @@ pub(crate) async fn handle_conn(
                                     // kept every payload of every BATCH frame on
                                     // the slow path.
                                     if let Some((dst2, life)) = used {
-                                        arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
+                                        arm_fast(&mut fast, &ss, conn_id, s, b.addr, dst2, life);
                                         #[cfg(test)]
                                         BATCH_FAST_ARMS
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -912,7 +1160,7 @@ pub(crate) async fn handle_conn(
                     let used =
                         forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
                     if let Some((dst, life)) = used {
-                        arm_fast(&mut fast, conn_id, s, a, dst, life);
+                        arm_fast(&mut fast, &ss, conn_id, s, a, dst, life);
                     }
                 }
             }

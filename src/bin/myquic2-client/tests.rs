@@ -1305,6 +1305,18 @@ async fn expired_dead_handle_is_invalidated_not_served() {
 /// The endpoints are returned alongside the client connection because
 /// dropping them closes it.
 async fn real_connection() -> (quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+    let (conn, _server_conn, client, server) = real_connection_with_server().await;
+    (conn, client, server)
+}
+
+/// [`real_connection`] plus the accepted server-side handle, so a datagram
+/// test can read exactly what the client queued.
+async fn real_connection_with_server() -> (
+    quinn::Connection,
+    quinn::Connection,
+    quinn::Endpoint,
+    quinn::Endpoint,
+) {
     let certified = rcgen::generate_simple_self_signed(vec!["test.com".to_string()]).unwrap();
     let alpn = normalize_alpn(None);
     let server_tls = server_tls_config(
@@ -1330,12 +1342,274 @@ async fn real_connection() -> (quinn::Connection, quinn::Endpoint, quinn::Endpoi
         let incoming = server.accept().await.unwrap();
         incoming.accept().unwrap().await.unwrap()
     };
-    let (conn, _server_conn) =
+    let (conn, server_conn) =
         tokio::join!(client.connect(server_addr, "test.com").unwrap(), accept);
-    (conn.unwrap(), client, server)
+    (conn.unwrap(), server_conn, client, server)
 }
 
-/// The production reply flush writes `header ++ payload` as **one** datagram,
+/// A single staged client payload must flush as a plain `0x02` datagram, not
+/// a BATCH wrapper: a run of one is the steady shape of DNS/STUN request and
+/// response traffic, and the wrapper would add a count byte plus a length
+/// prefix for no sharing.
+#[tokio::test]
+async fn client_single_staged_payload_flushes_as_plain_datagram() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let body = &b"single-query"[..];
+    let p = PendingBatch::new(bind, body.len());
+    let limit = client_conn.max_datagram_size().unwrap();
+    let mut frag = DgramFragmenter::new();
+    let sent = flush_pending_batch(&client_conn, 7, &mut frag, &addr.as_ref(), &p, body, limit);
+    assert!(sent.complete(), "a small staged payload must be accepted");
+
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the single payload must arrive")
+        .unwrap();
+    assert!(
+        !is_batch(&d),
+        "a run of one must stay a plain 0x02 datagram"
+    );
+    let (sess, decoded_addr, payload) =
+        decode_datagram_ref(&d).expect("the single frame must decode");
+    assert_eq!(sess, 7);
+    assert_eq!(payload, body, "the payload must be sent verbatim");
+    match decoded_addr {
+        TargetAddrRef::Ip(a) => assert_eq!(a, addr.socket_addr().unwrap()),
+        other => panic!("an IP destination must stay IP-form: {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "one staged payload must produce exactly one frame"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// The client-side N-pack flush: one BATCH frame carries every staged payload
+/// in order, under the association's session id and shared destination.
+#[tokio::test]
+async fn client_n_pack_flushes_one_ordered_batch_frame() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let bodies: Vec<Vec<u8>> = (0..MAX_BATCH_ITEMS)
+        .map(|i| format!("item-{i:02}").into_bytes())
+        .collect();
+    let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+    let mut arena = Vec::new();
+    let mut p = PendingBatch::new(bind, refs[0].len());
+    arena.extend_from_slice(refs[0]);
+    for (i, body) in refs.iter().enumerate().skip(1) {
+        p.lens[i] = body.len() as u16;
+        p.n += 1;
+        arena.extend_from_slice(body);
+    }
+    assert_eq!(p.n, MAX_BATCH_ITEMS, "the test stages a full run");
+
+    let limit = client_conn.max_datagram_size().unwrap();
+    let mut frag = DgramFragmenter::new();
+    let sent = flush_pending_batch(
+        &client_conn,
+        7,
+        &mut frag,
+        &addr.as_ref(),
+        &p,
+        &arena,
+        limit,
+    );
+    assert!(sent.complete(), "a full small run must fit one frame");
+
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the batch frame must arrive")
+        .unwrap();
+    assert!(is_batch(&d), "the staged run must ride one BATCH frame");
+    let b = decode_batch_ref(&d).expect("the frame must decode as a batch");
+    assert_eq!(b.sess, 7);
+    assert_eq!(
+        b.payloads, refs,
+        "a batch must preserve staging order exactly"
+    );
+    match b.addr {
+        TargetAddrRef::Ip(a) => assert_eq!(a, addr.socket_addr().unwrap()),
+        other => panic!("an IP destination must stay IP-form: {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "a staged run must produce exactly one frame, not one per payload"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// MQP-3 open/compress: the first frame for a flow carries its address; the
+/// next frame for the same flow is a 5-byte `SINGLE` (flow 0 is implicit).
+#[tokio::test]
+async fn client_v3_open_then_compressed_single() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let body = &b"open-reply"[..];
+    let limit = client_conn.max_datagram_size().unwrap();
+    let mut frag = DgramFragmenter::new();
+    let mut table = FlowTable::default();
+    assert_eq!(table.insert(addr.clone()).unwrap().0, 0);
+
+    let mut arena = body.to_vec();
+    let mut open = PendingTrain::new(bind);
+    open.push(
+        PendingItem {
+            flow: 0,
+            open: true,
+            off: 0,
+            len: body.len(),
+            open_addr: None,
+        },
+        train_item_len(0, 7, body.len()),
+    );
+    assert!(
+        flush_pending_train(&client_conn, 7, &mut frag, &table, &open, &mut arena, limit)
+            .complete()
+    );
+    assert!(arena.is_empty(), "a flush must recycle the staging arena");
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the open frame must arrive")
+        .unwrap();
+    let s = decode_single(&d).expect("the first frame must be a v3 SINGLE");
+    assert_eq!(s.sess, 7);
+    assert_eq!(s.flow, 0);
+    assert_eq!(s.inline, Some(addr.as_ref()));
+    assert_eq!(s.payload, body);
+
+    let mut arena = body.to_vec();
+    let mut compressed = PendingTrain::new(bind);
+    compressed.push(
+        PendingItem {
+            flow: 0,
+            open: false,
+            off: 0,
+            len: body.len(),
+            open_addr: None,
+        },
+        train_item_len(0, 0, body.len()),
+    );
+    assert!(
+        flush_pending_train(
+            &client_conn,
+            7,
+            &mut frag,
+            &table,
+            &compressed,
+            &mut arena,
+            limit,
+        )
+        .complete()
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the compressed frame must arrive")
+        .unwrap();
+    let s = decode_single(&d).expect("the steady frame must be a compressed SINGLE");
+    assert_eq!(s.flow, 0);
+    assert_eq!(s.inline, None, "flow 0 must cost 5 bytes, not an address");
+    assert_eq!(d.len(), 5 + body.len());
+    assert_eq!(s.payload, body);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// One TRAIN can carry payloads for different flows (different destinations);
+/// the receiver gets them in staging order.
+#[tokio::test]
+async fn client_v3_train_mixes_flows() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let mut table = FlowTable::default();
+    assert_eq!(table.insert(a).unwrap().0, 0);
+    assert_eq!(table.insert(b).unwrap().0, 1);
+    let body_a = &b"aaaa"[..];
+    let body_b = &b"bbbbbb"[..];
+    let mut arena = Vec::new();
+    let off_a = arena.len();
+    arena.extend_from_slice(body_a);
+    let off_b = arena.len();
+    arena.extend_from_slice(body_b);
+    let mut train = PendingTrain::new(bind);
+    train.push(
+        PendingItem {
+            flow: 0,
+            open: false,
+            off: off_a,
+            len: body_a.len(),
+            open_addr: None,
+        },
+        train_item_len(0, 0, body_a.len()),
+    );
+    train.push(
+        PendingItem {
+            flow: 1,
+            open: false,
+            off: off_b,
+            len: body_b.len(),
+            open_addr: None,
+        },
+        train_item_len(1, 0, body_b.len()),
+    );
+    let limit = client_conn.max_datagram_size().unwrap();
+    let mut frag = DgramFragmenter::new();
+    assert!(
+        flush_pending_train(
+            &client_conn,
+            9,
+            &mut frag,
+            &table,
+            &train,
+            &mut arena,
+            limit
+        )
+        .complete()
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the train must arrive")
+        .unwrap();
+    let t = decode_train(&d).expect("the frame must be a v3 TRAIN");
+    assert_eq!(t.sess, 9);
+    let items: Vec<_> = t.items().collect();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].flow, 0);
+    assert_eq!(items[0].payload, body_a);
+    assert_eq!(items[0].inline, None);
+    assert_eq!(items[1].flow, 1);
+    assert_eq!(items[1].payload, body_b);
+    assert_eq!(items[1].inline, None);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
 /// byte-identical to what `encode_reply` produces in one buffer.
 ///
 /// This is the path the two-iovec change rewrote (the payload used to be
@@ -2403,6 +2677,62 @@ async fn test_assoc() -> TestAssoc {
     let entry = Arc::new(AssocEntry::new(Arc::new(relay)));
     entry.app.store(Some(Arc::new(app_addr)));
     TestAssoc { entry, app }
+}
+
+/// MQP-3 downlink: a TRAIN resolves compressed items through the association's
+/// outbound flow table, and an inline no-flow item supplies its own source. The
+/// staged replies must carry the source address of each item.
+#[tokio::test]
+async fn dispatch_v3_train_resolves_flows_and_inline_source() {
+    let a: SocketAddr = "198.51.100.1:53".parse().unwrap();
+    let b: SocketAddr = "203.0.113.9:5353".parse().unwrap();
+    let c: SocketAddr = "192.0.2.77:443".parse().unwrap();
+    let assoc = test_assoc().await;
+    assoc.entry.flows.rcu(|old| {
+        let mut t = (**old).clone();
+        assert!(t.insert_at_owned(0, TargetAddr::Ip(a)));
+        assert!(t.insert_at_owned(1, TargetAddr::Ip(b)));
+        Arc::new(t)
+    });
+    let items = [
+        TrainItem {
+            flow: 0,
+            inline: None,
+            src_override: false,
+            payload: b"from-flow-0",
+        },
+        TrainItem {
+            flow: 1,
+            inline: None,
+            src_override: false,
+            payload: b"from-flow-1",
+        },
+        TrainItem {
+            flow: MQP3_NO_FLOW,
+            inline: Some(TargetAddrRef::Ip(c)),
+            src_override: false,
+            payload: b"inline-source",
+        },
+    ];
+    let frame = encode_train(7, &items, 1400).expect("encode the downlink train");
+    let hub = UdpHub::new();
+    hub.publish(7, assoc.entry.clone());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    assert_eq!(
+        dispatch_stage_multi(&mut cache, &hub, 7, frame, &mut reasm, &mut out),
+        3
+    );
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].dst, a);
+    assert_eq!(out[1].dst, b);
+    assert_eq!(out[2].dst, c);
+    assert_eq!(out[0].payload, &b"from-flow-0"[..]);
+    assert_eq!(out[1].payload, &b"from-flow-1"[..]);
+    assert_eq!(out[2].payload, &b"inline-source"[..]);
+    assert!(out[0].sock.is_some(), "the head item owns the relay Arc");
+    assert!(out[1].sock.is_none() && out[2].sock.is_none());
 }
 
 /// Prime a fresh relay socket's writable readiness, and drain the priming
@@ -3585,14 +3915,14 @@ fn only_the_dedicated_bulk_udp_shards_use_the_bulk_preset() {
     }
 }
 
-/// P0-2 regression: the deferred 2-pack flush must never park its payload
-/// back for a later loop iteration. The pre-fix code re-stored it on a stale
-/// memo, so the payload waited for the next app datagram — unbounded when
-/// the app pauses, since the idle and control branches never look at the
-/// deferred queue — and was finally mis-counted at association exit. With no
-/// publishable egress the payload is dropped and counted exactly once.
+/// P0-2 regression: the deferred N-pack flush must never park its payloads
+/// back for a later loop iteration. The pre-fix code re-stored them on a stale
+/// memo, so they waited for the next app datagram — unbounded when the app
+/// pauses, since the idle and control branches never look at the deferred
+/// queue — and were finally mis-counted at association exit. With no
+/// publishable egress every payload is dropped and counted exactly once.
 #[tokio::test]
-async fn deferred_2pack_flush_drops_once_instead_of_parking() {
+async fn deferred_batch_flush_drops_each_payload_once_instead_of_parking() {
     use std::sync::atomic::Ordering;
     // NO_EGRESS is process-wide and this test asserts an exact delta, so it
     // must not overlap any other test that can bump it (the same lock the
@@ -3602,17 +3932,12 @@ async fn deferred_2pack_flush_drops_once_instead_of_parking() {
     let egress = SharedEgress::default();
     let mut frag = DgramFragmenter::new();
     let addr = TargetAddr::Ip("127.0.0.1:53".parse().unwrap());
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    let payload = b"deferred-query";
+    let p = PendingBatch::new(bind, payload.len());
 
     let before = dgram_drops::snapshot();
-    flush_deferred_pair(
-        &egress,
-        &pool,
-        &mut frag,
-        7,
-        pool.udp_bind_shard(EgressClass::Interactive, 0),
-        &addr.as_ref(),
-        b"deferred-query",
-    );
+    flush_deferred_batch(&egress, &pool, &mut frag, 7, &p, &addr.as_ref(), payload);
     let d = dgram_drops::snapshot().since(&before);
     assert_eq!(
         d.no_egress, 1,
@@ -3623,18 +3948,33 @@ async fn deferred_2pack_flush_drops_once_instead_of_parking() {
         before.no_egress + 1,
         "exactly one bookkeeping event for one lost payload"
     );
+
+    // A real run loses every staged datagram, not one event for the frame.
+    let mut arena = payload.to_vec();
+    arena.extend_from_slice(b"abc");
+    let mut p2 = PendingBatch::new(bind, payload.len());
+    p2.lens[1] = 3;
+    p2.n = 2;
+    let before = dgram_drops::snapshot();
+    flush_deferred_batch(&egress, &pool, &mut frag, 7, &p2, &addr.as_ref(), &arena);
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.no_egress, 2,
+        "every payload in an undeliverable run is counted"
+    );
 }
 
 /// Serializes the tests that assert exact deltas on the process-wide egress
 /// drop counters: `EGRESS_DEAD`, `NO_EGRESS` and `udp_write::no_app`. The
 /// tests that bump them on purpose take this lock too, so a parallel test
-/// cannot inflate the delta another test is asserting (`deferred_2pack_flush_
-/// drops_once_instead_of_parking` and the UDP-associate startup test were the
-/// two missing holders; the rest of the file uses live loopback connections).
+/// cannot inflate the delta another test is asserting
+/// (`deferred_batch_flush_drops_each_payload_once_instead_of_parking` and the
+/// UDP-associate startup test were the two missing holders; the rest of the
+/// file uses live loopback connections).
 static EGRESS_VERDICT_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The send-verdict recovery is one shared handler for the per-datagram path
-/// and the deferred 2-pack flush, and it must count exactly once per event:
+/// and the deferred N-pack flush, and it must count exactly once per event:
 /// `ConnectionLost` invalidates the shared cache and bumps `EGRESS_DEAD`;
 /// `Unsupported` only counts; `Blocked`/`TooLarge` are already counted where
 /// they are decided (inside `send_encoded`) and must not be counted again.
@@ -3756,12 +4096,12 @@ async fn send_verdict_recovery_is_counted_once_and_shared() {
     );
 }
 
-/// Regression for the deferred 2-pack flush dropping its send verdict: a memo
+/// Regression for the deferred N-pack flush dropping its send verdict: a memo
 /// hit whose cached handle died between staging and the flush must run the same
 /// recovery as the per-datagram path — one `EGRESS_DEAD`, cache invalidated —
 /// instead of silently losing the payload with `.is_some()`.
 #[tokio::test]
-async fn deferred_2pack_flush_recovers_a_dead_egress_verdict() {
+async fn deferred_batch_flush_recovers_a_dead_egress_verdict() {
     use std::sync::atomic::Ordering;
     let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
     let pool = ConnPool::new(1, vec![], true, true, 1);
@@ -3769,6 +4109,8 @@ async fn deferred_2pack_flush_recovers_a_dead_egress_verdict() {
     let mut frag = DgramFragmenter::new();
     let addr = TargetAddr::Ip("127.0.0.1:53".parse().unwrap());
     let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    let payload = b"deferred-query";
+    let p = PendingBatch::new(bind, payload.len());
 
     // A live memo pointing at a connection that is closed by the time of the
     // flush: exactly the stale-handle window the memo deliberately serves.
@@ -3794,15 +4136,7 @@ async fn deferred_2pack_flush_recovers_a_dead_egress_verdict() {
 
     let before = dgram_drops::snapshot();
     let gen_before = egress.generation[bind.index].load(Ordering::Acquire);
-    flush_deferred_pair(
-        &egress,
-        &pool,
-        &mut frag,
-        7,
-        bind,
-        &addr.as_ref(),
-        b"deferred-query",
-    );
+    flush_deferred_batch(&egress, &pool, &mut frag, 7, &p, &addr.as_ref(), payload);
     let d = dgram_drops::snapshot().since(&before);
     assert_eq!(
         d.egress_dead, 1,

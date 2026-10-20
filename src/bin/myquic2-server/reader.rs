@@ -86,7 +86,7 @@ pub(crate) fn sess_buf_pool_len() -> usize {
     SESS_BUF_POOL.with(|p| p.borrow().len())
 }
 
-/// Wire length of the `atyp | addr | port` header a batch frame carries for
+/// Wire length of the `atyp | addr | port` header a packed frame carries for
 /// `src`. A reply's source is always IP-form (the session reader reports the
 /// address the target answered from), so this is 7 or 19 bytes.
 fn reply_addr_len(src: SocketAddr) -> usize {
@@ -96,21 +96,205 @@ fn reply_addr_len(src: SocketAddr) -> usize {
     }
 }
 
-/// Payload bytes (length prefixes included) one BATCH frame can carry for
-/// `src` at the current path budget: the path budget minus the fixed part
-/// `encode_batch` spends (`BATCH_PREFIX_LEN + addr header + count byte`).
-/// [`reply_stage`] charges each staged item's `2 + len` against it; a run that
-/// is admitted is therefore guaranteed to encode.
+/// One reply waiting in the MQP-3 TRAIN arena.
 ///
-/// Staging against this is what keeps the staging copy from being paid for
-/// nothing: the previous shape staged *every* small reply into its own `Bytes`
-/// and only discovered at flush time that the frame could not fit
-/// (`encode_batch` needs the whole frame inside the DATAGRAM budget — three
-/// 500 B replies already exceed a 1472 B path), so a burst of 100-512 B
-/// replies paid a staging allocation and memcpy per reply *plus* the
-/// per-reply frame it would have paid anyway.
-fn reply_batch_budget(limit: usize, src: SocketAddr) -> usize {
-    limit.saturating_sub(BATCH_PREFIX_LEN + reply_addr_len(src) + 1)
+/// `flow` is the inbound flow whose destination produced this source, or
+/// [`MQP3_NO_FLOW`] for an unsolicited/full-cone source (and for a domain
+/// target, whose resolved IP the client does not know). A no-flow item carries
+/// its source inline; a known flow is compressed and the client's own flow
+/// table supplies the source address.
+pub(crate) struct ReplyItem {
+    pub(crate) flow: u8,
+    pub(crate) src: SocketAddr,
+    pub(crate) off: usize,
+    pub(crate) len: usize,
+}
+
+/// Stage one small reply into the current MQP-3 TRAIN.
+///
+/// Unlike the MQP-2 BATCH stager this does **not** require a shared source: a
+/// train can mix destinations, which is the case that matters for DNS/game
+/// fanout. `last_flow` is a one-entry memo of `(source, flow)` so a steady
+/// source does not reload the flow snapshot or scan the table per reply.
+///
+/// `false` means the run is full or the next item would exceed the path
+/// budget; the caller flushes and retries. Saturating arithmetic, because
+/// `limit` is a live path budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reply_stage_v3(
+    arena: &mut Vec<u8>,
+    staged: &mut Vec<ReplyItem>,
+    staged_wire: &mut usize,
+    flows: &arc_swap::ArcSwap<FlowTable>,
+    last_flow: &mut Option<(SocketAddr, u8)>,
+    src: SocketAddr,
+    payload: &[u8],
+    limit: usize,
+) -> bool {
+    if staged.len() >= MQP3_MAX_TRAIN_ITEMS {
+        return false;
+    }
+    let flow = match *last_flow {
+        Some((s, f)) if s == src => f,
+        _ => {
+            let snap = flows.load();
+            let f = snap.flow_for_ip(src).unwrap_or(MQP3_NO_FLOW);
+            *last_flow = Some((src, f));
+            f
+        }
+    };
+    // A known IP flow is compressed. A no-flow item (unsolicited source, a
+    // source port that changed, or a domain target) carries its address inline:
+    // the client resolves flow ids from its outbound destination table, which
+    // for a domain is not a valid SOCKS reply source.
+    let addr_len = if flow == MQP3_NO_FLOW {
+        reply_addr_len(src)
+    } else {
+        0
+    };
+    let base = if staged.is_empty() {
+        MQP3_TRAIN_HEADER_LEN
+    } else {
+        *staged_wire
+    };
+    let next = base.saturating_add(train_item_len(flow, addr_len, payload.len()));
+    if next > limit {
+        return false;
+    }
+    let off = arena.len();
+    arena.extend_from_slice(payload);
+    staged.push(ReplyItem {
+        flow,
+        src,
+        off,
+        len: payload.len(),
+    });
+    *staged_wire = next;
+    true
+}
+
+/// Send one staged reply as a `SINGLE`, falling back to the MQP-2 fragment
+/// sender. Returns true when a `TooLarge` verdict should trigger a budget
+/// probe.
+fn flush_reply_single(
+    c2: &quinn::Connection,
+    s: u32,
+    frag: &mut DgramFragmenter,
+    item: &ReplyItem,
+    payload: &[u8],
+    limit: usize,
+) -> bool {
+    let ta = TargetAddr::Ip(item.src);
+    let inline = (item.flow == MQP3_NO_FLOW).then(|| ta.as_ref());
+    let sent = match encode_single(s, item.flow, inline.as_ref(), false, payload, limit) {
+        Some(body) => try_send_datagram(c2, body),
+        None => DatagramSend::TooLarge,
+    };
+    match sent {
+        DatagramSend::Sent => {
+            udp_stats::payload(payload.len());
+            false
+        }
+        DatagramSend::Blocked | DatagramSend::TooLarge => {
+            frag.send(c2, s, &ta.as_ref(), payload, limit).outcome() == DatagramSend::TooLarge
+        }
+        // The caller's next action is the same for a dead/unsupported
+        // connection: flush what remains, then leave the reader. Nothing is
+        // counted here; the per-frame verdict is one event, not one per reply.
+        DatagramSend::Unsupported | DatagramSend::ConnectionLost => false,
+    }
+}
+
+/// Flush the staged replies as one MQP-3 TRAIN, or as per-reply
+/// `SINGLE`/fragment sends if the frame is refused.
+///
+/// Accounting is per reply, never per frame: a successful train books every
+/// payload, a refused train books nothing and the fallback books each payload
+/// through `flush_reply_single`/`DgramFragmenter::send`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flush_reply_train(
+    c2: &quinn::Connection,
+    s: u32,
+    frag: &mut DgramFragmenter,
+    arena: &mut Vec<u8>,
+    staged: &mut Vec<ReplyItem>,
+    staged_wire: &mut usize,
+    limit: &mut usize,
+    last_too_large_probe_ms: &mut u64,
+) {
+    if staged.is_empty() {
+        *staged_wire = 0;
+        arena.clear();
+        return;
+    }
+    let mut too_large = false;
+    if staged.len() == 1 {
+        let item = &staged[0];
+        too_large = flush_reply_single(
+            c2,
+            s,
+            frag,
+            item,
+            &arena[item.off..item.off + item.len],
+            *limit,
+        );
+    } else {
+        let n = staged.len().min(MQP3_MAX_TRAIN_ITEMS);
+        let mut addrs: [TargetAddr; MQP3_MAX_TRAIN_ITEMS] =
+            std::array::from_fn(|_| TargetAddr::Ip(SocketAddr::from(([0, 0, 0, 0], 0))));
+        let mut refs: [TrainItem<'_>; MQP3_MAX_TRAIN_ITEMS] = [TrainItem {
+            flow: 0,
+            inline: None,
+            src_override: false,
+            payload: &[],
+        }; MQP3_MAX_TRAIN_ITEMS];
+        for (i, item) in staged.iter().take(n).enumerate() {
+            addrs[i] = TargetAddr::Ip(item.src);
+        }
+        for (i, item) in staged.iter().take(n).enumerate() {
+            let inline = (item.flow == MQP3_NO_FLOW).then(|| addrs[i].as_ref());
+            refs[i] = TrainItem {
+                flow: item.flow,
+                inline,
+                src_override: false,
+                payload: &arena[item.off..item.off + item.len],
+            };
+        }
+        let sent = encode_train(s, &refs[..n], *limit)
+            .map(|body| try_send_datagram(c2, body))
+            .unwrap_or(DatagramSend::TooLarge);
+        match sent {
+            DatagramSend::Sent => {
+                for item in staged.iter().take(n) {
+                    udp_stats::payload(item.len);
+                }
+                tracing::debug!("udp session {s}: {n} replies sent as one MQP-3 train");
+            }
+            DatagramSend::Blocked | DatagramSend::TooLarge => {
+                for item in staged.iter().take(n) {
+                    too_large |= flush_reply_single(
+                        c2,
+                        s,
+                        frag,
+                        item,
+                        &arena[item.off..item.off + item.len],
+                        *limit,
+                    );
+                }
+            }
+            DatagramSend::Unsupported | DatagramSend::ConnectionLost => {}
+        }
+    }
+    staged.clear();
+    arena.clear();
+    *staged_wire = 0;
+    if too_large {
+        let now_probe = mono_millis().max(1);
+        if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
+            *last_too_large_probe_ms = now_probe;
+            *limit = c2.max_datagram_size().unwrap_or(0);
+        }
+    }
 }
 
 /// Stage one small reply into the current run's arena.
@@ -119,22 +303,23 @@ fn reply_batch_budget(limit: usize, src: SocketAddr) -> usize {
 /// no room left in the frame budget. The caller flushes the run and retries; a
 /// reply that still cannot be staged on its own is sent as a single datagram.
 ///
-/// The budget check charges **every** item's 2-byte length prefix, not just the
-/// one being added. `encode_batch` spends `BATCH_PREFIX_LEN + addr + 1 +
-/// Σ(2 + len)`, and [`reply_batch_budget`] already subtracts the fixed part, so
-/// a run that would hold `staged.len() + 1` items costs
-/// `arena.len() + BATCH_ITEM_OVERHEAD * (staged.len() + 1) + payload.len()`.
-/// Charging a single prefix (the previous shape) under-counted an N-item run by
-/// `2 * N` bytes: 16 x 88 B replies need `5 + 7 + 1 + 16 x 90 = 1453 B`, so at
-/// a 1452 B path budget the 16th was admitted and `encode_batch` then refused
-/// the frame — the flush degraded to 16 per-reply sends and the staging copy had
-/// been paid for nothing, which is exactly the waste this budget exists to
-/// prevent. Saturating arithmetic: `limit` is a live path budget and this runs
-/// under panic=abort, so an absurd value must clamp, not wrap.
+/// The budget check uses [`batch_frame_len`], the same arithmetic as
+/// `encode_batch`: it charges the fixed part plus **every** item's 2-byte
+/// length prefix, not just the one being added. A run that would hold
+/// `staged.len() + 1` items therefore costs
+/// `BATCH_PREFIX_LEN + addr + 1 + Σ(2 + len)`. Charging a single prefix (the
+/// previous shape) under-counted an N-item run by `2 * N` bytes: 16 x 88 B
+/// replies need `5 + 7 + 1 + 16 x 90 = 1453 B`, so at a 1452 B path budget the
+/// 16th was admitted and `encode_batch` then refused the frame — the flush
+/// degraded to 16 per-reply sends and the staging copy had been paid for
+/// nothing, which is exactly the waste this budget exists to prevent.
+/// Saturating arithmetic: `limit` is a live path budget and this runs under
+/// panic=abort, so an absurd value must clamp, not wrap.
 ///
 /// The arena is reused across bursts and cleared on every flush, so the steady
 /// state allocates nothing per reply — the copy into the arena is the only one
 /// the caller pays, and `encode_batch` reads the payloads straight out of it.
+#[cfg(test)]
 pub(crate) fn reply_stage(
     arena: &mut Vec<u8>,
     staged: &mut Vec<(usize, usize)>,
@@ -146,12 +331,11 @@ pub(crate) fn reply_stage(
     if staged_src.is_some_and(|s| s != src) || staged.len() >= MAX_BATCH_ITEMS {
         return false;
     }
-    let prefixes = BATCH_ITEM_OVERHEAD.saturating_mul(staged.len().saturating_add(1));
-    if arena
-        .len()
-        .saturating_add(prefixes)
-        .saturating_add(payload.len())
-        > reply_batch_budget(limit, src)
+    if batch_frame_len(
+        reply_addr_len(src),
+        staged.len().saturating_add(1),
+        arena.len().saturating_add(payload.len()),
+    ) > limit
     {
         return false;
     }
@@ -164,7 +348,7 @@ pub(crate) fn reply_stage(
 
 /// Flush staged small replies for one target as a single MQP-2 BATCH frame.
 ///
-/// Server-side mirror of the client association's 2-pack: up to
+/// Server-side mirror of the client association's N-pack: up to
 /// [`MAX_BATCH_ITEMS`] replies that share one `(ip, port)` source ride one
 /// DATAGRAM — one quinn connection-state lock and one AEAD instead of one
 /// per reply. `arena`/`staged` are the run's reused buffers (see
@@ -180,6 +364,7 @@ pub(crate) fn reply_stage(
 /// re-sends each reply through `DgramFragmenter::send`, which does its own
 /// exactly-once accounting — the same bookkeeping an unbatched reply gets. That
 /// fallback now only fires when the path budget shrank under a staged run.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_reply_batch(
     c2: &quinn::Connection,
@@ -274,7 +459,7 @@ pub(crate) fn flush_reply_batch(
 
 /// What processing one reply did to the reader's drain loop.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplyDisposition {
+pub(crate) enum ReplyDisposition {
     /// Keep draining the current burst.
     Continue,
     /// Tear the reader down: the path budget collapsed to zero, or the
@@ -292,7 +477,7 @@ enum ReplyDisposition {
 /// payload memcpy per drained reply. Any future `await` in here would have to
 /// move back behind an owned copy in the caller.
 #[allow(clippy::too_many_arguments)]
-fn handle_session_reply(
+pub(crate) fn handle_session_reply(
     c2: &quinn::Connection,
     s: u32,
     payload: &[u8],
@@ -300,8 +485,10 @@ fn handle_session_reply(
     reply_filter: ReplyFilter,
     frag: &mut DgramFragmenter,
     arena: &mut Vec<u8>,
-    staged: &mut Vec<(usize, usize)>,
-    staged_src: &mut Option<SocketAddr>,
+    staged: &mut Vec<ReplyItem>,
+    staged_wire: &mut usize,
+    flows: &arc_swap::ArcSwap<FlowTable>,
+    last_flow: &mut Option<(SocketAddr, u8)>,
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
     last_touch: &mut u64,
@@ -362,13 +549,13 @@ fn handle_session_reply(
         // The staged replies cannot go out either: flush counts them through
         // the per-reply path (each is a TooLarge drop) instead of losing them
         // silently on the way out.
-        flush_reply_batch(
+        flush_reply_train(
             c2,
             s,
             &mut *frag,
             &mut *arena,
             &mut *staged,
-            &mut *staged_src,
+            &mut *staged_wire,
             limit,
             &mut *last_too_large_probe_ms,
         );
@@ -405,7 +592,21 @@ fn handle_session_reply(
             .as_ref()
             .is_some_and(|r| !r.is_empty() && r.contains(&src))
     };
-    if !on_allowlist {
+    // A destination can fall out of the 16-entry recent ring while its flow is
+    // still live (a 32-resolver DNS fanout is exactly that shape). The flow
+    // table is an exact, session-scoped record of accepted IP targets, so it is
+    // a second authorization source rather than a routing-only hint. Only
+    // checked on a ring miss, and only IP flows match (`flow_for_ip` skips
+    // domain entries, which have no resolved client-side address).
+    let on_flow = !on_allowlist && flows.load().flow_for_ip(src).is_some();
+    if on_flow {
+        // The one-entry staging memo may have cached NO_FLOW before this mapping
+        // was installed (the target's first reply can race the accept loop's
+        // install). Invalidate it here so the reply is compressed now, instead
+        // of staying inline until a different source happens to evict the memo.
+        *last_flow = None;
+    }
+    if !on_allowlist && !on_flow {
         if reply_filter == ReplyFilter::FullCone {
             // Admitted anyway; counted so an operator can see whether (and how
             // much) unsolicited traffic is actually arriving.
@@ -415,41 +616,59 @@ fn handle_session_reply(
             return ReplyDisposition::Continue;
         }
     }
-    // Reply batching: a small reply rides the run's BATCH frame instead of its
-    // own DATAGRAM. A run is the consecutive replies of this burst from one
-    // source, so a different source, a large reply, the burst end and the exit
-    // paths below flush what is staged first — order on the wire is preserved
-    // and nothing waits (the payload is copied once, into the reused arena).
+    // Reply packing: a small reply rides the run's MQP-3 TRAIN instead of its
+    // own DATAGRAM. Unlike the old BATCH, a run may mix sources; a large reply,
+    // the burst end and the exit paths below flush what is staged first — order
+    // on the wire is preserved and nothing waits (the payload is copied once,
+    // into the reused arena).
     //
-    // Staging is budget-aware: `reply_stage` refuses a reply that would not fit
-    // the frame, so a run always encodes (unless the path budget shrank after
-    // staging). A reply that cannot be staged even alone falls through to the
-    // single-datagram send below.
+    // Staging is budget-aware: `reply_stage_v3` refuses a reply that would not
+    // fit the frame, so a run always encodes (unless the path budget shrank
+    // after staging). A reply that cannot be staged even alone falls through to
+    // the single-datagram send below.
     if n <= BATCH_SMALL_MAX {
-        if reply_stage(arena, staged, staged_src, src, payload, *limit) {
+        if reply_stage_v3(
+            arena,
+            staged,
+            staged_wire,
+            flows,
+            last_flow,
+            src,
+            payload,
+            *limit,
+        ) {
             return ReplyDisposition::Continue;
         }
-        flush_reply_batch(
+        flush_reply_train(
             c2,
             s,
             &mut *frag,
             &mut *arena,
             &mut *staged,
-            &mut *staged_src,
+            &mut *staged_wire,
             limit,
             &mut *last_too_large_probe_ms,
         );
-        if reply_stage(arena, staged, staged_src, src, payload, *limit) {
+        if reply_stage_v3(
+            arena,
+            staged,
+            staged_wire,
+            flows,
+            last_flow,
+            src,
+            payload,
+            *limit,
+        ) {
             return ReplyDisposition::Continue;
         }
     }
-    flush_reply_batch(
+    flush_reply_train(
         c2,
         s,
         &mut *frag,
         &mut *arena,
         &mut *staged,
-        &mut *staged_src,
+        &mut *staged_wire,
         limit,
         &mut *last_too_large_probe_ms,
     );
@@ -481,13 +700,13 @@ fn handle_session_reply(
             // on a dead connection each per-reply send reports the same terminal
             // outcome, and nothing is counted for it — the same disposition an
             // unstaged reply on this path gets.
-            flush_reply_batch(
+            flush_reply_train(
                 c2,
                 s,
                 &mut *frag,
                 &mut *arena,
                 &mut *staged,
-                &mut *staged_src,
+                &mut *staged_wire,
                 limit,
                 &mut *last_too_large_probe_ms,
             );
@@ -507,6 +726,7 @@ pub(crate) async fn sess_reader_task(
     last2: Arc<std::sync::atomic::AtomicU64>,
     recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
     recent_epoch: Arc<std::sync::atomic::AtomicU64>,
+    flows: Arc<arc_swap::ArcSwap<FlowTable>>,
     reply_filter: ReplyFilter,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -535,19 +755,15 @@ pub(crate) async fn sess_reader_task(
     // real epoch (it counts pushes), so the first reply always loads.
     let mut allow_snap: Option<Arc<RecentAddrs>> = None;
     let mut allow_epoch: u64 = u64::MAX;
-    // Staged small replies for one grouped BATCH frame — the reply-path twin
-    // of the client association's 2-pack. One run is the replies of the
-    // current drain burst that share a source; a different source, a large
-    // reply, the burst end and every session-exiting path flush it through
-    // `flush_reply_batch`, so the queue is bounded by `MAX_BATCH_ITEMS` and
-    // holds nothing across awaits. The payloads live in one reused `arena`
-    // (offsets+lengths in `staged`), so a staged reply costs a copy into a
-    // buffer that is never reallocated, not a fresh `Bytes` allocation. The
-    // arena starts empty: a session that never batches keeps no buffer, and one
-    // that does grows it to at most one frame (`reply_batch_budget`).
+    // Staged small replies for one MQP-3 TRAIN. A train can mix sources, so a
+    // run is bounded only by item count and the path budget; a large reply, the
+    // burst end and every session-exiting path flush it through
+    // `flush_reply_train`, so nothing survives across awaits. Payloads live in
+    // one reused arena; the arena starts empty and grows to at most one frame.
     let mut arena: Vec<u8> = Vec::new();
-    let mut staged: Vec<(usize, usize)> = Vec::with_capacity(MAX_BATCH_ITEMS);
-    let mut staged_src: Option<SocketAddr> = None;
+    let mut staged: Vec<ReplyItem> = Vec::with_capacity(MQP3_MAX_TRAIN_ITEMS);
+    let mut staged_wire = 0usize;
+    let mut last_flow: Option<(SocketAddr, u8)> = None;
     'session: loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
@@ -609,7 +825,9 @@ pub(crate) async fn sess_reader_task(
                     &mut frag,
                     &mut arena,
                     &mut staged,
-                    &mut staged_src,
+                    &mut staged_wire,
+                    flows.as_ref(),
+                    &mut last_flow,
                     &mut limit,
                     &mut last_too_large_probe_ms,
                     &mut last_touch,
@@ -685,13 +903,13 @@ pub(crate) async fn sess_reader_task(
         // The burst ends here, so whatever is staged goes out before the
         // reader parks: the last reply of a burst must not wait for the next
         // target reply to be flushed.
-        flush_reply_batch(
+        flush_reply_train(
             &c2,
             s,
             &mut frag,
             &mut arena,
             &mut staged,
-            &mut staged_src,
+            &mut staged_wire,
             &mut limit,
             &mut last_too_large_probe_ms,
         );
@@ -909,6 +1127,8 @@ pub(crate) async fn get_or_create_sess(
         Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default()));
     let recent_epoch: Arc<std::sync::atomic::AtomicU64> =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flows_pre: Arc<arc_swap::ArcSwap<FlowTable>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default()));
     let h_pre = tokio::spawn(sess_reader_task(
         conn_id,
         s,
@@ -918,6 +1138,7 @@ pub(crate) async fn get_or_create_sess(
         last_pre.clone(),
         recent_pre.clone(),
         recent_epoch.clone(),
+        flows_pre.clone(),
         ss.reply_filter,
     ));
     let reader_abort = h_pre.abort_handle();
@@ -987,6 +1208,7 @@ pub(crate) async fn get_or_create_sess(
                     }),
                 recent: recent_pre.clone(),
                 recent_epoch: recent_epoch.clone(),
+                flows: flows_pre.clone(),
             },
         );
         ss.note_live_insert();

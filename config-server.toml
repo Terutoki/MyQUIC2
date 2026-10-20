@@ -38,7 +38,7 @@ auth_token = ""
 # Optional cap, in MiB, on the peer-pinnable memory the admitted connections may
 # represent. The fixed process-wide terms are charged first — the UDP session
 # pool: MAX_SESSIONS_GLOBAL (8192) x (2 x MYQUIC2_SESS_SOCKET_BUF + its reader
-# buffer) = ~1.06 GiB at the shipped 64 KiB buffers on non-Linux, ~2.06 GiB on
+# buffer + 4 KiB MQP-3 flow table) = ~1.09 GiB at the shipped 64 KiB buffers on non-Linux, ~2.09 GiB on
 # Linux (the kernel stores/returns SO_*BUF at twice the requested value); the
 # per-endpoint buffers: ~19 MiB each (quinn's 2.875 MiB userspace receive
 # scratch + 16 MiB Linux kernel socket caps) x quic_endpoints; and the TCP pump

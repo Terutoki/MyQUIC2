@@ -158,8 +158,11 @@ struct AppDgramCtx<'a> {
     activity_stamp: &'a mut u64,
     bind: &'a mut Option<UdpBind>,
     pending_buf: &'a mut Vec<u8>,
-    pending_pack: &'a mut Option<PendingPack>,
-    pending_addr: &'a mut TargetAddr,
+    pending_train: &'a mut Option<PendingTrain>,
+    /// Session-scoped outbound flow table. The association task is its only
+    /// writer; a clone-on-write snapshot is published to `entry.flows` so the
+    /// dispatcher can decode downlink flow ids without a lock.
+    flows: &'a mut FlowTable,
     frag: &'a mut DgramFragmenter,
 }
 
@@ -184,8 +187,8 @@ impl AppDgramCtx<'_> {
         let activity_stamp = &mut *self.activity_stamp;
         let bind = &mut *self.bind;
         let pending_buf = &mut *self.pending_buf;
-        let pending_pack = &mut *self.pending_pack;
-        let pending_addr = &mut *self.pending_addr;
+        let pending_train = &mut *self.pending_train;
+        let flows = &mut *self.flows;
         let frag = &mut *self.frag;
 
         // The kernel truncates a datagram larger than the receive buffer and
@@ -293,74 +296,108 @@ impl AppDgramCtx<'_> {
             b
         });
         let sent = match egress_shared.with_fresh(bind, now, |c, limit| {
-            {
-                if payload.len() <= BATCH_SMALL_MAX {
-                    if let Some(p) = pending_pack.take() {
-                        if p.bind == bind && pending_addr.as_ref() == addr {
-                            let pair: [&[u8]; 2] = [&pending_buf[..p.len], payload];
-                            match send_udp_batch(c, sess, &addr, &pair, limit) {
-                                DatagramSend::Sent => {
-                                    return PayloadSend {
-                                        frames: 1,
-                                        failed: None,
-                                    };
-                                }
-                                DatagramSend::TooLarge | DatagramSend::Blocked => {
-                                    let pa = pending_addr.as_ref();
-                                    let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
-                                    if s1.failed.is_some() {
-                                        let s2 = frag.send(c, sess, &addr, payload, limit);
-                                        return prefer_severe(s1, s2);
-                                    }
-                                    return frag.send(c, sess, &addr, payload, limit);
-                                }
-                                other => {
-                                    // One BATCH verdict for both staged
-                                    // payloads: `frames: 0` says neither went
-                                    // out, and the outer caller's
-                                    // `recover_send_outcome` counts the event
-                                    // once (`EGRESS_DEAD` is per dead
-                                    // connection, not per lost datagram) —
-                                    // deliberately, so a 2-pack loss cannot
-                                    // double-count or double-invalidate.
-                                    return PayloadSend {
-                                        frames: 0,
-                                        failed: Some(other),
-                                    };
-                                }
-                            }
-                        }
-                        // Different destination or binding: hand the staged
-                        // payload to the single-datagram path first, then stage
-                        // this one below.
-                        let pa = pending_addr.as_ref();
-                        let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
-                        if s1.failed.is_some() {
-                            let s2 = frag.send(c, sess, &addr, payload, limit);
-                            return prefer_severe(s1, s2);
-                        }
-                    }
-                    pending_retarget(pending_addr, &addr);
-                    pending_buf.clear();
-                    pending_buf.extend_from_slice(payload);
-                    *pending_pack = Some(PendingPack {
-                        bind,
-                        len: payload.len(),
-                    });
-                    return PayloadSend {
-                        frames: 1,
-                        failed: None,
-                    };
-                } else if let Some(p) = pending_pack.take() {
-                    let pa = pending_addr.as_ref();
-                    let s1 = frag.send(c, sess, &pa, &pending_buf[..p.len], limit);
-                    if s1.failed.is_some() {
+            // A payload that cannot join a TRAIN still has to drain the current
+            // run first: keeping it would reorder the association's wire.
+            if payload.len() > BATCH_SMALL_MAX {
+                if let Some(p) = pending_train.take() {
+                    let s1 = flush_pending_train(c, sess, frag, flows, &p, pending_buf, limit);
+                    if !s1.complete() {
                         let s2 = frag.send(c, sess, &addr, payload, limit);
                         return prefer_severe(s1, s2);
                     }
                 }
+                return frag.send(c, sess, &addr, payload, limit);
             }
-            frag.send(c, sess, &addr, payload, limit)
+            // A refused header takes the same single/fragment path (and the
+            // same accounting) it would take without a train.
+            let Ok(header) = addr.header() else {
+                if let Some(p) = pending_train.take() {
+                    let s1 = flush_pending_train(c, sess, frag, flows, &p, pending_buf, limit);
+                    if !s1.complete() {
+                        let s2 = frag.send(c, sess, &addr, payload, limit);
+                        return prefer_severe(s1, s2);
+                    }
+                }
+                return frag.send(c, sess, &addr, payload, limit);
+            };
+            // Conservative worst case for one item: extra flow byte + inline
+            // address. Deciding the preliminary flush against it makes the
+            // exact append below memory-safe against a full run without a
+            // second budget branch: `wire_len` is an upper bound, so an item
+            // that fits this estimate fits the encoder.
+            let worst_item = 1usize
+                .saturating_add(1)
+                .saturating_add(varint_len(payload.len()))
+                .saturating_add(header.len())
+                .saturating_add(payload.len());
+            if pending_train.as_ref().is_some_and(|p| {
+                p.bind != bind
+                    || p.n >= MQP3_MAX_TRAIN_ITEMS
+                    || p.wire_len.saturating_add(worst_item) > limit
+            }) {
+                let p = pending_train.take().expect("checked by is_some_and");
+                let s1 = flush_pending_train(c, sess, frag, flows, &p, pending_buf, limit);
+                if !s1.complete() {
+                    let s2 = frag.send(c, sess, &addr, payload, limit);
+                    return prefer_severe(s1, s2);
+                }
+            }
+            // Flow allocation and the inline decision. A new IP flow is opened
+            // inline; an established flow keeps its address inline until a
+            // downlink frame for that flow was successfully staged on the
+            // client (see `AssocEntry::confirmed`). That downlink is proof the
+            // server installed the mapping, so compressing the next frame is
+            // safe even if the open frames were lost. A pure-uplink flow never
+            // gets that proof and stays inline; that costs the flow byte plus
+            // the address, but cannot black-hole. Flow ids are never reused; a
+            // full table falls back to the reserved no-flow inline id.
+            //
+            // Domain targets deliberately stay inline (`NO_FLOW`) on every
+            // frame. The first unresolved domain is delivered by a spawned
+            // resolver task, so the session (and its flow table) may not exist
+            // when the accept loop sees the open; compressing later frames
+            // would then need a growth-proof race. The reply direction already
+            // cannot compress a domain flow, because the client has no resolved
+            // IP to put in the SOCKS header. Inline avoids both problems and
+            // does not consume a flow slot; TRAIN still shares the session
+            // header across a domain fanout.
+            let (flow, want_open) = if matches!(addr, TargetAddrRef::Domain(..)) {
+                (MQP3_NO_FLOW, true)
+            } else {
+                match flows.flow_for(&addr) {
+                    Some(f) => (f, !entry.flow_confirmed(f)),
+                    None => match flows.insert(addr.into_owned()) {
+                        Some((f, owned)) => {
+                            publish_flow(entry, f, owned);
+                            (f, true)
+                        }
+                        None => (MQP3_NO_FLOW, true),
+                    },
+                }
+            };
+            let already_open = pending_train
+                .as_ref()
+                .is_some_and(|p| flow < MQP3_MAX_FLOWS as u8 && p.open_mask & (1u64 << flow) != 0);
+            let open = want_open && !already_open;
+            let addr_len = if open { header.len() } else { 0 };
+            let item_len = train_item_len(flow, addr_len, payload.len());
+            let train = pending_train.get_or_insert_with(|| PendingTrain::new(bind));
+            let off = pending_buf.len();
+            pending_buf.extend_from_slice(payload);
+            train.push(
+                PendingItem {
+                    flow,
+                    open,
+                    off,
+                    len: payload.len(),
+                    open_addr: (flow == MQP3_NO_FLOW).then(|| addr.into_owned()),
+                },
+                item_len,
+            );
+            PayloadSend {
+                frames: 1,
+                failed: None,
+            }
         }) {
             Some(s) => s,
             None => {
@@ -414,7 +451,7 @@ impl AppDgramCtx<'_> {
             );
         }
         // Exactly one place for a send verdict's recovery, shared with the
-        // deferred 2-pack flush below. `Blocked`/`TooLarge` are already counted
+        // deferred TRAIN flush below. `Blocked`/`TooLarge` are already counted
         // where they are decided; `ConnectionLost`/`Unsupported` are the states
         // the memo hit path deliberately defers to the send's verdict.
         recover_send_outcome(egress_shared, bind, sent);
@@ -526,24 +563,21 @@ pub(crate) async fn udp_associate_inner(
     // until then every datagram would bind from itself, which cannot happen
     // because the first send binds before it goes out.
     let mut bind: Option<UdpBind> = None;
-    // Opportunistic 2-pack staging: one small payload held across drain
-    // iterations so two consecutive same-destination small datagrams go out as
-    // a single BATCH frame (one quinn lock + one AEAD instead of two). Never
-    // waits: flushed at burst end or when the next datagram does not match, so
-    // no added latency, only saved work.
+    // Opportunistic MQP-3 TRAIN staging: small payloads for any mix of
+    // destinations are held across drain iterations and flushed as one QUIC
+    // DATAGRAM (one quinn lock + one AEAD instead of one per payload). The run
+    // is capped by the current DATAGRAM budget, not just by
+    // `MQP3_MAX_TRAIN_ITEMS`, and never waits: it is flushed at burst end,
+    // when the next item would not fit, and before a non-trainable payload, so
+    // packing adds no latency.
     //
-    // The bytes live in a **reused** buffer and the address is re-materialized
-    // only when the destination actually changes, so a steady destination pays
-    // one `memcpy` and no allocation. The previous shape stored
-    // `payload.to_vec()` (plus a `String` for a domain target) on *every* small
-    // datagram, pairing or not — a per-datagram allocation on the interactive
-    // class, whose whole point is latency.
-    let mut pending_buf: Vec<u8> = Vec::with_capacity(BATCH_SMALL_MAX);
-    let mut pending_pack: Option<PendingPack> = None;
-    // The staged payload's destination, kept *outside* the `Option` so the
-    // domain key's `String` survives a take/flush cycle and is rewritten in
-    // place instead of reallocated on every stage.
-    let mut pending_addr = TargetAddr::Ip(SocketAddr::from(([0, 0, 0, 0], 0)));
+    // Destination state is the session's flow table. A new destination gets a
+    // flow id and is published to the dispatcher immediately; the first few
+    // frames repeat the address inline so a reordered/lost open cannot
+    // black-hole the flow. After that the address is gone from the wire.
+    let mut pending_buf: Vec<u8> = Vec::with_capacity(BATCH_SMALL_MAX * 2);
+    let mut pending_train: Option<PendingTrain> = None;
+    let mut flows = FlowTable::default();
     'assoc: loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
@@ -580,7 +614,7 @@ pub(crate) async fn udp_associate_inner(
                 // in the thread-local burst scratch (`with_burst_msg`) instead
                 // of copying it out to `buf` first. The context borrows the
                 // association state mutably; it is scoped to this drain burst
-                // and released before the deferred 2-pack flush below.
+                // and released before the deferred TRAIN flush below.
                 let mut ctx = AppDgramCtx {
                     sess,
                     pool: &pool,
@@ -591,8 +625,8 @@ pub(crate) async fn udp_associate_inner(
                     activity_stamp: &mut activity_stamp,
                     bind: &mut bind,
                     pending_buf: &mut pending_buf,
-                    pending_pack: &mut pending_pack,
-                    pending_addr: &mut pending_addr,
+                    pending_train: &mut pending_train,
+                    flows: &mut flows,
                     frag: &mut frag,
                 };
                 for _ in 0..LAST_HOP_DRAIN {
@@ -667,15 +701,15 @@ pub(crate) async fn udp_associate_inner(
                         AppDgram::BreakAssoc => break 'assoc,
                     }
                 }
-                if let Some(p) = pending_pack.take() {
-                    flush_deferred_pair(
+                if let Some(p) = pending_train.take() {
+                    flush_deferred_train(
                         &egress_shared,
                         &pool,
                         &mut frag,
                         sess,
-                        p.bind,
-                        &pending_addr.as_ref(),
-                        &pending_buf[..p.len],
+                        &p,
+                        &flows,
+                        &mut pending_buf,
                     );
                 }
                 record_drain_batch(drained);
@@ -732,51 +766,340 @@ pub(crate) async fn udp_associate_inner(
         }
     }
     // Backstop only: the flush at the end of the recv branch above always
-    // drains `pending_pack` now (it sends, or drops it with accounting), so no exit
-    // path can leave one behind. Kept so a future staging site added outside
-    // that branch fails loudly in the counters instead of losing a datagram
-    // silently.
-    if pending_pack.is_some() {
-        dgram_drops::bump(&dgram_drops::NO_EGRESS);
+    // drains `pending_train` now (it sends, or drops it with accounting), so no
+    // exit path can leave one behind. Kept so a future staging site added
+    // outside that branch fails loudly in the counters instead of losing a
+    // datagram silently.
+    if let Some(p) = pending_train {
+        for _ in 0..p.n {
+            dgram_drops::bump(&dgram_drops::NO_EGRESS);
+        }
     }
     assoc_recycle_buf(buf);
     Ok(())
 }
 
-/// One staged small payload of the association's opportunistic 2-pack.
-///
-/// Metadata only: the bytes live in the association's reused `pending_buf`
-/// (`len` bytes) and the destination in its `pending_addr` slot, so nothing
-/// here allocates.
-pub(crate) struct PendingPack {
-    pub(crate) bind: UdpBind,
+#[derive(Default)]
+pub(crate) struct PendingItem {
+    pub(crate) flow: u8,
+    pub(crate) open: bool,
+    pub(crate) off: usize,
     pub(crate) len: usize,
+    /// Only for [`MQP3_NO_FLOW`]: the inline address of a destination that did
+    /// not fit the fixed flow table. Established flows resolve through the
+    /// table at flush time.
+    pub(crate) open_addr: Option<TargetAddr>,
 }
 
-/// Point the association's staged destination at `addr`, reusing the key
-/// buffer it already owns.
+/// One in-progress MQP-3 TRAIN.
 ///
-/// A domain target keeps its `String` allocation across destination switches
-/// (`clear` + `push_str`), which is what makes the alternating-destination case
-/// allocation-free as well as the steady one. The caller must invoke this
-/// *before* publishing a pack, so `pending_addr` always describes the staged
-/// payload.
-pub(crate) fn pending_retarget(slot: &mut TargetAddr, addr: &TargetAddrRef<'_>) {
-    match (&mut *slot, addr) {
-        (TargetAddr::Domain(name, port), TargetAddrRef::Domain(h, p)) => {
-            if name.as_str() != *h || *port != *p {
-                name.clear();
-                name.push_str(h);
-                *port = *p;
+/// Metadata only: payload bytes live back-to-back in the association's reused
+/// `pending_buf`, and flow addresses live in the session's `FlowTable`. A
+/// `PendingTrain` is never larger than `MQP3_MAX_TRAIN_ITEMS`; `wire_len` is a
+/// conservative upper bound used while staging and the encoder recomputes the
+/// exact size (the same-flow form is slightly smaller).
+pub(crate) struct PendingTrain {
+    pub(crate) bind: UdpBind,
+    pub(crate) items: [PendingItem; MQP3_MAX_TRAIN_ITEMS],
+    pub(crate) n: usize,
+    pub(crate) wire_len: usize,
+    /// Bit `f` is set when flow `f` has already appeared with an inline address
+    /// in this run, so a second item for it is compressed even during the
+    /// open window.
+    pub(crate) open_mask: u64,
+}
+
+impl PendingTrain {
+    pub(crate) fn new(bind: UdpBind) -> Self {
+        Self {
+            bind,
+            items: std::array::from_fn(|_| PendingItem::default()),
+            n: 0,
+            wire_len: MQP3_TRAIN_HEADER_LEN,
+            open_mask: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, item: PendingItem, item_len: usize) {
+        debug_assert!(self.n < MQP3_MAX_TRAIN_ITEMS);
+        debug_assert!(item.len <= BATCH_SMALL_MAX);
+        if item.open && item.flow < MQP3_MAX_FLOWS as u8 {
+            self.open_mask |= 1u64 << item.flow;
+        }
+        self.items[self.n] = item;
+        self.n += 1;
+        self.wire_len = self.wire_len.saturating_add(item_len);
+    }
+}
+
+/// Publish a newly allocated flow to the dispatcher's read-only snapshot.
+///
+/// Allocation happens once per destination, so the clone-on-write copy is not a
+/// per-packet cost. A concurrent dispatcher either sees the old snapshot
+/// (inline/known flows still resolve) or the new one; it can never see a
+/// half-written table.
+fn publish_flow(entry: &AssocEntry, flow: u8, addr: Arc<TargetAddr>) {
+    entry.flows.rcu(|old| {
+        let mut next = (**old).clone();
+        let ok = next.insert_at(flow, addr.clone());
+        debug_assert!(ok, "freshly allocated flow must install");
+        Arc::new(next)
+    });
+}
+
+fn pending_item_addr<'a>(item: &'a PendingItem, flows: &'a FlowTable) -> Option<TargetAddrRef<'a>> {
+    if item.flow == MQP3_NO_FLOW {
+        item.open_addr.as_ref().map(TargetAddr::as_ref)
+    } else {
+        flows.get(item.flow).map(TargetAddr::as_ref)
+    }
+}
+
+/// Send one staged item as a `SINGLE`, falling back to the MQP-2 fragment
+/// sender if the v3 header does not fit or the DATAGRAM queue is full.
+fn flush_train_single(
+    c: &quinn::Connection,
+    sess: u32,
+    frag: &mut DgramFragmenter,
+    item: &PendingItem,
+    addr: &TargetAddrRef<'_>,
+    payload: &[u8],
+    limit: usize,
+) -> PayloadSend {
+    let inline = item.open.then_some(*addr);
+    let sent = match encode_single(sess, item.flow, inline.as_ref(), false, payload, limit) {
+        Some(body) => try_send_datagram(c, body),
+        None => DatagramSend::TooLarge,
+    };
+    match sent {
+        DatagramSend::Sent => {
+            udp_stats::payload(payload.len());
+            PayloadSend {
+                frames: 1,
+                failed: None,
             }
         }
-        (TargetAddr::Ip(slot), TargetAddrRef::Ip(a)) => *slot = *a,
-        (slot, other) => *slot = other.into_owned(),
+        DatagramSend::Blocked | DatagramSend::TooLarge => frag.send(c, sess, addr, payload, limit),
+        // A dead/unsupported connection is one event for the whole flush;
+        // `recover_send_outcome` counts it once and invalidates the shared
+        // cache.
+        other => PayloadSend {
+            frames: 0,
+            failed: Some(other),
+        },
+    }
+}
+
+fn fallback_train(
+    c: &quinn::Connection,
+    sess: u32,
+    frag: &mut DgramFragmenter,
+    p: &PendingTrain,
+    flows: &FlowTable,
+    arena: &[u8],
+    limit: usize,
+) -> PayloadSend {
+    let mut worst = PayloadSend {
+        frames: 0,
+        failed: None,
+    };
+    for item in &p.items[..p.n] {
+        let Some(addr) = pending_item_addr(item, flows) else {
+            // A compressed item whose flow vanished cannot be addressed. This
+            // is a receiver-side bookkeeping failure, not a path verdict; count
+            // it as a refusal rather than inventing an address.
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            continue;
+        };
+        let payload = &arena[item.off..item.off + item.len];
+        worst = prefer_severe(
+            worst,
+            flush_train_single(c, sess, frag, item, &addr, payload, limit),
+        );
+    }
+    worst
+}
+
+/// Send one staged MQP-3 run, or fall back to per-payload sends.
+///
+/// A run of one is a plain `SINGLE` rather than a one-item TRAIN: the train
+/// header and item flags would cost more than the 5/6-byte single header. For a
+/// real run, `encode_train` does the exact budget check; if quinn refuses the
+/// frame (full queue or a shrunken path budget), every payload is retried as a
+/// `SINGLE`/fragment, each with its own accounting.
+pub(crate) fn flush_pending_train(
+    c: &quinn::Connection,
+    sess: u32,
+    frag: &mut DgramFragmenter,
+    flows: &FlowTable,
+    p: &PendingTrain,
+    arena: &mut Vec<u8>,
+    limit: usize,
+) -> PayloadSend {
+    let sent = flush_pending_train_inner(c, sess, frag, flows, p, arena, limit);
+    arena.clear();
+    sent
+}
+
+fn flush_pending_train_inner(
+    c: &quinn::Connection,
+    sess: u32,
+    frag: &mut DgramFragmenter,
+    flows: &FlowTable,
+    p: &PendingTrain,
+    arena: &[u8],
+    limit: usize,
+) -> PayloadSend {
+    if p.n == 0 {
+        return PayloadSend {
+            frames: 0,
+            failed: None,
+        };
+    }
+    if p.n == 1 {
+        let item = &p.items[0];
+        debug_assert_eq!(item.off, 0, "a one-item run must start at arena offset 0");
+        let Some(addr) = pending_item_addr(item, flows) else {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            return PayloadSend {
+                frames: 0,
+                failed: None,
+            };
+        };
+        let payload = &arena[item.off..item.off + item.len];
+        return flush_train_single(c, sess, frag, item, &addr, payload, limit);
+    }
+    let mut refs: [TrainItem<'_>; MQP3_MAX_TRAIN_ITEMS] = [TrainItem {
+        flow: 0,
+        inline: None,
+        src_override: false,
+        payload: &[],
+    }; MQP3_MAX_TRAIN_ITEMS];
+    for (i, item) in p.items[..p.n].iter().enumerate() {
+        let addr = if item.open {
+            match pending_item_addr(item, flows) {
+                Some(a) => Some(a),
+                None => {
+                    return fallback_train(c, sess, frag, p, flows, arena, limit);
+                }
+            }
+        } else {
+            None
+        };
+        refs[i] = TrainItem {
+            flow: item.flow,
+            inline: addr,
+            src_override: false,
+            payload: &arena[item.off..item.off + item.len],
+        };
+    }
+    let Some(body) = encode_train(sess, &refs[..p.n], limit) else {
+        return fallback_train(c, sess, frag, p, flows, arena, limit);
+    };
+    match try_send_datagram(c, body) {
+        DatagramSend::Sent => {
+            for item in &p.items[..p.n] {
+                udp_stats::payload(item.len);
+            }
+            PayloadSend {
+                frames: 1,
+                failed: None,
+            }
+        }
+        DatagramSend::Blocked | DatagramSend::TooLarge => {
+            fallback_train(c, sess, frag, p, flows, arena, limit)
+        }
+        other => PayloadSend {
+            frames: 0,
+            failed: Some(other),
+        },
+    }
+}
+
+/// Send the deferred MQP-3 run once, or drop it with accounting.
+///
+/// The run is never parked for a later iteration: that would wait for the next
+/// app datagram, unbounded when the app pauses. A stale memo falls back to the
+/// same acquire a datagram takes on a miss, exactly once; a genuine no-egress
+/// outcome drops every payload in the run and counts each one. The send verdict
+/// still drives `recover_send_outcome`, so a handle that died between staging
+/// and the flush is counted and invalidated instead of silently disappearing.
+pub(crate) fn flush_deferred_train(
+    egress_shared: &SharedEgress,
+    pool: &ConnPool,
+    frag: &mut DgramFragmenter,
+    sess: u32,
+    p: &PendingTrain,
+    flows: &FlowTable,
+    arena: &mut Vec<u8>,
+) {
+    let bind = p.bind;
+    let now_flush = coarse_millis();
+    if let Some(sent) = egress_shared.with_fresh(bind, now_flush, |c, limit| {
+        flush_pending_train(c, sess, frag, flows, p, arena, limit)
+    }) {
+        recover_send_outcome(egress_shared, bind, sent);
+        return;
+    }
+    // Generation read before the cached read, the same contract the
+    // per-datagram miss path in `udp_associate_inner` documents.
+    let generation =
+        egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+    match egress_shared.acquire(pool, bind, now_flush) {
+        Some((conn, limit, stamp)) => {
+            egress_shared.memo_store(bind, generation, &conn, limit, stamp);
+            recover_send_outcome(
+                egress_shared,
+                bind,
+                flush_pending_train(&conn, sess, frag, flows, p, arena, limit),
+            );
+        }
+        None => {
+            let mut n = 0;
+            for _ in 0..p.n {
+                n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+            }
+            dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, n, || {
+                format!(
+                    "; class={} ({} staged datagrams, deferred TRAIN flush)",
+                    bind.class.name(),
+                    p.n
+                )
+            });
+            // The run is gone; the next datagram must not append to its arena
+            // (a one-item flush would otherwise read the old bytes at offset 0).
+            arena.clear();
+        }
+    }
+}
+
+/// One in-progress BATCH run of the association's opportunistic N-pack.
+///
+/// Metadata only: the bytes live back-to-back in the association's reused
+/// `pending_buf` and the destination in its `pending_addr` slot, so appending
+/// an item after the first allocates nothing. `lens` is in wire order and its
+/// sum is exactly `pending_buf.len()` while the run is staged.
+#[cfg(test)]
+pub(crate) struct PendingBatch {
+    pub(crate) bind: UdpBind,
+    pub(crate) lens: [u16; MAX_BATCH_ITEMS],
+    pub(crate) n: usize,
+}
+
+#[cfg(test)]
+impl PendingBatch {
+    /// Start a run with `len` payload bytes already in `pending_buf`.
+    pub(crate) fn new(bind: UdpBind, len: usize) -> Self {
+        debug_assert!(len <= BATCH_SMALL_MAX);
+        debug_assert!(len <= u16::MAX as usize);
+        let mut lens = [0u16; MAX_BATCH_ITEMS];
+        lens[0] = len as u16;
+        Self { bind, lens, n: 1 }
     }
 }
 
 /// Shared recovery for one send verdict on `bind`: the per-datagram path and
-/// the deferred 2-pack flush both route through here, so the two cannot drift.
+/// the deferred TRAIN flush both route through here, so the two cannot drift.
 ///
 /// `Blocked`/`TooLarge` are counted where they are decided —
 /// `DgramFragmenter::send` for the protocol's own size caps, `send_encoded` for
@@ -790,8 +1113,8 @@ pub(crate) fn pending_retarget(slot: &mut TargetAddr, addr: &TargetAddrRef<'_>) 
 /// `ConnectionLost`/`Unsupported` are the two states the memo hit path
 /// deliberately leaves to the send's verdict (see `SharedEgress::with_fresh`):
 /// both are counted in `EGRESS_DEAD`, **one bump per event** — a single verdict
-/// can lose several staged payloads (a failed BATCH carries two), and the outage
-/// is one fault, not one per payload. A lost connection invalidates the shared
+/// can lose a whole staged run, and the outage is one fault, not one per
+/// payload. A lost connection invalidates the shared
 /// cache so the next datagram re-acquires; `Unsupported` is static for the
 /// connection's life, so re-acquiring cannot find a better slot and would only
 /// add two quinn state-mutex acquisitions per datagram — it deliberately does
@@ -826,16 +1149,84 @@ pub(crate) fn recover_send_outcome(egress_shared: &SharedEgress, bind: UdpBind, 
     }
 }
 
-/// Send the deferred 2-pack payload once, or drop it with accounting.
+/// Send one staged BATCH run through `c`, falling back to per-payload sends if
+/// the frame is refused by the path budget or a full DATAGRAM buffer.
 ///
-/// The payload is never returned: parking it back for a later iteration is
-/// what the pre-fix code did, and a parked payload waits for the next app
+/// A run of one is deliberately sent as a plain `0x02` datagram: the BATCH
+/// wrapper would add a count byte and a length prefix for no sharing, and the
+/// single-datagram path is the one every unbatched payload already uses. For a
+/// real run (`n >= 2`), `send_udp_batch` books every payload on success; on a
+/// refused frame it books nothing, so the fallback re-sends each payload
+/// through `DgramFragmenter::send`, which does its own exactly-once
+/// accounting.
+///
+/// This function is the client-side twin of the server's `flush_reply_batch`.
+/// It is called with the staging arena exactly as it was left by
+/// [`PendingBatch`], so it borrows rather than copies each payload.
+#[cfg(test)]
+pub(crate) fn flush_pending_batch(
+    c: &quinn::Connection,
+    sess: u32,
+    frag: &mut DgramFragmenter,
+    addr: &TargetAddrRef<'_>,
+    p: &PendingBatch,
+    arena: &[u8],
+    limit: usize,
+) -> PayloadSend {
+    if p.n == 0 {
+        return PayloadSend {
+            frames: 0,
+            failed: None,
+        };
+    }
+    let total: usize = p.lens[..p.n].iter().map(|&n| n as usize).sum();
+    debug_assert_eq!(total, arena.len(), "staged lengths must cover the arena");
+    if p.n == 1 {
+        return frag.send(c, sess, addr, &arena[..total], limit);
+    }
+    let mut refs: [&[u8]; MAX_BATCH_ITEMS] = [&[][..]; MAX_BATCH_ITEMS];
+    let mut off = 0usize;
+    for (r, &len) in refs.iter_mut().zip(&p.lens[..p.n]) {
+        let len = len as usize;
+        *r = &arena[off..off + len];
+        off += len;
+    }
+    match send_udp_batch(c, sess, addr, &refs[..p.n], limit) {
+        DatagramSend::Sent => PayloadSend {
+            frames: 1,
+            failed: None,
+        },
+        DatagramSend::TooLarge | DatagramSend::Blocked => {
+            let mut worst = PayloadSend {
+                frames: 0,
+                failed: None,
+            };
+            for r in &refs[..p.n] {
+                worst = prefer_severe(worst, frag.send(c, sess, addr, r, limit));
+            }
+            worst
+        }
+        // A dead/unsupported connection is one event for the whole run, not one
+        // per payload: `recover_send_outcome` counts `EGRESS_DEAD` once and
+        // invalidates the shared cache once.
+        other => PayloadSend {
+            frames: 0,
+            failed: Some(other),
+        },
+    }
+}
+
+/// Send the deferred N-pack run once, or drop it with accounting.
+///
+/// The run is never returned: parking it back for a later iteration is what
+/// the pre-fix 2-pack code did, and a parked payload waits for the next app
 /// datagram — unbounded when the app pauses, since the idle and control
 /// branches never look at it. A memo that has gone stale between staging and
 /// this flush (a coarse-tick boundary, or a concurrent generation bump from
 /// a reconnect or budget probe) therefore falls back to the same acquire a
 /// datagram takes on a memo miss, exactly once; a genuine no-egress outcome
-/// drops the payload and counts it. Either way the deferred queue empties.
+/// drops every payload in the run and counts each one. Either way the deferred
+/// queue empties.
 ///
 /// The send **verdict** is not thrown away: this used to end in
 /// `with_fresh(..).is_some()`, so a cached handle that died between staging and
@@ -845,18 +1236,20 @@ pub(crate) fn recover_send_outcome(egress_shared: &SharedEgress, bind: UdpBind, 
 /// datagram paying one failed send, and every flush silently dropping its
 /// payload). Both the memo-hit and the re-acquire send now go through
 /// `recover_send_outcome`, exactly like the per-datagram path.
-pub(crate) fn flush_deferred_pair(
+#[cfg(test)]
+pub(crate) fn flush_deferred_batch(
     egress_shared: &SharedEgress,
     pool: &ConnPool,
     frag: &mut DgramFragmenter,
     sess: u32,
-    bind: UdpBind,
+    p: &PendingBatch,
     addr: &TargetAddrRef<'_>,
-    payload: &[u8],
+    arena: &[u8],
 ) {
+    let bind = p.bind;
     let now_flush = coarse_millis();
     if let Some(sent) = egress_shared.with_fresh(bind, now_flush, |c, limit| {
-        frag.send(c, sess, addr, payload, limit)
+        flush_pending_batch(c, sess, frag, addr, p, arena, limit)
     }) {
         recover_send_outcome(egress_shared, bind, sent);
         return;
@@ -871,20 +1264,27 @@ pub(crate) fn flush_deferred_pair(
             recover_send_outcome(
                 egress_shared,
                 bind,
-                frag.send(&conn, sess, addr, payload, limit),
+                flush_pending_batch(&conn, sess, frag, addr, p, arena, limit),
             );
         }
         None => {
-            let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+            let mut n = 0;
+            for _ in 0..p.n {
+                n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+            }
             dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, n, || {
-                format!("; class={} (deferred 2-pack flush)", bind.class.name())
+                format!(
+                    "; class={} ({} staged datagrams, deferred N-pack flush)",
+                    bind.class.name(),
+                    p.n
+                )
             });
         }
     }
 }
 
 /// Pick the outcome the caller must react to when two single sends were both
-/// attempted (batch fallback, pending flush): a dead connection outranks a
+/// attempted (packed-frame fallback, pending flush): a dead connection outranks a
 /// size/backpressure verdict, so the egress cache is invalidated rather than
 /// merely refreshed. Both sends already did their own drop accounting; this
 /// only decides which verdict drives the shared recovery.

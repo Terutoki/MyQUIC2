@@ -58,8 +58,8 @@ pub use mqp::ack::{
 pub use mqp::addr::{AddrHeader, TargetAddr, TargetAddrRef};
 pub use mqp::batch::{
     BATCH_ITEM_OVERHEAD, BATCH_PREFIX_LEN, BATCH_SMALL_MAX, BatchFrame, BatchItems, BatchRef,
-    MAX_BATCH_ITEMS, MQP_DGRAM_BATCH, batch_sess, decode_batch, decode_batch_ref, encode_batch,
-    is_batch,
+    MAX_BATCH_ITEMS, MQP_DGRAM_BATCH, batch_frame_len, batch_sess, decode_batch, decode_batch_ref,
+    encode_batch, is_batch,
 };
 pub use mqp::datagram::{
     DGRAM_DEFAULT_LIMIT, DGRAM_PREFIX_LEN, MQP_DGRAM_TYPE, decode_datagram, decode_datagram_ref,
@@ -71,6 +71,13 @@ pub use mqp::fragment::{
     FRAG_SWEEP_INTERVAL_MS, FRAG_TIMEOUT_MS, FragmentRef, MIN_PATH_DGRAM_BUDGET, MQP_DGRAM_FRAG,
     MQP_FRAG_MAX_PAYLOAD, MQP_FRAG_MAX_TOTAL, SOCKS_UDP_HDR_MAX, UDP_PAYLOAD_MAX, UDP_RECV_MAX,
     UDP_RECV_SLACK, decode_fragment, dgram_sess, encode_fragment, fragment_chunk_len,
+};
+pub use mqp::v3::{
+    FlowTable, MQP3_FLOW_TABLE_MAX_BYTES, MQP3_FRAG, MQP3_FRAG_PREFIX_LEN, MQP3_KIND_MASK,
+    MQP3_MAX_FLOWS, MQP3_MAX_TRAIN_ITEMS, MQP3_NO_FLOW, MQP3_SINGLE, MQP3_TRAIN,
+    MQP3_TRAIN_HEADER_LEN, TrainFrame, TrainItem, TrainItemRef, TrainItems, decode_single,
+    decode_train, encode_single, encode_train, is_v3, single_frame_len, train_item_len, train_sess,
+    v3_sess, varint_len,
 };
 pub use tls::{
     client_tls_config, gen_self_signed_files, is_placeholder_token, load_cert_der, load_key_der,
@@ -1135,6 +1142,7 @@ mod tests {
     /// cross-thread by construction); the seeds need no network.
     #[test]
     fn a_resolution_invalidates_another_threads_negative_memo() {
+        let _serial = crate::dns::resolve::DNS_CACHE_TEST_LOCK.blocking_lock();
         let (host, port) = ("neg-memo-coherence.test", 19056u16);
         let addr: SocketAddr = "93.184.216.34:19056".parse().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -3725,11 +3733,12 @@ mod tests {
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested
         // value, so each session's socket cap is 4 x 64 KiB there and the
-        // pool term is ~2.06 GiB instead of the requested ~1.03 GiB.
+        // pool term is ~2.09 GiB instead of the requested ~1.09 GiB. The
+        // per-session MQP-3 flow-table charge adds 32 MiB over the whole pool.
         let pool_mib = if cfg!(target_os = "linux") {
-            2112
+            2144
         } else {
-            1088
+            1120
         };
         assert_eq!(
             pool / (1024 * 1024),

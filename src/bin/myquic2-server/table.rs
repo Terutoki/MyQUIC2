@@ -48,6 +48,12 @@ pub(crate) struct SessEntry {
     /// that destination's replies as forged until the pin and DNS entry both
     /// expired).
     pub(crate) recent_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Session-scoped MQP-3 flow table. The datagram path installs `flow ->
+    /// target` mappings from inline opens; the reply reader reads the same
+    /// snapshot to decide whether a source can ride a compressed flow id. This
+    /// is what makes the two directions share one mapping instead of each
+    /// direction inventing its own id space.
+    pub(crate) flows: Arc<arc_swap::ArcSwap<FlowTable>>,
 }
 pub(crate) type SessTable = Arc<ShardedSessTable>;
 
@@ -77,6 +83,17 @@ pub(crate) enum ReplyFilter {
     Restricted,
     /// Any source may answer (`udp_full_cone = true`).
     FullCone,
+}
+
+/// The live session's MQP-3 flow table, if the entry exists and its reader has
+/// not exited. One shard read lock; used by the slow/arming paths, not by a
+/// steady v3 frame (which reads its fast slot's cached `Arc` instead).
+pub(crate) fn session_flows(ss: &SessTable, s: u32) -> Option<Arc<arc_swap::ArcSwap<FlowTable>>> {
+    let sh = ss.shard(s);
+    let r = sh.read();
+    r.get(&s)
+        .filter(|e| !e.reader.is_finished())
+        .map(|e| e.flows.clone())
 }
 
 pub(crate) struct ShardedSessTable {

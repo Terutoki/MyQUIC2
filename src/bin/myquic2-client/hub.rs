@@ -40,6 +40,21 @@ pub(crate) const HUB_SHARDS: usize = 256;
 /// reassembler and no per-session mutable state exists anywhere.
 pub(crate) struct AssocEntry {
     pub(crate) relay: Arc<tokio::net::UdpSocket>,
+    /// Session-scoped MQP-3 flow table. The association task allocates flows
+    /// and publishes a new snapshot; the dispatcher reads the same snapshot to
+    /// turn a downlink flow id back into the source address. Semantics match
+    /// the server's per-session table: ids are never reused while the session
+    /// is live, and a full table falls back to an inline address.
+    pub(crate) flows: Arc<arc_swap::ArcSwap<FlowTable>>,
+    /// Bit `f` is set once a downlink frame for flow `f` was successfully
+    /// resolved from the flow table and staged. That is the client's proof that
+    /// the server has the mapping (a compressed downlink is only possible after
+    /// an accepted inline open), so the next outbound frame may compress. Until
+    /// this bit is set the association keeps the address inline: losing the
+    /// first frames cannot black-hole a flow, and a pure-uplink flow simply
+    /// stays inline instead of risking that failure. A future FLOW_ACK can
+    /// confirm those without waiting for a target reply.
+    pub(crate) confirmed: std::sync::atomic::AtomicU64,
     /// The app's source address, published by the relay loop when it first sees
     /// a datagram from the app, read by whichever dispatcher has a reply to
     /// deliver. Lock-free in both directions.
@@ -107,6 +122,8 @@ impl AssocEntry {
     pub(crate) fn new(relay: Arc<tokio::net::UdpSocket>) -> Self {
         Self {
             relay,
+            flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
+            confirmed: std::sync::atomic::AtomicU64::new(0),
             app: ArcSwapOption::const_empty(),
             alive: std::sync::atomic::AtomicBool::new(true),
             replied: std::sync::atomic::AtomicBool::new(false),
@@ -116,6 +133,20 @@ impl AssocEntry {
 
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn flow_confirmed(&self, flow: u8) -> bool {
+        flow < MQP3_MAX_FLOWS as u8
+            && self.confirmed.load(std::sync::atomic::Ordering::Relaxed) & (1u64 << flow) != 0
+    }
+
+    #[inline]
+    pub(crate) fn confirm_flow(&self, flow: u8) {
+        if flow < MQP3_MAX_FLOWS as u8 {
+            self.confirmed
+                .fetch_or(1u64 << flow, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Record that a reply was written. One relaxed store — no clock read.
