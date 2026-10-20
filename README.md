@@ -25,7 +25,7 @@ SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-3 protocol · built
 | | Feature | Detail |
 |---|---|---|
 | 🚀 | **TCP + UDP, fully covered** | Standard SOCKS5 (`CONNECT` / `UDP ASSOCIATE`); IPv4 / IPv6 / domain targets |
-| 🧬 | **Minimal MQP-3 protocol** | Flow-compressed UDP headers (5 B steady, 6 B extra flow), mixed-flow `TRAIN` packing, and a small `SINGLE` frame; MQP-2 fragmentation/reassembly remains for payloads larger than one DATAGRAM (8 KiB per payload) |
+| 🧬 | **Minimal MQP-3 protocol** | Flow-compressed UDP headers (5 B steady, 6 B extra flow), mixed-flow `TRAIN` packing, and mixed-source downlink trains; the MQP-2 datagram/fragment path remains for payloads outside the ≤512 B v3 staging window (up to 8 KiB per payload) |
 | ⚡ | **Extreme performance** | Zero-copy TCP ↔ QUIC pump, BBR + GSO/GRO, reused staging buffers — one frame buffer per outgoing QUIC DATAGRAM frame (a `TRAIN` fills to the path budget); the shipped 4/8/4 MB windows put a single flow at ~240 Mb/s on the target 140 ms RTT (300 Mb/s peak with the opt-in 8/16/8 preset), and connection count scales linearly |
 | 🔀 | **Connection isolation** | 4 TCP connections + 2 class-split UDP connections; UDP never competes with TCP for a congestion window |
 | 🛡️ | **Secure by design** | TLS 1.3 + pinned Ed25519 server cert; optional `auth_token` (constant-time) keeps it from being an open relay |
@@ -589,25 +589,156 @@ quic_conns = 4                        # TCP pool size, 1–16 (UDP has its own c
 
 ## 📡 The MQP-3 Protocol
 
+MQP-3 replaces the per-payload UDP address with a session-scoped **flow**. Flow 0
+is implicit; additional flows cost one byte. Small IP payloads can share one
+QUIC DATAGRAM in a mixed-flow `TRAIN`, while large payloads keep the MQP-2
+self-describing datagram/fragment path. The client and server are a **matched
+deployment**: there is no in-band capability negotiation and no mixed-version
+MQP-2 peer contract. The server still decodes v2 frames for large payloads and
+tests, but its small-reply path emits v3; neither old-client/new-server nor
+new-client/old-server is supported.
+
+### Frame kinds and flags
+
+The first byte is `kind` (high nibble) plus flags (low nibble):
+
+| Kind | Name | Status |
+|---|---|---|
+| `0x10` | `SINGLE` | production, uplink and downlink |
+| `0x20` | `TRAIN` | production, uplink and downlink |
+| `0x30` | `FRAG` | compact codec implemented, **not wired** into the reassembler |
+| `0x40` | `CTL` | reserved; **no CAPS/HELLO/FLOW_ACK opcodes implemented** |
+
+Flags for `SINGLE`/`FRAG`: `I=0x1` inline address, `F=0x2` flow byte present,
+`S=0x4` the inline address is the actual source rather than the flow's bound
+address. The same bits are used per item in `TRAIN`; the `TRAIN` header uses
+bit `0x1` for its same-flow form.
+
+### `SINGLE` — one payload
+
 ```text
-TCP open (stream head, once)   atyp | addr | port                            -> reply: "MQ" | 0x00 | bound address
-UDP SINGLE                     0x10 | flags | sess u32le | [flow u8] | [addr] | payload
-UDP TRAIN                      0x20 | flags | sess u32le | count u8 | (
-                                 item: iflg u8 | [flow u8] | len varint | [addr] | payload )*
-UDP FRAG (compact codec)       0x30 | flags | sess u32le | [flow u8] | id u32le | idx u8 | total u8 | [addr] | chunk
-MQP-2 decoders (legacy/frags)  0x02 datagram · 0x05 fragment · 0x06 batch
-Auth                           uni stream carrying the token bytes verbatim (sent at 1-RTT, never in 0-RTT)
+0x10 | flags | sess u32le | [flow u8 if F] | [addr if I] | payload
 ```
 
-- 🎯 Address encoding mirrors SOCKS5 exactly (IPv4 / IPv6 / domain), so IP headers can be reused byte-for-byte.
-- 🧵 MQP-3 adds a session-scoped **flow** id. Flow 0 is implicit, so the steady `SINGLE` header is **5 B** (6 B for an extra flow) and carries no address. A new IP flow stays inline until a compressed downlink is successfully staged, which proves the server installed the mapping; then it compresses. A pure-uplink flow stays inline (no ACK yet), so a lost open can never black-hole it. Flow ids are never reused while the session lives, and a full 64-entry table falls back to inline `NO_FLOW`.
-- 🚂 A `TRAIN` packs payloads for **different destinations/flows** into one DATAGRAM, filling to the live path budget (defensive cap 64 items). It only stages packets already present in the current drain burst, so it adds no latency. A run of one is sent as a `SINGLE`.
-- 🌐 Domain targets stay inline on both directions: the client has no resolved IP to put in the SOCKS5 reply header, and the first domain lookup is delivered by a spawned resolver. IP targets get the flow compression; `TRAIN` still shares the session/QUIC frame for a domain fanout.
-- 🧩 Payloads larger than one DATAGRAM still use the MQP-2 self-describing fragment form (`0x05`), so out-of-order arrival reassembles directly and losing any fragment drops the whole datagram. The compact MQP-3 `FRAG` codec exists but is not yet wired into the reassembler.
-- 🔁 The fragment id is **32 bits**. An id therefore comes around again only after 4.29e9 fragmented payloads, so the sender-side reuse guard is a correctness backstop instead of a periodic cliff.
-- 📦 The MQP-2 `0x06 BATCH` decoder remains for legacy peers; the client/server production path uses `TRAIN`, which can mix sources (the old BATCH required one shared destination and ≤16 items).
-- ⏱️ A partial expires after 2 s, and reassembly memory is capped at 256 KiB per connection. That budget covers the in-flight chunks *and* the compact per-generation replay guards used to refuse stale id reuse; overflow reclaims the guards first and only falls back to evicting the oldest in-flight partial when no guard is left.
-- 🔒 The token is sent at 1-RTT only: 0-RTT early data is replayable, so a bearer secret never rides it.
+- Flow 0 steady state: **5 B header** (`0x10 | sess`), no address.
+- Extra flow: **6 B header** (one flow byte).
+- Opening/new inline frame: the normal address header follows (`7 B` IPv4,
+  `19 B` IPv6, `4 + L` domain), so the first frame is self-contained.
+- There is no length field; the rest of the DATAGRAM is the payload.
+
+### `TRAIN` — mixed destinations in one DATAGRAM
+
+```text
+0x20 | flags | sess u32le | count u8
+  [flow u8 if SAME_FLOW and flow != 0]
+  item*: iflg u8 | [flow u8 if iflg.F] | len varint | [addr if iflg.I] | payload
+```
+
+- Header: **6 B**; `count` is 1..64 (defensive cap, not a scheduling target).
+- Flow 0 items omit the flow byte and cost **1 B flags + 1–2 B LEB128 length**;
+  an extra flow costs one more byte. The same-flow form carries a non-zero flow
+  once and drops the per-item flow byte. **Flow 0 stays in the mixed form** even
+  when every item shares it: setting `SAME_FLOW` for implicit flow 0 would make
+  the decoder read the first item's flags as a flow id. The wire size is
+  identical apart from the clear flag bit.
+- The encoder fills only the current drain burst and only up to the live
+  DATAGRAM budget. It never waits for more payloads, so batching adds no
+  latency. A run of one is sent as `SINGLE`.
+- A `TRAIN` may mix destinations and flows; this is the main gain for
+  DNS/game/WebRTC fanout, where the old MQP-2 `BATCH` had to flush whenever the
+  source changed.
+
+### `FRAG` — large payloads
+
+```text
+0x30 | flags | sess u32le | [flow u8 if F] | id u32le | idx u8 | total u8 | [addr if I] | chunk
+```
+
+The compact header is 11 B for flow 0, 12 B for an extra flow, plus an optional
+inline address. The codec and tests exist in `src/mqp/v3.rs`, but the current
+reassembler is still keyed by `(sess, id)` and expects the MQP-2 self-describing
+fragment form. Production therefore keeps using MQP-2 `0x05` FRAG for payloads
+that do not fit one DATAGRAM. A future wiring needs a `(sess, flow, id)` partial
+and tombstone key plus a rule for inline fragments before the flow is confirmed.
+
+### Flow lifecycle
+
+- `FlowTable` holds 64 entries per session. IDs are allocated monotonically and
+  are **never reused while the session lives**, even after a conflicting install
+  removes an entry. A full table falls back to `NO_FLOW = 0xff` inline frames.
+- An IP flow starts inline. The client keeps it inline until it successfully
+  stages a **compressed downlink** frame for that flow. That frame is only
+  possible after the server accepted an inline open and installed the mapping,
+  so it acts as an implicit ACK. This avoids a separate control frame and means
+  a lost open can never black-hole the flow.
+- A pure-uplink flow never receives that confirmation and therefore stays
+  inline. There is no `FLOW_ACK` in this version; the trade-off is up to 1 B of
+  flow id plus the address per frame instead of risking a permanent black hole.
+- Domain targets always use `NO_FLOW` inline in both directions. The client has
+  no resolved IP to put in the SOCKS5 reply header, and the first domain lookup
+  is delivered by a spawned server resolver, so the session/flow table may not
+  exist when the accept loop sees the open.
+- A conflicting inline install for an already-used flow id removes the old
+  binding. Later compressed frames for that id are dropped as unknown rather
+  than forwarded to the old target.
+
+### Downlink behavior
+
+- The server reader uses the **same** session flow table as ingress. A reply
+  whose source exactly matches an installed IP flow is compressed to flow 0
+  (5 B) or an extra flow (6 B).
+- Domain flows, a target answering from a different port, and full-cone
+  unsolicited sources are sent inline with their actual source address. They
+  are still packed into a mixed-source `TRAIN` when they fit.
+- Downlink staging no longer flushes on a source change: one `TRAIN` can carry
+  replies from several targets, which is where the large fanout win comes from.
+  A run of one emits `SINGLE`.
+- Small replies (≤512 B) use the MQP-3 path; larger replies leave the v3
+  staging path and use `DgramFragmenter::send` (a v2 single datagram if it fits
+  one DATAGRAM, otherwise v2 fragments). The 512 B bound is the fate-sharing cap,
+  not a wire limit.
+- A compressed downlink also confirms the flow for the client, so bidirectional
+  IP flows begin compressing their uplink after the first reply.
+- Downlink savings are header-only: 7 B (flow 0) / 6 B (extra flow) per IPv4
+  reply and 19 B / 18 B per IPv6 reply. The larger operational win is mixed-source packing: an 8-source 60 B
+  fanout at 50k replies/s is modeled at roughly −15% bytes and ~18× fewer sends,
+  while a steady same-source flow is only ~1% (the old BATCH already amortized
+  its shared address). Replies above 512 B are unchanged.
+
+### Header savings and current limits
+
+| Case | MQP-2 header | MQP-3 header | Saved |
+|---|---:|---:|---:|
+| IPv4 flow 0 | 12 B | 5 B | 7 B |
+| IPv4 extra flow | 12 B | 6 B | 6 B |
+| IPv6 flow 0 | 24 B | 5 B | 19 B |
+| IPv6 extra flow | 24 B | 6 B | 18 B |
+| Domain / changed source / unsolicited | 9 + L / 12 / 24 B | inline `NO_FLOW`, no compression | 0 or −1 B standalone |
+| Payload > 512 B | MQP-2 single/FRAG | MQP-2 single/FRAG | 0 |
+
+> Domain and exceptional sources use `NO_FLOW = 0xff`, so a standalone v3 inline
+> reply is one byte larger than v2. A mixed-source `TRAIN` still amortizes the
+> QUIC frame and is the reason domain/fanout bursts can win overall.
+
+- Savings are header-only; **payloads are never compressed**. Encrypted or
+  random UDP payloads do not compress well and payload compression would add
+  CPU, buffering and latency.
+- The 16-entry per-session IP allowlist remains. On a ring miss, the exact live
+  `(sess, flow) -> IP` mapping can authorize a reply from a high-fanout IP that
+  the ring evicted; this is why 32-resolver DNS fanout does not need full-cone.
+- MQP-2 `0x02`/`0x05`/`0x06` decoders remain for large-payload and test paths.
+  The server accepts v2 inputs; the client uses v2 single/FRAG for large
+  payloads. The MQP-2 `0x06` BATCH decoder is retained, but the production
+  small-packet path is MQP-3 `TRAIN`. These decoders are not a mixed-version
+  contract.
+- Fragment ID stays 32 bits. A partial expires after 2 s and reassembly is capped
+  at 8 KiB per payload and 256 KiB per connection.
+- Default ALPN remains `h3`; there is no CAPS/HELLO gate, no `mqp3=false`
+  rollback switch, and no FLOW_ACK/FLOW_REJECT. A new client talking to an old
+  MQP-2-only server is therefore not supported; nor is an old client against
+  this server's v3 downlink.
+- 🔒 The token is sent at 1-RTT only: 0-RTT early data is replayable, so a
+  bearer secret never rides it.
 
 ---
 
@@ -732,7 +863,7 @@ Per-file map:
 - Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅ · sharded ingress (`quic_endpoints` 1 and 2) and the `MYQUIC2_SHARD_RUNTIME=0` fallback both serve the same sweep with a clean `SIGTERM` exit (0.05 s measured) ✅ · the sharded client pool (7 slot runtimes) and its `MYQUIC2_SHARD_RUNTIME=0` fallback likewise: TCP 256 KiB byte-verified, UDP sweep ALL OK, both sides exit 0 on `SIGTERM` ✅
 - **Latency harness** (`examples/hotpath_bench.rs`): `hotpath_bench lat <socks> <host:port> <n> [payload]` reports p50/p90/p99/p999 RTT for serial UDP request→reply through one association, and `hotpath_bench lattcp <socks> <host:port> <n> [bytes]` reports SOCKS CONNECT latency plus first-echo RTT. Run them against a netem-shaped path (`tc qdisc add dev lo root netem delay 70ms loss 0.5%` on Linux) — loopback's ~0 RTT hides every transport knob (ACK delay, windows, MTU, busy-poll), which is why earlier tuning could not be validated by the shipped harness.
 - Loopback smoke of this change set (debug binaries, macOS): IP and **domain** targets for both TCP and UDP (server-side resolution, host-keyed DNS cache), the whole 8 B–8000 B fragment sweep with a bounded in-flight window, and the new latency modes — `lat` p50 ≈ 0.30 ms / p99 ≈ 0.90 ms, `lattcp` connect p50 ≈ 0.18 ms / echo p50 ≈ 0.28 ms (loopback baseline, numbers only show the harness works; WAN p50/p99 needs the netem run). The 8 KiB payload at the harness's default 16-outstanding window still shows bench-side loss on loopback both before and after this change (baseline HEAD: 13/20 verified; current: 15/20) — that is the 64 KiB relay receive buffer being outrun by 16 × 8 KiB replies, not the relay: with a bounded window (batch ≤ 4) the same sweep is 100 % verified on both trees.
-- MQP-3 release smoke (macOS loopback, same binaries as this tree): IP and domain UDP `udp`/`udpdomain` 1000/1000, `udpmulti` 4×500 0 loss, paced `udppaced` 1k–5k pps **0 loss**, open-loop `udpps` 2 s 9985/9985, `lat` p50 ≈ 0.98 ms (baseline HEAD p50 ≈ 0.985 ms) — loopback only; the Linux 2–4 core `udpps`/`udppaced`/`udpmulti`/`udpdomain` numbers are still the deployment gate.
+- MQP-3 release smoke (macOS loopback, same binaries as this tree): IP and domain UDP `udp`/`udpdomain` 1000/1000, `udpmulti` 4×500 0 loss, paced `udppaced` 1k–5k pps **0 loss**, open-loop `udpps` 2 s 10803/10803, `lat` p50 ≈ 0.98 ms (baseline HEAD p50 ≈ 0.985 ms) — loopback only; the Linux 2–4 core `udpps`/`udppaced`/`udpmulti`/`udpdomain` numbers are still the deployment gate.
 - UDP N=1 soak (`hotpath_bench udpps`, single association, IPv4 target, macOS dev box): open-loop 128 B blast delivers **~40k recv pps** at ~66k sent pps (was ~2.6k recv pps before the last-hop batching pass); closed-loop windowed holds **~30k pps / 0 loss**; `udpraw` loopback control ~82k pps
 - Cost-critical invariants are pinned by unit tests, not just by the numbers above: byte-identity of every encoder fast path against its reference implementation, one address validation per steady destination (`prefix_cache_steady_state_one_validation`), exact reassembly/`held` accounting on every operation (including that a completed generation costs only its compact replay guard), the batch decoder's up-front validation over every truncated prefix, the reply/uplink staging paths with their fallback and exactly-once drop accounting, and the admission arithmetic.
 
