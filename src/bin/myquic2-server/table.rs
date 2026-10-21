@@ -1,5 +1,6 @@
 //! Session table: entries, sharding, sweeps, destination memos.
 use super::*;
+use myquic2::mqp::r2_flow::SessionFlows;
 
 /// One live UDP session: the socket replies are read from, plus the bookkeeping
 /// the connection needs to reap it.
@@ -54,6 +55,16 @@ pub(crate) struct SessEntry {
     /// is what makes the two directions share one mapping instead of each
     /// direction inventing its own id space.
     pub(crate) flows: Arc<arc_swap::ArcSwap<FlowTable>>,
+    /// Session-scoped MQP-3 **rev2** reverse table: reply source -> wire id.
+    ///
+    /// The accept loop installs a binding here when a `DATA OPEN` is accepted
+    /// (and the connection-wide [`FlowRegistry`](myquic2::mqp::r2_flow::FlowRegistry)
+    /// gets the matching `wire_id -> binding` entry); the session reply reader
+    /// takes a snapshot of this table to classify an inbound reply source as
+    /// `Exact` (compress it) or `Rebind` (send one `OPEN|SRC` first). It is a
+    /// clone-on-write snapshot like [`Self::flows`] because the install happens
+    /// on the accept task while the reader looks up on the reply task.
+    pub(crate) r2_flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
 }
 pub(crate) type SessTable = Arc<ShardedSessTable>;
 
@@ -94,6 +105,22 @@ pub(crate) fn session_flows(ss: &SessTable, s: u32) -> Option<Arc<arc_swap::ArcS
     r.get(&s)
         .filter(|e| !e.reader.is_finished())
         .map(|e| e.flows.clone())
+}
+
+/// The live session's MQP-3 **rev2** reverse table (see [`SessEntry::r2_flows`]).
+///
+/// Same shape and liveness rule as [`session_flows`]: one shard read lock, used
+/// by the `DATA OPEN` install path and the `SESS_CLOSE`/`FLOW_CLOSE` cleanup
+/// paths, never by a steady frame.
+pub(crate) fn session_r2_flows(
+    ss: &SessTable,
+    s: u32,
+) -> Option<Arc<arc_swap::ArcSwap<SessionFlows>>> {
+    let sh = ss.shard(s);
+    let r = sh.read();
+    r.get(&s)
+        .filter(|e| !e.reader.is_finished())
+        .map(|e| e.r2_flows.clone())
 }
 
 pub(crate) struct ShardedSessTable {
@@ -305,6 +332,24 @@ impl ShardedSessTable {
         }
         self.note_empty_state();
         out
+    }
+
+    /// Remove and return one session entry (immediate `SESS_CLOSE` teardown).
+    ///
+    /// The caller owns the returned entry: aborting its reader releases the task,
+    /// dropping it closes the session socket, and dropping `_permit` returns the
+    /// process-wide session slot. The reply reader may be mid-drain on its way
+    /// out; its own removal re-checks the entry it published (there is none any
+    /// more), so the two removals cannot double-decrement the live count.
+    pub(crate) fn take_session(&self, s: u32) -> Option<SessEntry> {
+        let mut w = self.shard(s).write();
+        let entry = w.remove(&s);
+        if entry.is_some() {
+            self.note_live_remove(1);
+        }
+        drop(w);
+        self.note_empty_state();
+        entry
     }
 
     pub(crate) fn sweep_all(&self, now: u64) -> Vec<SessEntry> {

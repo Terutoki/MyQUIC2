@@ -1,6 +1,11 @@
 //! Admission limits: connection/dial/stream caps and the per-connection handler.
 use super::*;
 use futures_util::future::FutureExt as _;
+use myquic2::mqp::r2::{self, Caps, Ctl, R2Kind};
+use myquic2::mqp::r2_flow::{
+    CtlState, FlowBinding, FlowIds, FlowRegistry, FlowState, RegistryError, SessionFlows,
+};
+use myquic2::udp::{R2Reassembler, R2Stager};
 
 /// Hard process-wide bounds: new QUIC connections are refused past this count
 /// and new UDP sessions borrow from a shared permit pool, so a single peer
@@ -569,6 +574,7 @@ async fn forward_v3_item(
     payload: Bytes,
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
+    r2: Option<&Arc<R2ConnState>>,
 ) -> bool {
     let want = resolve_fast(fast, ss, sess, a, allow_private);
     let payload = match want {
@@ -583,7 +589,7 @@ async fn forward_v3_item(
     // Keep the per-flow wire order: staged fast-path sends go out before the
     // slow path's immediate send.
     flush_staged_sends(staged);
-    let used = forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private).await;
+    let used = forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private, r2).await;
     if let Some((dst, life)) = used {
         arm_fast(fast, ss, conn_id, sess, a, dst, life);
         true
@@ -607,6 +613,7 @@ async fn handle_v3_ingress(
     conn_id: usize,
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
+    r2: Option<&Arc<R2ConnState>>,
     d: Bytes,
 ) {
     let Some(sess) = v3_sess(&d) else {
@@ -657,6 +664,7 @@ async fn handle_v3_ingress(
                 d.slice_ref(s.payload),
                 allow_private,
                 staged,
+                r2,
             )
             .await;
             if accepted
@@ -707,6 +715,7 @@ async fn handle_v3_ingress(
                     d.slice_ref(item.payload),
                     allow_private,
                     staged,
+                    r2,
                 )
                 .await;
                 if accepted
@@ -769,6 +778,890 @@ fn install_v3_flow(
 pub(crate) static BATCH_FAST_ARMS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// MQP-3 rev2: per-connection state, ingress dispatch and flow installation
+// ---------------------------------------------------------------------------
+
+/// Minimum gap between two `CAPS` replies to `HELLO`s on one connection
+/// (spec §3.4: `HELLO`/`CAPS` are idempotent and loss-tolerant, so the reply is
+/// throttled rather than queued).
+pub(crate) const R2_CAPS_MIN_INTERVAL_MS: u64 = 100;
+
+/// Whether a `CAPS` reply is due at `now_ms` given the last one (`0` = never).
+pub(crate) fn r2_caps_due(last_ms: u64, now_ms: u64) -> bool {
+    last_ms == 0 || now_ms.saturating_sub(last_ms) >= R2_CAPS_MIN_INTERVAL_MS
+}
+
+/// Rev2 counters that are not part of the shared `dgram_drops`/`udp_stats`
+/// surface (shared with the client, so not extended here). Relaxed atomics: at
+/// most one increment per frame next to a QUIC DATAGRAM send, so the cost is
+/// noise; tests read them to prove a drop happened on the path under test
+/// instead of inferring it from a timeout.
+pub(crate) mod r2_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Rev2 frame dropped because no valid `HELLO` had been seen.
+    pub(crate) static GATED: AtomicU64 = AtomicU64::new(0);
+    /// `DATA OPEN` bindings installed (accepted + `FLOW_ACK`).
+    pub(crate) static OPENS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static ACKS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static REJECTS: AtomicU64 = AtomicU64::new(0);
+    /// Compressed steady/TRAIN item naming an id with no live binding.
+    pub(crate) static UNKNOWN_ID: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static INLINE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TRAIN_ITEMS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FRAGS: AtomicU64 = AtomicU64::new(0);
+    /// Rev2 `FRAG` frames accepted into the reassembler (not dropped).
+    pub(crate) static FRAG_FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Reassembled rev2 payloads routed to a target.
+    pub(crate) static FRAG_COMPLETE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static CAPS_SENT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static BAD_HELLO: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SESS_CLOSES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FLOW_CLOSES: AtomicU64 = AtomicU64::new(0);
+    /// A repeated `FLOW_CLOSE`/`SESS_CLOSE` for an already-closed target. The
+    /// sender repeats these (3x) because they are loss-tolerant: a duplicate is
+    /// idempotent, never a refusal.
+    pub(crate) static STALE_CLOSES: AtomicU64 = AtomicU64::new(0);
+    /// Bindings dropped because their session ended (expiry/SESS_CLOSE/teardown).
+    pub(crate) static SESSION_END_BINDINGS: AtomicU64 = AtomicU64::new(0);
+    /// Downlink frames sent (steady `DATA`, same-flow `TRAIN`, `OPEN|SRC`).
+    pub(crate) static STEADY_SENT: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static OPEN_SRC_SENT: AtomicU64 = AtomicU64::new(0);
+    /// Staged small replies dropped because the connection stager was full
+    /// (bounded queue) or could not be re-queued after a drain.
+    pub(crate) static STAGE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
+    /// Server-owned flows created for full-cone / unsolicited downlink sources
+    /// (`DATA OPEN|SRC` with an id from the server's half).
+    pub(crate) static FULL_CONE_FLOWS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-QUIC-connection state for the MQP-3 rev2 data plane.
+///
+/// One instance is created by [`handle_conn`] and shared (via `Arc`) with the
+/// datagram reader, the session sweeper and every session's reply reader, so
+/// all of them resolve the same `wire_id -> binding` table:
+/// - [`FlowRegistry`] is the connection-wide forward table a compressed frame
+///   resolves through;
+/// - [`FlowIds`] is the server owner's monotonic allocator (Phase 1b
+///   server-initiated/full-cone flows; Phase 1a never allocates from it);
+/// - [`CtlState`] carries the `HELLO`/`CAPS` gate: rev2 data frames are dropped
+///   (and counted) until a valid HELLO for this wire version has been seen.
+pub(crate) struct R2ConnState {
+    pub(crate) registry: Arc<FlowRegistry>,
+    /// Server-owned id allocator. Reserved for Phase 1b (server-initiated and
+    /// full-cone downlink flows); keeping it on the connection state means that
+    /// phase does not have to rethread it.
+    #[allow(dead_code)]
+    pub(crate) ids: FlowIds,
+    pub(crate) ctl: Arc<CtlState>,
+    /// Phase-2 connection-scoped downlink stager. Every session reply reader
+    /// pushes ready-to-send small payloads here and drains it at its drain-burst
+    /// boundary, so replies from different sessions aggregate into one
+    /// cross-session `TRAIN dict` with round-robin fairness. The mutex is the
+    /// ownership shim the shared `R2Stager` API needs (`push`/`drain` take
+    /// `&mut self`); its critical sections are pure encode/try-send work, never
+    /// an await.
+    pub(crate) stage: Arc<parking_lot::Mutex<R2Stager>>,
+    /// Last `CAPS` reply stamp (`coarse_millis` epoch; `0` = never).
+    last_caps_ms: std::sync::atomic::AtomicU64,
+}
+
+impl R2ConnState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            registry: Arc::new(FlowRegistry::new(
+                myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_CONN,
+            )),
+            ids: FlowIds::new(true),
+            ctl: Arc::new(CtlState::new()),
+            stage: Arc::new(parking_lot::Mutex::new(R2Stager::new())),
+            last_caps_ms: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Whether this HELLO may be answered with CAPS now (100 ms throttle).
+    ///
+    /// Uses the precise [`mono_millis`] clock, not the 1 s-quantized
+    /// [`coarse_millis`]: the throttle window is 100 ms, and a coarse sample
+    /// would suppress every retransmitted HELLO inside the same second. Control
+    /// frames are rare, so one vDSO read here is free.
+    fn caps_due(&self, now_ms: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.last_caps_ms.load(Ordering::Relaxed);
+        if !r2_caps_due(last, now_ms) {
+            return false;
+        }
+        // `0` means "never replied", so the first real stamp is never 0.
+        self.last_caps_ms.store(now_ms.max(1), Ordering::Relaxed);
+        true
+    }
+}
+
+/// Best-effort control-frame send (control frames are loss-tolerant).
+fn r2_send_ctl(cd: &quinn::Connection, ctl: &Ctl) {
+    let _ = try_send_datagram(cd, r2::encode_ctl(ctl));
+}
+
+/// Count one rev2 policy/gate refusal (shared `REFUSED` plus the rev2 counter).
+fn r2_refuse(counter: Option<&std::sync::atomic::AtomicU64>) {
+    dgram_drops::bump(&dgram_drops::REFUSED);
+    if let Some(c) = counter {
+        r2_stats::bump(c);
+    }
+}
+
+fn r2_reject(cd: &quinn::Connection, id: u32, reason: u8) {
+    r2_stats::bump(&r2_stats::REJECTS);
+    r2_send_ctl(cd, &Ctl::FlowReject { id, reason });
+}
+
+/// Install an accepted `DATA OPEN` in both tables: the connection-wide forward
+/// registry and the session's reverse table.
+///
+/// The target has already accepted the payload when this runs; an install
+/// failure therefore only means "no compression", never "payload lost".
+fn r2_install(
+    state: &Arc<R2ConnState>,
+    ss: &SessTable,
+    sess: u32,
+    wire_id: u32,
+    target: TargetAddr,
+    resolved: Vec<SocketAddr>,
+) -> Result<Arc<FlowBinding>, RegistryError> {
+    let Some(flows) = session_r2_flows(ss, sess) else {
+        // The session vanished between the forward and the install; the payload
+        // was delivered, but there is nothing left to bind.
+        return Err(RegistryError::Full);
+    };
+    {
+        let snap = flows.load();
+        if snap.is_full() && snap.find_id(wire_id).is_none() {
+            return Err(RegistryError::Full);
+        }
+    }
+    let binding = FlowBinding::new_shared(wire_id, sess, target);
+    if !resolved.is_empty() {
+        binding.set_resolved(resolved);
+    }
+    // The server has installed the binding and is about to send FLOW_ACK.
+    binding.mark_open();
+    let inserted = state.registry.insert(binding)?;
+    flows.rcu(|old| {
+        let mut next = (**old).clone();
+        let _ = next.insert(inserted.clone());
+        Arc::new(next)
+    });
+    Ok(inserted)
+}
+
+/// Drop one binding from both tables (`FLOW_CLOSE`, or a peer-rejected
+/// server-owned flow). Idempotent: an already-removed id is a no-op.
+pub(crate) fn r2_remove_flow(
+    ss: &SessTable,
+    state: &R2ConnState,
+    wire_id: u32,
+) -> Option<Arc<FlowBinding>> {
+    let binding = state.registry.remove(wire_id)?;
+    binding.mark_closed();
+    if let Some(flows) = session_r2_flows(ss, binding.session) {
+        flows.rcu(|old| {
+            let mut next = (**old).clone();
+            let _ = next.remove(wire_id);
+            Arc::new(next)
+        });
+    }
+    Some(binding)
+}
+
+/// Drop every rev2 binding of a session entry (session removal paths: the 180 s
+/// sweeper, `SESS_CLOSE`, connection teardown). Returns how many were dropped.
+pub(crate) fn r2_close_entry_bindings(state: &R2ConnState, entry: &SessEntry) -> usize {
+    let flows = entry.r2_flows.load();
+    let mut n = 0usize;
+    for binding in flows.iter() {
+        if state.registry.remove(binding.wire_id).is_some() {
+            binding.mark_closed();
+            n += 1;
+        }
+    }
+    // Publish an empty reverse table too: a reply reader that still holds this
+    // session's handle (it is being aborted) must not match a torn-down binding
+    // from its snapshot.
+    if n > 0 {
+        entry.r2_flows.store(Arc::new(SessionFlows::new()));
+    }
+    n
+}
+
+/// `CTL SESS_CLOSE`: reap the session (socket, reader task, permit) and every
+/// binding it owns from the connection registry, immediately.
+pub(crate) fn r2_close_session(ss: &SessTable, state: &R2ConnState, sess: u32) -> bool {
+    let entry = ss.take_session(sess);
+    // Purge by session id, which is authoritative even if the table entry was
+    // already gone (a reply reader that exited first, or a retransmitted close):
+    // a receive-only binding must never outlive its association.
+    let purged = state.registry.remove_session(sess);
+    if purged > 0 {
+        r2_stats::SESSION_END_BINDINGS
+            .fetch_add(purged as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let Some(entry) = entry else {
+        return false;
+    };
+    // Mark the bindings in the session's reverse table closed before it is
+    // dropped, so a reply reader still holding the snapshot cannot use them.
+    let flows = entry.r2_flows.load();
+    for binding in flows.iter() {
+        binding.mark_closed();
+    }
+    if !flows.is_empty() {
+        entry.r2_flows.store(Arc::new(SessionFlows::new()));
+    }
+    entry.reader.abort();
+    true
+}
+
+/// Handle one rev2 `CTL` DATAGRAM.
+fn r2_handle_ctl(
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    state: &Arc<R2ConnState>,
+    r2_reasm: &mut R2Reassembler,
+    d: &[u8],
+) {
+    let Ok(ctl) = r2::decode_ctl(d) else {
+        r2_refuse(None);
+        return;
+    };
+    match ctl {
+        Ctl::Hello { wire_ver, .. } => {
+            if wire_ver == r2::R2_WIRE_VER {
+                state.ctl.mark_hello();
+            } else {
+                // Version mismatch: answer with our own version so the peer can
+                // fail fast, but never open the gate for it.
+                r2_stats::bump(&r2_stats::BAD_HELLO);
+            }
+            if state.caps_due(mono_millis()) {
+                let caps = Caps::default();
+                state.ctl.set_caps(caps);
+                r2_stats::bump(&r2_stats::CAPS_SENT);
+                r2_send_ctl(cd, &Ctl::Caps(caps));
+            }
+        }
+        // Server-owned flows are Phase 1b; a client ACK can only confirm one.
+        Ctl::FlowAck { id, .. } => {
+            if let Some(binding) = state.registry.get(id) {
+                binding.mark_open();
+            }
+        }
+        Ctl::FlowReject { id, .. } => {
+            // The peer refused a server-opened flow (Phase 1b). Client-owned ids
+            // are not the peer's to reject.
+            if r2::wire_id_server_owned(id) {
+                let _ = r2_remove_flow(ss, state, id);
+            } else {
+                r2_refuse(None);
+            }
+        }
+        Ctl::FlowClose { id } => {
+            // Idempotent: a close retransmission (or a close for an id this
+            // side already reaped) is a no-op, not a policy refusal. Release any
+            // in-flight rev2 partial for the flow as well.
+            let dropped = r2_reasm.drop_flow(id);
+            let _ = state.stage.lock().drop_flow(id);
+            if dropped > 0 {
+                r2_stats::SESSION_END_BINDINGS
+                    .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if r2_remove_flow(ss, state, id).is_some() {
+                r2_stats::bump(&r2_stats::FLOW_CLOSES);
+            } else {
+                r2_stats::bump(&r2_stats::STALE_CLOSES);
+            }
+        }
+        Ctl::SessClose { sess, .. } => {
+            let dropped = r2_reasm.drop_session(sess);
+            let _ = state.stage.lock().drop_session(sess);
+            if dropped > 0 {
+                r2_stats::SESSION_END_BINDINGS
+                    .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if r2_close_session(ss, state, sess) {
+                r2_stats::bump(&r2_stats::SESS_CLOSES);
+            } else {
+                r2_stats::bump(&r2_stats::STALE_CLOSES);
+            }
+        }
+        // A server never receives CAPS from a client.
+        Ctl::Caps(_) => r2_refuse(None),
+    }
+}
+
+/// Forward one payload for an already-installed rev2 flow.
+///
+/// The target is the binding's IP address, or (domain flow) the first address
+/// the install validated — a steady compressed frame never resolves DNS again
+/// and never reaches an address the install did not authorize. Payload delivery
+/// goes through the same fast/slow machinery as every other ingress frame.
+#[allow(clippy::too_many_arguments)]
+async fn r2_forward_flow_item(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    wire_id: u32,
+    payload: Bytes,
+) -> bool {
+    // A server-owned id names a *downlink-created* flow (full-cone / unsolicited
+    // source). A steady/TRAIN item on it is the client app's reply to that
+    // source, and is legitimate exactly when this connection has a live binding
+    // for the id: the binding carries the session and the remote source
+    // (`target = Ip(src)`), so it is forwarded like any other flow item. Unknown
+    // and closed ids still fail lookup (drop + count, never guess), and a client
+    // `DATA OPEN` on a server-owned id is still rejected by the owner-half rule.
+    let Some(binding) = state.registry.get(wire_id) else {
+        r2_refuse(Some(&r2_stats::UNKNOWN_ID));
+        return false;
+    };
+    if binding.state() == FlowState::Closed {
+        // The id was closed (FLOW_CLOSE / session teardown); a late frame must
+        // fail lookup, never be re-routed.
+        r2_refuse(Some(&r2_stats::UNKNOWN_ID));
+        return false;
+    }
+    let Some(dst) = binding.target_ip().or_else(|| binding.resolved_first()) else {
+        r2_refuse(None);
+        return false;
+    };
+    let sess = binding.session;
+    let aref = r2::ip_ref(dst);
+    match try_stage(fast, ss, conn_id, sess, dst, payload, allow_private, staged) {
+        Ok(()) => true,
+        Err(payload) => {
+            flush_staged_sends(staged);
+            let used = forward_server_dgram(
+                ss,
+                cd,
+                conn_id,
+                sess,
+                aref,
+                payload,
+                allow_private,
+                Some(state),
+            )
+            .await;
+            if let Some((used_dst, life)) = used {
+                arm_fast(fast, ss, conn_id, sess, aref, used_dst, life);
+            }
+            used.is_some()
+        }
+    }
+}
+
+/// Resolve and forward the payload of a domain-target `DATA OPEN`.
+///
+/// Returns the validated address set to install in the binding (the set is what
+/// authorizes domain reply sources on the downlink), or `None` after sending the
+/// matching `FLOW_REJECT`.
+#[allow(clippy::too_many_arguments)]
+async fn r2_forward_domain_open(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    state: &Arc<R2ConnState>,
+    id: u32,
+    sess: u32,
+    host: &str,
+    port: u16,
+    payload: Bytes,
+) -> Option<Vec<SocketAddr>> {
+    // Resolve synchronously: the OPEN is the only frame that carries the name,
+    // so the validated address set must be known before the binding is
+    // installed. The DNS layer's own negative cache makes a repeated OPEN cheap,
+    // and the shared slow-path budget bounds a flood of distinct names (a peer
+    // pays a registry slot and a new flow id per OPEN, so this is only a
+    // second line of defence).
+    let _dns_permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            dgram_drops::bump(&dgram_drops::DNS_BUDGET);
+            r2_reject(cd, id, r2::R2_REJECT_DNS);
+            return None;
+        }
+    };
+    let addrs = match resolve_all_cached(host, port).await {
+        Ok(v) => v,
+        Err(_) => {
+            r2_refuse(None);
+            r2_reject(cd, id, r2::R2_REJECT_DNS);
+            return None;
+        }
+    };
+    let usable: Vec<SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| allow_private || is_global_ip(a.ip()))
+        .collect();
+    if usable.is_empty() {
+        // Every record was rejected by the SSRF policy.
+        r2_refuse(None);
+        r2_reject(cd, id, r2::R2_REJECT_POLICY);
+        return None;
+    }
+    let dst = usable[0];
+    let sock = match get_or_create_sess(
+        ss,
+        cd,
+        conn_id,
+        sess,
+        Some((host, port, dst, DNS_CACHE_TTL_MS)),
+        Some(state),
+    )
+    .await
+    {
+        Some(s) => s,
+        None => {
+            // Session/share/permit refusal: no flow can be installed around it.
+            r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL);
+            return None;
+        }
+    };
+    remember_dst(ss, sess, dst);
+    arm_fast(
+        fast,
+        ss,
+        conn_id,
+        sess,
+        TargetAddrRef::Domain(host, port),
+        dst,
+        DNS_CACHE_TTL_MS,
+    );
+    udp_try_send(&sock, map_for_dual(dst), payload);
+    Some(usable)
+}
+
+/// Handle one `DATA OPEN` (client-initiated flow: the address is the target).
+#[allow(clippy::too_many_arguments)]
+async fn r2_ingress_open(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    id: u32,
+    sess: u32,
+    target: TargetAddr,
+    payload: Bytes,
+) {
+    // Half-owner rule (spec §2.1): the low bit names which endpoint allocated
+    // the id. A client may only open ids from its own half; a server-owned id
+    // arrives in Phase 1b as the *server's* OPEN|SRC, never as a client OPEN.
+    if sess == 0 || r2::wire_id_server_owned(id) {
+        r2_refuse(None);
+        r2_reject(cd, id, r2::R2_REJECT_POLICY);
+        return;
+    }
+    // An id is bound to one `(session, target)` for the connection's life: a
+    // reopen with a different target is a protocol violation, never a reroute.
+    if let Some(existing) = state.registry.get(id) {
+        if existing.session != sess || existing.target != target {
+            r2_refuse(None);
+            r2_reject(cd, id, r2::R2_REJECT_POLICY);
+            return;
+        }
+    } else if state.registry.len() >= state.registry.cap() {
+        r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL);
+        return;
+    }
+    // Deliver first (or resolve+deliver): a flow is installed only after the
+    // target actually accepted a payload. A duplicate OPEN still forwards this
+    // frame's distinct payload, then re-installs idempotently and re-ACKs.
+    let resolved: Option<Vec<SocketAddr>> = match target.as_ref() {
+        TargetAddrRef::Ip(dst) => {
+            if !allow_private && !is_global_ip_cached(dst.ip()) {
+                r2_refuse(None);
+                r2_reject(cd, id, r2::R2_REJECT_POLICY);
+                return;
+            }
+            flush_staged_sends(staged);
+            let used = forward_server_dgram(
+                ss,
+                cd,
+                conn_id,
+                sess,
+                r2::ip_ref(dst),
+                payload,
+                allow_private,
+                Some(state),
+            )
+            .await;
+            match used {
+                Some((used_dst, life)) => {
+                    arm_fast(fast, ss, conn_id, sess, r2::ip_ref(dst), used_dst, life);
+                    Some(Vec::new())
+                }
+                None => {
+                    r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL);
+                    return;
+                }
+            }
+        }
+        TargetAddrRef::Domain(host, port) => {
+            match r2_forward_domain_open(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                allow_private,
+                state,
+                id,
+                sess,
+                host,
+                port,
+                payload,
+            )
+            .await
+            {
+                Some(v) => Some(v),
+                None => return,
+            }
+        }
+    };
+    let Some(resolved) = resolved else {
+        return;
+    };
+    match r2_install(state, ss, sess, id, target, resolved) {
+        Ok(_) => {
+            r2_stats::bump(&r2_stats::OPENS);
+            r2_send_ctl(
+                cd,
+                &Ctl::FlowAck {
+                    id,
+                    status: r2::R2_ACK_OPEN,
+                },
+            );
+            r2_stats::bump(&r2_stats::ACKS);
+        }
+        Err(RegistryError::Full) => r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL),
+        Err(RegistryError::Conflict) => {
+            r2_refuse(None);
+            r2_reject(cd, id, r2::R2_REJECT_POLICY);
+        }
+    }
+}
+
+/// Route one decoded rev2 `DATA` frame (steady / open / inline).
+#[allow(clippy::too_many_arguments)]
+async fn r2_ingress_data(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    d: Bytes,
+) {
+    let Ok(data) = r2::decode_data(&d) else {
+        r2_refuse(None);
+        return;
+    };
+    // Uplink frames never carry the `SRC` flag: a client-initiated OPEN names
+    // its destination, a steady frame names nothing, and INLINE is a one-shot
+    // destination. `OPEN|SRC` is the downlink rebind form.
+    if data.src {
+        r2_refuse(None);
+        return;
+    }
+    let target = data.addr.map(TargetAddrRef::into_owned);
+    let payload = d.slice_ref(data.payload);
+    udp_stats::payload(data.payload.len());
+    match (data.id, data.sess, target) {
+        (Some(id), Some(sess), Some(target)) => {
+            r2_ingress_open(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                allow_private,
+                staged,
+                state,
+                id,
+                sess,
+                target,
+                payload,
+            )
+            .await;
+        }
+        (None, Some(sess), Some(target)) => {
+            // INLINE: one-shot forwarding, never installed (the fail-safe for a
+            // full table / a target the client does not want to bind).
+            let accepted = forward_v3_item(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                sess,
+                target.as_ref(),
+                payload,
+                allow_private,
+                staged,
+                Some(state),
+            )
+            .await;
+            if accepted {
+                r2_stats::bump(&r2_stats::INLINE);
+            }
+        }
+        (Some(id), None, None) => {
+            let _ = r2_forward_flow_item(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                allow_private,
+                staged,
+                state,
+                id,
+                payload,
+            )
+            .await;
+        }
+        // OPEN/INLINE forms that also carry an id (or none) are contradictory;
+        // a truncated header was already rejected by the decoder.
+        _ => r2_refuse(None),
+    }
+}
+
+/// Route one rev2 `TRAIN`: every item resolves through the connection registry
+/// and is forwarded on its own; an item naming an unknown id is dropped and
+/// counted, never guessed, and the rest of the frame continues.
+#[allow(clippy::too_many_arguments)]
+async fn r2_ingress_train(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    d: Bytes,
+) {
+    let Ok(train) = r2::decode_train(&d) else {
+        r2_refuse(None);
+        return;
+    };
+    for (wire_id, item) in train.items() {
+        r2_stats::bump(&r2_stats::TRAIN_ITEMS);
+        udp_stats::payload(item.len());
+        let payload = d.slice_ref(item);
+        let _ = r2_forward_flow_item(
+            fast,
+            ss,
+            cd,
+            conn_id,
+            allow_private,
+            staged,
+            state,
+            wire_id,
+            payload,
+        )
+        .await;
+    }
+}
+
+/// Route one rev2 `FRAG` frame through the connection's rev2 reassembler.
+///
+/// Completion is routed exactly like the equivalent single-frame payload:
+/// - an `OPEN` context (`wire_id + sess + addr`) takes the same policy/install/
+///   `FLOW_ACK` path as a single `DATA OPEN`;
+/// - an `INLINE` context (no id) takes the one-shot forward path and is never
+///   installed;
+/// - a steady context (id only) resolves the connection registry *at completion*
+///   (never caches a session in the partial) and forwards the whole payload.
+///
+/// Partials are bounded by the shared module (8 KiB, 2 s, 256 partials,
+/// 256 KiB/connection); a refused/expired fragment is a drop, never a
+/// connection fault and never a guess.
+#[allow(clippy::too_many_arguments)]
+async fn r2_ingress_frag(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    r2_reasm: &mut R2Reassembler,
+    d: Bytes,
+) {
+    let Ok(frag) = r2::decode_frag(&d) else {
+        r2_stats::bump(&r2_stats::FRAGS);
+        r2_refuse(None);
+        return;
+    };
+    r2_stats::bump(&r2_stats::FRAG_FRAMES);
+    let Some(done) = r2_reasm.push(&frag, coarse_millis()) else {
+        // Partial, duplicate, expired or refused fragment: the module already
+        // bounds and validates everything; UDP semantics say drop.
+        return;
+    };
+    // One payload for the 60 s report, exactly like the single-frame paths count
+    // a delivered datagram's payload (booked once per reassembled payload, not
+    // per fragment).
+    udp_stats::payload(done.payload.len());
+    // Uplink frames never carry `SRC`: an `OPEN`/`INLINE` fragment names its
+    // destination; a steady fragment set names nothing.
+    if done.src {
+        r2_stats::bump(&r2_stats::FRAGS);
+        r2_refuse(None);
+        return;
+    }
+    match (done.wire_id, done.sess, done.addr) {
+        (Some(id), Some(sess), Some(target)) => {
+            // Fragmented OPEN: the whole payload is the flow's first data, so it
+            // takes the same session/policy/install/ACK path as a single-frame
+            // OPEN (including duplicate-OPEN and conflict handling).
+            r2_ingress_open(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                allow_private,
+                staged,
+                state,
+                id,
+                sess,
+                target,
+                done.payload,
+            )
+            .await;
+            r2_stats::bump(&r2_stats::FRAG_COMPLETE);
+        }
+        (None, Some(sess), Some(target)) => {
+            // Fragmented INLINE: one-shot forwarding, never installed.
+            let accepted = forward_v3_item(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                sess,
+                target.as_ref(),
+                done.payload,
+                allow_private,
+                staged,
+                Some(state),
+            )
+            .await;
+            if accepted {
+                r2_stats::bump(&r2_stats::INLINE);
+                r2_stats::bump(&r2_stats::FRAG_COMPLETE);
+            }
+        }
+        (Some(id), None, None) => {
+            // Steady fragments: the registry is consulted here, at completion;
+            // the partial never cached a session.
+            if r2_forward_flow_item(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                allow_private,
+                staged,
+                state,
+                id,
+                done.payload,
+            )
+            .await
+            {
+                r2_stats::bump(&r2_stats::FRAG_COMPLETE);
+            }
+        }
+        // Contradictory/malformed completion (e.g. `sess` without `addr`): the
+        // decoder plus the reassembler make this unreachable for a conforming
+        // peer, but a hostile one must only cost this payload.
+        _ => {
+            r2_stats::bump(&r2_stats::FRAGS);
+            r2_refuse(None);
+        }
+    }
+}
+
+/// Dispatch one rev2 DATAGRAM body.
+///
+/// The `HELLO` gate is applied here, before any frame can reach a target:
+/// without a valid HELLO for this wire version a rev2 data frame is dropped and
+/// counted ([`r2_stats::GATED`]), which is what keeps a "new server + old
+/// client" deployment from exposing any unexpected path. Legacy v2/v3 frames
+/// keep their own dispatch and are unaffected.
+#[allow(clippy::too_many_arguments)]
+async fn handle_r2_ingress(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    r2_reasm: &mut R2Reassembler,
+    d: Bytes,
+) {
+    let Some(kind) = r2::kind(&d) else {
+        return;
+    };
+    if kind == R2Kind::Ctl {
+        // HELLO is the only control frame allowed before the gate opens.
+        let is_hello = d.get(1).copied() == Some(r2::R2_CTL_HELLO);
+        if !is_hello && !state.ctl.hello_seen() {
+            r2_refuse(Some(&r2_stats::GATED));
+            return;
+        }
+        r2_handle_ctl(ss, cd, state, r2_reasm, &d);
+        return;
+    }
+    if !state.ctl.hello_seen() {
+        r2_refuse(Some(&r2_stats::GATED));
+        return;
+    }
+    match kind {
+        R2Kind::Data => {
+            r2_ingress_data(fast, ss, cd, conn_id, allow_private, staged, state, d).await;
+        }
+        R2Kind::Train => {
+            r2_ingress_train(fast, ss, cd, conn_id, allow_private, staged, state, d).await;
+        }
+        R2Kind::Frag => {
+            r2_ingress_frag(
+                fast,
+                ss,
+                cd,
+                conn_id,
+                allow_private,
+                staged,
+                state,
+                r2_reasm,
+                d,
+            )
+            .await;
+        }
+        R2Kind::Ctl => unreachable!(),
+    }
+}
+
 pub(crate) async fn handle_conn(
     conn: quinn::Connection,
     allow_private: bool,
@@ -795,20 +1688,32 @@ pub(crate) async fn handle_conn(
     // holds a session (`ShardedSessTable::note_empty_state`); an idle TCP-only
     // connection must not dilute anyone's session budget.
     let sess: SessTable = Arc::new(ShardedSessTable::new(reply_filter));
+    // MQP-3 rev2 connection state (flow registry + HELLO/CAPS gate). Shared by
+    // this handler, the datagram reader, the sweeper and every session reader.
+    let r2_state = R2ConnState::new();
     {
         let sess = sess.clone();
         let conn = conn.clone();
+        let r2_sweep = r2_state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = mono_millis();
-                        // Shard-by-shard sweep, abort after all locks drop.
+                        // Shard-by-shard sweep, abort after all locks drop. The
+                        // rev2 bindings of every reaped session go with it, so a
+                        // stale `wire_id` can only fail lookup afterwards.
                         let evicted = sess.sweep_all(now);
+                        for entry in &evicted {
+                            r2_close_entry_bindings(&r2_sweep, entry);
+                        }
                         abort_evicted(evicted);
                     }
                     _ = conn.closed() => {
                         let drained = sess.drain_all();
+                        for entry in &drained {
+                            r2_close_entry_bindings(&r2_sweep, entry);
+                        }
                         abort_evicted(drained);
                         break;
                     }
@@ -830,6 +1735,7 @@ pub(crate) async fn handle_conn(
     // QUIC DATAGRAMs -> per-sess UDP sockets
     let cd = conn.clone();
     let ss = sess.clone();
+    let r2 = r2_state.clone();
     tokio::spawn(async move {
         // One receive future per connection instead of one per datagram:
         // `read_datagram` is cancel-safe (a buffered datagram is returned before
@@ -841,6 +1747,11 @@ pub(crate) async fn handle_conn(
         // Large app datagrams arrive as MQP-2 fragments; reassemble before they
         // reach a target socket, so the target sees the datagram the app sent.
         let mut reasm = DgramReassembler::new();
+        // MQP-3 rev2 uplink `FRAG` reassembly, one per connection: the rev2
+        // keys are connection-scoped (`wire_id`) or self-describing (`INLINE`),
+        // so it sits next to the legacy MQP-2 reassembler rather than inside a
+        // session. It shares the same expiry tick.
+        let mut r2_reasm = R2Reassembler::new();
         // The reassembler can only expire state it is asked about, and `push` is
         // reached only when a fragment arrives — so a peer that sends fragments
         // and then goes quiet (its connection stays alive on keepalives) would pin
@@ -934,7 +1845,9 @@ pub(crate) async fn handle_conn(
                     Ok(d) => d,
                     Err(_) => break,
                 },
-                _ = reasm_tick.tick(), if reasm.held_bytes() > 0 => {
+                _ = reasm_tick.tick(),
+                    if reasm.held_bytes() > 0 || r2_reasm.held_bytes() > 0 =>
+                {
                     // Coarse epoch: every consumer here compares against
                     // `FRAG_TIMEOUT_MS` (2 s) or the 500 ms sweep throttle, so a
                     // 1 s-quantized sample of the same epoch is sufficient — and
@@ -944,7 +1857,9 @@ pub(crate) async fn handle_conn(
                     // bound, and it runs per fragmented payload, not per packet.
                     // It is a backstop now — a 32-bit space cannot wrap inside
                     // the window at any sustained rate.)
-                    reasm.expire(coarse_millis());
+                    let now = coarse_millis();
+                    reasm.expire(now);
+                    r2_reasm.expire(now);
                     continue;
                 }
             };
@@ -983,8 +1898,36 @@ pub(crate) async fn handle_conn(
                 // it directly: one refcount bump per slice, no extra clone per packet.
                 // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
                 if is_v3(&d) {
-                    handle_v3_ingress(&mut fast, &ss, &cd, conn_id, allow_private, &mut staged, d)
-                        .await;
+                    handle_v3_ingress(
+                        &mut fast,
+                        &ss,
+                        &cd,
+                        conn_id,
+                        allow_private,
+                        &mut staged,
+                        Some(&r2),
+                        d,
+                    )
+                    .await;
+                    continue;
+                }
+                // MQP-3 rev2 frames are dispatched before the MQP-2 kinds: their
+                // first byte is `0x0X`, which no legacy decoder accepts (see
+                // `r2::is_r2`), so the two dispatch orders can never claim the
+                // same DATAGRAM. The gate inside drops rev2 data until HELLO.
+                if r2::is_r2(&d) {
+                    handle_r2_ingress(
+                        &mut fast,
+                        &ss,
+                        &cd,
+                        conn_id,
+                        allow_private,
+                        &mut staged,
+                        &r2,
+                        &mut r2_reasm,
+                        d,
+                    )
+                    .await;
                     continue;
                 }
                 if d.first() == Some(&MQP_DGRAM_FRAG) {
@@ -1031,6 +1974,7 @@ pub(crate) async fn handle_conn(
                         a.as_ref(),
                         whole,
                         allow_private,
+                        Some(&r2),
                     )
                     .await;
                     if let Some((dst, life)) = used {
@@ -1073,6 +2017,7 @@ pub(crate) async fn handle_conn(
                                             b.addr,
                                             payload,
                                             allow_private,
+                                            Some(&r2),
                                         )
                                         .await;
                                         // Arm from the slow path's answer, so the
@@ -1104,6 +2049,7 @@ pub(crate) async fn handle_conn(
                                         b.addr,
                                         payload,
                                         allow_private,
+                                        Some(&r2),
                                     )
                                     .await;
                                     // Same arm as the `Some(dst)` arm above: an
@@ -1157,8 +2103,17 @@ pub(crate) async fn handle_conn(
                     // See the fragment branch: flush staged sends before the slow
                     // path's immediate send to keep per-flow order.
                     flush_staged_sends(&mut staged);
-                    let used =
-                        forward_server_dgram(&ss, &cd, conn_id, s, a, payload, allow_private).await;
+                    let used = forward_server_dgram(
+                        &ss,
+                        &cd,
+                        conn_id,
+                        s,
+                        a,
+                        payload,
+                        allow_private,
+                        Some(&r2),
+                    )
+                    .await;
                     if let Some((dst, life)) = used {
                         arm_fast(&mut fast, &ss, conn_id, s, a, dst, life);
                     }

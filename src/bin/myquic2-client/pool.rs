@@ -36,6 +36,17 @@ pub(crate) struct ConnSlot {
     /// `pick_tcp` would otherwise pay twice per TCP flow. `wait_conn` remains
     /// the authority that fails a flow fast.
     pub(crate) live: Arc<std::sync::atomic::AtomicBool>,
+    /// MQP-3 rev2 state for the connection currently published in `shared`:
+    /// the per-connection flow registry, the client wire-id allocator, the
+    /// `HELLO`/`CAPS` negotiation result and the generation epoch.
+    ///
+    /// Published by the reconnect loop *before* the connection (and before the
+    /// generation bump), so a dispatcher or association that wakes on a new
+    /// generation always finds the state that belongs to the connection it is
+    /// about to use. Cleared on the connection-death path before the next
+    /// dial, which is what makes "no rev2 state" mean "this generation cannot
+    /// carry rev2 frames".
+    pub(crate) rev2: Arc<arc_swap::ArcSwapOption<ConnRev2>>,
     /// Inbound-progress stamp (coarse-epoch milliseconds), published by the
     /// reconnect loop's 1 Hz silence watchdog whenever its `ConnectionStats`
     /// snapshot shows `udp_rx.datagrams` advanced, and seeded at connection
@@ -61,8 +72,25 @@ impl ConnSlot {
             gen_tx,
             gen_rx,
             live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rev2: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             last_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Publish the rev2 state for the connection this slot is about to carry.
+    pub(crate) fn set_rev2(&self, rev2: Arc<ConnRev2>) {
+        self.rev2.store(Some(rev2));
+    }
+
+    /// Current rev2 state, if the published connection is a rev2 generation.
+    pub(crate) fn rev2(&self) -> Option<Arc<ConnRev2>> {
+        self.rev2.load().as_ref().cloned()
+    }
+
+    /// Clear the rev2 state of the dead generation (connection-death path, in
+    /// the same commit that clears `shared`).
+    pub(crate) fn clear_rev2(&self) {
+        self.rev2.store(None);
     }
 
     pub(crate) fn is_live(&self) -> bool {

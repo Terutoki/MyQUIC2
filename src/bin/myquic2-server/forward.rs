@@ -329,6 +329,7 @@ pub(crate) fn resolve_forward_target(
 /// caller's own pin cannot outlive it (see [`pin_life_ms`]); `None` means the
 /// datagram was dropped (SSRF filter, negative cache, DNS overload, no session
 /// slot, or the per-connection [`DnsGate`] coalescing an in-flight lookup).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_server_dgram(
     ss: &SessTable,
     cd: &quinn::Connection,
@@ -337,6 +338,7 @@ pub(crate) async fn forward_server_dgram(
     addr: TargetAddrRef<'_>,
     payload: Bytes,
     allow_private: bool,
+    r2: Option<&Arc<R2ConnState>>,
 ) -> Option<(SocketAddr, u64)> {
     match addr {
         TargetAddrRef::Ip(dst) => {
@@ -354,7 +356,7 @@ pub(crate) async fn forward_server_dgram(
             // zero-length domain, so the lookup that could match it is
             // unreachable. Storing it was a shard write lock plus a 72-byte memo
             // write per datagram that nothing could read back.
-            let sock = get_or_create_sess(ss, cd, conn_id, s, None).await?;
+            let sock = get_or_create_sess(ss, cd, conn_id, s, None, r2).await?;
             remember_dst(ss, s, dst);
             udp_try_send(&sock, map_for_dual(dst), payload);
             // An IP target has no DNS entry behind it: the pin's own TTL is the
@@ -369,7 +371,7 @@ pub(crate) async fn forward_server_dgram(
                 }
                 ForwardResolution::Addr(dst, life) => {
                     let sock =
-                        get_or_create_sess(ss, cd, conn_id, s, Some((h, p, dst, life))).await?;
+                        get_or_create_sess(ss, cd, conn_id, s, Some((h, p, dst, life)), r2).await?;
                     remember_dst(ss, s, dst);
                     udp_try_send(&sock, map_for_dual(dst), payload);
                     return Some((dst, life));
@@ -404,6 +406,11 @@ pub(crate) async fn forward_server_dgram(
             let task_ss = ss.clone();
             let cd = cd.clone();
             let host = h.to_owned();
+            // The spawned resolver creates/uses a session, so it needs the
+            // connection's rev2 state (the session's reverse table and, through
+            // it, the reply reader's rev2 handle). Cloned here because the task
+            // outlives this frame.
+            let r2_task = r2.map(Arc::clone);
             tokio::spawn(async move {
                 let _permit = permit;
                 let unusable = deliver_resolved_server_dgram(
@@ -415,6 +422,7 @@ pub(crate) async fn forward_server_dgram(
                     p,
                     payload,
                     allow_private,
+                    r2_task.as_ref(),
                 )
                 .await;
                 // Success or a name-level failure: always complete the claim, or
@@ -451,6 +459,7 @@ async fn deliver_resolved_server_dgram(
     port: u16,
     payload: Bytes,
     allow_private: bool,
+    r2: Option<&Arc<R2ConnState>>,
 ) -> bool {
     let dst = match resolve_all_cached(host, port).await {
         Ok(v) => match v
@@ -477,6 +486,7 @@ async fn deliver_resolved_server_dgram(
         conn_id,
         s,
         Some((host, port, dst, DNS_CACHE_TTL_MS)),
+        r2,
     )
     .await
     {

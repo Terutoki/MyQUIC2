@@ -4,6 +4,12 @@
 //!
 //! Modes:
 //!   `echo <port>`                 UDP echo server (fast target for `udp`).
+//!   `echomulti <base_port> <count>`
+//!                                 UDP echo target on `count` consecutive
+//!                                 loopback ports starting at `base_port`
+//!                                 (127.0.0.1 only): one socket per port, every
+//!                                 datagram echoed back to its source. This is
+//!                                 the fan-out target for `udpfanout`.
 //!   `techo <port>`                TCP echo server that returns the request
 //!                                 verbatim, so a client can verify payload
 //!                                 integrity byte-for-byte.
@@ -33,6 +39,22 @@
 //!                                 removing only shows up once several
 //!                                 associations run in parallel (see the
 //!                                 hardening passes' "run-to-run noise" notes).
+//!   `udpfanout <socks> <host:port> <flows> <n> [batch]`
+//!                                 one UDP ASSOCIATE, `n` datagrams sent
+//!                                 round-robin over `flows` consecutive
+//!                                 destination ports (`host:(port+i)`), waiting
+//!                                 for `n` replies. This is the mixed-destination
+//!                                 shape behind TRAIN: `udp`/`udpmulti` hit one
+//!                                 destination, so they never show the per-item
+//!                                 flow/addressing cost, and `udpdomain` varies
+//!                                 only the encoding. `host` may be an IPv4
+//!                                 literal (ATYP 0x01) or a name (ATYP 0x03, the
+//!                                 domain fan-out wire; the proxy resolves it,
+//!                                 so use a name that resolves to the echo
+//!                                 target). The payload is fixed at 60 B so
+//!                                 frames stay on the v3/TRAIN path (payloads
+//!                                 >512 B never batch); pair it with the
+//!                                 `echomulti` target.
 //!   `udpps <socks> <host:port> <secs> [payload]`
 //!                                 N=1 soak: one UDP ASSOCIATE, one relay
 //!                                 socket, fixed `payload`-byte payload
@@ -57,6 +79,36 @@
 //!                                 runs to find the knee (highest rate at ~0%
 //!                                 loss); the N-pack staging exists to move
 //!                                 exactly this ceiling.
+//!
+//!   `udpbidir <socks> <host:port> <secs> [payload] [pps]`
+//!                                 full-duplex small-packet soak: one sender
+//!                                 thread paces datagrams on an absolute timeline
+//!                                 exactly like `udppaced`, while the reply drain
+//!                                 runs concurrently for the whole send window.
+//!                                 The `echo` target returns exactly one reply per
+//!                                 datagram, so both directions carry the same
+//!                                 offered rate and interference between them
+//!                                 shows up as receive loss instead of a slower
+//!                                 send. Reports sent/recv, loss%, send pps,
+//!                                 recv pps and wall time (the D6 acceptance
+//!                                 shape for the full-duplex work).
+//!
+//!   `udpmultipaced <socks> <host:port> <assocs> <secs> [payload] [pps]`
+//!                                 `assocs` independent UDP ASSOCIATEs, each on
+//!                                 its own thread with its own relay socket
+//!                                 (the `udpmulti` shape), each paced at `pps`
+//!                                 datagrams/s of `payload` bytes for `secs` on
+//!                                 an absolute timeline and draining replies
+//!                                 concurrently (the `udppaced` discipline).
+//!                                 Reports assocs, payload, per-assoc and
+//!                                 aggregate target pps, total sent/recv,
+//!                                 send_errs, loss%, wall, aggregate sent/recv
+//!                                 pps, and per-assoc min/max recv. With a
+//!                                 payload <=512 B on a neutral port every
+//!                                 association classifies as interactive, so
+//!                                 they share the client's one interactive UDP
+//!                                 connection — the shape a connection-level
+//!                                 cross-session stager has to move.
 //!
 //!   `lat <socks> <host:port> <n> [payload]`
 //!                                 serial UDP round trip: one UDP ASSOCIATE,
@@ -93,6 +145,17 @@
 //!       lattcp 127.0.0.1:1080 127.0.0.1:9000 200
 //!   tc qdisc del dev lo root
 //!
+//! Fan-out, full-duplex and multi-association runs use the `echomulti` target
+//! (one echo port per destination flow; its first port also serves modes that
+//! send everything to one destination) with the proxy in front of it:
+//!   cargo run --release --example hotpath_bench -- echomulti 9000 8
+//!   cargo run --release --example hotpath_bench -- \
+//!       udpfanout 127.0.0.1:1080 127.0.0.1:9000 8 100000
+//!   cargo run --release --example hotpath_bench -- \
+//!       udpbidir 127.0.0.1:1080 127.0.0.1:9000 10 128 20000
+//!   cargo run --release --example hotpath_bench -- \
+//!       udpmultipaced 127.0.0.1:1080 127.0.0.1:9000 4 10 128 2000
+//!
 //!   `chan <n> [depth]`
 //!                                 per-datagram cost of the client's inbound
 //!                                 hand-off (`tokio::sync::mpsc` bounded
@@ -116,6 +179,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("echo") => echo(args[2].parse().unwrap()),
+        Some("echomulti") => echomulti(args[2].parse().unwrap(), args[3].parse().unwrap()),
         Some("techo") => techo(args[2].parse().unwrap()),
         Some("utag") => utag(args[2].parse().unwrap(), args[3].as_bytes()[0]),
         Some("tcp") => tcp(
@@ -156,6 +220,13 @@ fn main() {
             args[5].parse().unwrap(),
             args.get(6).and_then(|s| s.parse().ok()).unwrap_or(64),
         ),
+        Some("udpfanout") => udpfanout(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args[5].parse().unwrap(),
+            args.get(6).and_then(|s| s.parse().ok()).unwrap_or(64),
+        ),
         Some("udpraw") => udpraw(
             &args[2],
             args[3].parse().unwrap(),
@@ -174,6 +245,21 @@ fn main() {
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10),
             args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128),
             args.get(6).and_then(|s| s.parse().ok()).unwrap_or(20_000),
+        ),
+        Some("udpbidir") => udpbidir(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128),
+            args.get(6).and_then(|s| s.parse().ok()).unwrap_or(20_000),
+        ),
+        Some("udpmultipaced") => udpmultipaced(
+            &args[2],
+            &args[3],
+            args[4].parse().unwrap(),
+            args[5].parse().unwrap(),
+            args.get(6).and_then(|s| s.parse().ok()).unwrap_or(128),
+            args.get(7).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
         Some("lat") => lat(
             &args[2],
@@ -213,7 +299,7 @@ fn main() {
         ),
         _ => {
             eprintln!(
-                "usage: hotpath_bench <echo|techo|tcp|udp|udpmulti|udpraw|udpps|udppaced|lat|lattcp|udpsweep|tcpecho|chan|server|reply|bulk> ..."
+                "usage: hotpath_bench <echo|echomulti|techo|tcp|udp|udpmulti|udpfanout|udpraw|udpps|udppaced|udpbidir|udpmultipaced|lat|lattcp|udpsweep|tcpecho|chan|server|reply|bulk> ..."
             );
             std::process::exit(2);
         }
@@ -253,6 +339,45 @@ fn echo(port: u16) {
         }));
     }
     println!("echo listening on 127.0.0.1:{port} ({ECHO_THREADS} reuseport threads)");
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Multi-port UDP echo target: `count` consecutive loopback ports starting at
+/// `base_port`, one socket per port, every datagram echoed back to its source.
+///
+/// This is the target for `udpfanout`, which addresses `host:(port+i)` for
+/// `i in 0..flows` and therefore needs one listener per destination flow. One
+/// blocking `recv_from` loop per socket is enough here — unlike `echo`, which
+/// needs `SO_REUSEPORT` threads because every association hammers the *same*
+/// port: fan-out spreads across distinct sockets, so no single socket becomes
+/// the target bottleneck.
+fn echomulti(base_port: u16, count: u16) {
+    if count == 0 {
+        eprintln!("echomulti: count must be > 0");
+        std::process::exit(2);
+    }
+    let Some(last_port) = base_port.checked_add(count - 1) else {
+        eprintln!("echomulti: ports {base_port}..+{count} overflow u16");
+        std::process::exit(2);
+    };
+    let mut handles = Vec::with_capacity(usize::from(count));
+    for i in 0..count {
+        // `i < count`, so `base_port + i <= last_port <= u16::MAX`.
+        let port = base_port + i;
+        let sock = UdpSocket::bind(("127.0.0.1", port))
+            .unwrap_or_else(|e| panic!("echomulti: bind 127.0.0.1:{port}: {e}"));
+        handles.push(std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, a)) = sock.recv_from(&mut buf) {
+                let _ = sock.send_to(&buf[..n], a);
+            }
+        }));
+    }
+    println!(
+        "echomulti listening on 127.0.0.1:{base_port}..={last_port} ({count} ports, udp echo)"
+    );
     for h in handles {
         let _ = h.join();
     }
@@ -1225,6 +1350,104 @@ fn udpmulti(socks: &str, target: &str, assocs: usize, n: usize, batch: usize) {
     );
 }
 
+/// One UDP ASSOCIATE, `n` datagrams sent round-robin over `flows` consecutive
+/// destination ports of one host, waiting for `n` replies.
+///
+/// This is the mixed-destination shape behind TRAIN: `udp` and `udpmulti` hit a
+/// single destination, so every frame can reuse one flow and the benchmark never
+/// sees per-item flow/addressing cost, while `udpdomain` varies the encoding but
+/// not the destination. Here each datagram names a different port (therefore a
+/// different flow), so a TRAIN that packs several datagrams cannot assume one
+/// destination. `host` may be an IPv4 literal (ATYP 0x01) or a name (ATYP 0x03,
+/// the domain fan-out wire; the proxy resolves it server-side, so use a name
+/// that resolves to the echo target). Pair with the `echomulti` target, which
+/// listens on exactly these consecutive ports.
+///
+/// The payload is deliberately small (60 B): MQP-3's v3/TRAIN path only carries
+/// payloads up to 512 B, and the 1000 B payload the other UDP modes use never
+/// batches, so the shape this mode exists to measure would not be on the wire at
+/// all at that size.
+fn udpfanout(socks: &str, target: &str, flows: u16, n: usize, batch: usize) {
+    /// Small enough to stay in the v3 batching range (1-512 B).
+    const PAYLOAD: usize = 60;
+    if flows == 0 {
+        eprintln!("udpfanout: flows must be > 0");
+        std::process::exit(2);
+    }
+    let (host, port) = split_host(target);
+    let Some(last_port) = port.checked_add(flows - 1) else {
+        eprintln!("udpfanout: destination ports {port}..+{flows} overflow u16");
+        std::process::exit(2);
+    };
+    let domain = if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        false
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        eprintln!("udpfanout: IPv6 target {host} is not supported (IPv4 literal or a name)");
+        std::process::exit(2);
+    } else {
+        true
+    };
+    let (_control, relay) = socks_associate(socks).unwrap();
+    let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    // One complete request per destination, encoded up front: only the
+    // destination varies per datagram, so the send loop never re-encodes.
+    let pkts: Vec<Vec<u8>> = (0..flows)
+        .map(|i| {
+            let p = port + i;
+            if domain {
+                udp_request_domain(&host, p, PAYLOAD)
+            } else {
+                udp_request(&host, p, PAYLOAD)
+            }
+        })
+        .collect();
+    let t0 = Instant::now();
+    // The `udp_pump` window/pump shape, with destination `sent % flows` rotating
+    // on every send so a burst is a mixed-destination run, not a single flow.
+    let mut sent = 0usize;
+    let mut recv = 0usize;
+    let mut stalled = 0usize;
+    let mut buf = vec![0u8; 2048];
+    while recv < n {
+        while sent < n && sent - recv < batch {
+            if u.send_to(&pkts[sent % pkts.len()], relay).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        match u.recv_from(&mut buf) {
+            Ok(_) => {
+                recv += 1;
+                stalled = 0;
+            }
+            Err(_) => {
+                // Same reasoning as `udp_pump`: a silent window on a UDP path is
+                // a real loss, not a reason to hang waiting for a fixed target.
+                stalled += 1;
+                if stalled >= 10 {
+                    break;
+                }
+            }
+        }
+    }
+    let dt = t0.elapsed();
+    println!(
+        "udpfanout socks={socks} target={target} atyp={} flows={flows} \
+         ports={port}..={last_port} payload={PAYLOAD} sent={sent} recv={recv} \
+         batch={batch} wall={:.3}s recv_pps={:.0} loss={:.3}%",
+        if domain { "domain" } else { "ip" },
+        dt.as_secs_f64(),
+        recv as f64 / dt.as_secs_f64(),
+        if sent == 0 {
+            0.0
+        } else {
+            100.0 * (sent - recv) as f64 / sent as f64
+        }
+    );
+}
+
 /// N=1 soak: one UDP ASSOCIATE, one relay socket, fixed small payload blasted
 /// for `secs` wall seconds. Sender and receiver run on two threads sharing the
 /// one socket (cloned fd) so the send rate is not gated by the reply RTT; both
@@ -1483,6 +1706,346 @@ fn udppaced(socks: &str, target: &str, secs: u64, payload: usize, pps: u64) {
     }
     if recv > s {
         eprintln!("udppaced FAIL: accounting mismatch recv={recv} > sent={s}");
+        std::process::exit(1);
+    }
+}
+
+/// Full-duplex paced small-packet soak: one UDP ASSOCIATE, one relay socket, a
+/// sender thread pacing `payload`-byte datagrams on an absolute timeline (the
+/// exact `udppaced` schedule) and a reply drain running concurrently for the
+/// whole send window.
+///
+/// The `echo` target returns exactly one reply per datagram, so both directions
+/// carry the same offered rate and the receive loss/pps is a measurement of
+/// whether the tunnel sustains both directions at once — the D6 acceptance shape
+/// for the full-duplex work. Send and receive rates are reported separately and
+/// never summed: a run that loses half the replies must not look like equal slow
+/// progress in both directions. As in `udppaced`, the send pps is over the paced
+/// window and the receive pps over the wall that actually carried replies.
+fn udpbidir(socks: &str, target: &str, secs: u64, payload: usize, pps: u64) {
+    if secs == 0 {
+        eprintln!("udpbidir: secs must be > 0");
+        std::process::exit(2);
+    }
+    if !(1..=512).contains(&payload) {
+        eprintln!("udpbidir: payload must be 1-512 (batchable range), got {payload}");
+        std::process::exit(2);
+    }
+    if pps == 0 {
+        eprintln!("udpbidir: pps must be > 0");
+        std::process::exit(2);
+    }
+    let (host, port) = split_host(target);
+    let (_control, relay) = match socks_associate(socks) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("udpbidir: associate {e}");
+            std::process::exit(1);
+        }
+    };
+    let u = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("udpbidir: bind {e}");
+            std::process::exit(1);
+        }
+    };
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let pkt = udp_request(&host, port, payload);
+    let secs_d = Duration::from_secs(secs);
+    let deadline = Instant::now() + secs_d;
+    let interval = Duration::from_nanos(1_000_000_000 / pps);
+    let sent = Arc::new(AtomicU64::new(0));
+    let send_errs = Arc::new(AtomicU64::new(0));
+    // Uplink half of the full duplex: the `udppaced` absolute-timeline sender on
+    // its own thread, so pacing is never delayed by reply processing.
+    let sender = {
+        let tx = u.try_clone().expect("udpbidir: clone relay socket");
+        let sent = sent.clone();
+        let send_errs = send_errs.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut next = start;
+            let mut n = 0u64;
+            let mut e = 0u64;
+            // Past this lag the schedule re-syncs: emitting the backlog as one
+            // burst would collapse buffers and measure that collapse.
+            let max_lag = Duration::from_secs(1);
+            while Instant::now() < deadline {
+                let now = Instant::now();
+                if next > now {
+                    let left = next - now;
+                    if left > Duration::from_micros(50) {
+                        std::thread::sleep(left - Duration::from_micros(20));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                    continue;
+                }
+                if now.duration_since(next) > max_lag {
+                    next = now;
+                }
+                match tx.send_to(&pkt, relay) {
+                    Ok(_) => n += 1,
+                    Err(_) => e += 1,
+                }
+                next += interval;
+            }
+            sent.fetch_add(n, Ordering::Relaxed);
+            send_errs.fetch_add(e, Ordering::Relaxed);
+        })
+    };
+    // Downlink half: runs concurrently on the calling thread, draining replies
+    // for the whole send window rather than only after the sender has finished.
+    let t0 = Instant::now();
+    let mut recv = 0u64;
+    let mut buf = vec![0u8; 2048];
+    let drain_end = deadline + Duration::from_secs(2);
+    while Instant::now() < drain_end {
+        match u.recv_from(&mut buf) {
+            Ok(_) => recv += 1,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        if Instant::now() >= drain_end {
+            break;
+        }
+    }
+    let _ = sender.join();
+    // Final short drain on the now-idle socket: the sender is done, so anything
+    // still in the kernel queue belongs to this run.
+    u.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    while u.recv_from(&mut buf).is_ok() {
+        recv += 1;
+    }
+    let dt = t0.elapsed();
+    let s = sent.load(Ordering::Relaxed);
+    let se = send_errs.load(Ordering::Relaxed);
+    let wall = dt.as_secs_f64();
+    let sent_pps = s as f64 / secs as f64;
+    let recv_pps = recv as f64 / wall;
+    let loss = if s == 0 {
+        0.0
+    } else {
+        100.0 * s.saturating_sub(recv) as f64 / s as f64
+    };
+    println!(
+        "udpbidir socks={socks} target={target} payload={payload} secs={secs} \
+         target_pps={pps} sent={s} recv={recv} send_errs={se} wall={wall:.3}s \
+         sent_pps={sent_pps:.0} recv_pps={recv_pps:.0} loss={loss:.3}%"
+    );
+    if s == 0 {
+        eprintln!("udpbidir FAIL: nothing sent (associate down or send path broken)");
+        std::process::exit(1);
+    }
+    if (sent_pps - pps as f64).abs() > 0.05 * pps as f64 {
+        eprintln!(
+            "udpbidir WARN: sender did not hold the pace (sent_pps={sent_pps:.0} vs target {pps}); \
+             the bottleneck is the harness, not the tunnel"
+        );
+    }
+    if recv > s {
+        eprintln!("udpbidir FAIL: accounting mismatch recv={recv} > sent={s}");
+        std::process::exit(1);
+    }
+}
+
+/// One association of [`udpmultipaced`]: handshake, bind its own relay socket,
+/// run a paced sender on a second thread, and drain replies concurrently on this
+/// thread for the whole shared `deadline`. Returns `(sent, recv, send_errs)`, or
+/// `None` when the association itself could not be set up — the caller counts
+/// that as a failed association instead of aborting the whole run.
+fn udpmultipaced_assoc(
+    socks: &str,
+    host: &str,
+    port: u16,
+    payload: usize,
+    pps: u64,
+    deadline: Instant,
+) -> Option<(u64, u64, u64)> {
+    // `_control` must outlive the pump: it *is* the association.
+    let Ok((_control, relay)) = socks_associate(socks) else {
+        return None;
+    };
+    let u = UdpSocket::bind("127.0.0.1:0").ok()?;
+    u.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let pkt = udp_request(host, port, payload);
+    let interval = Duration::from_nanos(1_000_000_000 / pps);
+    let sent = Arc::new(AtomicU64::new(0));
+    let send_errs = Arc::new(AtomicU64::new(0));
+    // Same absolute-timeline sender as `udppaced`/`udpbidir`: a stall sends
+    // catch-up packets only inside the 1 s lag window, past it re-syncs.
+    let sender = {
+        let tx = u.try_clone().expect("udpmultipaced: clone relay socket");
+        let sent = sent.clone();
+        let send_errs = send_errs.clone();
+        std::thread::spawn(move || {
+            let mut next = Instant::now();
+            let mut n = 0u64;
+            let mut e = 0u64;
+            let max_lag = Duration::from_secs(1);
+            while Instant::now() < deadline {
+                let now = Instant::now();
+                if next > now {
+                    let left = next - now;
+                    if left > Duration::from_micros(50) {
+                        std::thread::sleep(left - Duration::from_micros(20));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                    continue;
+                }
+                if now.duration_since(next) > max_lag {
+                    next = now;
+                }
+                match tx.send_to(&pkt, relay) {
+                    Ok(_) => n += 1,
+                    Err(_) => e += 1,
+                }
+                next += interval;
+            }
+            sent.fetch_add(n, Ordering::Relaxed);
+            send_errs.fetch_add(e, Ordering::Relaxed);
+        })
+    };
+    // Reply drain runs concurrently with the sender, exactly as in `udpbidir`;
+    // `drain_end` bounds the post-deadline wait for in-flight replies.
+    let mut recv = 0u64;
+    let mut buf = vec![0u8; 2048];
+    let drain_end = deadline + Duration::from_secs(2);
+    while Instant::now() < drain_end {
+        match u.recv_from(&mut buf) {
+            Ok(_) => recv += 1,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+        if Instant::now() >= drain_end {
+            break;
+        }
+    }
+    let _ = sender.join();
+    // Final short drain on the now-idle socket: the sender is done, so anything
+    // still in the kernel queue belongs to this association's run.
+    u.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    while u.recv_from(&mut buf).is_ok() {
+        recv += 1;
+    }
+    Some((
+        sent.load(Ordering::Relaxed),
+        recv,
+        send_errs.load(Ordering::Relaxed),
+    ))
+}
+
+/// `assocs` concurrent associations, one OS thread and one relay socket each
+/// (the `udpmulti` shape), each paced at `pps` datagrams/s of `payload` bytes
+/// for `secs` on an absolute timeline and draining its replies concurrently
+/// (the `udppaced`/`udpbidir` discipline).
+///
+/// This is the many-associations-on-one-connection shape the Phase-2
+/// connection-level cross-session stager is measured against. With a payload
+/// <=512 B and a target port outside `interactive_ports`/`udp_bulk_ports`, the
+/// client classifies every association as interactive, so they all share its
+/// single interactive UDP connection and the run puts several sessions' TRAIN
+/// stagers on that one connection at once. The harness cannot observe which
+/// egress class the client actually picks; use a neutral destination port (e.g.
+/// 9000) and keep `payload` <=512 B to stay on this path.
+///
+/// Aggregate send pps is over `secs` (every association shares one deadline, so
+/// the aggregate is the sum of the per-association paces; association setup is
+/// not part of the paced window) and aggregate receive pps is over `wall` (which
+/// includes the drain grace). Per-association receive counts are reported as
+/// min/max so one starved association cannot hide behind a healthy aggregate.
+fn udpmultipaced(socks: &str, target: &str, assocs: usize, secs: u64, payload: usize, pps: u64) {
+    if assocs == 0 {
+        eprintln!("udpmultipaced: assocs must be > 0");
+        std::process::exit(2);
+    }
+    if secs == 0 {
+        eprintln!("udpmultipaced: secs must be > 0");
+        std::process::exit(2);
+    }
+    if !(1..=512).contains(&payload) {
+        eprintln!("udpmultipaced: payload must be 1-512 (batchable range), got {payload}");
+        std::process::exit(2);
+    }
+    if pps == 0 {
+        eprintln!("udpmultipaced: pps must be > 0");
+        std::process::exit(2);
+    }
+    let (host, port) = split_host(target);
+    // One deadline shared by all associations: they pace over the same `secs`
+    // window, so the aggregate pps is not skewed by staggered starts.
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let t0 = Instant::now();
+    let mut workers = Vec::with_capacity(assocs);
+    for _ in 0..assocs {
+        let socks = socks.to_string();
+        let host = host.clone();
+        workers.push(std::thread::spawn(move || {
+            udpmultipaced_assoc(&socks, &host, port, payload, pps, deadline)
+        }));
+    }
+    let (mut total_sent, mut total_recv, mut total_errs, mut failed) = (0u64, 0u64, 0u64, 0usize);
+    let mut per_assoc_recv = Vec::with_capacity(assocs);
+    for w in workers {
+        match w.join() {
+            Ok(Some((s, r, e))) => {
+                total_sent += s;
+                total_recv += r;
+                total_errs += e;
+                per_assoc_recv.push(r);
+            }
+            // A failed setup and a panicked worker both mean this association
+            // contributed nothing; count it rather than losing the whole run.
+            _ => failed += 1,
+        }
+    }
+    let wall = t0.elapsed();
+    let wall_s = wall.as_secs_f64();
+    let target_agg = pps.saturating_mul(assocs as u64);
+    let sent_pps = total_sent as f64 / secs as f64;
+    let recv_pps = total_recv as f64 / wall_s;
+    let loss = if total_sent == 0 {
+        0.0
+    } else {
+        100.0 * total_sent.saturating_sub(total_recv) as f64 / total_sent as f64
+    };
+    let (recv_min, recv_max) = match (per_assoc_recv.iter().min(), per_assoc_recv.iter().max()) {
+        (Some(lo), Some(hi)) => (*lo, *hi),
+        _ => (0, 0),
+    };
+    println!(
+        "udpmultipaced socks={socks} target={target} assocs={assocs} failed_assocs={failed} \
+         payload={payload} secs={secs} target_pps_per_assoc={pps} target_pps_agg={target_agg} \
+         sent={total_sent} recv={total_recv} send_errs={total_errs} wall={wall_s:.3}s \
+         sent_pps={sent_pps:.0} recv_pps={recv_pps:.0} loss={loss:.3}% \
+         per_assoc_recv_min={recv_min} per_assoc_recv_max={recv_max}"
+    );
+    if total_sent == 0 {
+        eprintln!(
+            "udpmultipaced FAIL: nothing sent (all associations failed or the send path is broken)"
+        );
+        std::process::exit(1);
+    }
+    if (sent_pps - target_agg as f64).abs() > 0.05 * target_agg as f64 {
+        eprintln!(
+            "udpmultipaced WARN: aggregate sender did not hold the pace (sent_pps={sent_pps:.0} \
+             vs target {target_agg}); the bottleneck is the harness (threads/pacing), not the tunnel"
+        );
+    }
+    if total_recv > total_sent {
+        eprintln!("udpmultipaced FAIL: accounting mismatch recv={total_recv} > sent={total_sent}");
         std::process::exit(1);
     }
 }

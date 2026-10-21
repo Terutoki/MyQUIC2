@@ -21,6 +21,12 @@ pub(crate) struct EgressMemo {
     pub(crate) conn: quinn::Connection,
     pub(crate) limit: usize,
     pub(crate) stamp_ms: u64,
+    /// MQP-3 rev2 state paired with `conn`. Served from the memo so the
+    /// uplink hot path reaches the connection's flow registry without an
+    /// extra slot load; pairing it with the cached connection is what keeps a
+    /// frame from being encoded against one connection's ids and sent on
+    /// another's.
+    pub(crate) rev2: Arc<ConnRev2>,
 }
 
 /// Init shim for the thread-local memo array: `[None; N]` needs a const item
@@ -44,6 +50,25 @@ pub(crate) struct EgressCache {
     /// policy can assert (and re-check) that the cache never serves a TCP
     /// connection, and so the 60 s line can name which connection egress is on.
     pub(crate) slot: usize,
+    /// Per-connection MQP-3 rev2 state, published with the connection. A
+    /// cached entry is never served without it: rev2 frames carry ids from
+    /// this exact registry, and using another generation's registry would
+    /// produce frames the peer cannot resolve.
+    pub(crate) rev2: Arc<ConnRev2>,
+}
+
+/// A resolved egress connection plus everything a rev2 frame needs: the live
+/// DATAGRAM budget and the connection generation's flow state.
+///
+/// A struct rather than a tuple because the three values must stay paired:
+/// an encoder validated against one connection's budget but sent with
+/// another's registry is exactly the kind of mix-up a positional tuple makes
+/// easy.
+pub(crate) struct EgressHandle {
+    pub(crate) conn: quinn::Connection,
+    pub(crate) limit: usize,
+    pub(crate) stamp_ms: u64,
+    pub(crate) rev2: Arc<ConnRev2>,
 }
 
 #[derive(Debug)]
@@ -140,7 +165,7 @@ impl SharedEgress {
         &self,
         bind: UdpBind,
         now_ms: u64,
-        f: impl FnOnce(&quinn::Connection, usize) -> R,
+        f: impl FnOnce(&quinn::Connection, usize, &Arc<ConnRev2>) -> R,
     ) -> Option<R> {
         let generation = self.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
         EGRESS_MEMO.with(|slots| {
@@ -149,7 +174,7 @@ impl SharedEgress {
             if entry.generation == generation
                 && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS
             {
-                return Some(f(&entry.conn, entry.limit));
+                return Some(f(&entry.conn, entry.limit, &entry.rev2));
             }
             // Stale (generation bump or expired refresh window): release this
             // thread's clone of the handle before returning None. The clone is
@@ -168,6 +193,7 @@ impl SharedEgress {
     /// generation, not per packet). `generation` is the generation observed before the
     /// acquire's cached read, so a mutation racing the acquire cannot leave a
     /// stale memo entry behind.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn memo_store(
         &self,
         bind: UdpBind,
@@ -175,6 +201,7 @@ impl SharedEgress {
         conn: &quinn::Connection,
         limit: usize,
         stamp_ms: u64,
+        rev2: &Arc<ConnRev2>,
     ) {
         EGRESS_MEMO.with(|slots| {
             slots.borrow_mut()[bind.index] = Some(EgressMemo {
@@ -182,6 +209,7 @@ impl SharedEgress {
                 conn: conn.clone(),
                 limit,
                 stamp_ms,
+                rev2: rev2.clone(),
             });
         });
     }
@@ -202,7 +230,7 @@ impl SharedEgress {
         pool: &ConnPool,
         bind: UdpBind,
         now_ms: u64,
-    ) -> Option<(quinn::Connection, usize, u64)> {
+    ) -> Option<EgressHandle> {
         let cached = &self.cached[bind.index];
         if let Some(c) = cached.load().as_ref() {
             // A fail-closed pool only ever publishes a slot of this class (see
@@ -216,11 +244,16 @@ impl SharedEgress {
                 "fail-closed egress must never cache another class's (or a TCP) slot"
             );
             if now_ms.saturating_sub(c.stamp_ms) < EGRESS_REFRESH_MS {
-                return Some((c.conn.clone(), c.limit, c.stamp_ms));
+                return Some(EgressHandle {
+                    conn: c.conn.clone(),
+                    limit: c.limit,
+                    stamp_ms: c.stamp_ms,
+                    rev2: c.rev2.clone(),
+                });
             }
         }
-        if let Some((c, m, stamp)) = self.refresh_global(pool, bind, now_ms) {
-            return Some((c, m, stamp));
+        if let Some(h) = self.refresh_global(pool, bind, now_ms) {
+            return Some(h);
         }
         // Stale-while-revalidate: an expired (or contended) handle is reused
         // optimistically, but only after one cheap liveness gate
@@ -231,7 +264,12 @@ impl SharedEgress {
         // loser path therefore costs at most one quinn lock and never parks.
         if let Some(c) = cached.load().as_ref() {
             if c.conn.close_reason().is_none() {
-                return Some((c.conn.clone(), c.limit, c.stamp_ms));
+                return Some(EgressHandle {
+                    conn: c.conn.clone(),
+                    limit: c.limit,
+                    stamp_ms: c.stamp_ms,
+                    rev2: c.rev2.clone(),
+                });
             }
             self.invalidate(bind);
         }
@@ -298,7 +336,7 @@ impl SharedEgress {
         pool: &ConnPool,
         bind: UdpBind,
         now_ms: u64,
-    ) -> Option<(quinn::Connection, usize, u64)> {
+    ) -> Option<EgressHandle> {
         // Single-flight: a loser drops fast (UDP semantics) instead of paying
         // the quinn locks while a winner is already refreshing. The losing
         // datagram is counted in `dgram_drops::NO_EGRESS` by the caller.
@@ -332,9 +370,15 @@ impl SharedEgress {
                 limit: m,
                 stamp_ms: now_ms,
                 slot: c.slot,
+                rev2: c.rev2.clone(),
             })));
             self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
-            return Some((c.conn.clone(), m, now_ms));
+            return Some(EgressHandle {
+                conn: c.conn.clone(),
+                limit: m,
+                stamp_ms: now_ms,
+                rev2: c.rev2.clone(),
+            });
         }
         drop(current);
         // The cached connection is gone (or lost DATAGRAM support): walk the
@@ -348,27 +392,44 @@ impl SharedEgress {
             // never be skipped just because a reconnect is publishing.
             let g = slot.shared.load();
             match g.as_ref() {
-                Some(c) if c.close_reason().is_none() => match c.max_datagram_size() {
-                    Some(m) => {
-                        // Lock-free publish: cannot lose, cannot park the
-                        // executor, and always carries a real stamp.
-                        cached.store(Some(Arc::new(EgressCache {
-                            conn: (**c).clone(),
-                            limit: m,
-                            stamp_ms: now_ms,
-                            slot: i,
-                        })));
-                        self.generation[bind.index]
-                            .fetch_add(1, std::sync::atomic::Ordering::Release);
-                        return Some(((**c).clone(), m, now_ms));
-                    }
-                    None => {
-                        if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
+                // The connection must have completed `HELLO`/`CAPS`: the spec
+                // forbids UDP frames before the handshake, and a rev2 encoder
+                // needs the generation's flow registry. A connection that is
+                // still negotiating is skipped exactly like a dead one, so the
+                // datagram is dropped/counted rather than sent on a wire the
+                // server has not acknowledged.
+                Some(c) if c.close_reason().is_none() => {
+                    let Some(rev2) = slot.rev2().filter(|r| r.is_ready()) else {
+                        continue;
+                    };
+                    match c.max_datagram_size() {
+                        Some(m) => {
+                            // Lock-free publish: cannot lose, cannot park the
+                            // executor, and always carries a real stamp.
+                            cached.store(Some(Arc::new(EgressCache {
+                                conn: (**c).clone(),
+                                limit: m,
+                                stamp_ms: now_ms,
+                                slot: i,
+                                rev2: rev2.clone(),
+                            })));
+                            self.generation[bind.index]
+                                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                            return Some(EgressHandle {
+                                conn: (**c).clone(),
+                                limit: m,
+                                stamp_ms: now_ms,
+                                rev2,
+                            });
                         }
-                        return None;
+                        None => {
+                            if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                warn!("peer does not support QUIC DATAGRAM; dropping outbound UDP");
+                            }
+                            return None;
+                        }
                     }
-                },
+                }
                 _ => continue,
             }
         }
@@ -455,6 +516,7 @@ impl SharedEgress {
             limit: m,
             stamp_ms: coarse_millis(),
             slot: c.slot,
+            rev2: c.rev2.clone(),
         })));
         self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     }

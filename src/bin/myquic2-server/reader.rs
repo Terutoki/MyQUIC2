@@ -1,5 +1,9 @@
 //! Per-session UDP reader and session creation.
 use super::*;
+use myquic2::mqp::r2;
+use myquic2::mqp::r2_flow::{FlowBinding, FlowRegistry, FlowState, SessionFlows, SourceMatch};
+use myquic2::udp::r2_frag::R2FragFlow;
+use myquic2::udp::{R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager};
 
 /// Userspace receive buffer per session reader: one full-protocol-cap datagram
 /// plus the truncation-detection slack byte (`n == buf.len()` means the kernel
@@ -89,6 +93,7 @@ pub(crate) fn sess_buf_pool_len() -> usize {
 /// Wire length of the `atyp | addr | port` header a packed frame carries for
 /// `src`. A reply's source is always IP-form (the session reader reports the
 /// address the target answered from), so this is 7 or 19 bytes.
+#[cfg(test)]
 fn reply_addr_len(src: SocketAddr) -> usize {
     match src {
         SocketAddr::V4(_) => 1 + 4 + 2,
@@ -103,6 +108,7 @@ fn reply_addr_len(src: SocketAddr) -> usize {
 /// target, whose resolved IP the client does not know). A no-flow item carries
 /// its source inline; a known flow is compressed and the client's own flow
 /// table supplies the source address.
+#[cfg(test)]
 pub(crate) struct ReplyItem {
     pub(crate) flow: u8,
     pub(crate) src: SocketAddr,
@@ -121,6 +127,7 @@ pub(crate) struct ReplyItem {
 /// budget; the caller flushes and retries. Saturating arithmetic, because
 /// `limit` is a live path budget.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn reply_stage_v3(
     arena: &mut Vec<u8>,
     staged: &mut Vec<ReplyItem>,
@@ -173,9 +180,371 @@ pub(crate) fn reply_stage_v3(
     true
 }
 
+// ---------------------------------------------------------------------------
+// MQP-3 rev2 downlink: connection-level staging (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Per-session rev2 reply state: the reverse table used to classify a reply
+/// source.
+///
+/// Phase 1 kept a per-session small-frame staging area here; Phase 2 moved all
+/// small-reply staging to the connection-scoped [`R2Stager`] so replies from
+/// different associations aggregate into one train. What remains is the
+/// read-only lookup handle.
+pub(crate) struct R2ReplyState {
+    pub(crate) flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
+    /// The connection state when this reader belongs to a live connection: the
+    /// full-cone path allocates a server-owned wire id from it and installs the
+    /// binding in the connection registry. `None` only for fixtures.
+    pub(crate) conn: Option<Arc<R2ConnState>>,
+}
+
+impl R2ReplyState {
+    pub(crate) fn new(
+        flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
+        conn: Option<Arc<R2ConnState>>,
+    ) -> Self {
+        Self { flows, conn }
+    }
+}
+
+/// Full-cone: install a **server-owned** flow for an unsolicited reply source.
+///
+/// This is the downlink-created half of the flow table: the server picks the id
+/// (owner bit 1) and sends the first reply as `DATA OPEN|SRC`, which teaches the
+/// client both the flow id and the actual source. The binding is published in
+/// both tables so:
+/// - later replies from the same source hit `SourceMatch::Exact` (via
+///   `reply_src`) and compress;
+/// - the client app can answer on the same id: an uplink steady/TRAIN item is
+///   forwarded to `target = Ip(src)` (the peer that sent to the relay).
+///
+/// Returns `None` when a resource bound is reached (id space exhausted,
+/// connection registry full, session reverse table full): the caller keeps the
+/// `DATA INLINE` fail-safe of today. The registry insert is undone if publishing
+/// into the session snapshot fails, so a failed install leaves no partial state.
+fn install_unsolicited(
+    conn: &Arc<R2ConnState>,
+    flows: &Arc<arc_swap::ArcSwap<SessionFlows>>,
+    sess: u32,
+    src: SocketAddr,
+) -> Option<Arc<FlowBinding>> {
+    // Check both table bounds before allocating an id: the id space is
+    // monotonic and never reused, so a failed install should not burn one.
+    if flows.load().is_full() {
+        return None;
+    }
+    if conn.registry.len() >= conn.registry.cap() {
+        return None;
+    }
+    let wire_id = conn.ids.alloc()?;
+    let binding = FlowBinding::new_shared(wire_id, sess, TargetAddr::Ip(src));
+    binding.set_reply_src(src);
+    binding.mark_open();
+    let binding = match conn.registry.insert(binding) {
+        Ok(binding) => binding,
+        Err(_) => return None,
+    };
+    let mut published = false;
+    flows.rcu(|old| {
+        let mut next = (**old).clone();
+        published = next.insert(binding.clone());
+        Arc::new(next)
+    });
+    if !published {
+        // The session table filled between the bounds check and the publish
+        // (single-writer per session, but keep the failure path total).
+        conn.registry.remove(wire_id);
+        binding.mark_closed();
+        return None;
+    }
+    r2_stats::bump(&r2_stats::FULL_CONE_FLOWS);
+    Some(binding)
+}
+
+/// Reader-level disposition of one stager drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StageDrain {
+    /// Frames were sent (or the queue is simply empty); no action needed.
+    Ok,
+    /// The live path budget refused an encoded frame. The stager counted the
+    /// refused payloads and left the rest queued; the caller re-reads the
+    /// budget under the usual 100 ms probe throttle.
+    TooLarge,
+    /// DATAGRAM support / the connection is gone: the session reader must flush
+    /// and exit (queued items are accounted by the stager's own drop path).
+    Terminal,
+}
+
+/// Map a stager drain verdict to the reader's disposition.
+///
+/// `Blocked` is ordinary backpressure: the stager counted the refused frame's
+/// payloads (`BUFFER_FULL`) and kept the remaining items queued for the next
+/// drain, so the reader keeps running. `TooLarge` is a budget verdict (the
+/// encoded frame is bigger than the *live* datagram budget; the stager dropped
+/// and counted that frame) and re-arms the budget probe. `Unsupported` /
+/// `ConnectionLost` are the only terminal verdicts.
+pub(crate) fn stage_verdict(failed: Option<DatagramSend>) -> StageDrain {
+    match failed {
+        None | Some(DatagramSend::Blocked) => StageDrain::Ok,
+        // `drain` only reports a verdict when a send was refused; a `Sent`
+        // cannot appear, but map it defensively to the no-op disposition.
+        Some(DatagramSend::Sent) => StageDrain::Ok,
+        Some(DatagramSend::TooLarge) => StageDrain::TooLarge,
+        Some(DatagramSend::Unsupported | DatagramSend::ConnectionLost) => StageDrain::Terminal,
+    }
+}
+
+/// Drain the connection stager, mapping the verdict and re-probing the live
+/// datagram budget when the path shrank under it.
+///
+/// The stager books sent payloads itself and accounts the refused frame's
+/// payloads, so this function counts nothing — it must never double-book.
+pub(crate) fn drain_stage(
+    c2: &quinn::Connection,
+    stage: &Arc<parking_lot::Mutex<R2Stager>>,
+    limit: &mut usize,
+    last_too_large_probe_ms: &mut u64,
+) -> StageDrain {
+    let outcome: R2DrainOutcome = stage.lock().drain(c2, *limit);
+    let verdict = stage_verdict(outcome.failed);
+    if verdict == StageDrain::TooLarge {
+        let now_probe = mono_millis().max(1);
+        if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
+            *last_too_large_probe_ms = now_probe;
+            *limit = c2.max_datagram_size().unwrap_or(0);
+        }
+    }
+    verdict
+}
+
+/// Push one staged item; when the bounded queue is full, drain once and retry.
+///
+/// A push that still fails after a drain is a local-buffer drop: the payload is
+/// counted as `BUFFER_FULL` (the same class as a full send buffer) plus the
+/// rev2 `STAGE_FULL_DROPS` counter, and is not booked as sent.
+fn stage_push(
+    c2: &quinn::Connection,
+    stage: &Arc<parking_lot::Mutex<R2Stager>>,
+    item: R2StageItem,
+    limit: &mut usize,
+    last_too_large_probe_ms: &mut u64,
+) -> StageDrain {
+    let item = {
+        let mut st = stage.lock();
+        match st.push(item) {
+            Ok(()) => return StageDrain::Ok,
+            Err(item) => item,
+        }
+    };
+    let verdict = drain_stage(c2, stage, limit, last_too_large_probe_ms);
+    let mut st = stage.lock();
+    if st.push(item).is_ok() {
+        return verdict;
+    }
+    drop(st);
+    dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+    r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+    verdict
+}
+
+/// Stage the first frame of a rebinding flow (`DATA OPEN|SRC`) and learn the
+/// actual reply source only once that frame was really queued.
+///
+/// The push and the drain run under one stager lock, so no other reader can
+/// send or enqueue between them: if the drain reports no failure and no
+/// budget-dropped items, the queue it just emptied contained this `OPEN|SRC`
+/// and it was queued on the wire. Only then is `reply_src` recorded, which is
+/// what lets the *following* replies from the same source compress.
+fn stage_open_src(
+    c2: &quinn::Connection,
+    stage: &Arc<parking_lot::Mutex<R2Stager>>,
+    item: R2StageItem,
+    limit: &mut usize,
+    last_too_large_probe_ms: &mut u64,
+) -> (StageDrain, bool) {
+    let mut st = stage.lock();
+    if let Err(item) = st.push(item) {
+        // Queue already full: drain it once, then push again.
+        let _ = st.drain(c2, *limit);
+        if let Err(item) = st.push(item) {
+            drop(st);
+            drop(item);
+            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+            r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+            return (StageDrain::Ok, false);
+        }
+    }
+    let outcome = st.drain(c2, *limit);
+    drop(st);
+    let verdict = stage_verdict(outcome.failed);
+    if verdict == StageDrain::TooLarge {
+        let now_probe = mono_millis().max(1);
+        if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
+            *last_too_large_probe_ms = now_probe;
+            *limit = c2.max_datagram_size().unwrap_or(0);
+        }
+    }
+    let sent = outcome.failed.is_none() && outcome.items_dropped == 0;
+    (verdict, sent)
+}
+
+/// Outcome of the Phase 1b large-reply send (rev2 `DATA` or rev2 `FRAG`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum R2LargeReply {
+    /// Every frame was queued (per-reply payload accounting already done).
+    Sent,
+    /// The DATAGRAM buffer was full; the payload is an ordinary UDP drop.
+    Blocked,
+    /// The live path budget cannot carry it; the caller re-probes under the
+    /// usual 100 ms throttle.
+    TooLarge,
+    /// DATAGRAM support / the connection is gone: the reader should flush and
+    /// exit.
+    Terminal,
+}
+
+impl R2LargeReply {
+    fn from_send(sent: DatagramSend) -> Self {
+        match sent {
+            DatagramSend::Sent => Self::Sent,
+            DatagramSend::Blocked => Self::Blocked,
+            DatagramSend::TooLarge => Self::TooLarge,
+            DatagramSend::Unsupported | DatagramSend::ConnectionLost => Self::Terminal,
+        }
+    }
+
+    fn from_payload(sent: &PayloadSend) -> Self {
+        match sent.outcome() {
+            DatagramSend::Sent => Self::Sent,
+            other => Self::from_send(other),
+        }
+    }
+}
+
+/// Send one reply that does not fit the small-reply staging path.
+///
+/// Phase 1b replaces the legacy MQP-2 fragmenter on the server reply path:
+/// every UDP reply now travels as rev2 `DATA` — steady (known flow), `OPEN|SRC`
+/// (one rebind frame that also teaches the client the actual source, after
+/// which the shared binding compresses), or `INLINE` (no flow: self-describing
+/// session + source) — or, when it exceeds one frame, as rev2 `FRAG` in the
+/// same addressing mode via the per-session [`R2Fragmenter`].
+///
+/// A payload is fragmented only when the matching single-frame encoding does
+/// not fit the live budget; the accounting is per reply (a single frame books
+/// its payload on `Sent`, the fragmenter books a whole fragmented payload
+/// itself, and a partial fragmented payload is a normal UDP drop).
+#[allow(clippy::too_many_arguments)]
+fn r2_send_large_reply(
+    c2: &quinn::Connection,
+    s: u32,
+    frag2: &mut R2Fragmenter,
+    r2_match: Option<&SourceMatch>,
+    src: SocketAddr,
+    payload: &[u8],
+    limit: usize,
+) -> R2LargeReply {
+    let n = payload.len();
+    let aref = r2::ip_ref(src);
+    let Ok(header) = aref.header() else {
+        // The reader normalized and validated the source before this call, so
+        // an unencodable address is unreachable; never panic on it.
+        return R2LargeReply::TooLarge;
+    };
+    let addr_len = header.len();
+    match r2_match {
+        Some(SourceMatch::Exact(binding)) => {
+            if r2::data_steady_len(binding.wire_id, n) <= limit {
+                let sent = r2::encode_data_steady(binding.wire_id, payload, limit)
+                    .map(|body| try_send_datagram(c2, body))
+                    .unwrap_or(DatagramSend::TooLarge);
+                let out = R2LargeReply::from_send(sent);
+                if out == R2LargeReply::Sent {
+                    udp_stats::payload(n);
+                    r2_stats::bump(&r2_stats::STEADY_SENT);
+                }
+                out
+            } else {
+                let sent = frag2.send(
+                    c2,
+                    limit,
+                    &R2FragFlow::Steady {
+                        wire_id: binding.wire_id,
+                    },
+                    payload,
+                );
+                if sent.complete() {
+                    r2_stats::bump(&r2_stats::STEADY_SENT);
+                }
+                R2LargeReply::from_payload(&sent)
+            }
+        }
+        Some(SourceMatch::Rebind(binding)) => {
+            if r2::data_open_len(binding.wire_id, addr_len, n) <= limit {
+                let sent = r2::encode_data_open(binding.wire_id, s, &aref, true, payload, limit)
+                    .map(|body| try_send_datagram(c2, body))
+                    .unwrap_or(DatagramSend::TooLarge);
+                let out = R2LargeReply::from_send(sent);
+                if out == R2LargeReply::Sent {
+                    binding.set_reply_src(src);
+                    udp_stats::payload(n);
+                    r2_stats::bump(&r2_stats::OPEN_SRC_SENT);
+                }
+                out
+            } else {
+                let sent = frag2.send(
+                    c2,
+                    limit,
+                    &R2FragFlow::Opening {
+                        wire_id: binding.wire_id,
+                        sess: s,
+                        addr: aref,
+                        src: true,
+                    },
+                    payload,
+                );
+                if sent.complete() {
+                    // The whole binding frame set was queued: the client learns
+                    // the actual source when it reassembles, so the next reply
+                    // from it compresses.
+                    binding.set_reply_src(src);
+                    r2_stats::bump(&r2_stats::OPEN_SRC_SENT);
+                }
+                R2LargeReply::from_payload(&sent)
+            }
+        }
+        None => {
+            if r2::data_inline_len(addr_len, n) <= limit {
+                let sent = r2::encode_data_inline(s, &aref, true, payload, limit)
+                    .map(|body| try_send_datagram(c2, body))
+                    .unwrap_or(DatagramSend::TooLarge);
+                let out = R2LargeReply::from_send(sent);
+                if out == R2LargeReply::Sent {
+                    udp_stats::payload(n);
+                }
+                out
+            } else {
+                let sent = frag2.send(
+                    c2,
+                    limit,
+                    &R2FragFlow::Inline {
+                        sess: s,
+                        addr: aref,
+                        src: true,
+                    },
+                    payload,
+                );
+                R2LargeReply::from_payload(&sent)
+            }
+        }
+    }
+}
+
 /// Send one staged reply as a `SINGLE`, falling back to the MQP-2 fragment
 /// sender. Returns true when a `TooLarge` verdict should trigger a budget
 /// probe.
+#[cfg(test)]
 fn flush_reply_single(
     c2: &quinn::Connection,
     s: u32,
@@ -212,6 +581,7 @@ fn flush_reply_single(
 /// payload, a refused train books nothing and the fallback books each payload
 /// through `flush_reply_single`/`DgramFragmenter::send`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn flush_reply_train(
     c2: &quinn::Connection,
     s: u32,
@@ -458,13 +828,14 @@ pub(crate) fn flush_reply_batch(
 }
 
 /// What processing one reply did to the reader's drain loop.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReplyDisposition {
     /// Keep draining the current burst.
     Continue,
     /// Tear the reader down: the path budget collapsed to zero, or the
-    /// connection reported DATAGRAM support lost / connection lost (the staged
-    /// replies were flushed by the arm that returned this).
+    /// connection reported DATAGRAM support lost / connection lost. Queued
+    /// stager items are connection-scoped: another session reader may still
+    /// drain them, and connection teardown accounts whatever is left.
     BreakSession,
 }
 
@@ -483,12 +854,10 @@ pub(crate) fn handle_session_reply(
     payload: &[u8],
     src_raw: SocketAddr,
     reply_filter: ReplyFilter,
-    frag: &mut DgramFragmenter,
-    arena: &mut Vec<u8>,
-    staged: &mut Vec<ReplyItem>,
-    staged_wire: &mut usize,
+    r2: &mut R2ReplyState,
+    stage: &Arc<parking_lot::Mutex<R2Stager>>,
+    frag2: &mut R2Fragmenter,
     flows: &arc_swap::ArcSwap<FlowTable>,
-    last_flow: &mut Option<(SocketAddr, u8)>,
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
     last_touch: &mut u64,
@@ -546,19 +915,10 @@ pub(crate) fn handle_session_reply(
         return ReplyDisposition::Continue;
     }
     if *limit == 0 {
-        // The staged replies cannot go out either: flush counts them through
-        // the per-reply path (each is a TooLarge drop) instead of losing them
-        // silently on the way out.
-        flush_reply_train(
-            c2,
-            s,
-            &mut *frag,
-            &mut *arena,
-            &mut *staged,
-            &mut *staged_wire,
-            limit,
-            &mut *last_too_large_probe_ms,
-        );
+        // Nothing can be sent on this path: draining with a zero budget makes
+        // the stager account every queued payload as a `TooLarge` drop instead
+        // of leaving them to connection teardown, then the reader exits.
+        let _ = drain_stage(c2, stage, limit, &mut *last_too_large_probe_ms);
         return ReplyDisposition::BreakSession;
     }
     let src = SocketAddr::new(unmap(src_raw.ip()), src_raw.port());
@@ -599,14 +959,19 @@ pub(crate) fn handle_session_reply(
     // checked on a ring miss, and only IP flows match (`flow_for_ip` skips
     // domain entries, which have no resolved client-side address).
     let on_flow = !on_allowlist && flows.load().flow_for_ip(src).is_some();
-    if on_flow {
-        // The one-entry staging memo may have cached NO_FLOW before this mapping
-        // was installed (the target's first reply can race the accept loop's
-        // install). Invalidate it here so the reply is compressed now, instead
-        // of staying inline until a different source happens to evict the memo.
-        *last_flow = None;
-    }
-    if !on_allowlist && !on_flow {
+    // MQP-3 rev2 reverse lookups: a reply source that matches a binding
+    // installed by this session's `DATA OPEN` is authorized by that binding
+    // (its addresses were SSRF/policy validated at install) and can be
+    // compressed. Phase 1b uses the same match for every reply size: small ones
+    // ride the steady/TRAIN staging below, large ones go out as one rev2 DATA
+    // frame or rev2 FRAG (the legacy MQP-2 fragmenter is retired here).
+    let mut r2_match = r2.flows.load().match_source(src).filter(|m| match m {
+        SourceMatch::Exact(binding) | SourceMatch::Rebind(binding) => {
+            binding.state() != FlowState::Closed
+        }
+    });
+    let on_r2 = r2_match.is_some();
+    if !on_allowlist && !on_flow && !on_r2 {
         if reply_filter == ReplyFilter::FullCone {
             // Admitted anyway; counted so an operator can see whether (and how
             // much) unsolicited traffic is actually arriving.
@@ -616,71 +981,94 @@ pub(crate) fn handle_session_reply(
             return ReplyDisposition::Continue;
         }
     }
-    // Reply packing: a small reply rides the run's MQP-3 TRAIN instead of its
-    // own DATAGRAM. Unlike the old BATCH, a run may mix sources; a large reply,
-    // the burst end and the exit paths below flush what is staged first — order
-    // on the wire is preserved and nothing waits (the payload is copied once,
-    // into the reused arena).
+    // Full-cone (and only full-cone): an unsolicited source with no matching
+    // flow opens a *server-owned* flow. The first reply goes out as
+    // `DATA OPEN|SRC` (an `Open` stage item) and the binding is installed in
+    // both tables, so later replies from the same source compress and the client
+    // app can answer on the same id. Any table bound falls back to the INLINE
+    // fail-safe of today (non-full-cone never enters this branch).
+    if r2_match.is_none()
+        && reply_filter == ReplyFilter::FullCone
+        && let Some(conn) = r2.conn.as_ref()
+        && let Some(binding) = install_unsolicited(conn, &r2.flows, s, src)
+    {
+        r2_match = Some(SourceMatch::Rebind(binding));
+    }
+    // ------------------------------------------------------------------
+    // Small replies: one connection-scoped staging queue (Phase 2).
     //
-    // Staging is budget-aware: `reply_stage_v3` refuses a reply that would not
-    // fit the frame, so a run always encodes (unless the path budget shrank
-    // after staging). A reply that cannot be staged even alone falls through to
-    // the single-datagram send below.
+    // Every reply that fits one rev2 DATA frame is pushed as an item and sent
+    // by whichever session reader next drains the shared stager, so replies
+    // from different associations can share one cross-session `TRAIN dict`
+    // (round-robin across sessions). The item shape mirrors the binding state:
+    // - Exact  -> `Steady { wire_id }`, can join any train;
+    // - Rebind -> `Open { wire_id, sess, addr, src: true }`, a standalone
+    //   `DATA OPEN|SRC`; the reply source is learned only once the frame was
+    //   actually queued (see `stage_open_src`);
+    // - None   -> `Inline { sess, addr, src: true }`, a standalone DATA INLINE
+    //   (the self-describing fail-safe, e.g. a full-cone reply).
+    //
+    // Payloads are owned copies: an item may be queued by this task and drained
+    // by another session's reader.
+    // ------------------------------------------------------------------
     if n <= BATCH_SMALL_MAX {
-        if reply_stage_v3(
-            arena,
-            staged,
-            staged_wire,
-            flows,
-            last_flow,
-            src,
-            payload,
-            *limit,
-        ) {
-            return ReplyDisposition::Continue;
-        }
-        flush_reply_train(
-            c2,
-            s,
-            &mut *frag,
-            &mut *arena,
-            &mut *staged,
-            &mut *staged_wire,
-            limit,
-            &mut *last_too_large_probe_ms,
-        );
-        if reply_stage_v3(
-            arena,
-            staged,
-            staged_wire,
-            flows,
-            last_flow,
-            src,
-            payload,
-            *limit,
-        ) {
-            return ReplyDisposition::Continue;
-        }
+        let is_rebind = matches!(r2_match.as_ref(), Some(SourceMatch::Rebind(_)));
+        let kind = match r2_match.as_ref() {
+            Some(SourceMatch::Exact(binding)) => R2StageKind::Steady {
+                wire_id: binding.wire_id,
+            },
+            Some(SourceMatch::Rebind(binding)) => R2StageKind::Open {
+                wire_id: binding.wire_id,
+                sess: s,
+                addr: TargetAddr::Ip(src),
+                src: true,
+            },
+            None => R2StageKind::Inline {
+                sess: s,
+                addr: TargetAddr::Ip(src),
+                src: true,
+            },
+        };
+        let item = R2StageItem {
+            session: s,
+            kind,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        let verdict = if is_rebind {
+            let (verdict, sent) =
+                stage_open_src(c2, stage, item, limit, &mut *last_too_large_probe_ms);
+            if sent {
+                if let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref() {
+                    binding.set_reply_src(src);
+                }
+                r2_stats::bump(&r2_stats::OPEN_SRC_SENT);
+            }
+            verdict
+        } else {
+            stage_push(c2, stage, item, limit, &mut *last_too_large_probe_ms)
+        };
+        return match verdict {
+            StageDrain::Terminal => ReplyDisposition::BreakSession,
+            // `TooLarge` already re-armed the budget probe; the refused frame's
+            // payloads were dropped and counted by the stager itself.
+            StageDrain::Ok | StageDrain::TooLarge => ReplyDisposition::Continue,
+        };
     }
-    flush_reply_train(
-        c2,
-        s,
-        &mut *frag,
-        &mut *arena,
-        &mut *staged,
-        &mut *staged_wire,
-        limit,
-        &mut *last_too_large_probe_ms,
-    );
-    let ta = TargetAddr::Ip(src);
-    let sent = frag.send(c2, s, &ta.as_ref(), payload, *limit);
-    if sent.fragmented() {
-        tracing::debug!("udp session {s}: {n} B sent as {} fragments", sent.frames);
+
+    // A reply too large for one staged frame must not overtake smaller replies
+    // already queued for this flow: drain the connection stager first (it may
+    // carry this session's earlier payloads), then send directly.
+    match drain_stage(c2, stage, limit, &mut *last_too_large_probe_ms) {
+        StageDrain::Ok | StageDrain::TooLarge => {}
+        StageDrain::Terminal => return ReplyDisposition::BreakSession,
     }
-    match sent.outcome() {
-        DatagramSend::Sent => {}
-        DatagramSend::Blocked => {}
-        DatagramSend::TooLarge => {
+    // Phase 1b/2: a reply above the small threshold is rev2 as well — one
+    // DATA/OPEN|SRC/INLINE frame when it fits the live budget, otherwise rev2
+    // FRAG. The legacy MQP-2 fragmenter is not a production reply sender.
+    let sent = r2_send_large_reply(c2, s, &mut *frag2, r2_match.as_ref(), src, payload, *limit);
+    match sent {
+        R2LargeReply::Sent | R2LargeReply::Blocked => {}
+        R2LargeReply::TooLarge => {
             // Size verdict, never a connection fault: keep the reader and the
             // cached budget, re-reading the live budget at most once per probe
             // interval. Unthrottled, every oversized reply in a PMTU-shrink
@@ -695,23 +1083,7 @@ pub(crate) fn handle_session_reply(
                 *limit = c2.max_datagram_size().unwrap_or(0);
             }
         }
-        DatagramSend::Unsupported | DatagramSend::ConnectionLost => {
-            // Best-effort delivery for what is staged before the reader exits:
-            // on a dead connection each per-reply send reports the same terminal
-            // outcome, and nothing is counted for it — the same disposition an
-            // unstaged reply on this path gets.
-            flush_reply_train(
-                c2,
-                s,
-                &mut *frag,
-                &mut *arena,
-                &mut *staged,
-                &mut *staged_wire,
-                limit,
-                &mut *last_too_large_probe_ms,
-            );
-            return ReplyDisposition::BreakSession;
-        }
+        R2LargeReply::Terminal => return ReplyDisposition::BreakSession,
     }
     ReplyDisposition::Continue
 }
@@ -727,6 +1099,10 @@ pub(crate) async fn sess_reader_task(
     recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
     recent_epoch: Arc<std::sync::atomic::AtomicU64>,
     flows: Arc<arc_swap::ArcSwap<FlowTable>>,
+    r2_flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
+    r2_registry: Option<Arc<FlowRegistry>>,
+    r2_conn: Option<Arc<R2ConnState>>,
+    stage: Arc<parking_lot::Mutex<R2Stager>>,
     reply_filter: ReplyFilter,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -737,7 +1113,10 @@ pub(crate) async fn sess_reader_task(
     // drained burst replies are handled in place from the recvmmsg scratch and
     // never touch it.
     let mut buf = sess_recv_buf();
-    let mut frag = DgramFragmenter::new();
+    // MQP-3 rev2 sender for replies that do not fit one `DATA` frame. Small
+    // replies are staged on the connection-level `stage` instead (Phase 2), so
+    // this session no longer keeps a legacy `DgramFragmenter` at all.
+    let mut frag2 = R2Fragmenter::new();
     let mut limit = c2.max_datagram_size().unwrap_or(0);
     let mut last_touch = 0u64;
     let mut last_limit_refresh = coarse_millis();
@@ -755,15 +1134,11 @@ pub(crate) async fn sess_reader_task(
     // real epoch (it counts pushes), so the first reply always loads.
     let mut allow_snap: Option<Arc<RecentAddrs>> = None;
     let mut allow_epoch: u64 = u64::MAX;
-    // Staged small replies for one MQP-3 TRAIN. A train can mix sources, so a
-    // run is bounded only by item count and the path budget; a large reply, the
-    // burst end and every session-exiting path flush it through
-    // `flush_reply_train`, so nothing survives across awaits. Payloads live in
-    // one reused arena; the arena starts empty and grows to at most one frame.
-    let mut arena: Vec<u8> = Vec::new();
-    let mut staged: Vec<ReplyItem> = Vec::with_capacity(MQP3_MAX_TRAIN_ITEMS);
-    let mut staged_wire = 0usize;
-    let mut last_flow: Option<(SocketAddr, u8)> = None;
+    // The session's reverse table, used to classify each reply source, plus the
+    // connection handles the full-cone path needs (server-owned id allocation
+    // and binding install). Small replies are pushed to the connection-scoped
+    // `stage`; nothing is retained in this task across awaits.
+    let mut r2 = R2ReplyState::new(r2_flows, r2_conn);
     'session: loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
@@ -822,12 +1197,10 @@ pub(crate) async fn sess_reader_task(
                     $msg,
                     $src,
                     reply_filter,
-                    &mut frag,
-                    &mut arena,
-                    &mut staged,
-                    &mut staged_wire,
+                    &mut r2,
+                    &stage,
+                    &mut frag2,
                     flows.as_ref(),
-                    &mut last_flow,
                     &mut limit,
                     &mut last_too_large_probe_ms,
                     &mut last_touch,
@@ -900,19 +1273,17 @@ pub(crate) async fn sess_reader_task(
                 ReplyDisposition::BreakSession => break 'session,
             }
         }
-        // The burst ends here, so whatever is staged goes out before the
-        // reader parks: the last reply of a burst must not wait for the next
-        // target reply to be flushed.
-        flush_reply_train(
-            &c2,
-            s,
-            &mut frag,
-            &mut arena,
-            &mut staged,
-            &mut staged_wire,
-            &mut limit,
-            &mut last_too_large_probe_ms,
-        );
+        // Drain-burst boundary: this is where a burst's small replies (from
+        // this session and from any other that pushed in the meantime) go out,
+        // aggregated by the connection stager into steady frames / one
+        // cross-session dict TRAIN. A terminal verdict means DATAGRAM support or
+        // the connection is gone: exit after the stager has accounted the
+        // refused frame (remaining items stay queued for the connection drop).
+        if drain_stage(&c2, &stage, &mut limit, &mut last_too_large_probe_ms)
+            == StageDrain::Terminal
+        {
+            break 'session;
+        }
         record_drain_batch(drained);
     }
     // Every exit above breaks to here, so the buffer is recycled exactly once
@@ -920,17 +1291,39 @@ pub(crate) async fn sess_reader_task(
     // error, lost DATAGRAM support).
     sess_recycle_buf(buf);
     sess_memo_forget(conn_id, s, &rs);
+    let mut removed_r2 = None;
     {
         let sh = ss2.shard(s);
         let mut w = sh.write();
         let mut removed = false;
         if let Some(cur) = w.get(&s)
             && Arc::ptr_eq(&cur.sock, &rs)
+            && let Some(entry) = w.remove(&s)
         {
-            removed = w.remove(&s).is_some();
+            removed = true;
+            removed_r2 = Some(entry.r2_flows);
         }
         if removed {
             ss2.note_live_remove(1);
+        }
+    }
+    // The session is gone: drop its rev2 bindings from the connection-wide
+    // registry too, so a steady frame for an id that belonged to this session
+    // can only fail lookup (never route on a stale binding). The 180 s sweeper
+    // and `SESS_CLOSE` perform the same cleanup for entries they remove.
+    //
+    // Only when *this* reader removed its entry: a reader that lost the race to
+    // a recreation must leave the live session's bindings alone.
+    if let Some(registry) = r2_registry
+        && let Some(r2_flows) = removed_r2
+    {
+        for binding in r2_flows.load().iter() {
+            binding.mark_closed();
+        }
+        let n = registry.remove_session(s);
+        if n > 0 {
+            r2_stats::SESSION_END_BINDINGS
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     // The table may now be empty: if this was its last session, drop out of the
@@ -938,6 +1331,18 @@ pub(crate) async fn sess_reader_task(
     // share back. Must run with the write guard above dropped (see
     // `note_empty_state`).
     ss2.note_empty_state();
+}
+
+/// Drop the rev2 bindings of session entries this path reaped itself, so a
+/// session freed under permit/fair-share pressure cannot leave `wire_id`
+/// entries in the connection registry (the 180 s and connection sweepers do the
+/// same for the entries they reap).
+fn r2_cleanup_evicted(r2: Option<&Arc<R2ConnState>>, entries: &[SessEntry]) {
+    if let Some(state) = r2 {
+        for entry in entries {
+            r2_close_entry_bindings(state, entry);
+        }
+    }
 }
 
 pub(crate) async fn get_or_create_sess(
@@ -952,6 +1357,11 @@ pub(crate) async fn get_or_create_sess(
     // `(host, port, resolved address, remaining life of that resolution)` — the
     // life is the source's, so the memo cannot outlive it (see `pin_life_ms`).
     dest: Option<(&str, u16, SocketAddr, u64)>,
+    // The connection's rev2 state, when this session is being created by a
+    // connection that speaks rev2 (production: always). The reply reader gets
+    // the registry handle so a session that reaps itself can drop its bindings;
+    // `None` is only used by unit fixtures that never install rev2 flows.
+    r2: Option<&Arc<R2ConnState>>,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
     // Session 0 is reserved (never allocated by any client hub): a wire
     // datagram carrying it is malformed or hostile, not a new session.
@@ -1043,6 +1453,7 @@ pub(crate) async fn get_or_create_sess(
     if ss.len_upper_bound(now) >= fair_cap {
         if claim_fair_sweep(now) {
             let evicted = ss.sweep_all(now);
+            r2_cleanup_evicted(r2, &evicted);
             abort_evicted(evicted);
             let now2 = mono_millis();
             let n2 = ss.len();
@@ -1085,6 +1496,7 @@ pub(crate) async fn get_or_create_sess(
                 return None;
             }
             let evicted = ss.sweep_all(mono_millis());
+            r2_cleanup_evicted(r2, &evicted);
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -1129,6 +1541,22 @@ pub(crate) async fn get_or_create_sess(
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     let flows_pre: Arc<arc_swap::ArcSwap<FlowTable>> =
         Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default()));
+    // The rev2 reverse table starts empty and is filled by `DATA OPEN` installs;
+    // the registry handle lets this session's reply reader drop its bindings if
+    // the reader exits on its own (idle reap or a dead socket).
+    let r2_flows_pre: Arc<arc_swap::ArcSwap<SessionFlows>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(SessionFlows::new()));
+    let r2_registry_pre: Option<Arc<FlowRegistry>> = r2.map(|st| st.registry.clone());
+    // Connection-scoped Phase-2 stager. A session created off a test fixture
+    // without connection state gets a private empty one: it can stage and send
+    // its replies, it just cannot aggregate across sessions.
+    // The reply reader needs the same connection state for full-cone
+    // server-owned flow creation (id allocation + registry install).
+    let r2_conn_pre: Option<Arc<R2ConnState>> = r2.cloned();
+    let r2_stage_pre: Arc<parking_lot::Mutex<R2Stager>> = r2.map_or_else(
+        || Arc::new(parking_lot::Mutex::new(R2Stager::new())),
+        |st| st.stage.clone(),
+    );
     let h_pre = tokio::spawn(sess_reader_task(
         conn_id,
         s,
@@ -1139,6 +1567,10 @@ pub(crate) async fn get_or_create_sess(
         recent_pre.clone(),
         recent_epoch.clone(),
         flows_pre.clone(),
+        r2_flows_pre.clone(),
+        r2_registry_pre,
+        r2_conn_pre,
+        r2_stage_pre,
         ss.reply_filter,
     ));
     let reader_abort = h_pre.abort_handle();
@@ -1209,6 +1641,7 @@ pub(crate) async fn get_or_create_sess(
                 recent: recent_pre.clone(),
                 recent_epoch: recent_epoch.clone(),
                 flows: flows_pre.clone(),
+                r2_flows: r2_flows_pre,
             },
         );
         ss.note_live_insert();
@@ -1250,6 +1683,8 @@ pub(crate) async fn get_or_create_sess(
             warn!("udp session {s} reader exited before publish ({n} so far)");
         }
     }
+    r2_cleanup_evicted(r2, &stale_dead);
+    r2_cleanup_evicted(r2, &swept);
     abort_evicted(stale_dead);
     abort_evicted(swept);
     if inserted { Some(sock) } else { None }

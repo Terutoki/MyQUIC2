@@ -70,6 +70,12 @@ pub(crate) fn spawn_conn_loop(
             match dial_once(&ep, &cfg, server, &sname, &auth).await {
                 Ok(conn) => {
                     info!("QUIC connected to {server}");
+                    // MQP-3 rev2 state is created per dial and published
+                    // *before* the connection: the dispatcher and the egress
+                    // cache resolve the state of the generation they are
+                    // handed, never a neighbouring generation's.
+                    let rev2 = ConnRev2::new();
+                    slot.set_rev2(rev2.clone());
                     slot.publish(&conn);
                     // Establishment is inbound progress: seed the routing
                     // stamp before publishing the live hint, so the first
@@ -81,6 +87,22 @@ pub(crate) fn spawn_conn_loop(
                     slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
                     bump_gen(&slot.gen_tx);
                     let connected_at = std::time::Instant::now();
+                    // MQP-3 rev2 negotiation: `CTL HELLO` immediately, retried
+                    // until `CAPS` or the ~2 s cap. The dispatcher task that
+                    // receives `CAPS` was started by the generation bump above
+                    // and stores it on this very `ConnRev2`; the egress cache
+                    // refuses to publish a connection until then, so no UDP
+                    // frame can leave before the peer acknowledged rev2.
+                    //
+                    // No `CAPS`/wrong wire version is fatal for this dial: the
+                    // connection is closed here and the redial loop retries.
+                    // There is deliberately no fallback to the old wire.
+                    if !rev2::handshake(&conn, &rev2).await {
+                        warn!(
+                            "MQP-3 rev2 handshake failed (no CAPS/wrong wire version) on {server}; closing and redialing"
+                        );
+                        conn.close(0u32.into(), b"rev2 handshake");
+                    }
                     // Silence watchdog, two independent detectors sharing one
                     // poll loop. `tx` progress is deliberately NEVER treated
                     // as health: keepalives and retransmits keep `udp_tx`
@@ -203,6 +225,18 @@ pub(crate) fn spawn_conn_loop(
                         // before the next dial publishes a fresh one. Scoped to
                         // this pool slot, so healthy slots keep their caches.
                         egress.forget_slot(idx);
+                        // The rev2 tables are connection-scoped: drop the dead
+                        // generation's registry and state in the same commit
+                        // that cleared the connection, so a dispatcher that
+                        // waits for the next generation cannot resolve ids
+                        // from the dead one (and an association's epoch check
+                        // sees the change before it sends).
+                        slot.clear_rev2();
+                        rev2.clear_flows();
+                        // Queued uplink payloads belong to this dead
+                        // generation: account each as an egress death instead
+                        // of leaving them to the stager's eventual `Drop`.
+                        rev2.clear_stage();
                         bump_gen(&slot.gen_tx);
                     }
                     if connected_at.elapsed() >= Duration::from_secs(5) {

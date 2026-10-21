@@ -264,8 +264,10 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 ///   make us hold before our writers block;
 /// - both DATAGRAM buffers: not flow-controlled at all, so a flood fills them
 ///   whatever the application does;
-/// - the per-connection reassembly budget ([`FRAG_MAX_HELD_BYTES`]): a peer that
-///   sends fragments it never completes pins this until the partial expires.
+/// - both per-connection reassembly budgets ([`FRAG_MAX_HELD_BYTES`] each): the
+///   legacy MQP-2 and the rev2 reassembler run side by side during the wire
+///   transition, and a peer that sends fragments it never completes pins each
+///   until the partials expire.
 ///
 /// Per-stream windows are not added: they are bounded by the connection window.
 /// The result is a ceiling, not a reservation — quinn allocates on demand — which
@@ -284,7 +286,7 @@ pub fn per_connection_memory_bytes(tuning: &TransportTuning) -> u64 {
         .receive_window
         .saturating_add(tuning.send_window)
         .saturating_add(2 * DATAGRAM_BUFFER as u64)
-        .saturating_add(FRAG_MAX_HELD_BYTES as u64)
+        .saturating_add(2 * FRAG_MAX_HELD_BYTES as u64)
 }
 
 /// Worst-case memory one UDP session can pin, in bytes: the session socket's

@@ -30,13 +30,15 @@ mod egress;
 mod hub;
 mod pool;
 mod reporter;
+mod rev2;
 mod socks;
 #[cfg(test)]
 mod tests;
 mod util;
 
 use crate::{
-    assoc::*, auth::*, dispatcher::*, egress::*, hub::*, pool::*, reporter::*, socks::*, util::*,
+    assoc::*, auth::*, dispatcher::*, egress::*, hub::*, pool::*, reporter::*, rev2::*, socks::*,
+    util::*,
 };
 
 // mimalloc on every target (see Cargo.toml): the shipped static / OpenWrt

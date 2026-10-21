@@ -3699,14 +3699,14 @@ mod tests {
     #[test]
     fn per_connection_memory_tracks_the_windows() {
         let d = per_connection_memory_bytes(&TransportTuning::default());
-        // 8 MB receive + 4 MB send + 2 x 1 MB DATAGRAM buffers + the
-        // per-connection reassembly budget.
+        // 8 MB receive + 4 MB send + 2 x 1 MB DATAGRAM buffers + both
+        // per-connection reassembly budgets (legacy MQP-2 + rev2).
         assert_eq!(
             d,
             8 * 1024 * 1024
                 + 4 * 1024 * 1024
                 + 2 * DATAGRAM_BUFFER as u64
-                + FRAG_MAX_HELD_BYTES as u64
+                + 2 * FRAG_MAX_HELD_BYTES as u64
         );
         let wide = TransportTuning {
             receive_window: 16 * 1024 * 1024,
@@ -3722,13 +3722,13 @@ mod tests {
         };
         assert_eq!(per_connection_memory_bytes(&narrow_streams), d);
         // A full house of the shipped defaults: 4096 x (transport 14 MB +
-        // reassembly 256 KiB). The UDP session pool is a *separate*, global term
-        // (`session_pool_memory_bytes`), charged once by the admission bound
-        // rather than per connection.
+        // two reassembly budgets of 256 KiB). The UDP session pool is a
+        // *separate*, global term (`session_pool_memory_bytes`), charged once
+        // by the admission bound rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            58368,
-            "4096 x 14.25 MB is the 57 GiB worst case for the default windows"
+            59392,
+            "4096 x 14.5 MB is the 58 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested

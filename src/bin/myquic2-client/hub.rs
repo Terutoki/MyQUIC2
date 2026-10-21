@@ -40,20 +40,23 @@ pub(crate) const HUB_SHARDS: usize = 256;
 /// reassembler and no per-session mutable state exists anywhere.
 pub(crate) struct AssocEntry {
     pub(crate) relay: Arc<tokio::net::UdpSocket>,
-    /// Session-scoped MQP-3 flow table. The association task allocates flows
-    /// and publishes a new snapshot; the dispatcher reads the same snapshot to
-    /// turn a downlink flow id back into the source address. Semantics match
-    /// the server's per-session table: ids are never reused while the session
-    /// is live, and a full table falls back to an inline address.
+    /// Legacy (v0.2.0 MQP-3) session flow table, kept only for the legacy v3
+    /// downlink decode path that remains for diagnostics/rollback.
+    ///
+    /// The MQP-3 wire rev2 data plane does **not** use it: downlink frames
+    /// resolve `wire_id -> binding` through the per-connection
+    /// [`ConnRev2`](crate::rev2::ConnRev2) registry (the session comes from the
+    /// binding), and the uplink keeps its per-target table in
+    /// [`UplinkFlows`](crate::rev2::UplinkFlows). A rev2 peer therefore always
+    /// finds this table empty, and a compressed legacy v3 frame is refused
+    /// (counted) rather than mis-delivered.
     pub(crate) flows: Arc<arc_swap::ArcSwap<FlowTable>>,
-    /// Bit `f` is set once a downlink frame for flow `f` was successfully
-    /// resolved from the flow table and staged. That is the client's proof that
-    /// the server has the mapping (a compressed downlink is only possible after
-    /// an accepted inline open), so the next outbound frame may compress. Until
-    /// this bit is set the association keeps the address inline: losing the
-    /// first frames cannot black-hole a flow, and a pure-uplink flow simply
-    /// stays inline instead of risking that failure. A future FLOW_ACK can
-    /// confirm those without waiting for a target reply.
+    /// Legacy (v0.2.0 MQP-3) downlink-confirmation bitmap, kept only for the
+    /// legacy v3 decode path (see [`Self::flows`]). Rev2 confirmation lives on
+    /// the shared [`FlowBinding`](myquic2::mqp::r2_flow::FlowBinding) state
+    /// (`Opening -> Open` via `CTL FLOW_ACK` or any compressed downlink), which
+    /// the association and the dispatcher share through the connection
+    /// registry.
     pub(crate) confirmed: std::sync::atomic::AtomicU64,
     /// The app's source address, published by the relay loop when it first sees
     /// a datagram from the app, read by whichever dispatcher has a reply to
@@ -133,12 +136,6 @@ impl AssocEntry {
 
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub(crate) fn flow_confirmed(&self, flow: u8) -> bool {
-        flow < MQP3_MAX_FLOWS as u8
-            && self.confirmed.load(std::sync::atomic::Ordering::Relaxed) & (1u64 << flow) != 0
     }
 
     #[inline]

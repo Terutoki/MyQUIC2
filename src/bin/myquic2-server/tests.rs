@@ -1,5 +1,8 @@
 //! Server unit tests (moved verbatim from the single-file bin).
 use super::*;
+use myquic2::mqp::r2;
+use myquic2::mqp::r2_flow::{FlowBinding, FlowState, SessionFlows, SourceMatch};
+use myquic2::udp::{R2Fragmenter, R2Reassembler, R2StageItem, R2StageKind, R2Stager};
 
 /// Serializes the tests that mutate the process-global session-holder
 /// count, so their exact reads cannot race each other.
@@ -215,6 +218,7 @@ fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) ->
             recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
             recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
+            r2_flows: Arc::new(arc_swap::ArcSwap::from_pointee(SessionFlows::new())),
         },
     );
     // Direct insert (not `get_or_create_sess`): keep the table's live count in
@@ -739,6 +743,7 @@ fn capped_session(idle_ms: u64) -> SessEntry {
         recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
         recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
+        r2_flows: Arc::new(arc_swap::ArcSwap::from_pointee(SessionFlows::new())),
     }
 }
 
@@ -1768,8 +1773,8 @@ fn admission_cap_bounds_connections_by_memory() {
     let per_conn = per_connection_memory_bytes(&TransportTuning::default());
     assert_eq!(
         per_conn,
-        14 * 1024 * 1024 + FRAG_MAX_HELD_BYTES as u64,
-        "4/8/4 MB windows + 2 x 1 MB packets + the per-connection reassembly budget"
+        14 * 1024 * 1024 + 2 * FRAG_MAX_HELD_BYTES as u64,
+        "4/8/4 MB windows + 2 x 1 MB packets + both per-connection reassembly budgets"
     );
     let per_session = per_session_memory_bytes();
     // Linux stores and reports SO_RCVBUF/SO_SNDBUF at 2x the requested value,
@@ -2821,7 +2826,7 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
     let spawns_before = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
     let mut inline = 0usize;
     for _ in 0..33 {
-        if forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true)
+        if forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true, None)
             .await
             .is_some()
         {
@@ -2870,7 +2875,7 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
     let spawns_before2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
     let mut inline2 = 0usize;
     for _ in 0..40 {
-        if forward_server_dgram(&ss, &server_conn, 0, 12, addr, payload.clone(), true)
+        if forward_server_dgram(&ss, &server_conn, 0, 12, addr, payload.clone(), true, None)
             .await
             .is_some()
         {
@@ -2946,7 +2951,7 @@ async fn filtered_domain_burst_is_refused_inline_after_one_waiter() {
     let spawns_before = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
     for _ in 0..33 {
         assert!(
-            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false)
+            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false, None)
                 .await
                 .is_none(),
             "a filtered target never relays a datagram"
@@ -2985,7 +2990,7 @@ async fn filtered_domain_burst_is_refused_inline_after_one_waiter() {
     let spawns_before2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
     for _ in 0..40 {
         assert!(
-            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false)
+            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false, None)
                 .await
                 .is_none(),
             "a cached unusable verdict never relays"
@@ -3227,6 +3232,7 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
         addr,
         Bytes::from_static(b"q"),
         true,
+        None,
     )
     .await;
     assert!(
@@ -3307,6 +3313,7 @@ async fn a_session_dest_memo_answers_a_domain_target_inline() {
         TargetAddrRef::Domain(host, port),
         Bytes::from_static(b"first"),
         true,
+        None,
     )
     .await;
     let (resolved, life) = used.expect(
@@ -3337,6 +3344,7 @@ async fn a_session_dest_memo_answers_a_domain_target_inline() {
         TargetAddrRef::Domain(host, port),
         Bytes::from_static(b"second"),
         true,
+        None,
     )
     .await;
     assert_eq!(
@@ -3729,11 +3737,13 @@ async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
         Arc::new(t)
     });
 
-    let mut frag = DgramFragmenter::new();
-    let mut arena = Vec::new();
-    let mut staged = Vec::new();
-    let mut staged_wire = 0usize;
-    let mut last_flow = None;
+    let r2_flows = {
+        let r = ss.shard(7).read();
+        r.get(&7).expect("session 7").r2_flows.clone()
+    };
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut frag2 = R2Fragmenter::new();
+    let mut r2 = R2ReplyState::new(r2_flows, None);
     let mut limit = server_conn.max_datagram_size().unwrap();
     let mut probe = 0u64;
     let mut last_touch = 0u64;
@@ -3741,18 +3751,16 @@ async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
     let mut allow_snap = None;
     let mut allow_epoch = u64::MAX;
     let body = &b"evicted-source"[..];
-    let _ = handle_session_reply(
+    let disposition = handle_session_reply(
         &server_conn,
         7,
         body,
         src,
         ReplyFilter::Restricted,
-        &mut frag,
-        &mut arena,
-        &mut staged,
-        &mut staged_wire,
+        &mut r2,
+        &stage,
+        &mut frag2,
         flows.as_ref(),
-        &mut last_flow,
         &mut limit,
         &mut probe,
         &mut last_touch,
@@ -3763,10 +3771,20 @@ async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
         &mut allow_snap,
         &mut allow_epoch,
     );
-    assert_eq!(staged.len(), 1, "the live flow must admit the reply");
-    assert_eq!(staged[0].flow, 0);
-    assert_eq!(staged[0].src, src);
-    assert_eq!(staged[0].len, body.len());
+    assert_eq!(disposition, ReplyDisposition::Continue);
+    assert_eq!(
+        drain_stage(&server_conn, &stage, &mut limit, &mut probe),
+        StageDrain::Ok
+    );
+    // The reply is authorized by the live v3 flow mapping, but no rev2 binding
+    // exists for the source, so it stages as the self-describing INLINE shape.
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("the authorized reply must be rev2 DATA");
+    assert_eq!(data.id, None, "no rev2 binding: an INLINE frame");
+    assert_eq!(data.sess, Some(7));
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(src)));
+    assert!(data.src);
+    assert_eq!(data.payload, body);
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
 }
@@ -4098,10 +4116,26 @@ async fn reply_batch_falls_back_to_per_reply_frames_when_it_cannot_fit() {
 // process-global holder count returns after the connection closes, which is
 // the exact-delta contract that lock exists for (same shape as
 // `batch_ingress_arms_the_connection_fast_table`).
-#[allow(clippy::await_holding_lock)]
-async fn unsolicited_reply_through_filter(
-    reply_filter: ReplyFilter,
-) -> Option<(Vec<u8>, SocketAddr)> {
+/// Observed outcome of one unsolicited-source run (assertions happen after the
+/// connection is closed, so a failure cannot leave the global holder count up).
+struct UnsolicitedProbe {
+    payload: Vec<u8>,
+    src: SocketAddr,
+    /// Full-cone only: the server-owned wire id the first reply opened.
+    server_id: Option<u32>,
+    /// Full-cone only: the client app's steady reply on that id reached the
+    /// remote source (the server forwarded it to `binding.target_ip()`).
+    app_reply_ok: bool,
+    /// Full-cone only: a second reply from the same source compressed to a
+    /// steady DATA frame (no second OPEN).
+    second_compressed: bool,
+    /// Full-cone only: a steady frame on an uninstalled server-owned id was
+    /// dropped and not forwarded.
+    unknown_server_id_dropped: bool,
+}
+
+#[allow(clippy::await_holding_lock)] // the HOLDER_TEST_LOCK guard must span the awaits (see above)
+async fn unsolicited_reply_through_filter(reply_filter: ReplyFilter) -> Option<UnsolicitedProbe> {
     use std::sync::atomic::Ordering;
 
     let _holder_guard = holder_test_guard();
@@ -4124,6 +4158,23 @@ async fn unsolicited_reply_through_filter(
         Arc::new(tokio::sync::Semaphore::new(1)),
         MAX_CONNECTIONS,
     ));
+    // This raw test client speaks the legacy MQP-2 wire for its *outbound*
+    // datagrams, but the server-owned-flow path needs the rev2 HELLO gate open
+    // before a rev2 steady frame from the app can be accepted.
+    client_conn
+        .send_datagram(r2::encode_ctl(&r2::Ctl::Hello {
+            wire_ver: r2::R2_WIRE_VER,
+            flags: 0,
+        }))
+        .unwrap();
+    let caps = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("CAPS must arrive after HELLO")
+        .unwrap();
+    assert!(
+        matches!(r2::decode_ctl(&caps), Ok(r2::Ctl::Caps(_))),
+        "HELLO must be answered with CAPS"
+    );
     client_conn.send_datagram(frame).unwrap();
 
     // Capture results instead of asserting inside the live section: a panic
@@ -4136,22 +4187,24 @@ async fn unsolicited_reply_through_filter(
         .ok()
         .and_then(|r| r.ok());
     let mut outbound_payload_ok = false;
-    let mut raw_reply: Option<Bytes> = None;
-    let mut stranger_addr: Option<SocketAddr> = None;
+    let mut probe: Option<UnsolicitedProbe> = None;
     let mut classified = false;
     if let Some((n, relay)) = outbound {
         outbound_payload_ok = &buf[..n] == b"ping";
         let stranger = tokio::net::UdpSocket::bind("[::1]:0")
             .await
             .expect("this test needs an IPv6 loopback (::1) source");
-        stranger_addr = Some(stranger.local_addr().unwrap());
+        let stranger_addr = stranger.local_addr().unwrap();
         let relay_v6: SocketAddr = format!("[::1]:{}", relay.port()).parse().unwrap();
         // Snapshot the classification counters before the stranger speaks, so
         // the check below proves the reader *processed* the datagram instead of
         // relying on a timeout to mean "dropped".
         let refused_before = dgram_drops::snapshot().refused;
         let unsolicited_before = udp_stats::snapshot().unsolicited;
-        let reply = [0x5A; 1000]; // > BATCH_SMALL_MAX: one 0x02 frame
+        // > BATCH_SMALL_MAX: Phase 1b+ carries it as a rev2 frame. Full-cone
+        // opens a server-owned flow (`DATA OPEN|SRC`), the restricted filter
+        // drops it entirely.
+        let reply = [0x5A; 1000];
         stranger.send_to(&reply, relay_v6).await.unwrap();
 
         let wait = if reply_filter == ReplyFilter::FullCone {
@@ -4161,7 +4214,7 @@ async fn unsolicited_reply_through_filter(
             // enough not to slow the suite down.
             Duration::from_millis(500)
         };
-        raw_reply = tokio::time::timeout(wait, client_conn.read_datagram())
+        let first = tokio::time::timeout(wait, client_conn.read_datagram())
             .await
             .ok()
             .and_then(|d| d.ok());
@@ -4185,6 +4238,75 @@ async fn unsolicited_reply_through_filter(
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if let Some(frame) = first {
+            let data = r2::decode_data(&frame).expect("the reply must be a rev2 DATA frame");
+            let mut app_reply_ok = false;
+            let mut second_compressed = false;
+            let mut unknown_server_id_dropped = true;
+            let server_id = data.id;
+            if reply_filter == ReplyFilter::FullCone {
+                // The first unsolicited reply must OPEN a server-owned flow.
+                let id = data
+                    .id
+                    .expect("full-cone must open a server-owned flow, not INLINE");
+                assert!(
+                    r2::wire_id_server_owned(id),
+                    "the server must allocate from its own wire-id half"
+                );
+                assert!(data.src, "the binding frame marks the source");
+                assert_eq!(data.addr, Some(TargetAddrRef::Ip(stranger_addr)));
+                // The client app can now answer on the same id: the server
+                // forwards the steady frame to the remote source.
+                client_conn
+                    .send_datagram(r2::encode_data_steady(id, b"app-reply", limit).unwrap())
+                    .unwrap();
+                let mut sbuf = [0u8; 64];
+                app_reply_ok =
+                    tokio::time::timeout(Duration::from_secs(5), stranger.recv_from(&mut sbuf))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .is_some_and(|(k, _)| &sbuf[..k] == b"app-reply");
+                // A steady frame for an unknown server-owned id must be dropped,
+                // never forwarded to a guessed destination.
+                let unknown = r2::make_wire_id(9_000, true).unwrap();
+                client_conn
+                    .send_datagram(r2::encode_data_steady(unknown, b"unknown-id", limit).unwrap())
+                    .unwrap();
+                unknown_server_id_dropped =
+                    tokio::time::timeout(Duration::from_millis(300), stranger.recv_from(&mut sbuf))
+                        .await
+                        .is_err();
+                // A second reply from the same source now matches the binding's
+                // `reply_src` and compresses to a steady frame (no OPEN).
+                stranger.send_to(b"again", relay_v6).await.unwrap();
+                let second =
+                    tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+                        .await
+                        .ok()
+                        .and_then(|d| d.ok());
+                if let Some(second) = second {
+                    let sdata =
+                        r2::decode_data(&second).expect("the compressed reply must be rev2 DATA");
+                    second_compressed = sdata.id == Some(id)
+                        && sdata.sess.is_none()
+                        && sdata.addr.is_none()
+                        && sdata.payload == b"again";
+                }
+            }
+            probe = Some(UnsolicitedProbe {
+                payload: data.payload.to_vec(),
+                src: match data.addr {
+                    Some(TargetAddrRef::Ip(a)) => a,
+                    other => panic!("a reply source must stay IP-form: {other:?}"),
+                },
+                server_id,
+                app_reply_ok,
+                second_compressed,
+                unknown_server_id_dropped,
+            });
         }
     }
 
@@ -4210,21 +4332,7 @@ async fn unsolicited_reply_through_filter(
         classified,
         "the stranger datagram must reach the session reader and be classified"
     );
-    raw_reply.map(|d| {
-        let (sess, src, payload) =
-            decode_datagram_ref(&d).expect("the reply must be a valid MQP-2 datagram");
-        assert_eq!(sess, 1, "the reply must carry the session id");
-        let src = match src {
-            TargetAddrRef::Ip(a) => a,
-            other => panic!("a reply source must stay IP-form: {other:?}"),
-        };
-        assert_eq!(
-            src,
-            stranger_addr.expect("a reply can only exist after the stranger sent"),
-            "the app must see the stranger's own source address"
-        );
-        (payload.to_vec(), src)
-    })
+    probe
 }
 
 /// `udp_full_cone = true` gives the relay endpoint-independent filtering: a
@@ -4232,17 +4340,37 @@ async fn unsolicited_reply_through_filter(
 /// peer's real source address (the property P2P games/WebRTC need).
 #[tokio::test]
 async fn full_cone_forwards_unsolicited_reply_source() {
-    let (payload, src) = unsolicited_reply_through_filter(ReplyFilter::FullCone)
+    let probe = unsolicited_reply_through_filter(ReplyFilter::FullCone)
         .await
         .expect("full-cone mode must forward a reply from a never-contacted host");
     assert_eq!(
-        payload,
+        probe.payload,
         vec![0x5A; 1000],
         "the unsolicited reply payload must survive intact"
     );
     assert!(
-        src.is_ipv6() && src.ip().is_loopback(),
-        "the app must see the stranger's source address, got {src}"
+        probe.src.is_ipv6() && probe.src.ip().is_loopback(),
+        "the app must see the stranger's source address, got {}",
+        probe.src
+    );
+    let id = probe
+        .server_id
+        .expect("full-cone must open a server-owned flow (DATA OPEN|SRC)");
+    assert!(
+        r2::wire_id_server_owned(id),
+        "the allocated wire id must come from the server's half"
+    );
+    assert!(
+        probe.app_reply_ok,
+        "a client steady frame on the server-owned id must be forwarded to the source"
+    );
+    assert!(
+        probe.second_compressed,
+        "a second reply from the same source must compress to steady DATA"
+    );
+    assert!(
+        probe.unknown_server_id_dropped,
+        "an unknown server-owned id must be dropped, never guessed"
     );
 }
 
@@ -4499,4 +4627,1867 @@ fn never_logged_sentinel_claims_immediately() {
         0,
         "claiming must reset the suppressed count"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MQP-3 rev2 data plane (Phase 1a small-packet path)
+// ---------------------------------------------------------------------------
+
+/// A rev2 `CTL HELLO` for this wire version.
+fn r2_hello_frame() -> Bytes {
+    r2::encode_ctl(&r2::Ctl::Hello {
+        wire_ver: r2::R2_WIRE_VER,
+        flags: 0,
+    })
+}
+
+/// A client-initiated `DATA OPEN` (the address is the destination).
+fn r2_open_frame(id: u32, sess: u32, target: &TargetAddr, payload: &[u8]) -> Bytes {
+    r2::encode_data_open(id, sess, &target.as_ref(), false, payload, 1472)
+        .expect("rev2 OPEN must encode")
+}
+
+/// A compressed `DATA` steady frame.
+fn r2_steady_frame(id: u32, payload: &[u8]) -> Bytes {
+    r2::encode_data_steady(id, payload, 1472).expect("rev2 steady frame must encode")
+}
+
+/// A no-flow `DATA INLINE` frame (session + destination in the header).
+fn r2_inline_frame(sess: u32, target: &TargetAddr, payload: &[u8]) -> Bytes {
+    r2::encode_data_inline(sess, &target.as_ref(), false, payload, 1472)
+        .expect("rev2 INLINE frame must encode")
+}
+
+fn r2_count(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Live connection driving the production `handle_conn` datagram path.
+async fn rev2_pair() -> (
+    quinn::Connection,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    rev2_pair_with(true).await
+}
+
+/// [`rev2_pair`] with an explicit SSRF policy, so the policy-refusal path can be
+/// driven without a live private target (`allow_private = false`).
+async fn rev2_pair_with(
+    allow_private: bool,
+) -> (
+    quinn::Connection,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let task = tokio::spawn(handle_conn(
+        server_conn,
+        allow_private,
+        ReplyFilter::Restricted,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        MAX_CONNECTIONS,
+    ));
+    (client_conn, task)
+}
+
+/// Send `HELLO` and require one CAPS advertising this wire version.
+async fn rev2_handshake(client: &quinn::Connection) {
+    client.send_datagram(r2_hello_frame()).unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("CAPS must arrive after HELLO")
+        .unwrap();
+    match r2::decode_ctl(&d).expect("CAPS must decode") {
+        r2::Ctl::Caps(caps) => {
+            assert_eq!(caps.wire_ver, r2::R2_WIRE_VER);
+            assert_eq!(caps, r2::Caps::default());
+        }
+        other => panic!("expected CAPS, got {other:?}"),
+    }
+}
+
+/// Require one `FLOW_ACK` for `want_id`.
+async fn rev2_expect_ack(client: &quinn::Connection, want_id: u32) {
+    let d = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("FLOW_ACK must arrive")
+        .unwrap();
+    match r2::decode_ctl(&d).expect("FLOW_ACK must decode") {
+        r2::Ctl::FlowAck { id, status } => {
+            assert_eq!(id, want_id, "ACK must name the opened wire id");
+            assert_eq!(status, r2::R2_ACK_OPEN);
+        }
+        other => panic!("expected FLOW_ACK, got {other:?}"),
+    }
+}
+
+/// Await one payload at `target`; `None` on timeout (used for negative checks).
+async fn rev2_recv_timeout(
+    target: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+    wait: Duration,
+) -> Option<Vec<u8>> {
+    match tokio::time::timeout(wait, target.recv_from(buf)).await {
+        Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+        Err(_) | Ok(Err(_)) => None,
+    }
+}
+
+/// Close the client and wait until the connection's sessions are reaped, so the
+/// process-global holder count returns exactly to `holders_before`.
+async fn rev2_teardown(
+    client: quinn::Connection,
+    server_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    holders_before: usize,
+) {
+    client.close(0u32.into(), b"done");
+    server_task.abort();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session_holders().load(std::sync::atomic::Ordering::Relaxed) != holders_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session holder count must return after the connection closes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Insert one live session entry into `ss` (test fixture). The reader is a
+/// pending task, so the entry counts as "fresh" for `session_r2_flows`, exactly
+/// like a session the accept loop just created. Direct insert + `note_live_insert`
+/// mirrors [`sess_with_sock`], so the process-global holder denominator is left
+/// untouched (these fixtures never call `note_empty_state` on insert).
+fn insert_test_session(ss: &SessTable, sess: u32) {
+    let h = tokio::spawn(std::future::pending::<()>());
+    let permit = session_limiter().clone().try_acquire_owned().unwrap();
+    ss.shard(sess).write().insert(
+        sess,
+        SessEntry {
+            sock: memo_sock(),
+            reader: h,
+            last: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
+            _permit: permit,
+            dest: DestMemo::NONE,
+            recent: Arc::new(arc_swap::ArcSwap::from_pointee(RecentAddrs::default())),
+            recent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
+            r2_flows: Arc::new(arc_swap::ArcSwap::from_pointee(SessionFlows::new())),
+        },
+    );
+    ss.note_live_insert();
+}
+
+/// Attach a live rev2 binding to session `sess`'s reverse table, the way the
+/// accept loop leaves it after an accepted `DATA OPEN`.
+fn insert_r2_binding(
+    ss: &SessTable,
+    sess: u32,
+    local_id: u32,
+    target: TargetAddr,
+    resolved: Vec<SocketAddr>,
+) -> (Arc<arc_swap::ArcSwap<SessionFlows>>, Arc<FlowBinding>) {
+    let wire_id = r2::make_wire_id(local_id, false).unwrap();
+    let binding = FlowBinding::new_shared(wire_id, sess, target);
+    if !resolved.is_empty() {
+        binding.set_resolved(resolved);
+    }
+    binding.mark_open();
+    let r2_flows = {
+        let r = ss.shard(sess).read();
+        r.get(&sess).expect("fixture session").r2_flows.clone()
+    };
+    r2_flows.rcu(|old| {
+        let mut next = (**old).clone();
+        assert!(next.insert(binding.clone()));
+        Arc::new(next)
+    });
+    (r2_flows, binding)
+}
+
+/// Session-7 fixture with one live rev2 binding in its reverse table, the way
+/// the accept loop leaves it after an accepted `DATA OPEN`.
+fn rev2_reply_fixture(
+    target: TargetAddr,
+    resolved: Vec<SocketAddr>,
+) -> (
+    SessTable,
+    Arc<arc_swap::ArcSwap<SessionFlows>>,
+    Arc<FlowBinding>,
+) {
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    insert_test_session(&ss, 7);
+    let (r2_flows, binding) = insert_r2_binding(&ss, 7, 1, target, resolved);
+    (ss, r2_flows, binding)
+}
+
+/// `HELLO` -> CAPS is wired, and a version-mismatched HELLO answers with our
+/// own version without opening the data gate.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_hello_gate_and_caps() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+    let id = r2::make_wire_id(1, false).unwrap();
+
+    // Premise: data before any HELLO is dropped and counted.
+    let gated_before = r2_count(&r2_stats::GATED);
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"early"))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "rev2 data before HELLO must not reach a target"
+    );
+    assert_eq!(
+        r2_count(&r2_stats::GATED) - gated_before,
+        1,
+        "the gated frame must be counted"
+    );
+
+    // A HELLO for another wire version answers with our CAPS but leaves the
+    // gate closed (fail-fast, never a silent downgrade).
+    let bad_before = r2_count(&r2_stats::BAD_HELLO);
+    client
+        .send_datagram(r2::encode_ctl(&r2::Ctl::Hello {
+            wire_ver: r2::R2_WIRE_VER + 1,
+            flags: 0,
+        }))
+        .unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("a mismatched HELLO must still be answered with CAPS")
+        .unwrap();
+    match r2::decode_ctl(&d).expect("CAPS must decode") {
+        r2::Ctl::Caps(caps) => assert_eq!(caps.wire_ver, r2::R2_WIRE_VER),
+        other => panic!("expected CAPS, got {other:?}"),
+    }
+    assert_eq!(r2_count(&r2_stats::BAD_HELLO) - bad_before, 1);
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"still-early"))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a version-mismatched HELLO must not open the data gate"
+    );
+
+    // The real handshake opens the gate; data is forwarded and ACKed. Wait out
+    // the CAPS throttle first: the mismatched HELLO above was answered, so a
+    // valid HELLO inside the same 100 ms window is marked (the gate opens) but
+    // is not answered again — correct behaviour, but it needs a clean window
+    // to observe the second CAPS deterministically.
+    tokio::time::sleep(Duration::from_millis(R2_CAPS_MIN_INTERVAL_MS + 20)).await;
+    let caps_before = r2_count(&r2_stats::CAPS_SENT);
+    rev2_handshake(&client).await;
+    assert!(r2_count(&r2_stats::CAPS_SENT) > caps_before);
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"open"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("OPEN after HELLO must be forwarded")
+        .unwrap();
+    assert_eq!(&buf[..n], b"open");
+    rev2_expect_ack(&client, id).await;
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// The Phase 1a ingress contract end to end: OPEN installs + ACKs, a steady
+/// frame resolves through the registry, duplicate OPEN still forwards its
+/// payload, INLINE forwards without installing, and unknown ids / rev2 FRAG are
+/// dropped and counted.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_open_ack_steady_inline_and_drops() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"open"))
+        .unwrap();
+    let (n, relay) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("the OPEN payload must reach the target")
+        .unwrap();
+    assert_eq!(&buf[..n], b"open");
+    rev2_expect_ack(&client, id).await;
+
+    // Steady: two bytes of header, resolved by the connection registry.
+    client
+        .send_datagram(r2_steady_frame(id, b"steady"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("a steady frame must resolve through the installed flow")
+        .unwrap();
+    assert_eq!(&buf[..n], b"steady");
+
+    // Downlink of a small reply compresses to a rev2 steady frame.
+    target.send_to(b"reply", relay).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("a small reply from the bound target must be compressed")
+        .unwrap();
+    let data = r2::decode_data(&frame).expect("downlink must be a rev2 DATA frame");
+    assert_eq!(data.id, Some(id));
+    assert_eq!(data.sess, None, "steady downlink carries no session");
+    assert_eq!(data.addr, None, "steady downlink carries no address");
+    assert_eq!(data.payload, b"reply");
+    assert_eq!(
+        frame.len(),
+        1 + r2::varint_len(id) + b"reply".len(),
+        "steady header is one kind byte plus the wire-id varint"
+    );
+
+    // Duplicate OPEN: idempotent install, but this frame's payload is delivered
+    // and the ACK is re-sent (the client may have missed the first one).
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"again"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("a duplicate OPEN still carries new data")
+        .unwrap();
+    assert_eq!(&buf[..n], b"again");
+    rev2_expect_ack(&client, id).await;
+
+    // INLINE: forwarded once, never installed, never ACKed.
+    let inline_before = r2_count(&r2_stats::INLINE);
+    client
+        .send_datagram(r2_inline_frame(1, &TargetAddr::Ip(dst), b"inline"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("INLINE must be forwarded")
+        .unwrap();
+    assert_eq!(&buf[..n], b"inline");
+    assert!(r2_count(&r2_stats::INLINE) > inline_before);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), client.read_datagram())
+            .await
+            .is_err(),
+        "INLINE must not install a flow or send an ACK"
+    );
+
+    // A steady frame for an id that was never installed fails lookup: drop, count,
+    // never guess (the destination exists, the id does not).
+    let inline_id = r2::make_wire_id(2, false).unwrap();
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    client
+        .send_datagram(r2_steady_frame(inline_id, b"guess"))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "an unknown wire id must never be forwarded"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    // Phase 1b: a one-fragment rev2 FRAG for an installed flow reassembles and
+    // forwards the whole payload like the equivalent steady DATA frame.
+    client
+        .send_datagram(
+            r2::encode_frag_steady(id, 2, 0, 1, b"frag", 1472).expect("frag must encode"),
+        )
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("a rev2 FRAG for an installed flow must be forwarded")
+        .unwrap();
+    assert_eq!(&buf[..n], b"frag");
+
+    // ...while a fragmented payload for an unknown id is dropped and counted at
+    // completion (the registry is resolved then, never guessed).
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    client
+        .send_datagram(
+            r2::encode_frag_steady(inline_id, 3, 0, 1, b"guess-frag", 1472)
+                .expect("frag must encode"),
+        )
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a fragmented payload for an unknown id must never be forwarded"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    // Half-owner rule: a client may not open an id from the server's half — it
+    // is rejected and nothing is forwarded (Phase 1b sends those as OPEN|SRC
+    // from the server side).
+    let server_owned = r2::make_wire_id(1, true).unwrap();
+    client
+        .send_datagram(r2_open_frame(
+            server_owned,
+            1,
+            &TargetAddr::Ip(dst),
+            b"spoofed",
+        ))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a client OPEN must not claim a server-owned wire id"
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("the rejected OPEN must be answered with FLOW_REJECT")
+        .unwrap();
+    match r2::decode_ctl(&frame).expect("FLOW_REJECT must decode") {
+        r2::Ctl::FlowReject { id, reason } => {
+            assert_eq!(id, server_owned);
+            assert_eq!(reason, r2::R2_REJECT_POLICY);
+        }
+        other => panic!("expected FLOW_REJECT, got {other:?}"),
+    }
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// SSRF policy failure on an OPEN answers `FLOW_REJECT(policy)` and installs
+/// nothing: the payload is never forwarded and a later steady frame for the id
+/// fails lookup instead of reaching a private target.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_open_policy_refusal_rejects_without_install() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    // The server's SSRF policy is the shipped `allow_private = false`: every
+    // loopback target must be refused before a session is created.
+    let (client, task) = rev2_pair_with(false).await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"private"))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "an SSRF-filtered OPEN must not reach the target"
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("a refused OPEN must be answered with FLOW_REJECT")
+        .unwrap();
+    match r2::decode_ctl(&frame).expect("FLOW_REJECT must decode") {
+        r2::Ctl::FlowReject {
+            id: rejected,
+            reason,
+        } => {
+            assert_eq!(rejected, id);
+            assert_eq!(reason, r2::R2_REJECT_POLICY);
+        }
+        other => panic!("expected FLOW_REJECT, got {other:?}"),
+    }
+
+    // No binding was installed: a compressed successor fails lookup.
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    client
+        .send_datagram(r2_steady_frame(id, b"after-reject"))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a rejected OPEN must not leave a binding behind"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// A same-flow `TRAIN` delivers every payload in wire order; a dict-form item
+/// naming an unknown id is dropped alone while the rest of the frame continues.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_train_delivers_known_flows_and_drops_unknown_items() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+
+    rev2_handshake(&client).await;
+    let a = r2::make_wire_id(1, false).unwrap();
+    let b = r2::make_wire_id(2, false).unwrap();
+    let unknown = r2::make_wire_id(9, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(a, 1, &TargetAddr::Ip(dst), b"open-a"))
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("open payload");
+    rev2_expect_ack(&client, a).await;
+
+    // Same-flow form: one header, two labelled payloads.
+    let train = r2::encode_train_same(a, &[&b"first"[..], &b"second"[..]], 1472)
+        .expect("same-flow train must encode");
+    client.send_datagram(train).unwrap();
+    let (n1, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("first train item")
+        .unwrap();
+    let first = buf[..n1].to_vec();
+    let (n2, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("second train item")
+        .unwrap();
+    let second = buf[..n2].to_vec();
+    assert_eq!(
+        (first, second),
+        (b"first".to_vec(), b"second".to_vec()),
+        "train items must keep wire order"
+    );
+
+    // Dict form with one unknown id: only the known item is forwarded.
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    let train = r2::encode_train_dict(
+        &[a, unknown],
+        &[(0, &b"known"[..]), (1, &b"unknown"[..])],
+        1472,
+    )
+    .expect("dict train must encode");
+    client.send_datagram(train).unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("the known item must be forwarded")
+        .unwrap();
+    assert_eq!(&buf[..n], b"known");
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "the item for the unknown id must be dropped, never guessed"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    // Two known flows in one dict train both arrive.
+    client
+        .send_datagram(r2_open_frame(b, 1, &TargetAddr::Ip(dst), b"open-b"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("open-b payload")
+        .unwrap();
+    assert_eq!(&buf[..n], b"open-b");
+    rev2_expect_ack(&client, b).await;
+    let train = r2::encode_train_dict(&[a, b], &[(0, &b"via-a"[..]), (1, &b"via-b"[..])], 1472)
+        .expect("dict train must encode");
+    client.send_datagram(train).unwrap();
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+            .await
+            .expect("both dict items must be forwarded")
+            .unwrap();
+        got.push(buf[..n].to_vec());
+    }
+    assert_eq!(got, vec![b"via-a".to_vec(), b"via-b".to_vec()]);
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// `CTL SESS_CLOSE` reaps the session and its bindings immediately: a late
+/// steady frame fails lookup, and the same wire id can be opened again (the
+/// registry entry is gone, so this is a fresh install, not a reroute).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_sess_close_reaps_bindings_on_the_live_path() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"open"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("open payload")
+        .unwrap();
+    assert_eq!(&buf[..n], b"open");
+    rev2_expect_ack(&client, id).await;
+
+    // SESS_CLOSE is processed on the connection's datagram task: wait for it to
+    // be applied instead of racing a sleep.
+    let closes_before = r2_count(&r2_stats::SESS_CLOSES);
+    client
+        .send_datagram(r2::encode_ctl(&r2::Ctl::SessClose { sess: 1, reason: 0 }))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while r2_count(&r2_stats::SESS_CLOSES) == closes_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "SESS_CLOSE must be processed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The binding is gone with the session: a late compressed frame is dropped.
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    client.send_datagram(r2_steady_frame(id, b"stale")).unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a binding closed by SESS_CLOSE must never route again"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    // The id is not tombstoned: a fresh OPEN reinstalls it on the recreated
+    // session (the wire id is never reused by a conforming client, but the
+    // server's behaviour must be a new install, not a stale reroute).
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"reopen"))
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("a reopen after SESS_CLOSE must be forwarded")
+        .unwrap();
+    assert_eq!(&buf[..n], b"reopen");
+    rev2_expect_ack(&client, id).await;
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// Domain target end to end: the OPEN resolves synchronously and installs the
+/// resolved address set, the first downlink reply from a resolved IP rebinds
+/// with one `OPEN|SRC` (payload riding the binding frame), and the next reply
+/// compresses to a two-byte steady frame.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_domain_open_and_downlink_rebind() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    // The seeded cache is host-keyed and carries no port: the queried port is
+    // attached on return, so it must be the target's real listen port.
+    let host = "rev2-domain.test";
+    let port = dst.port();
+    dns_cache_seed(host, port, dst).await;
+    let (client, task) = rev2_pair().await;
+    let mut buf = [0u8; 64];
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(
+            id,
+            1,
+            &TargetAddr::Domain(host.into(), port),
+            b"domain-open",
+        ))
+        .unwrap();
+    let (n, relay) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("the resolved domain OPEN must reach the target")
+        .unwrap();
+    assert_eq!(&buf[..n], b"domain-open");
+    rev2_expect_ack(&client, id).await;
+
+    // First reply from the resolved address: rebind (domain bindings have no
+    // reply source yet, so the server sends the actual source inline once).
+    target.send_to(b"domain-first", relay).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("the first domain reply must arrive")
+        .unwrap();
+    let data = r2::decode_data(&frame).expect("rebind must be a rev2 DATA frame");
+    assert_eq!(data.id, Some(id));
+    assert_eq!(data.sess, Some(1), "the binding frame names its session");
+    assert!(data.src, "the binding frame marks the address as a source");
+    assert_eq!(
+        data.addr,
+        Some(TargetAddrRef::Ip(dst)),
+        "the client must learn the target's actual reply source"
+    );
+    assert_eq!(data.payload, b"domain-first");
+
+    // Second reply is compressed: the client already knows the source.
+    target.send_to(b"domain-steady", relay).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("the second domain reply must arrive")
+        .unwrap();
+    let data = r2::decode_data(&frame).expect("compressed downlink must be rev2 DATA");
+    assert_eq!(data.id, Some(id));
+    assert_eq!(data.sess, None);
+    assert_eq!(data.addr, None);
+    assert_eq!(data.payload, b"domain-steady");
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// Await one downlink DATAGRAM (5 s budget).
+async fn r2_read_frame(client: &quinn::Connection) -> Bytes {
+    tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("a downlink frame must arrive")
+        .unwrap()
+}
+
+/// Await one downlink DATAGRAM with a short budget; `None` means nothing was
+/// emitted (used for ordering/negative assertions).
+async fn r2_read_frame_timeout(client: &quinn::Connection, wait: Duration) -> Option<Bytes> {
+    tokio::time::timeout(wait, client.read_datagram())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+}
+
+/// Downlink staging against a live pair: a run of one is a steady frame, a run
+/// of several is one dict `TRAIN` (same flow), a changed source port rebinds
+/// with `OPEN|SRC` (the learned source compresses afterwards), and a reply over
+/// the staging threshold drains the queue first (order) before going direct.
+#[tokio::test]
+async fn rev2_downlink_steady_train_and_port_rebind() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let other_port: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+    let (ss, _r2_flows, binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    // Mirror the ingest path: the accept loop records every destination it
+    // sends to, which is the reply reader's other authorization source.
+    remember_dst(&ss, 7, src);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server_conn.clone(), stage, None);
+
+    // A run of one is a steady frame (2 B header + id varint).
+    assert!(matches!(h.reply(b"one", src), ReplyDisposition::Continue));
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("a run of one must be steady DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.sess, None);
+    assert_eq!(data.payload, b"one");
+
+    // A run of two same-flow replies is one dict `TRAIN`.
+    for payload in [&b"two"[..], b"three"] {
+        assert!(matches!(h.reply(payload, src), ReplyDisposition::Continue));
+    }
+    assert_eq!(h.r2.flows.load().len(), 1);
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client_conn).await;
+    let train = r2::decode_train(&frame).expect("a run of two must be a dict TRAIN");
+    let items: Vec<_> = train.items().collect();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|(id, _)| *id == binding.wire_id));
+    assert_eq!(items[0].1, b"two");
+    assert_eq!(items[1].1, b"three");
+
+    // Same IP, new port: one OPEN|SRC binds the actual source, payload riding it.
+    // The rebind item is drained immediately so the reply source is learned only
+    // once the binding frame was actually queued.
+    assert!(matches!(
+        h.reply(b"port", other_port),
+        ReplyDisposition::Continue
+    ));
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("a source rebind must be rev2 DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.sess, Some(7));
+    assert!(data.src);
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(other_port)));
+    assert_eq!(data.payload, b"port");
+    assert_eq!(binding.reply_src(), Some(other_port));
+    assert!(matches!(
+        h.r2.flows.load().match_source(other_port),
+        Some(SourceMatch::Exact(_))
+    ));
+
+    // ...and the learned port compresses from now on.
+    assert!(matches!(
+        h.reply(b"after", other_port),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("post-rebind downlink must be steady DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.sess, None);
+    assert_eq!(data.payload, b"after");
+
+    // Ordering across the staging boundary: a queued small reply goes out
+    // before a subsequent reply too large to stage, and that large reply is
+    // rev2 DATA (one frame at this payload), never the legacy v2 form.
+    let big = vec![0x5Au8; BATCH_SMALL_MAX + 1];
+    assert!(matches!(
+        h.reply(b"small-first", other_port),
+        ReplyDisposition::Continue
+    ));
+    assert!(matches!(
+        h.reply(&big, other_port),
+        ReplyDisposition::Continue
+    ));
+    let first = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&first).expect("the queued small reply must be steady DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.payload, b"small-first");
+    let second = r2_read_frame(&client_conn).await;
+    assert!(
+        r2::is_r2(&second),
+        "a >512 B reply must stay on the rev2 wire"
+    );
+    let data =
+        r2::decode_data(&second).expect("a fitting oversized reply must be rev2 steady DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.sess, None);
+    assert_eq!(data.addr, None);
+    assert_eq!(data.payload, &big[..]);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A domain binding has no exact source until one is learned: a reply from any
+/// address in the binding's validated `resolved` set triggers one `OPEN|SRC`
+/// rebind (this is the domain downlink-compression path).
+#[tokio::test]
+async fn rev2_downlink_domain_resolved_ip_rebinds() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let resolved: SocketAddr = "203.0.113.7:53".parse().unwrap();
+    let (ss, _r2_flows, binding) = rev2_reply_fixture(
+        TargetAddr::Domain("rev2.example".into(), 53),
+        vec![resolved],
+    );
+    remember_dst(&ss, 7, resolved);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server_conn.clone(), stage, None);
+    assert!(matches!(
+        h.reply(b"domain-rebind", resolved),
+        ReplyDisposition::Continue
+    ));
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("domain rebind must be rev2 DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.sess, Some(7));
+    assert!(data.src);
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(resolved)));
+    assert_eq!(data.payload, b"domain-rebind");
+    assert_eq!(binding.reply_src(), Some(resolved));
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// `SESS_CLOSE` / `FLOW_CLOSE` teardown at the state level: the session entry,
+/// its socket/task/permit and every registry binding go together, and a
+/// per-flow close removes exactly one binding from both tables.
+#[tokio::test]
+async fn rev2_close_paths_remove_bindings_from_both_tables() {
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, r2_flows, binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    let state = R2ConnState::new();
+    assert!(state.registry.insert(binding.clone()).is_ok());
+    assert_eq!(ss.shard(7).read().len(), 1);
+
+    // FLOW_CLOSE: one binding, both tables.
+    assert!(r2_remove_flow(&ss, &state, binding.wire_id).is_some());
+    assert!(state.registry.get(binding.wire_id).is_none());
+    assert_eq!(binding.state(), FlowState::Closed);
+    assert!(r2_flows.load().is_empty());
+    assert!(
+        r2_remove_flow(&ss, &state, binding.wire_id).is_none(),
+        "a second FLOW_CLOSE is a no-op"
+    );
+
+    // SESS_CLOSE: entry removed immediately, bindings gone with it.
+    let (ss2, r2_flows2, binding2) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    let state2 = R2ConnState::new();
+    assert!(state2.registry.insert(binding2.clone()).is_ok());
+    assert!(r2_close_session(&ss2, &state2, 7));
+    assert!(
+        ss2.shard(7).read().get(&7).is_none(),
+        "the session entry must be removed immediately"
+    );
+    assert!(
+        state2.registry.get(binding2.wire_id).is_none(),
+        "its bindings must be removed from the connection registry"
+    );
+    assert_eq!(binding2.state(), FlowState::Closed);
+    assert!(r2_flows2.load().is_empty());
+    assert!(
+        !r2_close_session(&ss2, &state2, 7),
+        "second close is a no-op"
+    );
+}
+
+/// The CAPS reply throttle is the spec's ~100 ms, and "never replied" is always
+/// due (the `0` stamp cannot mean "replied at process start").
+#[test]
+fn rev2_caps_reply_throttle_is_100ms() {
+    assert!(r2_caps_due(0, 1));
+    assert!(r2_caps_due(0, 999_999));
+    assert!(!r2_caps_due(100, 150));
+    assert!(!r2_caps_due(100, 199));
+    assert!(r2_caps_due(100, 200));
+    assert!(r2_caps_due(100, 100 + R2_CAPS_MIN_INTERVAL_MS + 1));
+}
+
+// ---------------------------------------------------------------------------
+// MQP-3 rev2 FRAG (Phase 1b: all UDP payloads up to 8 KiB use rev2)
+// ---------------------------------------------------------------------------
+
+/// Split `payload` into rev2 `FRAG` frames the way the uplink sender does:
+/// `Some(id)+Some(addr)` = first fragment carries `OPEN`; `Some(id)` alone =
+/// steady fragments; `None+Some(addr)` = every fragment carries `INLINE`.
+///
+/// Scripted here (rather than via `R2Fragmenter`) so the test can send the
+/// frames in any order and assert on out-of-order reassembly.
+fn r2_frag_frames(
+    id: Option<u32>,
+    sess: Option<u32>,
+    addr: Option<&TargetAddr>,
+    payload: &[u8],
+    limit: usize,
+) -> Vec<Bytes> {
+    let header_len = |r: &TargetAddrRef<'_>| r.header().expect("test address must encode").len();
+    let (first_hdr, rest_hdr) = match (id, addr) {
+        (Some(wid), Some(a)) => (
+            r2::frag_open_len(wid, header_len(&a.as_ref()), 0),
+            r2::frag_steady_len(wid, 0),
+        ),
+        (Some(wid), None) => {
+            let h = r2::frag_steady_len(wid, 0);
+            (h, h)
+        }
+        (None, Some(a)) => {
+            let h = r2::frag_inline_len(header_len(&a.as_ref()), 0);
+            (h, h)
+        }
+        (None, None) => panic!("an inline fragment needs an address"),
+    };
+    let first_chunk = limit - first_hdr;
+    let rest_chunk = limit - rest_hdr;
+    assert!(first_chunk > 0 && rest_chunk > 0);
+    let total = if payload.len() <= first_chunk {
+        1usize
+    } else {
+        1 + (payload.len() - first_chunk).div_ceil(rest_chunk)
+    };
+    assert!(total <= usize::from(r2::R2_MAX_FRAG_TOTAL));
+    let mut frames = Vec::with_capacity(total);
+    let mut offset = 0usize;
+    for idx in 0..total {
+        let remaining = payload.len() - offset;
+        let chunk_len = if idx == 0 {
+            first_chunk.min(remaining)
+        } else {
+            rest_chunk.min(remaining)
+        };
+        let chunk = &payload[offset..offset + chunk_len];
+        let body = match (id, addr) {
+            (Some(wid), Some(a)) if idx == 0 => r2::encode_frag_open(
+                wid,
+                sess.expect("open needs a session"),
+                &a.as_ref(),
+                false,
+                7,
+                idx as u8,
+                total as u8,
+                chunk,
+                limit,
+            ),
+            (Some(wid), _) => r2::encode_frag_steady(wid, 7, idx as u8, total as u8, chunk, limit),
+            (None, Some(a)) => r2::encode_frag_inline(
+                sess.expect("inline needs a session"),
+                &a.as_ref(),
+                false,
+                7,
+                idx as u8,
+                total as u8,
+                chunk,
+                limit,
+            ),
+            (None, None) => unreachable!(),
+        }
+        .expect("fragment frame must encode");
+        frames.push(body);
+        offset += chunk_len;
+    }
+    frames
+}
+
+/// Read downlink frames until the rev2 reassembler completes a payload.
+async fn r2_collect_reassembled(
+    client: &quinn::Connection,
+    reasm: &mut R2Reassembler,
+    max_frames: usize,
+) -> Option<myquic2::udp::R2Assembled> {
+    for _ in 0..max_frames {
+        let d = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+            .await
+            .expect("a downlink frame must arrive")
+            .unwrap();
+        assert!(
+            r2::is_r2(&d),
+            "Phase 1b must carry every downlink frame on the rev2 wire"
+        );
+        let f = r2::decode_frag(&d).expect("a fragmented downlink must be rev2 FRAG");
+        if let Some(done) = reasm.push(&f, coarse_millis()) {
+            return Some(done);
+        }
+    }
+    None
+}
+
+/// Downlink unit-test harness: the locals `handle_session_reply` needs, plus a
+/// connection-scoped stager, so a test can drive several replies/ sessions
+/// through the production reply body and drain once.
+struct R2ReplyHarness {
+    session: u32,
+    server: quinn::Connection,
+    r2: R2ReplyState,
+    frag2: R2Fragmenter,
+    flows: Arc<arc_swap::ArcSwap<FlowTable>>,
+    stage: Arc<parking_lot::Mutex<R2Stager>>,
+    limit: usize,
+    last_probe: u64,
+    last_touch: u64,
+    last_refresh: u64,
+    last2: Arc<std::sync::atomic::AtomicU64>,
+    recent: Arc<arc_swap::ArcSwap<RecentAddrs>>,
+    recent_epoch: Arc<std::sync::atomic::AtomicU64>,
+    allow_snap: Option<Arc<RecentAddrs>>,
+    allow_epoch: u64,
+    reply_filter: ReplyFilter,
+}
+
+impl R2ReplyHarness {
+    fn new(
+        session: u32,
+        ss: &SessTable,
+        server: quinn::Connection,
+        stage: Arc<parking_lot::Mutex<R2Stager>>,
+        conn: Option<Arc<R2ConnState>>,
+    ) -> Self {
+        let (last2, recent, recent_epoch, flows, r2_flows) = {
+            let r = ss.shard(session).read();
+            let e = r.get(&session).expect("fixture session");
+            (
+                e.last.clone(),
+                e.recent.clone(),
+                e.recent_epoch.clone(),
+                e.flows.clone(),
+                e.r2_flows.clone(),
+            )
+        };
+        let limit = server.max_datagram_size().unwrap_or(0);
+        Self {
+            session,
+            server,
+            r2: R2ReplyState::new(r2_flows, conn),
+            frag2: R2Fragmenter::new(),
+            flows,
+            stage,
+            limit,
+            last_probe: 0,
+            last_touch: 0,
+            last_refresh: coarse_millis(),
+            last2,
+            recent,
+            recent_epoch,
+            allow_snap: None,
+            allow_epoch: u64::MAX,
+            reply_filter: ReplyFilter::Restricted,
+        }
+    }
+
+    /// Run this harness with another reply-source policy (full-cone tests).
+    fn with_filter(mut self, filter: ReplyFilter) -> Self {
+        self.reply_filter = filter;
+        self
+    }
+
+    fn reply(&mut self, payload: &[u8], src: SocketAddr) -> ReplyDisposition {
+        handle_session_reply(
+            &self.server,
+            self.session,
+            payload,
+            src,
+            self.reply_filter,
+            &mut self.r2,
+            &self.stage,
+            &mut self.frag2,
+            self.flows.as_ref(),
+            &mut self.limit,
+            &mut self.last_probe,
+            &mut self.last_touch,
+            &mut self.last_refresh,
+            self.last2.as_ref(),
+            self.recent.as_ref(),
+            self.recent_epoch.as_ref(),
+            &mut self.allow_snap,
+            &mut self.allow_epoch,
+        )
+    }
+
+    /// Drain the connection stager once (the session reader's burst boundary).
+    fn drain(&mut self) -> StageDrain {
+        drain_stage(
+            &self.server,
+            &self.stage,
+            &mut self.limit,
+            &mut self.last_probe,
+        )
+    }
+}
+
+/// Large uplink: fragmented `OPEN` (sent out of order) installs the flow,
+/// delivers the whole payload and is ACKed; fragmented steady frames then
+/// resolve through the registry at completion.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_frag_large_uplink_open_and_steady_roundtrip() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 8192];
+    let limit = client
+        .max_datagram_size()
+        .expect("DATAGRAM is negotiated by the test transport");
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    let big_open = vec![0xA1u8; 2500];
+    let frames = r2_frag_frames(
+        Some(id),
+        Some(1),
+        Some(&TargetAddr::Ip(dst)),
+        &big_open,
+        limit,
+    );
+    assert!(frames.len() > 1, "fixture must exceed one rev2 frame");
+    // Out of order: every steady fragment first, the OPEN-carrying fragment
+    // last. The reassembler keeps the context from whichever fragment has it
+    // and routes the whole payload once the set completes.
+    for frame in frames.iter().skip(1).rev() {
+        client.send_datagram(frame.clone()).unwrap();
+    }
+    client.send_datagram(frames[0].clone()).unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(10), target.recv_from(&mut buf))
+        .await
+        .expect("the reassembled OPEN payload must reach the target")
+        .unwrap();
+    assert_eq!(&buf[..n], &big_open[..]);
+    rev2_expect_ack(&client, id).await;
+
+    // Fragmented steady frame set for the now-installed flow.
+    let big_steady = vec![0xB2u8; 4000];
+    let frames = r2_frag_frames(Some(id), None, None, &big_steady, limit);
+    assert!(frames.len() > 1);
+    for frame in &frames {
+        client.send_datagram(frame.clone()).unwrap();
+    }
+    let (n, _) = tokio::time::timeout(Duration::from_secs(10), target.recv_from(&mut buf))
+        .await
+        .expect("the reassembled steady payload must reach the target")
+        .unwrap();
+    assert_eq!(&buf[..n], &big_steady[..]);
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// A fragmented `OPEN` runs the same SSRF policy as a single-frame one: the
+/// whole reassembled payload is refused before any session/forward, with
+/// `FLOW_REJECT(policy)` and no binding installed.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_frag_open_policy_refusal_rejects() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair_with(false).await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 8192];
+    let limit = client.max_datagram_size().unwrap();
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    let payload = vec![0xCCu8; 2200];
+    for frame in r2_frag_frames(
+        Some(id),
+        Some(1),
+        Some(&TargetAddr::Ip(dst)),
+        &payload,
+        limit,
+    ) {
+        client.send_datagram(frame).unwrap();
+    }
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a fragmented OPEN to a filtered target must be refused before forwarding"
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
+        .await
+        .expect("the refused fragmented OPEN must be answered with FLOW_REJECT")
+        .unwrap();
+    match r2::decode_ctl(&frame).expect("FLOW_REJECT must decode") {
+        r2::Ctl::FlowReject {
+            id: rejected,
+            reason,
+        } => {
+            assert_eq!(rejected, id);
+            assert_eq!(reason, r2::R2_REJECT_POLICY);
+        }
+        other => panic!("expected FLOW_REJECT, got {other:?}"),
+    }
+    // Nothing was installed: a compressed successor fails lookup.
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    client
+        .send_datagram(r2_steady_frame(id, b"after-reject"))
+        .unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// A fragmented steady payload for an id the connection never installed is
+/// dropped at completion (the registry is consulted only once the whole
+/// payload is back), never guessed from the fragments.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_frag_unknown_steady_id_is_dropped() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0u8; 8192];
+    let limit = client.max_datagram_size().unwrap();
+
+    rev2_handshake(&client).await;
+    let unknown = r2::make_wire_id(9, false).unwrap();
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    let payload = vec![0x11u8; 2200];
+    for frame in r2_frag_frames(Some(unknown), None, None, &payload, limit) {
+        client.send_datagram(frame).unwrap();
+    }
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a fragmented unknown id must never be forwarded"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// A partial that never completes is reaped by the shared reassembly timeout:
+/// fragments arriving after the expiry cannot complete a payload, so nothing is
+/// forwarded and nothing is delivered to a target.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_frag_partial_expires() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 8192];
+    let limit = client.max_datagram_size().unwrap();
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"open"))
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("small OPEN must be forwarded");
+    rev2_expect_ack(&client, id).await;
+
+    let payload = vec![0xDDu8; 2500];
+    let frames = r2_frag_frames(Some(id), None, None, &payload, limit);
+    assert!(frames.len() > 1);
+    client.send_datagram(frames[0].clone()).unwrap();
+    // Past the 2 s reassembly window plus a sweep tick.
+    tokio::time::sleep(Duration::from_millis(FRAG_TIMEOUT_MS + 900)).await;
+    for frame in &frames[1..] {
+        client.send_datagram(frame.clone()).unwrap();
+    }
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(500)).await,
+        None,
+        "fragments after the partial expired must not complete a payload"
+    );
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// Large downlink: all three rev2 addressing modes — steady (known flow),
+/// `OPEN|SRC` rebind (learned source), and INLINE (no flow) — are carried as
+/// rev2 FRAG when the reply exceeds one frame, and reassemble to the exact
+/// payload/context on the peer.
+#[tokio::test]
+async fn rev2_frag_large_downlink_modes() {
+    let (client, server) = stream_test_pair().await;
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let big = vec![0x5Au8; 3000];
+    let limit = server.max_datagram_size().unwrap();
+    assert!(
+        r2::data_steady_len(r2::make_wire_id(1, false).unwrap(), big.len()) > limit,
+        "fixture must exceed one rev2 DATA frame"
+    );
+
+    // Exact -> steady fragments (id only; no session/address context).
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _f, binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    remember_dst(&ss, 7, src);
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), None);
+    assert!(matches!(h.reply(&big, src), ReplyDisposition::Continue));
+    let mut reasm = R2Reassembler::new();
+    let done = r2_collect_reassembled(&client, &mut reasm, 16)
+        .await
+        .expect("the steady fragment set must complete");
+    assert_eq!(done.wire_id, Some(binding.wire_id));
+    assert_eq!(done.sess, None);
+    assert_eq!(done.addr, None);
+    assert_eq!(done.payload, Bytes::from(big.clone()));
+    assert!(
+        r2_stats::STEADY_SENT.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the steady fragment send must be counted"
+    );
+
+    // Rebind -> the first fragment carries OPEN|SRC, later ones are steady.
+    let bound: SocketAddr = "203.0.113.9:4242".parse().unwrap();
+    let rebind_src: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+    let (ss, _f, binding) = rev2_reply_fixture(TargetAddr::Ip(bound), Vec::new());
+    remember_dst(&ss, 7, rebind_src);
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), None);
+    assert!(matches!(
+        h.reply(&big, rebind_src),
+        ReplyDisposition::Continue
+    ));
+    let mut reasm = R2Reassembler::new();
+    let done = r2_collect_reassembled(&client, &mut reasm, 16)
+        .await
+        .expect("the rebind fragment set must complete");
+    assert_eq!(done.wire_id, Some(binding.wire_id));
+    assert_eq!(done.sess, Some(7));
+    assert_eq!(done.addr, Some(TargetAddr::Ip(rebind_src)));
+    assert!(done.src, "the binding frame marks the address as a source");
+    assert_eq!(done.payload, Bytes::from(big.clone()));
+    assert_eq!(binding.reply_src(), Some(rebind_src));
+
+    // Inline -> no flow matches (the binding names another IP); the reply is
+    // self-describing and still authorized by the session's destination list.
+    let inline_src: SocketAddr = "198.51.100.77:7777".parse().unwrap();
+    let other = TargetAddr::Ip("203.0.113.9:4242".parse().unwrap());
+    let (ss, _f, _binding) = rev2_reply_fixture(other, Vec::new());
+    remember_dst(&ss, 7, inline_src);
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), None);
+    assert!(matches!(
+        h.reply(&big, inline_src),
+        ReplyDisposition::Continue
+    ));
+    let mut reasm = R2Reassembler::new();
+    let done = r2_collect_reassembled(&client, &mut reasm, 16)
+        .await
+        .expect("the inline fragment set must complete");
+    assert_eq!(done.wire_id, None);
+    assert_eq!(done.sess, Some(7));
+    assert_eq!(done.addr, Some(TargetAddr::Ip(inline_src)));
+    assert!(done.src);
+    assert_eq!(done.payload, Bytes::from(big));
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+// ---------------------------------------------------------------------------
+// MQP-3 rev2 Phase 2: connection-level cross-session stager
+// ---------------------------------------------------------------------------
+
+/// Two associations on one connection: their small replies stage into the same
+/// connection queue and go out as ONE cross-session dict `TRAIN` (one frame,
+/// both wire ids and payloads).
+#[tokio::test]
+async fn rev2_stage_cross_session_dict_train() {
+    let (client, server) = stream_test_pair().await;
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    insert_test_session(&ss, 7);
+    insert_test_session(&ss, 8);
+    let src_a: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let src_b: SocketAddr = "198.51.100.10:5353".parse().unwrap();
+    let (_, binding_a) = insert_r2_binding(&ss, 7, 1, TargetAddr::Ip(src_a), Vec::new());
+    let (_, binding_b) = insert_r2_binding(&ss, 8, 2, TargetAddr::Ip(src_b), Vec::new());
+    remember_dst(&ss, 7, src_a);
+    remember_dst(&ss, 8, src_b);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut ha = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), None);
+    let mut hb = R2ReplyHarness::new(8, &ss, server.clone(), stage.clone(), None);
+
+    // Both replies are staged before either drain: the shared queue holds a
+    // Steady item from each session, which the round-robin drain packs together.
+    assert!(matches!(
+        ha.reply(b"from-a", src_a),
+        ReplyDisposition::Continue
+    ));
+    assert!(matches!(
+        hb.reply(b"from-b", src_b),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(ha.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let train = r2::decode_train(&frame).expect("two sessions must share one dict TRAIN");
+    let items: Vec<(u32, &[u8])> = train.items().collect();
+    assert_eq!(items.len(), 2, "one frame carries both sessions' payloads");
+    assert_eq!(items[0], (binding_a.wire_id, &b"from-a"[..]));
+    assert_eq!(items[1], (binding_b.wire_id, &b"from-b"[..]));
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+/// Per-session FIFO survives the shared queue: replies pushed in order are
+/// sent in order, across a train and the next single-frame drain.
+#[tokio::test]
+async fn rev2_stage_preserves_per_session_order_across_drains() {
+    let (client, server) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _r2_flows, binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    remember_dst(&ss, 7, src);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage, None);
+
+    for payload in [&b"a1"[..], b"a2", b"a3"] {
+        assert!(matches!(h.reply(payload, src), ReplyDisposition::Continue));
+    }
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let train = r2::decode_train(&frame).expect("three steady items must be one TRAIN");
+    let got: Vec<&[u8]> = train.items().map(|(_, p)| p).collect();
+    assert_eq!(got, vec![&b"a1"[..], b"a2", b"a3"]);
+    assert!(train.items().all(|(id, _)| id == binding.wire_id));
+
+    assert!(matches!(h.reply(b"a4", src), ReplyDisposition::Continue));
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("a single queued reply must be steady DATA");
+    assert_eq!(data.id, Some(binding.wire_id));
+    assert_eq!(data.payload, b"a4");
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+/// A full staging queue drops the payload with `BUFFER_FULL` accounting and
+/// never books it as sent or emits a frame.
+#[tokio::test]
+async fn rev2_stage_queue_full_drops_and_counts() {
+    use std::sync::atomic::Ordering;
+
+    let (client, server) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _r2_flows, _binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    remember_dst(&ss, 7, src);
+    // Capacity zero: every push is refused, even after the drain retry.
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::with_capacity(0, 0)));
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage, None);
+
+    let full_before = dgram_drops::snapshot().buffer_full;
+    let stage_before = r2_stats::STAGE_FULL_DROPS.load(Ordering::Relaxed);
+    assert!(matches!(
+        h.reply(b"dropped", src),
+        ReplyDisposition::Continue
+    ));
+    assert!(
+        dgram_drops::snapshot().buffer_full > full_before,
+        "a full staging queue is a BUFFER_FULL drop"
+    );
+    assert!(
+        r2_stats::STAGE_FULL_DROPS.load(Ordering::Relaxed) > stage_before,
+        "the rev2 staging drop counter must move"
+    );
+    assert!(
+        r2_read_frame_timeout(&client, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "a dropped staged payload must not be emitted"
+    );
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+/// Connection teardown with queued items: the stager's `Drop` accounts every
+/// queued payload as `EGRESS_DEAD` (nothing is lost silently).
+#[tokio::test]
+async fn rev2_stage_drop_accounts_queued_items() {
+    use std::sync::atomic::Ordering;
+
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    for i in 0..3u32 {
+        stage
+            .lock()
+            .push(R2StageItem {
+                session: 7,
+                kind: R2StageKind::Steady {
+                    wire_id: r2::make_wire_id(i + 1, false).unwrap(),
+                },
+                payload: Bytes::from_static(b"q"),
+            })
+            .expect("a fresh stager has room");
+    }
+    let dead_before = dgram_drops::snapshot().egress_dead;
+    drop(stage);
+    assert_eq!(
+        dgram_drops::snapshot().egress_dead - dead_before,
+        3,
+        "every queued payload must be accounted on drop"
+    );
+    let _ = Ordering::Relaxed;
+}
+
+/// A dead connection surfaces as `StageDrain::Terminal`, which is what makes
+/// the session readers take their existing flush-and-exit path.
+#[tokio::test]
+async fn rev2_stage_drain_reports_terminal_on_connection_lost() {
+    let (client, server) = stream_test_pair().await;
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut limit = server.max_datagram_size().unwrap_or(0);
+    let mut probe = 0u64;
+    server.close(0u32.into(), b"bye");
+    let mut verdict = StageDrain::Ok;
+    for i in 0..100u32 {
+        let _ = stage.lock().push(R2StageItem {
+            session: 7,
+            kind: R2StageKind::Steady {
+                wire_id: r2::make_wire_id(i + 1, false).unwrap(),
+            },
+            payload: Bytes::from_static(b"dead"),
+        });
+        verdict = drain_stage(&server, &stage, &mut limit, &mut probe);
+        if verdict == StageDrain::Terminal {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        verdict,
+        StageDrain::Terminal,
+        "a closed connection must surface as Terminal"
+    );
+    client.close(0u32.into(), b"done");
+}
+
+/// The drain-verdict mapping is the only place the stager's `DatagramSend`
+/// surface turns into reader dispositions; pin every arm.
+#[test]
+fn rev2_stage_verdict_mapping() {
+    assert_eq!(stage_verdict(None), StageDrain::Ok);
+    assert_eq!(
+        stage_verdict(Some(DatagramSend::Blocked)),
+        StageDrain::Ok,
+        "backpressure keeps the reader alive; the stager retained the rest"
+    );
+    assert_eq!(
+        stage_verdict(Some(DatagramSend::TooLarge)),
+        StageDrain::TooLarge
+    );
+    assert_eq!(
+        stage_verdict(Some(DatagramSend::Unsupported)),
+        StageDrain::Terminal
+    );
+    assert_eq!(
+        stage_verdict(Some(DatagramSend::ConnectionLost)),
+        StageDrain::Terminal
+    );
+    assert_eq!(
+        stage_verdict(Some(DatagramSend::Sent)),
+        StageDrain::Ok,
+        "defensive: drain never reports a successful verdict"
+    );
+}
+
+/// Fairness: a quiet session's reply is not starved by a busy session's queue.
+/// The stager's round-robin cursor must pull the quiet session's head into the
+/// very first frame, even when the busy session has dozens of items queued.
+#[tokio::test]
+async fn rev2_stage_fairness_quiet_session_shares_first_frame() {
+    let (client, server) = stream_test_pair().await;
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    insert_test_session(&ss, 7);
+    insert_test_session(&ss, 8);
+    let busy_src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let quiet_src: SocketAddr = "198.51.100.10:5353".parse().unwrap();
+    let (_, busy_binding) = insert_r2_binding(&ss, 7, 1, TargetAddr::Ip(busy_src), Vec::new());
+    let (_, quiet_binding) = insert_r2_binding(&ss, 8, 2, TargetAddr::Ip(quiet_src), Vec::new());
+    remember_dst(&ss, 7, busy_src);
+    remember_dst(&ss, 8, quiet_src);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut busy = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), None);
+    let mut quiet = R2ReplyHarness::new(8, &ss, server.clone(), stage.clone(), None);
+
+    for i in 0..40u8 {
+        assert!(matches!(
+            busy.reply(&[b'b', i], busy_src),
+            ReplyDisposition::Continue
+        ));
+    }
+    assert!(matches!(
+        quiet.reply(b"quiet", quiet_src),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(busy.drain(), StageDrain::Ok);
+    // The first frame is a dict train that already carries the quiet session's
+    // payload: the round-robin cursor interleaves it with the busy session.
+    let frame = r2_read_frame(&client).await;
+    let train = r2::decode_train(&frame).expect("a cross-session run must be a dict TRAIN");
+    let ids: Vec<u32> = train.items().map(|(id, _)| id).collect();
+    assert!(
+        ids.contains(&quiet_binding.wire_id),
+        "the quiet session must share the first frame, got ids {ids:?} (busy {})",
+        busy_binding.wire_id
+    );
+    assert!(
+        ids.contains(&busy_binding.wire_id),
+        "the busy session's items must be in the same run"
+    );
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+// ---------------------------------------------------------------------------
+// MQP-3 rev2 final: server-owned full-cone flows + client replies
+// ---------------------------------------------------------------------------
+
+/// Full-cone: an unsolicited source with no matching flow opens one
+/// server-owned flow — one `DATA OPEN|SRC` with an id from the server's half,
+/// installed in both tables — and later replies from the same source compress.
+#[tokio::test]
+async fn rev2_full_cone_opens_server_owned_flow_and_compresses() {
+    use std::sync::atomic::Ordering;
+
+    let (client, server) = stream_test_pair().await;
+    let peer: SocketAddr = "203.0.113.7:5353".parse().unwrap();
+    // The fixture's only binding names a different target, so the peer source
+    // matches no flow and full-cone has to create one.
+    let (ss, _flows, _other) = rev2_reply_fixture(
+        TargetAddr::Ip("203.0.113.99:9".parse().unwrap()),
+        Vec::new(),
+    );
+    let conn = R2ConnState::new();
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), Some(conn.clone()))
+        .with_filter(ReplyFilter::FullCone);
+
+    let flows_before = r2_stats::FULL_CONE_FLOWS.load(Ordering::Relaxed);
+    assert!(matches!(
+        h.reply(b"hello-peer", peer),
+        ReplyDisposition::Continue
+    ));
+    assert!(
+        r2_stats::FULL_CONE_FLOWS.load(Ordering::Relaxed) > flows_before,
+        "the full-cone flow must be counted"
+    );
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("the first unsolicited reply must be rev2 DATA");
+    let id = data
+        .id
+        .expect("full-cone must open a server-owned flow, not INLINE");
+    assert!(
+        r2::wire_id_server_owned(id),
+        "the id must come from the server's half"
+    );
+    assert_eq!(data.sess, Some(7));
+    assert!(data.src);
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(peer)));
+    assert_eq!(data.payload, b"hello-peer");
+
+    // The binding is installed in both tables, carries the remote source as its
+    // target, learned the reply source, and is Open.
+    let binding = conn
+        .registry
+        .get(id)
+        .expect("the server-owned binding must be in the connection registry");
+    assert_eq!(binding.session, 7);
+    assert_eq!(binding.state(), FlowState::Open);
+    assert_eq!(binding.reply_src(), Some(peer));
+    assert_eq!(binding.target_ip(), Some(peer));
+    assert!(matches!(
+        h.r2.flows.load().match_source(peer),
+        Some(SourceMatch::Exact(_))
+    ));
+
+    // Second reply from the same source: the reverse table hits `reply_src` and
+    // the payload compresses to steady DATA (no second OPEN).
+    assert!(matches!(
+        h.reply(b"compressed", peer),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("the second reply must be steady DATA");
+    assert_eq!(data.id, Some(id));
+    assert_eq!(data.sess, None);
+    assert_eq!(data.addr, None);
+    assert_eq!(data.payload, b"compressed");
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+/// Non-full-cone mode is byte-identical to before: an unmatched (but
+/// allowlisted) source keeps the self-describing INLINE fail-safe and opens no
+/// flow.
+#[tokio::test]
+async fn rev2_non_full_cone_unmatched_reply_stays_inline() {
+    let (client, server) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _flows, _other) = rev2_reply_fixture(
+        TargetAddr::Ip("198.51.100.99:9".parse().unwrap()),
+        Vec::new(),
+    );
+    remember_dst(&ss, 7, src);
+    let conn = R2ConnState::new();
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage, Some(conn.clone()));
+
+    assert!(matches!(
+        h.reply(b"inline", src),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("the unmatched reply must be rev2 DATA");
+    assert_eq!(data.id, None, "restricted mode must not open a flow");
+    assert_eq!(data.sess, Some(7));
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(src)));
+    assert!(data.src);
+    assert_eq!(data.payload, b"inline");
+    assert!(
+        conn.registry.is_empty(),
+        "non-full-cone must not install a server-owned binding"
+    );
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
+/// Full-cone falls back to the INLINE fail-safe at either table bound (session
+/// reverse table full, connection registry full), never panicking and never
+/// leaving a half-installed binding.
+#[tokio::test]
+async fn rev2_full_cone_falls_back_to_inline_when_bounds_reached() {
+    // (a) Per-session reverse table full: 63 extra bindings fill the 64-slot
+    // session table, so the server-owned flow cannot be published.
+    let (client, server) = stream_test_pair().await;
+    let peer: SocketAddr = "203.0.113.7:5353".parse().unwrap();
+    let (ss, _flows, _other) = rev2_reply_fixture(
+        TargetAddr::Ip("203.0.113.99:9".parse().unwrap()),
+        Vec::new(),
+    );
+    for local in 2..=64u32 {
+        let target = TargetAddr::Ip(SocketAddr::from((
+            std::net::Ipv4Addr::new(198, 51, 100, 7),
+            local as u16,
+        )));
+        let _ = insert_r2_binding(&ss, 7, local, target, Vec::new());
+    }
+    let conn = R2ConnState::new();
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server.clone(), stage.clone(), Some(conn.clone()))
+        .with_filter(ReplyFilter::FullCone);
+    assert!(matches!(
+        h.reply(b"table-full", peer),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("the fallback must be rev2 DATA");
+    assert_eq!(data.id, None, "a full session table falls back to INLINE");
+    assert_eq!(data.sess, Some(7));
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(peer)));
+    assert!(data.payload == b"table-full");
+    assert!(
+        conn.registry.is_empty(),
+        "the failed install must not leave a registry entry"
+    );
+
+    // (b) Connection registry full: pre-fill the per-connection flow cap.
+    let conn2 = R2ConnState::new();
+    for local in 0..conn2.registry.cap() {
+        let target = TargetAddr::Ip(SocketAddr::from((
+            std::net::Ipv4Addr::new(203, 0, 113, 9),
+            local as u16,
+        )));
+        let binding = FlowBinding::new_shared(
+            r2::make_wire_id(local as u32 + 1, false).unwrap(),
+            999,
+            target,
+        );
+        assert!(
+            conn2.registry.insert(binding).is_ok(),
+            "pre-fill insert {local} must fit the cap"
+        );
+    }
+    assert_eq!(conn2.registry.len(), conn2.registry.cap());
+    let (ss2, _f2, _b2) = rev2_reply_fixture(
+        TargetAddr::Ip("203.0.113.99:9".parse().unwrap()),
+        Vec::new(),
+    );
+    let stage2 = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h2 = R2ReplyHarness::new(7, &ss2, server.clone(), stage2, Some(conn2.clone()))
+        .with_filter(ReplyFilter::FullCone);
+    assert!(matches!(
+        h2.reply(b"reg-full", peer),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(h2.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("the fallback must be rev2 DATA");
+    assert_eq!(data.id, None, "a full registry falls back to INLINE");
+    assert_eq!(data.sess, Some(7));
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(peer)));
+    assert!(data.payload == b"reg-full");
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
 }

@@ -24,6 +24,7 @@ pub(crate) fn spawn_udp_reporter() {
         let mut prev_w = udp_write::snapshot();
         let mut prev_r = udp_stats::reassembly_drops();
         let mut prev_d = dgram_drops::snapshot();
+        let mut prev_rev2 = counters::snapshot();
         loop {
             tick.tick().await;
             let now = udp_stats::snapshot();
@@ -86,6 +87,17 @@ pub(crate) fn spawn_udp_reporter() {
                 );
             }
             prev_d = now_d;
+            // MQP-3 rev2 small-packet path: one line only while it is active,
+            // so a deployment with no rev2 traffic keeps its old log shape.
+            // The counters separate "rev2 is being used" from "it fell back"
+            // (`inline`), which is the question the 3-byte-header work exists
+            // to answer.
+            let now_rev2 = counters::snapshot();
+            let dr = counters::since(&prev_rev2);
+            if !dr.is_idle() {
+                info!("mqp3 rev2 (60s): {dr}");
+                prev_rev2 = now_rev2;
+            }
             prev = now;
             prev_w = now_w;
         }

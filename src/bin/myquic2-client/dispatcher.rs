@@ -1,6 +1,9 @@
 //! Inbound DATAGRAM dispatcher.
 use super::*;
 use futures_util::future::FutureExt as _;
+use myquic2::mqp::r2::{self, R2Kind};
+use myquic2::mqp::r2_flow::FlowBinding;
+use myquic2::udp::{R2Assembled, R2Reassembler};
 
 /// Direct-mapped dispatcher cache, one slot per session id modulo the table
 /// size. A collision only means the slot is re-probed, never that a packet is
@@ -328,10 +331,11 @@ pub(crate) fn dispatch_stage_multi(
                 }
             }
             MQP3_FRAG => {
-                // Compact FRAG is decode-ready but not yet wired into the
-                // reassembler; the sender still uses MQP-2 fragments for large
-                // payloads. Count it rather than silently losing it if a peer
-                // enables the form early.
+                // Legacy (v0.2.0) compact FRAG is decode-ready but was never
+                // wired to a reassembler, and no rev2 peer emits it: large
+                // payloads now ride rev2 `FRAG` (handled in `dispatch_r2_frag`).
+                // Count it rather than silently losing it if an old peer sends
+                // the form.
                 dgram_drops::bump(&dgram_drops::REFUSED);
             }
             _ => {}
@@ -722,6 +726,443 @@ pub(crate) fn flush_staged(
     staged.clear();
 }
 
+// ---------------- MQP-3 wire rev2 downlink ----------------
+
+/// The SOCKS5 reply source of a bound flow: the learned reply source
+/// (`DATA OPEN|SRC` / a rebind) when present, else the exact IP target.
+///
+/// A domain flow that has not learned a source yet has nowhere to deliver: the
+/// requested name is not a valid SOCKS5 reply source, so the frame is dropped
+/// and counted instead of writing a domain where the app expects an address.
+fn r2_reply_dst(binding: &FlowBinding) -> Option<SocketAddr> {
+    binding.reply_src().or_else(|| binding.target.socket_addr())
+}
+
+/// Reply destination of a self-describing inline address.
+///
+/// The server always echoes IP-form sources; a domain here is hostile or a
+/// future peer, so only this thread's positive DNS cache may resolve it (same
+/// rule as the legacy inline path: no resolver task per item).
+fn r2_addr_dst(addr: TargetAddrRef<'_>) -> Option<SocketAddr> {
+    match addr {
+        TargetAddrRef::Ip(dst) => Some(dst),
+        TargetAddrRef::Domain(h, p) => match lookup_cached_fast(h, p) {
+            CachedLookup::Addr(dst) => Some(dst),
+            CachedLookup::Negative | CachedLookup::Unknown => None,
+        },
+    }
+}
+
+/// Resolve a session id to its live association entry, counting the same
+/// no-app / unknown-session cases as the legacy paths.
+fn r2_lookup(
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    sess: u32,
+) -> Option<(Arc<AssocEntry>, SocketAddr)> {
+    match lookup_entry(cache, hub, sess) {
+        Lookup::Hit(entry, app) => Some((entry, app)),
+        // `lookup_entry` already counted the unknown session.
+        Lookup::NoEntry => None,
+        Lookup::NoApp => {
+            udp_write::no_app();
+            None
+        }
+    }
+}
+
+/// Install a server-owned flow announced by a standalone `DATA OPEN`/`OPEN|SRC`.
+///
+/// rev2 wire ids are half-owned (`local << 1 | owner`): the server may open a
+/// flow for an unsolicited / full-cone reply (owner bit 1) that this endpoint
+/// has never seen. The OPEN is self-describing (`sess + addr`, `addr` being the
+/// actual reply source), so the binding can be created locally: the reply is
+/// staged now, and the app's later traffic to that source reuses the same id
+/// (`ensure_binding` finds it through [`FlowRegistry::find_server_flow`]).
+///
+/// Only a standalone OPEN can install — a steady frame or a `TRAIN` item carries
+/// no address, so there is no way to name the flow. A full or conflicting
+/// registry drops and counts the frame instead of evicting a live flow, and an
+/// unknown *client-owned* id is never installable (only owner bit 1 is).
+fn install_server_flow(
+    rev2: &ConnRev2,
+    id: u32,
+    sess: Option<u32>,
+    addr: Option<TargetAddrRef<'_>>,
+) -> Option<Arc<FlowBinding>> {
+    if !r2::wire_id_server_owned(id) {
+        return None;
+    }
+    let (Some(sess), Some(addr)) = (sess, addr) else {
+        return None;
+    };
+    let src = r2_addr_dst(addr)?;
+    let binding = FlowBinding::new_shared(id, sess, TargetAddr::Ip(src));
+    binding.set_reply_src(src);
+    binding.mark_open();
+    match rev2.registry.insert(binding) {
+        Ok(binding) => {
+            counters::server_flow_accept();
+            Some(binding)
+        }
+        Err(_) => {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            counters::rx_drop();
+            None
+        }
+    }
+}
+
+/// Handle one rev2 `CTL` frame.
+///
+/// Every opcode is idempotent and loss-tolerant by construction: a lost `CAPS`
+/// only delays readiness (the `HELLO` retry covers it), a lost `FLOW_ACK` only
+/// delays compression (the uplink keeps sending `OPEN`), and a lost
+/// `FLOW_CLOSE`/`SESS_CLOSE` is backstopped by the server's idle sweep.
+pub(crate) fn handle_r2_ctl(rev2: &ConnRev2, r2_reasm: &mut R2Reassembler, d: &[u8]) {
+    let Ok(ctl) = r2::decode_ctl(d) else {
+        counters::ctl_drop();
+        return;
+    };
+    match ctl {
+        r2::Ctl::Caps(caps) => rev2.on_caps(caps),
+        r2::Ctl::FlowAck { id, .. } => match rev2.registry.get(id) {
+            Some(binding) => {
+                binding.mark_open();
+                counters::flow_ack_rx();
+            }
+            None => counters::rx_unknown_id(),
+        },
+        r2::Ctl::FlowReject { id, .. } => {
+            let _ = r2_reasm.drop_flow(id);
+            match rev2.registry.remove(id) {
+                Some(binding) => {
+                    binding.mark_closed();
+                    // The uplink falls back to `INLINE` for this target until the
+                    // TTL expires (spec §3.4) instead of re-opening on every
+                    // payload; the binding's target is the key the uplink looks up.
+                    rev2.note_rejected(binding.target.clone(), mono_millis());
+                    counters::flow_reject_rx();
+                }
+                None => counters::rx_unknown_id(),
+            }
+        }
+        r2::Ctl::FlowClose { id } => {
+            let _ = r2_reasm.drop_flow(id);
+            let _ = rev2.stager.lock().drop_flow(id);
+            match rev2.registry.remove(id) {
+                Some(binding) => {
+                    binding.mark_closed();
+                    counters::flow_close_rx();
+                }
+                None => counters::rx_unknown_id(),
+            }
+        }
+        // The client keeps the association alive; the notification only makes
+        // the next uplink burst re-open its flows on the (re)created session.
+        // Bounded inside `ConnRev2`, so a hostile peer cannot grow it.
+        r2::Ctl::SessClose { sess, .. } => {
+            let _ = r2_reasm.drop_session(sess);
+            let _ = rev2.stager.lock().drop_session(sess);
+            // Both client-owned and accepted server-owned bindings of the
+            // closed session must go: a receive-only (server-owned) binding is
+            // otherwise never removed by the association's own uplink sync.
+            let _ = rev2.registry.remove_session(sess);
+            rev2.note_session_closed(sess);
+            counters::sess_close_rx();
+        }
+        // This endpoint originates `HELLO`; a HELLO from the server is not a
+        // rev2 flow-control event. Count and ignore.
+        r2::Ctl::Hello { .. } => counters::ctl_drop(),
+    }
+}
+
+/// One rev2 `DATA` frame: steady (`wire_id` only), `OPEN`/`OPEN|SRC`, or
+/// `INLINE` (session + address).
+fn dispatch_r2_data(
+    rev2: &ConnRev2,
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    d: &Bytes,
+    out: &mut Vec<StagedReply>,
+) -> usize {
+    let Ok(f) = r2::decode_data(d) else {
+        counters::rx_drop();
+        return 0;
+    };
+    let Some(id) = f.id else {
+        // INLINE: no flow bound, self-describing session + address. The
+        // sender's fail-safe when its table is full.
+        let (Some(sess), Some(addr)) = (f.sess, f.addr) else {
+            counters::rx_drop();
+            return 0;
+        };
+        let Some((entry, app)) = r2_lookup(cache, hub, sess) else {
+            return 0;
+        };
+        let Some(dst) = r2_addr_dst(addr) else {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            counters::rx_drop();
+            return 0;
+        };
+        let payload = d.slice_ref(f.payload);
+        udp_stats::payload(payload.len());
+        counters::rx_frame();
+        out.push(stage_reply(&entry, app, dst, payload));
+        return 1;
+    };
+    counters::rx_frame();
+    let binding = match rev2.registry.get(id) {
+        Some(binding) => binding,
+        None => {
+            // Unknown id: only a server-owned standalone OPEN can install a
+            // flow (full-cone / unsolicited reply). An unknown client-owned id
+            // or an address-less steady frame is still a drop — never guess.
+            match install_server_flow(rev2, id, f.sess, f.addr) {
+                Some(binding) => binding,
+                None => {
+                    counters::rx_unknown_id();
+                    return 0;
+                }
+            }
+        }
+    };
+    // An extended frame carries the session as a cross-check: ids are
+    // connection-scoped, so a mismatch names the wrong association and is
+    // dropped instead of delivered.
+    if f.sess.is_some_and(|s| s != binding.session) {
+        counters::rx_drop();
+        return 0;
+    }
+    // `OPEN|SRC` is how the server teaches the client the actual reply source
+    // (domain flow binding, port change, anycast): record it for the SOCKS5
+    // reply header, exactly like the shipped inline path.
+    if f.src
+        && let Some(src) = f.addr
+        && let Some(src) = r2_addr_dst(src)
+    {
+        binding.set_reply_src(src);
+    }
+    // Any compressed downlink proves the server installed this id: that is the
+    // implicit ACK the uplink waits for (a pure-uplink flow otherwise relies on
+    // `CTL FLOW_ACK`).
+    binding.mark_open();
+    let Some(dst) = r2_reply_dst(&binding) else {
+        dgram_drops::bump(&dgram_drops::REFUSED);
+        counters::rx_drop();
+        return 0;
+    };
+    let Some((entry, app)) = r2_lookup(cache, hub, binding.session) else {
+        return 0;
+    };
+    let payload = d.slice_ref(f.payload);
+    udp_stats::payload(payload.len());
+    out.push(stage_reply(&entry, app, dst, payload));
+    1
+}
+
+/// One rev2 `TRAIN` frame: a same-flow or dict run of already-open flows.
+///
+/// Items that name an uninstalled id are dropped individually (counted), never
+/// mapped to a guessed session: the codec has already validated the frame
+/// shape and item bounds, so the loop cannot read past the datagram.
+fn dispatch_r2_train(
+    rev2: &ConnRev2,
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    d: &Bytes,
+    out: &mut Vec<StagedReply>,
+) -> usize {
+    let Ok(t) = r2::decode_train(d) else {
+        counters::rx_drop();
+        return 0;
+    };
+    let mut staged = 0usize;
+    for (id, payload) in t.items() {
+        let Some(binding) = rev2.registry.get(id) else {
+            // TRAIN items never install a flow: a run carries no address, so an
+            // uninstalled id is a stale frame (counted), never a new binding.
+            counters::rx_unknown_id();
+            continue;
+        };
+        binding.mark_open();
+        let Some(dst) = r2_reply_dst(&binding) else {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+            counters::rx_drop();
+            continue;
+        };
+        let Some((entry, app)) = r2_lookup(cache, hub, binding.session) else {
+            continue;
+        };
+        udp_stats::payload(payload.len());
+        counters::rx_frame();
+        out.push(stage_reply(&entry, app, dst, d.slice_ref(payload)));
+        staged += 1;
+    }
+    staged
+}
+
+/// One rev2 `FRAG` frame: feed it to the per-connection reassembler and stage
+/// the completed payload exactly like a `DATA` frame of the same shape.
+///
+/// The reassembler owns every bound (8 KiB payload, 256 partials, 256 KiB held,
+/// 2 s timeout), so a peer that sends one fragment and stops cannot pin memory
+/// here — the dispatcher's existing reassembly tick expires it.
+fn dispatch_r2_frag(
+    rev2: &ConnRev2,
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    r2_reasm: &mut R2Reassembler,
+    d: &Bytes,
+    out: &mut Vec<StagedReply>,
+) -> usize {
+    let Ok(f) = r2::decode_frag(d) else {
+        counters::rx_drop();
+        return 0;
+    };
+    counters::frag_rx();
+    let Some(a) = r2_reasm.push(&f, coarse_millis()) else {
+        // Partial (or a refused/duplicate fragment): nothing to deliver yet.
+        return 0;
+    };
+    counters::frag_complete();
+    let R2Assembled {
+        wire_id,
+        sess,
+        addr,
+        src,
+        payload,
+    } = a;
+    let (sess, dst) = match wire_id {
+        Some(id) => {
+            let binding = match rev2.registry.get(id) {
+                Some(binding) => binding,
+                None => {
+                    // A fragmented server-owned OPEN|SRC is self-describing
+                    // through its first fragment, so it installs like the
+                    // single-frame form; a steady fragment set (no address)
+                    // or an unknown client-owned id is still a drop.
+                    match install_server_flow(rev2, id, sess, addr.as_ref().map(TargetAddr::as_ref))
+                    {
+                        Some(binding) => binding,
+                        None => {
+                            counters::rx_unknown_id();
+                            return 0;
+                        }
+                    }
+                }
+            };
+            // Ids are connection-scoped; an inline context carrying another
+            // session would name the wrong association.
+            if sess.is_some_and(|s| s != binding.session) {
+                counters::rx_drop();
+                return 0;
+            }
+            // A compressed downlink for this id is the implicit ACK.
+            binding.mark_open();
+            let src_dst = if src {
+                addr.as_ref().and_then(|a| r2_addr_dst(a.as_ref()))
+            } else {
+                None
+            };
+            if let Some(src_addr) = src_dst {
+                // `OPEN|SRC` (or a rebind) teaches the actual reply source.
+                binding.set_reply_src(src_addr);
+            }
+            let Some(dst) = src_dst.or_else(|| r2_reply_dst(&binding)) else {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                counters::rx_drop();
+                return 0;
+            };
+            (binding.session, dst)
+        }
+        None => {
+            // The self-describing `INLINE` fail-safe: session + address on
+            // every fragment (the reassembler already refused a partial whose
+            // context disagreed).
+            let (Some(sess), Some(addr)) = (sess, addr) else {
+                counters::rx_drop();
+                return 0;
+            };
+            let Some(dst) = r2_addr_dst(addr.as_ref()) else {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                counters::rx_drop();
+                return 0;
+            };
+            (sess, dst)
+        }
+    };
+    let Some((entry, app)) = r2_lookup(cache, hub, sess) else {
+        return 0;
+    };
+    // One booking for the whole reassembled payload, exactly like one `DATA`
+    // frame (the fragment frames themselves are not payloads).
+    udp_stats::payload(payload.len());
+    counters::rx_frame();
+    out.push(stage_reply(&entry, app, dst, payload));
+    1
+}
+
+/// Decode and route one inbound MQP-3 rev2 datagram.
+///
+/// Returns the number of replies staged. Rev2 is dispatched *before* the
+/// legacy v3/MQP-2 paths (which the caller selects by first byte): the two
+/// wire generations intentionally share a connection during staging, and the
+/// safe first-byte ranges (`0x0X` vs `0x1X..`) keep them disjoint.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_r2(
+    rev2: &ConnRev2,
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    r2_reasm: &mut R2Reassembler,
+    d: Bytes,
+    out: &mut Vec<StagedReply>,
+) -> usize {
+    match r2::kind(&d) {
+        Some(R2Kind::Ctl) => {
+            handle_r2_ctl(rev2, r2_reasm, &d);
+            0
+        }
+        Some(R2Kind::Data) => dispatch_r2_data(rev2, cache, hub, &d, out),
+        Some(R2Kind::Train) => dispatch_r2_train(rev2, cache, hub, &d, out),
+        // Rev2 FRAG is reassembled here and never routed into the legacy
+        // MQP-2 fragment path (the first-byte dispatch keeps them disjoint).
+        Some(R2Kind::Frag) => dispatch_r2_frag(rev2, cache, hub, r2_reasm, &d, out),
+        None => 0,
+    }
+}
+
+/// Route one inbound DATAGRAM: rev2 first (first byte `0x0X`), then the
+/// legacy MQP-3/MQP-2/BATCH paths keyed by session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_inbound(
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    rev2: &ConnRev2,
+    d: Bytes,
+    reasm: &mut DgramReassembler,
+    r2_reasm: &mut R2Reassembler,
+    out: &mut Vec<StagedReply>,
+) {
+    if r2::is_r2(&d) {
+        dispatch_r2(rev2, cache, hub, r2_reasm, d, out);
+        return;
+    }
+    let sess_of = |d: &Bytes| {
+        dgram_sess(d)
+            .or_else(|| batch_sess(d))
+            .or_else(|| v3_sess(d))
+    };
+    match sess_of(&d) {
+        Some(sess) => {
+            dispatch_stage_multi(cache, hub, sess, d, reasm, out);
+        }
+        None => {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+        }
+    }
+}
+
 pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
     tokio::spawn(async move {
         let mut gen_rx = slot.gen_rx.clone();
@@ -736,6 +1177,18 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
+            // MQP-3 rev2 state of this generation. The reconnect loop
+            // publishes it before the connection (and before the generation
+            // bump), so it is normally present here; if a death/redial raced
+            // the wakeup, wait for the next event instead of spinning on a
+            // live-but-state-less generation.
+            let Some(rev2) = slot.rev2() else {
+                tokio::select! {
+                    _ = gen_rx.changed() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                continue;
+            };
             let reader = conn.read_datagram();
             tokio::pin!(reader);
             let mut cache: [DispatchSlot; DISPATCH_CACHE] = std::array::from_fn(|_| DispatchSlot {
@@ -749,6 +1202,11 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             // keeps its own, which is correct because a payload's fragments all
             // travel on the connection that carried them.
             let mut reasm = DgramReassembler::new();
+            // The rev2 reassembler, one per connection like the legacy one:
+            // its key is connection-scoped (`wire_id`/`INLINE`+session), so a
+            // per-association copy would only duplicate state and the same
+            // payload's frames all travel on this connection.
+            let mut r2_reasm = R2Reassembler::new();
             // `push` only runs when a fragment arrives, so a peer that sends
             // fragments and then goes quiet would pin its partials for the
             // connection's lifetime; this tick is what makes `FRAG_TIMEOUT_MS` a
@@ -782,21 +1240,16 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         // replies; a drained connection error breaks out after
                         // flushing what was staged.
                         let mut drained = 1usize;
-                        let sess_of =
-                            |d: &Bytes| dgram_sess(d).or_else(|| batch_sess(d)).or_else(|| v3_sess(d));
-                        if let Some(sess) = sess_of(&head) {
-                            if staged.len() < LAST_HOP_DRAIN * 2 {
-                                dispatch_stage_multi(
-                                    &mut cache,
-                                    &hub,
-                                    sess,
-                                    head,
-                                    &mut reasm,
-                                    &mut staged,
-                                );
-                            }
-                        } else {
-                            dgram_drops::bump(&dgram_drops::REFUSED);
+                        if staged.len() < LAST_HOP_DRAIN * 2 {
+                            dispatch_inbound(
+                                &mut cache,
+                                &hub,
+                                &rev2,
+                                head,
+                                &mut reasm,
+                                &mut r2_reasm,
+                                &mut staged,
+                            );
                         }
                         for _ in 1..LAST_HOP_DRAIN {
                             if staged.len() >= LAST_HOP_DRAIN * 2 {
@@ -805,18 +1258,15 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                             match reader.as_mut().now_or_never() {
                                 Some(Ok(d)) => {
                                     drained += 1;
-                                    if let Some(sess) = sess_of(&d) {
-                                        dispatch_stage_multi(
-                                            &mut cache,
-                                            &hub,
-                                            sess,
-                                            d,
-                                            &mut reasm,
-                                            &mut staged,
-                                        );
-                                    } else {
-                                        dgram_drops::bump(&dgram_drops::REFUSED);
-                                    }
+                                    dispatch_inbound(
+                                        &mut cache,
+                                        &hub,
+                                        &rev2,
+                                        d,
+                                        &mut reasm,
+                                        &mut r2_reasm,
+                                        &mut staged,
+                                    );
                                 }
                                 Some(Err(_)) => { reader_failed = true; break; }
                                 None => break,
@@ -844,7 +1294,11 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         }
                     }
                     _ = gen_rx.changed() => break,
-                    _ = reasm_tick.tick() => { reasm.expire(coarse_millis()); }
+                    _ = reasm_tick.tick() => {
+                        let now = coarse_millis();
+                        reasm.expire(now);
+                        r2_reasm.expire(now);
+                    }
                 }
             }
             if reader_failed {

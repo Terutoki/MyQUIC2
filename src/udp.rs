@@ -1,5 +1,8 @@
 pub mod batch;
 pub mod fragmenter;
+pub mod r2_frag;
+pub mod r2_reasm;
+pub mod r2_stage;
 pub mod reassembler;
 pub mod retry;
 pub mod send;
@@ -12,6 +15,9 @@ pub use batch::{LAST_HOP_DRAIN, record_drain_batch, record_extra_syscalls, recor
 
 pub use fragmenter::DgramFragmenter;
 pub(crate) use fragmenter::frag_id_reuse_blocked;
+pub use r2_frag::{R2FragFlow, R2Fragmenter};
+pub use r2_reasm::{R2Assembled, R2Reassembler};
+pub use r2_stage::{R2DrainOutcome, R2StageItem, R2StageKind, R2Stager};
 pub use reassembler::DgramReassembler;
 pub(crate) use reassembler::Partial;
 pub(crate) use reassembler::tombstone_bytes;

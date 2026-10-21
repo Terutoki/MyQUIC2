@@ -5,10 +5,28 @@
 //! exist to catch a framing regression in any future rewrite.
 use super::*;
 
+use myquic2::mqp::r2;
+use myquic2::mqp::r2_flow::{FlowBinding, FlowState, R2_MAX_FLOWS_PER_CONN};
+use myquic2::udp::{R2Assembled, R2Fragmenter, R2Reassembler, R2StageItem, R2StageKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Serve `bytes` on a loopback socket and run the real reader against it,
 /// exactly as `handle_socks` drives it.
+/// Ready-to-use MQP-3 rev2 connection state for the wire tests: `CAPS`
+/// negotiated (`wire_ver=2`), empty flow registry, client-owned id allocator.
+fn rev2_state() -> Arc<ConnRev2> {
+    let r = ConnRev2::new();
+    r.on_caps(r2::Caps::default());
+    r
+}
+
+/// Phase 2: small payloads queue in the connection-scoped stager and a drain
+/// (the association's burst end) writes them. Tests that call `send_uplink`
+/// directly drive that drain explicitly.
+fn drain_now(rev2: &ConnRev2, conn: &quinn::Connection, limit: usize) {
+    let _ = rev2.drain_stage(conn, limit);
+}
+
 async fn feed(bytes: &[u8], lenient: bool) -> Result<TargetAddr> {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -1221,10 +1239,11 @@ async fn egress_bindings_do_not_share_cached_handles() {
         limit: 1200,
         stamp_ms: now,
         slot: pool.udp_global_slot(ib.index),
+        rev2: rev2_state(),
     })));
     // The interactive binding serves its live handle ...
     let got = e.acquire(&pool, ib, now).expect("interactive handle");
-    assert_eq!(got.0.stable_id(), conn.stable_id());
+    assert_eq!(got.conn.stable_id(), conn.stable_id());
     // ... while a fail-closed bulk binding, whose own slot has no connection,
     // gets nothing — never the interactive handle, and never a sibling
     // shard's cache either.
@@ -1263,6 +1282,7 @@ async fn expired_dead_handle_is_invalidated_not_served() {
         limit: 1200,
         stamp_ms: now,
         slot: pool.udp_global_slot(class.index),
+        rev2: rev2_state(),
     })));
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     // Hold the single-flight gate: `refresh_global` returns None, so
@@ -1273,7 +1293,7 @@ async fn expired_dead_handle_is_invalidated_not_served() {
     let got = e
         .acquire(&pool, class, expired_now)
         .expect("a live expired handle must still be served");
-    assert_eq!(got.0.stable_id(), conn.stable_id());
+    assert_eq!(got.conn.stable_id(), conn.stable_id());
     assert!(e.cached[class.index].load().is_some());
 
     // Dead expired handle: dropped, cache invalidated (generation bumped
@@ -1454,160 +1474,332 @@ async fn client_n_pack_flushes_one_ordered_batch_frame() {
     server_conn.close(0u32.into(), b"done");
 }
 
-/// MQP-3 open/compress: the first frame for a flow carries its address; the
-/// next frame for the same flow is a 5-byte `SINGLE` (flow 0 is implicit).
+/// MQP-3 rev2 uplink state machine over a real QUIC connection: an unknown
+/// target's first payload is `DATA OPEN` (session + address), every payload
+/// before the ack repeats the OPEN (idempotent server-side), and after the ack
+/// a payload is a 2-byte-header steady `DATA` while several queued payloads of
+/// the open flow become one `TRAIN` on the connection-scoped stager.
 #[tokio::test]
-async fn client_v3_open_then_compressed_single() {
+async fn client_rev2_open_until_ack_then_steady_and_train() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
         class: EgressClass::Interactive,
         index: 0,
     };
-    let body = &b"open-reply"[..];
     let limit = client_conn.max_datagram_size().unwrap();
-    let mut frag = DgramFragmenter::new();
-    let mut table = FlowTable::default();
-    assert_eq!(table.insert(addr.clone()).unwrap().0, 0);
+    let send = |body: &[u8], up: &mut UplinkFlows, frag: &mut R2Fragmenter| {
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            body,
+            bind,
+            &rev2,
+            up,
+            frag,
+        )
+    };
 
-    let mut arena = body.to_vec();
-    let mut open = PendingTrain::new(bind);
-    open.push(
-        PendingItem {
-            flow: 0,
-            open: true,
-            off: 0,
-            len: body.len(),
-            open_addr: None,
-        },
-        train_item_len(0, 7, body.len()),
-    );
-    assert!(
-        flush_pending_train(&client_conn, 7, &mut frag, &table, &open, &mut arena, limit)
-            .complete()
-    );
-    assert!(arena.is_empty(), "a flush must recycle the staging arena");
+    // (1) First payload: standalone OPEN with session + address. The stager
+    // only queues it; the drain (the association's burst end in production)
+    // writes it.
+    assert!(send(b"one", &mut up, &mut frag).complete());
+    drain_now(&rev2, &client_conn, limit);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the open frame must arrive")
         .unwrap();
-    let s = decode_single(&d).expect("the first frame must be a v3 SINGLE");
-    assert_eq!(s.sess, 7);
-    assert_eq!(s.flow, 0);
-    assert_eq!(s.inline, Some(addr.as_ref()));
-    assert_eq!(s.payload, body);
+    let f = r2::decode_data(&d).expect("the first frame must be rev2 DATA");
+    let id = f.id.expect("an unbound target opens a flow");
+    assert!(!r2::wire_id_server_owned(id), "the client owns the id");
+    assert_eq!(f.sess, Some(7));
+    assert_eq!(f.addr, Some(addr.as_ref()));
+    assert_eq!(f.payload, b"one");
+    assert!(!f.src, "an uplink OPEN names the destination, not a source");
+    let binding = rev2.registry.get(id).expect("the flow is in the registry");
+    assert_eq!(binding.state(), FlowState::Opening);
 
-    let mut arena = body.to_vec();
-    let mut compressed = PendingTrain::new(bind);
-    compressed.push(
-        PendingItem {
-            flow: 0,
-            open: false,
-            off: 0,
-            len: body.len(),
-            open_addr: None,
-        },
-        train_item_len(0, 0, body.len()),
-    );
-    assert!(
-        flush_pending_train(
-            &client_conn,
-            7,
-            &mut frag,
-            &table,
-            &compressed,
-            &mut arena,
-            limit,
-        )
-        .complete()
-    );
+    // (2) Still Opening: the next payload repeats OPEN (a lost open/ack must
+    // only delay compression, never delivery).
+    assert!(send(b"two", &mut up, &mut frag).complete());
+    drain_now(&rev2, &client_conn, limit);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
-        .expect("the compressed frame must arrive")
+        .expect("the repeated open must arrive")
         .unwrap();
-    let s = decode_single(&d).expect("the steady frame must be a compressed SINGLE");
-    assert_eq!(s.flow, 0);
-    assert_eq!(s.inline, None, "flow 0 must cost 5 bytes, not an address");
-    assert_eq!(d.len(), 5 + body.len());
-    assert_eq!(s.payload, body);
+    let f = r2::decode_data(&d).expect("the repeat must be rev2 DATA");
+    assert_eq!(f.id, Some(id));
+    assert_eq!(f.sess, Some(7));
+    assert_eq!(f.addr, Some(addr.as_ref()));
+    assert_eq!(f.payload, b"two");
+
+    // (3) ACK observed (`FLOW_ACK` or any compressed downlink): steady DATA
+    // with only the wire id, a 2-byte header for ids below 64.
+    binding.mark_open();
+    assert!(send(b"three", &mut up, &mut frag).complete());
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the steady frame must arrive")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("the committed frame must be rev2 DATA");
+    assert_eq!(f.id, Some(id));
+    assert_eq!(f.sess, None, "steady frames carry no session");
+    assert_eq!(f.addr, None, "steady frames carry no address");
+    assert_eq!(f.payload, b"three");
+    assert_eq!(
+        d.len(),
+        1 + r2::varint_len(id) + b"three".len(),
+        "a confirmed flow costs only the id"
+    );
+
+    // (4) Two queued payloads of the same open flow are packed into one TRAIN
+    // by the connection stager (dict form: a cross-session train may carry
+    // several wire ids).
+    assert!(send(b"aaaa", &mut up, &mut frag).complete());
+    assert!(send(b"bb", &mut up, &mut frag).complete());
+    assert_eq!(rev2.stage_len(), 2, "both payloads wait for the drain");
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the train frame must arrive")
+        .unwrap();
+    let t = r2::decode_train(&d).expect("the frame must be a rev2 TRAIN");
+    assert_eq!(t.form, r2::R2_TRAIN_FORM_DICT);
+    assert_eq!(t.count, 2);
+    let items: Vec<(u32, &[u8])> = t.items().collect();
+    assert_eq!(items, vec![(id, &b"aaaa"[..]), (id, &b"bb"[..])]);
+    assert_eq!(rev2.stage_len(), 0, "a drain empties the queue");
 
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
 }
 
-/// One TRAIN can carry payloads for different flows (different destinations);
-/// the receiver gets them in staging order.
+/// A domain target uses the same rev2 small-packet path: `DATA OPEN` carries
+/// `TargetAddr::Domain`, the server resolves and ACKs, and the next frame is a
+/// compressed steady `DATA` (the SOCKS5 reply source is learned from the
+/// downlink `OPEN|SRC`, see the dispatcher tests).
 #[tokio::test]
-async fn client_v3_train_mixes_flows() {
+async fn client_rev2_domain_flow_opens_with_domain_addr() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
-    let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
-    let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Domain("example.com".to_string(), 53);
     let bind = UdpBind {
         class: EgressClass::Interactive,
         index: 0,
     };
-    let mut table = FlowTable::default();
-    assert_eq!(table.insert(a).unwrap().0, 0);
-    assert_eq!(table.insert(b).unwrap().0, 1);
-    let body_a = &b"aaaa"[..];
-    let body_b = &b"bbbbbb"[..];
-    let mut arena = Vec::new();
-    let off_a = arena.len();
-    arena.extend_from_slice(body_a);
-    let off_b = arena.len();
-    arena.extend_from_slice(body_b);
-    let mut train = PendingTrain::new(bind);
-    train.push(
-        PendingItem {
-            flow: 0,
-            open: false,
-            off: off_a,
-            len: body_a.len(),
-            open_addr: None,
-        },
-        train_item_len(0, 0, body_a.len()),
-    );
-    train.push(
-        PendingItem {
-            flow: 1,
-            open: false,
-            off: off_b,
-            len: body_b.len(),
-            open_addr: None,
-        },
-        train_item_len(1, 0, body_b.len()),
-    );
     let limit = client_conn.max_datagram_size().unwrap();
-    let mut frag = DgramFragmenter::new();
     assert!(
-        flush_pending_train(
+        send_uplink(
             &client_conn,
-            9,
+            limit,
+            11,
+            &addr.as_ref(),
+            b"query",
+            bind,
+            &rev2,
+            &mut up,
             &mut frag,
-            &table,
-            &train,
-            &mut arena,
-            limit
         )
         .complete()
     );
+    drain_now(&rev2, &client_conn, limit);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
-        .expect("the train must arrive")
+        .expect("the domain open must arrive")
         .unwrap();
-    let t = decode_train(&d).expect("the frame must be a v3 TRAIN");
-    assert_eq!(t.sess, 9);
-    let items: Vec<_> = t.items().collect();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].flow, 0);
-    assert_eq!(items[0].payload, body_a);
-    assert_eq!(items[0].inline, None);
-    assert_eq!(items[1].flow, 1);
-    assert_eq!(items[1].payload, body_b);
-    assert_eq!(items[1].inline, None);
+    let f = r2::decode_data(&d).expect("the frame must be rev2 DATA");
+    let id = f.id.expect("a domain target opens a flow");
+    assert_eq!(f.sess, Some(11));
+    assert_eq!(f.addr, Some(TargetAddrRef::Domain("example.com", 53)));
+
+    rev2.registry.get(id).unwrap().mark_open();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            11,
+            &addr.as_ref(),
+            b"query2",
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the compressed domain frame must arrive")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("the steady frame must be rev2 DATA");
+    assert_eq!(f.id, Some(id));
+    assert_eq!(
+        f.addr, None,
+        "a resolved domain flow compresses like an IP one"
+    );
+    assert_eq!(f.payload, b"query2");
 
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
+}
+
+/// Registry full ⇒ `DATA INLINE` (session + address), the fail-safe that never
+/// blocks the association; nothing half-bound is left in the session table.
+#[tokio::test]
+async fn client_rev2_inline_fallback_when_registry_full() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let filler = TargetAddr::Ip("192.0.2.1:1".parse().unwrap());
+    for i in 1..=R2_MAX_FLOWS_PER_CONN as u32 {
+        let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 1, filler.clone());
+        assert!(rev2.registry.insert(b).is_ok());
+    }
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            b"inline",
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    assert!(
+        up.flows.is_empty(),
+        "the fallback must not half-bind a flow"
+    );
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the inline frame must arrive")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("the fallback frame must be rev2 DATA");
+    assert_eq!(f.id, None, "INLINE carries no wire id");
+    assert_eq!(f.sess, Some(7));
+    assert_eq!(f.addr, Some(addr.as_ref()));
+    assert_eq!(f.payload, b"inline");
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// `CTL HELLO` immediately after the connection, retried until the server's
+/// `CAPS`; only then does the connection become usable for rev2 udp.
+#[tokio::test]
+async fn rev2_handshake_negotiates_caps() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = Arc::new(ConnRev2::new());
+    assert!(!state.is_ready());
+    // The production dispatcher is what receives `CAPS`; drive the same
+    // `handle_r2_ctl` path from a reader task here.
+    let client_for_reader = client_conn.clone();
+    let reader_state = state.clone();
+    let reader = tokio::spawn(async move {
+        while !reader_state.is_ready() {
+            let Ok(d) = client_for_reader.read_datagram().await else {
+                return;
+            };
+            if r2::kind(&d) == Some(r2::R2Kind::Ctl) {
+                handle_r2_ctl(&reader_state, &mut myquic2::udp::R2Reassembler::new(), &d);
+            }
+        }
+    });
+    let server = tokio::spawn(async move {
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("the client must send HELLO")
+            .unwrap();
+        match r2::decode_ctl(&d).expect("HELLO must decode") {
+            r2::Ctl::Hello { wire_ver, .. } => {
+                assert_eq!(wire_ver, r2::R2_WIRE_VER, "HELLO advertises wire_ver=2");
+            }
+            other => panic!("first CTL must be HELLO, got {other:?}"),
+        }
+        server_conn
+            .send_datagram(r2::encode_ctl(&r2::Ctl::Caps(r2::Caps::default())))
+            .expect("CAPS must be sendable");
+        server_conn
+    });
+    assert!(rev2::handshake(&client_conn, &state).await);
+    assert!(state.is_ready());
+    assert_eq!(
+        state.ctl.caps().map(|c| c.max_frame_bytes),
+        Some(r2::R2_DEFAULT_MAX_FRAME_BYTES),
+        "CAPS limits are stored on the connection state"
+    );
+    reader.abort();
+    let server_conn = server.await.unwrap();
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A `CAPS` with another wire version is a definitive mismatch: fail fast
+/// instead of waiting out the timeout. There is no silent old-wire fallback.
+#[tokio::test]
+async fn rev2_handshake_fails_fast_on_wire_version_mismatch() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = ConnRev2::new();
+    let server = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("the client must send HELLO")
+            .unwrap();
+        server_conn
+            .send_datagram(r2::encode_ctl(&r2::Ctl::Caps(r2::Caps {
+                wire_ver: 9,
+                ..r2::Caps::default()
+            })))
+            .expect("CAPS must be sendable");
+        server_conn
+    });
+    assert!(
+        !rev2::handshake(&client_conn, &state).await,
+        "a version mismatch must fail the handshake"
+    );
+    assert!(!state.is_ready());
+    let server_conn = server.await.unwrap();
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// No `CAPS` at all (an old server silently drops HELLO) must also fail the
+/// handshake so the reconnect loop redials.
+#[tokio::test]
+async fn rev2_handshake_times_out_without_caps() {
+    let (client_conn, _server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = ConnRev2::new();
+    assert!(
+        !rev2::handshake_with(
+            &client_conn,
+            &state,
+            Duration::from_millis(60),
+            Duration::from_millis(10)
+        )
+        .await
+    );
+    assert!(!state.is_ready());
+    client_conn.close(0u32.into(), b"done");
 }
 
 /// byte-identical to what `encode_reply` produces in one buffer.
@@ -1779,36 +1971,37 @@ async fn egress_memo_honours_generation_and_freshness() {
         limit: 1200,
         stamp_ms: now,
         slot: 0,
+        rev2: rev2_state(),
     })));
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     let generation = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, generation, &conn, 1200, now);
-    assert_eq!(e.with_fresh(class, now, |_, limit| limit), Some(1200));
+    e.memo_store(class, generation, &conn, 1200, now, &rev2_state());
+    assert_eq!(e.with_fresh(class, now, |_, limit, _| limit), Some(1200));
     assert!(
-        e.with_fresh(bulk, now, |_, _| ()).is_none(),
+        e.with_fresh(bulk, now, |_, _, _| ()).is_none(),
         "a memo stored for one class must not serve the other"
     );
     assert!(
-        e.with_fresh(sibling, now, |_, _| ()).is_none(),
+        e.with_fresh(sibling, now, |_, _, _| ()).is_none(),
         "a memo stored for one bulk shard must not serve a sibling shard"
     );
     assert!(
-        e.with_fresh(class, now + EGRESS_REFRESH_MS, |_, _| ())
+        e.with_fresh(class, now + EGRESS_REFRESH_MS, |_, _, _| ())
             .is_none(),
         "a stamp past the refresh window must miss"
     );
     e.invalidate(class);
     assert!(
-        e.with_fresh(class, now, |_, _| ()).is_none(),
+        e.with_fresh(class, now, |_, _, _| ()).is_none(),
         "a successful invalidate bumps the generation and drops the memo"
     );
     // A memo tagged before a later bump is not served even while its stamp
     // is still inside the window.
     let old_gen = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, old_gen, &conn, 1200, now);
-    assert!(e.with_fresh(class, now, |_, _| ()).is_some());
+    e.memo_store(class, old_gen, &conn, 1200, now, &rev2_state());
+    assert!(e.with_fresh(class, now, |_, _, _| ()).is_some());
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
-    assert!(e.with_fresh(class, now, |_, _| ()).is_none());
+    assert!(e.with_fresh(class, now, |_, _, _| ()).is_none());
 }
 
 /// A memo hit serves the handle whatever the connection's state: liveness is
@@ -1837,12 +2030,13 @@ async fn memo_hit_serves_a_dead_handle_and_the_send_reports_it() {
         limit: 1200,
         stamp_ms: now,
         slot: 0,
+        rev2: rev2_state(),
     })));
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     let generation = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, generation, &conn, 1200, now);
+    e.memo_store(class, generation, &conn, 1200, now, &rev2_state());
     assert_eq!(
-        e.with_fresh(class, now, |_, limit| limit),
+        e.with_fresh(class, now, |_, limit, _| limit),
         Some(1200),
         "a fresh memo hit must be served without a quinn lock"
     );
@@ -1855,7 +2049,7 @@ async fn memo_hit_serves_a_dead_handle_and_the_send_reports_it() {
         "the test's closed handle must probe dead"
     );
     assert!(
-        e.with_fresh(class, now, |_, limit| limit).is_some(),
+        e.with_fresh(class, now, |_, limit, _| limit).is_some(),
         "liveness is the send's verdict: the memo must not take a per-frame \
          quinn lock to re-check it"
     );
@@ -1867,7 +2061,7 @@ async fn memo_hit_serves_a_dead_handle_and_the_send_reports_it() {
     // ... and the caller's `ConnectionLost` arm invalidates, so the next
     // datagram on every thread re-acquires instead of reusing the handle.
     e.invalidate(class);
-    assert!(e.with_fresh(class, now, |_, _| ()).is_none());
+    assert!(e.with_fresh(class, now, |_, _, _| ()).is_none());
 }
 
 /// A `TooLarge` send refreshes the cached DATAGRAM budget instead of
@@ -1897,6 +2091,7 @@ async fn too_large_refreshes_the_budget_without_discarding_the_handle() {
         limit: live.saturating_sub(64).max(1),
         stamp_ms: mono_millis(),
         slot: 0,
+        rev2: rev2_state(),
     })));
     let gen_before = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
     let cached_before = e.cached[class.index].load_full().expect("published above");
@@ -1974,12 +2169,13 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
         limit: live,
         stamp_ms: now,
         slot: 0,
+        rev2: rev2_state(),
     })));
     e.generation[class.index].fetch_add(1, Ordering::Release);
     let generation = e.generation[class.index].load(Ordering::Acquire);
-    e.memo_store(class, generation, &conn, live, now);
+    e.memo_store(class, generation, &conn, live, now, &rev2_state());
     for _ in 0..16 {
-        assert_eq!(e.with_fresh(class, now, |_, limit| limit), Some(live));
+        assert_eq!(e.with_fresh(class, now, |_, limit, _| limit), Some(live));
     }
     assert_eq!(
         e.generation[class.index].load(Ordering::Acquire),
@@ -2000,6 +2196,7 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
         limit: live.saturating_sub(64).max(1),
         stamp_ms: now,
         slot: 0,
+        rev2: rev2_state(),
     })));
     e.generation[class.index].fetch_add(1, Ordering::Release);
     let gen_before = e.generation[class.index].load(Ordering::Acquire);
@@ -2026,6 +2223,7 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
         limit: live.saturating_sub(64).max(1),
         stamp_ms: now,
         slot: 0,
+        rev2: rev2_state(),
     })));
     let gen_storm = e.generation[class.index].load(Ordering::Acquire);
     for _ in 0..64 {
@@ -2054,7 +2252,7 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
     // handle — no invalidate, no re-acquire. Model that arm (doing nothing)
     // and assert the steady path is undisturbed.
     let gen_unsupported = e.generation[class.index].load(Ordering::Acquire);
-    e.memo_store(class, gen_unsupported, &conn, live, now);
+    e.memo_store(class, gen_unsupported, &conn, live, now, &rev2_state());
     // ... production `Unsupported` arm runs here: bump EGRESS_DEAD only ...
     assert_eq!(
         e.generation[class.index].load(Ordering::Acquire),
@@ -2063,7 +2261,7 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
          takes per datagram without finding a better slot"
     );
     assert!(
-        e.with_fresh(class, now, |_, _| ()).is_some(),
+        e.with_fresh(class, now, |_, _, _| ()).is_some(),
         "the memo stays servable across Unsupported verdicts"
     );
 }
@@ -2599,12 +2797,14 @@ async fn egress_stays_on_its_connection_while_it_lives() {
         limit: 1200,
         stamp_ms: now.saturating_sub(EGRESS_REFRESH_MS),
         slot: pool.udp_global_slot(class.index),
+        rev2: rev2_state(),
     })));
-    let (got, limit, stamp) = e
+    let got = e
         .refresh_global(&pool, class, now)
         .expect("a live cached connection must be reused, not re-picked");
+    let (limit, stamp) = (got.limit, got.stamp_ms);
     assert_eq!(
-        got.stable_id(),
+        got.conn.stable_id(),
         conn.stable_id(),
         "the cached connection must survive the refresh"
     );
@@ -3993,6 +4193,7 @@ async fn send_verdict_recovery_is_counted_once_and_shared() {
         limit: 1200,
         stamp_ms: coarse_millis(),
         slot: 0,
+        rev2: rev2_state(),
     };
 
     // A success changes nothing.
@@ -4122,15 +4323,16 @@ async fn deferred_batch_flush_recovers_a_dead_egress_verdict() {
     );
     let now = coarse_millis();
     let generation = egress.generation[bind.index].load(Ordering::Acquire);
-    egress.memo_store(bind, generation, &conn, 1200, now);
+    egress.memo_store(bind, generation, &conn, 1200, now, &rev2_state());
     egress.cached[bind.index].store(Some(Arc::new(EgressCache {
         conn: conn.clone(),
         limit: 1200,
         stamp_ms: now,
         slot: 0,
+        rev2: rev2_state(),
     })));
     assert!(
-        egress.with_fresh(bind, now, |_, _| ()).is_some(),
+        egress.with_fresh(bind, now, |_, _, _| ()).is_some(),
         "premise: the memo is fresh, so the flush takes the hit path"
     );
 
@@ -4305,6 +4507,7 @@ async fn forget_slot_releases_only_that_slots_handles() {
             limit: 1200,
             stamp_ms: now,
             slot,
+            rev2: rev2_state(),
         })));
     }
     let other_gen = e.generation[1].load(std::sync::atomic::Ordering::Acquire);
@@ -4343,12 +4546,12 @@ async fn stale_egress_memo_releases_the_connection() {
         index: 0,
     };
     let now = mono_millis();
-    e.memo_store(bind, 0, &conn, 1200, now);
+    e.memo_store(bind, 0, &conn, 1200, now, &rev2_state());
     assert!(!memo_is_empty(bind), "premise: the memo holds a handle");
 
     // Fresh hit: served, and the hit path must not clear the memo.
     assert!(
-        e.with_fresh(bind, now, |c, limit| (c.stable_id(), limit))
+        e.with_fresh(bind, now, |c, limit, _| (c.stable_id(), limit))
             .is_some(),
         "a fresh memo entry must be served"
     );
@@ -4360,11 +4563,1699 @@ async fn stale_egress_memo_releases_the_connection() {
     // Generation bump (invalidate/forget_slot): the stale entry must be freed.
     e.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     assert!(
-        e.with_fresh(bind, now, |_, _| ()).is_none(),
+        e.with_fresh(bind, now, |_, _, _| ()).is_none(),
         "a stale memo entry must not be served"
     );
     assert!(
         memo_is_empty(bind),
         "a stale memo entry must release its cloned Connection"
     );
+}
+
+// ---------------- MQP-3 wire rev2 downlink ----------------
+
+/// A compressed steady `DATA` resolves its wire id through the connection
+/// registry, delivers to the binding's session, and is itself the implicit ACK
+/// that moves the uplink binding `Opening -> Open`.
+#[tokio::test]
+async fn dispatch_rev2_steady_resolves_binding_and_marks_it_open() {
+    let assoc = test_assoc().await;
+    let sess = 7u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let target: SocketAddr = "198.51.100.1:53".parse().unwrap();
+    let binding = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        sess,
+        TargetAddr::Ip(target),
+    );
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let frame = r2::encode_data_steady(binding.wire_id, b"reply-1", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        1
+    );
+    assert_eq!(
+        out[0].dst, target,
+        "no learned source yet: the IP target is used"
+    );
+    assert_eq!(out[0].payload, &b"reply-1"[..]);
+    assert!(
+        binding.is_open(),
+        "a compressed downlink is the implicit ACK"
+    );
+    assert!(
+        assoc
+            .entry
+            .replied
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "delivering a reply marks the association active for the idle tick"
+    );
+}
+
+/// Domain flow downlink: a steady frame cannot name a reply source, so it is
+/// dropped (counted); the server's `DATA OPEN|SRC` teaches the actual source,
+/// after which the same flow compresses into SOCKS5 replies.
+#[tokio::test]
+async fn dispatch_rev2_domain_open_src_binds_reply_source() {
+    // The steady-frame drop below bumps the process-wide REFUSED counter; the
+    // DNS slow-path tests assert exact REFUSED deltas, so share their lock.
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let assoc = test_assoc().await;
+    let sess = 9u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let binding = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        sess,
+        TargetAddr::Domain("example.com".to_string(), 53),
+    );
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    // A compressed frame for a domain flow with no learned source has nowhere
+    // to deliver: the requested name is not a valid SOCKS5 reply address.
+    let frame = r2::encode_data_steady(binding.wire_id, b"lost", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        0
+    );
+    assert!(
+        binding.reply_src().is_none(),
+        "a steady frame must not invent a source address"
+    );
+
+    // The binding frame carries the real source of the reply.
+    let src: SocketAddr = "203.0.113.9:53".parse().unwrap();
+    let frame = r2::encode_data_open(
+        binding.wire_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        b"first",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, src);
+    assert_eq!(out[0].payload, &b"first"[..]);
+    assert_eq!(binding.reply_src(), Some(src));
+    assert!(binding.is_open());
+
+    // Subsequent steady frames resolve through the learned reply source.
+    let frame = r2::encode_data_steady(binding.wire_id, b"second", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        1
+    );
+    assert_eq!(out[1].dst, src);
+    assert_eq!(out[1].payload, &b"second"[..]);
+}
+
+/// A same-flow `TRAIN` delivers every item through the flow's binding, in wire
+/// order.
+#[tokio::test]
+async fn dispatch_rev2_train_resolves_same_flow() {
+    let assoc = test_assoc().await;
+    let sess = 3u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let target: SocketAddr = "192.0.2.7:5353".parse().unwrap();
+    let binding = FlowBinding::new_shared(
+        r2::make_wire_id(2, false).unwrap(),
+        sess,
+        TargetAddr::Ip(target),
+    );
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let frame = r2::encode_train_same(binding.wire_id, &[b"x", b"yy"], 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        2
+    );
+    assert_eq!(out[0].dst, target);
+    assert_eq!(out[1].dst, target);
+    assert_eq!(out[0].payload, &b"x"[..]);
+    assert_eq!(out[1].payload, &b"yy"[..]);
+    assert!(binding.is_open());
+}
+
+/// `DATA INLINE` (the server's fail-safe) is self-describing: session + source
+/// address, no registry lookup.
+#[tokio::test]
+async fn dispatch_rev2_inline_downlink_delivers() {
+    let assoc = test_assoc().await;
+    let sess = 5u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let src: SocketAddr = "198.51.100.44:443".parse().unwrap();
+    let frame =
+        r2::encode_data_inline(sess, &TargetAddrRef::Ip(src), false, b"inline", 1400).unwrap();
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, src);
+    assert_eq!(out[0].payload, &b"inline"[..]);
+}
+
+/// Unknown wire ids are dropped and counted, never mapped to a guessed
+/// session.
+#[tokio::test]
+async fn dispatch_rev2_unknown_id_is_dropped() {
+    let assoc = test_assoc().await;
+    let hub = UdpHub::new();
+    hub.publish(7, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let before = counters::snapshot();
+    let frame = r2::encode_data_steady(999, b"stale", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        0
+    );
+    assert!(out.is_empty());
+    let delta = counters::since(&before);
+    assert!(delta.rx_unknown_id >= 1, "the stale id must be counted");
+}
+
+/// `CTL` handling: `CAPS` stores the limits, `FLOW_ACK` confirms an uplink
+/// binding, `FLOW_REJECT`/`FLOW_CLOSE` close and forget one, and `SESS_CLOSE`
+/// reaches the association through the bounded notification set.
+#[tokio::test]
+async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
+    let rev2 = ConnRev2::new();
+    let hub = UdpHub::new();
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let mut send = |rev2: &ConnRev2, ctl: r2::Ctl, cache: &mut [DispatchSlot; DISPATCH_CACHE]| {
+        let frame = r2::encode_ctl(&ctl);
+        dispatch_r2(rev2, cache, &hub, &mut r2_reasm, frame, &mut out)
+    };
+
+    // CAPS: negotiated limits become the connection state.
+    let caps = r2::Caps {
+        max_train_items: 8,
+        ..r2::Caps::default()
+    };
+    assert_eq!(send(&rev2, r2::Ctl::Caps(caps), &mut cache), 0);
+    assert!(rev2.is_ready());
+    assert_eq!(rev2.ctl.caps(), Some(caps));
+
+    // FLOW_ACK: Opening -> Open.
+    let a = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        7,
+        TargetAddr::Ip("198.51.100.1:53".parse().unwrap()),
+    );
+    assert!(rev2.registry.insert(a.clone()).is_ok());
+    assert_eq!(
+        send(
+            &rev2,
+            r2::Ctl::FlowAck {
+                id: a.wire_id,
+                status: r2::R2_ACK_OPEN
+            },
+            &mut cache
+        ),
+        0
+    );
+    assert!(a.is_open());
+
+    // FLOW_REJECT: closed and forgotten.
+    let b = FlowBinding::new_shared(
+        r2::make_wire_id(2, false).unwrap(),
+        7,
+        TargetAddr::Ip("198.51.100.2:53".parse().unwrap()),
+    );
+    assert!(rev2.registry.insert(b.clone()).is_ok());
+    assert_eq!(
+        send(
+            &rev2,
+            r2::Ctl::FlowReject {
+                id: b.wire_id,
+                reason: r2::R2_REJECT_TABLE_FULL
+            },
+            &mut cache
+        ),
+        0
+    );
+    assert_eq!(b.state(), FlowState::Closed);
+    assert!(rev2.registry.get(b.wire_id).is_none());
+    assert!(
+        rev2.is_rejected(&b.target_ref(), mono_millis()),
+        "a rejected target is sent INLINE until the TTL expires"
+    );
+
+    // FLOW_CLOSE: closed and forgotten.
+    let c = FlowBinding::new_shared(
+        r2::make_wire_id(3, false).unwrap(),
+        7,
+        TargetAddr::Ip("198.51.100.3:53".parse().unwrap()),
+    );
+    assert!(rev2.registry.insert(c.clone()).is_ok());
+    assert_eq!(
+        send(&rev2, r2::Ctl::FlowClose { id: c.wire_id }, &mut cache),
+        0
+    );
+    assert_eq!(c.state(), FlowState::Closed);
+    assert!(rev2.registry.get(c.wire_id).is_none());
+
+    // SESS_CLOSE: recorded for the association to consume exactly once.
+    assert!(!rev2.take_session_closed(42));
+    assert_eq!(
+        send(
+            &rev2,
+            r2::Ctl::SessClose {
+                sess: 42,
+                reason: 0
+            },
+            &mut cache
+        ),
+        0
+    );
+    assert!(rev2.take_session_closed(42));
+    assert!(!rev2.take_session_closed(42));
+}
+
+/// A `SESS_CLOSE` makes the association forget its bindings so the next uplink
+/// payload re-opens the flow instead of sending steady frames for ids the
+/// server no longer holds.
+#[test]
+fn rev2_session_close_makes_the_uplink_reopen() {
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    up.sync(&rev2, 7);
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let binding = {
+        let b = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
+        assert!(rev2.registry.insert(b.clone()).is_ok());
+        assert!(up.flows.insert(b.clone()));
+        b
+    };
+    binding.mark_open();
+    rev2.note_session_closed(7);
+    up.sync(&rev2, 7);
+    assert!(up.flows.is_empty(), "the session's bindings are forgotten");
+    assert!(
+        rev2.registry.get(binding.wire_id).is_none(),
+        "and dropped from the connection registry"
+    );
+    // A different session is unaffected.
+    rev2.note_session_closed(8);
+    up.sync(&rev2, 7);
+    assert!(
+        rev2.take_session_closed(8),
+        "the other session's flag is kept"
+    );
+}
+
+/// The egress cache only publishes a rev2 connection after `CAPS`: the spec
+/// forbids UDP frames before the handshake, and the uplink encoder needs the
+/// generation's registry.
+#[tokio::test]
+async fn egress_refuses_a_connection_until_caps_arrive() {
+    let (conn, _client, _server) = real_connection().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let e = SharedEgress::default();
+    let bind = pool.udp_bind_shard(EgressClass::Bulk, 0);
+    let slot = pool.slot(pool.udp_global_slot(bind.index));
+    slot.publish(&conn);
+    let now = mono_millis();
+    assert!(
+        e.refresh_global(&pool, bind, now).is_none(),
+        "a connection without rev2 state must not carry UDP"
+    );
+    let state = ConnRev2::new();
+    slot.set_rev2(state.clone());
+    assert!(
+        e.refresh_global(&pool, bind, now).is_none(),
+        "rev2 state without CAPS is not ready"
+    );
+    state.on_caps(r2::Caps::default());
+    let h = e
+        .refresh_global(&pool, bind, now)
+        .expect("a negotiated connection is publishable");
+    assert_eq!(h.conn.stable_id(), conn.stable_id());
+    assert_eq!(h.rev2.epoch, state.epoch);
+}
+
+/// Full-slice round trip: a real association task on a real QUIC connection
+/// plus the slot's DATAGRAM dispatcher and the shared egress cache.
+///
+/// The uplink's first payload must arrive as `DATA OPEN` (with session and
+/// address), the server's `FLOW_ACK` must turn the binding `Open`, the next
+/// payload must ride a compressed frame, and a server reply must come back
+/// through the dispatcher to the app's UDP socket. Association exit then emits
+/// best-effort `CTL SESS_CLOSE`.
+#[tokio::test]
+async fn rev2_full_duplex_round_trip_through_assoc_and_dispatcher() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let hub = Arc::new(UdpHub::new());
+    let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
+    // Publish the connection and its negotiated rev2 state as the reconnect
+    // loop would, then start the slot's dispatcher on that generation.
+    let slot = pool.slot(pool.udp_global_slot(0));
+    let state = rev2_state();
+    slot.set_rev2(state.clone());
+    slot.publish(&client_conn);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    bump_gen(&slot.gen_tx);
+    spawn_dispatcher(slot.clone(), hub.clone());
+
+    // SOCKS5 control connection + UDP ASSOCIATE.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = l.local_addr().unwrap();
+    let mut control = tokio::net::TcpStream::connect(control_addr).await.unwrap();
+    let (control_server, _) = l.accept().await.unwrap();
+    let assoc = tokio::spawn(handle_udp_associate(
+        control_server,
+        pool.clone(),
+        hub.clone(),
+        egress.clone(),
+    ));
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply[..4], &[0x05, 0x00, 0x00, 0x01]);
+    let relay = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    );
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let target: SocketAddr = "127.0.0.1:5300".parse().unwrap();
+    let mut frame = vec![0u8, 0, 0, 0x01];
+    frame.extend_from_slice(
+        &target
+            .ip()
+            .to_string()
+            .parse::<Ipv4Addr>()
+            .unwrap()
+            .octets(),
+    );
+    frame.extend_from_slice(&target.port().to_be_bytes());
+    frame.extend_from_slice(b"ping");
+    app.send_to(&frame, relay).await.unwrap();
+
+    // Uplink: the first payload of a new target is DATA OPEN.
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the assoc must send the first payload")
+        .unwrap();
+    let open = r2::decode_data(&d).expect("the first uplink frame must be rev2 DATA");
+    let id = open.id.expect("a new target opens a flow");
+    assert_eq!(open.addr, Some(TargetAddrRef::Ip(target)));
+    assert_eq!(open.payload, b"ping");
+    assert!(open.sess.is_some(), "OPEN carries the session");
+
+    // The server installs the flow and acks it.
+    server_conn
+        .send_datagram(r2::encode_ctl(&r2::Ctl::FlowAck {
+            id,
+            status: r2::R2_ACK_OPEN,
+        }))
+        .unwrap();
+    let binding = state.registry.get(id).expect("the flow is in the registry");
+    for _ in 0..10_000 {
+        if binding.is_open() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(binding.is_open(), "FLOW_ACK must confirm the uplink flow");
+
+    // Downlink: a compressed reply for that flow reaches the app socket.
+    server_conn
+        .send_datagram(r2::encode_data_steady(id, b"pong", 1400).unwrap())
+        .unwrap();
+    let mut b = [0u8; 64];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(5), app.recv_from(&mut b))
+        .await
+        .expect("the reply must reach the app")
+        .unwrap();
+    // SOCKS5 UDP reply header: RSV/FRAG + ATYP 0x01 + IPv4 + port, then the
+    // payload verbatim.
+    assert_eq!(&b[..4], &[0, 0, 0, 0x01]);
+    assert_eq!(&b[4..8], &[127, 0, 0, 1]);
+    assert_eq!(u16::from_be_bytes([b[8], b[9]]), target.port());
+    assert_eq!(&b[10..n], b"pong", "payload must arrive verbatim");
+
+    // Uplink after the ack: compressed (no session, no address, 2-byte header).
+    app.send_to(&frame, relay).await.unwrap();
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the confirmed flow must send a compressed frame")
+        .unwrap();
+    match r2::kind(&d) {
+        Some(r2::R2Kind::Data) => {
+            let f = r2::decode_data(&d).unwrap();
+            assert_eq!(f.id, Some(id));
+            assert_eq!(f.sess, None);
+            assert_eq!(f.addr, None);
+            assert_eq!(f.payload, b"ping");
+        }
+        Some(r2::R2Kind::Train) => {
+            let t = r2::decode_train(&d).unwrap();
+            let items: Vec<(u32, &[u8])> = t.items().collect();
+            assert_eq!(items, vec![(id, &b"ping"[..])]);
+        }
+        other => panic!("expected a compressed frame, got {other:?}"),
+    }
+
+    // Association exit: best-effort SESS_CLOSE on the same connection.
+    drop(control);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("association exit must send a control frame")
+        .unwrap();
+    match r2::decode_ctl(&d).expect("exit control frame must decode") {
+        r2::Ctl::SessClose { sess, .. } => {
+            assert_ne!(sess, 0);
+        }
+        other => panic!("expected SESS_CLOSE, got {other:?}"),
+    }
+
+    assoc.abort();
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+// ---------------- MQP-3 wire rev2 fragmentation (Phase 1b) ----------------
+
+/// Reassemble the next payload from `server_conn`'s rev2 `FRAG` frames. Returns
+/// the payload and how many frames it took; every received datagram must be a
+/// rev2 frame (the client no longer emits MQP-2 for any payload size).
+async fn recv_rev2_fragments(
+    server_conn: &quinn::Connection,
+    reasm: &mut R2Reassembler,
+) -> (R2Assembled, usize) {
+    let mut frames = 0usize;
+    loop {
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("a rev2 fragment must arrive")
+            .unwrap();
+        assert!(
+            r2::is_r2(&d),
+            "the client must never emit a legacy MQP-2 frame (first byte {:?})",
+            d.first()
+        );
+        let f = r2::decode_frag(&d).expect("the frame must be rev2 FRAG");
+        frames += 1;
+        if let Some(done) = reasm.push(&f, coarse_millis()) {
+            return (done, frames);
+        }
+    }
+}
+
+/// A payload above one frame is fragmented with `OPEN` addressing while the
+/// flow is still opening (first fragment carries session + address), then with
+/// steady addressing once the ack confirmed it. Every frame is rev2.
+#[tokio::test]
+async fn client_rev2_large_payload_fragments_open_then_steady() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let big: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+    // A limit below the payload forces the fragment path even though the
+    // loopback connection could carry more.
+    let limit = 400usize;
+
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    let mut reasm = R2Reassembler::new();
+    let (open, frames) = recv_rev2_fragments(&server_conn, &mut reasm).await;
+    assert!(frames >= 2, "the payload must span several frames");
+    let id = open
+        .wire_id
+        .expect("flow-addressed fragments name the wire id");
+    assert_eq!(open.sess, Some(7), "the OPEN fragment carries the session");
+    assert_eq!(open.addr, Some(addr.clone()));
+    assert_eq!(open.payload, big);
+
+    // Ack it, then the same payload fragments with steady frames only.
+    let binding = rev2.registry.get(id).expect("the flow is in the registry");
+    binding.mark_open();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    let mut reasm = R2Reassembler::new();
+    let (steady, frames) = recv_rev2_fragments(&server_conn, &mut reasm).await;
+    assert!(frames >= 2);
+    assert_eq!(steady.wire_id, Some(id));
+    assert_eq!(steady.sess, None, "steady fragments carry no session");
+    assert_eq!(steady.addr, None, "steady fragments carry no address");
+    assert_eq!(steady.payload, big);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A payload above [`BATCH_SMALL_MAX`] that *does* fit one frame stays one
+/// standalone `DATA`/`OPEN` frame — fragmentation is for overflow, not for
+/// every large payload (fate sharing: one frame lost, one payload lost).
+#[tokio::test]
+async fn client_rev2_large_payload_fits_one_data_frame() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    let limit = client_conn.max_datagram_size().unwrap();
+
+    // Opening: one DATA OPEN frame (session + address).
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the single open frame must arrive")
+        .unwrap();
+    assert!(r2::is_r2(&d));
+    let f = r2::decode_data(&d).expect("a fitting payload is one DATA frame, not FRAG");
+    let id = f.id.expect("the flow was opened");
+    assert_eq!(f.sess, Some(7));
+    assert_eq!(f.addr, Some(addr.as_ref()));
+    assert_eq!(f.payload, big);
+
+    // Confirmed: one compressed steady frame.
+    rev2.registry.get(id).unwrap().mark_open();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the single steady frame must arrive")
+        .unwrap();
+    assert!(r2::is_r2(&d));
+    let f = r2::decode_data(&d).expect("a fitting payload is one DATA frame, not FRAG");
+    assert_eq!(f.id, Some(id));
+    assert_eq!(f.sess, None);
+    assert_eq!(f.payload, big);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Registry full ⇒ a large payload is fragmented in the self-describing
+/// `INLINE` form (session + address on every frame), the fail-safe that still
+/// delivers when no wire id can be bound.
+#[tokio::test]
+async fn client_rev2_large_inline_fragments() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    // Fill the connection registry so `ensure_binding` must fail.
+    let filler = TargetAddr::Ip("203.0.113.7:9".parse().unwrap());
+    for i in 1..=R2_MAX_FLOWS_PER_CONN as u32 {
+        let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 2, filler.clone());
+        assert!(rev2.registry.insert(b).is_ok());
+    }
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let big: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+    assert!(
+        send_uplink(
+            &client_conn,
+            400,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    let mut reasm = R2Reassembler::new();
+    let (done, frames) = recv_rev2_fragments(&server_conn, &mut reasm).await;
+    assert!(frames >= 2);
+    assert_eq!(done.wire_id, None, "INLINE fragments carry no wire id");
+    assert_eq!(done.sess, Some(7));
+    assert_eq!(done.addr, Some(addr.clone()));
+    assert_eq!(done.payload, big);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// The negotiated `CAPS.max_frame_bytes` is the live per-frame cap: a payload
+/// that would fit the raw QUIC budget is fragmented when the peer negotiated a
+/// smaller frame.
+#[tokio::test]
+async fn client_rev2_caps_frame_cap_forces_fragments() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = ConnRev2::new();
+    rev2.on_caps(r2::Caps {
+        max_frame_bytes: 400,
+        ..r2::Caps::default()
+    });
+    assert!(rev2.is_ready());
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    // Pre-built confirmed binding: the payload itself (> 1000 B) must fragment
+    // even though it is smaller than the raw connection budget.
+    let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
+    binding.mark_open();
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    up.sync(&rev2, 7);
+    assert!(up.flows.insert(binding));
+    let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    let conn_limit = client_conn.max_datagram_size().unwrap();
+    assert!(
+        conn_limit > 1000,
+        "premise: the raw budget would fit the payload"
+    );
+    assert!(
+        send_uplink(
+            &client_conn,
+            conn_limit,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    let mut reasm = R2Reassembler::new();
+    let (done, frames) = recv_rev2_fragments(&server_conn, &mut reasm).await;
+    assert!(
+        frames >= 2,
+        "CAPS.max_frame_bytes must bound the single frame"
+    );
+    assert_eq!(done.payload, big);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Wire order between the connection stager's queued small payloads and a
+/// following standalone large payload: the queue is drained first, so the peer
+/// never sees the large payload overtake the small one queued before it.
+#[tokio::test]
+async fn client_rev2_large_after_queued_small_keeps_order() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
+    binding.mark_open();
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    up.sync(&rev2, 7);
+    assert!(up.flows.insert(binding.clone()));
+    let limit = 400usize;
+
+    // Small payload of the open flow: queued on the connection stager, nothing
+    // on the wire yet.
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            b"small",
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    // Large payload: must drain the queue first, then go out directly.
+    let big: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            &big,
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the drained queue must arrive first")
+        .unwrap();
+    assert!(r2::is_r2(&d));
+    let first = r2::decode_data(&d).expect("a one-item drain sends a steady DATA frame");
+    assert_eq!(first.id, Some(binding.wire_id));
+    assert_eq!(first.payload, b"small");
+
+    let mut reasm = R2Reassembler::new();
+    let (done, frames) = recv_rev2_fragments(&server_conn, &mut reasm).await;
+    assert!(frames >= 2);
+    assert_eq!(done.payload, big);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// An address the SOCKS5 form cannot encode is a `TooLarge` drop with the same
+/// accounting the legacy fragmenter used — never a legacy send.
+#[tokio::test]
+async fn client_rev2_unencodable_addr_is_too_large() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let long = "a".repeat(300);
+    let addr = TargetAddrRef::Domain(&long, 53);
+    assert!(
+        addr.header().is_err(),
+        "premise: the address is unencodable"
+    );
+    let before = dgram_drops::snapshot();
+    let sent = send_uplink(
+        &client_conn,
+        1200,
+        7,
+        &addr,
+        b"payload",
+        bind,
+        &rev2,
+        &mut up,
+        &mut frag,
+    );
+    assert_eq!(sent.failed, Some(DatagramSend::TooLarge));
+    assert_eq!(sent.frames, 0);
+    let delta = dgram_drops::snapshot().since(&before);
+    assert!(
+        delta.too_large >= 1,
+        "the unencodable target must book a TOO_LARGE drop"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "nothing may be sent for an unencodable target"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Downlink rev2 FRAG: out-of-order `OPEN|SRC` fragments reassemble, learn the
+/// reply source and deliver through the association's staged-reply path.
+#[tokio::test]
+async fn dispatch_rev2_frag_open_src_out_of_order() {
+    let assoc = test_assoc().await;
+    let sess = 7u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let binding = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        sess,
+        TargetAddr::Domain("example.com".to_string(), 53),
+    );
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    let src: SocketAddr = "203.0.113.9:53".parse().unwrap();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    // Deliver the steady tail first: the reassembler keeps the context from
+    // whichever fragment carries it.
+    let tail = r2::encode_frag_steady(binding.wire_id, 99, 1, 2, b"world", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        0,
+        "a partial payload delivers nothing"
+    );
+    let head = r2::encode_frag_open(
+        binding.wire_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        99,
+        0,
+        2,
+        b"hello ",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, head, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, src, "OPEN|SRC fragments learn the reply source");
+    assert_eq!(out[0].payload, &b"hello world"[..]);
+    assert_eq!(binding.reply_src(), Some(src));
+    assert!(binding.is_open(), "a downlink payload is the implicit ACK");
+    assert_eq!(reasm.inflight(), 0);
+}
+
+/// Downlink inline fragments: session + address self-describe the route, and a
+/// steady frame set for an uninstalled wire id is dropped and counted.
+#[tokio::test]
+async fn dispatch_rev2_frag_inline_and_unknown_id() {
+    let assoc = test_assoc().await;
+    let sess = 5u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let src: SocketAddr = "198.51.100.44:443".parse().unwrap();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let head =
+        r2::encode_frag_inline(sess, &TargetAddrRef::Ip(src), false, 3, 0, 2, b"ab", 1400).unwrap();
+    let tail =
+        r2::encode_frag_inline(sess, &TargetAddrRef::Ip(src), false, 3, 1, 2, b"cd", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, head, &mut out),
+        0
+    );
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, src);
+    assert_eq!(out[0].payload, &b"abcd"[..]);
+
+    // Unknown wire id: reassembly succeeds, the registry lookup does not.
+    let unknown = r2::make_wire_id(9999, false).unwrap();
+    let before = counters::snapshot();
+    for idx in 0..2u8 {
+        let d = if idx == 0 {
+            r2::encode_frag_steady(unknown, 77, 0, 2, b"xx", 1400).unwrap()
+        } else {
+            r2::encode_frag_steady(unknown, 77, 1, 2, b"yy", 1400).unwrap()
+        };
+        assert_eq!(
+            dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, d, &mut out),
+            0
+        );
+    }
+    assert!(
+        counters::since(&before).rx_unknown_id >= 1,
+        "an uninstalled id is counted, not guessed"
+    );
+}
+
+/// A partial rev2 payload expires on the connection's reassembly tick, so a
+/// peer that sends one fragment and stops cannot pin memory.
+#[tokio::test]
+async fn dispatch_rev2_frag_partial_expires() {
+    let assoc = test_assoc().await;
+    let sess = 6u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let binding = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        sess,
+        TargetAddr::Ip("198.51.100.1:53".parse().unwrap()),
+    );
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let half = r2::encode_frag_steady(binding.wire_id, 42, 0, 2, b"half", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, half, &mut out),
+        0
+    );
+    assert_eq!(reasm.inflight(), 1);
+    // `expire` takes an absolute clock reading, not a duration. Reading the
+    // clock after the push makes this deterministic on any runner (the old
+    // `expire(FRAG_TIMEOUT_MS)` depended on the process-uptime clock still
+    // being near zero, which is not true on slower/real CI machines).
+    reasm.expire(coarse_millis() + FRAG_TIMEOUT_MS + 1);
+    assert_eq!(reasm.inflight(), 0, "the partial must expire");
+    // The missing fragment arriving after expiry cannot complete the payload.
+    let tail = r2::encode_frag_steady(binding.wire_id, 42, 1, 2, b"tail", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        0
+    );
+    assert!(out.is_empty());
+    assert_eq!(reasm.inflight(), 1, "the late tail starts a new partial");
+}
+
+// ---------------- Phase 2: connection-level cross-session stager ----------------
+
+/// Two associations (four payload flows, sessions 1 and 2) share one
+/// connection: their queued steady payloads are packed into **one** `TRAIN
+/// dict` carrying both wire ids, instead of one frame per association.
+#[tokio::test]
+async fn rev2_stager_packs_two_associations_into_one_dict_train() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut frag = R2Fragmenter::new();
+    let limit = client_conn.max_datagram_size().unwrap();
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
+    let mut up_a = UplinkFlows::new();
+    let mut up_b = UplinkFlows::new();
+
+    // Open both flows (one standalone OPEN each) and ack them, exactly like two
+    // associations whose first datagrams opened a flow.
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            1,
+            &a.as_ref(),
+            b"a0",
+            bind,
+            &rev2,
+            &mut up_a,
+            &mut frag
+        )
+        .complete()
+    );
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("session 1 open")
+        .unwrap();
+    let id_a = r2::decode_data(&d).unwrap().id.unwrap();
+    rev2.registry.get(id_a).unwrap().mark_open();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            2,
+            &b.as_ref(),
+            b"b0",
+            bind,
+            &rev2,
+            &mut up_b,
+            &mut frag
+        )
+        .complete()
+    );
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("session 2 open")
+        .unwrap();
+    let id_b = r2::decode_data(&d).unwrap().id.unwrap();
+    rev2.registry.get(id_b).unwrap().mark_open();
+
+    // Both associations queue one steady payload before the next drain.
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            1,
+            &a.as_ref(),
+            b"a1",
+            bind,
+            &rev2,
+            &mut up_a,
+            &mut frag
+        )
+        .complete()
+    );
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            2,
+            &b.as_ref(),
+            b"b1",
+            bind,
+            &rev2,
+            &mut up_b,
+            &mut frag
+        )
+        .complete()
+    );
+    assert_eq!(rev2.stage_len(), 2, "both payloads wait for one drain");
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the cross-session train must arrive")
+        .unwrap();
+    let t = r2::decode_train(&d).expect("two steady items become a dict train");
+    assert_eq!(t.form, r2::R2_TRAIN_FORM_DICT);
+    assert_eq!(t.nfl, 2, "one flow id per session");
+    let items: Vec<(u32, &[u8])> = t.items().collect();
+    assert_eq!(items, vec![(id_a, &b"a1"[..]), (id_b, &b"b1"[..])]);
+    assert_eq!(rev2.stage_len(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "two payloads from two sessions must be one frame, not two"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Per-session FIFO order survives the round-robin packing, and a later drain
+/// continues after the earlier payloads of the same session.
+#[tokio::test]
+async fn rev2_stager_preserves_per_session_order_across_drains() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut frag = R2Fragmenter::new();
+    let limit = client_conn.max_datagram_size().unwrap();
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
+    let mut up_a = UplinkFlows::new();
+    let mut up_b = UplinkFlows::new();
+    // Open and ack both flows deterministically.
+    for (sess, target, up) in [(1u32, &a, &mut up_a), (2u32, &b, &mut up_b)] {
+        assert!(
+            send_uplink(
+                &client_conn,
+                limit,
+                sess,
+                &target.as_ref(),
+                b"x",
+                bind,
+                &rev2,
+                up,
+                &mut frag
+            )
+            .complete()
+        );
+        drain_now(&rev2, &client_conn, limit);
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("open")
+            .unwrap();
+        let id = r2::decode_data(&d).unwrap().id.unwrap();
+        rev2.registry.get(id).unwrap().mark_open();
+    }
+
+    // Three payloads on session 1, two on session 2, queued before one drain.
+    for body in [&b"a1"[..], &b"a2"[..], &b"a3"[..]] {
+        assert!(
+            send_uplink(
+                &client_conn,
+                limit,
+                1,
+                &a.as_ref(),
+                body,
+                bind,
+                &rev2,
+                &mut up_a,
+                &mut frag
+            )
+            .complete()
+        );
+    }
+    for body in [&b"b1"[..], &b"b2"[..]] {
+        assert!(
+            send_uplink(
+                &client_conn,
+                limit,
+                2,
+                &b.as_ref(),
+                body,
+                bind,
+                &rev2,
+                &mut up_b,
+                &mut frag
+            )
+            .complete()
+        );
+    }
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("train")
+        .unwrap();
+    let t = r2::decode_train(&d).expect("train frame");
+    let order: Vec<&[u8]> = t.items().map(|(_, p)| p).collect();
+    // The stager interleaves sessions (round robin) but must not reorder one
+    // session's payloads relative to each other.
+    let s1: Vec<&[u8]> = order.iter().copied().filter(|p| p[0] == b'a').collect();
+    let s2: Vec<&[u8]> = order.iter().copied().filter(|p| p[0] == b'b').collect();
+    assert_eq!(s1, vec![&b"a1"[..], &b"a2"[..], &b"a3"[..]]);
+    assert_eq!(s2, vec![&b"b1"[..], &b"b2"[..]]);
+
+    // A later drain continues the session order without replaying retired ones.
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            1,
+            &a.as_ref(),
+            b"a4",
+            bind,
+            &rev2,
+            &mut up_a,
+            &mut frag
+        )
+        .complete()
+    );
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("later payload")
+        .unwrap();
+    assert_eq!(r2::decode_data(&d).unwrap().payload, b"a4");
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// `Open` and `Inline` items are self-describing standalone frames; they never
+/// join a train and they keep their own session/address headers.
+#[tokio::test]
+async fn rev2_stager_open_and_inline_items_are_standalone() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let limit = client_conn.max_datagram_size().unwrap();
+    let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
+    let id = r2::make_wire_id(1, false).unwrap();
+    assert!(
+        rev2.registry
+            .insert(FlowBinding::new_shared(id, 1, a.clone()))
+            .is_ok()
+    );
+    // A steady item from session 3, an Open item from session 1 and an Inline
+    // item from session 2: the two self-describing frames are standalone.
+    for item in [
+        R2StageItem {
+            session: 3,
+            kind: R2StageKind::Steady {
+                wire_id: r2::make_wire_id(2, false).unwrap(),
+            },
+            payload: Bytes::from_static(b"steady"),
+        },
+        R2StageItem {
+            session: 1,
+            kind: R2StageKind::Open {
+                wire_id: id,
+                sess: 1,
+                addr: a.clone(),
+                src: false,
+            },
+            payload: Bytes::from_static(b"open"),
+        },
+        R2StageItem {
+            session: 2,
+            kind: R2StageKind::Inline {
+                sess: 2,
+                addr: b.clone(),
+                src: false,
+            },
+            payload: Bytes::from_static(b"inline"),
+        },
+    ] {
+        assert!(rev2.push_stage(item).is_ok());
+    }
+    drain_now(&rev2, &client_conn, limit);
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("each item is one frame")
+            .unwrap();
+        frames.push(d);
+    }
+    let mut saw_open = false;
+    let mut saw_inline = false;
+    let mut saw_steady = false;
+    for d in &frames {
+        match r2::kind(d) {
+            Some(r2::R2Kind::Data) => {
+                let f = r2::decode_data(d).unwrap();
+                if f.id.is_none() {
+                    assert_eq!(f.sess, Some(2));
+                    assert_eq!(f.addr, Some(b.as_ref()));
+                    assert_eq!(f.payload, b"inline");
+                    saw_inline = true;
+                } else if f.sess.is_some() {
+                    assert_eq!(f.id, Some(id));
+                    assert_eq!(f.addr, Some(a.as_ref()));
+                    assert_eq!(f.payload, b"open");
+                    saw_open = true;
+                } else {
+                    assert_eq!(f.payload, b"steady");
+                    saw_steady = true;
+                }
+            }
+            other => panic!("standalone items must be DATA frames, got {other:?}"),
+        }
+    }
+    assert!(saw_open && saw_inline && saw_steady);
+    assert_eq!(rev2.stage_len(), 0);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A full stager queue that a drain cannot empty books the payload as a full
+/// send buffer instead of losing it silently.
+#[tokio::test]
+async fn rev2_stage_queue_full_accounts_buffer_full() {
+    let (client_conn, _server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    // One byte of capacity: no payload can ever be queued.
+    let rev2 = ConnRev2::with_stager_capacity(8, 1);
+    rev2.on_caps(r2::Caps::default());
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    let before = dgram_drops::snapshot();
+    let sent = send_uplink(
+        &client_conn,
+        limit,
+        7,
+        &addr.as_ref(),
+        b"payload",
+        bind,
+        &rev2,
+        &mut up,
+        &mut frag,
+    );
+    assert_eq!(sent.failed, Some(DatagramSend::Blocked));
+    assert_eq!(sent.frames, 0);
+    assert_eq!(rev2.stage_len(), 0, "a refused payload is not queued");
+    assert!(
+        dgram_drops::snapshot().since(&before).buffer_full >= 1,
+        "the full-queue drop must book BUFFER_FULL"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+}
+
+/// A drain verdict of `ConnectionLost` propagates through `PayloadSend.failed`
+/// so the existing recovery invalidates the egress cache instead of leaving a
+/// dead handle cached.
+#[tokio::test]
+async fn rev2_stage_drain_propagates_connection_lost() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let limit = client_conn.max_datagram_size().unwrap();
+    let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    // Pre-open/ack a flow and queue one steady payload behind the association.
+    let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
+    binding.mark_open();
+    assert!(rev2.registry.insert(binding.clone()).is_ok());
+    up.sync(&rev2, 7);
+    assert!(up.flows.insert(binding.clone()));
+    assert!(
+        rev2.push_stage(R2StageItem {
+            session: 7,
+            kind: R2StageKind::Steady {
+                wire_id: binding.wire_id
+            },
+            payload: Bytes::from_static(b"queued"),
+        })
+        .is_ok()
+    );
+    // Kill the connection, then send a large payload: it drains first (and
+    // meets the dead connection) before going out itself.
+    client_conn.close(0u32.into(), b"done");
+    for _ in 0..10_000 {
+        if client_conn.close_reason().is_some() && server_conn.close_reason().is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    let sent = send_uplink(
+        &client_conn,
+        limit,
+        7,
+        &addr.as_ref(),
+        &big,
+        bind,
+        &rev2,
+        &mut up,
+        &mut frag,
+    );
+    assert_eq!(
+        sent.failed,
+        Some(DatagramSend::ConnectionLost),
+        "a dead connection must surface its verdict to the egress recovery"
+    );
+    assert_eq!(rev2.stage_len(), 0, "the failed drain accounts its items");
+}
+
+/// A redial (new connection state) never inherits the previous generation's
+/// queued payloads: the old stager is torn down with them and the new one
+/// starts empty (the teardown accounting itself is unit-tested in `rev2`).
+#[tokio::test]
+async fn rev2_stager_resets_with_the_connection_generation() {
+    let old = rev2_state();
+    let new = ConnRev2::new();
+    assert_ne!(old.epoch, new.epoch);
+    let id = old.ids.alloc().unwrap();
+    assert!(
+        old.push_stage(R2StageItem {
+            session: 1,
+            kind: R2StageKind::Steady { wire_id: id },
+            payload: Bytes::from_static(b"old"),
+        })
+        .is_ok()
+    );
+    assert_eq!(old.stage_len(), 1);
+    // A fresh generation's stager is empty, and an association's flow table is
+    // reset by the epoch check, so the old item can never be sent with new ids.
+    assert_eq!(new.stage_len(), 0);
+    let mut up = UplinkFlows::new();
+    up.sync(&new, 1);
+    assert!(up.flows.is_empty());
+}
+
+// ---------------- Final symmetry: server-owned flows (full-cone) ----------------
+
+/// A server-owned, never-seen `DATA OPEN|SRC` installs a local binding (the
+/// reply is staged immediately), a following compressed frame on that id
+/// resolves, and the app's reply reuses the same server-owned wire id instead
+/// of burning a client-owned one.
+#[tokio::test]
+async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
+    let assoc = test_assoc().await;
+    let sess = 7u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let src: SocketAddr = "203.0.113.9:53".parse().unwrap();
+    let server_id = r2::make_wire_id(1, true).unwrap();
+    assert!(
+        r2::wire_id_server_owned(server_id),
+        "premise: server-owned id"
+    );
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let before = counters::snapshot();
+
+    // The server's unsolicited OPEN|SRC: unknown id, self-describing context.
+    let frame = r2::encode_data_open(
+        server_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        b"unsolicited",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, src);
+    assert_eq!(out[0].payload, &b"unsolicited"[..]);
+    let binding = rev2
+        .registry
+        .get(server_id)
+        .expect("the server-owned flow must be installed");
+    assert_eq!(binding.session, sess);
+    assert_eq!(binding.target, TargetAddr::Ip(src));
+    assert_eq!(binding.reply_src(), Some(src));
+    assert!(binding.is_open(), "the announcing OPEN is the flow's ack");
+    assert!(
+        counters::since(&before).server_flow_accept >= 1,
+        "the accepted flow is counted"
+    );
+
+    // A later compressed frame on that id resolves through the new binding.
+    let frame = r2::encode_data_steady(server_id, b"more", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        1
+    );
+    assert_eq!(out[1].dst, src);
+    assert_eq!(out[1].payload, &b"more"[..]);
+
+    // Unknown *client-owned* ids are still dropped and never installed.
+    let client_unknown = r2::make_wire_id(9999, false).unwrap();
+    let frame = r2::encode_data_steady(client_unknown, b"stale", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        0
+    );
+    assert!(rev2.registry.get(client_unknown).is_none());
+    // ... and a TRAIN item never installs a flow (no address to name it).
+    let server_unknown = r2::make_wire_id(4242, true).unwrap();
+    let frame = r2::encode_train_same(server_unknown, &[b"y"], 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        0
+    );
+    assert!(rev2.registry.get(server_unknown).is_none());
+
+    // Uplink: the app replies to that source on a real connection; the frame
+    // must carry the server-owned id (owner bit 1), not a fresh client id.
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            sess,
+            &TargetAddr::Ip(src).as_ref(),
+            b"app-reply",
+            bind,
+            &rev2,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    drain_now(&rev2, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the app reply must reach the server")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("steady DATA");
+    assert_eq!(f.id, Some(server_id));
+    assert!(
+        r2::wire_id_server_owned(f.id.unwrap()),
+        "the reply must ride the server-owned flow"
+    );
+    assert_eq!(f.sess, None);
+    assert_eq!(f.payload, b"app-reply");
+    assert_eq!(rev2.ids.allocated(), 0, "no client-owned id was burned");
+    assert!(up.flows.find_id(server_id).is_some());
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A fragmented server-owned `OPEN|SRC` installs the same way (the first
+/// fragment carries the self-describing context), so a large unsolicited reply
+/// also becomes a reusable flow.
+#[tokio::test]
+async fn rev2_server_owned_fragmented_open_installs() {
+    let assoc = test_assoc().await;
+    let sess = 3u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let src: SocketAddr = "198.51.100.44:443".parse().unwrap();
+    let server_id = r2::make_wire_id(2, true).unwrap();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let head = r2::encode_frag_open(
+        server_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        11,
+        0,
+        2,
+        b"big-",
+        1400,
+    )
+    .unwrap();
+    let tail = r2::encode_frag_steady(server_id, 11, 1, 2, b"reply", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, head, &mut out),
+        0
+    );
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, src);
+    assert_eq!(out[0].payload, &b"big-reply"[..]);
+    let binding = rev2
+        .registry
+        .get(server_id)
+        .expect("fragmented server-owned flow installed");
+    assert_eq!(binding.reply_src(), Some(src));
+    assert!(binding.is_open());
+}
+
+/// `SESS_CLOSE` purges every registry entry of that session — client-owned and
+/// accepted server-owned — while other sessions keep their flows.
+#[tokio::test]
+async fn rev2_sess_close_purges_registry_entries() {
+    let rev2 = rev2_state();
+    let client_owned = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        7,
+        TargetAddr::Ip("198.51.100.1:53".parse().unwrap()),
+    );
+    let server_owned = FlowBinding::new_shared(
+        r2::make_wire_id(1, true).unwrap(),
+        7,
+        TargetAddr::Ip("203.0.113.9:53".parse().unwrap()),
+    );
+    let other_session = FlowBinding::new_shared(
+        r2::make_wire_id(2, false).unwrap(),
+        8,
+        TargetAddr::Ip("192.0.2.7:53".parse().unwrap()),
+    );
+    for b in [&client_owned, &server_owned, &other_session] {
+        assert!(rev2.registry.insert(b.clone()).is_ok());
+    }
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess: 7, reason: 0 });
+    assert_eq!(
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &UdpHub::new(),
+            &mut reasm,
+            frame,
+            &mut out
+        ),
+        0
+    );
+    assert!(rev2.registry.get(client_owned.wire_id).is_none());
+    assert!(rev2.registry.get(server_owned.wire_id).is_none());
+    assert!(
+        rev2.registry.get(other_session.wire_id).is_some(),
+        "another session's flows are untouched"
+    );
+    assert!(rev2.take_session_closed(7));
+    // `remove_session` detaches the bindings from the registry; the
+    // association's own `sync` marks the ones it still holds closed when it
+    // consumes the `SESS_CLOSE` flag, so no tombstone is needed here.
+    assert_eq!(client_owned.session, 7);
 }

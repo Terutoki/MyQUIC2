@@ -1,0 +1,89 @@
+======================================================================================================================
+A. STEADY-STATE HEADER PER PAYLOAD (one payload per frame, flow 0 / extra flow)
+======================================================================================================================
+  IPv4 flow0           p=28    cur=33    new=30    save=3   ( 3.3% own-packet)  [steady compressed]
+  IPv4 flow0           p=60    cur=65    new=62    save=3   ( 2.5% own-packet)  [steady compressed]
+  IPv4 flow0           p=200   cur=205   new=202   save=3   ( 1.1% own-packet)  [steady compressed]
+  IPv4 flow0           p=512   cur=517   new=514   save=3   ( 0.5% own-packet)  [steady compressed]
+  IPv4 flow0           p=1000  cur=1005  new=1002  save=3   ( 0.3% own-packet)  [steady compressed]
+
+  IPv4 extra flow      p=28    cur=34    new=30    save=4   ( 4.4% own-packet)  [steady compressed]
+  IPv4 extra flow      p=60    cur=66    new=62    save=4   ( 3.3% own-packet)  [steady compressed]
+  IPv4 extra flow      p=200   cur=206   new=202   save=4   ( 1.5% own-packet)  [steady compressed]
+  IPv4 extra flow      p=512   cur=518   new=514   save=4   ( 0.7% own-packet)  [steady compressed]
+  IPv4 extra flow      p=1000  cur=1006  new=1002  save=4   ( 0.4% own-packet)  [steady compressed]
+
+  IPv6 flow0           p=28    cur=33    new=30    save=3   ( 3.3% own-packet)  [steady compressed]
+  IPv6 flow0           p=60    cur=65    new=62    save=3   ( 2.5% own-packet)  [steady compressed]
+  IPv6 flow0           p=200   cur=205   new=202   save=3   ( 1.1% own-packet)  [steady compressed]
+  IPv6 flow0           p=512   cur=517   new=514   save=3   ( 0.5% own-packet)  [steady compressed]
+  IPv6 flow0           p=1000  cur=1005  new=1002  save=3   ( 0.3% own-packet)  [steady compressed]
+
+  domain L=20 flow0    p=28    cur=58    new=30    save=28  (24.3% own-packet)  [current-inline vs new-compressed]
+  domain L=20 flow0    p=60    cur=90    new=62    save=28  (19.0% own-packet)  [current-inline vs new-compressed]
+  domain L=20 flow0    p=200   cur=230   new=202   save=28  ( 9.7% own-packet)  [current-inline vs new-compressed]
+  domain L=20 flow0    p=512   cur=542   new=514   save=28  ( 4.7% own-packet)  [current-inline vs new-compressed]
+  domain L=20 flow0    p=1000  cur=1030  new=1002  save=28  ( 2.6% own-packet)  [current-inline vs new-compressed]
+
+======================================================================================================================
+B. TRAIN ITEM OVERHEAD (same burst, flow-0 small IP payloads)
+======================================================================================================================
+  p=28   k=2   cur=66    (117.86%)  new=60    (107.14%)  save=6    B
+  p=28   k=8   cur=246   (109.82%)  new=234   (104.46%)  save=12   B
+  p=28   k=18  cur=546   (108.33%)  new=524   (103.97%)  save=22   B
+  p=28   k=40  cur=1206  (107.68%)  new=1162  (103.75%)  save=44   B
+
+  p=60   k=2   cur=130   (108.33%)  new=124   (103.33%)  save=6    B
+  p=60   k=8   cur=502   (104.58%)  new=490   (102.08%)  save=12   B
+  p=60   k=18  cur=1122  (103.89%)  new=1100  (101.85%)  save=22   B
+  p=60   k=40  cur=2486  (103.58%)  new=2442  (101.75%)  save=44   B
+
+  p=200  k=2   cur=412   (103.00%)  new=406   (101.50%)  save=6    B
+  p=200  k=8   cur=1630  (101.88%)  new=1618  (101.12%)  save=12   B
+  p=200  k=18  cur=3660  (101.67%)  new=3638  (101.06%)  save=22   B
+  p=200  k=40  cur=8126  (101.57%)  new=8082  (101.03%)  save=44   B
+
+======================================================================================================================
+C. WORKLOAD SCENARIOS (wire bytes per payload; own packet = low rate, packed = high rate)
+======================================================================================================================
+C1 28B flow0 steady (1000 datagrams)                       frames=1000  payload=28000   own=90000  (321.4%) packed=36595  (130.7%) pkts=29
+C1 new                                                     frames=1000  payload=28000   own=87000  (310.7%) packed=33485  (119.6%) pkts=27
+
+C2 60B flow0 steady current                                frames=1000  payload=60000   own=122000 (203.3%) packed=70245  (117.1%) pkts=59
+C2 60B flow0 steady new                                    frames=1000  payload=60000   own=119000 (198.3%) packed=67080  (111.8%) pkts=56
+
+C3 domain-40B current inline (NO_FLOW)                     frames=1000  payload=40000   own=127000 (317.5%) packed=75465  (188.7%) pkts=63
+C3 domain-40B new steady compressed                        frames=1000  payload=40000   own=99000  (247.5%) packed=46090  (115.2%) pkts=38
+
+C3b domain-300B current inline                             frames=1000  payload=300000  own=388000 (129.3%) packed=351370 (117.1%) pkts=334
+C3b domain-300B new compressed                             frames=1000  payload=300000  own=360000 (120.0%) packed=323370 (107.8%) pkts=334
+
+C4 pure-uplink 60B current inline-forever                  frames=1000  payload=60000   own=129000 (215.0%) packed=77465  (129.1%) pkts=63
+C4 pure-uplink 60B new compressed (ACK)                    frames=1000  payload=60000   own=119000 (198.3%) packed=67080  (111.8%) pkts=56
+
+C5 1200B current v2 FRAG x2                                frames=2     payload=1200    own=1351   (112.6%) packed=1351   (112.6%) pkts=2
+C5 1200B new compact FRAG x2                               frames=2     payload=1200    own=1325   (110.4%) packed=1325   (110.4%) pkts=2
+
+C6 32-flow fanout 60B current                              frames=2     payload=1920    own=2143   (111.6%) packed=2143   (111.6%) pkts=2
+C6 32-flow fanout 60B new                                  frames=2     payload=1920    own=2104   (109.6%) packed=2104   (109.6%) pkts=2
+
+  cross-session train items/packet = 18
+C7 32 sessions x 60B current (own pkt each)                frames=32    payload=1920    own=3904   (203.3%) packed=2254   (117.4%) pkts=2
+C7 32 sessions x 60B new (x-session train)                 frames=2     payload=1920    own=2104   (109.6%) packed=2104   (109.6%) pkts=2
+
+  p=28: current 38 items/train, new 40 items/train
+C8 28B high-pps current                                    frames=1     payload=1064    own=1204   (113.2%) packed=1204   (113.2%) pkts=1
+C8 28B high-pps new                                        frames=1     payload=1120    own=1220   (108.9%) packed=1220   (108.9%) pkts=1
+      per-payload wire: current=31.68 B, new=30.50 B
+
+  p=60: current 18 items/train, new 19 items/train
+C8 60B high-pps current                                    frames=1     payload=1080    own=1180   (109.3%) packed=1180   (109.3%) pkts=1
+C8 60B high-pps new                                        frames=1     payload=1140    own=1219   (106.9%) packed=1219   (106.9%) pkts=1
+      per-payload wire: current=65.56 B, new=64.16 B
+
+======================================================================================================================
+D. CANDIDATE B (1-byte steady header) marginal gain over candidate A
+======================================================================================================================
+  p=28   A=30   B=29   save=1 ( 1.1% of own-packet wire)
+  p=60   A=62   B=61   save=1 ( 0.8% of own-packet wire)
+  p=200  A=202  B=201  save=1 ( 0.4% of own-packet wire)

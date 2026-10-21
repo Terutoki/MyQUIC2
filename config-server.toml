@@ -44,7 +44,7 @@ auth_token = ""
 # scratch + 16 MiB Linux kernel socket caps) x quic_endpoints; and the TCP pump
 # buffers: 2 x 16 KiB per active stream x MAX_STREAM_TASKS = ~512 MiB — and
 # what is left is divided by receive window + send budget + both DATAGRAM
-# buffers + the reassembly budget = 14.25 MiB with the default 4/8/4 MB
+# buffers + the reassembly budget = 14.5 MiB with the default 4/8/4 MB
 # windows. Raising the windows therefore admits fewer connections instead of
 # multiplying the memory ceiling, and a budget at or below the fixed terms
 # admits exactly one connection (warned about at startup). The worst case
