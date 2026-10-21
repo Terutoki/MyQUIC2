@@ -1,967 +1,203 @@
 <div align="center">
 
-# ⚡ MyQUIC2
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.svg">
+  <img src="assets/readme/hero-light.svg" alt="MyQUIC2 — the small-packet QUIC proxy. SOCKS5 in, QUIC/TLS 1.3 out, MQP-3 wire rev2 in between." width="100%">
+</picture>
 
-**High-performance · TCP and UDP over one blazing-fast QUIC tunnel**
+[![Release](https://img.shields.io/badge/Release-v0.2.1-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
+[![Tests](https://img.shields.io/badge/Tests-424_passing-16a34a?style=flat-square)](#-verification)
+[![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
+[![Protocol](https://img.shields.io/badge/Protocol-MQP--3-f59e0b?style=flat-square)](#-mqp-3-rev2-wire)
+[![Platform](https://img.shields.io/badge/Platform-Linux_%7C_macOS_%7C_OpenWrt-6366f1?style=flat-square)](#-install)
+[![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](https://github.com/Terutoki/MyQUIC2/blob/main/LICENSE)
 
-SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-3 protocol · built for speed and low latency
+**SOCKS5 in · QUIC / TLS 1.3 out · MQP-3 rev2 in between**
 
-[![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?logo=rust&logoColor=white)](#-building)
-[![QUIC](https://img.shields.io/badge/QUIC-TLS%201.3-38bdf8)](#-architecture)
-[![Performance](https://img.shields.io/badge/Performance-blazing%20fast-f97316)](#-performance-design)
-[![Protocol](https://img.shields.io/badge/Protocol-MQP--3-f59e0b)](#-the-mqp-3-protocol)
-[![Tests](https://img.shields.io/badge/Tests-424%20passing-16a34a)](#-verification)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20OpenWrt-6366f1)](#-building)
-[![License](https://img.shields.io/badge/License-MIT-22c55e)](#-license)
-
-[✨ Highlights](#-highlights) · [🏗️ Architecture](#-architecture) · [🚀 Quick Start](#-quick-start) · [⚙️ Configuration](#-configuration) · [📡 Protocol](#-the-mqp-3-protocol) · [🔒 Security](#-security-model) · [🚀 Performance](#-performance-design) · [📊 Limits](#-limits--memory) · [📦 Building](#-building)
+[Architecture](#-architecture) · [Wire](#-mqp-3-rev2-wire) · [Full duplex](#-full-duplex) · [Stager](#-cross-session-stager) · [Performance](#-performance) · [Security](#-security) · [Install](#-install) · [Quick start](#-quick-start) · [Verify](#-verification)
 
 </div>
 
----
-
-## ✨ Highlights
-
-| | Feature | Detail |
-|---|---|---|
-| 🚀 | **TCP + UDP, fully covered** | Standard SOCKS5 (`CONNECT` / `UDP ASSOCIATE`); IPv4 / IPv6 / domain targets |
-| 🧬 | **Minimal MQP-3 protocol (rev2)** | Connection-scoped flow ids: a confirmed IP/domain flow costs a **2 B** steady `DATA` header; same-flow `TRAIN` is a 3 B header + 1 B/item; a fragmented payload uses an **8 B** steady `FRAG` header (8 KiB max, both directions); CTL `HELLO/CAPS/FLOW_ACK` makes domain and pure-uplink flows compressible in both directions. All UDP payload sizes now use rev2 |
-| ⚡ | **Extreme performance** | Zero-copy TCP ↔ QUIC pump, BBR + GSO/GRO, reused staging buffers — one frame buffer per outgoing QUIC DATAGRAM frame (a `TRAIN` fills to the path budget); the shipped 4/8/4 MB windows put a single flow at ~240 Mb/s on the target 140 ms RTT (300 Mb/s peak with the opt-in 8/16/8 preset), and connection count scales linearly |
-| 🔀 | **Connection isolation** | 4 TCP connections + 2 class-split UDP connections; UDP never competes with TCP for a congestion window |
-| 🛡️ | **Secure by design** | TLS 1.3 + pinned Ed25519 server cert; optional `auth_token` (constant-time) keeps it from being an open relay |
-| 🌐 | **Server-side DNS** | Resolved at the exit with 120 s positive / 10 s negative caches and single-flight, so results match the egress |
-| ♻️ | **Self-healing** | ~10 s silence-watchdog detection after a path death (2× keepalive, always below the 15 s QUIC-idle backstop), second-scale redial, UDP associations recover automatically |
-| 📦 | **OpenWrt-ready** | Static musl binaries (four CPU levels, v1–v4), ~4.4 MB each |
+> [!IMPORTANT]
+> **Wire-breaking by design.** This tree speaks **MQP-3 wire rev2**. It does not interoperate with v0.2.0 (v3 wire) or v0.1.x / MQP-2. Upgrade client and server together; mixed-version deployment is not supported.
+>
+> The protocol is still called **MQP-3**. The revision lives in `CTL HELLO/CAPS wire_ver = 2`, not in the name. There is no MQP-4.
 
 ---
 
-## 🏗️ Architecture
+## ✨ What it is
 
-### System overview
+A SOCKS5 proxy made of **two binaries, one wire, and very little ceremony**.
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart LR
-    subgraph EDGE["💻  Client edge"]
-        direction TB
-        APPS["🧑‍💻 Apps<br/>curl · browser · games"]
-        SOCKS["🧦 SOCKS5 ingress<br/>CONNECT · UDP ASSOCIATE<br/>:1080"]
-        POOL["🎰 ConnPool<br/>4 × TCP + 3 × UDP slots<br/>one Endpoint per slot"]
-        APPS -->|"TCP / UDP"| SOCKS
-        SOCKS -->|"5 s budgets"| POOL
-    end
-    subgraph TUNNEL["⚡  QUIC tunnel"]
-        direction TB
-        TLS["🔐 TLS 1.3<br/>pinned Ed25519"]
-        MQP["📡 MQP-3<br/>streams · DATAGRAMs · flow/TRAIN"]
-        CC["🚄 BBR + ECN<br/>GSO / GRO"]
-        TLS --- MQP --- CC
-    end
-    subgraph EXIT["🛰️  Exit side"]
-        direction TB
-        ING["🚪 QUIC ingress<br/>:8443 · SO_REUSEPORT<br/>1 endpoint / core · ≤ 8"]
-        AUTH["🔑 token gate<br/>5 s / 5 s / 10 s"]
-        ROUTE["🧭 dispatch<br/>TCP dial-out · UDP sessions"]
-        TARGETS["🎯 Targets<br/>TCP / UDP"]
-        ING --> AUTH
-        AUTH --> ROUTE
-        ROUTE --> TARGETS
-    end
-    EDGE ==>|"① 4 TCP + 3 UDP<br/>QUIC connections"| TUNNEL
-    TUNNEL ==>|"② encrypted<br/>MQP-3 frames"| EXIT
-    style EDGE fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
-    style TUNNEL fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#1e1b4b
-    style EXIT fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
-    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef tun fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    class APPS app
-    class SOCKS,POOL edge
-    class TLS,MQP,CC tun
-    class ING,AUTH,ROUTE,TARGETS exit
-```
+- **TCP is a QUIC stream.** The SOCKS5 success reply is optimistic; payload bytes are pumped with zero-copy buffers and borrowed QUIC halves.
+- **UDP is an MQP-3 rev2 DATAGRAM plane.** Connection-scoped flow ids, 2 B steady headers, full-duplex flows, cross-association TRAIN packing, compact 8 KiB FRAG.
+- **One client, one server, one config each.** No mixed-version negotiation, no payload compression, no hidden control stream.
+- **UDP stays unreliable.** A lost fragment drops that payload; a lost TRAIN drops the payloads it carried. Bounded reassembly and stager queues cap the fate sharing.
 
-Three crates in one package (`Cargo.toml`: lib `myquic2` + two binaries):
+## 🧭 Architecture
 
-| Unit | Source | Role |
-|---|---|---|
-| `myquic2` (lib) | `src/*.rs` + `src/{mqp,config,tls,transport,dns,udp,tcp,stats,time,sync}/` | MQP-3 rev2 codec + flow registry + connection stager/fragmenter/reassembler · legacy v2/v3 decode · config · TLS · transport · DNS · stats (`src/lib.rs` is the thin facade) |
-| `myquic2-client` | `src/bin/myquic2-client/` | SOCKS5 ingress → connection pool → QUIC egress; reconnect, classified UDP egress, dispatcher-side relay |
-| `myquic2-server` | `src/bin/myquic2-server/` | QUIC ingress → token auth → dial-out; session table, reassembly, egress scheduling |
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/architecture-dark.svg">
+  <img src="assets/readme/architecture-light.svg" alt="Architecture: SOCKS5 client pool, QUIC/TLS tunnel and MQP-3 rev2 data plane, admission-first server ingress" width="100%">
+</picture>
+</p>
 
-**Data-plane mapping**
+- **Pool-first client.** Every pool slot owns a QUIC endpoint, a UDP socket and a pinned runtime. TCP and UDP egress are isolated; the thread-local egress memo is lock-free.
+- **One wire, two transports.** TCP rides a QUIC stream; UDP rides MQP-3 rev2 DATAGRAMs. Shared pieces: TLS 1.3, BBR, PMTU discovery, GSO/GRO.
+- **Admission-first server.** `SO_REUSEPORT` ingress endpoints, token auth, memory/connection admission, one 64 KiB session socket per association.
 
-- **TCP**: one TCP connection = one QUIC bidirectional stream; everything after the stream head is raw bytes. The SOCKS success reply is optimistic (sent without waiting for the remote dial).
-- **UDP**: one SOCKS association = one session id over QUIC DATAGRAMs (unreliable, no head-of-line blocking). Payloads larger than one frame are fragmented and reassembled by the peer — **delivered whole or dropped whole**, never truncated.
+## 📡 MQP-3 rev2 wire
 
-### End-to-end module map
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/wire-dark.svg">
+  <img src="assets/readme/wire-light.svg" alt="MQP-3 rev2 frames: DATA 2 B, DATA OPEN/INLINE, TRAIN same/dict, FRAG 8 B, CTL" width="100%">
+</picture>
+</p>
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart LR
-    subgraph CLI["🚀  myquic2-client · pool-first"]
-        direction TB
-        SOCKS["🧦 socks.rs<br/>CONNECT / ASSOCIATE"]
-        POOL["🎰 pool.rs<br/>ConnPool · per-slot Endpoint<br/>selection-time path health"]
-        EGRESS["🧭 egress.rs<br/>SharedEgress + thread memo"]
-        HUB["🗂️ hub.rs<br/>UdpHub · 4032 sessions"]
-        ASSOC["🔁 assoc.rs<br/>app ↔ QUIC relay"]
-        DISP["📥 dispatcher.rs<br/>per-slot DATAGRAM reader"]
-        AUTHC["📞 auth.rs<br/>dial · backoff · watchdog"]
-        SOCKS --> POOL
-        SOCKS --> ASSOC
-        POOL --> AUTHC
-        ASSOC --> HUB
-        HUB --> DISP
-        EGRESS -.-> ASSOC
-    end
-    subgraph SRV["🛰️  myquic2-server · admission-first"]
-        direction TB
-        ACC["🚪 accept.rs<br/>accept + handle_conn"]
-        AUTHX["🔑 auth.rs<br/>constant-time token gate"]
-        TABLE["🗃️ table.rs<br/>ShardedSessTable · 8 shards"]
-        FWD["➡️ forward.rs + reader.rs<br/>uplink · staged TRAIN reply"]
-        TCPS["🌐 tcp.rs<br/>happy-eyeballs dial-out"]
-        PIN["📌 pin.rs<br/>ConnPin · DestMemo"]
-        ACC --> AUTHX
-        AUTHX --> TABLE
-        TABLE --> FWD
-        FWD --> TCPS
-        FWD -.-> PIN
-    end
-    CLI ==>|"QUIC streams ⟷ DATAGRAMs<br/>TLS 1.3 · MQP-3"| SRV
-    style CLI fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
-    style SRV fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef cli fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef cli2 fill:#ecfeff,stroke:#0891b2,stroke-width:1.5px,color:#164e63
-    classDef srv fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    class SOCKS,POOL,AUTHC cli
-    class EGRESS,HUB,ASSOC,DISP cli2
-    class ACC,AUTHX,TABLE,FWD,TCPS,PIN srv
-```
+- **`DATA` — 2 B steady.** A connection-scoped monotonic `wire_id` and the payload. No session, no address, no length.
+- **`DATA OPEN / INLINE` — the first frame.** Self-describing `(session, address)`; OPEN repeats until ACKed. INLINE is the table-full fail-safe.
+- **`TRAIN` — one frame, many payloads.** Same-flow: 3 B header + 1 B/item. Dict form mixes flows and associations in one DATAGRAM.
+- **`FRAG` — 8 B steady.** Payloads up to 8 KiB; `(wire_id, frag_id)` reassembly; context only on the first fragment.
+- **First-byte safety.** All rev2 frames start with `0x0X`, disjoint from MQP-2 and the v0.2.0 wire; old parsers drop them safely. A non-rev2 peer fails fast at HELLO/CAPS.
 
-TCP `CONNECT`: `socks.rs` → `pool.pick_tcp()` → `open_bi` (5 s) → address header → optimistic `0.0.0.0:0` reply → `copy_tcp_quic_acked` (idle 300 s, dial-ACK 25 s).
-UDP `ASSOCIATE`: `assoc.rs` relay socket → `hub.alloc_sess` (cap 4032) → `egress.with_fresh` → per-connection `R2Stager` → rev2 `DATA`/`TRAIN`/`FRAG` → server `accept.rs` reader (ingress + reassembler) → `forward_server_dgram` → per-session socket → reply `reader.rs` connection stager emits rev2 `DATA`/`TRAIN`/`FRAG` → client `dispatcher.rs` (registry + reassembler) → `assoc` relay socket → app.
+**Implementation contract:** [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md)
 
-#### 🎰 Connection pool panorama — every slot is a full QUIC endpoint
+## 🔁 Full duplex
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart TB
-    subgraph APPS["🧑‍💻  application flows"]
-        direction LR
-        APP2["🎮 DNS · game<br/>interactive"]
-        APP1["🖥️ bulk TCP flow"]
-        APP4["🔍 small UDP assoc<br/>≤ 512 B"]
-        APP3["📞 bulk UDP assoc<br/>VPN · media"]
-        APP2 ~~~ APP1 ~~~ APP4 ~~~ APP3
-    end
-    subgraph POOL["🎰  ConnPool · 7 connections by default"]
-        direction TB
-        subgraph UDPR["🟠 UDP range · udp_split on"]
-            direction LR
-            U0["slot 4<br/>⚡ interactive UDP<br/>≤ 512 B flows"]
-            U1["slot 5<br/>📦 bulk shard 0"]
-            U2["slot 6<br/>📦 bulk shard 1"]
-            U0 ~~~ U1 ~~~ U2
-        end
-        subgraph TCP["🔵 TCP pool · quic_conns = 4"]
-            direction LR
-            T0["slot 0<br/>📌 interactive<br/>DNS · NTP · STUN"]
-            T1["slot 1<br/>📦 bulk RR"]
-            T2["slot 2<br/>📦 bulk RR"]
-            T3["slot 3<br/>📦 bulk RR"]
-            T0 ~~~ T1 ~~~ T2 ~~~ T3
-        end
-    end
-    subgraph SLOT["🔧  inside every slot — no shared receive path"]
-        direction LR
-        EP["🔌 Endpoint<br/>own UDP socket · CID table · driver"]
-        CN["🔗 Connection<br/>ArcSwap · live bit · watch generation"]
-        DL["📥 dispatcher<br/>DATAGRAM reader · reassembler"]
-        LP["📞 conn_loop<br/>dial · backoff · silence watchdog"]
-        EP --- CN --- DL --- LP
-    end
-    APPS ==>|"pick_tcp → pinned / round-robin<br/>udp_bind → interactive / shard"| POOL
-    POOL -.->|"every slot expands to"| SLOT
-    style APPS fill:#f8fafc,stroke:#cbd5e1,stroke-width:1.5px,color:#0f172a
-    style POOL fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
-    style TCP fill:#eff6ff,stroke:#60a5fa,stroke-width:2px,color:#1e3a8a
-    style UDPR fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    style SLOT fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
-    classDef tcp fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
-    classDef udp fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    classDef infra fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
-    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
-    class T0,T1,T2,T3 tcp
-    class U0,U1,U2 udp
-    class EP,CN,DL,LP infra
-    class APP1,APP2,APP3,APP4 app
-```
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/duplex-dark.svg">
+  <img src="assets/readme/duplex-light.svg" alt="Full-duplex MQP-3 rev2 lifecycle: client-owned and server-owned flows, domain rebind, SESS_CLOSE" width="100%">
+</picture>
+</p>
 
-> `pick_tcp`: interactive ports → slot 0, bulk → `1 + rr % (n-1)`; failover continues the rotation over the live set, so a reconnect spreads flows instead of piling them onto slot 1. `udp_bind`: first datagram decides for life (interactive port or ≤512 B → interactive; a port in `udp_bulk_ports` forces bulk regardless of size, so a VPN tunnel — first packet 148 B — does not share the interactive connection with DNS/STUN/games; else round-robin shard). `SharedEgress` hot path is a thread-local memo (generation + 1000 ms stamp, zero locks); `udp_fail_closed = true` never spills UDP onto a TCP cwnd.
+- **Both endpoints can open a flow.** Client-owned and server-owned ids share one table. `FLOW_ACK` confirms; a compressed downlink is also an implicit ACK.
+- **Everything worth compressing compresses.** Domain targets, pure-uplink flows, and — with `udp_full_cone = true` — server-owned flows for unsolicited sources. The app replies on the same id.
+- **Source changes rebind the same id.** One `OPEN|SRC` teaches the actual reply source; the client writes it into the SOCKS5 reply header, unchanged for apps.
+- **Optimistic first packet.** A new UDP connection does not wait for CAPS: the first payload can leave immediately. The server buffers up to 8 pre-HELLO frames (16 KiB) and releases them in order after a valid HELLO. Wrong-version HELLOs never release the buffer.
+- **Close means close.** `SESS_CLOSE` / `FLOW_CLOSE` purge bindings, queued stager items and in-flight partials on both ends.
 
-#### 🔵 TCP ECHO path — one SOCKS connection, one QUIC stream
+## 🚀 Cross-session stager
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
-sequenceDiagram
-    autonumber
-    box rgb(236, 253, 245) Client edge
-        participant App as 🖥️ App
-        participant Socks as 🧦 socks.rs
-        participant Pool as 🎰 pool.rs
-        participant QC as 🚀 QUIC client
-    end
-    box rgb(255, 247, 237) Exit side
-        participant QS as 🛰️ QUIC server
-        participant Dial as 🌐 tcp.rs
-        participant Tgt as 🎯 Target
-    end
-    rect rgb(240, 253, 244)
-        Note over App,Socks: ① SOCKS5 CONNECT · atyp + addr + port
-        App->>Socks: CONNECT atyp + addr + port
-        Socks->>Pool: pick_tcp(target)
-        Pool-->>Socks: slot 0 (pinned) or RR bulk slot
-    end
-    rect rgb(238, 242, 255)
-        Note over Socks,QC: ② stream setup · optimistic success
-        Socks->>QC: wait_conn + open_bi (5 s budgets)
-        Socks->>QC: write AddrHeader (7 / 19 / 259 B)
-        Socks-->>App: ✅ 0.0.0.0:0 SUCCESS (optimistic, no dial wait)
-        QC->>QS: STREAM head + raw bytes (zero-copy past head)
-    end
-    rect rgb(255, 247, 237)
-        Note over QS,Tgt: ③ exit-side dial · ACK
-        QS->>Dial: read target (5 s) + stream-task share
-        Dial->>Dial: DNS 8 candidates + happy-eyeballs 250 ms stagger
-        Dial->>Tgt: TCP connect + set_nodelay
-        Dial-->>QS: ACK MQ + bound address (5 s)
-        QS-->>QC: ACK frame
-        QC-->>Socks: read_mqp_ack (25 s budget)
-    end
-    rect rgb(236, 254, 255)
-        Note over App,Tgt: ④ bidirectional bulk copy · copy_tcp_quic_idle (300 s)
-        loop every chunk
-            App->>Tgt: c2s write_chunk ≥ 8 KiB zero-copy
-            Tgt->>App: s2c read_chunks(8) + write_vectored
-        end
-    end
-    Note over Socks,Dial: any failure → RST (SO_LINGER=0) + reset/stop 0x04
-```
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/stager-dark.svg">
+  <img src="assets/readme/stager-light.svg" alt="Cross-session stager packs payloads from several associations into one round-robin TRAIN dict" width="100%">
+</picture>
+</p>
 
-#### 🟠 UDP ECHO path — one ASSOCIATE, one session id, three frame shapes
+One stager per QUIC connection, not per association. Small payloads from every app share a per-session FIFO with a round-robin cursor; one `TRAIN dict` can carry them all. Bounded queue, exact drop accounting, per-session fairness, `CAPS.max_train_items` honored.
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
-sequenceDiagram
-    autonumber
-    box rgb(236, 253, 245) Client edge
-        participant App as 🎮 App
-        participant Assoc as 🔁 assoc.rs
-        participant Hub as 🗂️ hub.rs
-        participant Egr as 🧭 egress.rs
-        participant Disp as 📥 dispatcher.rs
-    end
-    box rgb(238, 242, 255) QUIC tunnel
-        participant QC as 🚀 QUIC client
-        participant QS as 🛰️ QUIC server
-    end
-    box rgb(255, 247, 237) Exit side
-        participant Sess as 🔌 session socket
-        participant Tgt as 🎯 Target
-    end
-    rect rgb(240, 253, 244)
-        Note over App,Hub: ① association setup
-        App->>Assoc: SOCKS5 UDP ASSOCIATE
-        Assoc->>Hub: alloc_sess (cap 4032)
-        Assoc-->>App: BND relay ip:port
-        App->>Assoc: UDP datagram (RSV / FRAG checked)
-        Assoc->>Assoc: lock app ip + port on 1st valid packet
-    end
-    rect rgb(238, 242, 255)
-        Note over Assoc,QC: ② pick a frame shape · egress binding
-        Assoc->>Egr: with_fresh(bind)
-        alt confirmed flow, fits one frame
-            Egr->>QC: rev2 DATA · 2 B steady (OPEN while unconfirmed)
-        else several small payloads (same or mixed flows)
-            Egr->>QC: rev2 TRAIN same/dict · 3–4 B header + 1–2 B/item
-        else payload larger than one frame
-            Egr->>QC: rev2 FRAG × N · 8 B steady header
-        end
-        QC->>QS: QUIC DATAGRAM (unreliable, no head-of-line blocking)
-    end
-    rect rgb(255, 247, 237)
-        Note over QS,Tgt: ③ exit-side fan-out
-        QS->>QS: FastSess 16 · reassemble 2 s · resolve fast → slow
-        QS->>Sess: get_or_create_sess + udp_try_send
-        Sess->>Tgt: UDP payload (sendmmsg burst ≤ 32)
-        Tgt-->>Sess: reply (IP allowlist 16 + exact live flow fallback)
-        Sess->>QS: recvmmsg burst ≤ 32
-    end
-    rect rgb(236, 254, 255)
-        Note over QS,App: ④ staged reply path
-        alt small replies (≤ one DATA frame)
-            QS->>QC: rev2 DATA/TRAIN · connection stager · cross-session dict
-        else large reply
-            QS->>QC: rev2 FRAG × N
-        end
-        QC->>Disp: read_datagram · 4096-entry cache · reassemble
-        Disp->>Assoc: StagedReply runs + sendmmsg (zero payload copy)
-        Assoc->>App: UDP datagram to the locked app address
-    end
-```
+## 📊 Performance
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart LR
-    P(["📦 payload +<br/>destination"]) --> Q{"does it fit<br/>one frame?"}
-    Q -->|"yes · confirmed flow,<br/>within live budget"| S["rev2 DATA<br/>2 B steady · 1 lock"]
-    Q -->|"no · several small payloads<br/>same or mixed flows"| B["rev2 TRAIN same/dict<br/>3 B header + 1 B/item"]
-    Q -->|"no · larger payload"| F["rev2 FRAG × N<br/>8 B header · (wire_id, frag_id)"]
-    S --> SEND["🚀 send_datagram"]
-    B --> SEND
-    F --> SEND
-    SEND -->|"queued"| OK(["✅ delivered whole<br/>or dropped whole"])
-    SEND -->|"Blocked"| DROP["🗑️ drop newest<br/>never drop-oldest"]
-    SEND -->|"TooLarge"| RE["🔄 re-read live budget<br/>100 ms throttle"]
-    RE -.-> Q
-    style P fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
-    classDef decision fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
-    classDef frame fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef send fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    class Q decision
-    class S,B,F frame
-    class SEND send
-    class OK ok
-    class DROP,RE warn
-```
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/performance-dark.svg">
+  <img src="assets/readme/performance-light.svg" alt="Measured header sizes, DATAGRAM send reduction and loopback smoke results" width="100%">
+</picture>
+</p>
 
-#### 🚪 Server ingress & session lifecycle — admission before work
+- **Steady UDP header:** 5–6 B → **2 B**. **FRAG header:** 18–30 B → **8 B**. **TRAIN item:** 2 B → **1 B**.
+- **8 associations × 1000 pps × 128 B × 65 s:** 519,992 / 519,990 delivered, **0.000 % loss**, **0.743 frames/payload** (≈ **−25 %** client DATAGRAM sends vs the v0.2.0 wire).
+- **All-size sweep:** 8 B … 8 KiB **ALL OK**. **Full duplex:** 30,000 / 30,000. **Paced:** 325,000 / 325,000.
+- These are macOS loopback measurements on release binaries. The Linux 2–4 core + `tc netem` matrix is the deployment gate: [`scripts/linux-bench-matrix.sh`](scripts/linux-bench-matrix.sh).
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart TB
-    subgraph G1["🚪  Ingress · admission before work"]
-        direction LR
-        L["[::]:8443<br/>SO_REUSEPORT<br/>1 endpoint / core · ≤ 8"]
-        A["accept_loop × N<br/>own socket · CID table · driver"]
-        G{"conn limit?<br/>4096 token · 256 bare"}
-        H["🤝 handshake<br/>PRE_AUTH 5 s · HANDSHAKE 10 s"]
-        T{"token gate<br/>constant time · 256 B"}
-        RF["🚫 implicit refuse<br/>1 / s warn"]
-        C1["✂️ close 0x01"]
-        L --> A --> G
-        G -->|"permit"| H
-        G -->|"full"| RF
-        H --> T
-        T -->|"fail"| C1
-    end
-    subgraph G2["📡  Session · per connection"]
-        direction LR
-        HC["handle_conn<br/>sweep 60 s<br/>uni drain · reader"]
-        R["DATAGRAM reader<br/>await head · drain 32<br/>FastSess 16 · reassembler"]
-        F{"target form?"}
-        DN["📌 domain<br/>ConnPin → DestMemo 30 s<br/>→ moka 120 s → hickory 5 s"]
-        SS["🛡️ IP gate<br/>is_global_ip_cached<br/>allow_private"]
-        HC --> R --> F
-        F -->|"domain"| DN
-        F -->|"IP"| SS
-    end
-    subgraph G3["🔌  Egress · UDP sessions"]
-        direction LR
-        GS["get_or_create_sess<br/>memo → fair share<br/>→ limiter → socket"]
-        SO["session socket 64 KiB<br/>+ reader task<br/>recvmmsg ≤ 32"]
-        RP["↩️ reply<br/>rev2 DATA/TRAIN · FRAG if >1 frame<br/>IP allowlist 16 + flow fallback"]
-        BYE["🧹 teardown<br/>take_idle · drain_all"]
-        GS --> SO --> RP
-        RP -->|"idle 180 s / conn closed"| BYE
-    end
-    G1 ==>|"pass / empty token"| G2
-    G2 ==>|"resolved · gated<br/>get_or_create_sess"| G3
-    style G1 fill:#eff6ff,stroke:#60a5fa,stroke-width:2px,color:#1e3a8a
-    style G2 fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
-    style G3 fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
-    classDef gate fill:#fef2f2,stroke:#f87171,stroke-width:2px,color:#7f1d1d
-    classDef good fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef infra fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
-    classDef deny fill:#fff1f2,stroke:#e11d48,stroke-width:1.5px,color:#881337
-    class G,T,F gate
-    class GS,SO,RP good
-    class L,A,H,HC,R,DN,SS infra
-    class RF,C1,BYE deny
-```
+## 🛡️ Security
 
-### Shared library (`src/`): layered design
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/security-dark.svg">
+  <img src="assets/readme/security-light.svg" alt="Security model: TLS 1.3, token auth, per-packet authorization, opt-in full-cone" width="100%">
+</picture>
+</p>
 
-`src/lib.rs` is only a facade (re-exports) plus socket/shutdown primitives: dual-stack UDP with 4 MiB QUIC buffers vs 64 KiB session buffers (`SESS_SOCKET_BUF`, overridable via `MYQUIC2_SESS_SOCKET_BUF`, clamped 16 KiB–4 MiB), `SO_REUSEPORT` group helpers, `SO_*BUFFORCE` retry under `CAP_NET_ADMIN`, `shutdown_signal()` (SIGTERM/SIGINT → `CONNECTION_CLOSE`, no drain window), and `read_mqp_ack()`.
+- **Every packet is authorized.** A compressed id resolves only a live binding; unknown ids drop that item, never guess a route. SSRF/private-IP filtering is unchanged.
+- **Reply-source policy.** A 16-entry per-session IP allowlist plus the exact live flow mapping; `udp_full_cone` is opt-in, off by default and warned at startup.
+- **Transport and token.** TLS 1.3 with ALPN `h3`; the bearer token is sent only on a 1-RTT uni stream, never in 0-RTT. Token comparison is constant-time.
+- **No payload compression.** Encrypted or random UDP is left untouched; gains are framing, fewer frames and fewer sends.
 
-**Layer cake** — a thin facade at the bottom, purpose-built layers above it, and
-the two binaries on top; each layer is unit-tested in isolation:
+## 📦 Install
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart TB
-    subgraph L1["🪝  primitives · src/lib.rs facade"]
-        direction LR
-        S1["dual-stack UDP<br/>SO_REUSEPORT · SO_*BUFFORCE"]
-        S2["shutdown_signal<br/>SIGTERM / SIGINT"]
-        S3["packet clock<br/>coarse · mono"]
-        S1 ~~~ S2 ~~~ S3
-    end
-    subgraph L2["🧬  codecs · transport · policy"]
-        direction LR
-        C1["MQP-3 rev2 codec<br/>DATA · TRAIN · FRAG · CTL"]
-        C2["TLS 1.3<br/>pinned Ed25519 · 0-RTT"]
-        C3["config + admission<br/>tuning · memory math"]
-        C1 ~~~ C2 ~~~ C3
-    end
-    subgraph L3["⚡  data plane"]
-        direction LR
-        D1["UDP<br/>fragmenter · reassembler · retry"]
-        D2["TCP pump<br/>zero-copy · vectored"]
-        D3["DNS<br/>memo → moka → hickory"]
-        D1 ~~~ D2 ~~~ D3
-    end
-    subgraph L4["🔭  cross-cutting"]
-        direction LR
-        O1["stats<br/>drop warnings · throttles"]
-        O2["linux knobs<br/>busy poll · notsent-lowat"]
-        O3["time<br/>coarse · mono"]
-        O1 ~~~ O2 ~~~ O3
-    end
-    subgraph BIN["🚀  binaries"]
-        direction LR
-        B1["myquic2-client<br/>pool-first · SOCKS5 ingress"]
-        B2["myquic2-server<br/>admission-first · QUIC ingress"]
-        B1 ~~~ B2
-    end
-    L1 ==> L2 ==> L3 ==> BIN
-    L4 -.-> BIN
-    style L1 fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
-    style L2 fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#1e1b4b
-    style L3 fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    style L4 fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
-    style BIN fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
-    classDef prim fill:#dcfce7,stroke:#059669,stroke-width:1.5px,color:#064e3b
-    classDef codec fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
-    classDef data fill:#ffedd5,stroke:#ea580c,stroke-width:1.5px,color:#7c2d12
-    classDef cross fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
-    classDef bin fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc
-    class S1,S2,S3 prim
-    class C1,C2,C3 codec
-    class D1,D2,D3 data
-    class O1,O2,O3 cross
-    class B1,B2 bin
-```
+**Latest published release: [v0.2.1](https://github.com/Terutoki/MyQUIC2/releases/latest).** Assets are profile-guided (PGO) builds made from the tag by the release workflow.
 
-Layers, files and ownership. Long module lists are kept as wrapping bullets
-rather than table cells, so this section never needs a horizontal scrollbar:
-
-- **MQP-3 rev2 codec** — `mqp/r2.rs`, `mqp/r2_flow.rs`, `udp/r2_frag.rs`, `udp/r2_reasm.rs`, `udp/r2_stage.rs`; legacy `mqp/v3.rs`, `addr.rs`, `datagram.rs`, `fragment.rs`, `batch.rs`, `ack.rs`, `error.rs`. rev2 `DATA`/`TRAIN`/`FRAG`/`CTL` codec + connection-scoped flow registry + fragmenter/reassembler/stager; MQP-2 `0x02`/`0x05`/`0x06` and legacy v3 decoders remain for old-frame tests/fallback; `TargetAddrRef` borrows on the hot path; `MqpError` is `Copy` (only `&'static str`/`u8`, no `anyhow` per bad frame).
-- **Config + admission math** — `config/tuning.rs`, `client_conf.rs`, `server_conf.rs`. `TransportTuning` defaults 4/8/4 MiB; `per_connection_memory_bytes` / `session_pool_memory_bytes`; `deny_unknown_fields` (typo = startup error).
-- **TLS 1.3** — `tls/cert.rs`, `server_cfg.rs`, `client_cfg.rs`. Ed25519 self-signed gen (500 y, backdated 7 d); server `ServerSessionMemoryCache(8192)`, `max_early_data = u32::MAX` (stateful single-use 0-RTT ticket); client pins one cert, `enable_early_data`, bearer token only on 1-RTT.
-- **Transport** — `transport/build.rs`, `limits.rs`. Sole `quinn::TransportConfig` builder; BBR default; bulk class `ACK 8/10 ms + 2 MiB DATAGRAM` vs interactive `2/5 ms + 1 MiB`; path MTU starts at `initial_mtu` (default 1200 = the QUIC floor, clamp 1200–1472; raise it on known paths), with discovery capped at 1472; `keepalive → idle = max(3x, 15 s)` and client `watchdog = max(2x, 8 s) < idle`; GSO/GRO auto-probed by `quinn-udp`.
-- **DNS (3 layers)** — `dns/memo.rs` → `store.rs` → `resolve.rs` + `key.rs`/`policy.rs`. Thread-local 2-way memo (64 sets × 2 ways, key = host + port, 261 B wire-max inline) → `moka` shared cache keyed by **host** (120 s pos / 10 s neg, single-flight, so a second port of the same name reuses one resolution) → cancellable `hickory` upstream (5 s); `ipnet` CIDR egress policy.
-- **UDP dataplane** — `udp/batch.rs`, `send.rs`, `fragmenter.rs`, `reassembler.rs`, `retry.rs`. `sendmmsg`/`recvmmsg` bursts (`LAST_HOP_DRAIN = 32`); `Blocked` drops newest (never `drop-oldest`); per-`(sess,id)` fragmenter; `(sess,id)` reassembler with 2 s expiry, 256 KiB / 256-partial caps, fingerprint tombstones; 16-shard `WouldBlock` retry pool (256 deep, 200 ms deadline).
-- **TCP pump** — `tcp/pump.rs`. `copy_tcp_quic[_idle/_acked]`: c2s double-buffer + `write_chunk` zero-copy ≥8 KiB, s2c `read_chunks(8)` + `write_vectored`; borrowed QUIC halves (no `Drop::finish` masquerading errors as FIN); RST (`SO_LINGER=0`) + `reset/stop(0x04)` on failure.
-- **Observability** — `stats/drops.rs`, `udp_stats.rs`, `udp_write.rs`, `warn.rs`. Thread-local batching (256 records / 256 KiB per flush); `lost()` excludes `UNKNOWN_SESS` (late replies ≠ tunnel loss); 10 s drop-warning + 1 s log-window throttles.
-- **Time** — `time/coarse.rs`, `mono.rs`. Packet clock `coarse_millis()` (`quanta::Instant::recent`, ~4–5 ns, dedicated upkeep thread); `mono_millis()` process uptime on the same base so the two are subtractable.
-
-Key constants (all pinned by unit tests): rev2 `DATA` steady = **2 B** (id < 128), `DATA OPEN` = 14 B IPv4 / 26 B IPv6 / 11+L domain, `TRAIN` same-flow = 3 B header + 1 B/item, `TRAIN dict` = 4 B + ids, `FRAG` steady = **8 B**, `CTL HELLO/CAPS wire_ver = 2`, `R2_MAX_TRAIN_ITEMS = 64`, per-connection flow cap 4096, per-session flow cap 64, stager 1024 items / 256 KiB, reassembly 8 KiB / 2 s / 256 partials / 256 KiB (legacy + rev2 both admission-charged). Legacy (receive/test only): v3 `SINGLE` 5/6 B, v3 `TRAIN` 6 B, MQP-2 `DGRAM_PREFIX_LEN = 5`, `FRAG_PREFIX_LEN = 11`, `BATCH_PREFIX_LEN = 5`, `MAX_BATCH_ITEMS = 16`, `BATCH_SMALL_MAX = 512 B`; `UDP_PAYLOAD_MAX = 65507 B`, `AUTH_TOKEN_MAX = 256 B`, `ALPN = myquic2/3` (default `h3` masquerade).
-
-### Client (`src/bin/myquic2-client/`): pool-first design
-
-- **`main.rs` startup**: `mimalloc` → warm `coarse_millis` → `load_toml<ClientConf>` → validate token ≤256 B → build interactive/bulk `ClientConfig`s → **one `quinn::Endpoint` + one UDP socket + one pinned current-thread runtime per pool slot** (no shared receive path; `connect_with` per slot; slots are pinned in priority order — interactive TCP, interactive UDP, remaining TCP, remaining UDP — and slots past the core count float) → one dispatcher + one reconnect loop per slot, spawned into that slot's runtime → `TcpListener` accept loop (`MAX_SOCKS_CONNS = 8192`) → `SIGTERM/INT` wakes every shard, which closes and drains its own endpoint under a 1 s budget (`MYQUIC2_SHARD_RUNTIME=0` restores the single shared runtime).
-- **`pool.rs` layout** (`ConnPool`, default `quic_conns = 4`, clamp 1–16): slots `0..tcp` are TCP (slot 0 = interactive, rest bulk round-robin); past them the UDP range (split on: 1 interactive + `udp_egress_conns` bulk shards, default 2, clamp 1–8; split off: 1 shared). Slot state is `Arc<ArcSwapOption<Connection>>` + `live: AtomicBool` + `watch<u64>` generation — reads are lock-free, `clear_if_and_mark_dead` is stable-id-guarded so a racing `publish` cannot blackhole. `wait_conn` trusts `close_reason`, `live` is only a lock-skipping hint. Bulk failover stays inside its class; only `udp_fail_closed = false` may spill to TCP.
-- **`egress.rs` (`SharedEgress`)**: hot path is a thread-local memo (`generation` + 1000 ms stamp, zero `Arc`/zero quinn lock); miss goes `generation → acquire → memo_store`. Winner refreshes globally (sticky: re-stamp a live connection instead of flapping back), losers serve stale-while-revalidate. `TooLarge` only re-reads `max_datagram_size` (100 ms throttle), `ConnectionLost` invalidates, `Unsupported` never invalidates. Order: own slot → same-class siblings → (fail-open only) other class/TCP.
-- **`hub.rs` (`UdpHub`, 256 shards, cap 4032)**: `alloc_sess` CAS-reserves `len` before minting (skips 0/`u32::MAX`); `AssocEntry` holds a `Weak`-free relay `Arc<UdpSocket>`, `ArcSwapOption` app addr, `replied` activity bit + 1 Hz-throttled touch; idle 180 s (30 s tick) reaps. `SessReservation` RAII guarantees `release` on panic.
-- **`dispatcher.rs` (per slot)**: `wait_conn(10 s)` → `read_datagram` + 4096-entry direct-mapped cache (`Weak` socket, `sess` + liveness check) + per-connection `R2Reassembler` (rev2 `FRAG`) and the legacy `DgramReassembler` (500 ms sweep). rev2 `DATA`/`TRAIN` resolve `wire_id` through the connection `FlowRegistry`, install server-owned flows on `OPEN|SRC`, and fan out to `StagedReply`s grouped by contiguous `(sock, app)` runs and flushed via `sendmmsg` (zero payload copy); unknown ids drop only that item. Domain misses go through the 1024-permit slow-path limiter and resolve-then-forward tasks. Read errors back off 100 ms → 1 s on `gen.changed`.
-- **`assoc.rs` (per association)**: pooled recv buffers (`ASSOC_RECV_BUF_LEN`, depth 8, ~34 MiB bound); `bind_relay` advertises the local IP; app source IP is pinned from the TCP peer, full `(ip, port)` locked on first valid packet (malformed `RSV/FRAG`/addr never locks). Uplink: every size is rev2 — a payload that fits one DATA frame is sent as steady/OPEN/INLINE `DATA`, ≤512 B items may stage into a same-flow `TRAIN` (path-budget packed), and larger payloads use `R2Fragmenter`; the legacy MQP-2 fragmenter is no longer used for production UDP. Idle tick carries 0–199 ms jitter; 180 s bidirectional silence exits and recycles the buffer.
-- **`auth.rs` (per slot)**: `resolve_server_addr` → `dial_once` under a 5 s deadline (`connect_with` → `into_0rtt`; token **never** in 0-RTT, sent as verbatim bytes on a 1-RTT uni stream) → double `ensure_dialed_alive` (quinn 0.11 can publish an already-dead handle) → `publish + bump`. Backoff is `backon` exponential (200 ms ×2, 5 s cap) + `rand` 0–200 ms jitter; ≥5 s healthy resets it. Silence watchdog (`2 × keepalive`, 8 s floor, 1 s poll): downlink = no datagrams, uplink = ACKs stalled while sends advance; either closes and redials. The watchdog window is derived from the same clamped keepalive as the `3 × keepalive`/15 s-floor QUIC idle timeout and is provably strictly below it (unit-tested over 1–300 s), so it is an independent detector rather than dead code the idle timer always beats.
-- **`socks.rs`**: 10 s negotiate budget (greeting must offer `0x00`, else `0xFF`; `ASSOCIATE` outer addr parsed leniently); `open_bi`/header 5 s each; `close_reason`-armed failure mapping (`HOST_UNREACHABLE` vs `GENERAL_FAILURE`); header write failure → `reset/stop(0x04)`; optimistic SOCKS reply precedes the 25 s server dial-ACK wait (`MAX_SOCKS_CONNS ≤ MAX_BIDI_STREAMS_PER_CONN` asserted).
-
-### Server (`src/bin/myquic2-server/`): admission-first design
-
-- **`main.rs` startup**: `coarse_millis` warm → `load_toml<ServerConf>` → token/congestion/IP-preference checks → placeholder/open-proxy warnings → cert reuse-or-generate (both files or neither; one missing = bail, never overwrite a pinned cert) → `server_tls_config` + `build_transport_tuned` → `SO_REUSEPORT` endpoint group → `AcceptState{conn_limit, pending_limit, …}` → one `accept_loop` per endpoint → `shutdown_signal` closes endpoints (`CONNECTION_CLOSE`, 3 s `wait_idle`; a lost driver bails so a supervisor restarts instead of half-serving).
-- **Ingress parallelism**: `quic_endpoints` unset = one per usable core on Linux (cgroup-aware, capped at 8), 1 elsewhere; clamped 1–8. Each member is a full `quinn::Endpoint` (own socket/CID table/driver) run inside its **own pinned current-thread runtime**, so the driver, accept loop, connection tasks and all of their thread-local state stay on one core instead of migrating under work-stealing; Linux spreads by 4-tuple, macOS delivers to the last-bound member only (warned). A NAT rebind re-hashes to a member that does not know the CID — the connection drops and the client redials. `MYQUIC2_SHARD_RUNTIME=0` applies to **both binaries**: the server's ingress endpoints and the client's pool slots go back to the shared multi-thread runtime.
-- **`accept.rs` accept**: `try_acquire(conn_limit)` else implicit refuse (1/s warn); with auth, an additional `pending_limit = min(256, cap)` slot. Handshake deadlines: `PRE_AUTH 5 s` (holding a pending slot) / `HANDSHAKE 10 s` (tokenless) / `AUTH 5 s` re-armed after the handshake, then `handle_conn`. Per connection: 60 s session sweep task + uni-stream drain (`stop(0)`) + DATAGRAM reader (awaited head + `now_or_never` drain to 32, `yield_now` on a full burst; 16-entry `FastSess` + `DgramReassembler` + 500 ms sweep tick).
-- **`auth.rs` gate**: client writes the token verbatim on a uni stream (`read_to_end`, 256 B cap); empty token = auth off. Comparison is `subtle::ConstantTimeEq` with length folded in, buffer wiped via `Zeroizing`; failure closes `0x01`.
-- **Admission (`table.rs` + `tuning.rs`)**: `conn_cap` = configured `max_connections` else 4096 with token / 256 without (clamped 1–4096); `max_peer_memory_mb` → `admission_cap = (budget − fixed) / per_conn`, where `fixed` = UDP session pool (~1.09 GiB non-Linux, ~2.09 GiB Linux) + ingress endpoint buffers (~18.875 MiB per endpoint on Linux) + TCP relay pump buffers (512 MiB) and `per_conn` defaults to 14.5 MiB; ≤ `fixed` admits exactly 1, logged. Process caps: `MAX_CONNECTIONS 4096`, `MAX_UNAUTH 256`, `MAX_DIALS_GLOBAL 4096`, `MAX_STREAM_TASKS 16384` (min 1024 share/conn), `MAX_SESSIONS_GLOBAL 8192`, per-conn `LOCAL_SESS_MAX 4096 / TARGET 4032 = MAX_UDP_ASSOCS` (compile-asserted equal), `MIN_SESSION_SHARE 1024`, 8 shards (`foldhash`), 180 s idle. `fair_sess_cap = clamp(8192/holders, 1024, 4096)` counts only non-empty tables; `len_upper_bound` + 1/s throttled sweeps stop forged sess-ids from becoming an `O(sessions)` amplifier.
-- **`forward.rs` + `reader.rs` (UDP)**: IP targets → SSRF check → `get_or_create_sess` → `udp_try_send`; domain targets → fast memo/pin → or single-flight `resolve_all_cached` waiter (each waiter sends its own payload, no queue). Session creation checks sess-memo → shard read → fair-share → `max_datagram_size` (only on the creation path, never for a cheap refusal) → global limiter → socket (lock-free syscall) → spawn reader → racing insert adopts the live entry. Reply path (`sess_reader_task`, 8 KiB + slack pooled buffers, `recvmmsg` to 32): 1 s touch, 10 s budget refresh (100 ms `TooLarge` throttle), 16-entry IP-only allowlist plus an exact live flow mapping on a ring miss (port changes legal; bypassed by `udp_full_cone`, which forwards any source), small replies staged into the connection-level `R2Stager` (cross-session `TRAIN dict` or steady `DATA`, per-reply fallback to `FRAG`); the ingress DATAGRAM reader arms the per-connection `FastSess`/pin fast table from the rev2 `DATA`/`TRAIN`/`FRAG` arms (legacy single/fragment/BATCH/v3 decoders remain receive/test-only), so packed small-packet flows keep the staged `sendmmsg` path. One quinn budget probe per cached `limit` (N=1 contract).
-- **`pin.rs` (DNS pinning)**: `ConnPin` (255 B inline host) → session `DestMemo` (255 B key = wire-format max, 30 s TTL, 7.5 s refresh) → thread DNS memo (261 B key); adopted life = `min(30 s, source remainder)`; `is_global_ip_cached` (64-entry thread hash); `RecentAddrs` 16-entry IP ring with epoch-gated mirroring so a foreign resolver push cannot evict-then-drop.
-- **`tcp.rs` (dial-out)**: 5 s target read → stream-task share (`fetch_add`, trickle headers hold no permit; over-share fails fast `0x05`) → DNS (8 candidates, v4/v6 interleave) → dial limiter (`0x04`) → `happy-eyeballs` staggered racing (250 ms, 4 s total, `allow_private` filtered, max 8) → `set_nodelay` → 5 s dial-ACK write → `copy_tcp_quic_idle` (300 s). Resets: `0x01` header timeout / `0x04` dial / `0x05` admission.
-- **`memo.rs`**: 128-entry thread-local `(conn_id, sess)` → `Weak` socket memo (never extends fd life) + 1/s-throttled touch memo (gate on `coarse_millis`, store `mono_millis`); global monotonic `conn_id` defeats stable-id aliasing across connections.
-
----
-
-## 🚀 Quick Start
+- `myquic2-v0.2.1-x86_64-unknown-linux-musl.tar.gz` — static musl build, runs on any x86-64 Linux.
+- `myquic2-v0.2.1-x86_64-unknown-linux-gnu.tar.gz` — glibc ≥ 2.36 (Debian 12+, Ubuntu 23.04+).
+- `myquic2-v0.2.1-openwrt-x86_64-v1.tar.gz` — OpenWrt safe default for every x86-64 CPU.
+- `myquic2-v0.2.1-openwrt-x86_64-v2..v4.tar.gz` — SSE4.2 / AVX2 / AVX512 tuned (a mismatch dies with `Illegal instruction`).
+- `SHA256SUMS` — checksums for every asset.
 
 ```sh
-# 1️⃣ Start the server (generates a self-signed Ed25519 certificate on first run)
-./myquic2-server --config config-server.toml
-
-# 2️⃣ Copy only server-cert.pem (the certificate — never the key) to the client side
-
-# 3️⃣ Start the client
-./myquic2-client --config config-client.toml
-
-# 4️⃣ Use it (same story for browser / system proxy settings)
-curl --socks5 127.0.0.1:1080 https://example.com
+sha256sum -c SHA256SUMS
 ```
 
-> 💡 Control logging with `RUST_LOG`: `RUST_LOG=myquic2_client=debug,myquic2_server=debug`
+Each tarball contains `myquic2-server`, `myquic2-client` and sample configs. Build from source with Rust 1.99+:
 
----
+```sh
+cargo build --release --bins
+# target/release/myquic2-server
+# target/release/myquic2-client
+```
+
+> [!NOTE]
+> `v0.2.1` is the latest published release. The `main` branch adds the optimistic first-packet path described above; those changes ship in the next release. macOS and non-x86-64 targets build from source.
+
+## ⚡ Quick start
+
+```sh
+# 1. Build
+cargo build --release --bins
+
+# 2. Configure
+#    config-server.toml: listen, auth_token, server_name, cert/key
+#    config-client.toml: server_addr, auth_token (same secret), socks_listen
+#    Set a non-empty auth_token on both sides.
+
+# 3. Run
+./target/release/myquic2-server --config config-server.toml
+./target/release/myquic2-client --config config-client.toml
+
+# SOCKS5 endpoint: 127.0.0.1:1080 (TCP streams + UDP ASSOCIATE)
+```
+
+The client and server must run the **same revision**. Certificates are generated on first server start; see [`config-server.toml`](config-server.toml) and [`config-client.toml`](config-client.toml) for every documented key.
 
 ## ⚙️ Configuration
 
-<details>
-<summary><b>Server <code>config-server.toml</code></b> — click to expand</summary>
+- **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
+- **UDP scheduling:** `udp_split`, `udp_egress_conns`, `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
+- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
-<br>
-
-```toml
-listen = "[::]:8443"           # QUIC ingress (dual-stack)
-cert_file = "server-cert.pem"  # self-signed, generated on first run
-key_file = "server-key.pem"
-server_name = "test.com"       # certificate SAN + expected SNI
-congestion = "bbr"             # bbr | cubic
-keep_alive_secs = 5            # 1–300; QUIC idle = max(3x, 15s)
-# initial_mtu = 1400             # path MTU (UDP payload) start, 1200–1472; default 1200 = QUIC floor, raise on known paths; mirror on both ends
-# quic_endpoints = 4           # SO_REUSEPORT ingress endpoints, 1–8 (default: one per core on Linux, capped at 8; 1 elsewhere)
-# dns_ip_preference = "ipv6"   # ipv6 (default) | ipv4: family tried first for resolved targets
-allow_private = false          # keep false on public exit nodes
-# udp_full_cone = false        # full-cone UDP relay: forward replies from ANY source (P2P); exposes app endpoints, opt-in
-auth_token = ""                # shared secret; must match the client (empty = no auth; firewall otherwise)
-
-# max_connections = 4096       # connection cap (defaults to 256 without a token)
-# max_peer_memory_mb = 512     # cap on peer-pinnable memory (UDP session pool charged first)
-```
-
-</details>
-
-<details>
-<summary><b>Client <code>config-client.toml</code></b> — click to expand</summary>
-
-<br>
-
-```toml
-socks_listen = "[::]:1080"
-server_addr = "127.0.0.1:8443"
-server_name = "test.com"              # must match the certificate SAN
-server_cert_file = "server-cert.pem"  # pinned server certificate
-congestion = "bbr"
-keep_alive_secs = 5
-reconnect_timeout_secs = 5
-# dns_ip_preference = "ipv6"           # ipv6 (default) | ipv4: family tried first (incl. server_addr)
-auth_token = ""                       # must match the server
-quic_conns = 4                        # TCP pool size, 1–16 (UDP has its own connections)
-# initial_mtu = 1400                  # path MTU (UDP payload) start, 1200–1472; default 1200 = QUIC floor, raise on known paths; mirror on both ends
-
-# udp_split = true                    # split interactive/bulk UDP egress (default on)
-# udp_egress_conns = 2                # bulk UDP shards, 1–8: N associations spread over min(N, k) connections per end
-# udp_fail_closed = true              # drop rather than degrade when UDP has no connection
-# interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
-# udp_bulk_ports = [51820, 1194]      # ports forced to the bulk class regardless of first-packet size (WireGuard, OpenVPN)
-```
-
-</details>
-
-| Note | Detail |
-|---|---|
-| 🔐 `auth_token` | Strongly recommended; an empty token makes the server an open relay (firewall isolation only). At most 256 B on the wire (a longer token can never authenticate and is rejected at startup) |
-| 🧵 `quic_conns` | TCP pool size; interactive ports (DNS/NTP/STUN) pin to slot 0; UDP gets its own connections: one interactive plus `udp_egress_conns` (2 by default) bulk shards. Every slot dials from its own QUIC endpoint (own UDP socket and receive path) |
-| 🛡️ `allow_private` | Whether private/loopback targets may be dialed (default `false`) |
-| 🕳️ `udp_full_cone` | Server: full-cone NAT semantics for the per-association UDP relay — replies from **any** source are forwarded to the client app, not just from hosts it has sent to (endpoint-independent filtering). This lets a peer initiate to the app's discovered UDP endpoint (P2P games, WebRTC, peer-hosted sessions). Default `false`: it exposes each client app's UDP endpoint to unsolicited internet traffic, peers are outside the `auth_token` boundary, and it only works if the server's ephemeral relay UDP ports are reachable through the host firewall / cloud security group. No client-side config or wire change — the app discovers the mapped endpoint itself (e.g. STUN through the tunnel). This mode adds no per-session inbound rate limit, so the app and the connection's DATAGRAM budget absorb any flood. Combined with `allow_private = true`, an unsolicited or source-spoofed sender can steer app replies toward private/loopback targets — keep `allow_private = false` on public servers |
-| 🚦 `quic_endpoints` | Server ingress parallelism: QUIC sockets sharing `listen` through `SO_REUSEPORT`, each with its own receive loop, CID table and accept path. Default is one per usable core on Linux (kernel spreads connections across the group); 1 on other platforms, where a REUSEPORT group is delivered to a single member. A connection is pinned to its member by 4-tuple, so a client NAT rebind drops it (the client redials) |
-| 🌐 `dns_ip_preference` | Family tried first for resolved names: `"ipv6"` (default, RFC 6724-style) or `"ipv4"`; applies to exit-side targets and the client's `server_addr` |
-| 🧭 `udp_bulk_ports` | Destination ports forced to the **bulk** UDP class regardless of first-packet size (default `[51820, 1194]` = WireGuard / OpenVPN). An association's class is fixed by its first datagram, and a tunnel's first packet is small (WireGuard handshake 148 B), so without this override the whole tunnel would ride the single interactive connection next to DNS/STUN/games and could never use the bulk shards. A port in `interactive_ports` keeps precedence; set `[]` to restore the pure size heuristic |
-| 🧮 `max_peer_memory_mb` | Optional server admission cap. The **fixed process-wide terms** are charged first — UDP session pool (~1.09 GiB non-Linux / ~2.09 GiB Linux, since the kernel doubles `SO_*BUF`), endpoint buffers (~19 MiB per ingress endpoint) and TCP pump buffers (~512 MiB at `MAX_STREAM_TASKS`) — then the remainder is divided by the 14.5 MiB per-connection transport figure — see [Limits & memory](#-limits--memory) |
-| 🧮 `max_udp_assocs` | Client-only cap on concurrently published UDP associations (default `MAX_UDP_ASSOCS` 4032, clamped 1–4032). Each association owns a relay socket whose Linux kernel caps are ~270 KiB plus an 8 KiB reader buffer, so lowering this (or `MYQUIC2_SESS_SOCKET_BUF`) is the client-side lever on a RAM-tight router |
-| 📡 Transport tuning | `stream_receive_window_mb` / `receive_window_mb` / `send_window_mb` (default 4/8/4 MiB), `ack_threshold` (2), `max_ack_delay_ms` (5), `initial_rtt_ms` (190, clamped 1–3000), `initial_mtu` (default 1200 = the QUIC floor, clamped 1200–1472; raise it on a known path). The 4/8/4 MB default sizes flow control for ~240 Mb/s @ 140 ms; the `2/4/2` low-memory preset gives ~114 Mb/s at 8.25 MiB per connection, and `8/16/8` ≈ 300 Mb/s peak at 2x/4x loaded latency. `initial_mtu` is the path MTU every connection starts from: at the default 1200 (the QUIC floor) quinn needs 4 probe/ACK RTTs to reach 1472 and, until then, sends 18–23% more packets and splits UDP payloads above 1150 B into 2 MQP fragments. Raise it on a known path: 1360 B payload + 28/48 B IP/UDP = 1388/1408 wire bytes, safe on WireGuard-1420 and similar tunnels; a known 1500-byte Ethernet path can use 1400/1472 (1420-byte UDP payloads stay a single frame at 1472). Values below 1200 clamp up to 1200 (QUIC forbids smaller packets). Mirror on both ends. `MYQUIC2_SESS_SOCKET_BUF` (bytes, 16 KiB–4 MiB) resizes the per-session kernel buffers without a rebuild |
-| 🧵 Runtime topology | `MYQUIC2_SHARD_RUNTIME=0` (also `false`/`off`/`no`) puts **both binaries** back on the shared multi-thread runtime. Default: one pinned current-thread runtime per server ingress endpoint and per client pool slot — see [Architecture](#-architecture); the topology in use is logged at startup |
-| ⚡ Linux socket tuning | `MYQUIC2_BUSY_POLL` (µs, clamped ≤1000, default off): `SO_BUSY_POLL` + `SO_PREFER_BUSY_POLL` on every UDP socket this crate creates (QUIC endpoints *and* session/relay sockets) — trades CPU for wakeup latency, for dedicated Linux servers. `MYQUIC2_TCP_NOTSET_LOWAT` (bytes, default 64 KiB, `0` = kernel default, clamped 4 KiB–4 MiB): `TCP_NOTSENT_LOWAT` on every relay TCP stream so the kernel send buffer cannot stack unsent bytes ahead of the QUIC flow control. The SOCKS listener also arms `TCP_DEFER_ACCEPT` (1 s) and `TCP_FASTOPEN` (qlen 16, only when `net.ipv4.tcp_fastopen` allows server mode) |
-
----
-
-## 📡 The MQP-3 Protocol
-
-MQP-3 is the tunnel's UDP data-plane protocol. This tree ships **wire rev2**, an
-incompatible redesign of the v0.2.0 MQP-3 wire. The protocol keeps its name; the
-revision lives only in `CTL HELLO/CAPS` `wire_ver = 2`. There is no MQP-2/v3 peer
-interop and no silent fallback: both ends must run this tree (**matched
-deployment**), and a non-rev2 peer fails fast at HELLO/CAPS. Internal wire
-version numbers never rename the protocol.
-
-The design is three ideas:
-
-1. **connection-scoped flows.** A flow is a `u32` id allocated monotonically by
-   one endpoint and mirrored by the other for the connection's lifetime. A steady
-   frame carries no session and no address — only the id.
-2. **a symmetric, full-duplex data plane.** `DATA`/`TRAIN`/`FRAG` are identical in
-   both directions; either endpoint can open a flow (client-owned `owner=0`,
-   server-owned `owner=1`); a DATAGRAM-carried CTL plane confirms, rejects and
-   tears flows down. Pure-uplink flows, domain targets and full-cone /
-   server-initiated sources all compress in both directions.
-3. **connection-level aggregation.** One per-connection stager packs small
-   payloads from **different UDP associations** into one `TRAIN dict`,
-   round-robin fair across sessions. A router carrying many apps therefore does
-   not emit one QUIC DATAGRAM per tiny payload.
-
-### Identity, ownership and tables
-
-```text
-wire_id = local_id << 1 | owner        owner = 0 client, 1 server
-local_id starts at 1 and is monotonic; ids are never reused while the
-connection lives; wire_id 0 is invalid and means "no flow" (use INLINE).
-```
-
-- The `session u32` (a SOCKS5 UDP ASSOCIATE) appears only in `OPEN`/`INLINE`
-  extended headers and in `CTL`; steady frames need only the flow id.
-- Per connection: a `FlowRegistry` (`wire_id -> binding`), a monotonic `FlowIds`
-  allocator per owner, and the connection-level stager. Defaults: **4096 live
-  flows/connection**, **64 flows/session**; both are negotiable in `CAPS`.
-- A binding records `(wire_id, session, target, state, reply_src, resolved)`.
-  `Opening -> Open` on `FLOW_ACK` or any compressed frame in the opposite
-  direction; `Closed` is terminal. A closed id fails lookup forever (no reuse),
-  so a delayed frame can never be spliced onto a new target.
-- Bounded state: stager 1024 items / 256 KiB per connection; reassembly 8 KiB
-  per payload, 2 s partial timeout, 256 partials / 256 KiB per connection; the
-  admission term charges **both** the legacy and rev2 reassembly budgets.
-
-### First-byte safety and version gate
-
-Every rev2 frame starts with a byte whose high nibble is `0` and which is not an
-MQP-2 type byte (`0x02/0x05/0x06`). The shipped v2 and v3 decoders treat such a
-byte as unknown and drop it, so mixed-version traffic can never be misrouted:
-
-```text
-0x00 DATA steady     0x01 DATA extended     0x04 TRAIN
-0x08 FRAG steady     0x09 FRAG extended     0x0C CTL
-```
-
-A client sends `CTL HELLO(wire_ver=2)` immediately on every new QUIC connection,
-but it does **not** wait for `CAPS` before the first UDP payload: once the
-connection is published, the egress generation is usable and the first datagram
-leaves optimistically. The server keeps the version gate authoritative — rev2
-data frames that arrive before a valid HELLO are held in a small bounded
-per-connection buffer (8 frames / 16 KiB) and dispatched in arrival order once
-`HELLO(2)` opens the gate; a wrong-version HELLO is answered with CAPS but never
-releases the buffer, and overflow is counted/dropped. `CAPS` therefore only
-upgrades the negotiated caps and compression limits, not packet readiness; a
-missing/wrong CAPS still closes/redials after the 2 s handshake budget. Default
-ALPN remains `h3` (the in-band gate, not ALPN, is the version boundary).
-
-### Frames
-
-One QUIC DATAGRAM body carries exactly one MQP frame. `DATA`/`FRAG` payloads are
-the remainder of the datagram (no length field); TRAIN items are length-prefixed.
-Flow ids and lengths use LEB128 (id `< 128` ⇒ one byte). Flags:
-`OPEN=0x1`, `INLINE=0x2`, `SRC=0x4` (with `OPEN`/`INLINE`, `SRC` says the inline
-address is the actual source, not the bound target).
-
-| Frame | Layout | Steady header |
-|---|---|---:|
-| `DATA` | `0x00 \| wire_id varint \| payload` | **2 B** (id < 128) |
-| `DATA OPEN` | `0x01 \| flags \| wire_id varint \| sess u32 \| addr \| payload` | 14 B IPv4 / 26 B IPv6 / 11+L domain |
-| `DATA INLINE` | `0x01 \| INLINE flag \| sess u32 \| addr \| payload` | 13 B IPv4 / 25 B IPv6 / 10+L domain |
-| `TRAIN same` | `0x04 \| form=0 \| count \| wire_id varint \| (len varint \| payload)*` | 3 B + id |
-| `TRAIN dict` | `0x04 \| form=1 \| count \| nfl \| wire_id* \| (idx \| len varint \| payload)*` | 4 B + nfl ids |
-| `FRAG` | `0x08 \| wire_id varint \| frag_id u32 \| idx u8 \| total u8 \| chunk` | **8 B** |
-| `FRAG OPEN/INLINE` | `0x09 \| flags \| [wire_id if !INLINE] \| frag_id u32 \| idx \| total \| [sess \| addr] \| chunk` | — |
-| `CTL` | `0x0C \| opcode \| body` | 4–17 B, rare |
-
-**`DATA`** is the steady state: 2 B header, rest is payload. The first frame of a
-flow is `DATA OPEN` — self-describing `(session, address)` — and while the binding
-is still `Opening` the sender repeats `OPEN` for each payload (idempotent
-server-side; losing an open costs compression, never delivery). `DATA INLINE`
-(no flow id) is the fail-safe for a full session table or id exhaustion.
-
-**`TRAIN`** packs already-open flows. Same-form is 3 B header + 1 B/item and is
-the steady shape for one busy flow; dict-form lists the flow ids once and carries
-one `idx` byte per item, so a single frame can mix flows from **different
-associations**. The stager fills only the current drain burst up to the live
-DATAGRAM budget, never waits for more payloads, and keeps per-session FIFO order;
-sessions are served round-robin so one busy association cannot starve the rest.
-A run of one is emitted as a 2 B `DATA`.
-
-**`FRAG`** carries payloads larger than one DATAGRAM up to 8 KiB. Steady
-fragments are 8 B (vs 18 B for the shipped MQP-2 fragment); the first fragment of
-an unconfirmed flow carries `OPEN`/`INLINE` context, the rest are steady. Key is
-`(wire_id, frag_id)`, `frag_id` is a monotonic u32, `total <= 64`; any lost
-fragment drops the whole payload after the 2 s timeout (UDP semantics), bounded
-by the reassembly caps above.
-
-**`CTL`** is carried in DATAGRAMs and is idempotent / loss-tolerant by design —
-losing a control frame only delays an optimisation, never delivery:
-
-| opcode | direction | meaning |
-|---|---|---|
-| `0x01 HELLO` | C→S | magic + `wire_ver=2` + flags; repeated until CAPS |
-| `0x02 CAPS` | S→C | version + caps: `max_conn_flows`, `max_flows_sess`, `max_train_items`, `max_frame_bytes`, `max_reassembly` |
-| `0x10 FLOW_ACK` | S→C (also C→S for server flows) | binding installed / pure-uplink flow confirmed |
-| `0x11 FLOW_REJECT` | both | policy / table-full / DNS failure; sender falls back to `INLINE` |
-| `0x12 FLOW_CLOSE` | both | release one flow |
-| `0x20 SESS_CLOSE` | both | release the association: socket, task, permit, bindings, queued stager items and in-flight partials |
-
-### Flow lifecycle (full duplex)
-
-```text
-client                                          server
-  |-- DATA OPEN(wire_id, sess, target, payload) ->|  validate (SSRF/policy), create session,
-  |                                               |  forward, install binding -> FLOW_ACK
-  |<- DATA OPEN|SRC(wire_id, sess, actual_src) ---|  first reply from a domain/new source
-  |   (client learns reply_src; the frame is the same 13/25 B as the old inline)
-  |-- DATA(wire_id, payload) -------------------->|  steady 2 B, both directions
-  |<- DATA/TRAIN(wire_id, payload) ---------------|  compressed after binding
-```
-
-- **Pure-uplink flows** never receive downlink data; the server's explicit
-  `FLOW_ACK` confirms them, so telemetry / game / VPN upload flows also reach the
-  2 B steady state.
-- **Domain targets** open with the domain name; the server resolves, authorizes
-  and ACKs, then compresses both directions. A reply whose source IP is a
-  resolved address but not an exact `(ip, port)` binding is taught to the client
-  with one `OPEN|SRC` “binding” frame; the client writes the learned actual source
-  into the SOCKS5 reply header (unchanged app-visible behaviour). Source changes /
-  anycast / port changes rebind the same wire id.
-- **Server-owned flows**: for a `udp_full_cone = true` unsolicited source with no
-  matching client flow, the server allocates an `owner=1` id, installs it, and
-  sends the first reply as `DATA OPEN|SRC`. The client installs it and may answer
-  on the **same** id; the server forwards that steady frame to the remote source.
-  Restricted mode (default) keeps the old `INLINE` fallback for unmatched sources.
-- `SESS_CLOSE` purges the session, all of its bindings (both halves), queued
-  stager items and in-flight reassembly partials on both ends.
-
-### What it costs
-
-| steady traffic | v0.2.0 MQP-3 | rev2 |
-|---|---|---:|
-| confirmed IP/domain flow, small payload | 5 B (flow 0) / 6 B + 4 B `sess` | **2 B** (id < 128) |
-| busy same-flow small burst | TRAIN 6 B + 2 B/item | **TRAIN 3 B + 1 B/item** |
-| mixed flows / multiple associations | one TRAIN per session | **TRAIN dict 4 B + nfl ids, 2–3 B/item**, cross-session |
-| large payload (> one frame) | 12/24 B single or 18/30 B per MQP-2 fragment | 2 B single `DATA` or **8 B per FRAG** |
-| first frame of an IP/domain flow | 12–13 B + address inline | 14/26/11+L B `OPEN`, then 2 B |
-| changed source / full-cone | 13/25 B inline every reply | one `OPEN\|SRC` (13/25 B, zero extra vs old) then 2 B |
-
-Payloads are never compressed; encrypted/random UDP does not compress and header
-compression is already this cheap. TCP carries no MQP header at all (it is a QUIC
-stream), so this table applies only to the UDP DATAGRAM plane.
-
-### Limits and invariants
-
-- Every inbound item is authorized **before** it can be staged: SSRF/allowlist
-  policy is unchanged from the shipped relay; a compressed frame resolves only an
-  already-installed binding (unknown id ⇒ drop that item, never guess a route).
-  The 16-entry per-session IP allowlist remains, with the exact live flow mapping
-  as its high-fanout fallback.
-- The server-owned flow path is reachable only under `udp_full_cone = true`
-  (opt-in, warned at startup) and only for a source the relay already received
-  from; it does not relax the restricted default.
-- Flow ids are never reused; `SESS_CLOSE`/`FLOW_CLOSE` release bindings; memory
-  and queue caps above are admission-charged where applicable.
-- Legacy MQP-2 (`0x02`/`0x05`/`0x06`) and v3 (`0x1X..0x4X`) decoders remain only
-  for old-frame tests and a small-path last-resort fallback; there is **no
-  legacy UDP production send path**. Their first-byte ranges are disjoint from
-  rev2, so both parsers can coexist safely on one connection during cleanup.
-- Default ALPN stays `h3`; the auth token still rides 1-RTT only (0-RTT early
-  data is replayable, so a bearer secret never rides it).
-
----
-
-## 🔒 Security Model
-
-- **Server identity**: the client pins the self-signed Ed25519 certificate (always on).
-- **Client identity**: an optional shared-secret `auth_token`, compared in constant time; no stream or datagram is accepted before it passes.
-- **Handshake budgets**: pre-auth 5 s (holding one of 256 pending slots), auth 5 s re-armed after the handshake, 10 s tokenless handshake timeout; failures close `0x01`.
-- **Egress policy**: with `allow_private = false`, private / loopback / CGNAT / documentation and other non-global ranges are filtered (including IPv4 embedded in NAT64, IPv4-mapped, IPv4-translated and IPv4-compatible IPv6 forms).
-- **UDP anti-spoofing**: the client accepts app datagrams only from the SOCKS control connection's peer **IP** (ports are not pinned — RFC 1928 clients may send from another port) and then locks the first full `(ip, port)` for reply delivery; the server validates reply sources against a 16-entry per-session **IP** allowlist, with an exact live `(sess, flow) -> IP` mapping as a second authorization source when the ring has evicted a high-fanout destination (a target answering from a different port still gets through if its IP is on the ring). Setting `udp_full_cone = true` deliberately trades that server-side validation for full-cone NAT reachability (opt-in, warned at startup, off by default); combined with `allow_private = true` an unsolicited or spoofed source can then steer app replies toward private/loopback targets, so the server warns about that pairing too.
-
----
-
-## 🚀 Performance Design
-
-- **Hot paths kept razor-thin**: zero-copy TCP ↔ QUIC pump (`write_chunk`/`read_chunks` hand owned buffers to quinn, one vectored write to TCP), lock-free thread-local memos (DNS, session, egress), and reused staging buffers. A relayed UDP payload costs **one exact-fit frame allocation per outgoing QUIC DATAGRAM frame** — quinn's `send_datagram` takes an owned `Bytes`, and the encoders fill the buffer to capacity so `Bytes::from(Vec)` adopts the allocation in place (no copy, no control block) — plus, at most, one copy into a per-session/per-association staging buffer that is never reallocated. A `TRAIN` amortizes the frame over every payload that fits the path budget; a fragmented payload costs one frame per fragment. Recycling frames through a pool was implemented and measured away: `Bytes::from_owner` boxes a control block per frame and a fixed-capacity pool can never hit the exact-fit adoption path, so it lost by 39–52% same-thread and 128–324% cross-thread per frame (`cargo run --release --example frame_bench`; the numbers and the rejected design live there).
-- **Modern congestion control**: BBR by default (Cubic as an escape hatch), ECN + PMTU discovery, and GSO/GRO batched I/O — a single flow reaches ~240 Mb/s at the target 140 ms RTT with the shipped 4/8/4 MB windows (300 Mb/s peak with the opt-in 8/16/8 preset). PMTU discovery is opportunistic (probes only leave from a transmit poll that builds no payload packet), so a connection keeps its start MTU for a while: the shipped default is `initial_mtu = 1200` (the QUIC floor, the smallest legal packet), which costs 18–23% more packets and MQP fragmentation above 1150 B until discovery ramps. A deployment with a known path should raise it — a 1360 B start is only 1388/1408 wire bytes after the IP+UDP headers, so it fits WireGuard-1420 tunnels — and the 1200-byte `min_mtu` plus quinn's black-hole detector remain the safety net for a smaller path.
-- **Built for high latency**: the shipped 4/8/4 MB windows size flow control for the target 140 ms BDP (~240 Mb/s single-flow) while ACK threshold 2 and a 5 ms delay keep the loaded queue bounded; the 2/4/2 MB low-memory preset shrinks the per-connection transport term from 14.5 MiB to 8.25 MiB on RAM-tight hosts.
-- **Connection-level isolation**: TCP, interactive UDP and bulk UDP each keep their own congestion window — no bandwidth fights, no queuing behind each other. Every client pool slot dials from **its own QUIC endpoint** (own UDP socket, CID table and receive loop) **and, since the sharded topology, its own pinned runtime** — driver, dispatcher, reconnect loop and their thread-locals stay on one core; and on Linux the server runs `quic_endpoints` endpoints sharing `listen` through `SO_REUSEPORT` (one per usable core by default) with the kernel spreading connections across them — no single receive loop serves the whole process.
-- **Socket buffers that hold on Linux**: every QUIC endpoint socket (one per client pool slot, `quic_endpoints` of them on the server) asks for 4 MB and session sockets 64 KiB of `SO_RCVBUF`/`SO_SNDBUF` (`MYQUIC2_SESS_SOCKET_BUF=32768` on RAM-tight routers, `=131072` for the zero-loss point the burst test measured; clamped to 16 KiB–4 MiB); where `net.core.{r,w}mem_max` clamps that (OpenWrt ships ~208 KiB), the service retries with `SO_*BUFFORCE` whenever it holds `CAP_NET_ADMIN` — root-run OpenWrt included — so burst headroom survives stock sysctls; a clamp warning names the sysctl otherwise.
-- **Linux-only kernel knobs, all best-effort and centralised**: `sendmmsg`/`recvmmsg` batch the last hop (probed at startup, portable fallback elsewhere); `SO_BUSY_POLL`/`SO_PREFER_BUSY_POLL` opt in via `MYQUIC2_BUSY_POLL`; `TCP_NOTSENT_LOWAT` bounds the relay TCP send queue (`MYQUIC2_TCP_NOTSET_LOWAT`); the SOCKS listener arms `TCP_DEFER_ACCEPT` + `TCP_FASTOPEN`; and each shard thread pins itself with `sched_setaffinity`. A kernel that rejects any of these logs once and keeps serving (`src/linux.rs` is the whole surface).
-- **Signal-driven shutdown**: SIGTERM/SIGINT closes the QUIC endpoints at once, so peers receive CONNECTION_CLOSE and redial within seconds instead of waiting out the ~10 s silence watchdog (the QUIC idle timeout, `3 × keepalive ≥ 15 s`, is the backstop); in-flight flows restart through the reconnect loops (no drain window).
-- **Tunable ceiling**: widen the transport windows on both ends to match your link's BDP and push throughput higher; pure TOML, no rebuild required — see [Limits & memory](#-limits--memory).
-
----
-
-## 📊 Limits & memory
-
-Numbers are for the shipped defaults (4/8/4 MB windows, 64 KiB session buffers, 8 server endpoints where a count matters); each one comes from a named constant in the source, and the constants — windows, caps, admission arithmetic — are pinned by unit tests.
-
-| Quantity | Default | Where it comes from |
-|---|---|---|
-| Single-flow throughput ceiling | ~240 Mb/s @ 140 ms RTT | default `stream_receive_window` 4 MB / `send_window` 4 MB — the window, not the congestion controller, is the ceiling on a high-BDP link |
-| Low-memory preset | ~114 Mb/s @ 140 ms (2/4/2 MB) | set `stream_receive_window_mb` / `receive_window_mb` / `send_window_mb` to 2/4/2 on **both** ends; the per-connection transport term drops from 14.5 MiB to 8.25 MiB |
-| Opt-in high-throughput preset | ~300 Mb/s @ 140 ms (8/16/8 MB) | set `stream_receive_window_mb` / `receive_window_mb` / `send_window_mb` to 8/16/8 (and `ack_threshold = 8`, `max_ack_delay_ms = 10`) on **both** ends; ~2x/4x loaded latency |
-| Path MTU start / ceiling | 1200 B / 1472 B (max UDP payload) | `initial_mtu` (config, both ends; 1200–1472; default 1200 = the QUIC floor, sub-floor values clamp up) and quinn's MTU-discovery upper bound; 1200 B payload is 1228/1248 wire bytes after the IPv4/IPv6 + UDP headers — raise it to 1360 (1388/1408, safe on WireGuard-1420) or 1400/1472 on a known path; DATAGRAM payload budget is `MTU − 38` B (1162 at 1200), MQP UDP payload `MTU − 50` B for IPv4, so >1150 B app payloads fragment at the default |
-| Peer-pinnable memory per admitted connection | 14.5 MiB (transport only) | receive window + send budget + both DATAGRAM buffers + **both** 256 KiB reassembly budgets (legacy + rev2); the process-wide fixed term below is charged separately |
-| Peer-pinnable memory, UDP session pool (process-wide) | ~1.09 GiB non-Linux, ~2.09 GiB Linux | `MAX_SESSIONS_GLOBAL` 8192 × (2 × 64 KiB socket caps + 8 KiB reader buffer + 4 KiB MQP-3 flow-table charge); Linux stores/returns `SO_*BUF` at 2× the requested value and the admission formula charges that; lower `MYQUIC2_SESS_SOCKET_BUF` to shrink it |
-| Worst case, no memory budget (default 4/8/4 MB preset) | ~60 GiB at 8 endpoints | 4096 connections × 14.5 MiB transport (~57 GiB) + the ~2.09 GiB session pool above + ~151 MiB endpoint buffers (8 endpoints) + 512 MiB TCP pump buffers; the startup log prints the breakdown |
-| Worst case, no memory budget (low-memory 2/4/2 MB preset) | ~36 GiB at 8 endpoints | 4096 × 8.25 MiB transport + the same session-pool/endpoint/pump terms |
-| Worst case, no memory budget (opt-in 8/16/8 MB preset) | ~108 GiB at 8 endpoints | 4096 × 26.25 MiB transport + the same fixed terms — `max_peer_memory_mb` is the only thing that bounds this (a 4096 MiB budget admits ~50 connections on a Linux 8-endpoint host, ~94 on non-Linux with 1 endpoint) |
-| UDP sessions | 8192 process-wide, 4032 per client process | global semaphore, and `fair_sess_cap()` = `clamp(8192 / session-holding connections, 1024, 4096)` per connection; the client cap is configurable (`max_udp_assocs`, 1–4032) |
-| Client UDP relay sockets | up to 4032 associations ≈ 1.0 GiB kernel caps + ~34 MiB reader buffers | one relay socket per association at 64 KiB `SO_*BUF` per direction; Linux stores 2× so each association can pin ~264 KiB worst case (256 KiB kernel caps + ~8.3 KiB reader buffer; caps, not reservations). Lower `max_udp_assocs` (1–4032, default 4032) or `MYQUIC2_SESS_SOCKET_BUF` (16 KiB ⇒ ~258 MiB of caps at 4032 associations). There is no client-side memory admission: this is a hard cap, not a budget |
-| Concurrent TCP flows | 8192 per client, 16384 stream tasks process-wide on the server | `MAX_SOCKS_CONNS` / `MAX_STREAM_TASKS`, with a 1024 floor per connection; each active flow holds two 16 KiB pump buffers (32 KiB) → up to 256 MiB client / 512 MiB server, charged as a process-wide term by admission |
-| QUIC connections | 4096 with a token, 256 without | `max_connections` / `max_peer_memory_mb`; the tokenless cap is what keeps an unauthenticated peer from pinning the full transport budget (256 × 14.5 MiB ≈ 3.56 GiB) **plus** the fixed term: the startup log prints the exact total — 5256 MiB on non-Linux with 1 endpoint, 6290–6423 MiB on Linux with 1–8 endpoints |
-| QUIC endpoint sockets | client: one per pool slot (default 7 = 4 TCP + 1 interactive UDP + 2 bulk UDP; up to 25 = 16 TCP + 1 + 8 UDP); server: `quic_endpoints` (up to 8; Linux default = usable cores) | distinct ingress/egress receive loops |
-| Per-endpoint buffers | ~19 MiB ceiling each: 2.875 MiB resident userspace receive scratch + 16 MiB Linux kernel socket caps | quinn allocates `max_udp_payload_size 1472 × GRO 64 × BATCH 32` at endpoint creation (quinn-udp 0.5.16 `unix.rs`); each socket asks 4 MB `SO_RCVBUF` + 4 MB `SO_SNDBUF`, stored at 2× by Linux. Default client ≈ 20 MiB userspace + 112 MiB caps; 8-endpoint server ≈ 23 MiB + 128 MiB; admission charges `endpoint_memory_bytes()` once |
-
-`max_peer_memory_mb` charges the **fixed process-wide terms once** — the UDP session pool, the endpoint buffers (`endpoint_memory_bytes()` × `quic_endpoints`) and the TCP pump buffers (`stream_pump_memory_bytes(MAX_STREAM_TASKS)`) — and only then divides what is left by the per-connection figure — so the startup log's "worst case" line is the memory this process can actually pin, not just the transport share. A budget at or below the fixed terms admits exactly one connection and says so explicitly in the log.
-
----
-
-## 🔭 Observability
-
-- **60 s reporters** on both ends: `udp relay` (datagrams/bytes/high-water; plus `unsolicited (full-cone)` when `udp_full_cone` admits a reply from a source the session never sent to), `udp write` (sent/retried/failed/retry-failed), `reassembly expired/evicted`, the `mqp3 rev2` line (steady/train/frag frames, `stage=pushes/drains/frames/items/dropped/full`, `srv=accept/reuse`), and the `udp budget` line (`TOO_LARGE` / `BUFFER_FULL` / `SESSION_FULL` / `FAIR_SHARE` / `DNS_BUDGET` / `NO_EGRESS` / `EGRESS_DEAD` / `REFUSED` / `SESS_CREATE_FAILED` + late-reply `UNKNOWN_SESS` kept separate).
-- **Honest accounting**: every drop bumps a named counter (no silent path); `metrics` `histogram!`/`counter!` on UDP batch sizes/syscalls is a no-op without a recorder and scrapable with a Prometheus exporter.
-- **Flood-safe logs**: 10 s per-kind datagram-drop warnings (winner-built detail only), 1 s log windows, and a dedicated TCP-abort throttle that never touches `conn.stats()` locks.
-
----
-
-## 📦 OpenWrt Deployment
-
-```sh
-# Built by the cross-compile loop below; the repository ships only the samples
-# in dist/openwrt-x86_64/ (the binaries are gitignored — CI rebuilds them).
-scp dist/openwrt-x86_64/myquic2-{server,client}-v1 root@router:/usr/bin/
-# Rename + chmod +x on the target; always use absolute paths in the configs
-```
-
-| CPU level | When to use |
-|---|---|
-| **v1** | Any x86-64 (N100 / J4125 and friends — the safe default) |
-| v2 / v3 / v4 | Require SSE4.2 / AVX2 / AVX512; a mismatch dies with `Illegal instruction` |
-
----
-
-## 🗂️ Project Layout
-
-```text
-MyQUIC2/
-├── src/
-│   ├── lib.rs                 # thin facade: module declarations + re-exports
-│   ├── mqp/                   # MQP-3 rev2 codec (DATA / TRAIN / FRAG / CTL) + flow tables + legacy decode
-│   ├── config/                # TOML config schema and transport parameters
-│   ├── tls/                   # certificate generation + client / server TLS
-│   ├── transport/             # QUIC transport builder (BBR / GSO / windows / limits)
-│   ├── dns/                   # moka-backed caches · single-flight · memos · egress policy
-│   ├── time/ · sync/          # clocks (mono / coarse) · lock helpers
-│   ├── stats/                 # drop / relay counters and rate-limited warnings
-│   ├── udp/                   # send path · fragmenter · reassembler · last-hop batching · retry pool
-│   ├── tcp/                   # TCP ↔ QUIC pump
-│   └── bin/
-│       ├── myquic2-client/    # pool · egress · hub · dispatcher · socks · assoc · auth · reporter
-│       └── myquic2-server/    # accept · auth · table · memo · forward · reader · tcp · pin · reporter
-├── examples/                  # zero_rtt_probe · hotpath_bench · frame_bench
-├── scripts/                   # pgo.sh (profile-guided release builds) · linux-bench-matrix.sh (target CI/bench matrix)
-└── dist/openwrt-x86_64/       # sample configs (the v1–v4 musl binaries are build outputs, gitignored)
-```
-
-Per-file map:
-
-- `lib.rs`: facade + `udp_socket_dual[_small]` / `SO_REUSEPORT` ingress / `SO_*BUFFORCE` / `shutdown_signal` / `read_mqp_ack`
-- `mqp/r2.rs` (rev2 DATA/TRAIN/FRAG/CTL codec), `r2_flow.rs` (FlowBinding/FlowRegistry/FlowIds/SessionFlows), `addr.rs`, legacy `v3.rs`, `datagram.rs` (+`DgramPrefixCache`), `fragment.rs`, `batch.rs`, `ack.rs` (+ALPN), `error.rs`
-- `config/tuning.rs` (`TransportTuning`, `per_connection/session_pool_memory_bytes`), `client_conf.rs`, `server_conf.rs`
-- `tls/cert.rs`, `server_cfg.rs`, `client_cfg.rs`
-- `transport/build.rs` (`build_transport_tuned_class`), `limits.rs` (37.5 MB/s × 140 ms BDP presets)
-- `dns/key.rs` (stack key), `memo.rs` (64×2 memo + `NEG_EPOCH`), `store.rs` (`moka` pos/neg), `resolve.rs` (fast/slow/hickory + 1024 slow limiter), `policy.rs` (`ipnet` CIDRs)
-- `udp/r2_frag.rs` (rev2 fragmenter), `r2_reasm.rs` (rev2 reassembler), `r2_stage.rs` (per-connection cross-session stager), `batch.rs` (`sendmmsg`/`recvmmsg` + `batch_report`), `send.rs` (`DatagramSend`, never-`drop-oldest`), legacy `fragmenter.rs`/`reassembler.rs`, `retry.rs` (16 shards × 256 × 200 ms)
-- `tcp/pump.rs` (`COPY_CHUNK 16 KiB`, `ZEROCOPY_MIN 8 KiB`, `COPY_BATCH 8`)
-- `stats/udp_stats.rs`, `drops.rs` (10 counters), `udp_write.rs`, `warn.rs`
-- `time/coarse.rs`, `mono.rs`
-- `bin/myquic2-client/{main,pool,egress,hub,dispatcher,assoc,socks,auth,reporter,util}.rs`
-- `bin/myquic2-server/{main,accept,auth,table,memo,forward,reader,tcp,pin,reporter}.rs`
-- `examples/hotpath_bench.rs` (TCP/UDP load + correctness + **latency** harness: `lat` measures UDP request→reply RTT percentiles, `lattcp` measures SOCKS CONNECT and first-echo latency), `zero_rtt_probe.rs` (0-RTT downgrade + token-replay guard probe), `frame_bench.rs` (frame-buffer lifecycle: the measured reason frames are not pooled)
-
----
+The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- `cargo test --all-targets`: **424 passed / 0 failed** on the macOS dev box (lib 199 + client 124 + server 101)
-- **CI-equivalent gate in Podman (Linux, Rust 1.99.0)**: `cargo fmt --all --check` ✅, `cargo clippy --all-targets -- -D warnings` ✅, `cargo test --all-targets` **428 passed / 0 failed** (Linux adds 4 `cfg(linux)` tests: lib 203 + client 124 + server 101), and both `cargo zigbuild --release` artifacts — `x86_64-unknown-linux-musl` (static) and `x86_64-unknown-linux-gnu.2.36` — build and package ✅
-- `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`: clean (no cargo features are defined)
-- Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅ · sharded ingress (`quic_endpoints` 1 and 2) and the `MYQUIC2_SHARD_RUNTIME=0` fallback both serve the same sweep with a clean `SIGTERM` exit (0.05 s measured) ✅ · the sharded client pool (7 slot runtimes) and its `MYQUIC2_SHARD_RUNTIME=0` fallback likewise: TCP 256 KiB byte-verified, UDP sweep ALL OK, both sides exit 0 on `SIGTERM` ✅
-- **MQP-3 rev2 full-duplex symmetry (D2/D4):** both endpoints can open flows. The server opens a **server-owned** flow (`DATA OPEN|SRC`, owner bit 1) for an unsolicited/full-cone reply source, installs it in the registry + session reverse table, and compresses subsequent replies; the client accepts that flow, stages the reply, and lets the app answer on the **same** id (steady/stager/fragment, owner bit preserved), which the server forwards to the remote source. Idempotent `FLOW_ACK/REJECT/CLOSE`, `SESS_CLOSE` purges queued items + in-flight partials on both ends.
-- **MQP-3 rev2 Phase 2 (connection-level cross-session stager):** both production directions now stage small payloads into one per-connection `R2Stager`, so a single `TRAIN dict` can carry flows from several UDP associations (round-robin fair; per-session FIFO; bounded queue; CAPS `max_train_items` honored; queued items purged on `SESS_CLOSE`/`FLOW_CLOSE`). Measured on the new `udpmultipaced` mode (8 associations × 1000 pps × 128 B, 65 s, release binaries): **519 992/519 992, 0.000 % loss**, client stager counters `347 639 frames / 467 845 items = 0.743 frames per payload` → **~26 % fewer client DATAGRAM sends** than one-per-payload (baseline Phase-1b was ≈0.99 frames/payload), zero stage drops/queue-full; `udppaced` 50000/50000 and `udpsweep` 8–8000 B ALL OK on the same build. Linux target matrix script: [`scripts/linux-bench-matrix.sh`](scripts/linux-bench-matrix.sh).
-- **MQP-3 rev2 end-to-end (this tree, macOS loopback, release binaries, temp configs):** all-size `udpsweep` 8/128/512/1000/2000/3000/5000/8000 B **ALL OK** (rev2 single-frame DATA or rev2 FRAG both directions, no legacy frames); `udppaced` 128 B @5k pps **325000/325000, 0.000 % loss** with the 60 s reporter `flow_open=31 open=499 steady=274140 train=358/854 frag=1200/4500/1200 inline=0 unknown_id=0 drops=0`; `udpdomain` 1000/1000; `udpfanout` 8 mixed-flow destinations 2000/2000; `udp` 1000 B single-frame 2000/2000; `udpbidir` full-duplex 30000/30000; `lat` p50 ≈ 197 µs; `hello=14 caps=14` for the 7 UDP connections.
-- **Latency harness** (`examples/hotpath_bench.rs`): `hotpath_bench lat <socks> <host:port> <n> [payload]` reports p50/p90/p99/p999 RTT for serial UDP request→reply through one association, and `hotpath_bench lattcp <socks> <host:port> <n> [bytes]` reports SOCKS CONNECT latency plus first-echo RTT. Run them against a netem-shaped path (`tc qdisc add dev lo root netem delay 70ms loss 0.5%` on Linux) — loopback's ~0 RTT hides every transport knob (ACK delay, windows, MTU, busy-poll), which is why earlier tuning could not be validated by the shipped harness.
-- Loopback smoke of this change set (debug binaries, macOS): IP and **domain** targets for both TCP and UDP (server-side resolution, host-keyed DNS cache), the whole 8 B–8000 B fragment sweep with a bounded in-flight window, and the new latency modes — `lat` p50 ≈ 0.30 ms / p99 ≈ 0.90 ms, `lattcp` connect p50 ≈ 0.18 ms / echo p50 ≈ 0.28 ms (loopback baseline, numbers only show the harness works; WAN p50/p99 needs the netem run). The 8 KiB payload at the harness's default 16-outstanding window still shows bench-side loss on loopback both before and after this change (baseline HEAD: 13/20 verified; current: 15/20) — that is the 64 KiB relay receive buffer being outrun by 16 × 8 KiB replies, not the relay: with a bounded window (batch ≤ 4) the same sweep is 100 % verified on both trees.
-- MQP-3 release smoke (macOS loopback, same binaries as this tree): IP and domain UDP `udp`/`udpdomain` 1000/1000, `udpmulti` 4×500 0 loss, paced `udppaced` 1k–5k pps **0 loss**, open-loop `udpps` 2 s 10803/10803, `lat` p50 ≈ 0.98 ms (baseline HEAD p50 ≈ 0.985 ms) — loopback only; the Linux 2–4 core `udpps`/`udppaced`/`udpmulti`/`udpdomain` numbers are still the deployment gate.
-- UDP N=1 soak (`hotpath_bench udpps`, single association, IPv4 target, macOS dev box): open-loop 128 B blast delivers **~40k recv pps** at ~66k sent pps (was ~2.6k recv pps before the last-hop batching pass); closed-loop windowed holds **~30k pps / 0 loss**; `udpraw` loopback control ~82k pps
-- Cost-critical invariants are pinned by unit tests, not just by the numbers above: byte-identity of every encoder fast path against its reference implementation, one address validation per steady destination (`prefix_cache_steady_state_one_validation`), exact reassembly/`held` accounting on every operation (including that a completed generation costs only its compact replay guard), the batch decoder's up-front validation over every truncated prefix, the reply/uplink staging paths with their fallback and exactly-once drop accounting, and the admission arithmetic.
-
----
-
-## 🛠️ Building
+- **424 tests** on the macOS dev box (lib 199 + client 124 + server 101).
+- **428 tests** in the Linux CI-equivalent environment (Linux adds 4 `cfg`-gated tests).
+- **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
+- **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
 
 ```sh
-cargo build --release          # native (toolchain pinned to 1.99.0 via rust-toolchain.toml, edition 2024)
-cargo test --all-targets       # tests
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+
+# Linux target matrix: netem 70/140 ms, 0/0.5/2 % loss
+sudo scripts/linux-bench-matrix.sh
 ```
 
-Release builds are crash-only and size-lean: `[profile.release]` sets `panic = "abort"` (a panicking task kills the process for a supervisor restart instead of unwinding that task — the fail-fast posture the ingress and the client's reconnect loops already have), fat LTO, one codegen unit, stripped symbols. Two optional, measured-at-your-host tunings:
+## 📚 Documentation
 
-- **Profile-guided builds**: the release workflow ships PGO binaries — a training job per target triple instrument, drives the same loopback workload through instrumented server/client binaries on the runner, merges the raw profiles and builds the assets with `-Cprofile-use` (see the `release.yml` header for why the v2–v4 legs train on a generic build). For local or self-built releases, `scripts/pgo.sh` runs the same flow with `cargo-pgo` and adds an optional `bolt` mode on Linux; requires `llvm-tools-preview` (see the script header). On a loopback dev box the win is in the noise — the profile is for the CPU-bound Linux exit node, where the deep quinn/rustls/relay call stacks are what it orders.
-- **Allocator huge pages**: `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` in the service environment lets mimalloc back the frame churn with large pages where the kernel supports it (less TLB pressure on the UDP paths). Measure on the target; it is a pure env change.
-
-<details>
-<summary><b>Cross-compile static musl for OpenWrt (v1–v4)</b> — click to expand</summary>
-
-<br>
-
-```sh
-rustup target add x86_64-unknown-linux-musl
-cargo install cargo-zigbuild   # requires zig on PATH
-
-# Build one CPU level at a time (sequentially, so they cannot overwrite each other)
-for v in x86-64 x86-64-v2 x86-64-v3 x86-64-v4; do
-  case $v in x86-64) n=v1;; x86-64-v2) n=v2;; x86-64-v3) n=v3;; x86-64-v4) n=v4;; esac
-  cargo zigbuild --release --target x86_64-unknown-linux-musl \
-    --config 'profile.release.strip="symbols"' \
-    --config "target.x86_64-unknown-linux-musl.rustflags=[\"-C\", \"target-cpu=$v\"]" \
-    --bin myquic2-server --bin myquic2-client
-  cp target/x86_64-unknown-linux-musl/release/myquic2-server dist/openwrt-x86_64/myquic2-server-$n
-  cp target/x86_64-unknown-linux-musl/release/myquic2-client dist/openwrt-x86_64/myquic2-client-$n
-  echo "built $n"
-done
-```
-
-</details>
-
-<details>
-<summary><b>Dependency rationale (why this crate)</b> — click to expand</summary>
-
-<br>
-
-- `quinn 0.11` (`runtime-tokio`, `rustls-aws-lc-rs`, no `platform-verifier`) + `rustls 0.23` (TLS 1.3 only, `aws-lc-rs`) + `rcgen 0.14` (`aws_lc_rs`): single crypto backend; 0.11.18+ already contains the DATAGRAM accounting + coalescing fixes.
-- `tokio` (rt-multi-thread/net/time/sync/io-util/signal), `clap`/`serde`/`toml`/`anyhow`/`thiserror`/`bytes`/`time`: runtime + config + errors.
-- `mimalloc`: +15% on musl UDP soak, neutral on glibc; one allocator on dev and router.
-- `foldhash` (DoS-resistant short-key tables) + `arc-swap` + `parking_lot` + `quanta`: hot-path sync/clocks.
-- `moka(future)` + `hickory-resolver(system-config/tokio)`: DNS cache/single-flight + cancellable upstream (replaces blocking `getaddrinfo`).
-- `ipnet`: CIDR egress policy (replaces hand-rolled masks); `happy-eyeballs(tokio)`: RFC 8305 racing; `backon(std)`: reconnect backoff; `fast-socks5`: SOCKS constants only (MIT).
-- `rustix(net/std/time)` + `nix(socket/uio/net/time/sched)` + `socket2`: `sendmmsg`/`recvmmsg`/`SO_*BUFFORCE` without `libc` unsafe, plus the Linux core pinning of the server's ingress shards.
-- `subtle` + `zeroize(alloc)`: constant-time token compare + wipe; `tracing` + `metrics`: logs + scrapable counters.
-
-</details>
-
----
+- [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md) — wire format, state machine, security contract.
+- [MQP3_REFACTOR_ANALYSIS.md](MQP3_REFACTOR_ANALYSIS.md) — design rationale, models, roadmap.
+- [analysis/mqp3-refactor/](analysis/mqp3-refactor/) — five deep-dive reports + byte/CPU model.
+- [examples/hotpath_bench.rs](examples/hotpath_bench.rs) — TCP/UDP load, correctness, latency and full-duplex harness.
+- [scripts/linux-bench-matrix.sh](scripts/linux-bench-matrix.sh) — Linux deployment benchmark matrix.
+- [config-server.toml](config-server.toml) · [config-client.toml](config-client.toml) — documented configuration samples.
 
 ## 📄 License
 
-MIT © MyQUIC2
-
-<div align="center">
-<sub>Built with 🦀 Rust</sub>
-</div>
+[MIT](LICENSE)
