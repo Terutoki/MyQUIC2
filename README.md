@@ -357,16 +357,32 @@ flowchart TB
 _Where the two binaries sit: LAN / OpenWrt, internet, VPS, targets._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-subgraph LAN["LAN / OpenWrt"]
-        APPS["apps"] --> CLIENT["myquic2-client<br/>SOCKS5 :1080"]
+subgraph LAN["🏠 LAN / OpenWrt"]
+        APPS(["🧑‍💻 Apps"])
+        CLIENT["🧦 myquic2-client<br/>SOCKS5 :1080"]
+        APPS -->|"TCP + UDP"| CLIENT
     end
-    CLIENT ==>|"QUIC / TLS 1.3"| NET(("Internet"))
-    NET ==>|"QUIC / TLS 1.3"| SRV["myquic2-server<br/>:8443"]
-    SRV --> DNS["resolver"]
-    SRV --> TCP["TCP targets"]
-    SRV --> UDP["UDP targets"]
+    CLIENT ==>|"QUIC · TLS 1.3"| NET(("🌍 Internet"))
+    NET ==>|"QUIC · TLS 1.3"| SRV["🛰️ myquic2-server<br/>:8443"]
+    SRV --> RES(["🔎 resolver"])
+    SRV --> TCP(["🌐 TCP targets"])
+    SRV --> UDP(["📦 UDP targets"])
+    class APPS,CLIENT clientC
+    class NET wireC
+    class SRV coreC
+    class RES,TCP,UDP warmC
+    style LAN fill:#f0fdf4,stroke:#bbf7d0,stroke-width:1.5px,color:#14532d
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 ### 🚀 Client paths
@@ -485,58 +501,98 @@ sequenceDiagram
 _The modern TCP dial: admission, happy-eyeballs racing, zero-copy pump._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","actorBkg":"#eef2ff","actorBorder":"#6366f1","actorTextColor":"#1e1b4b","actorLineColor":"#c7d2fe","signalColor":"#475569","signalTextColor":"#0f172a","labelBoxBkgColor":"#f8fafc","labelBoxBorderColor":"#cbd5e1","labelTextColor":"#0f172a","loopTextColor":"#0f172a","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a","activationBkgColor":"#e0e7ff","activationBorderColor":"#6366f1","sequenceNumberBackgroundColor":"#6366f1","sequenceNumberColor":"#ffffff"}} }%%
 sequenceDiagram
-autonumber
-    participant App
-    participant Client as MyQUIC2 client
-    participant Server as MyQUIC2 server
-    participant TCP as Target TCP
-    App->>Client: SOCKS5 CONNECT
-    Client->>Server: open bi stream + stream head
-    Server->>Server: admission + token gate
-    Server->>TCP: happy-eyeballs dial (250 ms stagger, 4 s)
-    TCP-->>Server: connected
-    Server-->>Client: dial ACK
-    Client-->>App: SOCKS5 success
-    Server->>TCP: zero-copy pump
-    Note over Server,TCP: failure -> RST + reset/stop 0x04
+    autonumber
+    participant App as 🧑‍💻 App
+    participant Client as 🧦 MyQUIC2 client
+    participant Server as 🛰️ MyQUIC2 server
+    participant Target as 🎯 Target TCP
+        rect rgb(248, 250, 252)
+            Note over App,Client: ① SOCKS5 CONNECT
+            App->>Client: atyp + addr + port
+            Client->>Server: open bi stream + stream head
+        end
+        rect rgb(238, 242, 255)
+            Note over Server: ② admission before work
+            Server->>Server: token gate + memory admission
+            Server->>Target: happy-eyeballs dial<br/>250 ms stagger · 4 s budget
+            Target-->>Server: connected
+            Server-->>Client: dial ACK
+            Client-->>App: SOCKS5 success
+        end
+        rect rgb(236, 253, 245)
+            Note over Server,Target: ③ zero-copy pump
+            Server->>Target: write_chunk / read_chunks
+            Note over Server,Target: failure → RST (SO_LINGER=0) + reset/stop 0x04
+        end
 ```
 
 #### Client egress selection (new)
 
-_Memo -> acquire -> own slot -> sibling -> fail-open or drop._
+_Memo → acquire → own slot → sibling → fail-open or drop._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart TB
-D["UDP datagram"] --> M{"thread memo<br/>fresh?"}
-    M -->|"hit"| SEND["send_datagram"]
-    M -->|"miss"| A["acquire egress"]
-    A --> O{"own slot usable?"}
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
+flowchart LR
+D[("📦 UDP datagram")] --> M{"memo<br/>fresh?"}
+    M -->|"hit"| SEND{{"🚀 send_datagram"}}
+    M -->|"miss"| A("🧭 acquire egress")
+    A --> O{"own slot<br/>usable?"}
     O -->|"yes"| SEND
-    O -->|"no"| S{"same-class sibling?"}
+    O -->|"no"| S{"same-class<br/>sibling?"}
     S -->|"yes"| SEND
     S -->|"no"| F{"udp_fail_closed?"}
-    F -->|"false"| TCP["fail-open to TCP"]
-    F -->|"true"| DROP["NO_EGRESS<br/>drop + count"]
+    F -->|"false"| TCP{{"🔁 fail-open to TCP"}}
+    F -->|"true"| DROP[/"⛔ NO_EGRESS<br/>drop + count"/]
+    class D,A,SEND clientC
+    class M,O,S,F decisionC
+    class TCP wireC
+    class DROP dangerC
+    linkStyle 1,4,6 stroke:#10b981,stroke-width:2.4px
+    linkStyle 2,3,5,7 stroke:#f59e0b,stroke-width:1.8px
+    linkStyle 8 stroke:#0ea5e9,stroke-width:2px
+    linkStyle 9 stroke:#f43f5e,stroke-width:2px
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 #### Reconnect & watchdog (new)
 
-_Two independent stall detectors; both close and redial below the QUIC idle timeout._
+_Two independent stall detectors, both below the QUIC idle timeout._
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Connecting
-    Connecting --> Negotiating: QUIC established
-    Negotiating --> Ready: CAPS(2)
-    Negotiating --> Reconnecting: no CAPS after 2 s
-    Ready --> Silent: no inbound datagrams
-    Ready --> AckStalled: tx advances, acks do not
-    Silent --> Reconnecting: close + backoff
-    AckStalled --> Reconnecting: close + backoff
-    Reconnecting --> Connecting: 200 ms ... 5 s
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
+flowchart TB
+CONNECT(["🔌 Connecting"]) --> NEG["🤝 Negotiating<br/>HELLO · CAPS"]
+    NEG -->|"CAPS(2)"| READY(["✅ Ready"])
+    NEG -->|"no CAPS · 2 s"| REDIAL["🔁 Reconnecting"]
+    READY --> SILENT["🌑 Silent<br/>no inbound datagrams"]
+    READY --> ACKSTALL["⏳ ACK stall<br/>tx advances, acks do not"]
+    SILENT -->|"close"| REDIAL
+    ACKSTALL -->|"close"| REDIAL
+    REDIAL -->|"200 ms … 5 s"| CONNECT
+    READY -.-|"timeouts"| CLOCK["⏱️ watchdog = max(2×keepalive, 8 s)<br/>QUIC idle = max(3×keepalive, 15 s)"]
+    class CONNECT,NEG,REDIAL muteC
+    class READY clientC
+    class SILENT,ACKSTALL warmC
+    class CLOCK noteC
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 ### 📡 Wire & flows
@@ -607,7 +663,7 @@ sequenceDiagram
 
 #### Frame decision (restored)
 
-_Payload shape -> DATA / TRAIN / FRAG, with the send verdicts._
+_Payload shape → DATA / TRAIN / FRAG, with the send verdicts._
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
@@ -641,31 +697,55 @@ flowchart LR
 _Why rev2 coexistence with old decoders cannot misroute._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-B["first wire byte"] --> N{"high nibble"}
-    N -->|"0x0X"| R["MQP-3 rev2<br/>DATA / TRAIN / FRAG / CTL"]
-    N -->|"0x02 / 0x05 / 0x06"| V2["MQP-2 legacy<br/>receive + tests only"]
-    N -->|"0x1X ... 0x4X"| V3["v0.2.0 v3 legacy<br/>receive + tests only"]
-    N -->|"anything else"| D["drop"]
+BYTE(["🧵 first wire byte"]) --> N{"high nibble"}
+    N -->|"0x0X"| R2["📡 MQP-3 rev2<br/>DATA · TRAIN · FRAG · CTL"]
+    N -->|"0x02 / 0x05 / 0x06"| V2["📼 MQP-2 legacy<br/>receive + tests only"]
+    N -->|"0x1X … 0x4X"| V3["📼 v0.2.0 v3 legacy<br/>receive + tests only"]
+    N -->|"other"| DROP["⛔ drop"]
+    class BYTE clientC
+    class R2 wireC
+    class V2,V3 muteC
+    class DROP dangerC
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 #### Flow state machine (new)
 
-_Inline -> Opening -> Open -> Closed; ACK is an optimisation, not a gate._
+_Inline → Opening → Open → Closed; ACK is an optimisation._
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Inline: no flow id
-    Inline --> Opening: DATA OPEN sent
-    Opening --> Open: FLOW_ACK / compressed downlink
-    Opening --> Inline: FLOW_REJECT
-    Open --> Closed: FLOW_CLOSE / SESS_CLOSE
-    Inline --> Closed: session ends
-    Closed --> [*]
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
+flowchart LR
+INLINE(["⚪ INLINE"]) -->|"DATA OPEN"| OPENING(["🟣 OPENING"])
+    OPENING -->|"FLOW_ACK<br/>or compressed reply"| OPEN(["🟢 OPEN"])
+    OPENING -->|"FLOW_REJECT"| INLINE
+    OPEN -->|"FLOW_CLOSE<br/>SESS_CLOSE"| CLOSED(["⚫ CLOSED"])
+    INLINE -->|"session ends"| CLOSED
+    OPEN -.->|"2 B steady"| HOT["📦 id + payload<br/>no session · no address"]
+    class INLINE muteC
+    class OPENING warmC
+    class OPEN clientC
+    class CLOSED dangerC
+    class HOT noteC
 
-    note right of Opening : OPEN repeats until ACK; loss only delays compression
-    note right of Closed : ids are never reused while the connection lives
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 #### Optimistic first packet (new)
@@ -673,21 +753,27 @@ stateDiagram-v2
 _The first UDP payload need not wait for CAPS; the server buffers pre-HELLO frames._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","actorBkg":"#eef2ff","actorBorder":"#6366f1","actorTextColor":"#1e1b4b","actorLineColor":"#c7d2fe","signalColor":"#475569","signalTextColor":"#0f172a","labelBoxBkgColor":"#f8fafc","labelBoxBorderColor":"#cbd5e1","labelTextColor":"#0f172a","loopTextColor":"#0f172a","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a","activationBkgColor":"#e0e7ff","activationBorderColor":"#6366f1","sequenceNumberBackgroundColor":"#6366f1","sequenceNumberColor":"#ffffff"}} }%%
 sequenceDiagram
-autonumber
-    participant App
-    participant Client as MyQUIC2 client
-    participant Server as MyQUIC2 server
-    Note over Client: QUIC established, rev2 state published
-    Client->>Server: CTL HELLO(wire_ver=2)
-    App->>Client: first UDP datagram
-    Client->>Server: DATA OPEN (optimistic)
-    Server->>Server: buffer pre-HELLO frames (8 / 16 KiB)
-    Server-->>Client: CTL CAPS(2)
-    Server->>Server: flush buffer in arrival order
-    Server-->>Client: FLOW_ACK + reply
-    Note over Client,Server: CAPS only updates caps, not a first-packet gate
+    autonumber
+    participant App as 🧑‍💻 App
+    participant Client as 🧦 MyQUIC2 client
+    participant Server as 🛰️ MyQUIC2 server
+        rect rgb(248, 250, 252)
+            Note over Client: QUIC established · rev2 state published
+            Client->>Server: CTL HELLO(wire_ver=2)
+            App->>Client: first UDP datagram
+        end
+        rect rgb(255, 247, 237)
+            Client->>Server: DATA OPEN (optimistic)
+            Server->>Server: buffer pre-HELLO frames<br/>8 frames / 16 KiB
+            Server-->>Client: CTL CAPS(2)
+            Server->>Server: flush buffer in arrival order
+            Server-->>Client: FLOW_ACK + reply
+        end
+        rect rgb(236, 253, 245)
+            Note over Client,Server: CAPS only updates caps · not a first-packet gate
+        end
 ```
 
 #### Domain target + rebind (new)
@@ -695,24 +781,32 @@ autonumber
 _Resolve once, learn the real source, then compress both directions._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","actorBkg":"#eef2ff","actorBorder":"#6366f1","actorTextColor":"#1e1b4b","actorLineColor":"#c7d2fe","signalColor":"#475569","signalTextColor":"#0f172a","labelBoxBkgColor":"#f8fafc","labelBoxBorderColor":"#cbd5e1","labelTextColor":"#0f172a","loopTextColor":"#0f172a","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a","activationBkgColor":"#e0e7ff","activationBorderColor":"#6366f1","sequenceNumberBackgroundColor":"#6366f1","sequenceNumberColor":"#ffffff"}} }%%
 sequenceDiagram
-autonumber
-    participant App
-    participant Client as MyQUIC2 client
-    participant Server as MyQUIC2 server
-    participant Resolver
-    participant Target
-    App->>Client: UDP to example.com:53
-    Client->>Server: DATA OPEN(domain, payload)
-    Server->>Resolver: memo -> moka -> hickory
-    Resolver-->>Server: A / AAAA
-    Server->>Target: payload
-    Target-->>Server: reply from actual source
-    Server-->>Client: DATA OPEN + SRC (actual source)
-    Client-->>App: SOCKS5 UDP reply (learned source)
-    Client->>Server: DATA 2 B steady
-    Note over Client,Server: source / port changes rebind the same wire id
+    autonumber
+    participant App as 🧑‍💻 App
+    participant Client as 🧦 MyQUIC2 client
+    participant Server as 🛰️ MyQUIC2 server
+    participant Resolver as 🔎 Resolver
+    participant Target as 🎯 Target
+        rect rgb(248, 250, 252)
+            Note over App,Client: ① first datagram names the domain
+            App->>Client: UDP to example.com:53
+            Client->>Server: DATA OPEN(domain, payload)
+            Server->>Resolver: memo → moka → hickory
+            Resolver-->>Server: A / AAAA
+        end
+        rect rgb(255, 247, 237)
+            Note over Server,Target: ② learn the actual source
+            Server->>Target: payload
+            Target-->>Server: reply from actual source
+            Server-->>Client: DATA OPEN + SRC (actual source)
+            Client-->>App: SOCKS5 reply (learned source)
+        end
+        rect rgb(236, 253, 245)
+            Note over Client,Server: afterwards 2 B both ways · source changes rebind the id
+            Client->>Server: DATA 2 B steady
+        end
 ```
 
 #### Pure-uplink flow (new)
@@ -720,19 +814,24 @@ autonumber
 _FLOW_ACK unlocks compression even when no payload ever comes back._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","actorBkg":"#eef2ff","actorBorder":"#6366f1","actorTextColor":"#1e1b4b","actorLineColor":"#c7d2fe","signalColor":"#475569","signalTextColor":"#0f172a","labelBoxBkgColor":"#f8fafc","labelBoxBorderColor":"#cbd5e1","labelTextColor":"#0f172a","loopTextColor":"#0f172a","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a","activationBkgColor":"#e0e7ff","activationBorderColor":"#6366f1","sequenceNumberBackgroundColor":"#6366f1","sequenceNumberColor":"#ffffff"}} }%%
 sequenceDiagram
-autonumber
-    participant App
-    participant Client as MyQUIC2 client
-    participant Server as MyQUIC2 server
-    participant Target
-    App->>Client: one-way datagrams
-    Client->>Server: DATA OPEN(payload)
-    Server->>Target: payload
-    Server-->>Client: FLOW_ACK (no payload)
-    Client->>Server: DATA 2 B steady
-    Note over Client,Server: no downlink needed<br/>FLOW_ACK unlocks compression
+    autonumber
+    participant App as 🧑‍💻 App
+    participant Client as 🧦 MyQUIC2 client
+    participant Server as 🛰️ MyQUIC2 server
+    participant Target as 🎯 Target
+        rect rgb(248, 250, 252)
+            Note over App,Client: telemetry · game upload · one-way flows
+            App->>Client: outbound datagram
+            Client->>Server: DATA OPEN(payload)
+            Server->>Target: payload
+        end
+        rect rgb(236, 253, 245)
+            Server-->>Client: FLOW_ACK (no payload)
+            Note over Client,Server: the ACK confirms the binding · compression unlocks without downlink
+            Client->>Server: DATA 2 B steady
+        end
 ```
 
 #### Server-owned full-cone flow (new)
@@ -740,21 +839,26 @@ autonumber
 _The server can open a flow for an unsolicited source; the app replies on the same id._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","actorBkg":"#eef2ff","actorBorder":"#6366f1","actorTextColor":"#1e1b4b","actorLineColor":"#c7d2fe","signalColor":"#475569","signalTextColor":"#0f172a","labelBoxBkgColor":"#f8fafc","labelBoxBorderColor":"#cbd5e1","labelTextColor":"#0f172a","loopTextColor":"#0f172a","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a","activationBkgColor":"#e0e7ff","activationBorderColor":"#6366f1","sequenceNumberBackgroundColor":"#6366f1","sequenceNumberColor":"#ffffff"}} }%%
 sequenceDiagram
-autonumber
-    participant Source
-    participant Server as MyQUIC2 server
-    participant Client as MyQUIC2 client
-    participant App
-    Source->>Server: unsolicited datagram
-    Server->>Server: allocate owner=1 wire id
-    Server-->>Client: DATA OPEN + SRC (sess, source)
-    Client-->>App: deliver (learned source)
-    App->>Client: app reply
-    Client->>Server: DATA 2 B steady (same id)
-    Server->>Source: app reply
-    Note over Source,App: requires udp_full_cone = true
+    autonumber
+    participant Source as 🌐 Remote source
+    participant Server as 🛰️ MyQUIC2 server
+    participant Client as 🧦 MyQUIC2 client
+    participant App as 🧑‍💻 App
+        rect rgb(248, 250, 252)
+            Note over Source,Server: udp_full_cone = true · opt-in
+            Source->>Server: unsolicited datagram
+            Server->>Server: allocate owner=1 wire id
+            Server-->>Client: DATA OPEN + SRC (sess, source)
+            Client-->>App: deliver (learned source)
+        end
+        rect rgb(236, 253, 245)
+            Note over App,Source: app replies on the same id
+            App->>Client: app reply
+            Client->>Server: DATA 2 B steady (same id)
+            Server->>Source: app reply
+        end
 ```
 
 #### Wire-version compatibility (new)
@@ -762,16 +866,27 @@ autonumber
 _Matched deployment: a wrong peer fails at HELLO/CAPS, never silently downgrades._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart TB
-A["new client dials"] --> B["send CTL HELLO(wire_ver=2)"]
-    B --> C{"peer speaks rev2?"}
-    C -->|"yes"| D["CAPS(2) -> UDP enabled"]
-    C -->|"no"| E["no CAPS within 2 s"]
-    E --> F["close + redial
-no downgrade"]
-    G["server sees a v3 / MQP-2 first byte"] --> H["drop
-matched deployment only"]
+A(["🆕 new client"]) --> B["📨 CTL HELLO(wire_ver=2)"]
+    B --> C{"peer answers<br/>CAPS(2)?"}
+    C -->|"yes"| D(["✅ UDP enabled"])
+    C -->|"no · 2 s"| E["🚫 close + redial"]
+    E -.-> F(["no old-wire downgrade"])
+    G(["📼 old v3 / MQP-2 peer"]) --> H["🔍 first byte is not 0x0X"]
+    H --> I(["⛔ drop on new server"])
+    class A,B,C,D clientC
+    class E,F dangerC
+    class G,H,I muteC
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 ### 🚪 Server & admission
@@ -835,21 +950,30 @@ flowchart TB
 
 #### Admission decision tree (new)
 
-_Connection permit -> token -> memory budget -> session fair-share._
+_Connection permit → token → memory budget → session fair-share._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
-flowchart TB
-C["new QUIC connection"] --> G{"global conn cap?"}
-    G -->|"no"| R["implicit refuse<br/>1/s warn"]
-    G -->|"yes"| A{"token valid?"}
-    A -->|"no"| CL["close 0x01"]
-    A -->|"yes"| M{"memory admission?"}
-    M -->|"deny"| R
-    M -->|"allow"| H["handle_conn"]
-    H --> S{"session / fair-share?"}
-    S -->|"ok"| SESS["session socket<br/>64 KiB"]
-    S -->|"full"| D["refuse / drop"]
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
+flowchart LR
+C{{"🔌 new QUIC connection"}} --> G["🛡️ global conn cap"] --> A["🔑 token valid"] --> M["🧮 memory budget"] --> H("🛰️ handle_conn") --> S["🔌 session fair-share"] --> SESS(["✅ admitted<br/>64 KiB socket"])
+    G -.->|"full"| R[/"🚫 refuse<br/>1/s warn"/]
+    A -.->|"invalid"| CL[/"✂️ close 0x01"/]
+    M -.->|"deny"| R
+    S -.->|"full"| D[/"📦 drop"/]
+    class C,G,A,M,H,S coreC
+    class SESS clientC
+    class R,CL,D dangerC
+    linkStyle 0,1,2,3,4,5 stroke:#10b981,stroke-width:2.4px
+    linkStyle 6,7,8,9 stroke:#f43f5e,stroke-width:1.8px
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 #### Reply-source authorization (new)
@@ -857,30 +981,58 @@ C["new QUIC connection"] --> G{"global conn cap?"}
 _Restricted allowlist first; full-cone is an explicit opt-in._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-R["UDP reply source"] --> FC{"udp_full_cone?"}
-    FC -->|"true"| OK["forward any source<br/>server-owned flow opt-in"]
-    FC -->|"false"| EX{"exact live<br/>(sess, flow) source?"}
+R(["📨 reply source"]) --> FC{"udp_full_cone?"}
+    FC -->|"true"| OK(["✅ forward any source"])
+    FC -->|"false"| EX{"exact live<br/>flow source?"}
     EX -->|"yes"| OK
-    EX -->|"no"| RING{"16-entry IP ring hit?"}
+    EX -->|"no"| RING{"16-entry IP ring?"}
     RING -->|"yes"| OK
-    RING -->|"no"| D["drop + count"]
+    RING -->|"no"| DROP(["⛔ drop + count"])
+    OK -.- NOTE["server-owned flow<br/>opt-in only"]
+    class R,FC,EX,RING coreC
+    class OK clientC
+    class DROP dangerC
+    class NOTE noteC
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 #### DNS resolution layers (new)
 
-_Thread memo -> moka -> hickory, then SSRF policy at the exit._
+_Thread memo → moka → hickory, then SSRF policy at the exit._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-Q["host + port"] --> TM["thread memo<br/>64 sets × 2 ways"]
-    TM -->|"miss"| MK["moka shared cache<br/>host key · 120 s / 10 s"]
-    MK -->|"miss"| H["hickory resolver<br/>5 s · cancellable"]
-    H --> C["A / AAAA candidates"]
-    C --> P["SSRF / ipnet policy"]
-    P --> O["dial or sendmmsg"]
+Q(["🌐 host + port"]) --> TM["🔥 thread memo<br/>64 sets × 2 ways"]
+    TM -->|"miss"| MK["☁️ moka shared<br/>host key · 120 s / 10 s"]
+    MK -->|"miss"| H["📡 hickory<br/>5 s · cancellable"]
+    H --> C["🎯 A / AAAA"]
+    C --> P["🛡️ SSRF / ipnet"]
+    P --> O(["🔌 dial / sendmmsg"])
+    class Q,TM coreC
+    class MK,H wireC
+    class C,P warmC
+    class O clientC
+    linkStyle 0,1,2,3,4,5 stroke:#0ea5e9,stroke-width:2px
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 ### 🚀 Scheduling & transport
@@ -890,26 +1042,40 @@ Q["host + port"] --> TM["thread memo<br/>64 sets × 2 ways"]
 _Per-session FIFO and a round-robin cursor feed one dict TRAIN._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-subgraph A["assoc A · DNS"]
-        A1["p"]:::q
-        A2["p"]:::q
+subgraph APPS["🧑‍💻 associations"]
+        A["assoc A<br/>DNS"]
+        B["assoc B<br/>game"]
+        C["assoc C<br/>VPN"]
     end
-    subgraph B["assoc B · game"]
-        B1["p"]:::q
+    subgraph STAGE["⚙️ connection stager"]
+        Q["per-session FIFO<br/>round-robin cursor"]
+        F["drain burst<br/>exact DATAGRAM budget"]
     end
-    subgraph C["assoc C · VPN"]
-        C1["p"]:::q
-        C2["p"]:::q
-    end
-    A2 --> RR["per-session FIFO<br/>round-robin cursor"]
-    B1 --> RR
-    C2 --> RR
-    RR --> T["TRAIN dict 0x04<br/>id list + idx + len + payload"]
-    T --> D["🚀 one QUIC DATAGRAM"]
-    classDef q fill:#e0f2fe,stroke:#0891b2,color:#0f172a
-    style RR fill:#fef3c7,stroke:#d97706,color:#713f12
+    A --> Q
+    B --> Q
+    C --> Q
+    Q --> F
+    F --> T["📦 TRAIN dict 0x04<br/>id list + idx + len + payload"]
+    T --> D(["🚀 one QUIC DATAGRAM"])
+    F -.-> NOTE["fair: a busy assoc cannot starve the rest"]
+    class A,B,C clientC
+    class Q,F coreC
+    class T wireC
+    class D clientC
+    class NOTE noteC
+    style APPS fill:#f0fdf4,stroke:#bbf7d0,stroke-width:1.5px,color:#14532d
+    style STAGE fill:#eef2ff,stroke:#c7d2fe,stroke-width:1.5px,color:#312e81
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 #### PMTU ramp (new)
@@ -917,15 +1083,31 @@ subgraph A["assoc A · DNS"]
 _Start at the QUIC floor, probe upward, and raise the start on known paths._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-I["initial_mtu<br/>default 1200"] --> P1["probe 1336"]
-    P1 --> P2["1404"]
-    P2 --> P3["1438"]
-    P3 --> P4["1472<br/>ceiling"]
-    I --> B["DATAGRAM budget<br/>mtu − 38 = 1162 B"]
-    P4 --> W["single frame<br/>up to 1434 B"]
-    I -.-> R["raise it<br/>1360 / 1400 / 1472"]
+subgraph RAMP["📈 PMTU discovery"]
+        I["🎚️ initial_mtu<br/>default 1200"] --> P1["1336"]
+        P1 --> P2["1404"]
+        P2 --> P3["1438"]
+        P3 --> P4["1472<br/>ceiling"]
+    end
+    I --> B["📦 DATAGRAM budget<br/>mtu − 38 = 1162 B"]
+    P4 --> W["✅ single frame<br/>up to 1434 B"]
+    I -.-> R["💡 raise on known paths<br/>1360 / 1400 / 1472"]
+    class I,P1,P2,P3,P4 wireC
+    class B warmC
+    class W clientC
+    class R noteC
+    style RAMP fill:#ecfeff,stroke:#a5f3fc,stroke-width:1.5px,color:#164e63
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 ### ✅ Verification
@@ -935,15 +1117,36 @@ I["initial_mtu<br/>default 1200"] --> P1["probe 1336"]
 _Every push: format, lint, 424/428 tests, musl and glibc builds._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px","primaryColor":"#eef2ff","primaryTextColor":"#0f172a","primaryBorderColor":"#6366f1","lineColor":"#94a3b8","secondaryColor":"#ecfeff","tertiaryColor":"#fff7ed","edgeLabelBackground":"#ffffff","clusterBkg":"#f8fafc","clusterBorder":"#e2e8f0","mainBkg":"#ffffff","noteBkgColor":"#eff6ff","noteBorderColor":"#93c5fd","noteTextColor":"#1e3a8a"},"flowchart":{"curve":"basis","nodeSpacing":34,"rankSpacing":52,"padding":12,"htmlLabels":true}} }%%
 flowchart LR
-C["push / PR"] --> F["rustfmt"]
-    F --> CL["clippy -D warnings"]
-    CL --> T["cargo test --all-targets<br/>424 macOS / 428 Linux"]
-    T --> M["musl static build"]
-    T --> G["gnu 2.36 build"]
-    M --> A["assets + SHA256SUMS"]
+subgraph CHECK["✅ checks"]
+        C(["📝 push / PR"]) --> F["🎨 rustfmt"]
+        F --> L["🧹 clippy -D warnings"]
+        L --> T["🧪 cargo test<br/>424 macOS · 428 Linux"]
+    end
+    subgraph BUILD["📦 builds"]
+        M["musl static"]
+        G["gnu 2.36"]
+    end
+    T --> M
+    T --> G
+    M --> A["📜 SHA256SUMS"]
     G --> A
+    A --> R(["🚀 release assets"])
+    class C,F,L,T coreC
+    class M,G wireC
+    class A,R clientC
+    style CHECK fill:#f0fdf4,stroke:#bbf7d0,stroke-width:1.5px,color:#14532d
+    style BUILD fill:#eef2ff,stroke:#c7d2fe,stroke-width:1.5px,color:#312e81
+
+    classDef clientC fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#064e3b
+    classDef coreC fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#1e1b4b
+    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warmC fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#7c2d12
+    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
+    classDef noteC fill:#f5f3ff,stroke:#8b5cf6,stroke-width:1.5px,color:#4c1d95
+    classDef decisionC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
 ```
 
 ## 📚 Documentation
