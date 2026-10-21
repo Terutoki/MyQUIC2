@@ -66,6 +66,38 @@
 > 约束遵守：未改任何配置参数/默认值（`src/config/**`、`Cargo.toml` 零改动），未加依赖；
 > 全部为代码逻辑、数据结构、批处理与调度结构改动。行为变化见 §7。
 
+### 0.6 第二批修复落地状态（rev2/R2 路径，2026-10-21 实施）
+
+第二批（T0–T9，rev2/R2 表格化、重组、stager 与统计路径）按
+`T3→T4→T9→T1→T7→T5+T0→T2→T8→T6` 顺序实施；约束同 0.5（零配置/零依赖改动，
+arc-swap 复用既有依赖），为既有行为钉住的测试同步更新以保持断言意图。落地要点
+以 `git diff` 为准：
+
+| 编号 | 状态 | 落地要点 |
+|---|---|---|
+| T3 | ✅ 已修复 | `server/accept.rs` r2_stats 新增 `TRAIN_ITEMS` 独立计数 + `bump_train_item()`：逐 **item**（一个 TRAIN 帧最多 64 项）thread-local 256 批回写，唯一一条落在包路径上的 r2_stats 线；其余 r2_stats 保持每帧一次 RMW（由测试直读） |
+| T4/T4b | ✅ 已修复 | `client/rev2.rs` counters 拆 `rev2_counter_fns_tls`（thread-local `Cell` 累计、`FLUSH_EVERY` 周期回写共享）与 direct fn 两类；`Rev2Snapshot::now()` 读前先 `flush_locals()` 当前线程，快照/测试读与批处理互见。可观测计数语义不变 |
+| T9 | ✅ 已修复 | `client/rev2.rs` `UplinkFlows` 单槽 memo（`last: Option<(TargetAddr, Arc<FlowBinding>)>`）服务 steady 目标：命中省 `SessionFlows::find` 线性扫描与 binding 的 Arc clone/drop；memo 槽位与 `mark_closed` 互斥语义由回归测试钉住（闭环后必须用新 id 重开，绝不复用死绑定） |
+| T1 | ✅ 已修复 | `server/accept.rs` TRAIN 两遍解析：pass1 构 `item_slot: Vec<u16>` + ≤64 去重 slot（编码器上限的线性去重），新增 `FlowRegistry::get_batch` **单次读锁**填充全部 slot；pass2 逐 item 走新拆出的 `r2_forward_flow_resolved(state, binding, payload)`（binding 已 `Closed` 不转发）；原逐项入口 `r2_forward_flow_item` 变薄包装 |
+| T7 | ✅ 已修复 | `client/dispatcher.rs` `dispatch_r2_train` 三层 hoist：per-distinct-id memo（跳 registry.get + reply-dst 推导）、per-session-run memo（跳 `r2_lookup` 的 Weak 升级 + is_alive + app 读）、`stage_reply_follow` 令 run 跟随项 `sock: None` 继承 flush 的 relay Arc（每 run 一次 clone）。miss 全部回落逐项路径，计数/拒绝/staging 顺序等可观测面逐项保持 |
+| T5+T0 | ✅ 已修复 | `udp/r2_stage.rs` drain 两段式：`pack(limit, &mut PackedFrames)` 只在锁内编码帧，`send_packed_frames`（自由函数）在**锁外**发 QUIC，`requeue_unsent` 失败帧之后的 items 回插恢复 per-session FIFO（溢出由调用方按满队策略记账：client `BUFFER_FULL`，server 另加 `STAGE_FULL_DROPS`）；`push` 返回排队长度免二次锁定；热路径 reader/drainer 全部走三段组合。**旧的整体 `drain()` 保留但仅剩 `stage_open_src` 一个调用方**（其不变式"本次排空的队列里就是这条 OPEN SRC 且已上线"要求 push→send 单持锁），其内部亦已改为 pack+send+requeue 并断言回插零溢出。**不做 push_batch**：下行回复来自不同 session 无共享可批实体，锁跨 send 已被两段式本身消除 |
+| T2 | ✅ 已修复 | `FlowBinding.resolved` RwLock→`ArcSwap<Vec<SocketAddr>>`：DNS install/rebind `store` 整组原子换、读取方 `load()` 快照永不阻塞写（REP `SourceMatch` 每候选一次快照读） |
+| T8 | ✅ 已修复 | `server/forward.rs` DnsGate 新增单槽 fast hint（hot_key/hot_state/hot_deadline 三个 AtomicU64；publish 序 deadline→state→key，Release 存 key）：同 key 热路径无锁直接返回 InFlight/Unusable；finish 按裁决失效——delivered 清 entry+hint、被淘汰且权威表无此 key 才清 hint、stale finish 不扰动 newer claim 的 hint、过期按 deadline 穿透。行为测试 `dns_gate_fast_hint_is_invalidated_by_a_delivered_finish_and_expires` |
+| T6 | ✅ 已修复 | `udp/r2_reasm.rs` 重组改**单 assembly buf**：total==1 零拷贝返回 `d.slice(chunk_off..)`（payload 与帧共享分配，测试断言指针相等）；多片按 `pos(i)=len(0)+(i-1)*unit`（发端分割契约：middle 等宽、末段短或等宽）**一次**拷入最终位置，位置不可定的分片持"帧视图"（Bytes refcount clone + chunk_off/len）等待 determinator，解锁时恰好一次落位；完成即 `Bytes::from(mem::take(buf))` 零二次拷贝（各 chunk end 单调 ≤ 末段 end，无需 truncate）；middle 宽度与已锁 `unit` 不符**整片拒绝**（任何 mutation 之前返回）；写入终点 > 8 KiB 一律拒绝（防恶意加宽 unit 的 resize 爆炸）。retained 记账改 capacity 基准：`buf.capacity() + pending Σ(len+48)`（`PENDING_CHUNK_COST`），每次 mutation 后重算并对 `held` 饱和增减；首次写 reserve 上限 8 KiB。`mqp/r2.rs` `FragRef` 增信息性 `chunk_off` 字段（decode 时填，wire 不变） |
+
+> **行为变化（仅两处）**：① middle 分片宽度与同 payload 已锁 unit 不符时该分片被拒
+> （旧实现容忍中段异宽并按到达序拼接——发射方契约本就等宽中段）；② `FragRef` 新增
+> `chunk_off` 字段（纯信息，wire/编码不变）。held 记账从"slot 表 + chunk 长度"改为
+> "assembly buf 容量 + pending 视图"，256 KiB/连接上限与满队/淘汰语义不变。
+>
+> **验证（macOS 本机）**：`cargo fmt --all --check` ✅ clean ｜
+> `cargo clippy --all-targets -- -D warnings` ✅ clean ｜
+> `cargo test --all-targets` ✅ **433 passed / 0 failed**
+> （lib 206 / client 125 / server 102；含 T6 新增 5 个、T8 fast-hint 1 个、
+> T9 回归 1 个、T5 requeue 2 个测试）。审查修复：`total == 64` 的完成掩码改用
+> `checked_shl`（原 `1u64 << 64` 在 debug 下 panic、release 下掩码归零永不完组），
+> 并由 `a_full_width_64_fragment_payload_completes` 钉住。
+
 ---
 
 ## 1. P1 问题（预期影响最大）

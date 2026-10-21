@@ -25,7 +25,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::RwLock;
 
 use super::addr::{TargetAddr, TargetAddrRef};
@@ -66,7 +66,10 @@ impl FlowState {
 
 /// One flow binding shared by the sender table, the receiver registry and the
 /// dispatchers. Fields are read on the per-packet path, so the mutable ones are
-/// atomics; only `resolved` takes a lock and only on DNS install/rebind.
+/// atomics or lock-free snapshot loads (`reply_src`, `resolved`): the
+/// REP-format `match_source` scan touches both per candidate binding, and a
+/// writer lock (however short) would re-serialize every reply-packet provenance
+/// check behind the rare DNS install that replaces the address set.
 #[derive(Debug)]
 pub struct FlowBinding {
     /// Connection-scoped wire id (`local << 1 | owner`), never zero.
@@ -83,7 +86,11 @@ pub struct FlowBinding {
     /// Server side, domain flows: addresses the name resolved to. Used to
     /// decide whether a reply source belongs to this flow (and may be
     /// compressed) before an exact source binding exists.
-    resolved: RwLock<Vec<SocketAddr>>,
+    ///
+    /// `ArcSwap<Vec<..>>` rather than a writer lock: the read side (one
+    /// snapshot load per candidate) never blocks and the whole set is
+    /// replaced at once on DNS install/rebind, which is its only write.
+    resolved: ArcSwap<Vec<SocketAddr>>,
 }
 
 impl FlowBinding {
@@ -96,7 +103,7 @@ impl FlowBinding {
             target,
             state: AtomicU8::new(FlowState::Opening as u8),
             reply_src: ArcSwapOption::const_empty(),
-            resolved: RwLock::new(Vec::new()),
+            resolved: ArcSwap::from_pointee(Vec::new()),
         })
     }
 
@@ -151,24 +158,25 @@ impl FlowBinding {
     /// frames forward to the address that was already validated at install).
     #[must_use]
     pub fn resolved_first(&self) -> Option<SocketAddr> {
-        self.resolved.read().first().copied()
+        self.resolved.load().first().copied()
     }
 
     /// Install the resolved address set of a domain flow (server side). An
-    /// empty set means "DNS failed"; the binding is then rejected.
+    /// empty set means "DNS failed"; the binding is then rejected. Set swap is
+    /// atomic: a reader sees either the old set or the new one, never a mix.
     pub fn set_resolved(&self, addrs: Vec<SocketAddr>) {
-        *self.resolved.write() = addrs;
+        self.resolved.store(Arc::new(addrs));
     }
 
     #[must_use]
     pub fn resolved_len(&self) -> usize {
-        self.resolved.read().len()
+        self.resolved.load().len()
     }
 
     /// Whether `ip` is one of the resolved addresses of a domain flow.
     #[must_use]
     pub fn resolved_contains(&self, ip: IpAddr) -> bool {
-        self.resolved.read().iter().any(|a| a.ip() == ip)
+        self.resolved.load().iter().any(|a| a.ip() == ip)
     }
 }
 
@@ -361,6 +369,23 @@ impl FlowRegistry {
     #[must_use]
     pub fn get(&self, wire_id: u32) -> Option<Arc<FlowBinding>> {
         self.map.read().get(&wire_id).cloned()
+    }
+
+    /// Resolve a batch of wire ids under **one** read-lock hold.
+    ///
+    /// `ids` is a `(wire_id, slot)` pair list in encounter order; every slot is
+    /// filled from the live map (`None` keeps the no-live-binding verdict).
+    /// Duplicate ids pay one foldhash probe each instead of one lock handoff
+    /// each — the TRAIN ingress uses this to replace one acquire per item (a
+    /// 64-item frame was 64 read-lock acquire/release cycles, all on the
+    /// packet path) with one acquire per frame. Callers that need per-item
+    /// frames see the *same* `Arc` as single lookups would return: the map
+    /// never stores two bindings for one id.
+    pub fn get_batch(&self, ids: &mut [(u32, Option<Arc<FlowBinding>>)]) {
+        let map = self.map.read();
+        for (wire_id, slot) in ids.iter_mut() {
+            *slot = map.get(wire_id).cloned();
+        }
     }
 
     /// Find a **server-owned** binding for `(session, target)`. This is how the

@@ -105,6 +105,25 @@ fn stage_reply(
     }
 }
 
+/// Follower variant of [`stage_reply`] for a TRAIN item whose association (and
+/// relay) is the same as the previously staged item's: `sock` stays `None` —
+/// the flush inherits the run head behind it (see `StagedReply`) — so a run of
+/// N items pays exactly one relay `Arc` clone (the head's) instead of N.
+fn stage_reply_follow(
+    entry: &AssocEntry,
+    app: SocketAddr,
+    dst: SocketAddr,
+    payload: Bytes,
+) -> StagedReply {
+    entry.mark_replied();
+    StagedReply {
+        sock: None,
+        app,
+        dst,
+        payload,
+    }
+}
+
 /// Result of resolving a session id for a batch frame.
 ///
 /// `lookup_entry` used to return `Option`, so the batch path could not tell
@@ -966,6 +985,27 @@ fn dispatch_r2_data(
 /// Items that name an uninstalled id are dropped individually (counted), never
 /// mapped to a guessed session: the codec has already validated the frame
 /// shape and item bounds, so the loop cannot read past the datagram.
+///
+/// Per-item work below is hoisted because a run frame is *made of* repeats:
+///
+/// * `registry.get` + reply-dst derivation runs once per distinct id (a
+///   one-slot memo). The per-item `Arc` clone/drop of the binding disappears
+///   entirely — the memo keeps `(id, sess, dst)` and nothing rearms the
+///   binding inside the frame.
+/// * `r2_lookup` (a `Weak` upgrade, an `is_alive` probe and an app read) runs
+///   once per session *run*: the memo holds the last staged item's
+///   `(sess, entry, app)`, and a frame's items of one session are consecutive
+///   because the sender packs them that way.
+/// * the staged reply becomes a [`stage_reply_follow`] (relay `Arc` inherited
+///   by the flush) after a run's head, so N same-session items pay one relay
+///   clone instead of N.
+///
+/// Misses re-derive through the normal per-item path, so every observable is
+/// per-item fresh: counting (`mark_open`, `mark_replied`, `rx_frame`,
+/// drop/refusal counters), `lookup` side effects (unknown-session bumps) and
+/// staging order all keep the legacy shape. Follower `None`s only ever follow
+/// this frame's own run head (the memo starts empty per frame), which is what
+/// `flush_staged`'s run-head invariant requires.
 fn dispatch_r2_train(
     rev2: &ConnRev2,
     cache: &mut [DispatchSlot; DISPATCH_CACHE],
@@ -978,25 +1018,52 @@ fn dispatch_r2_train(
         return 0;
     };
     let mut staged = 0usize;
+    // One-slot memo per distinct id: `(wire_id, session, reply_dst)` of the
+    // last resolved item. Only resolved, deliverable ids enter it.
+    let mut last: Option<(u32, u32, SocketAddr)> = None;
+    // The association of the last item actually staged into `out`: its
+    // session, the entry Arc (already upgraded by the lookup — kept alive so
+    // the follower call needs nothing but a reference) and its app address.
+    let mut last_pushed: Option<(u32, Arc<AssocEntry>, SocketAddr)> = None;
     for (id, payload) in t.items() {
-        let Some(binding) = rev2.registry.get(id) else {
-            // TRAIN items never install a flow: a run carries no address, so an
-            // uninstalled id is a stale frame (counted), never a new binding.
-            counters::rx_unknown_id();
-            continue;
+        let (sess, dst): (u32, SocketAddr) = match &last {
+            Some((lid, lsess, ldst)) if *lid == id => (*lsess, *ldst),
+            _ => {
+                let Some(binding) = rev2.registry.get(id) else {
+                    // TRAIN items never install a flow: a run carries no
+                    // address, so an uninstalled id is a stale frame
+                    // (counted), never a new binding.
+                    counters::rx_unknown_id();
+                    continue;
+                };
+                binding.mark_open();
+                let Some(dst) = r2_reply_dst(&binding) else {
+                    dgram_drops::bump(&dgram_drops::REFUSED);
+                    counters::rx_drop();
+                    continue;
+                };
+                last = Some((id, binding.session, dst));
+                (binding.session, dst)
+            }
         };
-        binding.mark_open();
-        let Some(dst) = r2_reply_dst(&binding) else {
-            dgram_drops::bump(&dgram_drops::REFUSED);
-            counters::rx_drop();
+        // Same association as the previous staged item: skip the lookup (the
+        // entry probe and its counters) entirely and stage as a follower.
+        if let Some((psess, pentry, papp)) = last_pushed.as_ref()
+            && *psess == sess
+        {
+            udp_stats::payload(payload.len());
+            counters::rx_frame();
+            out.push(stage_reply_follow(pentry, *papp, dst, d.slice_ref(payload)));
+            staged += 1;
             continue;
-        };
-        let Some((entry, app)) = r2_lookup(cache, hub, binding.session) else {
+        }
+        let Some((entry, app)) = r2_lookup(cache, hub, sess) else {
             continue;
         };
         udp_stats::payload(payload.len());
         counters::rx_frame();
         out.push(stage_reply(&entry, app, dst, d.slice_ref(payload)));
+        last_pushed = Some((sess, entry, app));
         staged += 1;
     }
     staged
@@ -1021,7 +1088,7 @@ fn dispatch_r2_frag(
         return 0;
     };
     counters::frag_rx();
-    let Some(a) = r2_reasm.push(&f, coarse_millis()) else {
+    let Some(a) = r2_reasm.push(d, &f, coarse_millis()) else {
         // Partial (or a refused/duplicate fragment): nothing to deliver yet.
         return 0;
     };

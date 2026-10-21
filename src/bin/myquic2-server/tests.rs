@@ -3110,6 +3110,41 @@ fn dns_gate_backstop_expires_and_a_stale_finish_is_ignored() {
     );
 }
 
+/// The one-slot fast hint is only ever a *hint* of the authoritative verdict:
+/// a delivered (cleared) finish must invalidate it — an `InFlight` hint that
+/// outlived its entry would keep dropping datagrams the gate lets spawn for
+/// the whole 15 s backstop — and an expired hint must fall through instead of
+/// answering from its deadline-blind state.
+#[test]
+fn dns_gate_fast_hint_is_invalidated_by_a_delivered_finish_and_expires() {
+    let gate = DnsGate::new();
+    let (s, host, port) = (11u32, "hint.test", 53u16);
+    let t0 = 2_000u64;
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        _ => panic!("a cold key must be admitted"),
+    };
+    // The same claim served twice: the second one comes from the hint.
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + 1),
+        GateClaim::InFlight
+    ));
+    // Delivered → the inner entry *and* the hint are gone; a fresh datagram
+    // must be admitted (spawned) again, never refused by a stale InFlight.
+    gate.finish(s, host, port, token, false, t0 + 2);
+    assert!(
+        matches!(gate.claim(s, host, port, t0 + 3), GateClaim::Proceed(_)),
+        "the hint must not outlive a delivered finish"
+    );
+    // Backstop expiry: a hint carrying an expired deadline must fall through
+    // to the lock path instead of returning its dead state.
+    let fresh = match gate.claim(s, host, port, t0 + DNS_GATE_INFLIGHT_TTL_MS + 10) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("an expired hint must fall through, got {other:?}"),
+    };
+    let _ = fresh;
+}
+
 /// Slot overflow must only cost a lost claim (the evicted waiter still delivers
 /// its payload), never a stuck or wrong verdict: the newest claim is still
 /// enforced and the evicted key is admissible again.
@@ -5718,7 +5753,7 @@ async fn r2_collect_reassembled(
             "Phase 1b must carry every downlink frame on the rev2 wire"
         );
         let f = r2::decode_frag(&d).expect("a fragmented downlink must be rev2 FRAG");
-        if let Some(done) = reasm.push(&f, coarse_millis()) {
+        if let Some(done) = reasm.push(&d, &f, coarse_millis()) {
             return Some(done);
         }
     }

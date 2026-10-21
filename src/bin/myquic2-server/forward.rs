@@ -43,6 +43,7 @@ pub(crate) static DNS_WAITER_SPAWNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// What [`DnsGate::claim`] says about one datagram's name.
+#[derive(Debug)]
 pub(crate) enum GateClaim {
     /// No live entry existed; the gate has recorded an in-flight claim and the
     /// caller must spawn the waiter. The token goes to [`DnsGate::finish`].
@@ -101,6 +102,36 @@ struct GateInner {
 pub(crate) struct DnsGate {
     inner: parking_lot::Mutex<GateInner>,
     seed: std::hash::RandomState,
+    /// One-slot fast verdict hint in front of the mutex, published by the
+    /// *authoritative* decision sites and refreshed whenever the slot verdict
+    /// they installed was itself served through the lock:
+    ///
+    /// * `claim()` publishes every resolution it found or created, so the
+    ///   repeated datagrams of a filtered name (or the followers of an
+    ///   in-flight burst) skip the lock acquire plus the 8-slot scan for one
+    ///   relaxed-load triple.
+    /// * `finish()` publishes an `Unusable` verdict through the same slot and
+    ///   *invalidates* the slot on a cleared (delivered) verdict — a
+    ///   `Proceed`-then-finish must not leave an `InFlight` hint behind, since
+    ///   the inner entry is gone and the gate would `Proceed` again. (The
+    ///   evicted-then-unusable publish is likewise synchronous.) The only
+    ///   drift left is a hint outliving the eviction of *its own* inner entry
+    ///   by other claims, bounded by the entry's verdict TTL; a stale hit then
+    ///   drops datagrams the gate would have let spawn, never the reverse in
+    ///   any durable way, and never mis-routes anything.
+    ///
+    /// A zero `hot_key` means "no hint"; a claim key that hashes to 0 simply
+    /// never hits the fast path and always takes the lock (a harmless
+    /// conservative outcome for an astronomically rare collision). The key is
+    /// stored with `Release` and read with `Acquire`, so a hint that is seen
+    /// at all is seen *whole*: the state and deadline stores cannot be
+    /// reordered past the key store, and an invalidation takes effect for
+    /// every reader that starts after it. Everything else is `Relaxed` — the
+    /// hint only decides drop-or-spawn, and expiry bounds any torn/stale
+    /// window to one verdict TTL.
+    hot_key: std::sync::atomic::AtomicU64,
+    hot_state: std::sync::atomic::AtomicU64,
+    hot_deadline: std::sync::atomic::AtomicU64,
 }
 
 impl DnsGate {
@@ -111,7 +142,32 @@ impl DnsGate {
                 next_generation: 0,
             }),
             seed: std::hash::RandomState::new(),
+            hot_key: std::sync::atomic::AtomicU64::new(0),
+            hot_state: std::sync::atomic::AtomicU64::new(0),
+            hot_deadline: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Publish the fast hint (see the field docs). The key is stored last with
+    /// `Release`, so every reader that gates on it (`Acquire` load) sees the
+    /// state and deadline a hint carries; an invalidated hint stores key 0 and
+    /// takes effect for every subsequent reader.
+    fn publish_hot(&self, key: u64, state: GateState, deadline: u64) {
+        use std::sync::atomic::Ordering;
+        self.hot_deadline.store(deadline, Ordering::Relaxed);
+        self.hot_state.store(
+            match state {
+                GateState::InFlight => 1_u64,
+                GateState::Unusable => 2_u64,
+            },
+            Ordering::Relaxed,
+        );
+        self.hot_key.store(key, Ordering::Release);
+    }
+
+    /// Invalidate the fast hint (verdict cleared / undecidable finish).
+    fn clear_hot(&self) {
+        self.hot_key.store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// The key one `(session, name, port)` resolution is gated on.
@@ -144,8 +200,28 @@ impl DnsGate {
     /// must either spawn the waiter or (on a later failure before the spawn)
     /// [`finish`](Self::finish) it with `unusable = false`. The permit is taken
     /// *before* this call by the caller, so a claim always has its budget.
+    ///
+    /// The fast slot is consulted first: a published live verdict for this
+    /// exact key returns without the mutex (and its 8-slot scan). A miss —
+    /// which includes any *other* key overwriting the one-slot hint, an
+    /// expired verdict, and any state whose slot was written by a generation
+    /// this fast read cannot identify — falls through to the authoritative
+    /// lock path below.
     pub(crate) fn claim(&self, s: u32, host: &str, port: u16, now_ms: u64) -> GateClaim {
+        use std::sync::atomic::Ordering;
         let key = self.key(s, host, port);
+        // The key load pairs `Release` with `Acquire`: a hint seen at all is
+        // seen whole (state and deadline included).
+        if key != 0 && self.hot_key.load(Ordering::Acquire) == key {
+            let deadline = self.hot_deadline.load(Ordering::Relaxed);
+            if deadline > now_ms {
+                match self.hot_state.load(Ordering::Relaxed) {
+                    1 => return GateClaim::InFlight,
+                    2 => return GateClaim::Unusable,
+                    _ => {}
+                }
+            }
+        }
         let mut inner = self.inner.lock();
         if let Some(e) = inner
             .entries
@@ -153,6 +229,9 @@ impl DnsGate {
             .flatten()
             .find(|e| e.key == key && e.deadline > now_ms)
         {
+            // Refresh the hint with the authoritative verdict (this claim
+            // already paid the lock; the followers do not have to).
+            self.publish_hot(key, e.state, e.deadline);
             return match e.state {
                 GateState::InFlight => GateClaim::InFlight,
                 GateState::Unusable => GateClaim::Unusable,
@@ -168,12 +247,14 @@ impl DnsGate {
             // claim's waiter still delivers its payload; its `finish` finds no
             // matching generation and is a no-op.
             .unwrap_or((generation as usize) % DNS_GATE_SLOTS);
+        let deadline = now_ms.saturating_add(DNS_GATE_INFLIGHT_TTL_MS);
         inner.entries[slot] = Some(GateEntry {
             key,
             state: GateState::InFlight,
-            deadline: now_ms.saturating_add(DNS_GATE_INFLIGHT_TTL_MS),
+            deadline,
             generation,
         });
+        self.publish_hot(key, GateState::InFlight, deadline);
         GateClaim::Proceed(generation)
     }
 
@@ -181,7 +262,9 @@ impl DnsGate {
     ///
     /// Clears the in-flight entry on a delivered/undecidable outcome, or — when
     /// the name yielded no usable address — replaces it with a short-lived
-    /// `Unusable` verdict so the following datagrams refuse inline.
+    /// `Unusable` verdict so the following datagrams refuse inline. The fast
+    /// slot follows the same verdict it mirrors: published for `Unusable`,
+    /// invalidated for a cleared verdict (see the field docs).
     pub(crate) fn finish(
         &self,
         s: u32,
@@ -200,16 +283,22 @@ impl DnsGate {
             .find(|e| e.is_some_and(|x| x.key == key))
             && slot.as_ref().is_some_and(|e| e.generation == generation)
         {
-            *slot = if unusable {
-                Some(GateEntry {
+            if unusable {
+                let deadline = now.saturating_add(DNS_GATE_UNUSABLE_TTL_MS);
+                *slot = Some(GateEntry {
                     key,
                     state: GateState::Unusable,
-                    deadline: now.saturating_add(DNS_GATE_UNUSABLE_TTL_MS),
+                    deadline,
                     generation,
-                })
+                });
+                self.publish_hot(key, GateState::Unusable, deadline);
             } else {
-                None
-            };
+                // The claim delivered (or was undecidable): the gate must
+                // `Proceed` for the next datagrams, so the InFlight hint dies
+                // with the entry.
+                *slot = None;
+                self.clear_hot();
+            }
         } else if unusable {
             // The claim was evicted (or its backstop expired and the slot was
             // reused) while the waiter ran: still publish the verdict, in the
@@ -219,12 +308,25 @@ impl DnsGate {
                 .iter_mut()
                 .find(|e| e.is_none_or(|x| x.deadline <= now))
             {
+                let deadline = now.saturating_add(DNS_GATE_UNUSABLE_TTL_MS);
                 *slot = Some(GateEntry {
                     key,
                     state: GateState::Unusable,
-                    deadline: now.saturating_add(DNS_GATE_UNUSABLE_TTL_MS),
+                    deadline,
                     generation,
                 });
+                self.publish_hot(key, GateState::Unusable, deadline);
+            }
+        } else {
+            // The slot was either evicted or its generation went stale (a
+            // newer claim for the same key owns it). Only in the first case is
+            // there no authoritative entry left for this key: an `InFlight`
+            // hint would otherwise drop datagrams the gate lets spawn until
+            // the (15 s) backstop expired, so the hint dies with it. When a
+            // newer claim for the key *does* still exist, its own publish is
+            // authoritative and a stale finish must not disturb it.
+            if !inner.entries.iter().flatten().any(|x| x.key == key) {
+                self.clear_hot();
             }
         }
     }

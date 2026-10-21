@@ -793,10 +793,15 @@ pub(crate) fn r2_caps_due(last_ms: u64, now_ms: u64) -> bool {
 }
 
 /// Rev2 counters that are not part of the shared `dgram_drops`/`udp_stats`
-/// surface (shared with the client, so not extended here). Relaxed atomics: at
-/// most one increment per frame next to a QUIC DATAGRAM send, so the cost is
-/// noise; tests read them to prove a drop happened on the path under test
-/// instead of inferring it from a timeout.
+/// surface (shared with the client, so not extended here). Relaxed atomics for
+/// everything except `TRAIN_ITEMS`, which is per *item* (a TRAIN datagram can
+/// carry up to 64) and therefore thread-locally batched on the same shape as
+/// `udp_stats::payload`: same-thread reads flush the caller's cell first, and
+/// a pending count on another thread becomes visible at the next 256 boundary
+/// — the same bound the `udp_stats` reporter documents, tolerable for a 60 s
+/// report. Tests never assert `TRAIN_ITEMS`, so the batch stays invisible.
+/// The rest are read directly by tests, so those stay one shared RMW per
+/// frame (a per-frame cost next to a QUIC DATAGRAM send reads as noise).
 pub(crate) mod r2_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -840,6 +845,30 @@ pub(crate) mod r2_stats {
     #[inline]
     pub(crate) fn bump(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    thread_local! {
+        static L_TRAIN_ITEMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// One TRAIN item accepted for the data plane.
+    ///
+    /// Per item (not per frame): up to 64 per datagram, making this the one
+    /// r2_stats line that sits on the packet path. Batched like
+    /// `udp_stats::payload` with a 256-cell flush; `TRAIN_ITEMS` has no
+    /// cross-thread reader (the 60 s report reads only the frames-sent family),
+    /// so the bounded visibility is invisible in practice.
+    #[inline]
+    pub(crate) fn bump_train_item() {
+        L_TRAIN_ITEMS.with(|c| {
+            let v = c.get().wrapping_add(1);
+            if v >= 256 {
+                TRAIN_ITEMS.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            } else {
+                c.set(v);
+            }
+        });
     }
 }
 
@@ -1151,6 +1180,11 @@ fn r2_handle_ctl(
 /// the install validated — a steady compressed frame never resolves DNS again
 /// and never reaches an address the install did not authorize. Payload delivery
 /// goes through the same fast/slow machinery as every other ingress frame.
+///
+/// This is the per-frame entry point (single `DATA` frames and FRAG
+/// completions): it resolves the id itself. The TRAIN ingress uses
+/// [`r2_forward_flow_resolved`] directly with bindings obtained under one
+/// registry lock for the whole frame.
 #[allow(clippy::too_many_arguments)]
 async fn r2_forward_flow_item(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
@@ -1163,23 +1197,50 @@ async fn r2_forward_flow_item(
     wire_id: u32,
     payload: Bytes,
 ) -> bool {
-    // A server-owned id names a *downlink-created* flow (full-cone / unsolicited
-    // source). A steady/TRAIN item on it is the client app's reply to that
-    // source, and is legitimate exactly when this connection has a live binding
-    // for the id: the binding carries the session and the remote source
-    // (`target = Ip(src)`), so it is forwarded like any other flow item. Unknown
-    // and closed ids still fail lookup (drop + count, never guess), and a client
-    // `DATA OPEN` on a server-owned id is still rejected by the owner-half rule.
-    let Some(binding) = state.registry.get(wire_id) else {
+    let binding = state.registry.get(wire_id);
+    r2_forward_flow_resolved(
+        fast,
+        ss,
+        cd,
+        conn_id,
+        allow_private,
+        staged,
+        state,
+        binding.as_ref(),
+        payload,
+    )
+    .await
+}
+
+/// Forward one payload whose binding is already resolved.
+///
+/// A server-owned id names a *downlink-created* flow (full-cone / unsolicited
+/// source). A steady/TRAIN item on it is the client app's reply to that source,
+/// and is legitimate exactly when this connection has a live binding for the
+/// id: the binding carries the session and the remote source
+/// (`target = Ip(src)`), so it is forwarded like any other flow item. Unknown
+/// and closed ids still fail lookup (drop + count, never guess), and a client
+/// `DATA OPEN` on a server-owned id is still rejected by the owner-half rule.
+/// `binding` is `None` for an id with no live registry entry (or a resolved
+/// binding that was already `Closed`).
+#[allow(clippy::too_many_arguments)]
+async fn r2_forward_flow_resolved(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    binding: Option<&Arc<FlowBinding>>,
+    payload: Bytes,
+) -> bool {
+    let Some(binding) = binding.filter(|b| b.state() != FlowState::Closed) else {
+        // The id was closed (FLOW_CLOSE / session teardown) or never lived: a
+        // late frame must fail lookup, never be re-routed.
         r2_refuse(Some(&r2_stats::UNKNOWN_ID));
         return false;
     };
-    if binding.state() == FlowState::Closed {
-        // The id was closed (FLOW_CLOSE / session teardown); a late frame must
-        // fail lookup, never be re-routed.
-        r2_refuse(Some(&r2_stats::UNKNOWN_ID));
-        return false;
-    }
     let Some(dst) = binding.target_ip().or_else(|| binding.resolved_first()) else {
         r2_refuse(None);
         return false;
@@ -1506,11 +1567,47 @@ async fn r2_ingress_train(
         r2_refuse(None);
         return;
     };
-    for (wire_id, item) in train.items() {
-        r2_stats::bump(&r2_stats::TRAIN_ITEMS);
+    // Frame-batched id resolution. One TRAIN can carry up to 64 items; the
+    // per-item `registry.get` paid one RwLock acquire/release per item (and a
+    // fresh `Arc` clone for every hit) *inside the datagram loop*. Instead the
+    // frame does two bounded passes:
+    //
+    //   pass 1 — collect each item's id, deduplicating into at most one slot per
+    //            distinct id (a duplicate that arrives before its original
+    //            resolves into the same slot, so the semantics are the per-item
+    //            ones: every item sees the binding the map holds when the frame
+    //            started);
+    //   batch  — one `get_batch` under a single read-lock hold fills every slot;
+    //   pass 2 — dispatch per item against its slot's binding.
+    //
+    // The intermediate lists are bounded by the frame's item count (≤ 64), so
+    // the two `Vec`s stay *well* inside a few hundred bytes and their capacity
+    // covers the codec's maximum frame on the first TRAIN.
+    let mut item_slot: Vec<u16> = Vec::with_capacity(usize::from(train.count));
+    let mut slots: Vec<(u32, Option<Arc<FlowBinding>>)> =
+        Vec::with_capacity(usize::from(train.count));
+    for (wire_id, _) in train.items() {
+        // Bounded linear scan (≤ 64 entries) — the codec already bounds the
+        // count, so the quadratic shape here is capped at 4 096 comparisons,
+        // the same order as the foldhash probes the per-item lookups did.
+        let slot = slots.iter().position(|(id, _)| *id == wire_id);
+        let slot = match slot {
+            Some(i) => i as u16,
+            None => {
+                slots.push((wire_id, None));
+                (slots.len() - 1) as u16
+            }
+        };
+        item_slot.push(slot);
+    }
+    state.registry.get_batch(&mut slots);
+    for (slot_index, (wire_id, item)) in train.items().enumerate() {
+        let _ = wire_id; // slots hold the ids; the fresh Arcs are what the item uses
+        r2_stats::bump_train_item();
         udp_stats::payload(item.len());
         let payload = d.slice_ref(item);
-        let _ = r2_forward_flow_item(
+        let binding = slots[usize::from(item_slot[slot_index])].1.as_ref();
+        let _ = r2_forward_flow_resolved(
             fast,
             ss,
             cd,
@@ -1518,7 +1615,7 @@ async fn r2_ingress_train(
             allow_private,
             staged,
             state,
-            wire_id,
+            binding,
             payload,
         )
         .await;
@@ -1556,7 +1653,7 @@ async fn r2_ingress_frag(
         return;
     };
     r2_stats::bump(&r2_stats::FRAG_FRAMES);
-    let Some(done) = r2_reasm.push(&frag, coarse_millis()) else {
+    let Some(done) = r2_reasm.push(&d, &frag, coarse_millis()) else {
         // Partial, duplicate, expired or refused fragment: the module already
         // bounds and validates everything; UDP semantics say drop.
         return;

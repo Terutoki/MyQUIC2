@@ -17,7 +17,9 @@ pub use fragmenter::DgramFragmenter;
 pub(crate) use fragmenter::frag_id_reuse_blocked;
 pub use r2_frag::{R2FragFlow, R2Fragmenter};
 pub use r2_reasm::{R2Assembled, R2Reassembler};
-pub use r2_stage::{R2DrainOutcome, R2StageItem, R2StageKind, R2Stager};
+pub use r2_stage::{
+    PackedFrames, R2DrainOutcome, R2StageItem, R2StageKind, R2Stager, send_packed_frames,
+};
 pub use reassembler::DgramReassembler;
 pub(crate) use reassembler::Partial;
 pub(crate) use reassembler::tombstone_bytes;

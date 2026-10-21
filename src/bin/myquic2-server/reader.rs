@@ -3,7 +3,10 @@ use super::*;
 use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{FlowBinding, FlowRegistry, FlowState, SessionFlows, SourceMatch};
 use myquic2::udp::r2_frag::R2FragFlow;
-use myquic2::udp::{R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager};
+use myquic2::udp::{
+    PackedFrames, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager,
+    send_packed_frames,
+};
 
 /// Userspace receive buffer per session reader: one full-protocol-cap datagram
 /// plus the truncation-detection slack byte (`n == buf.len()` means the kernel
@@ -300,13 +303,33 @@ pub(crate) fn stage_verdict(failed: Option<DatagramSend>) -> StageDrain {
 ///
 /// The stager books sent payloads itself and accounts the refused frame's
 /// payloads, so this function counts nothing — it must never double-book.
+///
+/// The drain is the two-phase split ([`R2Stager::pack`] +
+/// [`send_packed_frames`]): packing up to a full queue's worth of frames stays
+/// inside a short lock hold, and the QUIC writes happen unlocked, so this
+/// session's burst no longer blocks every other session's `stage_push` behind
+/// its series of DATAGRAM sends. The post-send requeue takes a fresh hold and
+/// books its (should-never-happen) overflow with the same full-queue policy
+/// `stage_push` uses.
 pub(crate) fn drain_stage(
     c2: &quinn::Connection,
     stage: &Arc<parking_lot::Mutex<R2Stager>>,
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
 ) -> StageDrain {
-    let outcome: R2DrainOutcome = stage.lock().drain(c2, *limit);
+    let mut q = PackedFrames::default();
+    {
+        let mut st = stage.lock();
+        st.pack(*limit, &mut q);
+    }
+    let outcome: R2DrainOutcome = send_packed_frames(c2, &mut q);
+    if outcome.failed.is_some() {
+        let overflow = stage.lock().requeue_unsent(&mut q, outcome.frames as usize);
+        for _ in 0..overflow {
+            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+            r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+        }
+    }
     let verdict = stage_verdict(outcome.failed);
     if verdict == StageDrain::TooLarge {
         let now_probe = mono_millis().max(1);
@@ -333,7 +356,7 @@ fn stage_push(
     let item = {
         let mut st = stage.lock();
         match st.push(item) {
-            Ok(()) => return StageDrain::Ok,
+            Ok(_) => return StageDrain::Ok,
             Err(item) => item,
         }
     };

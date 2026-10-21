@@ -651,6 +651,11 @@ pub fn decode_train(b: &[u8]) -> Result<TrainFrame<'_>, MqpError> {
 // ---------------- FRAG ----------------
 
 /// Borrowed view of a decoded `FRAG` frame.
+///
+/// `chunk_off` is where [`Self::chunk`] sits inside the buffer handed to
+/// [`decode_frag`]; an owner of that buffer uses the pair to address the chunk
+/// without copying it (the rev2 reassembler keeps out-of-order chunks as
+/// offset views of the frame instead of owned copies).
 #[derive(Debug, Clone, Copy)]
 pub struct FragRef<'a> {
     pub id: Option<u32>,
@@ -660,6 +665,7 @@ pub struct FragRef<'a> {
     pub frag_id: u32,
     pub idx: u8,
     pub total: u8,
+    pub chunk_off: usize,
     pub chunk: &'a [u8],
 }
 
@@ -836,6 +842,7 @@ pub fn decode_frag(b: &[u8]) -> Result<FragRef<'_>, MqpError> {
         frag_id,
         idx,
         total,
+        chunk_off: off,
         chunk,
     })
 }

@@ -100,10 +100,34 @@ pub struct R2DrainOutcome {
     pub failed: Option<DatagramSend>,
 }
 
-/// One encoded frame plus the number of items it carries.
+/// One encoded DATAGRAM of a test-shape `next_frame` probe.
+#[cfg(test)]
 struct EncodedFrame {
     body: Bytes,
     items: u32,
+}
+
+/// One packed DATAGRAM of a [`R2Stager::pack`] batch: the encoded body plus
+/// where its items sit in [`PackedFrames::items`].
+#[derive(Debug)]
+struct PackedFrame {
+    body: Bytes,
+    /// Index of the frame's first item in [`PackedFrames::items`] (the item
+    /// ranges of consecutive frames ascend in frame order).
+    item_off: u32,
+    item_len: u32,
+}
+
+/// Phase-A/B handoff between [`R2Stager::pack`] and [`send_packed_frames`].
+///
+/// Produced under the stager's lock, consumed after it is released. Frames
+/// carry their own item ranges into `items`, so phase B needs nothing from
+/// the queues: the failed frame's payloads are where the drop accounting
+/// happens, frames beyond it keep their items for [`R2Stager::requeue_unsent`].
+#[derive(Debug, Default)]
+pub struct PackedFrames {
+    frames: Vec<PackedFrame>,
+    items: Vec<R2StageItem>,
 }
 
 /// Per-connection stager. One instance lives next to the connection's
@@ -119,6 +143,15 @@ pub struct R2Stager {
     max_bytes: usize,
     /// Negotiated `CAPS.max_train_items`, clamped to the codec bound.
     max_train_items: usize,
+    /// Scratch for the run being packed. Cleared per frame and owned by the
+    /// stager, so packing a queue full of frames costs no fresh allocation:
+    /// the per-frame `run`/`unique`/dict-flow `Vec`s this used to allocate
+    /// are three of the four hot spots of every drain burst on both ends.
+    /// (The dict item views stay a per-frame `Vec` at the codec call — a
+    /// stager field cannot hold non-static payload slices.)
+    run_scratch: Vec<R2StageItem>,
+    unique_scratch: Vec<u32>,
+    flows_scratch: Vec<u32>,
 }
 
 impl Default for R2Stager {
@@ -143,6 +176,9 @@ impl R2Stager {
             max_items,
             max_bytes,
             max_train_items: r2::R2_MAX_TRAIN_ITEMS,
+            run_scratch: Vec::new(),
+            unique_scratch: Vec::new(),
+            flows_scratch: Vec::new(),
         }
     }
 
@@ -226,9 +262,12 @@ impl R2Stager {
         removed
     }
 
-    /// Queue one item. On a full queue the item is returned unchanged so the
-    /// caller can apply its own drop accounting (never silently lost here).
-    pub fn push(&mut self, item: R2StageItem) -> Result<(), R2StageItem> {
+    /// Queue one item. Returns the queue length after the push, so a caller
+    /// can fire an opportunistic drain (`queued >= one train`) with the same
+    /// lock hold instead of paying a second acquisition for a length read.
+    /// On a full queue the item is returned unchanged so the caller can apply
+    /// its own drop accounting (never silently lost here).
+    pub fn push(&mut self, item: R2StageItem) -> Result<usize, R2StageItem> {
         if self.queued_items >= self.max_items
             || self
                 .queued_bytes
@@ -246,7 +285,7 @@ impl R2Stager {
         queue.push_back(item);
         self.queued_items += 1;
         self.queued_bytes += bytes;
-        Ok(())
+        Ok(self.queued_items)
     }
 
     /// Drop everything, returning how many items the caller must account for
@@ -260,71 +299,116 @@ impl R2Stager {
         n
     }
 
-    /// Pop and encode the next DATAGRAM body, using at most `limit` bytes.
+    /// Phase A of the drain: pack **every** queued payload into DATAGRAM
+    /// bodies, moving item ownership into `q` in encounter order and booking
+    /// the per-payload stats exactly like the per-frame drain did.
+    ///
+    /// This runs under the caller's stager lock, which is the point of the
+    /// split: the burst drains used to hold that lock across encode **and**
+    /// the whole series of `try_send_datagram` calls, so every association's
+    /// `push` waited behind one slow send. Packing is pointer moves and
+    /// bookkeeping; [`send_packed_frames`] then writes to the wire without
+    /// the lock, and [`Self::requeue_unsent`] returns anything left over
+    /// behind a fresh (non-blocking-on-send) lock hold.
+    pub fn pack(&mut self, limit: usize, q: &mut PackedFrames) {
+        while self.pack_one_frame(limit, q) {}
+    }
+
+    /// Pack exactly one DATAGRAM (returns `false` when the queue is empty).
     ///
     /// A run of confirmed flows from any sessions becomes one `TRAIN dict`; a
     /// single confirmed item becomes a 2 B steady `DATA`; `Open`/`Inline`
-    /// items become standalone self-describing frames. Returns `None` when the
-    /// queue is empty.
-    fn next_frame(&mut self, limit: usize) -> Option<EncodedFrame> {
-        loop {
-            let session = self.next_session()?;
-            let head_is_standalone = self
+    /// items become standalone self-describing frames.
+    fn pack_one_frame(&mut self, limit: usize, q: &mut PackedFrames) -> bool {
+        let Some(session) = self.next_session() else {
+            return false;
+        };
+        let head_is_standalone = self
+            .sessions
+            .get(&session)
+            .and_then(|q| q.front())
+            .is_some_and(|i| !matches!(i.kind, R2StageKind::Steady { .. }));
+        if head_is_standalone {
+            let Some(item) = self.pop_one(session) else {
+                return true;
+            };
+            match self.encode_standalone(&item, limit) {
+                Some(body) => {
+                    udp_stats::payload(item.payload.len());
+                    let item_off = q.items.len() as u32;
+                    q.items.push(item);
+                    q.frames.push(PackedFrame {
+                        body,
+                        item_off,
+                        item_len: 1,
+                    });
+                }
+                // The live budget shrank below a queued standalone item: drop
+                // it (counted) and keep packing.
+                None => self.drop_too_large(1),
+            }
+            return true;
+        }
+        // Steady run into the reusable scratch, then encode. The scratch is
+        // emptied per frame; `take`/restore keeps the allocations across
+        // frames (and avoids double `&mut self` between the field and the
+        // per-session pops).
+        let mut run = std::mem::take(&mut self.run_scratch);
+        let mut unique = std::mem::take(&mut self.unique_scratch);
+        run.clear();
+        unique.clear();
+        let mut cost = 4usize; // kind/form/count/nfl
+        let mut took_any = self.take_steady_head(session, limit, &mut run, &mut unique, &mut cost);
+        while took_any && let Some(next) = self.next_steady_session() {
+            took_any = self.take_steady_head(next, limit, &mut run, &mut unique, &mut cost);
+        }
+        let run_len = run.len();
+        if run_len == 0 {
+            // The steady head does not fit the live limit (or stopped being
+            // the front): free the slot so the loop makes progress.
+            let front_still_steady = self
                 .sessions
                 .get(&session)
-                .and_then(|q| q.front())
-                .is_some_and(|i| !matches!(i.kind, R2StageKind::Steady { .. }));
-            if head_is_standalone {
-                let item = self.pop_one(session)?;
-                match self.encode_standalone(item, limit) {
-                    Some(frame) => return Some(frame),
-                    None => {
-                        // The live budget shrank below a queued standalone
-                        // item: drop it (counted) and keep draining.
-                        self.drop_too_large(1);
-                        continue;
-                    }
-                }
+                .and_then(|qq| qq.front())
+                .is_some_and(|i| matches!(i.kind, R2StageKind::Steady { .. }));
+            if front_still_steady {
+                let _ = self.pop_one(session);
+                self.drop_too_large(1);
             }
-            let run = self.collect_steady_run(session, limit);
-            if run.is_empty() {
-                // Every remaining head is either standalone (handled next
-                // iteration) or cannot fit the live limit. Drop the latter so
-                // the loop always makes progress.
-                if self
-                    .sessions
-                    .get(&session)
-                    .and_then(|q| q.front())
-                    .is_some_and(|i| matches!(i.kind, R2StageKind::Steady { .. }))
-                {
-                    let _ = self.pop_one(session);
-                    self.drop_too_large(1);
-                }
-                continue;
-            }
-            let single = run.len() == 1;
-            let encoded = if single {
-                let (wire_id, payload) = &run[0];
-                r2::encode_data_steady(*wire_id, payload, limit)
-            } else {
-                self.encode_train(&run, limit)
-            };
-            match encoded {
-                Some(body) => {
-                    let items = run.len() as u32;
-                    for (_, payload) in &run {
-                        udp_stats::payload(payload.len());
-                    }
-                    return Some(EncodedFrame { body, items });
-                }
-                None => {
-                    // The live budget shrank under queued items: drop this run
-                    // (counted) and keep draining the rest.
-                    self.drop_too_large(run.len());
-                    continue;
-                }
-            }
+            self.run_scratch = run;
+            self.unique_scratch = unique;
+            return true;
         }
+        let encoded = if run_len == 1 {
+            let R2StageKind::Steady { wire_id } = run[0].kind else {
+                unreachable!("a steady run only holds steady items");
+            };
+            r2::encode_data_steady(wire_id, &run[0].payload, limit)
+        } else {
+            self.encode_train_run(&run, limit)
+        };
+        match encoded {
+            Some(body) => {
+                for item in run.iter() {
+                    udp_stats::payload(item.payload.len());
+                }
+                let item_off = q.items.len() as u32;
+                q.items.append(&mut run);
+                q.frames.push(PackedFrame {
+                    body,
+                    item_off,
+                    item_len: run_len as u32,
+                });
+            }
+            // The live budget shrank under queued items: drop this run
+            // (counted) and keep packing the rest.
+            None => self.drop_too_large(run_len),
+        }
+        // Restore the scratch for the next frame (capacity preserved; `run`
+        // was appended into `q`, so the empty Vec keeps its allocation).
+        self.run_scratch = run;
+        self.unique_scratch = unique;
+        true
     }
 
     /// Account `n` payloads dropped because the live path budget no longer fits
@@ -344,52 +428,33 @@ impl R2Stager {
     }
 
     /// Encode one standalone `Open`/`Inline` item.
-    fn encode_standalone(&self, item: R2StageItem, limit: usize) -> Option<EncodedFrame> {
-        let body = match item.kind {
+    fn encode_standalone(&self, item: &R2StageItem, limit: usize) -> Option<Bytes> {
+        match &item.kind {
             R2StageKind::Open {
                 wire_id,
                 sess,
                 addr,
                 src,
-            } => r2::encode_data_open(wire_id, sess, &addr.as_ref(), src, &item.payload, limit),
+            } => r2::encode_data_open(*wire_id, *sess, &addr.as_ref(), *src, &item.payload, limit),
             R2StageKind::Inline { sess, addr, src } => {
-                r2::encode_data_inline(sess, &addr.as_ref(), src, &item.payload, limit)
+                r2::encode_data_inline(*sess, &addr.as_ref(), *src, &item.payload, limit)
             }
             R2StageKind::Steady { wire_id } => {
-                r2::encode_data_steady(wire_id, &item.payload, limit)
+                r2::encode_data_steady(*wire_id, &item.payload, limit)
             }
-        }?;
-        udp_stats::payload(item.payload.len());
-        Some(EncodedFrame { body, items: 1 })
+        }
     }
 
     /// Pop heads round-robin while they are `Steady` and fit `limit`.
     ///
-    /// `first` is the session already selected by [`Self::next_frame`], so the
-    /// run starts with that session's head and only then rotates. Per-session
-    /// FIFO order is preserved; sessions interleave for fairness.
-    fn collect_steady_run(&mut self, first: u32, limit: usize) -> Vec<(u32, Bytes)> {
-        let mut run: Vec<(u32, Bytes)> = Vec::new();
-        let mut unique: Vec<u32> = Vec::new();
-        let mut cost = 4usize; // kind/form/count/nfl
-        if !self.take_steady_head(first, limit, &mut run, &mut unique, &mut cost) {
-            return run;
-        }
-        while let Some(session) = self.next_steady_session() {
-            if !self.take_steady_head(session, limit, &mut run, &mut unique, &mut cost) {
-                break;
-            }
-        }
-        run
-    }
-
-    /// Pop one `Steady` head from `session` if it keeps the train within
-    /// `limit`; mirrors the exact wire size [`r2::encode_train_dict`] will use.
+    /// `first` is the session already selected by [`Self::pack_one_frame`], so
+    /// the run starts with that session's head and only then rotates.
+    /// Per-session FIFO order is preserved; sessions interleave for fairness.
     fn take_steady_head(
         &mut self,
         session: u32,
         limit: usize,
-        run: &mut Vec<(u32, Bytes)>,
+        run: &mut Vec<R2StageItem>,
         unique: &mut Vec<u32>,
         cost: &mut usize,
     ) -> bool {
@@ -415,31 +480,48 @@ impl R2Stager {
             return false;
         }
         let item = self.pop_one(session).expect("peeked item exists");
-        let wire_id = match item.kind {
-            R2StageKind::Steady { wire_id } => wire_id,
-            _ => unreachable!("take_steady_head peeked a steady item"),
+        let R2StageKind::Steady { wire_id } = item.kind else {
+            unreachable!("take_steady_head peeked a steady item");
         };
         if new_flow {
             unique.push(wire_id);
         }
         *cost += add;
-        run.push((wire_id, item.payload));
+        run.push(item);
         true
     }
 
-    fn encode_train(&self, run: &[(u32, Bytes)], limit: usize) -> Option<Bytes> {
-        let mut flows: Vec<u32> = Vec::new();
-        for (wire_id, _) in run {
-            if !flows.contains(wire_id) {
-                flows.push(*wire_id);
+    /// Build the dict-form `TRAIN` for a multi-item steady run.
+    ///
+    /// The flow dedupe list is the reusable [`Self::flows_scratch`] (cleared
+    /// per frame); the item views are built at the codec call, where their
+    /// payload borrows live (a stager field cannot store `&[u8]` views of a
+    /// local run).
+    fn encode_train_run(&mut self, run: &[R2StageItem], limit: usize) -> Option<Bytes> {
+        self.flows_scratch.clear();
+        for item in run {
+            let R2StageKind::Steady { wire_id } = item.kind else {
+                unreachable!("a steady run only holds steady items");
+            };
+            if !self.flows_scratch.contains(&wire_id) {
+                self.flows_scratch.push(wire_id);
             }
         }
-        let mut items: Vec<(u8, &[u8])> = Vec::with_capacity(run.len());
-        for (wire_id, payload) in run {
-            let idx = flows.iter().position(|f| f == wire_id)?;
-            items.push((idx as u8, payload.as_ref()));
-        }
-        r2::encode_train_dict(&flows, &items, limit)
+        let items: Vec<(u8, &[u8])> = run
+            .iter()
+            .map(|item| {
+                let R2StageKind::Steady { wire_id } = item.kind else {
+                    unreachable!("a steady run only holds steady items");
+                };
+                let idx = self
+                    .flows_scratch
+                    .iter()
+                    .position(|f| *f == wire_id)
+                    .expect("every run flow was deduped into the flow list");
+                (idx as u8, item.payload.as_ref())
+            })
+            .collect();
+        r2::encode_train_dict(self.flows_scratch.as_slice(), &items, limit)
     }
 
     /// Pop the next session that has a non-empty queue, rotating the cursor.
@@ -486,34 +568,90 @@ impl R2Stager {
         Some(item)
     }
 
-    /// Drain frames and send them on `conn`. Stops on the first send verdict
-    /// that is not `Sent`; the remaining items stay queued for the next drain
-    /// (the failed frame's items are counted as dropped, see
-    /// [`R2DrainOutcome`]).
+    /// Pack and send the whole queue **under the caller's lock**.
+    ///
+    /// Only the rare `stage_open_src` path needs this single-hold shape any
+    /// more: its invariant ("the queue this drain just emptied contained this
+    /// `OPEN|SRC`, and it was queued on the wire") requires that no other
+    /// reader can enqueue or drain between that push and this send. The burst
+    /// drains use [`Self::pack`] + [`send_packed_frames`] +
+    /// [`Self::requeue_unsent`] instead, so the QUIC writes happen outside the
+    /// lock.
     pub fn drain(&mut self, conn: &Connection, limit: usize) -> R2DrainOutcome {
-        let mut out = R2DrainOutcome::default();
-        while let Some(frame) = self.next_frame(limit) {
-            match try_send_datagram(conn, frame.body) {
-                DatagramSend::Sent => {
-                    out.frames = out.frames.saturating_add(1);
-                    out.items_sent = out.items_sent.saturating_add(frame.items);
-                }
-                other => {
-                    out.items_dropped = out.items_dropped.saturating_add(frame.items);
-                    out.failed = Some(other);
-                    let counter = if other == DatagramSend::Blocked {
-                        &dgram_drops::BUFFER_FULL
-                    } else {
-                        &dgram_drops::EGRESS_DEAD
-                    };
-                    for _ in 0..frame.items {
-                        dgram_drops::bump(counter);
-                    }
-                    break;
-                }
-            }
+        let mut q = PackedFrames::default();
+        self.pack(limit, &mut q);
+        let out = send_packed_frames(conn, &mut q);
+        if out.failed.is_some() {
+            // Under the caller's lock the requeue cannot overflow: the packed
+            // items were popped from this same queue (its bounded budget has
+            // not moved) and nothing else can have pushed in between.
+            let overflow = self.requeue_unsent(&mut q, out.frames as usize);
+            debug_assert_eq!(overflow, 0, "requeue under one lock hold cannot overflow");
         }
         out
+    }
+
+    /// Phase C of the unlocked drain: after [`send_packed_frames`] stopped at
+    /// frame index `failed_frame`, requeue the items of every frame beyond it,
+    /// in encounter order — per-session FIFO is exactly what pack popped, and
+    /// the deque of round-robin candidates is rebuilt by the pushes (only the
+    /// cursor's starting point can differ, which no invariant depends on).
+    ///
+    /// The failed frame's own items stay dead: the send phase already
+    /// accounted them to the verdict's drop counter, so this must not
+    /// double-book and must not resurrect them.
+    ///
+    /// Returns how many items could **not** be requeued because the bounded
+    /// queue filled again during the unlocked send window (an ordinary drop,
+    /// not a fault). The caller accounts each of those with its full-queue
+    /// drop policy; this function books nothing (the item payloads are
+    /// released here, the counter bump is the caller's business).
+    pub fn requeue_unsent(&mut self, q: &mut PackedFrames, failed_frame: usize) -> usize {
+        let start = match q.frames.get(failed_frame + 1) {
+            Some(first_unsent) => first_unsent.item_off as usize,
+            None => {
+                // The failed frame was the last one packed: nothing unsent.
+                q.frames.clear();
+                return 0;
+            }
+        };
+        if start > q.items.len() {
+            q.frames.clear();
+            return 0;
+        }
+        let mut overflow = 0usize;
+        for item in q.items.drain(start..) {
+            if self.push(item).is_err() {
+                overflow += 1;
+            }
+        }
+        // The frames list is dead weight after the requeue; a later reuse of
+        // `q` must never re-send stale bodies.
+        q.frames.clear();
+        overflow
+    }
+
+    /// Pack exactly one frame for the shape tests: same selection as
+    /// [`Self::pack_one_frame`] (so the tests pin the shipped packing), with
+    /// the popped items released locally — only a caller that drains to
+    /// exhaustion may use this wrapper on a production path.
+    #[cfg(test)]
+    fn next_frame(&mut self, limit: usize) -> Option<EncodedFrame> {
+        let mut q = PackedFrames::default();
+        loop {
+            if !self.pack_one_frame(limit, &mut q) {
+                return None;
+            }
+            if let Some(frame) = q.frames.pop() {
+                return Some(EncodedFrame {
+                    body: frame.body,
+                    items: frame.item_len,
+                });
+            }
+            // An over-limit head is dropped without producing a frame; the
+            // production `pack` loop simply tries the next head, so this
+            // wrapper must keep going instead of popping an empty batch.
+        }
     }
 }
 
@@ -526,6 +664,50 @@ impl Drop for R2Stager {
             dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
         }
     }
+}
+
+/// Phase B of the drain: put the packed frames on the wire **in order**,
+/// stopping at the first verdict that is not `Sent` (the queue's ordering is
+/// the wire's ordering; a blocked verdict must not reorder what follows).
+///
+/// This runs with the stager lock already released — that is the entire point
+/// of the split ([`R2Stager::pack`] comment). The *failed* frame's payloads
+/// are accounted here, per item and exactly (drop accounting is deliberately
+/// per-event): `Blocked` (the path's DATAGRAM budget is exhausted) books
+/// `BUFFER_FULL`, every other verdict books `EGRESS_DEAD`.
+///
+/// `q` keeps the unsent tail: its frames beyond the failure still own their
+/// items, and frame bodies either moved into quinn (`Sent`) or were released
+/// with the failed frame. [`R2Stager::requeue_unsent`] finalises the phase.
+pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOutcome {
+    let mut out = R2DrainOutcome::default();
+    let mut idx = 0usize;
+    while idx < q.frames.len() {
+        // Move the body out (a `Bytes` header swap, no payload copy): the
+        // slot's body is dead after quinn owns it.
+        let body = std::mem::take(&mut q.frames[idx].body);
+        match try_send_datagram(conn, body) {
+            DatagramSend::Sent => {
+                out.frames = out.frames.saturating_add(1);
+                out.items_sent = out.items_sent.saturating_add(q.frames[idx].item_len);
+            }
+            other => {
+                out.items_dropped = q.frames[idx].item_len;
+                out.failed = Some(other);
+                let counter = if other == DatagramSend::Blocked {
+                    &dgram_drops::BUFFER_FULL
+                } else {
+                    &dgram_drops::EGRESS_DEAD
+                };
+                for _ in 0..q.frames[idx].item_len {
+                    dgram_drops::bump(counter);
+                }
+                break;
+            }
+        }
+        idx += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -747,5 +929,70 @@ mod tests {
         let ids: Vec<u32> = t.items().map(|(id, _)| id).collect();
         assert!(ids.contains(&id(1000)), "quiet session must not be starved");
         assert!(ids.len() > 1);
+    }
+
+    /// Requeue semantics of the two-phase drain: what failed to send rejoins
+    /// its session's queue in the order pack popped it, per-session FIFO is
+    /// bit-exact, the failed frame's own items stay dead, and `PackedFrames`
+    /// is left clean for reuse.
+    #[test]
+    fn requeue_unsent_restores_the_tail_in_session_order() {
+        let mut s = R2Stager::new();
+        // Frame 0: cross-session dict train. Frame 1: standalone OPEN (its own
+        // frame). Frame 2: another steady item in session 1.
+        s.push(steady(1, 1, b"a1")).unwrap();
+        s.push(steady(2, 2, b"b1")).unwrap();
+        s.push(open(1, 9, b"o")).unwrap();
+        s.push(steady(1, 3, b"a2")).unwrap();
+        let mut q = PackedFrames::default();
+        s.pack(1162, &mut q);
+        assert_eq!(q.frames.len(), 3);
+        assert_eq!(q.items.len(), 4);
+        assert!(s.is_empty(), "pack moved every item out of the queue");
+        // Frame 1's pack order is observed through the packed batch itself.
+        assert_eq!(q.frames[0].item_len, 2, "frame 0 is the dict train");
+        assert_eq!(q.frames[1].item_len, 1, "frame 1 is the standalone OPEN");
+        assert_eq!(q.frames[2].item_len, 1);
+        // Simulate: frame 1 failed (its item stays dead), so
+        // `outcome.frames == 1` requeues only what is beyond the failure.
+        let overflow = s.requeue_unsent(&mut q, 1);
+        assert_eq!(overflow, 0);
+        assert!(q.frames.is_empty(), "stale bodies must not survive");
+        // The head items (the sent train's and the failed frame's) stay in
+        // `q.items` until `q` itself is dropped: only frames *beyond* the
+        // failure were resurrected, and requeueing them removed them.
+        assert_eq!(s.len(), 1, "only the unsent tail rejoined");
+        // The rest is session 1's steady item — the OPEN and the sent train
+        // items are gone (drop accounting is the send phase's job, not the
+        // requeue's).
+        let f = s.next_frame(1162).unwrap();
+        let d = r2::decode_data(&f.body).unwrap();
+        assert_eq!(d.id, Some(id(3)), "the steady item kept its id identity");
+    }
+
+    /// A queue that refilled inside the unlocked send window makes the
+    /// requeue overflow: the items that do not fit are dropped and reported
+    /// for the caller's policy counter, and the item budget stays exact.
+    #[test]
+    fn requeue_overflow_drops_items_that_cannot_rejoin() {
+        let mut s = R2Stager::with_capacity(4, 256);
+        s.push(steady(1, 1, b"a")).unwrap();
+        s.push(open(2, 9, b"o")).unwrap();
+        let mut q = PackedFrames::default();
+        s.pack(1162, &mut q);
+        assert_eq!(q.frames.len(), 2, "one steady frame + one standalone OPEN");
+        assert_eq!(q.items.len(), 2);
+        // The send window "stalls" while another association fills the queue
+        // to its cap again; the tail (the OPEN item) then has no slot to
+        // rejoin and must be reported as overflow instead of resurrected.
+        s.push(steady(3, 3, b"r1")).unwrap();
+        s.push(steady(4, 4, b"r2")).unwrap();
+        s.push(steady(3, 5, b"r3")).unwrap();
+        s.push(steady(4, 6, b"r4")).unwrap();
+        assert_eq!(s.len(), 4);
+        let overflow = s.requeue_unsent(&mut q, 0);
+        assert_eq!(overflow, 1, "the unsent tail item did not fit back");
+        assert_eq!(s.len(), 4, "the queue is exactly full again");
+        assert!(q.frames.is_empty());
     }
 }

@@ -5087,7 +5087,7 @@ async fn recv_rev2_fragments(
         );
         let f = r2::decode_frag(&d).expect("the frame must be rev2 FRAG");
         frames += 1;
-        if let Some(done) = reasm.push(&f, coarse_millis()) {
+        if let Some(done) = reasm.push(&d, &f, coarse_millis()) {
             return (done, frames);
         }
     }

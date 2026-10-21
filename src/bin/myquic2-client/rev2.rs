@@ -37,7 +37,10 @@ use myquic2::mqp::r2_flow::{
     CtlState, FlowBinding, FlowIds, FlowRegistry, FlowState, R2_MAX_FLOWS_PER_CONN, SessionFlows,
 };
 use myquic2::udp::r2_frag::R2FragFlow;
-use myquic2::udp::{R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager};
+use myquic2::udp::{
+    PackedFrames, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager,
+    send_packed_frames,
+};
 
 /// Retry cadence for `CTL HELLO` until `CAPS` arrives.
 pub(crate) const HELLO_RETRY: Duration = Duration::from_millis(200);
@@ -110,7 +113,19 @@ pub(crate) struct ConnRev2 {
     /// stager lock.
     pub(crate) stager: Arc<parking_lot::Mutex<R2Stager>>,
     /// Sessions the server closed (see [`MAX_CLOSED_SESSIONS`]).
+    ///
+    /// The `take` guard is the datagram's very first shared read, and the vector
+    /// is empty in steady state (populated only by a server `SESS_CLOSE`): the
+    /// `closed_len` counter below turns the per-datagram probe into one relaxed
+    /// load, and the exclusive write lock is taken only while a close is
+    /// actually pending.
     closed_sessions: parking_lot::RwLock<Vec<u32>>,
+    /// Live `closed_sessions` length, maintained under the write lock. A stale
+    /// *overshoot* is impossible (writes under the lock refresh it last); a
+    /// stale zero short-takes one extra payload before the next sync re-checks,
+    /// which is ordinary UDP loss. Updated with `Relaxed`: the caller treats
+    /// `false` as "not closed on this datagram" and re-checks on the next sync.
+    closed_len: std::sync::atomic::AtomicUsize,
     /// `(target, rejected_at_ms)` for targets the server rejected with
     /// `CTL FLOW_REJECT` (see [`REJECT_TTL_MS`]).
     rejected: parking_lot::RwLock<Vec<(TargetAddr, u64)>>,
@@ -153,6 +168,7 @@ impl ConnRev2 {
             max_frame_bytes: std::sync::atomic::AtomicU16::new(0),
             stager: Arc::new(parking_lot::Mutex::new(stager)),
             closed_sessions: parking_lot::RwLock::new(Vec::new()),
+            closed_len: std::sync::atomic::AtomicUsize::new(0),
             rejected: parking_lot::RwLock::new(Vec::new()),
         })
     }
@@ -202,16 +218,50 @@ impl ConnRev2 {
 
     /// Queue one ready-to-send small payload for this connection.
     ///
-    /// Returns the item back when the bounded queue is full; the caller owns
+    /// Returns the post-push queue length so `stage_or_count` can fire the
+    /// opportunistic drain on the same lock hold (this used to be a second
+    /// `MutexGuard` acquisition per staged payload just to read the length).
+    /// The item comes back when the bounded queue is full; the caller owns
     /// the drop policy (see [`send_uplink`]).
-    pub(crate) fn push_stage(&self, item: R2StageItem) -> Result<(), R2StageItem> {
+    pub(crate) fn push_stage(&self, item: R2StageItem) -> Result<usize, R2StageItem> {
         self.stager.lock().push(item)
     }
 
-    /// Drain the connection's queued payloads onto `conn` (one caller at a
-    /// time; the lock serialises concurrent associations).
+    /// Two-phase drain of the connection's queued payloads.
+    ///
+    /// Phase A packs the whole queue under one short lock hold; phase B sends
+    /// the frames without any lock; phase C (only on a failed send) requeues
+    /// the unsent tail behind a fresh hold. Packing is serialised by the
+    /// stager lock, but the send phase is not: two concurrent associations
+    /// drain disjoint batches, and their DATAGRAMs can interleave on the wire
+    /// (a later-packed batch may be sent first). That is inside the UDP /
+    /// MQP-3 contract — every frame is self-describing and FRAG reassembly is
+    /// keyed by index — and it is the price of keeping quinn sends outside the
+    /// stager lock. A single batch is still put on the wire in queue order.
     pub(crate) fn drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainOutcome {
-        self.stager.lock().drain(conn, limit)
+        let mut q = PackedFrames::default();
+        {
+            let mut st = self.stager.lock();
+            st.pack(limit, &mut q);
+        }
+        let outcome = send_packed_frames(conn, &mut q);
+        if outcome.failed.is_some() {
+            let overflow = self
+                .stager
+                .lock()
+                .requeue_unsent(&mut q, outcome.frames as usize);
+            // The requeue should never overflow (the queue was emptied by this
+            // drain and its budget has not moved), but a concurrent
+            // association can legitimately refill it inside the unlocked send
+            // window; each such item takes the same full-queue policy the
+            // push path uses.
+            for _ in 0..overflow {
+                counters::stage_full();
+                let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+                warn_stage_full(n);
+            }
+        }
+        outcome
     }
 
     /// Number of payloads currently queued on this connection.
@@ -241,15 +291,40 @@ impl ConnRev2 {
         if closed.len() < MAX_CLOSED_SESSIONS && !closed.contains(&sess) {
             closed.push(sess);
         }
+        // Refresh under the same lock hold: a concurrent `take` that saw the
+        // pre-push length then did not find its id cannot pass a stale zero to
+        // the *next* sync.
+        self.closed_len
+            .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Consume a recorded `SESS_CLOSE` for `sess`.
     pub(crate) fn take_session_closed(&self, sess: u32) -> bool {
+        // The steady-state short-circuit: an empty vector (the common case)
+        // costs one relaxed load instead of an exclusive lock acquisition per
+        // uplink datagram. `closed_len` only says "the lock may be worth
+        // taking" — the vector itself stays the authority, so a concurrent
+        // `note` racing an in-flight probe is refuted (not lost): it refreshes
+        // the count under its own write hold and the next sync picks it up.
+        if self.closed_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return false;
+        }
         let mut closed = self.closed_sessions.write();
-        closed.iter().position(|&s| s == sess).is_some_and(|i| {
-            closed.swap_remove(i);
-            true
-        })
+        match closed.iter().position(|&s| s == sess) {
+            Some(i) => {
+                closed.swap_remove(i);
+                self.closed_len
+                    .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => {
+                // Heal the counter (its earlier read raced a concurrent
+                // drain); one fresh store can only ever be conservative.
+                self.closed_len
+                    .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     /// Record that the server rejected a flow for `target`. The uplink then
@@ -395,6 +470,19 @@ pub(crate) struct UplinkFlows {
     pub(crate) flows: SessionFlows,
     /// Connection epoch the current `flows` belong to.
     pub(crate) epoch: u64,
+    /// One-slot memo of the binding the last uplink datagram used.
+    ///
+    /// A steady association sends to the same target it used microseconds ago:
+    /// without the memo that hit cost a linear scan of [`UplinkFlows::flows`]
+    /// (one probe per slot until the match, plus the matched `Arc<FlowBinding>`
+    /// clone and its drop) on *every* datagram. The memo turns the common hit
+    /// into one `TargetAddrRef` compare plus the state load the caller needs
+    /// anyway. Set only when the slot is empty, so a steady flow pays zero
+    /// extra allocations; invalidated by any reset below and by a miss (the
+    /// next ensure re-derives it the normal way). A memo binding whose `state`
+    /// became `Closed` fails the check here, so a later `FLOW_CLOSE`/session
+    /// teardown is honoured even though the registry side already dropped it.
+    pub(crate) last: Option<(TargetAddr, Arc<FlowBinding>)>,
 }
 
 impl UplinkFlows {
@@ -402,6 +490,7 @@ impl UplinkFlows {
         Self {
             flows: SessionFlows::new(),
             epoch: 0,
+            last: None,
         }
     }
 
@@ -421,6 +510,7 @@ impl UplinkFlows {
         if self.epoch != rev2.epoch {
             self.flows = SessionFlows::new();
             self.epoch = rev2.epoch;
+            self.last = None;
             counters::flow_table_reset();
             return;
         }
@@ -430,6 +520,7 @@ impl UplinkFlows {
                 let _ = rev2.registry.remove(b.wire_id);
             }
             self.flows = SessionFlows::new();
+            self.last = None;
             counters::session_reset();
         }
     }
@@ -486,7 +577,7 @@ pub(crate) fn send_uplink(
         let drained = drain_conn_stage(rev2, conn, limit);
         return prefer_severe(drained, bad_address_header());
     }
-    let Some(binding) = ensure_binding(rev2, &mut up.flows, sess, addr) else {
+    let Some(binding) = ensure_binding(rev2, up, sess, addr) else {
         counters::inline_fallback();
         if payload.len() > BATCH_SMALL_MAX {
             let drained = drain_conn_stage(rev2, conn, limit);
@@ -554,12 +645,14 @@ fn stage_or_count(
     };
     for attempt in 0..2 {
         match rev2.push_stage(item) {
-            Ok(()) => {
+            Ok(queued) => {
                 counters::stage_push();
                 // Opportunistic drain at one train's worth of queued items:
                 // cross-session items meet here, and the queue stays bounded
                 // even when the pushing association's burst is interrupted.
-                if rev2.stage_len() >= r2::R2_MAX_TRAIN_ITEMS {
+                // The push call itself now returns the post-push length, so
+                // this no longer pays a second lock acquisition for the read.
+                if queued >= r2::R2_MAX_TRAIN_ITEMS {
                     drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
                 }
                 return match drained.failed {
@@ -751,14 +844,29 @@ fn bad_address_header() -> PayloadSend {
 /// connection registry is full, or the session table is full (the spec's
 /// fail-safe). A `Closed` binding for the target is forgotten first: its id
 /// cannot be reused on this connection, so the target gets a fresh one.
+///
+/// The association's one-slot memo (`UplinkFlows::last`) serves the steady
+/// hit — same target, same live binding — without the per-slot scan and the
+/// extra `Arc` clone/drop of a `SessionFlows::find`. Everything past the memo
+/// miss is unchanged.
 fn ensure_binding(
     rev2: &ConnRev2,
-    flows: &mut SessionFlows,
+    up: &mut UplinkFlows,
     sess: u32,
     addr: &TargetAddrRef<'_>,
 ) -> Option<Arc<FlowBinding>> {
+    if let Some((cached_addr, cached)) = &up.last
+        && cached_addr.as_ref() == *addr
+        && cached.session == sess
+        && cached.state() != FlowState::Closed
+    {
+        return Some(cached.clone());
+    }
+    up.last = None;
+    let flows = &mut up.flows;
     if let Some(existing) = flows.find(addr) {
         if existing.state() != FlowState::Closed {
+            up.last = Some((addr.into_owned(), existing.clone()));
             return Some(existing);
         }
         let _ = flows.remove(existing.wire_id);
@@ -780,6 +888,7 @@ fn ensure_binding(
         if server.is_open() {
             if flows.insert(server.clone()) {
                 counters::server_flow_reuse();
+                up.last = Some((addr.into_owned(), server.clone()));
                 return Some(server);
             }
             // Per-association table full: the documented INLINE fail-safe.
@@ -805,6 +914,7 @@ fn ensure_binding(
         return None;
     }
     counters::flow_open();
+    up.last = Some((addr.into_owned(), binding.clone()));
     Some(binding)
 }
 
@@ -845,8 +955,27 @@ pub(crate) fn drain_assoc_stage(egress: &SharedEgress, pool: &ConnPool, bind: Ud
 /// module: the codec/state slice this task is allowed to touch ends at the
 /// client sources, and these counters only exist to answer "is the rev2 path
 /// actually being used, and does it fall back" from the 60 s report and the
-/// tests. Every count is a relaxed atomic; the hot path pays one RMW per sent
-/// frame, which is the same cost class as the existing `udp_stats::payload`.
+/// tests.
+///
+/// Two cost classes. The per-datagram/per-frame data-plane events (`open_tx`,
+/// `steady_tx`, `inline_tx`, the `stage_*` family, `frag_*`, `rx_frame`) used
+/// to pay one process-wide cache-line RMW *per event* from every relay task
+/// and the per-slot dispatcher — the exact cost [`crate::udp_stats::payload`]
+/// was converted away from when its counters went thread-local (the comment
+/// above used to claim the two were the same class; that claim stopped being
+/// true). Those events now accumulate in thread-local cells flushed into the
+/// process-wide statics at the [`FLUSH_EVERY`] boundary, so the hot path pays
+/// local `Cell` writes and the shared lines move only once per 256 events.
+/// Control-plane events (handshake, CTL, unknown-id/refusal accounting) stay
+/// direct shared increments: they are rare by definition and several are the
+/// regression-test observables.
+///
+/// Read exactness follows the shipped `udp_stats` model: `snapshot()` /
+/// `since()` flush the *caller's* cells first (tests and a reporter running on
+/// the counting thread see their own records exactly); a pending count on a
+/// *different* thread becomes visible at the next flush boundary instead of
+/// immediately, bounded by 256 events — the reporter reads once per 60 s, so
+/// the bound matches the existing documented behaviour.
 pub(crate) mod counters {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -871,6 +1000,9 @@ pub(crate) mod counters {
 
             impl Rev2Snapshot {
                 fn now() -> Self {
+                    // Flush the caller's pending batch first: reporter and
+                    // tests read on the collecting thread.
+                    flush_locals();
                     Self {
                         $($name: COUNTERS.$name.load(Ordering::Relaxed),)*
                     }
@@ -885,11 +1017,58 @@ pub(crate) mod counters {
                     $($name: now.$name.saturating_sub(prev.$name),)*
                 }
             }
+        };
+    }
 
-            $(#[inline]
-            pub(crate) fn $name() {
-                COUNTERS.$name.fetch_add(1, Ordering::Relaxed);
-            })*
+    macro_rules! rev2_counter_fns_direct {
+        ($($name:ident),* $(,)?) => {
+            $(
+                #[inline]
+                pub(crate) fn $name() {
+                    COUNTERS.$name.fetch_add(1, Ordering::Relaxed);
+                }
+            )*
+        };
+    }
+
+    macro_rules! rev2_counter_fns_tls {
+        ($($name:ident),* $(,)?) => {
+            /// Pending counts for the data-plane counters, per thread.
+            #[derive(Debug, Default)]
+            struct Rev2Locals {
+                $($name: std::cell::Cell<u64>,)*
+            }
+
+            thread_local! {
+                static LOCALS: Rev2Locals = Rev2Locals::default();
+            }
+
+            fn flush_locals() {
+                LOCALS.with(|l| {
+                    $(
+                        let v = l.$name.get();
+                        if v != 0 {
+                            COUNTERS.$name.fetch_add(v, Ordering::Relaxed);
+                            l.$name.set(0);
+                        }
+                    )*
+                });
+            }
+
+            $(
+                #[inline]
+                pub(crate) fn $name() {
+                    LOCALS.with(|l| {
+                        let v = l.$name.get().wrapping_add(1);
+                        if v >= FLUSH_EVERY {
+                            COUNTERS.$name.fetch_add(v, Ordering::Relaxed);
+                            l.$name.set(0);
+                        } else {
+                            l.$name.set(v);
+                        }
+                    });
+                }
+            )*
         };
     }
 
@@ -960,6 +1139,11 @@ pub(crate) mod counters {
         ctl_drop,
     }
 
+    /// Thread-local flush threshold for the data-plane counters: the hot path
+    /// touches the shared line once instead of once per event (same bound the
+    /// `udp_stats` reporter documents).
+    const FLUSH_EVERY: u64 = 256;
+
     impl Rev2Snapshot {
         /// Whether nothing happened in the window (the reporter stays silent).
         pub(crate) fn is_idle(&self) -> bool {
@@ -970,6 +1154,49 @@ pub(crate) mod counters {
     /// Snapshot for the reporter and tests.
     pub(crate) fn snapshot() -> Rev2Snapshot {
         Rev2Snapshot::now()
+    }
+
+    // Data-plane hot counters (per uplink payload / per downlink frame / per
+    // drained drain): thread-local cells, flushed into the shared statics at
+    // `FLUSH_EVERY`. None of these is a regression-test observable read on a
+    // different thread, which is what keeps cross-thread reads exact.
+    rev2_counter_fns_tls! {
+        open_tx,
+        steady_tx,
+        inline_tx,
+        stage_push,
+        stage_drains,
+        stage_frames,
+        stage_items,
+        stage_drop,
+        stage_full,
+        frag_tx,
+        frag_rx,
+        frag_complete,
+        rx_frame,
+    }
+
+    // Control-plane / test-observable counters: direct shared increments, the
+    // exact cross-thread one-per-event cost the tests rely on.
+    rev2_counter_fns_direct! {
+        hello_tx,
+        handshake_ok,
+        handshake_fail,
+        caps_rx,
+        flow_ack_rx,
+        flow_reject_rx,
+        flow_close_rx,
+        sess_close_rx,
+        sess_close_tx,
+        flow_open,
+        server_flow_accept,
+        server_flow_reuse,
+        inline_fallback,
+        rx_unknown_id,
+        rx_drop,
+        flow_table_reset,
+        session_reset,
+        ctl_drop,
     }
 
     impl std::fmt::Display for Rev2Snapshot {
@@ -1082,7 +1309,7 @@ mod tests {
     #[test]
     fn inline_fallback_when_registry_is_full() {
         let r = ConnRev2::new();
-        let mut flows = SessionFlows::new();
+        let mut up = UplinkFlows::new();
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
         // Fill the connection registry by hand (its cap is the shared default).
         // The filler target differs from `addr`: ids are allocated from 1, so
@@ -1096,23 +1323,23 @@ mod tests {
             assert!(r.registry.insert(b).is_ok());
         }
         assert!(
-            ensure_binding(&r, &mut flows, 1, &TargetAddrRef::Ip(addr)).is_none(),
+            ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
             "a full registry must fall back to INLINE"
         );
-        assert!(flows.is_empty());
+        assert!(up.flows.is_empty());
     }
 
     #[test]
     fn closed_binding_is_reopened_with_a_fresh_id() {
         let r = ConnRev2::new();
-        let mut flows = SessionFlows::new();
+        let mut up = UplinkFlows::new();
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
-        let first = ensure_binding(&r, &mut flows, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         assert_eq!(first.state(), FlowState::Opening);
         first.mark_closed();
-        let second = ensure_binding(&r, &mut flows, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        let second = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         assert_ne!(first.wire_id, second.wire_id);
-        assert_eq!(flows.len(), 1);
+        assert_eq!(up.flows.len(), 1);
         assert!(r.registry.get(first.wire_id).is_none());
         assert!(r.registry.get(second.wire_id).is_some());
     }
@@ -1127,6 +1354,49 @@ mod tests {
         up.sync(&r2, 7);
         assert_eq!(up.epoch, r2.epoch);
         assert!(up.flows.is_empty());
+    }
+
+    #[test]
+    fn uplink_memo_serves_the_steady_target_without_a_second_binding() {
+        let r = ConnRev2::new();
+        let mut up = UplinkFlows::new();
+        let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        // The steady hit: same association, same target, live binding — served
+        // by the one-slot memo, never re-scanned into a new binding.
+        let second = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the memo serves the same Arc");
+        assert_eq!(up.flows.len(), 1, "no second binding was created");
+        // A different target misses the memo (it holds only one slot): the
+        // normal path opens the second target, and going back re-derives the
+        // first one by id equality — no re-OPEN, no id change.
+        let other: SocketAddr = "198.51.100.10:4242".parse().unwrap();
+        let third = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(other)).unwrap();
+        assert_ne!(third.wire_id, first.wire_id);
+        let back = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        assert_eq!(
+            back.wire_id, first.wire_id,
+            "the scan re-finds the first flow"
+        );
+        assert_eq!(up.flows.len(), 2);
+        // The memo slot now holds the first binding again. Close it as a late
+        // `FLOW_CLOSE` would: the next call must fail the memo state check and
+        // reopen a *fresh* binding, never serve the closed one.
+        first.mark_closed();
+        let after_close = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        assert_ne!(
+            after_close.wire_id, first.wire_id,
+            "a closed memo binding is not served"
+        );
+        assert_eq!(
+            up.flows.len(),
+            2,
+            "the dead slot was replaced, not appended"
+        );
+        // An epoch reset drops the memo with the flow table.
+        let r2 = ConnRev2::new();
+        up.sync(&r2, 1);
+        assert!(up.last.is_none(), "redial invalidates the memo");
     }
 
     #[test]
@@ -1182,8 +1452,8 @@ mod tests {
         let r = ConnRev2::new();
         let now = coarse_millis();
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
-        let mut flows = SessionFlows::new();
-        let first = ensure_binding(&r, &mut flows, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        let mut up = UplinkFlows::new();
+        let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         first.mark_open();
         // A reject closes the flow and arms the target's INLINE window.
         first.mark_closed();
@@ -1191,7 +1461,7 @@ mod tests {
         r.note_rejected(TargetAddr::Ip(addr), now);
         assert!(r.is_rejected(&TargetAddrRef::Ip(addr), now));
         assert!(
-            ensure_binding(&r, &mut flows, 1, &TargetAddrRef::Ip(addr)).is_none(),
+            ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
             "a rejected target must fall back to INLINE inside the TTL"
         );
         // The window is TTL-wide; a probe at the TTL boundary expires it (that
@@ -1204,9 +1474,13 @@ mod tests {
         // Expire the entry as the wall clock would, then the next payload
         // retries a fresh OPEN with a new (never reused) id.
         r.rejected.write().clear();
-        let retried = ensure_binding(&r, &mut flows, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        let retried = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         assert_ne!(retried.wire_id, first.wire_id, "an id is never reused");
-        assert_eq!(flows.len(), 1, "the retried flow replaced the dead binding");
+        assert_eq!(
+            up.flows.len(),
+            1,
+            "the retried flow replaced the dead binding"
+        );
         assert!(r.registry.get(retried.wire_id).is_some());
     }
 

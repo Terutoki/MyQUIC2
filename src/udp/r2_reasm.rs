@@ -16,8 +16,9 @@
 //! targets into one payload.
 //!
 //! Bounds are the shipped ones: 8 KiB per payload, 256 partials, 256 KiB of
-//! retained chunks per connection, 2 s partial timeout. Everything is validated
-//! before allocation; a malformed fragment only drops that fragment.
+//! retained assembly/pending bytes per connection, 2 s partial timeout.
+//! Everything is validated before allocation; a malformed fragment only drops
+//! that fragment.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -51,16 +52,68 @@ struct FragCtx {
     src: bool,
 }
 
+/// One out-of-order-arrival chunk that cannot be written into the assembly
+/// buffer yet: its position needs a determinator (the first fragment's length,
+/// plus the unit width from the index 2) that has not landed.
+///
+/// The chunk is held as a *view* of the frame it arrived on (an owned
+/// refcount clone of the [`Bytes`] plus offset/len), so it is copied exactly
+/// once — into the assembly buffer when a later fragment unlocks it. The
+/// clone is one atomic increment against the incoming frame; the per-index
+/// slot table this replaces paid one owned heap allocation + a full chunk
+/// memcpy per arrival *and* a whole-payload copy at completion.
+#[derive(Debug)]
+struct PendingChunk {
+    idx: u8,
+    /// The arrived frame (refcount view: the chunk never escapes the frame's
+    /// allocation).
+    d: Bytes,
+    chunk_off: usize,
+    len: usize,
+}
+/// Cost of one [`PendingChunk`] in the retained-bytes budget: the view
+/// (idx + offset + len + the `Bytes` header) and its share of the frame it
+/// pins. 48 B is the same per-datagram bookkeeping charge the fragmenter
+/// uses.
+const PENDING_CHUNK_COST: usize = 48;
+
 #[derive(Debug)]
 struct Partial {
     total: u8,
     ctx: Option<FragCtx>,
-    chunks: Vec<Option<Bytes>>,
-    got: u8,
-    /// Assembled payload bytes held (bounded by [`MQP_FRAG_MAX_PAYLOAD`]).
+    /// Assembled bytes in index order. Chunk *i* owns the buffer range
+    /// `[pos(i), pos(i) + len(i))` with `pos(0) = 0` and
+    /// `pos(i) = len(0) + (i - 1) * unit` — the segmentation contract of the
+    /// shipped fragmenter, which plans one split per payload: every
+    /// non-first non-last fragment carries the same rest-chunk budget
+    /// (`unit`), the first fragment its own budget, the last one a remainder.
+    /// Positions resolve as the determinators land; a chunk that cannot be
+    /// placed yet waits in [`Partial::pending`].
+    ///
+    /// This replaces the previous `Vec<Option<Bytes>>` slot table: one
+    /// shared allocation instead of one heap chunk + one slot entry per
+    /// fragment, and no second full-payload copy at completion.
+    buf: Vec<u8>,
+    /// Bit *i* set = chunk *i* landed. This is both the duplicate test and
+    /// the completion test (all of the first `total` bits).
+    got: u64,
+    /// `len(0)` — set by the first fragment; every later position hangs off it.
+    first_len: Option<usize>,
+    /// The unit width: `len(i)` for any middle fragment (`1 <= i < total - 1`),
+    /// locked by the first middle fragment that lands. A later middle
+    /// fragment with a different length is refused: a sender splitting one
+    /// payload with two different middle widths is not the shipped
+    /// fragmenter (and the positions below would not be derivable).
+    unit: Option<usize>,
+    /// Chunks whose positions are not determinable yet.
+    pending: Vec<PendingChunk>,
+    /// Sum of accepted chunk lengths, bounded by [`MQP_FRAG_MAX_PAYLOAD`]
+    /// per arrival — the assembled payload is at most that big.
     bytes: usize,
-    /// Chunk bytes plus the slot-table allocation (bounded by
-    /// [`FRAG_MAX_HELD_BYTES`] together with every other partial).
+    /// Retained footprint: `buf.capacity()` + the pending views. Charged
+    /// against [`FRAG_MAX_HELD_BYTES`] like the previous scheme and re-derived
+    /// after every mutation, because capacity-based accounting has no
+    /// per-chunk free event.
     retained: usize,
     first_ms: u64,
 }
@@ -70,16 +123,91 @@ impl Partial {
         Self {
             total,
             ctx,
-            chunks: vec![None; usize::from(total)],
+            buf: Vec::new(),
             got: 0,
+            first_len: None,
+            unit: None,
+            pending: Vec::new(),
             bytes: 0,
             retained: 0,
             first_ms: now_ms,
         }
     }
 
-    fn slot_table_bytes(total: u8) -> usize {
-        usize::from(total) * std::mem::size_of::<Option<Bytes>>()
+    /// Byte offset of chunk `idx` in the assembly buffer, or `None` while a
+    /// determinator is missing: `first_len` for every later fragment and —
+    /// except index 1, whose offset is directly after the first chunk — the
+    /// `unit` width. Index 0 is always placed.
+    fn pos_of(first_len: Option<usize>, unit: Option<usize>, idx: u8) -> Option<usize> {
+        if idx == 0 {
+            return Some(0);
+        }
+        let head = first_len?;
+        let steps = usize::from(idx) - 1;
+        let unit = if steps == 0 { 0 } else { unit? };
+        head.checked_add(steps.checked_mul(unit)?)
+    }
+
+    /// Write `bytes` into `buf` at `pos`, growing it as needed. The buffer can
+    /// never grow past the payload bound: `bytes` admission caps the sum of
+    /// chunk lengths, but not the positions a hostile wide `unit` could
+    /// pretend, so this is checked where the resize would happen.
+    fn buf_write(buf: &mut Vec<u8>, pos: usize, bytes: &[u8]) -> bool {
+        let Some(end) = pos.checked_add(bytes.len()) else {
+            return false;
+        };
+        if end > MQP_FRAG_MAX_PAYLOAD {
+            return false;
+        }
+        if buf.len() < end {
+            buf.resize(end, 0);
+        }
+        buf[pos..end].copy_from_slice(bytes);
+        true
+    }
+
+    /// Write every pending chunk whose position just became determinable;
+    /// swap-remove re-examines the entry that lands at `i`. Unwritable
+    /// entries (never for a conforming partial) stay queued and simply never
+    /// complete the payload — a drop by timeout, not a fault.
+    fn drain_pending(&mut self) {
+        let mut i = 0;
+        while i < self.pending.len() {
+            let c = &self.pending[i];
+            let Some(pos) = Self::pos_of(self.first_len, self.unit, c.idx) else {
+                i += 1;
+                continue;
+            };
+            let end = pos.checked_add(c.len);
+            if !end.is_some_and(|end| {
+                end <= MQP_FRAG_MAX_PAYLOAD
+                    && c.chunk_off
+                        .checked_add(c.len)
+                        .is_some_and(|e| e <= c.d.len())
+            }) {
+                // Hostile geometry: the view never fits its own frame or the
+                // payload. Leave it queued (it can never be written).
+                i += 1;
+                continue;
+            }
+            let end = end.expect("checked above");
+            let c = self.pending.swap_remove(i);
+            if self.buf.len() < end {
+                self.buf.resize(end, 0);
+            }
+            self.buf[pos..end].copy_from_slice(&c.d[c.chunk_off..c.chunk_off + c.len]);
+        }
+    }
+
+    /// Re-derive the retained footprint (`Self::retained`) from the current
+    /// buffer capacity and pending views.
+    fn recompute_retained(&mut self) {
+        let pending: usize = self
+            .pending
+            .iter()
+            .map(|c| c.len + PENDING_CHUNK_COST)
+            .sum();
+        self.retained = self.buf.capacity() + pending;
     }
 }
 
@@ -129,14 +257,26 @@ impl R2Reassembler {
         self.parts.len()
     }
 
-    /// Feed one decoded `FRAG` frame. Returns the payload once every fragment
-    /// has landed.
-    pub fn push(&mut self, f: &r2::FragRef<'_>, now_ms: u64) -> Option<R2Assembled> {
+    /// Feed one decoded `FRAG` frame contiguous in `d` (the chunk sits at
+    /// [`r2::FragRef::chunk_off`] of this very buffer). Returns the payload
+    /// once every fragment has landed.
+    ///
+    /// Copy policy: a single-fragment payload is delivered as a **view** of
+    /// `d` (zero copies); each multi-part chunk is copied exactly once —
+    /// straight into its final position in the partial's assembly buffer, or
+    /// (while its position is undeterminable) held as a view of `d` and copied
+    /// once a later determinator unlocks it.
+    pub fn push(&mut self, d: &Bytes, f: &r2::FragRef<'_>, now_ms: u64) -> Option<R2Assembled> {
         // Shape checks before anything allocates.
         if f.total < 1 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total || f.chunk.is_empty() {
             return None;
         }
         if f.chunk.len() > MQP_FRAG_MAX_PAYLOAD {
+            return None;
+        }
+        // The caller contract: `f` is decoded from this very buffer. The view
+        // arithmetic below depends on it (and never worries about it again).
+        if f.chunk_off.checked_add(f.chunk.len()) != Some(d.len()) {
             return None;
         }
         let key = match (f.id, f.sess) {
@@ -167,49 +307,64 @@ impl R2Reassembler {
             return None;
         }
 
-        // One-fragment payload: assemble directly, no partial table entry.
+        // One-fragment payload: the chunk *is* the payload — slice it out of
+        // the frame instead of copying it (the previous `copy_from_slice` was
+        // the only whole-payload copy on the single-fragment fast path).
         if f.total == 1 {
             return Some(R2Assembled {
                 wire_id: f.id,
                 sess: incoming.as_ref().map(|c| c.sess),
                 addr: incoming.map(|c| c.addr),
                 src: f.src,
-                payload: Bytes::copy_from_slice(f.chunk),
+                payload: d.slice(f.chunk_off..),
             });
         }
 
+        let n = f.chunk.len();
+        let idx = f.idx;
+        let middle = idx >= 1 && idx != f.total - 1;
         let is_new = !self.parts.contains_key(&key);
-        let existing = self.parts.get(&key);
-        if let Some(p) = existing {
+        if let Some(p) = self.parts.get(&key) {
             if p.total != f.total {
                 return None;
             }
             match (&p.ctx, &incoming) {
                 (Some(old), Some(new)) if old != new => return None,
-                (None, Some(_)) => {}
                 _ => {}
             }
-        }
-
-        // Admission: one owned copy per fragment (the chunk's backing batch is
-        // far larger than the frame — see the MQP-2 reassembler note), charged
-        // exactly. A partial also charges its slot table on the first chunk.
-        let retained_chunk = f.chunk.len();
-        if let Some(p) = self.parts.get(&key) {
-            if p.bytes.saturating_add(retained_chunk) > MQP_FRAG_MAX_PAYLOAD {
+            if p.got & (1u64 << idx) != 0 {
+                // Duplicate fragment: UDP permits it, delivery already
+                // happened (or will) once. Ignore, don't disturb the partial.
                 return None;
             }
-            if self.held.saturating_add(retained_chunk) > FRAG_MAX_HELD_BYTES {
+            if middle
+                && let Some(w) = p.unit
+                && w != n
+            {
+                // The segmentation contract: one unit width per payload; a
+                // second width means the positions below are not derivable.
+                return None;
+            }
+            if p.bytes.saturating_add(n) > MQP_FRAG_MAX_PAYLOAD {
+                return None;
+            }
+            let placeable = Partial::pos_of(p.first_len, p.unit, idx).is_some();
+            let charge = if placeable { n } else { n + PENDING_CHUNK_COST };
+            if self.held.saturating_add(charge) > FRAG_MAX_HELD_BYTES {
                 return None;
             }
         } else {
-            let slot = Partial::slot_table_bytes(f.total);
-            let retained = retained_chunk.saturating_add(slot);
-            if retained > FRAG_MAX_HELD_BYTES {
-                return None;
-            }
+            // New partial: charge its physical footprint estimate (the first
+            // fragment will reserve `total x len` assembly capacity at most,
+            // later ones a view), and evict under the same pressures as
+            // before — this cannot happen mid-payload.
+            let est = if idx == 0 {
+                (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
+            } else {
+                n + PENDING_CHUNK_COST
+            };
             while self.parts.len() >= FRAG_MAX_PARTIALS
-                || self.held.saturating_add(retained) > FRAG_MAX_HELD_BYTES
+                || self.held.saturating_add(est) > FRAG_MAX_HELD_BYTES
             {
                 if !self.evict_oldest() {
                     return None;
@@ -217,51 +372,101 @@ impl R2Reassembler {
             }
         }
 
-        let (completed, first) = {
+        let completed = {
             let partial = self
                 .parts
                 .entry(key)
                 .or_insert_with(|| Partial::new(f.total, incoming.clone(), now_ms));
             if partial.ctx.is_none() {
-                partial.ctx = incoming;
+                partial.ctx = incoming.clone();
             }
-            let slot = &mut partial.chunks[usize::from(f.idx)];
-            if slot.is_some() {
-                // Duplicate fragment: UDP permits it, delivery already happened
-                // (or will) once. Ignore, don't disturb the partial.
+            // The determinators as they will read after this fragment's own
+            // contribution, so the fragment's position (and the payload bound
+            // at that position) is known *before* anything is mutated: a
+            // placement past the payload bound must leave the partial
+            // untouched rather than half-written.
+            let first_after = if idx == 0 { Some(n) } else { partial.first_len };
+            let unit_after = if middle && partial.unit.is_none() {
+                Some(n)
+            } else {
+                partial.unit
+            };
+            let pos = Partial::pos_of(first_after, unit_after, idx);
+            if let Some(pos) = pos
+                && pos.saturating_add(n) > MQP_FRAG_MAX_PAYLOAD
+            {
+                // Hostile geometry: the position sits past the payload bound
+                // (a wide `unit` pretending room ahead of the payload). A
+                // just-created empty partial cannot trigger this (its only
+                // placeable fragment is index 0, whose position is `n`); a
+                // live one keeps its state and the fragment is refused — the
+                // payload times out rather than assembling garbage.
+                if partial.got == 0 {
+                    self.parts.remove(&key);
+                }
                 return None;
             }
-            *slot = Some(Bytes::copy_from_slice(f.chunk));
-            partial.got += 1;
-            partial.bytes += retained_chunk;
-            partial.retained += retained_chunk;
-            let first = partial.got == 1 && partial.got != partial.total;
-            if first {
-                // Charge the slot table with the first stored chunk, so a flood
-                // of never-completing partials is covered by the byte budget
-                // (same accounting as the MQP-2 reassembler).
-                partial.retained += Partial::slot_table_bytes(partial.total);
+            let first_was = partial.first_len;
+            let unit_was = partial.unit;
+            let old_retained = partial.retained;
+            partial.bytes += n;
+            if idx == 0 {
+                partial.first_len = Some(n);
             }
-            (partial.got == partial.total, first)
+            if middle && partial.unit.is_none() {
+                partial.unit = Some(n);
+            }
+            partial.got |= 1u64 << idx;
+            match pos {
+                Some(pos) => {
+                    if partial.buf.capacity() == 0 {
+                        // Reserve once, roughly for the whole payload, so a
+                        // full set of fragments stops re-allocating per
+                        // fragment; later growth still covers a hostile wide
+                        // unit.
+                        partial
+                            .buf
+                            .reserve((usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD));
+                    }
+                    let placed = Partial::buf_write(&mut partial.buf, pos, f.chunk);
+                    debug_assert!(placed, "the bound check above keeps every write in range");
+                }
+                None => partial.pending.push(PendingChunk {
+                    idx,
+                    d: d.clone(),
+                    chunk_off: f.chunk_off,
+                    len: n,
+                }),
+            }
+            // A determinator landed with this fragment: it may unlock queued
+            // views (their writes grow `buf`, so retention is derived after
+            // the drain).
+            if partial.first_len != first_was || partial.unit != unit_was {
+                partial.drain_pending();
+            }
+            partial.recompute_retained();
+            self.held = self
+                .held
+                .saturating_sub(old_retained)
+                .saturating_add(partial.retained);
+            // Completion = every index landed. `total` may be the full 64
+            // (`R2_MAX_FRAG_TOTAL`), and shifting a 64-bit mask by 64 panics
+            // in debug and wraps to a zero mask in release, so the all-ones
+            // mask is spelled out for that width.
+            let want = 1u64
+                .checked_shl(u32::from(f.total))
+                .map_or(u64::MAX, |m| m - 1);
+            partial.got == want
         };
         if is_new {
             self.order.push_back((key, now_ms));
         }
         if !completed {
-            self.held += if first {
-                // `first` implies one stored chunk + the slot table.
-                retained_chunk + Partial::slot_table_bytes(f.total)
-            } else {
-                retained_chunk
-            };
             return None;
         }
         let partial = self.parts.remove(&key)?;
         self.held = self.held.saturating_sub(partial.retained);
-        let mut out = Vec::with_capacity(partial.bytes);
-        for chunk in partial.chunks {
-            out.extend_from_slice(&chunk?);
-        }
+        let buf = partial.buf;
         let ctx = partial.ctx;
         let src = ctx.as_ref().map_or(f.src, |c| c.src);
         Some(R2Assembled {
@@ -269,7 +474,9 @@ impl R2Reassembler {
             sess: ctx.as_ref().map(|c| c.sess),
             addr: ctx.map(|c| c.addr),
             src,
-            payload: Bytes::from(out),
+            // The assembly buffer *is* the payload: the previous completion
+            // re-copied every chunk into a fresh `Vec` first.
+            payload: Bytes::from(buf),
         })
     }
 
@@ -376,6 +583,11 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port)
     }
 
+    /// Test frame: the owned `Bytes` view (the "arrived datagram") plus the
+    /// decoded view over it, with the chunk at a one-byte offset inside the
+    /// frame — the shape decode_frag produces, so the reassembler exercises
+    /// the same view arithmetic (and the same zero-copy slice) as in
+    /// production. `feed` is the way tests hand these in.
     fn frag<'a>(
         id: Option<u32>,
         sess: Option<u32>,
@@ -384,8 +596,12 @@ mod tests {
         total: u8,
         frag_id: u32,
         chunk: &'a [u8],
-    ) -> r2::FragRef<'a> {
-        r2::FragRef {
+    ) -> (Bytes, r2::FragRef<'a>) {
+        let mut frame = Vec::with_capacity(chunk.len() + 1);
+        frame.push(0u8);
+        frame.extend_from_slice(chunk);
+        let d = Bytes::from(frame);
+        let f = r2::FragRef {
             id,
             sess,
             addr,
@@ -393,22 +609,26 @@ mod tests {
             frag_id,
             idx,
             total,
+            chunk_off: 1,
             chunk,
-        }
+        };
+        (d, f)
+    }
+
+    /// Push one helper-built frame (`frag` above): the owned view is what the
+    /// reassembler holds out-of-order chunks against, as a real datagram
+    /// would be.
+    fn feed(r: &mut R2Reassembler, input: (Bytes, r2::FragRef<'_>)) -> Option<R2Assembled> {
+        r.push(&input.0, &input.1, 0)
     }
 
     #[test]
     fn steady_reassembly_out_of_order() {
         let mut r = R2Reassembler::new();
         let id = r2::make_wire_id(1, false).unwrap();
-        assert!(
-            r.push(&frag(Some(id), None, None, 1, 2, 7, b"world"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id), None, None, 1, 2, 7, b"world")).is_none());
         assert_eq!(r.inflight(), 1);
-        let done = r
-            .push(&frag(Some(id), None, None, 0, 2, 7, b"hello "), 0)
-            .unwrap();
+        let done = feed(&mut r, frag(Some(id), None, None, 0, 2, 7, b"hello ")).unwrap();
         assert_eq!(done.wire_id, Some(id));
         assert_eq!(done.sess, None);
         assert_eq!(done.payload, Bytes::from_static(b"hello world"));
@@ -422,12 +642,17 @@ mod tests {
         let id = r2::make_wire_id(2, false).unwrap();
         let target = TargetAddrRef::Ip(v4(53));
         assert!(
-            r.push(&frag(Some(id), Some(7), Some(target), 1, 2, 9, b"de"), 0)
-                .is_none()
+            feed(
+                &mut r,
+                frag(Some(id), Some(7), Some(target), 1, 2, 9, b"de")
+            )
+            .is_none()
         );
-        let done = r
-            .push(&frag(Some(id), Some(7), Some(target), 0, 2, 9, b"ab"), 0)
-            .unwrap();
+        let done = feed(
+            &mut r,
+            frag(Some(id), Some(7), Some(target), 0, 2, 9, b"ab"),
+        )
+        .unwrap();
         assert_eq!(done.wire_id, Some(id));
         assert_eq!(done.sess, Some(7));
         assert_eq!(done.addr, Some(TargetAddr::Ip(v4(53))));
@@ -438,13 +663,8 @@ mod tests {
     fn inline_reassembly_uses_session_key() {
         let mut r = R2Reassembler::new();
         let target = TargetAddrRef::Ip(v4(53));
-        assert!(
-            r.push(&frag(None, Some(7), Some(target), 0, 2, 3, b"ab"), 0)
-                .is_none()
-        );
-        let done = r
-            .push(&frag(None, Some(7), Some(target), 1, 2, 3, b"cd"), 0)
-            .unwrap();
+        assert!(feed(&mut r, frag(None, Some(7), Some(target), 0, 2, 3, b"ab")).is_none());
+        let done = feed(&mut r, frag(None, Some(7), Some(target), 1, 2, 3, b"cd")).unwrap();
         assert_eq!(done.wire_id, None);
         assert_eq!(done.sess, Some(7));
         assert_eq!(done.addr, Some(TargetAddr::Ip(v4(53))));
@@ -455,9 +675,11 @@ mod tests {
     fn context_mismatch_is_refused() {
         let mut r = R2Reassembler::new();
         let id = r2::make_wire_id(3, false).unwrap();
+        // First fragment of a flow payload, carrying its `OPEN` context.
         assert!(
-            r.push(
-                &frag(
+            feed(
+                &mut r,
+                frag(
                     Some(id),
                     Some(7),
                     Some(TargetAddrRef::Ip(v4(53))),
@@ -465,15 +687,15 @@ mod tests {
                     2,
                     1,
                     b"a"
-                ),
-                0
+                )
             )
             .is_none()
         );
         // Different session for the same wire id: a peer trying to splice.
         assert!(
-            r.push(
-                &frag(
+            feed(
+                &mut r,
+                frag(
                     Some(id),
                     Some(8),
                     Some(TargetAddrRef::Ip(v4(53))),
@@ -481,8 +703,7 @@ mod tests {
                     2,
                     1,
                     b"b"
-                ),
-                0
+                )
             )
             .is_none()
         );
@@ -493,20 +714,11 @@ mod tests {
     fn total_mismatch_and_duplicates() {
         let mut r = R2Reassembler::new();
         let id = r2::make_wire_id(4, false).unwrap();
-        assert!(
-            r.push(&frag(Some(id), None, None, 0, 3, 1, b"a"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 3, 1, b"a")).is_none());
         // Same key with a different total: refuse, keep the partial.
-        assert!(
-            r.push(&frag(Some(id), None, None, 1, 2, 1, b"b"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id), None, None, 1, 2, 1, b"b")).is_none());
         // Duplicate index: ignore.
-        assert!(
-            r.push(&frag(Some(id), None, None, 0, 3, 1, b"a"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 3, 1, b"a")).is_none());
         assert_eq!(r.inflight(), 1);
     }
 
@@ -514,22 +726,46 @@ mod tests {
     fn single_fragment_payload_is_returned_directly() {
         let mut r = R2Reassembler::new();
         let id = r2::make_wire_id(5, false).unwrap();
-        let done = r
-            .push(&frag(Some(id), None, None, 0, 1, 1, b"whole"), 0)
-            .unwrap();
+        let done = feed(&mut r, frag(Some(id), None, None, 0, 1, 1, b"whole")).unwrap();
         assert_eq!(done.wire_id, Some(id));
         assert_eq!(done.payload, Bytes::from_static(b"whole"));
         assert_eq!(r.inflight(), 0);
+    }
+
+    /// The single-fragment fast path is a **view** of the frame: the payload
+    /// shares the arrived `Bytes` allocation instead of being re-copied.
+    #[test]
+    fn single_fragment_payload_is_returned_zero_copy() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(5, false).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"padded!");
+        let off = frame.len();
+        frame.extend_from_slice(b"whole");
+        let d = Bytes::from(frame);
+        let f = r2::FragRef {
+            id: Some(id),
+            sess: None,
+            addr: None,
+            src: false,
+            frag_id: 1,
+            idx: 0,
+            total: 1,
+            chunk_off: off,
+            chunk: &d[off..],
+        };
+        let done = r.push(&d, &f, 0).unwrap();
+        assert_eq!(done.payload, Bytes::from_static(b"whole"));
+        assert_eq!(done.payload.as_ptr(), &d[off..] as *const [u8] as *const u8);
+        assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), 0);
     }
 
     #[test]
     fn expiry_releases_held_bytes() {
         let mut r = R2Reassembler::new();
         let id = r2::make_wire_id(6, false).unwrap();
-        assert!(
-            r.push(&frag(Some(id), None, None, 0, 2, 1, b"xx"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 2, 1, b"xx")).is_none());
         assert!(r.held_bytes() > 0);
         r.expire(FRAG_TIMEOUT_MS - 1);
         assert_eq!(r.inflight(), 1);
@@ -543,17 +779,11 @@ mod tests {
         let mut r = R2Reassembler::new();
         for i in 0..FRAG_MAX_PARTIALS as u32 {
             let id = r2::make_wire_id(i + 1, false).unwrap();
-            assert!(
-                r.push(&frag(Some(id), None, None, 0, 2, 1, b"x"), 0)
-                    .is_none()
-            );
+            assert!(feed(&mut r, frag(Some(id), None, None, 0, 2, 1, b"x")).is_none());
         }
         assert_eq!(r.inflight(), FRAG_MAX_PARTIALS);
         let id = r2::make_wire_id(10_000, false).unwrap();
-        assert!(
-            r.push(&frag(Some(id), None, None, 0, 2, 1, b"y"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 2, 1, b"y")).is_none());
         assert_eq!(r.inflight(), FRAG_MAX_PARTIALS);
     }
 
@@ -563,8 +793,9 @@ mod tests {
         let id1 = r2::make_wire_id(1, false).unwrap();
         let id2 = r2::make_wire_id(2, false).unwrap();
         assert!(
-            r.push(
-                &frag(
+            feed(
+                &mut r,
+                frag(
                     Some(id1),
                     Some(7),
                     Some(TargetAddrRef::Ip(v4(53))),
@@ -572,15 +803,11 @@ mod tests {
                     2,
                     1,
                     b"aa"
-                ),
-                0
+                )
             )
             .is_none()
         );
-        assert!(
-            r.push(&frag(Some(id2), None, None, 0, 2, 2, b"bb"), 0)
-                .is_none()
-        );
+        assert!(feed(&mut r, frag(Some(id2), None, None, 0, 2, 2, b"bb")).is_none());
         assert_eq!(r.drop_session(7), 1);
         assert_eq!(r.inflight(), 1);
         assert!(r.held_bytes() > 0);
@@ -597,10 +824,89 @@ mod tests {
         let mut r = R2Reassembler::new();
         let id = r2::make_wire_id(7, false).unwrap();
         let big = vec![0u8; MQP_FRAG_MAX_PAYLOAD + 1];
-        assert!(
-            r.push(&frag(Some(id), None, None, 0, 2, 1, &big), 0)
-                .is_none()
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 2, 1, &big)).is_none());
+        assert_eq!(r.inflight(), 0);
+    }
+
+    /// The last fragment can land first (quinn only forwards what arrived);
+    /// its position cannot be derived from its own length, so the reassembler
+    /// holds it as a view and writes it once the first fragment sets the
+    /// layout. The payload must be byte-exact — zero padding must never leak
+    /// into a final chunk shorter than the unit width.
+    #[test]
+    fn reassembly_survives_last_fragment_first_and_short_tails() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(8, false).unwrap();
+        // total 3: first fragment, one middle fragment, a two-byte tail that
+        // lands first.
+        assert!(feed(&mut r, frag(Some(id), None, None, 2, 3, 4, b"rl")).is_none());
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 3, 4, b"head")).is_none());
+        let done = feed(&mut r, frag(Some(id), None, None, 1, 3, 4, b"middl")).unwrap();
+        assert_eq!(
+            done.payload,
+            Bytes::from_static(b"headmiddlrl"),
+            "the short tail is written at its exact offset"
         );
         assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), 0);
+    }
+
+    /// total 2 has no middle fragment: the tail's position is directly after
+    /// the first fragment, so its early arrival is served by `first_len`
+    /// alone.
+    #[test]
+    fn reassembly_two_parts_resolve_from_the_first_fragment_alone() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(9, false).unwrap();
+        assert!(feed(&mut r, frag(Some(id), None, None, 1, 2, 5, b"cd")).is_none());
+        let done = feed(&mut r, frag(Some(id), None, None, 0, 2, 5, b"ab")).unwrap();
+        assert_eq!(done.payload, Bytes::from_static(b"abcd"));
+        assert_eq!(r.inflight(), 0);
+    }
+
+    /// The unit width is a *contract* of the segmentation plan: a middle
+    /// fragment disagreeing with a locked width cannot be placed consistently
+    /// and is refused wholesale instead of corrupting the reassembly.
+    #[test]
+    fn a_middle_fragment_disagreeing_with_the_locked_unit_is_refused() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(10, false).unwrap();
+        // total 4: fragment 1 locks the unit width at 5.
+        assert!(feed(&mut r, frag(Some(id), None, None, 1, 4, 6, b"five!")).is_none());
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 4, 6, b"x0")).is_none());
+        // A second middle fragment with another width: refused, partial intact.
+        assert!(feed(&mut r, frag(Some(id), None, None, 2, 4, 6, b"seven77")).is_none());
+        assert_eq!(r.inflight(), 1);
+        // The conforming width is accepted (a refusal was per-fragment) but
+        // the payload is still one fragment short.
+        assert!(feed(&mut r, frag(Some(id), None, None, 2, 4, 6, b"five!")).is_none());
+        // The tail completes it (payload: chunk0 + five! + five! + tail).
+        let done = feed(&mut r, frag(Some(id), None, None, 3, 4, 6, b"tail")).unwrap();
+        assert_eq!(done.payload, Bytes::from_static(b"x0five!five!tail"));
+        assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), 0);
+    }
+
+    /// `got` is a 64-bit mask and the wire allows the full width
+    /// ([`MQP_FRAG_MAX_TOTAL`] = 64): completion must use the all-ones mask,
+    /// not `1u64 << total`, which panics in debug builds and wraps to a zero
+    /// mask in release (a legal 64-fragment payload would never complete).
+    #[test]
+    fn a_full_width_64_fragment_payload_completes() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(11, false).unwrap();
+        let total = MQP_FRAG_MAX_TOTAL;
+        for idx in 0..total {
+            let chunk = [b'a' + idx];
+            let done = feed(&mut r, frag(Some(id), None, None, idx, total, 7, &chunk));
+            if idx + 1 == total {
+                let done = done.expect("every index landed: the payload completes");
+                assert_eq!(done.payload.len(), usize::from(total));
+                assert_eq!(r.inflight(), 0);
+                assert_eq!(r.held_bytes(), 0);
+            } else {
+                assert!(done.is_none(), "still partial after index {idx}");
+            }
+        }
     }
 }
