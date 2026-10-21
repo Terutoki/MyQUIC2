@@ -668,5 +668,5 @@ CTL SESS_CLOSE(sess=7, reason=0):
 - **实测**：8 assoc × 1000 pps × 128 B × 65 s：519 992/519 992、0 % loss；client **0.743 frames/payload**（Phase-1b ≈0.99，
   约 −26 % DATAGRAM 发送），stage 0 丢/0 队满；416 tests 全绿。
 - **全双工对称已完整**：server-owned full-cone flow（server OPEN|SRC + client 接受/复用 + server ingress 转发）
-  已落地；`SESS_CLOSE` 双端 purge；423 tests 全绿。
+  已落地；`SESS_CLOSE` 双端 purge；424 tests 全绿。
 - **仍未完成（可选/外部）**：Linux 目标机实测、Blocked 下严格保序、旧 v3/v2 发送路径最终清理。

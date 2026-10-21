@@ -392,14 +392,16 @@ impl SharedEgress {
             // never be skipped just because a reconnect is publishing.
             let g = slot.shared.load();
             match g.as_ref() {
-                // The connection must have completed `HELLO`/`CAPS`: the spec
-                // forbids UDP frames before the handshake, and a rev2 encoder
-                // needs the generation's flow registry. A connection that is
-                // still negotiating is skipped exactly like a dead one, so the
-                // datagram is dropped/counted rather than sent on a wire the
-                // server has not acknowledged.
+                // A rev2 generation is usable for UDP as soon as its state is
+                // published, **before** `CAPS`: the first payload is sent
+                // optimistically instead of waiting one HELLO/CAPS RTT. The
+                // server keeps the version gate authoritative by buffering
+                // these frames until a valid HELLO arrives, then flushing them;
+                // `CAPS` only updates the negotiated caps and the compression
+                // limits. `HELLO` itself is sent immediately by the reconnect
+                // loop, so the server-side buffer usually holds nothing.
                 Some(c) if c.close_reason().is_none() => {
-                    let Some(rev2) = slot.rev2().filter(|r| r.is_ready()) else {
+                    let Some(rev2) = slot.rev2() else {
                         continue;
                     };
                     match c.max_datagram_size() {

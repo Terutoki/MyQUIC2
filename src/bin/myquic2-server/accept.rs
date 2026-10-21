@@ -800,8 +800,10 @@ pub(crate) fn r2_caps_due(last_ms: u64, now_ms: u64) -> bool {
 pub(crate) mod r2_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Rev2 frame dropped because no valid `HELLO` had been seen.
-    pub(crate) static GATED: AtomicU64 = AtomicU64::new(0);
+    /// Rev2 data/control frames accepted into the pre-HELLO buffer.
+    pub(crate) static PRE_HELLO_BUFFERED: AtomicU64 = AtomicU64::new(0);
+    /// Pre-HELLO frames dropped because the bounded buffer was full.
+    pub(crate) static PRE_HELLO_DROPPED: AtomicU64 = AtomicU64::new(0);
     /// `DATA OPEN` bindings installed (accepted + `FLOW_ACK`).
     pub(crate) static OPENS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static ACKS: AtomicU64 = AtomicU64::new(0);
@@ -850,8 +852,9 @@ pub(crate) mod r2_stats {
 ///   resolves through;
 /// - [`FlowIds`] is the server owner's monotonic allocator (Phase 1b
 ///   server-initiated/full-cone flows; Phase 1a never allocates from it);
-/// - [`CtlState`] carries the `HELLO`/`CAPS` gate: rev2 data frames are dropped
-///   (and counted) until a valid HELLO for this wire version has been seen.
+/// - [`CtlState`] carries the `HELLO`/`CAPS` version gate: rev2 data frames
+///   that beat the HELLO are buffered (bounded) and flushed once a valid HELLO
+///   for this wire version opens the gate; overflow is counted and dropped.
 pub(crate) struct R2ConnState {
     pub(crate) registry: Arc<FlowRegistry>,
     /// Server-owned id allocator. Reserved for Phase 1b (server-initiated and
@@ -870,7 +873,20 @@ pub(crate) struct R2ConnState {
     pub(crate) stage: Arc<parking_lot::Mutex<R2Stager>>,
     /// Last `CAPS` reply stamp (`coarse_millis` epoch; `0` = never).
     last_caps_ms: std::sync::atomic::AtomicU64,
+    /// Rev2 frames that arrived before a valid `HELLO` (data **and** control,
+    /// e.g. `SESS_CLOSE`). The client may send its first UDP payload
+    /// optimistically (no `CAPS` wait), so the server buffers those frames
+    /// until the version gate opens, then dispatches them in arrival order.
+    /// Bounded to keep a connection flood from pinning memory; overflow is
+    /// counted and dropped.
+    pre_hello: parking_lot::Mutex<(Vec<Bytes>, usize)>,
 }
+
+/// Bounds for [`R2ConnState::pre_hello`]: only the first optimistic frames
+/// need to survive the HELLO round trip. A larger burst is dropped and counted
+/// rather than buffered (the handshake completes in one RTT on any live path).
+pub(crate) const PRE_HELLO_MAX_FRAMES: usize = 8;
+pub(crate) const PRE_HELLO_MAX_BYTES: usize = 16 * 1024;
 
 impl R2ConnState {
     pub(crate) fn new() -> Arc<Self> {
@@ -882,6 +898,7 @@ impl R2ConnState {
             ctl: Arc::new(CtlState::new()),
             stage: Arc::new(parking_lot::Mutex::new(R2Stager::new())),
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
+            pre_hello: parking_lot::Mutex::new((Vec::new(), 0)),
         })
     }
 
@@ -900,6 +917,30 @@ impl R2ConnState {
         // `0` means "never replied", so the first real stamp is never 0.
         self.last_caps_ms.store(now_ms.max(1), Ordering::Relaxed);
         true
+    }
+
+    /// Buffer one pre-HELLO frame; `false` means the buffer is full and the
+    /// caller must count/drop it.
+    fn buffer_pre_hello(&self, d: Bytes) -> bool {
+        let mut q = self.pre_hello.lock();
+        let (frames, bytes) = &mut *q;
+        if frames.len() >= PRE_HELLO_MAX_FRAMES
+            || bytes.saturating_add(d.len()) > PRE_HELLO_MAX_BYTES
+        {
+            return false;
+        }
+        *bytes += d.len();
+        frames.push(d);
+        r2_stats::bump(&r2_stats::PRE_HELLO_BUFFERED);
+        true
+    }
+
+    /// Take the buffered pre-HELLO frames after a valid HELLO opened the gate.
+    fn take_pre_hello(&self) -> Vec<Bytes> {
+        let mut q = self.pre_hello.lock();
+        let frames = std::mem::take(&mut q.0);
+        q.1 = 0;
+        frames
     }
 }
 
@@ -1603,11 +1644,14 @@ async fn r2_ingress_frag(
 
 /// Dispatch one rev2 DATAGRAM body.
 ///
-/// The `HELLO` gate is applied here, before any frame can reach a target:
-/// without a valid HELLO for this wire version a rev2 data frame is dropped and
-/// counted ([`r2_stats::GATED`]), which is what keeps a "new server + old
-/// client" deployment from exposing any unexpected path. Legacy v2/v3 frames
-/// keep their own dispatch and are unaffected.
+/// Optimistic-first-packet contract: the client no longer waits for `CAPS`
+/// before sending its first UDP payload. The version gate remains authoritative
+/// — every rev2 frame except `HELLO` that arrives before a valid `HELLO` is
+/// stashed in a bounded per-connection buffer and dispatched only once
+/// `HELLO(wire_ver=2)` opens the gate; overflow is counted and dropped. This
+/// keeps order for optimistic data plus an early `SESS_CLOSE`. A wrong-version
+/// HELLO never opens the gate and therefore never releases the buffer. Legacy
+/// v2/v3 frames keep their own dispatch and are unaffected.
 #[allow(clippy::too_many_arguments)]
 async fn handle_r2_ingress(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
@@ -1624,27 +1668,78 @@ async fn handle_r2_ingress(
         return;
     };
     if kind == R2Kind::Ctl {
-        // HELLO is the only control frame allowed before the gate opens.
+        // HELLO is processed immediately; every other frame (data or control)
+        // waits for it in the bounded buffer so optimistic sends keep their
+        // order, including a fast SESS_CLOSE.
         let is_hello = d.get(1).copied() == Some(r2::R2_CTL_HELLO);
         if !is_hello && !state.ctl.hello_seen() {
-            r2_refuse(Some(&r2_stats::GATED));
+            if state.buffer_pre_hello(d) {
+                return;
+            }
+            r2_refuse(Some(&r2_stats::PRE_HELLO_DROPPED));
             return;
         }
         r2_handle_ctl(ss, cd, state, r2_reasm, &d);
+        if state.ctl.hello_seen() {
+            for frame in state.take_pre_hello() {
+                r2_dispatch_frame(
+                    fast,
+                    ss,
+                    cd,
+                    conn_id,
+                    allow_private,
+                    staged,
+                    state,
+                    r2_reasm,
+                    frame,
+                )
+                .await;
+            }
+        }
         return;
     }
     if !state.ctl.hello_seen() {
-        r2_refuse(Some(&r2_stats::GATED));
+        if state.buffer_pre_hello(d) {
+            return;
+        }
+        r2_refuse(Some(&r2_stats::PRE_HELLO_DROPPED));
         return;
     }
-    match kind {
-        R2Kind::Data => {
+    r2_dispatch_frame(
+        fast,
+        ss,
+        cd,
+        conn_id,
+        allow_private,
+        staged,
+        state,
+        r2_reasm,
+        d,
+    )
+    .await;
+}
+
+/// Dispatch one already-version-gated rev2 data frame.
+#[allow(clippy::too_many_arguments)]
+async fn r2_dispatch_frame(
+    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+    state: &Arc<R2ConnState>,
+    r2_reasm: &mut R2Reassembler,
+    d: Bytes,
+) {
+    match r2::kind(&d) {
+        Some(R2Kind::Data) => {
             r2_ingress_data(fast, ss, cd, conn_id, allow_private, staged, state, d).await;
         }
-        R2Kind::Train => {
+        Some(R2Kind::Train) => {
             r2_ingress_train(fast, ss, cd, conn_id, allow_private, staged, state, d).await;
         }
-        R2Kind::Frag => {
+        Some(R2Kind::Frag) => {
             r2_ingress_frag(
                 fast,
                 ss,
@@ -1658,7 +1753,8 @@ async fn handle_r2_ingress(
             )
             .await;
         }
-        R2Kind::Ctl => unreachable!(),
+        Some(R2Kind::Ctl) => r2_handle_ctl(ss, cd, state, r2_reasm, &d),
+        None => r2_refuse(None),
     }
 }
 
@@ -1914,7 +2010,7 @@ pub(crate) async fn handle_conn(
                 // MQP-3 rev2 frames are dispatched before the MQP-2 kinds: their
                 // first byte is `0x0X`, which no legacy decoder accepts (see
                 // `r2::is_r2`), so the two dispatch orders can never claim the
-                // same DATAGRAM. The gate inside drops rev2 data until HELLO.
+                // same DATAGRAM. The gate inside buffers non-HELLO frames until HELLO.
                 if r2::is_r2(&d) {
                     handle_r2_ingress(
                         &mut fast,

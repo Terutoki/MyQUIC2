@@ -4889,11 +4889,12 @@ fn rev2_session_close_makes_the_uplink_reopen() {
     );
 }
 
-/// The egress cache only publishes a rev2 connection after `CAPS`: the spec
-/// forbids UDP frames before the handshake, and the uplink encoder needs the
-/// generation's registry.
+/// The egress cache publishes a rev2 generation as soon as its state exists,
+/// even before `CAPS`, so the first UDP payload can be sent optimistically.
+/// `CAPS` only upgrades the boot limits; the server buffers pre-HELLO frames
+/// until the version gate opens.
 #[tokio::test]
-async fn egress_refuses_a_connection_until_caps_arrive() {
+async fn egress_publishes_before_caps_for_optimistic_first_packet() {
     let (conn, _client, _server) = real_connection().await;
     let pool = ConnPool::new(1, Vec::new(), true, true, 1);
     let e = SharedEgress::default();
@@ -4907,16 +4908,20 @@ async fn egress_refuses_a_connection_until_caps_arrive() {
     );
     let state = ConnRev2::new();
     slot.set_rev2(state.clone());
+    let h = e
+        .refresh_global(&pool, bind, now)
+        .expect("rev2 state is publishable before CAPS");
+    assert_eq!(h.conn.stable_id(), conn.stable_id());
+    assert_eq!(h.rev2.epoch, state.epoch);
     assert!(
-        e.refresh_global(&pool, bind, now).is_none(),
-        "rev2 state without CAPS is not ready"
+        !h.rev2.is_ready(),
+        "the optimistic send happens before CAPS"
     );
     state.on_caps(r2::Caps::default());
     let h = e
         .refresh_global(&pool, bind, now)
         .expect("a negotiated connection is publishable");
-    assert_eq!(h.conn.stable_id(), conn.stable_id());
-    assert_eq!(h.rev2.epoch, state.epoch);
+    assert!(h.rev2.is_ready());
 }
 
 /// Full-slice round trip: a real association task on a real QUIC connection

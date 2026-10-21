@@ -39,8 +39,9 @@ first byte = 0b0000_0000 | kind/flags
 - 混合部署：新服务端遇到旧客户端（首字节 `0x1X/0x2X/0x3X/0x4X`）→ 非法首字节丢弃；
   新客户端遇到旧服务端（rev2 首字节 `0x0X`）→ 旧端丢弃。
 - **不承诺混合版本可用**：双方都升级；`HELLO/CAPS` 只做 fail-fast/能力协商（见 §6）。
-- 服务端在未收到 HELLO 时也拒绝 rev2 数据（返回计数器 `REFUSED`），避免“新服务端 + 旧客户端”出现任何
-  非预期通路；客户端未收到 CAPS 时不发送 UDP 数据（连接在池预热阶段完成协商，不增加首包 RTT）。
+- **乐观首包**：客户端连接一旦发布即可发送 UDP（不等 CAPS）；服务端对 HELLO 之前到达的 rev2 数据帧先放入
+  每连接有界缓冲（8 帧 / 16 KiB），收到合法 `HELLO(wire_ver=2)` 后按到达顺序处理；版本不符的 HELLO 只回 CAPS、
+  不开门也不释放缓冲；溢出计数丢弃。CAPS 只更新协商上限/压缩，不再是发首包的前置条件。
 
 ---
 
@@ -173,8 +174,9 @@ extended: 0x09 | flags u8 | [wire_id if !INLINE] | frag_id u32 | idx u8 | total 
 0x20 SESS_CLOSE  : sess u32 | reason u8
 ```
 
-- **HELLO/CAPS**：客户端连接建立后立即发 HELLO；未收到 CAPS 前不发送 UDP 数据（连接池预热期完成）。
-  服务端每收到一个 HELLO 回一次 CAPS（100 ms 节流）。版本不匹配 → 客户端关闭连接并报错（fail-fast）。
+- **HELLO/CAPS**：客户端连接建立后立即发 HELLO，但**不等待 CAPS** 才发 UDP 首包（乐观首包）；
+  服务端每收到一个 HELLO 回一次 CAPS（100 ms 节流），并把 HELLO 前到达的 rev2 数据帧在合法 HELLO 后按序释放。
+  版本不匹配 → 客户端关闭连接并报错（fail-fast）。
 - **FLOW_ACK**：服务端安装 flow 成功后发送；客户端收到后把该 flow 从 `Opening` 置 `Open`，开始压缩上行。
   ACK 丢失 → 客户端继续发 OPEN（幂等），服务端重复安装/重复 ACK，只延迟压缩，不黑洞。
 - **FLOW_REJECT**：策略/表满/DNS 失败；客户端对该目标回退 `INLINE`（可 TTL 后重试）。
@@ -239,9 +241,11 @@ full-cone unsolicited（无匹配 flow）:
 
 ## 6. 版本协商与混合部署
 
-- 客户端：连接建立 → 发 HELLO（重试至 CAPS 或 1.5 s 超时）→ 校验 `wire_ver==2` → 池 slot 标 ready，才允许 UDP 数据。
-- 服务端：未收到 HELLO 时 rev2 数据仅计数丢弃；收到 HELLO 回 CAPS；HELLO 版本不符回 CAPS(自身版本) 并计数。
-- 新客户端 + 旧服务端：HELLO 被旧端丢弃 → 无 CAPS → 1.5 s 后关闭连接并报错（不静默降级）。
+- 客户端：连接建立 → 发 HELLO（后台重试至 CAPS 或 2 s 超时）；连接一旦发布即可继续发 UDP（乐观首包，不等 CAPS）。
+- 服务端：HELLO 前的 rev2 数据帧进入每连接有界缓冲（8 帧 / 16 KiB），合法 HELLO 后按到达顺序处理；HELLO 版本不符
+  只回 CAPS(自身版本) 并计数，不开门也不释放缓冲；溢出计数丢弃。
+- 新客户端 + 旧服务端：HELLO 被旧端丢弃 → 无 CAPS → 2 s 后关闭连接并报错（不静默降级）；乐观首包在旧端会被
+  未知首字节丢弃，不会产生错误路径。
 - 旧客户端 + 新服务端：旧帧首字节非法 → 丢弃；服务端可对同一连接连续非法帧计数超阈值后关闭。
 - 默认 ALPN 仍 `h3`；需要 fail-closed 的部署可显式 ALPN bump（可选，不进本阶段）。
 - 协议名字始终 **MQP-3**；`wire_ver=2` 只存在于 CAPS/日志。
@@ -266,14 +270,14 @@ full-cone unsolicited（无匹配 flow）:
 | `bin/myquic2-client/assoc.rs` | `PendingTrain` 改用 rev2 `DATA/TRAIN`；每目标按 `SessionFlows` 找 `wire_id`；`Opening→Open` 由 ACK/下行确认；`>512 B` 改走 rev2 FRAG |
 | `bin/myquic2-client/hub.rs` | `AssocEntry` 增加 `session` 与 `Arc<ConnFlowRegistry>` 句柄；`confirmed` 位图改为 binding 状态 |
 | `bin/myquic2-client/dispatcher.rs` | 解析 rev2 `DATA/TRAIN/FRAG/CTL`；`wire_id → FlowBinding → session → DispatchCache`；处理 `FLOW_ACK/REJECT/CLOSE`、`OPEN|SRC` 重绑定 |
-| `bin/myquic2-client/pool.rs` | 每连接创建 `ConnFlowRegistry`/`CtlState`；HELLO/CAPS 在 slot ready 前完成；重连时重建 |
-| `bin/myquic2-client/egress.rs` | 发送 HELLO（连接 ready 路径）；控制帧发送（ACK 处理后的 CLOSE 等） |
+| `bin/myquic2-client/pool.rs` | 每连接创建 `ConnFlowRegistry`/`CtlState`；HELLO 立即发送，CAPS 异步完成（不阻塞首包）；重连时重建 |
+| `bin/myquic2-client/egress.rs` | 连接发布即可用（乐观首包，不等 CAPS）；控制帧发送（ACK 处理后的 CLOSE 等） |
 
 ### 7.3 服务端
 
 | 文件 | 改动 |
 |---|---|
-| `bin/myquic2-server/accept.rs` | rev2 入口：首字节 0x0X；未 HELLO 丢弃；解 DATA/TRAIN/FRAG；`wire_id→FlowBinding→session`；OPEN 安装后发 FLOW_ACK |
+| `bin/myquic2-server/accept.rs` | rev2 入口：首字节 0x0X；HELLO 前有界缓冲 + 合法 HELLO 后按序释放；解 DATA/TRAIN/FRAG；`wire_id→FlowBinding→session`；OPEN 安装后发 FLOW_ACK |
 | `bin/myquic2-server/reader.rs` | 下行用 rev2 DATA/TRAIN/FRAG；`(session, src)→wire_id` 反向表；域名/换端口 `OPEN|SRC` 绑定；full-cone server-owned id |
 | `bin/myquic2-server/table.rs` | `SessEntry` 持有 `SessionFlows`/wire_id 反向表；SESS_CLOSE 立即回收 |
 | `bin/myquic2-server/forward.rs` | 解析域名后把 `resolved` 写入 flow binding（Phase 1b） |
@@ -336,8 +340,8 @@ full-cone unsolicited（无匹配 flow）:
 |---|---|---|
 | codec | `src/mqp/r2.rs`：DATA steady/OPEN/INLINE、TRAIN same/dict、FRAG（codec 就绪）、CTL 全部 opcode、首字节安全校验、varint/边界/截断测试 | 15 unit |
 | flow state | `src/mqp/r2_flow.rs`：`FlowBinding`（状态/reply_src/resolved）、`SessionFlows`、`FlowRegistry`（含 `remove_session`）、`FlowIds`、`CtlState` | 10 unit |
-| client | `src/bin/myquic2-client/rev2.rs`（新）：每连接 `ConnRev2`、HELLO→CAPS 门禁、OPEN→steady/TRAIN/INLINE 状态机、全尺寸 rev2（单帧 DATA 否则 `R2Fragmenter`）、下行 `R2Reassembler`、burst/deferred flush、FLOW_REJECT TTL 回退、SESS_CLOSE×3；`pool/egress/auth/dispatcher/assoc/...` 接线 | 114 bin tests |
-| server | `accept.rs`：`R2ConnState`、HELLO/CAPS 门、rev2 入口（OPEN/steady/TRAIN/INLINE/**FRAG**）、SSRF/策略复用、安装 registry+SessionFlows、FLOW_ACK/REJECT、SESS_CLOSE/FLOW_CLOSE、sweep 清理；`reader.rs`：`match_source` → steady/TRAIN/OPEN|SRC 下行 + 全尺寸 rev2 FRAG/单帧；`table/forward` 接线 | 90 bin tests |
+| client | `src/bin/myquic2-client/rev2.rs`（新）：每连接 `ConnRev2`、HELLO→CAPS 门禁、OPEN→steady/TRAIN/INLINE 状态机、全尺寸 rev2（单帧 DATA 否则 `R2Fragmenter`）、下行 `R2Reassembler`、burst/deferred flush、FLOW_REJECT TTL 回退、SESS_CLOSE×3；`pool/egress/auth/dispatcher/assoc/...` 接线 | 124 bin tests |
+| server | `accept.rs`：`R2ConnState`、HELLO/CAPS 门、rev2 入口（OPEN/steady/TRAIN/INLINE/**FRAG**）、SSRF/策略复用、安装 registry+SessionFlows、FLOW_ACK/REJECT、SESS_CLOSE/FLOW_CLOSE、sweep 清理；`reader.rs`：`match_source` → steady/TRAIN/OPEN|SRC 下行 + 全尺寸 rev2 FRAG/单帧；`table/forward` 接线 | 101 bin tests |
 | frag | `src/udp/r2_frag.rs`：`R2Fragmenter` + `R2FragFlow::{Steady,Opening,Inline}`，聚合背压门（all-or-nothing）、单帧内嵌/碎片自适应 | 7 unit |
 | stage | `src/udp/r2_stage.rs`：Phase 2 连接级跨 session 聚集原语 `R2Stager`（per-session FIFO + round-robin 公平、`TRAIN dict` 跨 session 合帧、Open/Inline 独立帧、有界队列） | 9 unit |
 | reasm | `src/udp/r2_reasm.rs`：`R2Reassembler`（`(wire_id,frag_id)`/INLINE key、OPEN ctx 一致性、8 KiB/2 s/256 partials/256 KiB、无 tombstone） | 9 unit |
@@ -373,7 +377,7 @@ full-cone unsolicited（无匹配 flow）:
   安装 registry + session 反向表，后续同源回包压缩；client 接受未知 server-owned `OPEN|SRC`（小包/分片首片）并安装绑定，
   app 回包复用同一 id（steady/stager/fragment），server ingress 接受该 id 并转发到远端源；非 full-cone 仍 inline。
   `SESS_CLOSE` 同时 purge 双端排队项、registry 绑定与在途 partial。
-- **测试**：`cargo test --all-targets` **423 passed / 0 failed**（lib 199 + client 124 + server 100）；clippy/fmt clean。
+- **测试**：`cargo test --all-targets` **424 passed / 0 failed**（lib 199 + client 124 + server 101）；Linux CI 428；clippy/fmt clean。
 
 ### 10.5 仍待完成（可选/后续）
 

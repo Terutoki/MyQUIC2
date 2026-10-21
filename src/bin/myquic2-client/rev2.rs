@@ -88,10 +88,12 @@ pub(crate) struct ConnRev2 {
     /// `HELLO`/`CAPS` negotiation state. The dispatcher records `CAPS` here;
     /// the reconnect loop and the egress cache read `is_ready()`.
     pub(crate) ctl: CtlState,
-    /// `true` once a `CAPS` with the rev2 wire version was received. Until
-    /// then the connection is not usable for UDP: the egress cache refuses to
-    /// publish it, so an association drops (and counts) datagrams for the
-    /// handshake window rather than sending frames the server would refuse.
+    /// `true` once a `CAPS` with the rev2 wire version was received. This is
+    /// **not** a UDP usability gate: the first payload may be sent
+    /// optimistically before `CAPS` (the server buffers pre-HELLO frames until
+    /// the version gate opens). `CAPS` only replaces the boot limits with the
+    /// peer's negotiated caps and enables the peer-advertised compression
+    /// limits; the reconnect loop still treats a missing/wrong CAPS as fatal.
     ready: std::sync::atomic::AtomicBool,
     /// `CAPS.max_frame_bytes` (`0` = not negotiated), the peer's one-frame
     /// cap. The live limit for every rev2 send is `min(conn budget, this)`,
@@ -183,8 +185,10 @@ impl ConnRev2 {
     /// Live per-frame limit: the connection's DATAGRAM budget capped by the
     /// peer's negotiated `CAPS.max_frame_bytes`.
     ///
-    /// Before `CAPS` the connection is not usable for rev2 anyway (the egress
-    /// cache refuses it), so the connection limit alone is the safe answer.
+    /// Before `CAPS` the connection limit alone is the safe answer: the
+    /// server's default cap is 1472 and a fresh connection's DATAGRAM budget
+    /// is at most that (initial MTU 1200/1472 minus QUIC overhead), so an
+    /// optimistic first frame cannot exceed what the server accepts.
     pub(crate) fn frame_limit(&self, conn_limit: usize) -> usize {
         let capped = self
             .max_frame_bytes
@@ -283,7 +287,9 @@ impl ConnRev2 {
 ///
 /// Sends `HELLO` immediately, then once per [`HELLO_RETRY`] until the
 /// dispatcher stores a `CAPS` (see [`ConnRev2::on_caps`]) or
-/// [`HANDSHAKE_TIMEOUT`] expires. A `CAPS` for a different wire version fails
+/// [`HANDSHAKE_TIMEOUT`] expires. UDP payloads are not blocked on this
+/// function: the egress cache publishes the generation right after the state
+/// is set, and the server buffers pre-HELLO frames until the gate opens. A `CAPS` for a different wire version fails
 /// immediately: waiting out the timeout would only delay the mandated redial.
 /// `false` means the caller must close the connection.
 pub(crate) async fn handshake(conn: &quinn::Connection, rev2: &ConnRev2) -> bool {

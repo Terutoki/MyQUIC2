@@ -10,7 +10,7 @@ SOCKS5 in · QUIC / TLS 1.3 out · purpose-built minimal MQP-3 protocol · built
 [![QUIC](https://img.shields.io/badge/QUIC-TLS%201.3-38bdf8)](#-architecture)
 [![Performance](https://img.shields.io/badge/Performance-blazing%20fast-f97316)](#-performance-design)
 [![Protocol](https://img.shields.io/badge/Protocol-MQP--3-f59e0b)](#-the-mqp-3-protocol)
-[![Tests](https://img.shields.io/badge/Tests-423%20passing-16a34a)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-424%20passing-16a34a)](#-verification)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20OpenWrt-6366f1)](#-building)
 [![License](https://img.shields.io/badge/License-MIT-22c55e)](#-license)
 
@@ -458,17 +458,18 @@ flowchart TB
     class B1,B2 bin
 ```
 
-| Layer | Files | What it owns |
-|---|---|---|
-| **MQP-3 rev2 codec** | `mqp/r2.rs`, `mqp/r2_flow.rs`, `udp/r2_frag.rs`, `udp/r2_reasm.rs`, plus legacy `mqp/v3.rs`/`addr.rs`/`datagram.rs`/`fragment.rs`/`batch.rs`/`ack.rs`/`error.rs` | rev2 `DATA`/`TRAIN`/`FRAG`/`CTL` codec + connection-scoped flow registry + fragmenter/reassembler; MQP-2 `0x02`/`0x05`/`0x06` and legacy v3 decoders remain for old-frame tests/fallback; `TargetAddrRef` borrows on the hot path; `MqpError` is `Copy` (only `&'static str`/`u8`, no `anyhow` per bad frame) |
-| **Config + admission math** | `config/tuning.rs`, `client_conf.rs`, `server_conf.rs` | `TransportTuning` defaults 4/8/4 MiB; `per_connection_memory_bytes` / `session_pool_memory_bytes`; `deny_unknown_fields` (typo = startup error) |
-| **TLS 1.3** | `tls/cert.rs`, `server_cfg.rs`, `client_cfg.rs` | Ed25519 self-signed gen (500 y, backdated 7 d); server `ServerSessionMemoryCache(8192)`, `max_early_data = u32::MAX` (stateful single-use 0-RTT ticket); client pins one cert, `enable_early_data`, bearer token only on 1-RTT |
-| **Transport** | `transport/build.rs`, `limits.rs` | Sole `quinn::TransportConfig` builder; BBR default; bulk class `ACK 8/10 ms + 2 MiB DATAGRAM` vs interactive `2/5 ms + 1 MiB`; path MTU starts at `initial_mtu` (default 1200 = the QUIC floor, clamp 1200–1472; raise it on known paths), with discovery capped at 1472; `keepalive → idle = max(3x, 15 s)` and client `watchdog = max(2x, 8 s) < idle`; GSO/GRO auto-probed by `quinn-udp` |
-| **DNS (3 layers)** | `dns/memo.rs` → `store.rs` → `resolve.rs` + `key.rs`/`policy.rs` | Thread-local 2-way memo (64 sets × 2 ways, key = host + port, 261 B wire-max inline) → `moka` shared cache keyed by **host** (120 s pos / 10 s neg, single-flight, so a second port of the same name reuses one resolution) → cancellable `hickory` upstream (5 s); `ipnet` CIDR egress policy |
-| **UDP dataplane** | `udp/batch.rs`, `send.rs`, `fragmenter.rs`, `reassembler.rs`, `retry.rs` | `sendmmsg`/`recvmmsg` bursts (`LAST_HOP_DRAIN = 32`); `Blocked` drops newest (never `drop-oldest`); per-`(sess,id)` fragmenter; `(sess,id)` reassembler with 2 s expiry, 256 KiB / 256-partial caps, fingerprint tombstones; 16-shard `WouldBlock` retry pool (256 deep, 200 ms deadline) |
-| **TCP pump** | `tcp/pump.rs` | `copy_tcp_quic[_idle/_acked]`: c2s double-buffer + `write_chunk` zero-copy ≥8 KiB, s2c `read_chunks(8)` + `write_vectored`; borrowed QUIC halves (no `Drop::finish` masquerading errors as FIN); RST (`SO_LINGER=0`) + `reset/stop(0x04)` on failure |
-| **Observability** | `stats/drops.rs`, `udp_stats.rs`, `udp_write.rs`, `warn.rs` | Thread-local batching (256 records / 256 KiB per flush); `lost()` excludes `UNKNOWN_SESS` (late replies ≠ tunnel loss); 10 s drop-warning + 1 s log-window throttles |
-| **Time** | `time/coarse.rs`, `mono.rs` | Packet clock `coarse_millis()` (`quanta::Instant::recent`, ~4–5 ns, dedicated upkeep thread); `mono_millis()` process uptime on the same base so the two are subtractable |
+Layers, files and ownership. Long module lists are kept as wrapping bullets
+rather than table cells, so this section never needs a horizontal scrollbar:
+
+- **MQP-3 rev2 codec** — `mqp/r2.rs`, `mqp/r2_flow.rs`, `udp/r2_frag.rs`, `udp/r2_reasm.rs`, `udp/r2_stage.rs`; legacy `mqp/v3.rs`, `addr.rs`, `datagram.rs`, `fragment.rs`, `batch.rs`, `ack.rs`, `error.rs`. rev2 `DATA`/`TRAIN`/`FRAG`/`CTL` codec + connection-scoped flow registry + fragmenter/reassembler/stager; MQP-2 `0x02`/`0x05`/`0x06` and legacy v3 decoders remain for old-frame tests/fallback; `TargetAddrRef` borrows on the hot path; `MqpError` is `Copy` (only `&'static str`/`u8`, no `anyhow` per bad frame).
+- **Config + admission math** — `config/tuning.rs`, `client_conf.rs`, `server_conf.rs`. `TransportTuning` defaults 4/8/4 MiB; `per_connection_memory_bytes` / `session_pool_memory_bytes`; `deny_unknown_fields` (typo = startup error).
+- **TLS 1.3** — `tls/cert.rs`, `server_cfg.rs`, `client_cfg.rs`. Ed25519 self-signed gen (500 y, backdated 7 d); server `ServerSessionMemoryCache(8192)`, `max_early_data = u32::MAX` (stateful single-use 0-RTT ticket); client pins one cert, `enable_early_data`, bearer token only on 1-RTT.
+- **Transport** — `transport/build.rs`, `limits.rs`. Sole `quinn::TransportConfig` builder; BBR default; bulk class `ACK 8/10 ms + 2 MiB DATAGRAM` vs interactive `2/5 ms + 1 MiB`; path MTU starts at `initial_mtu` (default 1200 = the QUIC floor, clamp 1200–1472; raise it on known paths), with discovery capped at 1472; `keepalive → idle = max(3x, 15 s)` and client `watchdog = max(2x, 8 s) < idle`; GSO/GRO auto-probed by `quinn-udp`.
+- **DNS (3 layers)** — `dns/memo.rs` → `store.rs` → `resolve.rs` + `key.rs`/`policy.rs`. Thread-local 2-way memo (64 sets × 2 ways, key = host + port, 261 B wire-max inline) → `moka` shared cache keyed by **host** (120 s pos / 10 s neg, single-flight, so a second port of the same name reuses one resolution) → cancellable `hickory` upstream (5 s); `ipnet` CIDR egress policy.
+- **UDP dataplane** — `udp/batch.rs`, `send.rs`, `fragmenter.rs`, `reassembler.rs`, `retry.rs`. `sendmmsg`/`recvmmsg` bursts (`LAST_HOP_DRAIN = 32`); `Blocked` drops newest (never `drop-oldest`); per-`(sess,id)` fragmenter; `(sess,id)` reassembler with 2 s expiry, 256 KiB / 256-partial caps, fingerprint tombstones; 16-shard `WouldBlock` retry pool (256 deep, 200 ms deadline).
+- **TCP pump** — `tcp/pump.rs`. `copy_tcp_quic[_idle/_acked]`: c2s double-buffer + `write_chunk` zero-copy ≥8 KiB, s2c `read_chunks(8)` + `write_vectored`; borrowed QUIC halves (no `Drop::finish` masquerading errors as FIN); RST (`SO_LINGER=0`) + `reset/stop(0x04)` on failure.
+- **Observability** — `stats/drops.rs`, `udp_stats.rs`, `udp_write.rs`, `warn.rs`. Thread-local batching (256 records / 256 KiB per flush); `lost()` excludes `UNKNOWN_SESS` (late replies ≠ tunnel loss); 10 s drop-warning + 1 s log-window throttles.
+- **Time** — `time/coarse.rs`, `mono.rs`. Packet clock `coarse_millis()` (`quanta::Instant::recent`, ~4–5 ns, dedicated upkeep thread); `mono_millis()` process uptime on the same base so the two are subtractable.
 
 Key constants (all pinned by unit tests): rev2 `DATA` steady = **2 B** (id < 128), `DATA OPEN` = 14 B IPv4 / 26 B IPv6 / 11+L domain, `TRAIN` same-flow = 3 B header + 1 B/item, `TRAIN dict` = 4 B + ids, `FRAG` steady = **8 B**, `CTL HELLO/CAPS wire_ver = 2`, `R2_MAX_TRAIN_ITEMS = 64`, per-connection flow cap 4096, per-session flow cap 64, stager 1024 items / 256 KiB, reassembly 8 KiB / 2 s / 256 partials / 256 KiB (legacy + rev2 both admission-charged). Legacy (receive/test only): v3 `SINGLE` 5/6 B, v3 `TRAIN` 6 B, MQP-2 `DGRAM_PREFIX_LEN = 5`, `FRAG_PREFIX_LEN = 11`, `BATCH_PREFIX_LEN = 5`, `MAX_BATCH_ITEMS = 16`, `BATCH_SMALL_MAX = 512 B`; `UDP_PAYLOAD_MAX = 65507 B`, `AUTH_TOKEN_MAX = 256 B`, `ALPN = myquic2/3` (default `h3` masquerade).
 
@@ -643,11 +644,17 @@ byte as unknown and drop it, so mixed-version traffic can never be misrouted:
 0x08 FRAG steady     0x09 FRAG extended     0x0C CTL
 ```
 
-A client sends `CTL HELLO(wire_ver=2)` on every new QUIC connection and does not
-send UDP until `CAPS(2)` arrives; the server answers with its version and keeps
-the rev2 gate closed for any other version. Wrong version ⇒ close/redial, never
-a silent downgrade. Default ALPN remains `h3` (the in-band gate, not ALPN, is the
-version boundary).
+A client sends `CTL HELLO(wire_ver=2)` immediately on every new QUIC connection,
+but it does **not** wait for `CAPS` before the first UDP payload: once the
+connection is published, the egress generation is usable and the first datagram
+leaves optimistically. The server keeps the version gate authoritative — rev2
+data frames that arrive before a valid HELLO are held in a small bounded
+per-connection buffer (8 frames / 16 KiB) and dispatched in arrival order once
+`HELLO(2)` opens the gate; a wrong-version HELLO is answered with CAPS but never
+releases the buffer, and overflow is counted/dropped. `CAPS` therefore only
+upgrades the negotiated caps and compression limits, not packet readiness; a
+missing/wrong CAPS still closes/redials after the 2 s handshake budget. Default
+ALPN remains `h3` (the in-band gate, not ALPN, is the version boundary).
 
 ### Frames
 
@@ -882,8 +889,8 @@ Per-file map:
 
 ## ✅ Verification
 
-- `cargo test --all-targets`: **423 passed / 0 failed** on the macOS dev box (lib 199 + client 124 + server 100)
-- **CI-equivalent gate in Podman (Linux, Rust 1.99.0)**: `cargo fmt --all --check` ✅, `cargo clippy --all-targets -- -D warnings` ✅, `cargo test --all-targets` **427 passed / 0 failed** (Linux adds 4 `cfg(linux)` tests: lib 203 + client 124 + server 100), and both `cargo zigbuild --release` artifacts — `x86_64-unknown-linux-musl` (static) and `x86_64-unknown-linux-gnu.2.36` — build and package ✅
+- `cargo test --all-targets`: **424 passed / 0 failed** on the macOS dev box (lib 199 + client 124 + server 101)
+- **CI-equivalent gate in Podman (Linux, Rust 1.99.0)**: `cargo fmt --all --check` ✅, `cargo clippy --all-targets -- -D warnings` ✅, `cargo test --all-targets` **428 passed / 0 failed** (Linux adds 4 `cfg(linux)` tests: lib 203 + client 124 + server 101), and both `cargo zigbuild --release` artifacts — `x86_64-unknown-linux-musl` (static) and `x86_64-unknown-linux-gnu.2.36` — build and package ✅
 - `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`: clean (no cargo features are defined)
 - Real binaries, end to end: TCP 1 MiB verified byte-for-byte ✅ · UDP sweep 8–8000 B (fragment path included) with 0 lost ✅ · `kill -9` + restart: automatic detection and redial, TCP and UDP green again ✅ · sharded ingress (`quic_endpoints` 1 and 2) and the `MYQUIC2_SHARD_RUNTIME=0` fallback both serve the same sweep with a clean `SIGTERM` exit (0.05 s measured) ✅ · the sharded client pool (7 slot runtimes) and its `MYQUIC2_SHARD_RUNTIME=0` fallback likewise: TCP 256 KiB byte-verified, UDP sweep ALL OK, both sides exit 0 on `SIGTERM` ✅
 - **MQP-3 rev2 full-duplex symmetry (D2/D4):** both endpoints can open flows. The server opens a **server-owned** flow (`DATA OPEN|SRC`, owner bit 1) for an unsolicited/full-cone reply source, installs it in the registry + session reverse table, and compresses subsequent replies; the client accepts that flow, stages the reply, and lets the app answer on the **same** id (steady/stager/fragment, owner bit preserved), which the server forwards to the remote source. Idempotent `FLOW_ACK/REJECT/CLOSE`, `SESS_CLOSE` purges queued items + in-flight partials on both ends.

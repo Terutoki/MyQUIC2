@@ -4819,11 +4819,13 @@ fn rev2_reply_fixture(
     (ss, r2_flows, binding)
 }
 
-/// `HELLO` -> CAPS is wired, and a version-mismatched HELLO answers with our
-/// own version without opening the data gate.
+/// Optimistic first packet: a rev2 data frame that arrives before `HELLO` is
+/// buffered (bounded), not forwarded or dropped, and is released only once a
+/// valid `HELLO(wire_ver=2)` opens the version gate. A wrong-version HELLO is
+/// answered with CAPS but never opens the gate or releases the buffer.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn rev2_hello_gate_and_caps() {
+async fn rev2_pre_hello_buffer_and_caps() {
     use std::sync::atomic::Ordering;
 
     let _holder_guard = holder_test_guard();
@@ -4834,20 +4836,34 @@ async fn rev2_hello_gate_and_caps() {
     let mut buf = [0u8; 64];
     let id = r2::make_wire_id(1, false).unwrap();
 
-    // Premise: data before any HELLO is dropped and counted.
-    let gated_before = r2_count(&r2_stats::GATED);
+    // Data before HELLO is buffered, not forwarded.
+    let buffered_before = r2_count(&r2_stats::PRE_HELLO_BUFFERED);
     client
         .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"early"))
         .unwrap();
     assert_eq!(
         rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
         None,
-        "rev2 data before HELLO must not reach a target"
+        "pre-HELLO data must stay buffered, not reach a target"
     );
     assert_eq!(
-        r2_count(&r2_stats::GATED) - gated_before,
+        r2_count(&r2_stats::PRE_HELLO_BUFFERED) - buffered_before,
         1,
-        "the gated frame must be counted"
+        "the optimistic frame must be buffered"
+    );
+
+    // A control frame before HELLO is buffered too, preserving order with the
+    // optimistic data (a fast association can exit and send SESS_CLOSE before
+    // the handshake completes). It is replayed after the gate opens.
+    let closes_before = r2_count(&r2_stats::SESS_CLOSES) + r2_count(&r2_stats::STALE_CLOSES);
+    client
+        .send_datagram(r2::encode_ctl(&r2::Ctl::SessClose { sess: 9, reason: 0 }))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        r2_count(&r2_stats::PRE_HELLO_BUFFERED) - buffered_before,
+        2,
+        "a pre-HELLO control frame is buffered, not dropped"
     );
 
     // A HELLO for another wire version answers with our CAPS but leaves the
@@ -4868,24 +4884,33 @@ async fn rev2_hello_gate_and_caps() {
         other => panic!("expected CAPS, got {other:?}"),
     }
     assert_eq!(r2_count(&r2_stats::BAD_HELLO) - bad_before, 1);
-    client
-        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"still-early"))
-        .unwrap();
     assert_eq!(
         rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
         None,
-        "a version-mismatched HELLO must not open the data gate"
+        "a version-mismatched HELLO must not release the buffer"
     );
 
-    // The real handshake opens the gate; data is forwarded and ACKed. Wait out
-    // the CAPS throttle first: the mismatched HELLO above was answered, so a
-    // valid HELLO inside the same 100 ms window is marked (the gate opens) but
-    // is not answered again — correct behaviour, but it needs a clean window
-    // to observe the second CAPS deterministically.
+    // The real handshake opens the gate; the buffered OPEN is flushed in
+    // arrival order and ACKed. Wait out the CAPS throttle first: the
+    // mismatched HELLO above was answered, so a valid HELLO inside the same
+    // 100 ms window is marked (the gate opens) but is not answered again.
     tokio::time::sleep(Duration::from_millis(R2_CAPS_MIN_INTERVAL_MS + 20)).await;
     let caps_before = r2_count(&r2_stats::CAPS_SENT);
     rev2_handshake(&client).await;
     assert!(r2_count(&r2_stats::CAPS_SENT) > caps_before);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        r2_count(&r2_stats::SESS_CLOSES) + r2_count(&r2_stats::STALE_CLOSES) > closes_before,
+        "the buffered SESS_CLOSE must be replayed after the gate opens"
+    );
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("the buffered OPEN must be flushed after a valid HELLO")
+        .unwrap();
+    assert_eq!(&buf[..n], b"early");
+    rev2_expect_ack(&client, id).await;
+
+    // Subsequent data is dispatched immediately.
     client
         .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"open"))
         .unwrap();
@@ -4894,11 +4919,51 @@ async fn rev2_hello_gate_and_caps() {
         .expect("OPEN after HELLO must be forwarded")
         .unwrap();
     assert_eq!(&buf[..n], b"open");
-    rev2_expect_ack(&client, id).await;
 
     rev2_teardown(client, task, holders_before).await;
 }
 
+/// The pre-HELLO buffer is bounded so a client that never sends a valid HELLO
+/// cannot pin memory; overflow is counted and dropped.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_pre_hello_buffer_is_bounded() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+    let buffered_before = r2_count(&r2_stats::PRE_HELLO_BUFFERED);
+    let dropped_before = r2_count(&r2_stats::PRE_HELLO_DROPPED);
+    for i in 0..(PRE_HELLO_MAX_FRAMES + 1) {
+        let id = r2::make_wire_id(u32::try_from(i + 1).unwrap(), false).unwrap();
+        client
+            .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"x"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Let the server reader drain the burst before checking counters.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        r2_count(&r2_stats::PRE_HELLO_BUFFERED) - buffered_before <= PRE_HELLO_MAX_FRAMES as u64,
+        "the buffer must never exceed its frame cap"
+    );
+    let buffered_after = r2_count(&r2_stats::PRE_HELLO_BUFFERED);
+    let dropped_after = r2_count(&r2_stats::PRE_HELLO_DROPPED);
+    assert!(
+        dropped_after > dropped_before,
+        "overflow must be counted, not silently buffered (buffered_before={buffered_before} buffered_after={buffered_after} dropped_before={dropped_before} dropped_after={dropped_after})"
+    );
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "buffered frames are never forwarded before HELLO"
+    );
+    rev2_teardown(client, task, holders_before).await;
+}
 /// The Phase 1a ingress contract end to end: OPEN installs + ACKs, a steady
 /// frame resolves through the registry, duplicate OPEN still forwards its
 /// payload, INLINE forwards without installing, and unknown ids / rev2 FRAG are
