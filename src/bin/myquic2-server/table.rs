@@ -11,6 +11,14 @@ use myquic2::mqp::r2_flow::SessionFlows;
 /// readable — and a mis-ordered tuple here would silently pair a socket with
 /// the wrong field.
 pub(crate) struct SessEntry {
+    /// The session id this entry is filed under.
+    ///
+    /// Redundant with the map key by design: reap paths that only get the
+    /// *entry* back (`sweep_all`/`sweep_local` eviction lists, the reply
+    /// reader's own exit) must be able to name the association in the
+    /// `SESS_CLOSE` notification they send the client, without re-deriving the
+    /// key or scanning the map.
+    pub(crate) sess: u32,
     pub(crate) sock: Arc<tokio::net::UdpSocket>,
     /// The reply reader. `is_finished` is the liveness signal everywhere.
     pub(crate) reader: tokio::task::JoinHandle<()>,

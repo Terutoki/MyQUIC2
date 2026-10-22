@@ -368,6 +368,19 @@ impl FlowRegistry {
         self.cap
     }
 
+    /// Whether one more binding would fit, measured with one read-lock hold.
+    ///
+    /// The client uplink probes this before its server-owned-flow scan: a full
+    /// registry can only fall back to `INLINE`, so the scan (and the id
+    /// allocation behind [`FlowRegistry::insert_new`]) is skipped entirely
+    /// while the table is full. Advisory only — capacity can change before the
+    /// caller inserts; [`FlowRegistry::insert_new`] re-checks it under the
+    /// write lock and remains the authority.
+    #[must_use]
+    pub fn has_capacity(&self) -> bool {
+        self.map.read().len() < self.cap
+    }
+
     /// Insert a binding. Re-inserting the same id for the same
     /// `(session, target)` is the idempotent duplicate-open case and succeeds
     /// with the existing binding returned.
@@ -381,6 +394,54 @@ impl FlowRegistry {
         }
         if map.len() >= self.cap {
             return Err(RegistryError::Full);
+        }
+        map.insert(binding.wire_id, binding.clone());
+        Ok(binding)
+    }
+
+    /// Allocate the next wire id from `ids` and insert the new flow's binding,
+    /// with both steps under the one write-lock hold that checked capacity.
+    ///
+    /// The cap is tested **before** [`FlowIds::alloc`]: wire ids are never
+    /// reused, so an id allocated for an insert the registry then refuses is
+    /// leaked from the sender's finite id space — repeated new-target attempts
+    /// against a full table would eventually exhaust it and force every payload
+    /// to `INLINE` even after the table drains. Checking capacity first makes a
+    /// full registry cost no id at all.
+    ///
+    /// Idempotent-duplicate and conflict semantics match
+    /// [`FlowRegistry::insert`]: an existing binding for the allocated id with
+    /// the same `(session, target)` is returned as-is (the duplicate-open
+    /// case), a different `(session, target)` is [`RegistryError::Conflict`].
+    /// In production the monotonic allocator makes a collision impossible; the
+    /// check is kept so this stays a drop-in replacement for `insert`.
+    ///
+    /// # Errors
+    /// [`RegistryError::Full`] when the registry is at its cap or `ids` is
+    /// exhausted; [`RegistryError::Conflict`] for an id already bound to a
+    /// different `(session, target)`.
+    pub fn insert_new(
+        &self,
+        ids: &FlowIds,
+        session: u32,
+        target: TargetAddr,
+    ) -> Result<Arc<FlowBinding>, RegistryError> {
+        let mut map = self.map.write();
+        // Capacity before allocation: a refused insert must not consume an id
+        // (see the doc above).
+        if map.len() >= self.cap {
+            return Err(RegistryError::Full);
+        }
+        // No id left is the same INLINE fail-safe as a full table.
+        let Some(wire_id) = ids.alloc() else {
+            return Err(RegistryError::Full);
+        };
+        let binding = FlowBinding::new_shared(wire_id, session, target);
+        if let Some(existing) = map.get(&binding.wire_id) {
+            if existing.session == binding.session && existing.target == binding.target {
+                return Ok(existing.clone());
+            }
+            return Err(RegistryError::Conflict);
         }
         map.insert(binding.wire_id, binding.clone());
         Ok(binding)
@@ -695,6 +756,83 @@ mod tests {
         assert!(reg.remove(a.wire_id).is_some());
         assert!(reg.get(a.wire_id).is_none());
         assert_eq!(reg.clear(), 1);
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn registry_insert_new_allocates_an_id_only_when_there_is_room() {
+        let ids = FlowIds::new(false);
+        let reg = FlowRegistry::new(2);
+        assert!(reg.has_capacity());
+        let a = reg.insert_new(&ids, 7, TargetAddr::Ip(v4(53))).unwrap();
+        let b = reg.insert_new(&ids, 7, TargetAddr::Ip(v4(54))).unwrap();
+        // The normal path allocates monotonically, client-owned ids.
+        assert_eq!(r2::wire_id_local(a.wire_id), 1);
+        assert_eq!(r2::wire_id_local(b.wire_id), 2);
+        assert!(!r2::wire_id_server_owned(a.wire_id));
+        assert_eq!(ids.allocated(), 2);
+        assert_eq!(reg.len(), 2);
+        assert!(!reg.has_capacity(), "premise: the registry is full");
+        // Full: refused with the fail-safe and *no* id consumed.
+        assert_eq!(
+            reg.insert_new(&ids, 7, TargetAddr::Ip(v4(55))).unwrap_err(),
+            RegistryError::Full
+        );
+        assert_eq!(ids.allocated(), 2, "a full registry must not consume an id");
+        // A second attempt costs nothing either (the old shape leaked one id
+        // per attempt against a full table).
+        assert!(reg.insert_new(&ids, 7, TargetAddr::Ip(v4(56))).is_err());
+        assert_eq!(ids.allocated(), 2);
+        // Freeing a slot restores capacity; the next insert takes the next id.
+        assert!(reg.remove(b.wire_id).is_some());
+        assert!(reg.has_capacity());
+        let c = reg.insert_new(&ids, 7, TargetAddr::Ip(v4(55))).unwrap();
+        assert_eq!(r2::wire_id_local(c.wire_id), 3);
+        assert_eq!(ids.allocated(), 3);
+    }
+
+    #[test]
+    fn registry_insert_new_keeps_insert_duplicate_and_conflict_semantics() {
+        let reg = FlowRegistry::new(8);
+        // Seed the map with id 1 for (7, v4(53)) as the receiver `insert` path
+        // would, then force the next allocation to hand out that same id.
+        let seeded = binding(1, 7, TargetAddr::Ip(v4(53)));
+        assert!(reg.insert(seeded.clone()).is_ok());
+        let dup_ids = FlowIds::new(false);
+        dup_ids.next.store(0, Ordering::Relaxed);
+        let dup = reg.insert_new(&dup_ids, 7, TargetAddr::Ip(v4(53))).unwrap();
+        assert_eq!(dup.wire_id, seeded.wire_id);
+        assert!(
+            Arc::ptr_eq(&dup, &seeded),
+            "the existing binding is returned"
+        );
+        assert_eq!(reg.len(), 1, "the duplicate open inserts nothing new");
+
+        // Same forced id, different target: conflict, never overwrite.
+        let conflict_ids = FlowIds::new(false);
+        conflict_ids.next.store(0, Ordering::Relaxed);
+        assert_eq!(
+            reg.insert_new(&conflict_ids, 7, TargetAddr::Ip(v4(54)))
+                .unwrap_err(),
+            RegistryError::Conflict
+        );
+        assert_eq!(reg.len(), 1);
+        assert_eq!(
+            reg.get(seeded.wire_id).unwrap().target,
+            TargetAddr::Ip(v4(53))
+        );
+    }
+
+    #[test]
+    fn registry_insert_new_reports_full_for_an_exhausted_allocator() {
+        let ids = FlowIds::new(false);
+        ids.next.store(MAX_LOCAL_FLOW_ID, Ordering::Relaxed);
+        let reg = FlowRegistry::new(8);
+        assert_eq!(
+            reg.insert_new(&ids, 7, TargetAddr::Ip(v4(53))).unwrap_err(),
+            RegistryError::Full,
+            "an exhausted id space is the same INLINE fail-safe as a full table"
+        );
         assert!(reg.is_empty());
     }
 

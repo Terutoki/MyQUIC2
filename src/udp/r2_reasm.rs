@@ -16,9 +16,10 @@
 //! targets into one payload.
 //!
 //! Bounds are the shipped ones: 8 KiB per payload, 256 partials, 256 KiB of
-//! retained assembly/pending bytes per connection, 2 s partial timeout.
-//! Everything is validated before allocation; a malformed fragment only drops
-//! that fragment.
+//! retained assembly/pending bytes per connection (the stale `order` slots left
+//! by completed partials are charged to the same budget and kept bounded by
+//! `R2Reassembler::prune_orders`), 2 s partial timeout. Everything is
+//! validated before allocation; a malformed fragment only drops that fragment.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -50,6 +51,13 @@ struct FragKey {
 /// [`R2Reassembler::held_bytes`] — otherwise a tick that only runs while
 /// `held_bytes() > 0` stops before the stale slots are swept.
 const ORDER_SLOT_BYTES: usize = std::mem::size_of::<(FragKey, u64)>();
+
+/// Stale-slot slack allowed on top of two `order` slots per live partial before
+/// [`R2Reassembler::prune_orders`] rebuilds the deque. The slack keeps the
+/// ordinary lazy sweep amortised (a rebuild is a sort of the live partials,
+/// while the sweep is O(1) per retired slot) and, at its ceiling, keeps the
+/// charged backlog to a small fraction of [`FRAG_MAX_HELD_BYTES`].
+const ORDER_SLOT_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FragCtx {
@@ -207,13 +215,21 @@ impl Partial {
 
     /// Re-derive the retained footprint (`Self::retained`) from the current
     /// buffer capacity and pending views.
+    ///
+    /// Charged: the assembly buffer's capacity, each pending chunk's view cost
+    /// plus the `PendingChunk` slots their `Vec` reserves, and this `Partial`
+    /// node itself (it lives in the partial `HashMap`, whose entry is not
+    /// otherwise charged). The last two terms are what keep `retained` honest
+    /// when the reassembler is full of small partials: without them the budget
+    /// under-counts a few hundred bytes per live partial.
     fn recompute_retained(&mut self) {
         let pending: usize = self
             .pending
             .iter()
             .map(|c| c.len + PENDING_CHUNK_COST)
-            .sum();
-        self.retained = self.buf.capacity() + pending;
+            .sum::<usize>()
+            + self.pending.capacity() * std::mem::size_of::<PendingChunk>();
+        self.retained = self.buf.capacity() + pending + std::mem::size_of::<Partial>();
     }
 }
 
@@ -239,7 +255,9 @@ pub struct R2Reassembler {
     /// Insertion order of the live partials, oldest first. `parts` is the
     /// authority; completed/expired/evicted entries leave a stale slot that the
     /// sweep and eviction paths skip lazily (the queued `first_ms` must still
-    /// match the live entry), so maintaining the order costs no scan.
+    /// match the live entry), so maintaining the order costs no scan. The
+    /// deque itself is bounded by [`Self::prune_orders`], which re-seats it from
+    /// the live partials once the stale tail outgrows them.
     order: VecDeque<(FragKey, u64)>,
     held: usize,
     /// Resident bytes of the `order` deque, including the stale slots of
@@ -361,22 +379,46 @@ impl R2Reassembler {
                 return None;
             }
             let placeable = Partial::pos_of(p.first_len, p.unit, idx).is_some();
-            let charge = if placeable { n } else { n + PENDING_CHUNK_COST };
-            if self.held.saturating_add(charge) > FRAG_MAX_HELD_BYTES {
+            // A placeable fragment can be the one that reserves the assembly
+            // buffer (`Partial::buf_write` grows it to the fragment's final
+            // position; the first placement also `reserve`s the whole payload
+            // estimate). Charge that reservation up front, not just the
+            // arriving chunk, so the budget check covers the allocation this
+            // mutation makes instead of accepting it and discovering the
+            // overshoot only after `recompute_retained()`.
+            let charge = if placeable {
+                let reserve = if p.buf.capacity() == 0 {
+                    (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
+                } else {
+                    0
+                };
+                n.max(reserve)
+            } else {
+                n + PENDING_CHUNK_COST
+            };
+            // Charge the stale `order` backlog too: those slots are resident
+            // bytes this type is responsible for. The prune bounds the backlog
+            // to a small fraction of the budget, so normal multi-fragment
+            // traffic is unaffected; a stale tail still cannot make the live
+            // set overshoot the stated bound.
+            if self.held_bytes().saturating_add(charge) > FRAG_MAX_HELD_BYTES {
                 return None;
             }
         } else {
             // New partial: charge its physical footprint estimate (the first
             // fragment will reserve `total x len` assembly capacity at most,
             // later ones a view), and evict under the same pressures as
-            // before — this cannot happen mid-payload.
+            // before — this cannot happen mid-payload. The budget is
+            // `held_bytes` (live retained bytes plus the bounded stale-slot
+            // backlog): eviction reclaims the slots it walks past, and the
+            // prune keeps that overhead far below the fragment budget.
             let est = if idx == 0 {
                 (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
             } else {
                 n + PENDING_CHUNK_COST
-            };
+            } + std::mem::size_of::<Partial>();
             while self.parts.len() >= FRAG_MAX_PARTIALS
-                || self.held.saturating_add(est) > FRAG_MAX_HELD_BYTES
+                || self.held_bytes().saturating_add(est) > FRAG_MAX_HELD_BYTES
             {
                 if !self.evict_oldest() {
                     return None;
@@ -474,6 +516,11 @@ impl R2Reassembler {
             self.order.push_back((key, now_ms));
             self.order_bytes = self.order_bytes.saturating_add(ORDER_SLOT_BYTES);
         }
+        // Completed/expired slots are only reclaimed when the sweep reaches
+        // them, so a completion flood behind one live blocker would grow the
+        // deque without bound. Rebuilding is a single integer compare until the
+        // stale tail actually outgrows the live set.
+        self.prune_orders();
         if !completed {
             return None;
         }
@@ -561,6 +608,39 @@ impl R2Reassembler {
                 self.held = self.held.saturating_sub(p.retained);
             }
         }
+        // The sweep can stop at the first live blocker while stale slots sit
+        // behind it; compact them before returning so a single blocker cannot
+        // pin an unbounded tail.
+        self.prune_orders();
+    }
+
+    /// Re-seat the `order` deque from the live partials once the stale slots
+    /// left by completed/expired/evicted ones outgrow them.
+    ///
+    /// A slot is only reclaimed by [`Self::expire`]/[`Self::evict_oldest`] when
+    /// it reaches the front, so one long-lived blocker pins every slot queued
+    /// behind it. The rebuild reproduces the sweep's contract — live partials
+    /// oldest first — with `first_ms` as the primary key and [`FragKey`] as the
+    /// deterministic tie-break; a rebuilt slot can never be mistaken for a live
+    /// entry that replaced its key because the sweep matches `first_ms`
+    /// exactly.
+    fn prune_orders(&mut self) {
+        let limit = self
+            .parts
+            .len()
+            .saturating_mul(2)
+            .saturating_add(ORDER_SLOT_LIMIT);
+        if self.order.len() <= limit {
+            return;
+        }
+        let mut live: Vec<(FragKey, u64)> = self
+            .parts
+            .iter()
+            .map(|(key, partial)| (*key, partial.first_ms))
+            .collect();
+        live.sort_unstable_by_key(|(key, first_ms)| (*first_ms, key.inline, key.id, key.frag_id));
+        self.order = VecDeque::from(live);
+        self.order_bytes = self.order.len().saturating_mul(ORDER_SLOT_BYTES);
     }
 
     /// Evict the oldest live partial; `false` when none is left.
@@ -937,5 +1017,116 @@ mod tests {
                 assert!(done.is_none(), "still partial after index {idx}");
             }
         }
+    }
+
+    /// A completed payload leaves its `order` slot behind for the sweep, so a
+    /// single live blocker at the front pins a growing tail of stale slots
+    /// (the deque used to be bounded only by the completion rate until the
+    /// blocker timed out). `prune_orders` must rebuild it from the live
+    /// partials, keeping the charged backlog (and thus `held_bytes`) bounded.
+    #[test]
+    fn stale_order_slots_behind_a_live_blocker_are_pruned() {
+        let mut r = R2Reassembler::new();
+        let blocker = r2::make_wire_id(900, false).unwrap();
+        assert!(feed(&mut r, frag(Some(blocker), None, None, 0, 2, 1, b"blocker")).is_none());
+        assert_eq!(r.inflight(), 1);
+        // Each two-fragment payload completes and leaves one stale slot that
+        // the sweep cannot reach: the live blocker sits in front of it.
+        for i in 0..512u32 {
+            let id = r2::make_wire_id(1_000 + i, false).unwrap();
+            assert!(feed(&mut r, frag(Some(id), None, None, 0, 2, 1, b"aa")).is_none());
+            let done = feed(&mut r, frag(Some(id), None, None, 1, 2, 1, b"bb"));
+            assert!(done.is_some(), "two-fragment payload {i} completes");
+        }
+        assert_eq!(r.inflight(), 1, "only the blocker is still live");
+        // The prune runs on the push that inserts the next partial, i.e. with
+        // two partials in `parts`; its threshold is `2 * parts + slack`.
+        let bound = (r.parts.len() + 1) * 2 + ORDER_SLOT_LIMIT;
+        assert!(
+            r.order.len() <= bound,
+            "prune_orders must bound the stale backlog: {} slots for {} live partials",
+            r.order.len(),
+            r.parts.len()
+        );
+        assert_eq!(
+            r.order_bytes,
+            r.order.len() * ORDER_SLOT_BYTES,
+            "the charged backlog must match the deque that is actually resident"
+        );
+        assert_eq!(
+            r.order.front().map(|(_, first_ms)| *first_ms),
+            Some(0),
+            "the live blocker still leads the sweep"
+        );
+        // A tick short of the timeout keeps the blocker (and must not be fooled
+        // by the stale slots into expiring it early).
+        r.expire(FRAG_TIMEOUT_MS - 1);
+        assert_eq!(r.inflight(), 1);
+        // Once the blocker is due, the sweep drains everything.
+        r.expire(FRAG_TIMEOUT_MS);
+        assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), 0);
+        assert!(r.order.is_empty());
+    }
+
+    /// After a rebuild the deque must still encode the sweep's contract
+    /// (`first_ms` order) and the eviction order: a tick stops at the first
+    /// non-expired live partial, and `evict_oldest` removes the oldest live
+    /// one — not whichever slot happens to sit first after the rebuild.
+    #[test]
+    fn rebuilt_order_keeps_expiry_and_eviction_order() {
+        let mut r = R2Reassembler::new();
+        let a = r2::make_wire_id(700, false).unwrap();
+        let b = r2::make_wire_id(701, false).unwrap();
+        let (d, f) = frag(Some(a), None, None, 0, 2, 1, b"aaaa");
+        assert!(r.push(&d, &f, 0).is_none());
+        let (d, f) = frag(Some(b), None, None, 0, 2, 2, b"bbbb");
+        assert!(r.push(&d, &f, 10).is_none());
+        // Grow the stale tail until the next sweep has to rebuild, without
+        // tripping the push-side prune first: the payloads all complete, so
+        // only their slots are left behind.
+        while r.order.len() <= r.parts.len() * 2 + ORDER_SLOT_LIMIT {
+            let id = r2::make_wire_id(1_000 + r.order.len() as u32, false).unwrap();
+            let (d, f) = frag(Some(id), None, None, 0, 2, 1, b"cc");
+            assert!(r.push(&d, &f, 20).is_none());
+            let (d, f) = frag(Some(id), None, None, 1, 2, 1, b"dd");
+            assert!(r.push(&d, &f, 20).is_some());
+        }
+        assert_eq!(r.inflight(), 2);
+        // The sweep stops at `a` (live at 0), but the rebuild compacts the
+        // stale tail and orders the live partials by `first_ms`: a then b.
+        r.expire(FRAG_TIMEOUT_MS - 1);
+        assert_eq!(r.inflight(), 2);
+        let Some(&(front_key, front_ms)) = r.order.front() else {
+            panic!("the rebuilt queue keeps the live partials");
+        };
+        assert_eq!((front_key.id, front_ms), (a, 0));
+        assert_eq!(r.order.len(), 2, "only the two live partials keep slots");
+        assert_eq!(r.order_bytes, 2 * ORDER_SLOT_BYTES);
+        // Fill to the partial cap; the next push evicts the oldest live
+        // partial the rebuilt queue names first (a), keeping b.
+        for i in 0..FRAG_MAX_PARTIALS - 2 {
+            let id = r2::make_wire_id(10_000 + i as u32, false).unwrap();
+            let (d, f) = frag(Some(id), None, None, 0, 2, 1, b"x");
+            assert!(r.push(&d, &f, FRAG_TIMEOUT_MS).is_none());
+        }
+        assert_eq!(r.inflight(), FRAG_MAX_PARTIALS);
+        let id = r2::make_wire_id(99_999, false).unwrap();
+        let (d, f) = frag(Some(id), None, None, 0, 2, 1, b"y");
+        assert!(r.push(&d, &f, FRAG_TIMEOUT_MS).is_none());
+        assert_eq!(r.inflight(), FRAG_MAX_PARTIALS);
+        assert!(
+            !r.parts.contains_key(&FragKey {
+                inline: false,
+                id: a,
+                frag_id: 1
+            }),
+            "the oldest live partial is evicted first"
+        );
+        assert!(r.parts.contains_key(&FragKey {
+            inline: false,
+            id: b,
+            frag_id: 2
+        }));
     }
 }

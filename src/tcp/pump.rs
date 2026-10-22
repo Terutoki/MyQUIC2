@@ -94,12 +94,36 @@ const IDLE_STAMP_THROTTLE_MS: u64 = 100;
 ///
 /// `BytesMut::chunk_mut` only reserves 64 B once the buffer is full, so without
 /// this a `read_buf` on a full buffer would perform 64-byte reads — correct,
-/// but hundreds of times more wakeups per chunk than intended. Pure so the
-/// invariant that keeps the pump fast is pinned by a test.
+/// but hundreds of times more wakeups per chunk than intended.
+///
+/// Sized **exactly**, not with `BytesMut::reserve`'s amortized growth: the
+/// buffer is filled by one `read_buf` and immediately handed to quinn
+/// (`split_to(n).freeze()`), so spare capacity beyond the one chunk this read
+/// needs is never useful, and `Vec`'s amortized growth step (up to double the
+/// current capacity) is what lets a buffer outgrow the copy-buffer pool's
+/// ≤2x retention threshold (`copy_buf_release`) instead of being replaced by a
+/// fresh chunk. `bytes` 1.12's `BytesMut` has no `reserve_exact` (only `Vec`
+/// does), so this reclaims the existing allocation in place when it is the sole
+/// handle ([`BytesMut::try_reclaim`], no allocation), and otherwise replaces
+/// the buffer with an exactly sized `len + COPY_CHUNK` allocation. The growth
+/// bound is then local to this function: a reallocated buffer is at most
+/// `len + COPY_CHUNK`, which is within 2x as long as `len <= COPY_CHUNK`.
+///
+/// Pure so the invariant that keeps the pump fast is pinned by a test.
 #[inline]
 pub(crate) fn reserve_copy_chunk(buf: &mut BytesMut) {
     if buf.capacity() - buf.len() < COPY_CHUNK {
-        buf.reserve(COPY_CHUNK);
+        // `try_reclaim` is `reserve` without the allocate-on-failure fallback:
+        // it reuses/reclaims when this handle is the only outstanding one and
+        // reports false (leaving the buffer untouched) when a frozen split half
+        // still shares the allocation.
+        if !buf.try_reclaim(COPY_CHUNK) {
+            // The shared allocation cannot be grown in place: replace it with
+            // exactly one chunk of headroom and copy the (usually zero) bytes.
+            let mut exact = BytesMut::with_capacity(buf.len() + COPY_CHUNK);
+            exact.extend_from_slice(&buf[..]);
+            *buf = exact;
+        }
     }
 }
 
@@ -276,11 +300,13 @@ async fn copy_tcp_quic_inner(
         let c2s = async {
             // Double-buffer. `split_to(n).freeze()` promotes the remainder to
             // a shared handle while quinn holds the frozen half in
-            // `unacked_segments`, so the next `reserve` on the same buffer
-            // cannot reclaim in place and would allocate a fresh 32 KiB.
+            // `unacked_segments`, so the next `reserve_copy_chunk` on the same
+            // buffer cannot reclaim in place and replaces it with a fresh,
+            // exactly one-chunk allocation (`COPY_CHUNK` unless the buffer
+            // still holds data).
             // Rotating gives the ACK one full other-buffer cycle to drop the
             // first frozen half before we need its capacity again; when the
-            // half is released within that window the alloc is skipped, and
+            // half is released within that window the reclaim is skipped, and
             // when it is not the behaviour is the same as the old
             // single-buffer path (allocate on reserve). Small writes
             // (`write_all`) do not split, so they keep the current buffer and
@@ -587,5 +613,157 @@ fn abort_tcp(tcp: tokio::net::TcpStream) {
     if let Ok(std) = tcp.into_std() {
         let _ = socket2::SockRef::from(&std).set_linger(Some(Duration::ZERO));
         // `std` drops here: linger 0 => RST.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact-reserve path must not panic or move data when the buffer is
+    /// empty and already has a chunk of room.
+    #[test]
+    fn reserve_copy_chunk_keeps_a_ready_buffer_as_is() {
+        let mut buf = BytesMut::with_capacity(COPY_CHUNK);
+        reserve_copy_chunk(&mut buf);
+        assert_eq!(buf.capacity(), COPY_CHUNK);
+        assert_eq!(buf.len(), 0);
+
+        // A pooled buffer may carry up to two chunks; the helper must neither
+        // shrink nor reallocate it while it already has a chunk of headroom.
+        let mut big = BytesMut::with_capacity(2 * COPY_CHUNK);
+        reserve_copy_chunk(&mut big);
+        assert_eq!(big.capacity(), 2 * COPY_CHUNK);
+    }
+
+    /// A frozen `split_to` half keeps the old allocation alive, so the
+    /// remainder cannot grow in place: the replacement must be exactly one
+    /// chunk (no amortized doubling), and the frozen half must keep its data.
+    #[test]
+    fn reserve_copy_chunk_is_exact_when_a_split_half_pins_the_allocation() {
+        let mut buf = BytesMut::with_capacity(COPY_CHUNK);
+        buf.extend_from_slice(&[0xA5u8; COPY_CHUNK]);
+        let frozen = buf.split_to(COPY_CHUNK).freeze();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(
+            buf.capacity(),
+            0,
+            "premise: the whole allocation is pinned by the frozen half"
+        );
+
+        reserve_copy_chunk(&mut buf);
+        assert!(
+            buf.capacity() >= COPY_CHUNK,
+            "the next read must have room for a whole chunk"
+        );
+        assert_eq!(
+            buf.capacity(),
+            COPY_CHUNK,
+            "an exact reservation must leave no amortized headroom"
+        );
+        assert!(
+            buf.capacity() <= 2 * COPY_CHUNK,
+            "one buffer must stay within the copy-buffer pool's 2x bound"
+        );
+        // The frozen half still points at its own allocation, untouched.
+        assert_eq!(&frozen[..], &[0xA5u8; COPY_CHUNK][..]);
+    }
+
+    /// The data-bearing arm: data already in the remainder survives the
+    /// replacement (the pump's call sites pass empty buffers, but the helper is
+    /// safe on a non-empty one), and the new capacity is exactly `len` plus one
+    /// chunk.
+    #[test]
+    fn reserve_copy_chunk_preserves_data_and_stays_within_two_chunks() {
+        let mut buf = BytesMut::with_capacity(COPY_CHUNK);
+        buf.extend_from_slice(&[0x5Au8; COPY_CHUNK]);
+        let frozen = buf.split_to(COPY_CHUNK / 2).freeze();
+        assert_eq!(buf.len(), COPY_CHUNK / 2);
+
+        reserve_copy_chunk(&mut buf);
+        assert_eq!(buf.len(), COPY_CHUNK / 2, "reserve must not consume data");
+        assert!(
+            buf.iter().all(|&b| b == 0x5A),
+            "the retained bytes must be copied verbatim"
+        );
+        assert_eq!(buf.capacity(), buf.len() + COPY_CHUNK);
+        assert!(buf.capacity() <= 2 * COPY_CHUNK);
+        assert_eq!(&frozen[..], &[0x5Au8; COPY_CHUNK / 2][..]);
+    }
+
+    /// Repeated upload cycles that keep each frozen half alive: every buffer
+    /// must stay bounded at one chunk, no matter how many times the rotation
+    /// comes back to it. This is the growth the audit's `reserve` path can
+    /// compound.
+    #[test]
+    fn repeated_frozen_split_cycles_keep_each_buffer_at_one_chunk() {
+        let mut bufs = [
+            BytesMut::with_capacity(COPY_CHUNK),
+            BytesMut::with_capacity(COPY_CHUNK),
+        ];
+        let mut cur = 0usize;
+        let mut held: Vec<Bytes> = Vec::new();
+        for round in 0..16 {
+            reserve_copy_chunk(&mut bufs[cur]);
+            let n = COPY_CHUNK.min(bufs[cur].capacity());
+            bufs[cur].extend_from_slice(&vec![round as u8; n]);
+            // `split_to(n).freeze()` is the zero-copy upload shape: the frozen
+            // half may outlive several rotations while quinn holds it.
+            held.push(bufs[cur].split_to(n).freeze());
+            assert!(
+                bufs[cur].capacity() <= 2 * COPY_CHUNK,
+                "round {round}: buffer capacity {} escaped the 2x bound",
+                bufs[cur].capacity()
+            );
+            cur ^= 1;
+            if held.len() > 4 {
+                held.remove(0);
+            }
+        }
+    }
+
+    /// `copy_buf_release` must keep its unchanged semantics: buffers up to (and
+    /// including) 2x `COPY_CHUNK` are pooled, anything larger is dropped, and
+    /// the pool never exceeds `COPY_BUF_POOL_DEPTH`.
+    #[test]
+    fn copy_buf_pool_retains_only_buffers_within_two_chunks() {
+        COPY_BUF_POOL.with(|p| p.borrow_mut().clear());
+        copy_buf_release(BytesMut::with_capacity(COPY_CHUNK));
+        copy_buf_release(BytesMut::with_capacity(2 * COPY_CHUNK));
+        copy_buf_release(BytesMut::with_capacity(2 * COPY_CHUNK + 1));
+        let caps: Vec<usize> =
+            COPY_BUF_POOL.with(|p| p.borrow().iter().map(BytesMut::capacity).collect());
+        assert!(caps.contains(&COPY_CHUNK));
+        assert!(caps.contains(&(2 * COPY_CHUNK)));
+        assert!(
+            !caps.contains(&(2 * COPY_CHUNK + 1)),
+            "a buffer that grew past 2x must be dropped, not pooled: {caps:?}"
+        );
+        assert!(caps.len() <= COPY_BUF_POOL_DEPTH);
+        COPY_BUF_POOL.with(|p| p.borrow_mut().clear());
+    }
+
+    /// `release_copy_bufs` hands both halves back and leaves the slots empty for
+    /// the next acquire (an unpoolable buffer simply resets the slot).
+    #[test]
+    fn release_copy_bufs_empties_both_slots() {
+        COPY_BUF_POOL.with(|p| p.borrow_mut().clear());
+        let mut bufs = [
+            BytesMut::with_capacity(COPY_CHUNK),
+            BytesMut::with_capacity(2 * COPY_CHUNK + 1),
+        ];
+        bufs[0].extend_from_slice(b"leftover");
+        release_copy_bufs(&mut bufs);
+        assert!(bufs[0].is_empty());
+        assert_eq!(
+            bufs[0].capacity(),
+            0,
+            "the slot is reset for the next acquire"
+        );
+        assert!(bufs[1].is_empty());
+        assert_eq!(bufs[1].capacity(), 0);
+        let pooled = COPY_BUF_POOL.with(|p| p.borrow().len());
+        assert_eq!(pooled, 1, "only the one-chunk buffer is poolable");
+        COPY_BUF_POOL.with(|p| p.borrow_mut().clear());
     }
 }

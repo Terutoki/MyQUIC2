@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::limits::{DATAGRAM_BUFFER, DATAGRAM_BUFFER_BULK, DGRAM_MAX_WIRE, MQP_DGRAM_MAX};
-use crate::{MAX_BIDI_STREAMS_PER_CONN, TransportTuning};
+use crate::{SERVER_PRE_AUTH_BIDI_CREDIT, SERVER_UNI_STREAM_CREDIT, TransportTuning};
 
 /// QUIC congestion controller selection.
 ///
@@ -132,7 +132,7 @@ pub fn build_transport_tuned(
     keep_alive_secs: u64,
     tuning: TransportTuning,
 ) -> Arc<quinn::TransportConfig> {
-    build_transport_tuned_class(congestion, keep_alive_secs, tuning, false)
+    build_transport_inner(congestion, keep_alive_secs, tuning, false, false)
 }
 
 /// Per-class transport builder.
@@ -141,11 +141,77 @@ pub fn build_transport_tuned(
 /// keeps the tuned values (default ACK threshold 2 / 5 ms) and 1MB DATAGRAM
 /// buffers. Flow-control windows come from `tuning` unchanged (default
 /// 4/8/4 MB).
+///
+/// This is the **server** (and symmetric test peer) shape: it advertises the
+/// stream credit a client needs for its SOCKS TCP relays and auth stream.
 pub fn build_transport_tuned_class(
     congestion: Congestion,
     keep_alive_secs: u64,
     tuning: TransportTuning,
     is_bulk: bool,
+) -> Arc<quinn::TransportConfig> {
+    build_transport_inner(congestion, keep_alive_secs, tuning, is_bulk, false)
+}
+
+/// Client-side transport builder: identical tuning, but the client advertises
+/// **zero** incoming stream credit.
+///
+/// The client initiates every stream it uses (one QUIC bidi stream per SOCKS
+/// TCP relay; one uni stream for the auth token). A server never opens a
+/// stream to the client — replies travel on the stream the client opened — so
+/// advertising credit only hands the peer a memory lever: quinn-proto keeps a
+/// receive assembler per peer-opened stream that buffers up to
+/// `MAX_CHUNKS = 1024` distinct gap spans (56 B `Buffer` node plus the retained
+/// packet allocation each), while flow control counts payload bytes, not span
+/// metadata. With a symmetric 8192-stream handshake credit (the pre-fix shape)
+/// one malicious server could park hundreds of MiB on a client that never
+/// accepts a stream. At `(0, 0)` a peer that still opens one is violating our
+/// transport parameters, and quinn rejects the stream id (closing the
+/// connection) before buffering data (`validate_receive_id`), so the lever is
+/// removed rather than merely charged.
+pub fn build_client_transport_tuned(
+    congestion: Congestion,
+    keep_alive_secs: u64,
+    tuning: TransportTuning,
+) -> Arc<quinn::TransportConfig> {
+    build_transport_inner(congestion, keep_alive_secs, tuning, false, true)
+}
+
+/// Per-class form of [`build_client_transport_tuned`]: `is_bulk` selects the
+/// bulk ACK/DATAGRAM preset (see [`build_transport_tuned_class`]).
+pub fn build_client_transport_tuned_class(
+    congestion: Congestion,
+    keep_alive_secs: u64,
+    tuning: TransportTuning,
+    is_bulk: bool,
+) -> Arc<quinn::TransportConfig> {
+    build_transport_inner(congestion, keep_alive_secs, tuning, is_bulk, true)
+}
+
+/// Incoming-stream credit `(bidi, uni)` the **handshake** advertises to the
+/// peer.
+///
+/// Only the server accepts streams: clients open them. `(0, 0)` on the client
+/// is a security bound, not a tuning value — see
+/// [`build_client_transport_tuned`]. The server starts at the small pre-auth
+/// credit and raises it to [`MAX_BIDI_STREAMS_PER_CONN`] with MAX_STREAMS right
+/// after the token check (`myquic2-server`'s accept loop), so an unauthenticated
+/// peer cannot park the full per-stream receive-assembler bound before it
+/// proves it holds the token; see [`SERVER_PRE_AUTH_BIDI_CREDIT`].
+pub(crate) fn incoming_stream_credits(is_client: bool) -> (u32, u32) {
+    if is_client {
+        (0, 0)
+    } else {
+        (SERVER_PRE_AUTH_BIDI_CREDIT, SERVER_UNI_STREAM_CREDIT)
+    }
+}
+
+fn build_transport_inner(
+    congestion: Congestion,
+    keep_alive_secs: u64,
+    tuning: TransportTuning,
+    is_bulk: bool,
+    is_client: bool,
 ) -> Arc<quinn::TransportConfig> {
     let tuning = if is_bulk {
         TransportTuning {
@@ -191,11 +257,18 @@ pub fn build_transport_tuned_class(
     // possible MQP-2 header, or a maximum-length domain target could never be
     // encoded at any path MTU.
     const _: () = assert!(DGRAM_MAX_WIRE > MQP_DGRAM_MAX);
-    // Bidi credit: must cover the client's whole admission cap, since
-    // interactive-port pinning can put every admitted TCP flow on one
-    // connection — see `MAX_BIDI_STREAMS_PER_CONN`.
-    t.max_concurrent_bidi_streams(MAX_BIDI_STREAMS_PER_CONN.into());
-    t.max_concurrent_uni_streams(100u32.into());
+    // Incoming stream credit. The client advertises `(0, 0)`: it never accepts
+    // a peer-opened stream, and every advertised stream slot is a
+    // peer-pinnable quinn receive assembler (up to 1024 gap spans each), which
+    // is exactly the memory lever [`build_client_transport_tuned`] closes. The
+    // server advertises the small **pre-auth** credit here and raises it to
+    // `MAX_BIDI_STREAMS_PER_CONN` with MAX_STREAMS right after the token check,
+    // so the full client-facing credit is never granted to an unauthenticated
+    // peer; the post-auth bound is charged as a process-wide fixed term (see
+    // `stream_assembler_memory_bytes`).
+    let (bidi_credit, uni_credit) = incoming_stream_credits(is_client);
+    t.max_concurrent_bidi_streams(bidi_credit.into());
+    t.max_concurrent_uni_streams(uni_credit.into());
     // Window sizing: every flow-control window must exceed the target BDP, or
     // it -- not the congestion controller -- becomes the throughput ceiling.
     // The shipped defaults are 4/8/4 MB (stream/connection/send) from
@@ -278,4 +351,41 @@ pub fn build_transport_tuned_class(
     // datagram budget is the live `Connection::max_datagram_size()`, which
     // quinn derives from the discovered path MTU; see `dgram_payload_cap`.
     Arc::new(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MAX_BIDI_STREAMS_PER_CONN;
+
+    // The pre-auth credit must be a strict subset of the post-auth one: if the
+    // handshake advertised the full credit there would be nothing to raise (and
+    // the pre-auth memory bound would be the post-auth one).
+    const _: () = assert!(SERVER_PRE_AUTH_BIDI_CREDIT < MAX_BIDI_STREAMS_PER_CONN);
+
+    /// The client must never advertise an incoming stream slot: quinn buffers
+    /// one receive assembler per peer-opened stream (up to `MAX_CHUNKS = 1024`
+    /// gap spans each), and flow control does not account for that metadata —
+    /// so a credit here is a peer-controlled memory lever on a side that never
+    /// accepts a stream.
+    #[test]
+    fn client_advertises_no_incoming_stream_credit() {
+        assert_eq!(incoming_stream_credits(true), (0, 0));
+    }
+
+    /// The server advertises the small pre-auth credit at handshake time and
+    /// raises it to `MAX_BIDI_STREAMS_PER_CONN` after authentication (see the
+    /// server's accept loop). The old symmetric 8192/100 handshake credit let
+    /// an unauthenticated peer park a receive assembler per advertised stream.
+    #[test]
+    fn server_advertises_only_the_pre_auth_stream_credit() {
+        assert_eq!(
+            incoming_stream_credits(false),
+            (SERVER_PRE_AUTH_BIDI_CREDIT, SERVER_UNI_STREAM_CREDIT)
+        );
+        assert_eq!(
+            SERVER_UNI_STREAM_CREDIT, 2,
+            "one auth uni stream plus one slot of margin; the server never opens one"
+        );
+    }
 }

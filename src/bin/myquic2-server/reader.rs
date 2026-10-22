@@ -1330,6 +1330,9 @@ pub(crate) async fn sess_reader_task(
     sess_recycle_buf(buf);
     sess_memo_forget(conn_id, s, &rs);
     let mut removed_r2 = None;
+    // Set by the removal block below; read after it to decide whether this
+    // reader's exit is the reap the client must be told about.
+    let removed_own;
     {
         let sh = ss2.shard(s);
         let mut w = sh.write();
@@ -1344,6 +1347,16 @@ pub(crate) async fn sess_reader_task(
         if removed {
             ss2.note_live_remove(1);
         }
+        removed_own = removed;
+    }
+    // Tell the client this association is gone (idle reap, socket read error or
+    // a terminal egress verdict). Without it the client keeps sending steady
+    // frames for a session the server no longer has — each one fails lookup and
+    // is silently dropped — until its own idle path notices. Best-effort and
+    // idempotent, like every `SESS_CLOSE`; a connection that is already closed
+    // needs no notification (the sends would only be dropped).
+    if removed_own && c2.close_reason().is_none() {
+        r2_send_sess_close(&c2, s);
     }
     // The session is gone: drop its rev2 bindings from the connection-wide
     // registry too, so a steady frame for an id that belonged to this session
@@ -1351,17 +1364,38 @@ pub(crate) async fn sess_reader_task(
     // and `SESS_CLOSE` perform the same cleanup for entries they remove.
     //
     // Only when *this* reader removed its entry: a reader that lost the race to
-    // a recreation must leave the live session's bindings alone.
+    // a recreation must leave the live session's bindings alone. Two guards
+    // enforce that, because a hostile peer can put an arbitrary session id on
+    // the wire, so "same session id" does not imply the same session:
+    // 1. the purge runs only when the table no longer holds an entry for `s`
+    //    (checked under the shard read lock, so the decision is not split from
+    //    a concurrent create), and
+    // 2. the purge is scoped to this entry's own reverse-table snapshot (by
+    //    wire id), never `remove_session(s)` — so bindings a recreated session
+    //    installed for the same id are untouched.
+    // The old code used `remove_session(s)` *after* dropping the shard lock: a
+    // session recreated under the same id in that window had its fresh
+    // bindings purged, leaving its steady frames permanently `UNKNOWN_ID`.
     if let Some(registry) = r2_registry
         && let Some(r2_flows) = removed_r2
     {
-        for binding in r2_flows.load().iter() {
-            binding.mark_closed();
-        }
-        let n = registry.remove_session(s);
-        if n > 0 {
-            r2_stats::SESSION_END_BINDINGS
-                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        let no_live_entry = {
+            let sh = ss2.shard(s);
+            let r = sh.read();
+            !r.contains_key(&s)
+        };
+        if no_live_entry {
+            let mut n = 0usize;
+            for binding in r2_flows.load().iter() {
+                binding.mark_closed();
+                if registry.remove(binding.wire_id).is_some() {
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                r2_stats::SESSION_END_BINDINGS
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     // The table may now be empty: if this was its last session, drop out of the
@@ -1383,7 +1417,37 @@ fn r2_cleanup_evicted(r2: Option<&Arc<R2ConnState>>, entries: &[SessEntry]) {
     }
 }
 
+/// Resolve this session's socket, creating it (and its reply reader) when the
+/// datagram is the session's first.
+///
+/// The plain entry point: every caller here is a *live* datagram path whose
+/// session cannot be cancelled behind its back, so there is nothing to check
+/// before publishing. The domain-OPEN lookup task, which runs after the client
+/// may already have closed the association, uses
+/// [`get_or_create_sess_guarded`] instead.
 pub(crate) async fn get_or_create_sess(
+    ss: &SessTable,
+    cd: &quinn::Connection,
+    conn_id: usize,
+    s: u32,
+    dest: Option<(&str, u16, SocketAddr, u64)>,
+    r2: Option<&Arc<R2ConnState>>,
+) -> Option<Arc<tokio::net::UdpSocket>> {
+    get_or_create_sess_guarded(ss, cd, conn_id, s, dest, r2, None).await
+}
+
+/// [`get_or_create_sess`] with a cancellation flag for an association that a
+/// `CTL SESS_CLOSE` may close while this creation is in flight.
+///
+/// `cancelled` is owned by the domain-OPEN lookup task. `SESS_CLOSE` sets it
+/// *before* `take_session`, and the creation path re-reads it inside the shard
+/// write critical section immediately before publishing the entry; together
+/// those two facts mean the close either sees the flag (and the creation rolls
+/// itself back) or is serialized after the publish (and removes the session).
+/// Without the flag, a DNS lookup that outlived the client's `SESS_CLOSE`
+/// recreated the session — socket, global permit and flow bindings included —
+/// after the close had reaped it.
+pub(crate) async fn get_or_create_sess_guarded(
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -1400,6 +1464,8 @@ pub(crate) async fn get_or_create_sess(
     // the registry handle so a session that reaps itself can drop its bindings;
     // `None` is only used by unit fixtures that never install rev2 flows.
     r2: Option<&Arc<R2ConnState>>,
+    // Set by `SESS_CLOSE` while this creation is in flight; see the type doc.
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Arc<tokio::net::UdpSocket>> {
     // Session 0 is reserved (never allocated by any client hub): a wire
     // datagram carrying it is malformed or hostile, not a new session.
@@ -1492,6 +1558,12 @@ pub(crate) async fn get_or_create_sess(
         if claim_fair_sweep(now) {
             let evicted = ss.sweep_all(now);
             r2_cleanup_evicted(r2, &evicted);
+            // The client's association is gone on this side: tell it, so its
+            // next steady frames do not target a session the server no longer
+            // has (they could only fail lookup). Best-effort and idempotent.
+            for entry in &evicted {
+                r2_send_sess_close(cd, entry.sess);
+            }
             abort_evicted(evicted);
             let now2 = mono_millis();
             let n2 = ss.len();
@@ -1535,6 +1607,9 @@ pub(crate) async fn get_or_create_sess(
             }
             let evicted = ss.sweep_all(mono_millis());
             r2_cleanup_evicted(r2, &evicted);
+            for entry in &evicted {
+                r2_send_sess_close(cd, entry.sess);
+            }
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -1614,7 +1689,10 @@ pub(crate) async fn get_or_create_sess(
     let reader_abort = h_pre.abort_handle();
     let mut stale_dead: Vec<SessEntry> = Vec::new();
     let mut swept: Vec<SessEntry> = Vec::new();
-    let (inserted, memo_data, reader_died) = {
+    // `cancelled_insert` is the third outcome of the publish critical section:
+    // the owning domain-OPEN task was cancelled by `SESS_CLOSE` while this
+    // creation was in flight, so the session must not be published at all.
+    let (inserted, memo_data, reader_died, cancelled_insert) = {
         let sh = ss.shard(s);
         // Blocks for the same reason the read path does: a losing `try_lock_write`
         // used to abort the freshly spawned reader, release the global permit and
@@ -1661,44 +1739,81 @@ pub(crate) async fn get_or_create_sess(
             swept = sweep_local(&mut w);
             ss.note_live_remove(swept.len());
         }
-        let dead = h_pre.is_finished();
-        w.insert(
-            s,
-            SessEntry {
-                sock: sock.clone(),
-                reader: h_pre,
-                last: last_pre.clone(),
-                _permit: permit,
-                dest: dest
-                    .and_then(|(h, p, a, life)| Some((PortKey::new(h, p)?, a, life)))
-                    .map_or(DestMemo::NONE, |(key, addr, life)| DestMemo {
-                        key,
-                        addr,
-                        expires: coarse_millis() + pin_life_ms(life),
-                    }),
-                recent: recent_pre.clone(),
-                recent_epoch: recent_epoch.clone(),
-                flows: flows_pre.clone(),
-                r2_flows: r2_flows_pre,
-            },
-        );
-        ss.note_live_insert();
-        if dead || w.get(&s).map(|e| e.reader.is_finished()).unwrap_or(false) {
-            if let Some(e) = w.remove(&s) {
-                e.reader.abort();
-            }
-            // The insert above is undone while this guard is still held, so the
-            // decrement always pairs with its increment.
-            ss.note_live_remove(1);
-            (false, None, true)
+        // The owning domain-OPEN task was cancelled by a `CTL SESS_CLOSE` while
+        // this creation was in flight: do not publish the session. `SESS_CLOSE`
+        // sets the flag *before* its `take_session` (which needs this same
+        // shard write lock), so either the removal already happened — this
+        // check sees the flag and rolls the abandoned insert back — or it will
+        // happen after this guard drops and remove what we published. Both
+        // orders leave no session behind, which is the point: the client closed
+        // the association and a late DNS answer must not resurrect it. The
+        // freshly spawned reader and the global permit are returned with the
+        // abandoned insert; the reaped entries above are still cleaned up by
+        // the caller's tail.
+        if cancelled.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+            h_pre.abort();
+            drop(permit);
+            (false, None, false, true)
         } else {
-            (
-                true,
-                Some((sock.clone(), last_pre.clone(), reader_abort.clone())),
-                false,
-            )
+            let dead = h_pre.is_finished();
+            w.insert(
+                s,
+                SessEntry {
+                    // The entry's own id, so reap paths outside the shard scan
+                    // (sweep results, the reader's exit) can name the session in
+                    // the `SESS_CLOSE` notification they send the client.
+                    sess: s,
+                    sock: sock.clone(),
+                    reader: h_pre,
+                    last: last_pre.clone(),
+                    _permit: permit,
+                    dest: dest
+                        .and_then(|(h, p, a, life)| Some((PortKey::new(h, p)?, a, life)))
+                        .map_or(DestMemo::NONE, |(key, addr, life)| DestMemo {
+                            key,
+                            addr,
+                            expires: coarse_millis() + pin_life_ms(life),
+                        }),
+                    recent: recent_pre.clone(),
+                    recent_epoch: recent_epoch.clone(),
+                    flows: flows_pre.clone(),
+                    r2_flows: r2_flows_pre,
+                },
+            );
+            ss.note_live_insert();
+            if dead || w.get(&s).map(|e| e.reader.is_finished()).unwrap_or(false) {
+                if let Some(e) = w.remove(&s) {
+                    e.reader.abort();
+                }
+                // The insert above is undone while this guard is still held, so
+                // the decrement always pairs with its increment.
+                ss.note_live_remove(1);
+                (false, None, true, false)
+            } else {
+                (
+                    true,
+                    Some((sock.clone(), last_pre.clone(), reader_abort.clone())),
+                    false,
+                    false,
+                )
+            }
         }
     };
+    if cancelled_insert {
+        // The close won the race: nothing was published, so there is no memo or
+        // reader to hand out. Finish the shared tail (holder state + reaped
+        // entries) and report "no session" to the caller, which rejects the
+        // OPEN instead of ACKing a closed association.
+        ss.note_empty_state();
+        r2_cleanup_evicted(r2, &stale_dead);
+        r2_cleanup_evicted(r2, &swept);
+        for entry in &swept {
+            r2_send_sess_close(cd, entry.sess);
+        }
+        abort_evicted(stale_dead);
+        abort_evicted(swept);
+        return None;
+    }
     if inserted {
         udp_stats::session();
         ss.note_insert();
@@ -1723,6 +1838,14 @@ pub(crate) async fn get_or_create_sess(
     }
     r2_cleanup_evicted(r2, &stale_dead);
     r2_cleanup_evicted(r2, &swept);
+    // The over-share reaps above removed live associations from this side: tell
+    // the client (`SESS_CLOSE` ×3, idempotent, best-effort) before the readers
+    // are aborted, so its steady frames do not target a session the server has
+    // already dropped. `stale_dead` needs no notification — those readers had
+    // already exited, so the client's own idle/exit path is what closed them.
+    for entry in &swept {
+        r2_send_sess_close(cd, entry.sess);
+    }
     abort_evicted(stale_dead);
     abort_evicted(swept);
     if inserted { Some(sock) } else { None }

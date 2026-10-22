@@ -44,9 +44,12 @@ pub use config::{
         DEFAULT_INITIAL_MTU, DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS,
         INITIAL_MTU_MAX, INITIAL_MTU_MIN, INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN,
         MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_QUIC_ENDPOINTS, MAX_UDP_ASSOCS,
-        MAX_UDP_EGRESS_CONNS, TransportTuning, default_quic_endpoints, endpoint_memory_bytes,
-        endpoint_recv_buffer_bytes, load_toml, per_connection_memory_bytes,
-        per_session_memory_bytes, session_pool_memory_bytes, stream_pump_memory_bytes,
+        MAX_UDP_EGRESS_CONNS, R2_SESSION_TABLES_BYTES, SERVER_PRE_AUTH_BIDI_CREDIT,
+        SERVER_UNI_STREAM_CREDIT, TransportTuning, default_quic_endpoints,
+        dns_inflight_memory_bytes, endpoint_memory_bytes, endpoint_recv_buffer_bytes, load_toml,
+        per_connection_memory_bytes, per_session_memory_bytes, pre_auth_stream_memory_bytes,
+        retry_pool_memory_bytes, session_pool_memory_bytes, stream_assembler_memory_bytes,
+        stream_pump_memory_bytes, worker_scratch_bytes,
     },
 };
 pub use time::{coarse::coarse_millis, mono::mono_millis};
@@ -86,9 +89,13 @@ pub use tls::{
 pub use transport::{
     Congestion, DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW,
     STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT,
-    build_transport, build_transport_tuned, build_transport_tuned_class, idle_timeout_secs,
-    watchdog_silence_secs,
+    build_client_transport_tuned, build_client_transport_tuned_class, build_transport,
+    build_transport_tuned, build_transport_tuned_class, idle_timeout_secs, watchdog_silence_secs,
 };
+// `incoming_stream_credits` is exercised by the lib tests below through
+// `use super::*`.
+#[allow(unused_imports)]
+pub(crate) use transport::incoming_stream_credits;
 // `MQP_DGRAM_MAX` / `clamp_keep_alive` are exercised by the unit tests below
 // through `use super::*` (`DATAGRAM_BUFFER` is also read by `config::tuning`).
 pub use dns::{
@@ -3708,7 +3715,8 @@ mod tests {
                 + crate::config::tuning::R2_FLOW_HEAP_SLACK_BYTES);
         // 8 MB receive + 4 MB send + 2 x 1 MB DATAGRAM buffers + both
         // per-connection reassembly budgets (legacy MQP-2 + rev2) + the rev2
-        // stager, ingress state, and flow registry.
+        // stager, ingress state, flow registry, and the pre-auth stream-credit
+        // assemblers the handshake advertises.
         assert_eq!(
             d,
             8 * 1024 * 1024
@@ -3718,6 +3726,7 @@ mod tests {
                 + stager
                 + crate::config::tuning::R2_INGRESS_FIXED_BYTES
                 + registry
+                + crate::config::tuning::pre_auth_stream_memory_bytes()
         );
         let wide = TransportTuning {
             receive_window: 16 * 1024 * 1024,
@@ -3739,23 +3748,26 @@ mod tests {
         // rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            78080,
-            "4096 x 19.0625 MiB is the 76.25 GiB worst case for the default windows"
+            80384,
+            "4096 x 19.625 MiB is the 78.5 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested
-        // value, so each session's socket cap is 4 x 64 KiB there and the
-        // pool term is ~2.09 GiB instead of the requested ~1.09 GiB. The
-        // per-session MQP-3 flow-table charge adds 32 MiB over the whole pool.
+        // value, so each session's socket cap is 4 x 64 KiB there. Each
+        // session also charges both flow tables at their worst case: the MQP-3
+        // v0.2 table (64 domain targets, 22 KiB) and the rev2 copy-on-write
+        // bookkeeping (2 KiB). That makes the Linux pool ~2.25 GiB; without the
+        // domain-target flow table it was under-counted by ~140 MiB.
         let pool_mib = if cfg!(target_os = "linux") {
-            2144
+            2304
         } else {
-            1120
+            1280
         };
         assert_eq!(
             pool / (1024 * 1024),
             pool_mib,
-            "the session pool term must charge the kernel's doubled socket caps on Linux"
+            "the session pool term must charge the kernel's doubled socket caps on Linux \
+             and both per-session flow tables at their worst case"
         );
         assert!(
             pool > 512 * 1024 * 1024,
@@ -3785,6 +3797,37 @@ mod tests {
         assert_eq!(endpoint_memory_bytes(16), 16 * endpoint_memory_bytes(1));
         // Two 16 KiB pump buffers per active TCP relay flow.
         assert_eq!(stream_pump_memory_bytes(8192), 8192 * 32 * 1024);
+        // The remaining process-wide fixed terms are peer-driven pools and
+        // quinn's per-stream reassembly metadata; pin their arithmetic so the
+        // startup worst-case line cannot silently drift.
+        let retry = retry_pool_memory_bytes();
+        assert_eq!(
+            retry,
+            16 * (256 + 16) * UDP_RECV_MAX as u64,
+            "16 retry shards x (queue depth + in-flight) x one maximum payload"
+        );
+        assert!(retry > 32 * 1024 * 1024, "retry pool must be a real term");
+        let dns = dns_inflight_memory_bytes();
+        assert_eq!(
+            dns,
+            1024 * (UDP_RECV_MAX as u64 + 255 + 512),
+            "1,024 DNS slow-path waiters x (payload + host + task structure)"
+        );
+        assert!(dns > 8 * 1024 * 1024, "DNS waiter term must be a real term");
+        let scratch = worker_scratch_bytes(4);
+        assert_eq!(scratch, 4 * worker_scratch_bytes(1));
+        assert!(
+            worker_scratch_bytes(1) >= (32 * udp::BURST_SLOT) as u64,
+            "each datagram worker thread holds a full recvmmsg burst scratch"
+        );
+        // quinn-proto caps each stream's reassembler at MAX_CHUNKS=1024 spans;
+        // the admission bound charges the whole parked-header-stream credit.
+        let assembler = stream_assembler_memory_bytes(4096);
+        assert_eq!(assembler, 4096 * 1024 * 96);
+        assert!(
+            assembler > 256 * 1024 * 1024,
+            "parked stream-reassembly metadata is the largest process-wide fixed term"
+        );
     }
 
     #[test]

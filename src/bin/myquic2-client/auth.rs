@@ -215,30 +215,15 @@ pub(crate) fn spawn_conn_loop(
                     // fresh C clears nothing and leaves live true (no bump —
                     // nothing changed); holding None means the `open_bi` path
                     // already cleared and bumped, so there is nothing to do.
-                    if slot.clear_if_and_mark_dead(&conn) {
-                        // A dead generation must not outlive the redial in the
-                        // shared egress caches: they hold strong
-                        // `quinn::Connection` clones per binding, and a dead
-                        // handle there is only reclaimed by a later datagram
-                        // or send verdict on that binding — i.e. never, if the
-                        // binding has gone idle. Release this slot's handles
-                        // before the next dial publishes a fresh one. Scoped to
-                        // this pool slot, so healthy slots keep their caches.
-                        egress.forget_slot(idx);
-                        // The rev2 tables are connection-scoped: drop the dead
-                        // generation's registry and state in the same commit
-                        // that cleared the connection, so a dispatcher that
-                        // waits for the next generation cannot resolve ids
-                        // from the dead one (and an association's epoch check
-                        // sees the change before it sends).
-                        slot.clear_rev2();
-                        rev2.clear_flows();
-                        // Queued uplink payloads belong to this dead
-                        // generation: account each as an egress death instead
-                        // of leaving them to the stager's eventual `Drop`.
-                        rev2.clear_stage();
-                        bump_gen(&slot.gen_tx);
-                    }
+                    //
+                    // `retire_dead_slot` is that one death commit, shared with
+                    // the SOCKS `open_bi` failure path: besides the clear it
+                    // releases the dead generation's egress handles (strong
+                    // `quinn::Connection` clones that would otherwise outlive
+                    // the redial) and its rev2 registry/staged payloads, then
+                    // bumps the generation. Whoever wins the `rcu` clear owns
+                    // the whole cleanup, so it can never run twice.
+                    retire_dead_slot(&slot, idx, &egress, &conn);
                     if connected_at.elapsed() >= Duration::from_secs(5) {
                         backoff = reconnect_backoff();
                     }
@@ -256,6 +241,70 @@ pub(crate) fn spawn_conn_loop(
         }
     });
 }
+/// Commit one dead connection generation and release everything it owned.
+///
+/// This is the single death commit both writers on a pool slot use: the
+/// reconnect loop after its connection/watchdog future ends, and the SOCKS
+/// `open_bi` failure path when it is the first to notice that the handle it was
+/// handed has died. Committing through [`ConnSlot::clear_if_and_mark_dead`]
+/// means exactly one caller wins the clear (the `rcu` decision, the
+/// `live = false` store and the progress-stamp reset land together), so the
+/// cleanup can never run twice for one generation and a connection published
+/// concurrently is neither marked dead nor cleaned.
+///
+/// On a won commit, in order:
+///
+/// 1. drop this pool slot's egress-cache handles — they hold strong
+///    `quinn::Connection` clones, and a dead generation is otherwise reclaimed
+///    only by a later verdict on that binding, i.e. never if it goes idle
+///    ([`SharedEgress::forget_slot`]);
+/// 2. retire the slot's rev2 state (compare-and-clear on generation identity,
+///    [`ConnSlot::clear_rev2_if`]) and drop the dead generation's connection-
+///    scoped flow registry and staged payloads, so a dispatcher that waits for
+///    the next generation cannot resolve ids from the dead one and an
+///    association's epoch check sees the change before it sends
+///    ([`ConnRev2::clear_flows`], [`ConnRev2::clear_stage`], which books every
+///    dropped payload as an egress death);
+/// 3. bump the generation, waking `wait_conn` waiters and dispatchers.
+///
+/// The rev2 state is captured *before* the clear commits: the publisher
+/// installs `set_rev2` before `publish`, so while `shared` still holds this
+/// connection `slot.rev2()` is this connection's state, whereas a read taken
+/// after the clear could observe the next generation's state if a redial
+/// slipped in behind the commit. The slot's rev2 entry is then retired with a
+/// compare-and-clear, never unconditionally: the SOCKS path is not the
+/// publisher, so a reconnect loop that published a fresh generation while this
+/// call was running must keep it — a blind clear would leave the fresh
+/// connection without rev2 state and force its UDP traffic to drop until the
+/// next redial.
+///
+/// Returns `true` when this call committed the death (and performed the
+/// cleanup), `false` when the slot already held another generation or nothing
+/// — another writer won the same commit, and there is nothing left to do.
+pub(crate) fn retire_dead_slot(
+    slot: &ConnSlot,
+    idx: usize,
+    egress: &SharedEgress,
+    conn: &quinn::Connection,
+) -> bool {
+    let rev2 = slot.rev2();
+    if !slot.clear_if_and_mark_dead(conn) {
+        return false;
+    }
+    egress.forget_slot(idx);
+    // Retire the slot only while it still holds this generation's state (see
+    // the doc above). The dead generation's own tables are independent of the
+    // slot's current state, so they are always released: a fresh generation
+    // published in the meantime keeps its state and its flows.
+    if let Some(dead) = &rev2 {
+        let _ = slot.clear_rev2_if(dead);
+        dead.clear_flows();
+        dead.clear_stage();
+    }
+    bump_gen(&slot.gen_tx);
+    true
+}
+
 /// Cap on a single dial attempt.
 ///
 /// Without an explicit bound a dead path costs ~15 s per attempt: QUIC keeps

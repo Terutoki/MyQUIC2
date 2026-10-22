@@ -4,7 +4,7 @@
 > This file is the implementation contract: land the codec first, then wire it up phase by phase. All version identification appears only in `wire_ver=2` of `CTL HELLO/CAPS`;
 > code/docs/logs **must not contain "MQP-4"**.
 >
-> **Status (2026-10-22):** the contract below is current; the implementation-status snapshot in §10 is dated and retains historical test counts. The current tree has **436 macOS / 440 Linux** tests, with server-owned full-cone flows, the connection-level stager and the reassembler purge hooks landed.
+> **Status (2026-10-22, audit-hardened):** the contract below is current; the implementation-status snapshot in §10 is dated and retains historical test counts. The current tree has **476 macOS tests**, with server-owned full-cone flows, the connection-level stager, the reassembler purge hooks and the full audit-hardening batch (§10.6) landed.
 
 ---
 
@@ -336,7 +336,7 @@ full-cone unsolicited (no matching flow):
 
 ## 10. Implementation Status (2026-10-21, Phase 1a landed)
 
-> **Status note (2026-10-22).** This section is a dated implementation snapshot, not a live tracker. Since the snapshot, server-owned/full-cone flows, the connection-level stager with cross-session `TRAIN dict`, and `R2Reassembler::{drop_session, drop_flow}` purge hooks have landed; the current tree has **436 macOS / 440 Linux** tests. Items below that describe these as remaining are retained as history. See the README verification section for the current counts.
+> **Status note (2026-10-22).** This section is a dated implementation snapshot, not a live tracker. Since the snapshot, server-owned/full-cone flows, the connection-level stager with cross-session `TRAIN dict`, `R2Reassembler::{drop_session, drop_flow}` purge hooks and the audit-hardening batch (§10.6) have landed; the current tree has **476 macOS tests**. Items below that describe these as remaining are retained as history. See the README verification section for the current counts.
 
 ### 10.1 Delivered
 
@@ -403,3 +403,14 @@ full-cone unsolicited (no matching flow):
 6. `R2Reassembler`'s active purge on SESS_CLOSE/FLOW_CLOSE (currently covered by the 2 s timeout/registry resolution at completion,
    which is part of UDP late-arrival semantics); if strict release is required, add shared-lib `drop_session/drop_flow` hooks.
 7. `R2Fragmenter`'s `Blocked` is not counted separately as BUFFER_FULL (consistent with single-frame; observability difference only).
+
+### 10.6 Audit hardening (2026-10-22, post-snapshot)
+
+A full-tree code audit (memory / performance / logic) landed these changes; they are implementation hardening, not wire changes:
+
+1. **Quinn stream-assembly memory bound.** The handshake advertises a small pre-auth credit (4 bidi + 2 uni streams; the previous 8192/100 let an unauthenticated peer park up to `MAX_CHUNKS = 1024` gap spans per advertised stream, hundreds of MiB per connection). After the token check the server raises bidi to 8192 with `MAX_STREAMS` (increase-only, protocol-legal). The client advertises `(0, 0)` incoming credit (it never accepts a stream). The pre-auth bound is charged per connection and the post-auth parked-header bound (4096 streams x 1024 spans x 96 B = 384 MiB) is a process-wide admission term; a per-connection parked-header cap of 256 is the fail-fast defense-in-depth.
+2. **Domain `OPEN` x `SESS_CLOSE` race.** In-flight domain lookups carry a cancellation flag; `SESS_CLOSE` flags them before `take_session`, and session creation re-checks the flag inside the shard write lock, so a late DNS answer can no longer recreate a closed session, install a binding or ACK it.
+3. **Server-side reaps notify the client.** `CTL SESS_CLOSE` (x3 best-effort) is now also emitted on idle sweep, fair-share/session-pool sweeps and reply-reader exit; the client already handled it, and a live binding can no longer point at a reaped session silently.
+4. **Memory-bound enforcement.** The rev2 reassembler's ordering index is pruned and charged against `FRAG_MAX_HELD_BYTES`; the v0.2 per-session flow table is charged at its domain-target worst case (22 KiB); admission additionally charges the process-wide retry pool, DNS waiters, worker scratch and (charge-only) the stream-assembly bound.
+5. **Hot-path / lock hygiene.** `FLOW_CLOSE`/`FLOW_REJECT` purge only a known binding's session-scoped stager state; the client `ensure_binding` checks the rejection window and registry capacity before any map scan and allocates wire ids only inside a successful insert; the stager keeps a steady-head-only cursor instead of rotating over standalone heads per item.
+6. **Smaller fixes.** Server-reap/reader-exit registry purge is scoped to the removed entry's bindings (a recreated session id keeps its own); `r2_install` rolls back the forward registry when the reverse table fill races; TCP pump buffers reserve exactly; hickory's internal DNS cache is disabled (outer moka is the only TTL authority); the client runtime sizes its multi-thread workers against the pinned shard runtimes.

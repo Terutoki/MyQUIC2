@@ -45,6 +45,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
+use foldhash::HashSet;
 use quinn::Connection;
 
 use crate::dgram_drops;
@@ -156,6 +157,19 @@ pub struct R2Stager {
     sessions: HashMap<u32, VecDeque<R2StageItem>, foldhash::fast::RandomState>,
     /// Round-robin cursor over session ids that currently have items.
     order: VecDeque<u32>,
+    /// Round-robin cursor over the subset of [`Self::order`] whose queue head is
+    /// `Steady` — the only sessions a train run can draw from. A run used to
+    /// scan [`Self::order`] once per packed item (O(items x sessions) when most
+    /// heads are standalone `Open`/`Inline`); this cursor only ever holds
+    /// sessions that can contribute, so [`Self::next_steady_session`] rotates
+    /// over the steady subset instead.
+    steady_order: VecDeque<u32>,
+    /// Membership of [`Self::steady_order`], so a head transition (a push into
+    /// an empty queue, or a pop revealing a new head) queues a session at most
+    /// once. A slot whose session emptied or whose head stopped being `Steady`
+    /// is dropped lazily by [`Self::next_steady_session`]; the session rejoins
+    /// on its next transition.
+    steady_mark: HashSet<u32>,
     queued_items: usize,
     queued_bytes: usize,
     max_items: usize,
@@ -190,6 +204,8 @@ impl R2Stager {
         Self {
             sessions: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             order: VecDeque::new(),
+            steady_order: VecDeque::new(),
+            steady_mark: HashSet::with_hasher(foldhash::fast::RandomState::default()),
             queued_items: 0,
             queued_bytes: 0,
             max_items,
@@ -239,6 +255,10 @@ impl R2Stager {
         }
         // The order deque keeps a stale slot for `session`; next_session skips
         // sessions whose map entry is gone, so no explicit removal is needed.
+        // The steady cursor is cleaned eagerly: it is a cold path, and a stale
+        // mark would otherwise have to be validated before the session could
+        // rejoin after a reopen.
+        self.forget_steady(session);
         for _ in 0..removed {
             dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
         }
@@ -247,9 +267,14 @@ impl R2Stager {
 
     /// Drop queue entries naming a closed flow (`FLOW_CLOSE`), preserving the
     /// order of the remaining items in each session queue.
+    ///
+    /// This scans every session's queue; [`Self::drop_flow_scoped`] is the
+    /// session-local variant for callers that know the association. Both book
+    /// one `EGRESS_DEAD` per removed item.
     pub fn drop_flow(&mut self, wire_id: u32) -> usize {
         let mut removed = 0usize;
-        for queue in self.sessions.values_mut() {
+        let mut touched = Vec::new();
+        for (session, queue) in self.sessions.iter_mut() {
             let before = queue.len();
             queue.retain(|item| match &item.kind {
                 R2StageKind::Steady { wire_id: id } | R2StageKind::Open { wire_id: id, .. } => {
@@ -260,6 +285,7 @@ impl R2Stager {
             let dropped = before - queue.len();
             if dropped > 0 {
                 removed += dropped;
+                touched.push(*session);
             }
         }
         if removed == 0 {
@@ -275,6 +301,73 @@ impl R2Stager {
             .sum();
         self.queued_items = items;
         self.queued_bytes = bytes;
+        // A retained queue may have lost its steady head; rebuild the steady
+        // cursor from the surviving heads, then re-seat the sessions whose head
+        // the purge revealed (cold path; the sort keeps the touched order
+        // deterministic, since the map iteration order is not).
+        let sessions = &self.sessions;
+        self.steady_order.retain(|session| {
+            sessions
+                .get(session)
+                .and_then(|q| q.front())
+                .is_some_and(|item| matches!(item.kind, R2StageKind::Steady { .. }))
+        });
+        self.steady_mark = self.steady_order.iter().copied().collect();
+        touched.sort_unstable();
+        for session in touched {
+            self.add_steady_head(session);
+        }
+        for _ in 0..removed {
+            dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+        }
+        removed
+    }
+
+    /// Session-scoped [`Self::drop_flow`]: purge queued entries naming a closed
+    /// flow from one association's queue only.
+    ///
+    /// The connection-scoped close path already knows which session the flow
+    /// belonged to, so this scans a single queue instead of every session's.
+    /// Returns how many payloads were removed and books one `EGRESS_DEAD` per
+    /// payload, exactly like [`Self::drop_flow`]. An unknown session or a queue
+    /// with no matching flow removes nothing, books nothing and returns 0.
+    pub fn drop_flow_scoped(&mut self, session: u32, wire_id: u32) -> usize {
+        let Some(queue) = self.sessions.get_mut(&session) else {
+            return 0;
+        };
+        let before = queue.len();
+        let mut freed = 0usize;
+        queue.retain(|item| {
+            let matches = match &item.kind {
+                R2StageKind::Steady { wire_id: id } | R2StageKind::Open { wire_id: id, .. } => {
+                    *id == wire_id
+                }
+                R2StageKind::Inline { .. } => false,
+            };
+            if matches {
+                freed = freed.saturating_add(item.payload.len());
+            }
+            !matches
+        });
+        let removed = before - queue.len();
+        if removed == 0 {
+            return 0;
+        }
+        self.queued_items = self.queued_items.saturating_sub(removed);
+        self.queued_bytes = self.queued_bytes.saturating_sub(freed);
+        // Re-seat the session in the steady cursor: the purge may have removed
+        // the queue head, emptying the queue or revealing a new one (cold
+        // path; O(1) plus the mark lookup).
+        let steady_head = self
+            .sessions
+            .get(&session)
+            .and_then(|q| q.front())
+            .is_some_and(|item| matches!(item.kind, R2StageKind::Steady { .. }));
+        if steady_head {
+            self.add_steady_head(session);
+        } else {
+            self.forget_steady(session);
+        }
         for _ in 0..removed {
             dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
         }
@@ -298,12 +391,18 @@ impl R2Stager {
         let session = item.session;
         let bytes = item.payload.len();
         let queue = self.sessions.entry(session).or_default();
-        if queue.is_empty() {
+        let was_empty = queue.is_empty();
+        if was_empty {
             self.order.push_back(session);
         }
         queue.push_back(item);
         self.queued_items += 1;
         self.queued_bytes += bytes;
+        if was_empty {
+            // The session (re)joins the round-robin; a steady head also joins
+            // the steady cursor a train run rotates over.
+            self.add_steady_head(session);
+        }
         Ok(self.queued_items)
     }
 
@@ -313,6 +412,8 @@ impl R2Stager {
         let n = self.queued_items;
         self.sessions.clear();
         self.order.clear();
+        self.steady_order.clear();
+        self.steady_mark.clear();
         self.queued_items = 0;
         self.queued_bytes = 0;
         n
@@ -496,6 +597,12 @@ impl R2Stager {
         let R2StageKind::Steady { wire_id } = item.kind else {
             unreachable!("take_steady_head peeked a steady item");
         };
+        // Keep the steady cursor in step with the general one: after serving a
+        // session it must point at the sessions *after* it, so a multi-item
+        // head still interleaves with the other steady sessions (the old
+        // single cursor got this from rotating on every pop). A session that
+        // `next_steady_session` just rotated to the back needs no move.
+        self.rotate_steady_past(session);
         if new_flow {
             unique.push(wire_id);
         }
@@ -551,30 +658,79 @@ impl R2Stager {
         None
     }
 
-    /// Pop the next session whose head is a `Steady` item, rotating the cursor.
+    /// Pop the next session whose head is a `Steady` item, rotating the steady
+    /// cursor.
+    ///
+    /// Only sessions whose queue head was `Steady` when they joined the cursor
+    /// are visited here; standalone-headed sessions are invisible to a train
+    /// run (this used to walk the whole session cursor once per packed item).
+    /// An entry whose session emptied or whose head is no longer steady is
+    /// dropped — its mark is removed and it does not rejoin until the session's
+    /// next head transition.
     fn next_steady_session(&mut self) -> Option<u32> {
-        let len = self.order.len();
-        for _ in 0..len {
-            let session = self.order.pop_front()?;
+        while let Some(session) = self.steady_order.pop_front() {
             let steady = self
                 .sessions
                 .get(&session)
                 .and_then(|q| q.front())
                 .is_some_and(|i| matches!(i.kind, R2StageKind::Steady { .. }));
             if steady {
-                self.order.push_back(session);
+                self.steady_order.push_back(session);
                 return Some(session);
             }
-            self.order.push_back(session);
+            self.steady_mark.remove(&session);
         }
         None
+    }
+
+    /// Add `session` to the steady cursor when its queue head is a `Steady`
+    /// item and it is not queued already. Called on the two head transitions:
+    /// a push into an empty queue and a pop revealing a new head.
+    fn add_steady_head(&mut self, session: u32) {
+        let steady = self
+            .sessions
+            .get(&session)
+            .and_then(|q| q.front())
+            .is_some_and(|item| matches!(item.kind, R2StageKind::Steady { .. }));
+        if steady && self.steady_mark.insert(session) {
+            self.steady_order.push_back(session);
+        }
+    }
+
+    /// Move the steady cursor past `session`. A no-op when the session is not
+    /// queued — in particular when it already sits at the back because
+    /// [`Self::next_steady_session`] just rotated it there (the fast path: the
+    /// per-item move in a train run is O(1); only a run's first item, which is
+    /// a session the general cursor picked, may need the scan).
+    fn rotate_steady_past(&mut self, session: u32) {
+        if self.steady_order.back() == Some(&session) {
+            return;
+        }
+        let Some(pos) = self.steady_order.iter().position(|s| *s == session) else {
+            return;
+        };
+        self.steady_order.rotate_left(pos + 1);
+    }
+
+    /// Drop `session` from the steady cursor (`SESS_CLOSE` teardown, cold path:
+    /// O(steady sessions)).
+    fn forget_steady(&mut self, session: u32) {
+        if self.steady_mark.remove(&session) {
+            self.steady_order.retain(|s| *s != session);
+        }
     }
 
     fn pop_one(&mut self, session: u32) -> Option<R2StageItem> {
         let queue = self.sessions.get_mut(&session)?;
         let item = queue.pop_front()?;
-        if queue.is_empty() {
+        let emptied = queue.is_empty();
+        if emptied {
             self.sessions.remove(&session);
+        } else {
+            // The pop may have revealed a steady head (Open/Inline items are
+            // sent one at a time, so a session can enter a train run only after
+            // its self-describing prefix has been popped).
+            self.add_steady_head(session);
         }
         self.queued_items = self.queued_items.saturating_sub(1);
         self.queued_bytes = self.queued_bytes.saturating_sub(item.payload.len());
@@ -1132,5 +1288,248 @@ mod tests {
         );
         assert_eq!(q.items.len(), R2_PACK_BATCH_ITEMS);
         assert_eq!(s.len(), 2 * per_train - R2_PACK_BATCH_ITEMS);
+    }
+
+    /// The steady cursor must hold only steady-headed sessions: with a large
+    /// standalone population ahead of a few steady sessions, a train run draws
+    /// the steady items directly instead of walking every standalone session,
+    /// and nothing is lost or duplicated.
+    #[test]
+    fn steady_cursor_ignores_standalone_heads() {
+        let mut s = R2Stager::new();
+        let standalone = 512u32;
+        for i in 0..standalone {
+            s.push(open(i, i + 1, b"o")).unwrap();
+        }
+        s.push(steady(standalone, 1, b"s1")).unwrap();
+        s.push(steady(standalone + 1, 2, b"s2")).unwrap();
+        // The general cursor knows every session; the steady cursor only the
+        // two that can contribute to a train.
+        assert_eq!(s.order.len(), standalone as usize + 2);
+        assert_eq!(s.steady_order.len(), 2);
+        assert_eq!(s.steady_mark.len(), 2);
+        assert_eq!(s.next_steady_session(), Some(standalone));
+        assert_eq!(s.next_steady_session(), Some(standalone + 1));
+        // Drain everything: 512 standalone frames plus one two-item train.
+        let mut frames = 0usize;
+        let mut items = 0usize;
+        while let Some(f) = s.next_frame(1162) {
+            frames += 1;
+            items += f.items as usize;
+        }
+        assert_eq!(items, standalone as usize + 2, "one delivery per payload");
+        assert_eq!(frames, standalone as usize + 1);
+        assert!(s.is_empty());
+        assert!(s.steady_order.is_empty(), "every steady slot is retired");
+    }
+
+    /// A steady head revealed by popping a standalone item joins the steady
+    /// cursor exactly once (the transition add), so the session's remaining
+    /// payloads still train in per-session FIFO order.
+    #[test]
+    fn revealed_steady_head_joins_the_steady_cursor() {
+        let mut s = R2Stager::new();
+        s.push(open(1, 1, b"o1")).unwrap();
+        s.push(steady(1, 2, b"s1")).unwrap();
+        s.push(open(2, 2, b"o2")).unwrap();
+        s.push(steady(2, 3, b"s2")).unwrap();
+        assert!(s.steady_order.is_empty(), "both heads are standalone");
+        let f = s.next_frame(1162).unwrap();
+        assert_eq!(r2::decode_data(&f.body).unwrap().id, Some(id(1)));
+        // Popping session 1's Open revealed a steady head; session 2's head is
+        // still its Open, so only session 1 is queued for train runs.
+        assert_eq!(s.steady_order, VecDeque::from(vec![1]));
+        let f = s.next_frame(1162).unwrap();
+        assert_eq!(r2::decode_data(&f.body).unwrap().id, Some(id(2)));
+        assert_eq!(s.steady_order, VecDeque::from(vec![1, 2]));
+        // The revealed steady items train together, in session order.
+        let f = s.next_frame(1162).unwrap();
+        let train: Vec<u32> = r2::decode_train(&f.body)
+            .unwrap()
+            .items()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(train, vec![id(2), id(3)]);
+        assert!(s.is_empty());
+        assert!(s.steady_order.is_empty());
+    }
+
+    /// Teardown paths keep the steady cursor consistent: a session or flow drop
+    /// retires/refreshes the slots it invalidated, and `clear` empties every
+    /// cursor.
+    #[test]
+    fn teardown_keeps_the_steady_cursor_consistent() {
+        let mut s = R2Stager::new();
+        s.push(steady(1, 1, b"a")).unwrap();
+        s.push(steady(1, 2, b"b")).unwrap();
+        s.push(steady(2, 3, b"c")).unwrap();
+        assert_eq!(s.steady_order, VecDeque::from(vec![1, 2]));
+        // A purge that does not touch a head leaves the cursor intact.
+        assert_eq!(s.drop_flow(id(1)), 1);
+        assert_eq!(s.steady_order, VecDeque::from(vec![1, 2]));
+        assert_eq!(s.len(), 2);
+        // A purge that empties a session's queue retires its steady slot.
+        assert_eq!(s.drop_flow(id(2)), 1);
+        assert_eq!(s.steady_order, VecDeque::from(vec![2]));
+        assert_eq!(s.steady_mark.len(), 1);
+        let f = s.next_frame(1162).unwrap();
+        let d = r2::decode_data(&f.body).unwrap();
+        assert_eq!(d.id, Some(id(3)));
+        assert_eq!(d.payload, b"c");
+        // `SESS_CLOSE` drops a whole session from the cursor.
+        s.push(steady(3, 4, b"d")).unwrap();
+        s.push(steady(4, 5, b"e")).unwrap();
+        assert_eq!(s.drop_session(3), 1);
+        assert_eq!(s.steady_order, VecDeque::from(vec![4]));
+        // `clear` empties every cursor.
+        assert_eq!(s.clear(), 1);
+        assert!(s.steady_order.is_empty());
+        assert!(s.steady_mark.is_empty());
+        // A purge that removes a standalone head reveals a steady one: the
+        // session must rejoin the steady cursor.
+        s.push(open(5, 20, b"o")).unwrap();
+        s.push(steady(5, 21, b"p")).unwrap();
+        assert!(s.steady_order.is_empty());
+        assert_eq!(s.drop_flow(id(20)), 1);
+        assert_eq!(s.steady_order, VecDeque::from(vec![5]));
+        let f = s.next_frame(1162).unwrap();
+        assert_eq!(r2::decode_data(&f.body).unwrap().id, Some(id(21)));
+    }
+
+    /// Session-scoped flow purge: only the named session's queue is scanned,
+    /// the same wire id in another session survives, `Steady` and `Open` items
+    /// both match, `Inline` never does, and the item/byte accounting stays
+    /// exact.
+    #[test]
+    fn drop_flow_scoped_is_session_local() {
+        let mut s = R2Stager::new();
+        s.push(steady(1, 10, b"aa")).unwrap(); // session 1, flow id(10)
+        s.push(open(1, 20, b"bb")).unwrap(); // session 1, flow id(20)
+        s.push(inline(1, b"cc")).unwrap(); // session 1, inline: never matched
+        s.push(steady(2, 10, b"dd")).unwrap(); // session 2, same wire id
+        let bytes = s.queued_bytes();
+        assert_eq!(bytes, 8);
+        // Unknown session / no matching flow: nothing removed, nothing booked.
+        assert_eq!(s.drop_flow_scoped(99, id(10)), 0);
+        assert_eq!(s.drop_flow_scoped(1, id(999)), 0);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.queued_bytes(), bytes);
+        // Scoped to session 1: only its steady item for flow id(10) goes. The
+        // other session's identical wire id and the inline item survive.
+        assert_eq!(s.drop_flow_scoped(1, id(10)), 1);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.queued_bytes(), bytes - 2);
+        // The `Open` form of a flow matches too.
+        assert_eq!(s.drop_flow_scoped(1, id(20)), 1);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.queued_bytes(), bytes - 4);
+        // Remaining frames keep their per-session FIFO order: session 1's inline
+        // item, then session 2's steady item.
+        let f = s.next_frame(1162).unwrap();
+        let d = r2::decode_data(&f.body).unwrap();
+        assert_eq!(d.id, None);
+        assert_eq!(d.sess, Some(1));
+        assert_eq!(d.payload, b"cc");
+        let f = s.next_frame(1162).unwrap();
+        let d = r2::decode_data(&f.body).unwrap();
+        assert_eq!(d.id, Some(id(10)));
+        assert_eq!(d.payload, b"dd");
+        assert!(s.is_empty());
+    }
+
+    /// Mixed standalone and steady heads across many sessions: whatever the
+    /// frame interleaving, every queued payload is delivered exactly once and
+    /// each session's steady items keep their FIFO order. The steady cursor's
+    /// transition add and rotation must neither drop nor duplicate a head.
+    #[test]
+    fn mixed_heads_deliver_every_payload_exactly_once() {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        enum Seen {
+            Steady(u32, Vec<u8>),
+            Open(u32, Vec<u8>),
+            Inline(u32, Vec<u8>),
+        }
+        let mut s = R2Stager::new();
+        let mut expected = Vec::new();
+        // wire id -> (owning session, steady sequence number)
+        let mut fifo = std::collections::HashMap::new();
+        let mut next_local = 1u32;
+        for session in 0..37u32 {
+            match session % 3 {
+                0 => {
+                    let local = next_local;
+                    next_local += 1;
+                    s.push(open(session, local, b"open")).unwrap();
+                    expected.push(Seen::Open(id(local), b"open".to_vec()));
+                }
+                1 => {
+                    s.push(inline(session, b"inline")).unwrap();
+                    expected.push(Seen::Inline(session, b"inline".to_vec()));
+                }
+                _ => {}
+            }
+            let n = 1 + session % 5;
+            for seq in 0..n {
+                let local = next_local;
+                next_local += 1;
+                let payload = vec![session as u8, seq as u8];
+                s.push(R2StageItem {
+                    session,
+                    kind: R2StageKind::Steady { wire_id: id(local) },
+                    payload: Bytes::from(payload.clone()),
+                })
+                .unwrap();
+                fifo.insert(id(local), (session, seq));
+                expected.push(Seen::Steady(id(local), payload));
+            }
+        }
+        let mut received = Vec::new();
+        let mut last_seq = std::collections::HashMap::new();
+        while let Some(f) = s.next_frame(1162) {
+            if f.body[0] == r2::R2_TRAIN {
+                for (wire_id, payload) in r2::decode_train(&f.body).unwrap().items() {
+                    received.push(Seen::Steady(wire_id, payload.to_vec()));
+                    let (session, seq) = fifo[&wire_id];
+                    if let Some(prev) = last_seq.insert(session, seq) {
+                        assert!(
+                            seq > prev,
+                            "session {session} FIFO order: {prev} then {seq}"
+                        );
+                    }
+                }
+            } else {
+                let d = r2::decode_data(&f.body).unwrap();
+                match (d.id, d.addr) {
+                    (Some(wire_id), None) => {
+                        received.push(Seen::Steady(wire_id, d.payload.to_vec()));
+                        let (session, seq) = fifo[&wire_id];
+                        if let Some(prev) = last_seq.insert(session, seq) {
+                            assert!(
+                                seq > prev,
+                                "session {session} FIFO order: {prev} then {seq}"
+                            );
+                        }
+                    }
+                    (Some(wire_id), Some(_)) => {
+                        received.push(Seen::Open(wire_id, d.payload.to_vec()));
+                    }
+                    (None, _) => {
+                        received.push(Seen::Inline(
+                            d.sess.expect("inline carries sess"),
+                            d.payload.to_vec(),
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            received.len(),
+            expected.len(),
+            "no payload lost or duplicated"
+        );
+        received.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(received, expected);
+        assert!(s.is_empty());
     }
 }

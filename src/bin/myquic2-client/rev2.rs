@@ -327,9 +327,35 @@ impl ConnRev2 {
     }
 
     /// Whether `addr` is inside an active rejection window.
+    ///
+    /// Read-mostly fast path: one shared-lock scan answers the common cases —
+    /// no match, or a match while no entry has expired — without paying the
+    /// exclusive lock the old shape took on every payload of a rejected
+    /// target's window (and on every new-target payload in general). Only when
+    /// the scan sees an expired entry, i.e. when the table actually needs
+    /// pruning, does this upgrade to the write lock, prune and re-test under
+    /// it. The TTL predicate is unchanged: an entry is live while
+    /// `now_ms - at < REJECT_TTL_MS`, exactly what the prune retains and what
+    /// [`Self::note_rejected`] maintains.
     pub(crate) fn is_rejected(&self, addr: &TargetAddrRef<'_>, now_ms: u64) -> bool {
+        let expired = |at: &u64| now_ms.saturating_sub(*at) >= REJECT_TTL_MS;
+        let rejected = self.rejected.read();
+        let mut hit = false;
+        let mut stale = false;
+        for (t, at) in rejected.iter() {
+            stale |= expired(at);
+            hit |= t.as_ref() == *addr;
+        }
+        if !stale {
+            return hit;
+        }
+        // An expired entry means the cache must be pruned. That is the rare
+        // case (it happens once per entry per TTL at most), so the write lock
+        // is paid only here; the re-test under it is authoritative against a
+        // concurrent `note_rejected`.
+        drop(rejected);
         let mut rejected = self.rejected.write();
-        rejected.retain(|(_, at)| now_ms.saturating_sub(*at) < REJECT_TTL_MS);
+        rejected.retain(|(_, at)| !expired(at));
         rejected.iter().any(|(t, _)| t.as_ref() == *addr)
     }
 
@@ -826,14 +852,25 @@ fn bad_address_header() -> PayloadSend {
 /// Find the binding for `addr`, opening a new flow when needed.
 ///
 /// Returns `None` when the frame must be sent `INLINE`: no id left, the
-/// connection registry is full, or the session table is full (the spec's
-/// fail-safe). A `Closed` binding for the target is forgotten first: its id
-/// cannot be reused on this connection, so the target gets a fresh one.
+/// connection registry is full, the session table is full, or the target is
+/// inside a `FLOW_REJECT` window (the spec's fail-safe). A `Closed` binding for
+/// the target is forgotten first: its id cannot be reused on this connection,
+/// so the target gets a fresh one.
 ///
 /// The association's one-slot memo (`UplinkFlows::last`) serves the steady
 /// hit — same target, same live binding — without the per-slot scan and the
-/// extra `Arc` clone/drop of a `SessionFlows::find`. Everything past the memo
-/// miss is unchanged.
+/// extra `Arc` clone/drop of a `SessionFlows::find`.
+///
+/// Everything past the memo miss is ordered cheapest-and-most-decisive first:
+/// the session-table scan, the full-table fail-safe, the rejection window
+/// (checked *before* any registry scan so a rejected target never pays the
+/// connection-wide map walk on every payload of its window), the connection
+/// registry's capacity probe (a full table can only fall back to `INLINE`,
+/// so the server-owned-flow scan is skipped), then that scan, and finally the
+/// atomic allocate-and-insert. [`FlowRegistry::insert_new`] re-checks capacity
+/// under its write lock before allocating an id, so a table that fills between
+/// the probe and the insert still cannot consume one: ids are never reused, and
+/// such a leak would eventually force every payload to `INLINE`.
 fn ensure_binding(
     rev2: &ConnRev2,
     up: &mut UplinkFlows,
@@ -860,6 +897,23 @@ fn ensure_binding(
     if flows.is_full() {
         return None;
     }
+    // A rejected target stays `INLINE` for the TTL: re-opening it would cost
+    // one rejected frame plus one lost payload per payload (see
+    // [`REJECT_TTL_MS`]). Checked before any registry scan: the rejection is
+    // the expected outcome for every payload of the window, so nothing can be
+    // bound for it and the scans below could only waste work. `is_rejected` is
+    // itself read-mostly (it takes the write lock only to prune expired
+    // entries).
+    if rev2.is_rejected(addr, coarse_millis()) {
+        return None;
+    }
+    // A full connection registry means no flow can be bound: `INLINE` is the
+    // only possible outcome, so skip the server-owned-flow scan (a full table
+    // is exactly when that scan is longest). Advisory only — `insert_new`
+    // re-checks the cap under its write lock and stays the authority.
+    if !rev2.registry.has_capacity() {
+        return None;
+    }
     // Full-cone symmetry: the server may already own a flow for this exact
     // (session, target) — it announced it with `DATA OPEN|SRC` and the
     // dispatcher installed it. Reuse that id so the app's reply rides the same
@@ -883,17 +937,13 @@ fn ensure_binding(
             let _ = rev2.registry.remove(server.wire_id);
         }
     }
-    // A rejected target stays `INLINE` for the TTL: re-opening it would cost
-    // one rejected frame plus one lost payload per payload (see
-    // [`REJECT_TTL_MS`]).
-    if rev2.is_rejected(addr, coarse_millis()) {
-        return None;
-    }
-    let id = rev2.ids.alloc()?;
-    let binding = FlowBinding::new_shared(id, sess, addr.into_owned());
-    // A duplicate id cannot happen (monotonic allocator, one owner), so any
-    // registry refusal is admission pressure or a logic fault: INLINE is safe.
-    let binding = rev2.registry.insert(binding).ok()?;
+    // One write-lock hold: capacity re-check, id allocation, insert. An id
+    // allocated before a refused insert would be lost for the connection's
+    // life (wire ids are never reused).
+    let binding = rev2
+        .registry
+        .insert_new(&rev2.ids, sess, addr.into_owned())
+        .ok()?;
     if !flows.insert(binding.clone()) {
         let _ = rev2.registry.remove(binding.wire_id);
         return None;
@@ -1314,6 +1364,82 @@ mod tests {
             "a full registry must fall back to INLINE"
         );
         assert!(up.flows.is_empty());
+        // The fail-safe must not consume a never-reused wire id: capacity is
+        // checked before allocation.
+        assert_eq!(r.ids.allocated(), 0, "a full registry must not leak ids");
+    }
+
+    /// A persistently full connection registry keeps taking new targets (the
+    /// `INLINE` fail-safe): every attempt must cost zero ids, or the finite
+    /// id space would eventually run dry and force `INLINE` even after the
+    /// table drains.
+    #[test]
+    fn full_registry_never_consumes_flow_ids() {
+        let r = ConnRev2::new();
+        let filler = TargetAddr::Ip("203.0.113.7:9".parse().unwrap());
+        for i in 1..=R2_MAX_FLOWS_PER_CONN as u32 {
+            let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 2, filler.clone());
+            assert!(r.registry.insert(b).is_ok());
+        }
+        assert!(!r.registry.has_capacity());
+        let mut up = UplinkFlows::new();
+        for i in 0..64u16 {
+            let addr = SocketAddr::from(([198, 51, 100, 9], 4000 + i));
+            assert!(
+                ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
+                "a full registry keeps falling back to INLINE"
+            );
+        }
+        assert_eq!(
+            r.ids.allocated(),
+            0,
+            "repeated new-target attempts against a full table must not leak ids"
+        );
+        assert!(up.flows.is_empty(), "no half-bound session entries either");
+    }
+
+    /// A target inside a `FLOW_REJECT` window takes the `INLINE` fail-safe: the
+    /// decision must be made before the registry scans and must not allocate an
+    /// id.
+    #[test]
+    fn rejected_target_path_consumes_no_id() {
+        let r = ConnRev2::new();
+        let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        r.note_rejected(TargetAddr::Ip(addr), coarse_millis());
+        let mut up = UplinkFlows::new();
+        assert!(
+            ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
+            "a rejected target must fall back to INLINE"
+        );
+        assert_eq!(
+            r.ids.allocated(),
+            0,
+            "the rejection short-circuit must not consume an id"
+        );
+        assert!(
+            r.is_rejected(&TargetAddrRef::Ip(addr), coarse_millis()),
+            "the live rejection window is unchanged by the probe"
+        );
+    }
+
+    /// The read-lock fast path must never prune a live entry; expired entries
+    /// are pruned exactly when the TTL makes the answer `false`.
+    #[test]
+    fn is_rejected_fast_path_keeps_live_entries_and_prunes_expired() {
+        let r = ConnRev2::new();
+        let a = TargetAddr::Ip("198.51.100.1:1".parse().unwrap());
+        let b = TargetAddr::Ip("198.51.100.2:2".parse().unwrap());
+        r.note_rejected(a.clone(), 1_000);
+        r.note_rejected(b.clone(), 1_000);
+        // Both windows are live: the probe answers from the shared lock and
+        // leaves the table untouched.
+        assert!(r.is_rejected(&a.as_ref(), 2_000));
+        assert!(r.is_rejected(&b.as_ref(), 2_000));
+        assert_eq!(r.rejected.read().len(), 2, "a live probe prunes nothing");
+        // One TTL later both entries are expired: the probe upgrades to the
+        // write lock, prunes them and answers `false`.
+        assert!(!r.is_rejected(&a.as_ref(), 1_000 + REJECT_TTL_MS));
+        assert_eq!(r.rejected.read().len(), 0, "expired entries are pruned");
     }
 
     #[test]

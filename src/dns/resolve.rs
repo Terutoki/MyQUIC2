@@ -31,7 +31,9 @@
 //!   all ports, so port-diverse traffic to it learns the verdict once instead
 //!   of once per port (each learning holding a `dns_slow_path_limiter` permit
 //!   for the lookup budget).
-//! - **upstream**: hickory, cancellable and TTL-clamped to the same windows.
+//! - **upstream**: hickory, cancellable, with its internal response cache
+//!   disabled — the caches above are the only TTL authority (see
+//!   [`upstream_resolver`]).
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -195,25 +197,51 @@ async fn resolve_ips(host: &str, port: u16, timeout: Duration) -> Result<Vec<IpA
     Ok(ips)
 }
 
+/// Configure a hickory resolver for use behind this module's caches.
+///
+/// `cache_size = 0` disables hickory's internal response cache: hickory backs
+/// it with a moka cache sized to this capacity, and a zero-capacity moka map is
+/// disabled (inserts are no-ops and no housekeeping runs). The max-TTLs are
+/// kept anyway, as defence in depth for anything that does not pass through the
+/// outer caches (the hosts-file lookup / IP literals) and to keep the
+/// resolver's own clamping consistent with the documented windows.
+///
+/// Pure so the "hickory is not a second TTL authority" invariant is pinned by
+/// a unit test.
+fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts) {
+    opts.positive_max_ttl = Some(DNS_CACHE_TTL);
+    opts.negative_max_ttl = Some(DNS_NEG_TTL);
+    opts.cache_size = 0;
+}
+
 /// Process-wide upstream resolver, built once from the platform's own DNS
 /// configuration: resolv.conf on Linux/OpenWrt, the System Configuration
 /// dynamic store on macOS. Unlike `getaddrinfo` on the tokio blocking pool,
 /// its lookups are cancellable async futures, so the `timeout` wrapper above
 /// actually stops the work instead of leaving a blocking thread to finish it
-/// after the caller gave up. Its internal response cache is TTL-clamped to
-/// this module's positive/negative TTLs, so a name whose answer is still in
-/// hickory's cache when the caches above expire can never be served an answer
-/// older than the documented windows. `Err` is only the do-not-use-hickory
-/// signal for the fallback above; the reason is logged once, at construction.
+/// after the caller gave up.
+///
+/// Its internal response cache is disabled (see
+/// [`configure_resolver_options`]): the moka caches above ([`DNS_CACHE_TTL`]
+/// positive, [`DNS_NEG_TTL`] negative) plus their per-thread memos and moka's
+/// single-flight are the only TTL authority. An earlier revision clamped
+/// hickory's TTLs to the same windows and claimed the two layers therefore
+/// agreed, but they are independent stores: hickory could serve an entry for
+/// its whole TTL *after* the outer entry expired, so a name could be answered
+/// up to ~240 s stale (one `DNS_CACHE_TTL` window in each layer). The second
+/// layer is also pure overhead here: it duplicates a lookup the outer cache
+/// already deduplicates, and its hits bypass the thread memo that the packet
+/// paths rely on to avoid even a cache probe.
+///
+/// `Err` is only the do-not-use-hickory signal for the fallback above; the
+/// reason is logged once, at construction.
 fn upstream_resolver() -> Result<&'static hickory_resolver::TokioResolver, &'static str> {
     static RESOLVER: std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>> =
         std::sync::OnceLock::new();
     RESOLVER
         .get_or_init(|| {
             let built = hickory_resolver::TokioResolver::builder_tokio().and_then(|mut b| {
-                let opts = b.options_mut();
-                opts.positive_max_ttl = Some(DNS_CACHE_TTL);
-                opts.negative_max_ttl = Some(DNS_NEG_TTL);
+                configure_resolver_options(b.options_mut());
                 b.build()
             });
             match built {
@@ -230,6 +258,17 @@ fn upstream_resolver() -> Result<&'static hickory_resolver::TokioResolver, &'sta
         .map_err(String::as_str)
 }
 
+/// Concurrent resolver waiters the DNS slow path admits process-wide.
+///
+/// A permit is held for the lifetime of a spawned UDP resolution waiter (the
+/// datagram paths hand their payload to the task, so the wait is a real task,
+/// not just a future) and of the server's TCP dial-time lookup. This is both
+/// the concurrency cap and the memory bound admission charges
+/// (`config::tuning::dns_inflight_memory_bytes`): each waiter can pin a
+/// max-size datagram payload, a 255-byte host name, and its task/future
+/// structure.
+pub const DNS_SLOW_PATH_PERMITS: usize = 1024;
+
 /// Process-wide budget for spawned resolution work (UDP waiter tasks and the
 /// server's TCP dial path share it). Exhaustion fails fast — a datagram or
 /// dial is refused and counted as `DNS_BUDGET` — instead of parking callers
@@ -237,7 +276,7 @@ fn upstream_resolver() -> Result<&'static hickory_resolver::TokioResolver, &'sta
 pub fn dns_slow_path_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static LIM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
-    LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1024)))
+    LIM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(DNS_SLOW_PATH_PERMITS)))
 }
 
 /// Result of a synchronous cache lookup.
@@ -629,6 +668,35 @@ mod tests {
     fn preference_defaults_to_ipv6_first() {
         assert_eq!(IpPreference::default(), IpPreference::Ipv6);
         assert_eq!(ip_preference(), IpPreference::Ipv6);
+    }
+
+    /// hickory must not be a second TTL authority behind the outer caches. If
+    /// its response cache stayed enabled, a name whose moka entry expired could
+    /// still be answered from hickory's own entry — up to one full TTL window
+    /// (~240 s) stale — and its hits would bypass the thread memo the packet
+    /// paths rely on. Pin both the disabled cache and the retained TTL clamps.
+    #[test]
+    fn hickory_response_cache_is_disabled_and_ttls_stay_bounded() {
+        let mut opts = hickory_resolver::config::ResolverOpts::default();
+        configure_resolver_options(&mut opts);
+        assert_eq!(
+            opts.cache_size, 0,
+            "hickory's internal cache must be disabled; the outer moka caches are the only TTL authority"
+        );
+        assert_eq!(opts.positive_max_ttl, Some(DNS_CACHE_TTL));
+        assert_eq!(opts.negative_max_ttl, Some(DNS_NEG_TTL));
+    }
+
+    /// The slow-path semaphore must be created with exactly
+    /// [`DNS_SLOW_PATH_PERMITS`] permits: admission charges that count x
+    /// per-waiter bytes, so the two drifting apart would under-count the DNS
+    /// term (`config::tuning::dns_inflight_memory_bytes`).
+    #[test]
+    fn slow_path_limiter_has_the_charged_permit_count() {
+        assert_eq!(
+            dns_slow_path_limiter().available_permits(),
+            DNS_SLOW_PATH_PERMITS
+        );
     }
 
     #[test]

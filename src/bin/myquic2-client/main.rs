@@ -48,8 +48,7 @@ use crate::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -61,6 +60,43 @@ async fn main() -> Result<()> {
     let _ = coarse_millis();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
+    let main_workers = main_runtime_workers(&c);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(main_workers)
+        .enable_all()
+        .build()
+        .context("build client main runtime")?;
+    rt.block_on(client_main(c, main_workers))
+}
+
+/// Worker count for the process's multi-threaded main runtime.
+///
+/// The sharded topology (`MYQUIC2_SHARD_RUNTIME`, on by default) pins one
+/// current-thread runtime — and therefore one OS thread — per pool slot: 7 at
+/// the shipped defaults (4 TCP + 1 interactive UDP + 2 bulk shards). The main
+/// runtime is where every SOCKS accept, TCP relay pump and UDP association
+/// task runs, so Tokio's `#[tokio::main]` default (`available_parallelism`
+/// workers) would put `cores + slots` runnable threads on `cores` CPUs: under
+/// saturation each hot task then gets `cores / (cores + slots)` of a core, and
+/// each pinned receive/dispatch thread competes on its own core with a
+/// work-stealing worker the scheduler lands there. Sizing the workers to the
+/// cores the pinned slot threads leave over keeps
+/// `pinned_slots + workers <= cores` (with a floor of one worker: the runtime
+/// must exist). The shared-runtime topology has no pinned slot threads, so it
+/// keeps the full default width.
+fn main_runtime_workers(c: &ClientConf) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if !shard_runtime_enabled() {
+        return cores;
+    }
+    cores
+        .saturating_sub(
+            planned_slot_count(c.conn_count(), c.udp_split(), c.udp_egress_cnt()).min(cores),
+        )
+        .max(1)
+}
+
+async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {
         anyhow::bail!(
             "auth_token is {} B, over the {AUTH_TOKEN_MAX_BYTES} B wire cap (server only reads the first {AUTH_TOKEN_MAX_BYTES} B, so a longer token can never authenticate)",
@@ -91,14 +127,17 @@ async fn main() -> Result<()> {
     let quic_client = Arc::new(quic_client);
     let mut ccfg_interactive = quinn::ClientConfig::new(quic_client.clone());
     let congestion = Congestion::from_config(&c.congestion);
-    ccfg_interactive.transport_config(build_transport_tuned_class(
+    // Client-side builders: same tuning, but they advertise zero incoming
+    // stream credit (the server never opens a stream to us; see
+    // `build_client_transport_tuned` for the peer-pinnable-memory reason).
+    ccfg_interactive.transport_config(build_client_transport_tuned_class(
         congestion,
         c.keep_alive_secs,
         c.tuning(),
         false,
     ));
     let mut ccfg_bulk = quinn::ClientConfig::new(quic_client);
-    ccfg_bulk.transport_config(build_transport_tuned_class(
+    ccfg_bulk.transport_config(build_client_transport_tuned_class(
         congestion,
         c.keep_alive_secs,
         c.tuning(),
@@ -108,7 +147,8 @@ async fn main() -> Result<()> {
     let server_str_log = server_str.clone();
 
     // Clamped once, because everything timing-related derives from it: the
-    // transport's keepalive/idle timeout (inside `build_transport_tuned_class`),
+    // transport's keepalive/idle timeout (inside
+    // `build_client_transport_tuned_class`),
     // the reconnect loop's silence watchdog, and the pool's selection-time
     // path-health threshold. Clamping here keeps the three from disagreeing
     // about what "keepalive" means.
@@ -257,9 +297,11 @@ async fn main() -> Result<()> {
             }
         }
         info!(
-            "client runtime: {} sharded current-thread runtime(s), one pool slot each \
-             (Linux: pinned in priority order — interactive TCP, interactive UDP, then the \
-             rest — up to the core count; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)",
+            "client runtime: {} sharded current-thread runtime(s), one pool slot each, plus \
+             {main_workers} main-runtime worker(s) for SOCKS/TCP/UDP tasks \
+             (Linux: slots pinned in priority order — interactive TCP, interactive UDP, then the \
+             rest — up to the core count, and the worker count is sized to the cores they leave \
+             over; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)",
             pool.slots_total()
         );
         (Vec::new(), joins)

@@ -89,8 +89,27 @@ impl ConnSlot {
 
     /// Clear the rev2 state of the dead generation (connection-death path, in
     /// the same commit that clears `shared`).
-    pub(crate) fn clear_rev2(&self) {
-        self.rev2.store(None);
+    ///
+    /// Compare-and-clear on the generation identity, not a blind store: the
+    /// death commit can run from two writers (the reconnect loop and a SOCKS
+    /// `open_bi` failure), and either one may lose the race to a redial that
+    /// published a fresh generation. A blind `store(None)` would strip the
+    /// fresh connection's rev2 state and blackhole its UDP traffic until the
+    /// next redial; a failed compare means the caller already lost the
+    /// generation and must leave the slot alone. Returns whether this call
+    /// cleared it.
+    pub(crate) fn clear_rev2_if(&self, dead: &Arc<ConnRev2>) -> bool {
+        let mut cleared = false;
+        self.rev2.rcu(|cur| {
+            if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, dead)) {
+                cleared = true;
+                None
+            } else {
+                cleared = false;
+                cur.clone()
+            }
+        });
+        cleared
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -813,6 +832,11 @@ impl ConnPool {
 
     /// Pick the slot for a new TCP flow. Returning flows stick to their slot
     /// for life, so nothing oscillates.
+    ///
+    /// Test-only since the SOCKS dead-slot cleanup needs the *index* as well as
+    /// the slot (`pick_tcp_index` + `slot`); kept as the single definition of
+    /// "the slot a new flow would use" for the routing tests.
+    #[cfg(test)]
     pub(crate) fn pick_tcp(&self, t: &TargetAddr) -> ConnSlot {
         self.slot(self.pick_tcp_index(t))
     }
@@ -838,4 +862,74 @@ pub(crate) fn slot_uses_bulk_preset(pool: &ConnPool, i: usize) -> bool {
     // UDP range: with the split, index 0 is the interactive slot and every
     // shard after it is bulk; without it, the single shared slot is bulk.
     !pool.udp_split || i > pool.tcp_slots
+}
+
+/// Number of pool slots [`ConnPool::new_with_bulk_ports`] would build for a
+/// config with these clamped values, without allocating the slots.
+///
+/// `main` needs the slot count *before* the runtime exists: the sharded
+/// topology pins one current-thread runtime per slot, and the main runtime's
+/// worker count is sized to the cores those pinned threads leave over (see
+/// `main_runtime_workers`). Keeping the arithmetic in one function that mirrors
+/// `new_with_bulk_ports` is what stops the two from drifting — a worker count
+/// computed from a stale slot layout silently reintroduces the oversubscription
+/// the split exists to avoid.
+#[must_use]
+pub(crate) fn planned_slot_count(conns: usize, udp_split: bool, udp_egress: usize) -> usize {
+    let tcp = conns.clamp(1, MAX_POOL_CONNS);
+    let bulk_shards = if udp_split {
+        udp_egress.clamp(1, MAX_UDP_EGRESS_CONNS)
+    } else {
+        1
+    };
+    let udp_slots = if udp_split { 1 + bulk_shards } else { 1 };
+    tcp + udp_slots
+}
+
+#[cfg(test)]
+mod planned_slot_count_tests {
+    use super::*;
+
+    #[test]
+    fn planned_slots_match_the_built_pool() {
+        for (conns, split, egress) in [
+            (None, true, None),
+            (Some(1), true, Some(1)),
+            (Some(16), true, Some(8)),
+            (Some(3), false, Some(8)),
+            (Some(0), true, Some(0)),
+            (Some(99), true, Some(99)),
+        ] {
+            let conns = conns.unwrap_or(crate::DEFAULT_QUIC_CONNS);
+            let egress = egress.unwrap_or(crate::DEFAULT_UDP_EGRESS_CONNS);
+            let pool = ConnPool::new_with_bulk_ports(
+                conns,
+                Vec::new(),
+                Vec::new(),
+                true,
+                split,
+                egress,
+                1,
+            );
+            assert_eq!(
+                planned_slot_count(conns, split, egress),
+                pool.slots_total(),
+                "config ({conns:?}, split={split}, egress={egress:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_build_seven_slots() {
+        // 4 TCP + interactive UDP + 2 bulk shards = 7 pinned runtimes at the
+        // shipped defaults; the main runtime is sized against this number.
+        assert_eq!(
+            planned_slot_count(
+                crate::DEFAULT_QUIC_CONNS,
+                true,
+                crate::DEFAULT_UDP_EGRESS_CONNS,
+            ),
+            7
+        );
+    }
 }

@@ -1689,6 +1689,11 @@ async fn client_rev2_inline_fallback_when_registry_full() {
         up.flows.is_empty(),
         "the fallback must not half-bind a flow"
     );
+    assert_eq!(
+        rev2.ids.allocated(),
+        0,
+        "the INLINE fail-safe must not consume a never-reused wire id"
+    );
     drain_now(&rev2, &client_conn, limit);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
@@ -3792,6 +3797,137 @@ async fn open_bi_failure_path_never_kills_a_fresh_connection() {
     assert!(
         slot.is_live(),
         "a stale teardown must never mark the fresh connection dead"
+    );
+}
+
+/// The `open_bi` failure path and the reconnect loop must share one death
+/// commit: besides clearing the slot it releases the dead generation's cached
+/// egress handles, its rev2 flow registry and its staged payloads, then bumps
+/// the generation. A connection death first noticed by a SOCKS flow used to
+/// leave all of that behind until the loop's watchdog fired.
+#[tokio::test]
+async fn retire_dead_slot_clears_egress_rev2_and_stage_once() {
+    let (conn, _client, _server) = real_connection().await;
+    let egress = SharedEgress::default();
+    let slot = ConnSlot::fresh();
+    let idx = 0usize;
+    let rev2 = ConnRev2::with_stager_capacity(4, 4096);
+    slot.set_rev2(rev2.clone());
+    slot.publish(&conn);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // The dead generation's state that must be released with it: one flow, one
+    // queued payload and this slot's cached egress handle.
+    let wire_id = r2::make_wire_id(1, false).unwrap();
+    let binding = FlowBinding::new_shared(
+        wire_id,
+        7,
+        TargetAddr::Ip("198.51.100.9:4242".parse().unwrap()),
+    );
+    assert!(rev2.registry.insert(binding).is_ok());
+    assert!(
+        rev2.push_stage(R2StageItem {
+            session: 7,
+            kind: R2StageKind::Steady { wire_id },
+            payload: bytes::Bytes::from_static(b"queued"),
+        })
+        .is_ok()
+    );
+    egress.cached[0].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: mono_millis(),
+        slot: idx,
+        rev2: rev2.clone(),
+    })));
+    let gen_before = *slot.gen_rx.borrow();
+
+    conn.close(0u32.into(), b"open_bi failed");
+    assert!(
+        retire_dead_slot(&slot, idx, &egress, &conn),
+        "the death commit is won by the first writer"
+    );
+    assert!(
+        slot.shared.load().as_ref().is_none(),
+        "the dead connection is retracted"
+    );
+    assert!(!slot.is_live());
+    assert!(
+        slot.rev2().is_none(),
+        "the generation's rev2 state is cleared"
+    );
+    assert!(
+        rev2.registry.is_empty(),
+        "its connection-scoped flow registry is dropped"
+    );
+    assert_eq!(rev2.stage_len(), 0, "its staged payloads are cleared");
+    assert!(
+        egress.cached[0].load().is_none(),
+        "its cached egress handles are released"
+    );
+    assert_eq!(
+        *slot.gen_rx.borrow(),
+        gen_before.wrapping_add(1),
+        "waiters and dispatchers are woken exactly once"
+    );
+
+    // A losing writer (the reconnect loop racing the same death) must not
+    // release anything twice or bump the generation again.
+    assert!(!retire_dead_slot(&slot, idx, &egress, &conn));
+    assert_eq!(*slot.gen_rx.borrow(), gen_before.wrapping_add(1));
+}
+
+/// A stale death report — an `open_bi` failure on a handle the pool has since
+/// replaced — must never clean the fresh generation's rev2/egress state.
+#[tokio::test]
+async fn retire_dead_slot_leaves_a_fresh_generation_untouched() {
+    let (dead, _c1, _s1) = real_connection().await;
+    let (fresh, _c2, _s2) = real_connection().await;
+    assert_ne!(dead.stable_id(), fresh.stable_id());
+    let egress = SharedEgress::default();
+    let slot = ConnSlot::fresh();
+    let dead_state = ConnRev2::new();
+    let fresh_state = ConnRev2::new();
+    slot.set_rev2(dead_state);
+    slot.publish(&dead);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A redial already published the next generation while the old SOCKS flow
+    // was still failing its `open_bi`.
+    slot.set_rev2(fresh_state.clone());
+    slot.publish(&fresh);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    egress.cached[0].store(Some(Arc::new(EgressCache {
+        conn: fresh.clone(),
+        limit: 1200,
+        stamp_ms: mono_millis(),
+        slot: 0,
+        rev2: fresh_state.clone(),
+    })));
+    let gen_before = *slot.gen_rx.borrow();
+
+    assert!(
+        !retire_dead_slot(&slot, 0, &egress, &dead),
+        "the stale death loses the clear to the published generation"
+    );
+    assert!(
+        slot.shared
+            .load()
+            .as_ref()
+            .is_some_and(|c| c.stable_id() == fresh.stable_id())
+    );
+    assert!(slot.is_live(), "the fresh connection stays usable");
+    assert!(
+        slot.rev2().is_some_and(|s| s.epoch == fresh_state.epoch),
+        "the fresh generation's rev2 state is untouched"
+    );
+    assert!(
+        egress.cached[0].load().is_some(),
+        "the fresh generation's egress handles are untouched"
+    );
+    assert_eq!(
+        *slot.gen_rx.borrow(),
+        gen_before,
+        "no wake-up for a death that changed nothing"
     );
 }
 

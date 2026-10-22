@@ -2,7 +2,7 @@
 use super::*;
 use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{
-    FlowBinding, FlowState, R2_MAX_RESOLVED_ADDRS, SessionFlows, SourceMatch,
+    FlowBinding, FlowState, R2_MAX_RESOLVED_ADDRS, RegistryError, SessionFlows, SourceMatch,
 };
 use myquic2::udp::{R2Fragmenter, R2Reassembler, R2StageItem, R2StageKind, R2Stager};
 
@@ -208,6 +208,7 @@ fn sess_with_sock(addr: Option<SocketAddr>, sock: Arc<tokio::net::UdpSocket>) ->
     ss.shard(7).write().insert(
         7,
         SessEntry {
+            sess: 7,
             sock,
             reader: h,
             last,
@@ -732,9 +733,13 @@ fn live_reader() -> tokio::task::AbortHandle {
     abort
 }
 
-/// One over-cap session in a scratch shard, stamped `idle_ms` ago.
-fn capped_session(idle_ms: u64) -> SessEntry {
+/// One over-cap session in a scratch shard, stamped `idle_ms` ago and filed
+/// under `sess` (the entry now carries its own id for the reap-path
+/// `SESS_CLOSE` notification; the fixtures only read it back through the
+/// table, so callers pass the key they insert under).
+fn capped_session(sess: u32, idle_ms: u64) -> SessEntry {
     SessEntry {
+        sess,
         sock: memo_sock(),
         reader: tokio::spawn(std::future::pending::<()>()),
         last: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -793,7 +798,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     // upgrade, so the table entry must be the socket's live owner.
     let mut socks = Vec::new();
     for s in [s1, s2] {
-        let entry = capped_session(0);
+        let entry = capped_session(s, 0);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
@@ -878,7 +883,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         "the fixture must share a home slot"
     );
     {
-        let entry = capped_session(0);
+        let entry = capped_session(colliding, 0);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
@@ -935,7 +940,7 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
 
     let mut socks = Vec::new();
     for s in [s1, s2, s3] {
-        let entry = capped_session(0);
+        let entry = capped_session(s, 0);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
@@ -1005,7 +1010,7 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     let mut overflow = Vec::new();
     for i in 0..(FAST_SESS_SLOTS as u32 + 1) {
         let s = 5000 + i;
-        let entry = capped_session(0);
+        let entry = capped_session(s, 0);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
@@ -1425,7 +1430,7 @@ async fn the_fair_share_gate_counts_inserts_since_the_sample() {
 
     // One connection's burst of new sessions, all inside the sample window.
     for s in 0..8u32 {
-        ss.shard(s).write().insert(s, capped_session(0));
+        ss.shard(s).write().insert(s, capped_session(s, 0));
         ss.note_insert();
         ss.note_live_insert();
     }
@@ -1447,7 +1452,7 @@ async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
     let ss = ShardedSessTable::new(ReplyFilter::Restricted);
     let now = mono_millis();
     assert_eq!(ss.len_upper_bound(now), 0);
-    ss.shard(7).write().insert(7, capped_session(0));
+    ss.shard(7).write().insert(7, capped_session(7, 0));
     ss.note_live_insert();
     ss.shard(7).write().remove(&7);
     ss.note_live_remove(1);
@@ -1456,7 +1461,7 @@ async fn stillborn_insert_leaves_the_fair_share_bound_unchanged() {
         0,
         "a rolled-back insert must not inflate the fair-share bound"
     );
-    ss.shard(7).write().insert(7, capped_session(0));
+    ss.shard(7).write().insert(7, capped_session(7, 0));
     ss.note_insert();
     ss.note_live_insert();
     assert_eq!(ss.len_upper_bound(now), 1);
@@ -1475,7 +1480,7 @@ async fn sweep_local_reaps_all_expired_in_one_call() {
     let now: u64 = 3_000_000;
     let mut m: SessMap = SessMap::default();
     for k in 0..70u32 {
-        m.insert(k, capped_session(1));
+        m.insert(k, capped_session(k, 1));
         m.get(&k).unwrap().last.store(0, Ordering::Relaxed);
     }
     // The scan as `sweep_local` performs it: every session reads idle.
@@ -1506,7 +1511,7 @@ async fn sweep_local_rechecks_idle_before_removing() {
     use std::sync::atomic::Ordering;
 
     let mut m: SessMap = SessMap::default();
-    m.insert(1, capped_session(1));
+    m.insert(1, capped_session(1, 1));
     let last = m.get(&1).unwrap().last.clone();
     // A sweep that starts well past the session's idle deadline.
     let now: u64 = 1_000_000;
@@ -1582,7 +1587,7 @@ async fn touch_stores_mono_millis_not_the_coarse_gate() {
     // can never be 180 s old and no wall-clock stamp reads expired.
     let now: u64 = 1_000_000;
     let mut m: SessMap = SessMap::default();
-    m.insert(1, capped_session(1));
+    m.insert(1, capped_session(1, 1));
     m.get(&1)
         .unwrap()
         .last
@@ -1765,8 +1770,9 @@ fn fair_shard_trigger_fires_below_the_static_shard_cap() {
 }
 
 /// The admission cap must be a real memory bound: raising the transport
-/// windows has to admit fewer connections, the process-wide fixed term (UDP
-/// session pool + ingress endpoint buffers + relay pump buffers) has to be
+/// windows has to admit fewer connections, the process-wide fixed terms (UDP
+/// session pool + ingress endpoint buffers + relay pump buffers + retry pool +
+/// DNS waiters + worker scratch + quinn stream-reassembly metadata) have to be
 /// charged against the budget exactly once (none of it is per connection), a
 /// budget too small for one connection still admits one (so the endpoint is
 /// diagnosable), and no configuration may exceed the hard connection cap.
@@ -1786,8 +1792,9 @@ fn admission_cap_bounds_connections_by_memory() {
             + 2 * FRAG_MAX_HELD_BYTES as u64
             + stager
             + myquic2::config::tuning::R2_INGRESS_FIXED_BYTES
-            + registry,
-        "4/8/4 MB windows + 2 x 1 MB packets + both reassembly budgets + rev2 stager/ingress/flow registry"
+            + registry
+            + myquic2::pre_auth_stream_memory_bytes(),
+        "4/8/4 MB windows + 2 x 1 MB packets + both reassembly budgets + rev2 stager/ingress/flow registry + the pre-auth stream-assembler credit"
     );
     let per_session = per_session_memory_bytes();
     // Linux stores and reports SO_RCVBUF/SO_SNDBUF at 2x the requested value,
@@ -1802,8 +1809,10 @@ fn admission_cap_bounds_connections_by_memory() {
     };
     assert_eq!(
         per_session,
-        (socket_terms + UDP_RECV_MAX + UDP_RECV_SLACK + MQP3_FLOW_TABLE_MAX_BYTES) as u64,
-        "a session's kernel caps (doubled on Linux), its reader buffer, and its MQP-3 flow table"
+        (socket_terms + UDP_RECV_MAX + UDP_RECV_SLACK + MQP3_FLOW_TABLE_MAX_BYTES) as u64
+            + myquic2::R2_SESSION_TABLES_BYTES,
+        "a session's kernel caps (doubled on Linux), its reader buffer, its MQP-3 flow table \
+         (domain-target worst case) and its rev2 copy-on-write table snapshots"
     );
     let pool = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
     assert_eq!(pool, MAX_SESSIONS_GLOBAL as u64 * per_session);
@@ -1813,12 +1822,20 @@ fn admission_cap_bounds_connections_by_memory() {
     );
     // The fixed term (charged once, before connections are divided out) is not
     // just the session pool any more: every QUIC ingress endpoint pins a
-    // resident userspace receive buffer plus its socket caps, and the whole
+    // resident userspace receive buffer plus its socket caps, the whole
     // process-wide stream-task pool can hold two 16 KiB relay-pump buffers per
-    // flow. Neither scales with the admitted-connection count, so both belong
-    // here — without them `max_peer_memory_mb` understated the pinnable memory.
+    // flow, the UDP retry pool and DNS waiters are peer-driven process-wide
+    // pools, worker threads hold burst/session scratch, and quinn's per-stream
+    // reassembly can hold up to MAX_CHUNKS gap spans for every header-parked
+    // stream. None of it scales with the admitted-connection count, so all of
+    // it belongs here — without the last terms `max_peer_memory_mb` understated
+    // the pinnable memory by hundreds of MiB.
     let endpoint = endpoint_memory_bytes(1);
     let pump = stream_pump_memory_bytes(MAX_STREAM_TASKS);
+    let retry = retry_pool_memory_bytes();
+    let dns = dns_inflight_memory_bytes();
+    let scratch = worker_scratch_bytes(1);
+    let assembler = stream_assembler_memory_bytes(HEADER_TASK_CREDIT);
     assert!(
         endpoint >= 8 * 1024 * 1024,
         "one endpoint must charge its resident receive buffer + socket caps (got {endpoint} B)"
@@ -1829,7 +1846,14 @@ fn admission_cap_bounds_connections_by_memory() {
         "two COPY_CHUNK (16 KiB) buffers per concurrent relay flow"
     );
     assert!(pump > 256 * 1024 * 1024, "pump term must be a real bound");
-    let fixed = pool + endpoint + pump;
+    assert!(retry > 32 * 1024 * 1024, "retry pool must be a real term");
+    assert!(dns > 8 * 1024 * 1024, "DNS waiter term must be a real term");
+    assert_eq!(assembler, HEADER_TASK_CREDIT as u64 * 1024 * 96);
+    assert!(
+        assembler > 256 * 1024 * 1024,
+        "parked stream-assembly metadata is the largest process-wide fixed term"
+    );
+    let fixed = pool + endpoint + pump + retry + dns + scratch + assembler;
     assert!(fixed > pool, "endpoint + pump terms are charged on top");
 
     // No budget: the count cap stands, clamped to the hard cap.
@@ -1849,12 +1873,15 @@ fn admission_cap_bounds_connections_by_memory() {
     );
     // The rev2 data-plane ceilings (stager, ingress state and the 4096-flow
     // registry) add ~4.5 MiB per connection on top of the transport and
-    // reassembly terms. Linux also charges the doubled session socket caps, so
-    // a 4 GiB budget now admits ~74 connections instead of the pre-rev2 ~99.
-    // Keep a floor that still catches a runaway fixed term without treating the
-    // documented admission ceiling as a regression.
+    // reassembly terms, and the process-wide fixed terms now also include the
+    // retry pool, DNS waiters, worker scratch and quinn's parked-stream
+    // reassembly metadata (~430 MiB). Linux charges the doubled session socket
+    // caps too, so a 4 GiB budget admits roughly 43 connections there (~98 on
+    // macOS, which does not double the caps). Keep a floor that still catches a
+    // runaway fixed term without treating the documented admission ceiling as a
+    // regression.
     assert!(
-        expected >= 64,
+        expected >= 32,
         "a 4 GiB budget must still admit a useful pool (got {expected})"
     );
     // Charging the fixed term is the whole point: without it the same budget
@@ -2133,12 +2160,16 @@ async fn header_wait_holds_no_stream_task_permit() {
         .clone()
         .try_acquire_owned()
         .expect("header credit");
+    let header_share = Arc::new(tokio::sync::Semaphore::new(HEADER_CREDIT_PER_CONN))
+        .try_acquire_owned()
+        .expect("per-connection header share");
     let t0 = std::time::Instant::now();
     // The header never completes: the 5 s budget must elapse first.
     handle_tcp_stream(
         srv_send,
         srv_recv,
         header_credit,
+        header_share,
         streams_held.clone(),
         MAX_STREAM_TASKS,
         1,
@@ -2194,11 +2225,15 @@ async fn admission_after_header_still_fails_fast() {
         .clone()
         .try_acquire_owned()
         .expect("header credit");
+    let header_share = Arc::new(tokio::sync::Semaphore::new(HEADER_CREDIT_PER_CONN))
+        .try_acquire_owned()
+        .expect("per-connection header share");
     let t0 = std::time::Instant::now();
     handle_tcp_stream(
         srv_send,
         srv_recv,
         header_credit,
+        header_share,
         streams_held.clone(),
         MAX_STREAM_TASKS,
         1,
@@ -2348,7 +2383,7 @@ async fn header_credit_bounds_header_tasks_and_is_returned() {
 async fn a_live_over_share_shard_loses_nothing_to_the_sweep() {
     let mut m: SessMap = SessMap::default();
     for k in 0..512u32 {
-        m.insert(k, capped_session(5));
+        m.insert(k, capped_session(k, 5));
     }
     assert!(
         shard_over_share(512, 256),
@@ -2600,7 +2635,7 @@ async fn session_churn_holds_caps_without_leaking() {
     let permits_before = session_limiter().available_permits();
     let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     for s in 1..=N as u32 {
-        ss.shard(s).write().insert(s, capped_session(0));
+        ss.shard(s).write().insert(s, capped_session(s, 0));
         ss.note_insert();
         ss.note_live_insert();
     }
@@ -3358,6 +3393,193 @@ fn pending_domain_opens_coalesce_cap_and_release() {
         matches!(state.begin_pending_open(1, 9999), PendingOpen::Started(_)),
         "releasing the in-flight guards must make room again"
     );
+}
+
+/// `SESS_CLOSE` cancels exactly the in-flight domain OPENs of its own session,
+/// and it *flags* them rather than removing the coalescing key: a retransmitted
+/// OPEN in the same window must coalesce onto the task that is about to notice
+/// the flag and stop, never spawn a second resolver.
+#[test]
+fn sess_close_cancels_only_its_sessions_in_flight_opens() {
+    let state = R2ConnState::new();
+    let ours = match state.begin_pending_open(7, 9) {
+        PendingOpen::Started(g) => g,
+        _ => panic!("the first OPEN must start a lookup"),
+    };
+    let other = match state.begin_pending_open(8, 9) {
+        PendingOpen::Started(g) => g,
+        _ => panic!("a different session is a different lookup"),
+    };
+    assert!(!ours.is_cancelled());
+    assert!(!other.is_cancelled());
+
+    state.cancel_pending_opens_for_session(7);
+    assert!(
+        ours.is_cancelled(),
+        "the closed session's in-flight OPEN must be cancelled"
+    );
+    assert!(
+        !other.is_cancelled(),
+        "another session's in-flight OPEN must be left alone"
+    );
+    assert!(
+        matches!(state.begin_pending_open(7, 9), PendingOpen::Duplicate),
+        "a flagged entry still coalesces (it is removed by its RAII guard)"
+    );
+
+    drop(ours);
+    assert!(
+        matches!(state.begin_pending_open(7, 9), PendingOpen::Started(_)),
+        "the guard's drop releases the key again"
+    );
+    drop(other);
+}
+
+/// A cancelled in-flight domain OPEN must not publish a session.
+///
+/// This is the write-critical-section half of the D1 fix: the creation path
+/// re-reads the flag immediately before inserting the entry, aborts the reader
+/// it just spawned and returns the global session permit with the abandoned
+/// insert. The caller (`r2_forward_domain_open_bg`) then gets `None` and rejects
+/// instead of ACKing/binding a closed association, whose `take_session` may
+/// have completed before the DNS answer arrived.
+#[tokio::test]
+async fn cancelled_in_flight_domain_open_does_not_publish_a_session() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let conn_id = next_conn_id();
+    let permits_before = session_limiter().available_permits();
+    assert!(permits_before > 0, "premise: the session pool has a slot");
+
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let sock =
+        get_or_create_sess_guarded(&ss, &server_conn, conn_id, 42, None, None, Some(&cancelled))
+            .await;
+    assert!(
+        sock.is_none(),
+        "a cancelled creation must not hand out a socket"
+    );
+    assert_eq!(ss.len(), 0, "no session may be published");
+    assert!(
+        ss.shard(42).read().get(&42).is_none(),
+        "the cancelled session id must not appear in its shard"
+    );
+    // The global permit must be back: the abandoned insert returns it, so a peer
+    // cannot pin the session pool with domain OPENs that were closed mid-DNS.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session_limiter().available_permits() < permits_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the aborted creation must return its session permit"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// `r2_install` publishes into **both** tables, is idempotent for a duplicate
+/// OPEN of the same `(session, target)`, and refuses a new id once the session's
+/// 64-entry reverse table is full without leaving a forward-registry entry
+/// behind (the D2 invariant: the reverse-table publish is what makes a binding
+/// reachable from every cleanup path, so it must never be half-installed; the
+/// concurrent `rcu`-full half of that rollback is not deterministically
+/// reachable from a unit test, the pre-check half is asserted here).
+#[tokio::test]
+async fn r2_install_publishes_both_tables_and_refuses_a_full_reverse_table() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    insert_test_session(&ss, 7);
+    let state = R2ConnState::new();
+    let target = TargetAddr::Ip("93.184.216.34:53".parse().unwrap());
+    let first_id = r2::make_wire_id(1, false).unwrap();
+
+    let binding = r2_install(&state, &ss, 7, first_id, target.clone(), Vec::new())
+        .expect("the first install must publish");
+    assert!(
+        state.registry.get(first_id).is_some(),
+        "the forward registry must hold the binding"
+    );
+    let reverse = session_r2_flows(&ss, 7).expect("the fixture session is live");
+    assert!(
+        reverse.load().find_id(first_id).is_some(),
+        "the session's reverse table must hold the binding"
+    );
+
+    // A duplicate OPEN for the same `(session, target)` re-installs idempotently
+    // and hands back the same binding (the caller re-ACKs it).
+    let again = r2_install(&state, &ss, 7, first_id, target.clone(), Vec::new())
+        .expect("a duplicate OPEN is idempotent");
+    assert!(Arc::ptr_eq(&binding, &again));
+
+    // The same id bound to a *different* target is the protocol-violation path.
+    assert!(matches!(
+        r2_install(
+            &state,
+            &ss,
+            7,
+            first_id,
+            TargetAddr::Ip("1.1.1.1:53".parse().unwrap()),
+            Vec::new()
+        ),
+        Err(RegistryError::Conflict)
+    ));
+
+    // Fill the session's reverse table to its cap (64 ids total).
+    for local in 2..=(myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_SESSION as u32) {
+        let id = r2::make_wire_id(local, false).expect("wire id");
+        r2_install(&state, &ss, 7, id, target.clone(), Vec::new()).expect("fill install");
+    }
+    assert!(
+        reverse.load().is_full(),
+        "premise: the reverse table reached its 64-entry cap"
+    );
+    // A new id is refused *before* the registry insert (no leaked forward entry).
+    let new_id = r2::make_wire_id(9999, false).expect("wire id");
+    assert!(matches!(
+        r2_install(&state, &ss, 7, new_id, target.clone(), Vec::new()),
+        Err(RegistryError::Full)
+    ));
+    assert!(
+        state.registry.get(new_id).is_none(),
+        "a full reverse table must not leak a forward-registry entry"
+    );
+    // An existing id still reinstalls (the pre-check exempts it), so a duplicate
+    // OPEN after the table filled is not wrongly rejected.
+    assert!(
+        r2_install(&state, &ss, 7, first_id, target, Vec::new()).is_ok(),
+        "a duplicate OPEN is exempt from the full-table refusal"
+    );
+}
+
+/// The server's reap notification is a `SESS_CLOSE` sent three times
+/// best-effort (the client's own association exit uses the same repeat), so one
+/// lost CTL datagram does not leave the client sending into a session the
+/// server has already reaped.
+#[tokio::test]
+async fn r2_send_sess_close_sends_three_idempotent_frames() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    r2_send_sess_close(&server_conn, 42);
+    for i in 0..3 {
+        let d = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+            .await
+            .unwrap_or_else(|_| panic!("SESS_CLOSE repeat {i} must arrive"))
+            .expect("datagram read");
+        assert_eq!(
+            r2::decode_ctl(&d).expect("SESS_CLOSE must decode"),
+            r2::Ctl::SessClose {
+                sess: 42,
+                reason: 0
+            }
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), client_conn.read_datagram())
+            .await
+            .is_err(),
+        "exactly three repeats, not an unbounded stream"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
 }
 
 /// The domain-flow address set is SSRF-filtered first and then capped: a
@@ -4887,6 +5109,7 @@ fn insert_test_session(ss: &SessTable, sess: u32) {
     ss.shard(sess).write().insert(
         sess,
         SessEntry {
+            sess,
             sock: memo_sock(),
             reader: h,
             last: Arc::new(std::sync::atomic::AtomicU64::new(mono_millis())),
@@ -5479,6 +5702,83 @@ async fn rev2_sess_close_reaps_bindings_on_the_live_path() {
         .unwrap();
     assert_eq!(&buf[..n], b"reopen");
     rev2_expect_ack(&client, id).await;
+
+    rev2_teardown(client, task, holders_before).await;
+}
+
+/// `FLOW_CLOSE` removes the binding, and a repeated close for the same id is a
+/// counted stale no-op that must not pay the stager/reassembler purge (the D3
+/// change removes the binding first and only then runs the scoped cleanup).
+/// Observable contract pinned here: the first close is counted as
+/// `FLOW_CLOSES`, later ones as `STALE_CLOSES`, and a steady frame for the
+/// closed id fails lookup either way.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_flow_close_removes_once_and_repeats_are_stale_noops() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(Ordering::Relaxed);
+    let (client, task) = rev2_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let mut buf = [0u8; 64];
+
+    rev2_handshake(&client).await;
+    let id = r2::make_wire_id(1, false).unwrap();
+    client
+        .send_datagram(r2_open_frame(id, 1, &TargetAddr::Ip(dst), b"open"))
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("open payload")
+        .unwrap();
+    rev2_expect_ack(&client, id).await;
+
+    let closes_before = r2_count(&r2_stats::FLOW_CLOSES);
+    client
+        .send_datagram(r2::encode_ctl(&r2::Ctl::FlowClose { id }))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while r2_count(&r2_stats::FLOW_CLOSES) == closes_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "FLOW_CLOSE must be processed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The binding is gone: a steady frame for it must fail lookup and never
+    // reach the target again.
+    let unknown_before = r2_count(&r2_stats::UNKNOWN_ID);
+    client.send_datagram(r2_steady_frame(id, b"late")).unwrap();
+    assert_eq!(
+        rev2_recv_timeout(&target, &mut buf, Duration::from_millis(300)).await,
+        None,
+        "a closed flow must never route again"
+    );
+    assert!(r2_count(&r2_stats::UNKNOWN_ID) > unknown_before);
+
+    // A retransmitted close is idempotent: `STALE_CLOSES` moves, `FLOW_CLOSES`
+    // does not (the scoped purge is skipped because no binding was removed).
+    let stale_before = r2_count(&r2_stats::STALE_CLOSES);
+    let flow_closes_after_first = r2_count(&r2_stats::FLOW_CLOSES);
+    client
+        .send_datagram(r2::encode_ctl(&r2::Ctl::FlowClose { id }))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while r2_count(&r2_stats::STALE_CLOSES) == stale_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a repeated FLOW_CLOSE must be counted stale"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        r2_count(&r2_stats::FLOW_CLOSES),
+        flow_closes_after_first,
+        "a repeated close must not be counted as another removal"
+    );
 
     rev2_teardown(client, task, holders_before).await;
 }

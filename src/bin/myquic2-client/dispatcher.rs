@@ -852,31 +852,36 @@ pub(crate) fn handle_r2_ctl(rev2: &ConnRev2, r2_reasm: &mut R2Reassembler, d: &[
             }
             None => counters::rx_unknown_id(),
         },
-        r2::Ctl::FlowReject { id, .. } => {
-            let _ = r2_reasm.drop_flow(id);
-            match rev2.registry.remove(id) {
-                Some(binding) => {
-                    binding.mark_closed();
-                    // The uplink falls back to `INLINE` for this target until the
-                    // TTL expires (spec §3.4) instead of re-opening on every
-                    // payload; the binding's target is the key the uplink looks up.
-                    rev2.note_rejected(binding.target.clone(), mono_millis());
-                    counters::flow_reject_rx();
-                }
-                None => counters::rx_unknown_id(),
+        r2::Ctl::FlowReject { id, .. } => match rev2.registry.remove(id) {
+            Some(binding) => {
+                // Known flow: only now is the per-id cleanup worth its scan.
+                let _ = r2_reasm.drop_flow(id);
+                let _ = rev2.stager.lock().drop_flow_scoped(binding.session, id);
+                binding.mark_closed();
+                // The uplink falls back to `INLINE` for this target until the
+                // TTL expires (spec §3.4) instead of re-opening on every
+                // payload; the binding's target is the key the uplink looks up.
+                rev2.note_rejected(binding.target.clone(), mono_millis());
+                counters::flow_reject_rx();
             }
-        }
-        r2::Ctl::FlowClose { id } => {
-            let _ = r2_reasm.drop_flow(id);
-            let _ = rev2.stager.lock().drop_flow(id);
-            match rev2.registry.remove(id) {
-                Some(binding) => {
-                    binding.mark_closed();
-                    counters::flow_close_rx();
-                }
-                None => counters::rx_unknown_id(),
+            // Duplicate/unknown reject: no queued state can exist for an id
+            // this side never installed, so the scans are skipped entirely.
+            None => counters::rx_unknown_id(),
+        },
+        r2::Ctl::FlowClose { id } => match rev2.registry.remove(id) {
+            Some(binding) => {
+                // Known flow: purge its queued stager items and in-flight
+                // reassembly now. The stager scan is scoped to the owning
+                // session, so this stays O(one queue) instead of O(all queues).
+                let _ = r2_reasm.drop_flow(id);
+                let _ = rev2.stager.lock().drop_flow_scoped(binding.session, id);
+                binding.mark_closed();
+                counters::flow_close_rx();
             }
-        }
+            // Duplicate/unknown close (legal and idempotent on the wire): no
+            // scan on the peer-controlled frame path.
+            None => counters::rx_unknown_id(),
+        },
         // The client keeps the association alive; the notification only makes
         // the next uplink burst re-open its flows on the (re)created session.
         // Bounded inside `ConnRev2`, so a hostile peer cannot grow it.

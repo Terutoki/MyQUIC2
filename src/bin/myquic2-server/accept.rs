@@ -126,6 +126,30 @@ pub(crate) fn header_task_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     LIM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(HEADER_TASK_CREDIT)))
 }
 
+/// Per-connection cap on concurrently parked TCP header reads.
+///
+/// [`HEADER_TASK_CREDIT`] is a **process-wide** bound: it says how many
+/// 5 s header reads this host will park in total, not how many one peer may
+/// take. Without a per-connection limit a single admitted peer opens its
+/// transport allowance of bidi streams (`MAX_BIDI_STREAMS_PER_CONN` = 8192),
+/// parks every header task the process can afford, and every other client's
+/// CONNECT is reset `0x05` until the trickle finishes. Each parked stream can
+/// also pin quinn-proto's reassembly gap chunks (`MAX_CHUNKS` = 1024), so the
+/// bytes behind one header credit are per-stream rather than per-permit — the
+/// global credit alone therefore bounds *tasks*, not one connection's share of
+/// them. The process-wide bound (and its admission charge in `main.rs`) stays
+/// [`HEADER_TASK_CREDIT`]; this constant is only the fair slice one connection
+/// may hold. It is deliberately a large slice: real clients keep only a
+/// handful of first-RTT header reads in flight, so this only bites a flood.
+pub(crate) const HEADER_CREDIT_PER_CONN: usize = 256;
+
+/// Per-connection parked-header refusals (the [`HEADER_CREDIT_PER_CONN`]
+/// share). Split from [`HEADER_TASK_REFUSED`] so "one peer took more than its
+/// slice" is distinguishable from "the host is out of header credit" in the
+/// logs: the first is a peer-behaviour signal, the second a capacity signal.
+pub(crate) static HEADER_SHARE_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Rate-limited (one line per second, with a suppressed count) warning for an
 /// exhausted [`HEADER_TASK_CREDIT`].
 ///
@@ -919,7 +943,17 @@ pub(crate) struct R2ConnState {
     /// spawned task, keyed by `(session, wire_id)`. Repeated OPENs for the same
     /// id are coalesced onto the in-flight lookup instead of spawning a second
     /// resolver; see [`R2ConnState::begin_pending_open`].
-    pending_dns_opens: parking_lot::Mutex<std::collections::HashSet<(u32, u32)>>,
+    ///
+    /// The value is the entry's cancellation flag. A `CTL SESS_CLOSE` for the
+    /// session sets it (`cancel_pending_opens_for_session`), and the lookup task
+    /// checks it when it is about to create the session, so a DNS answer that
+    /// lands after the client closed the association cannot resurrect a
+    /// session (and a wire binding) the close already reaped. The map stays
+    /// bounded by [`MAX_PENDING_DNS_OPENS`]; a flag's lifetime is owned by the
+    /// task's RAII guard, exactly like the coalescing key.
+    pending_dns_opens: parking_lot::Mutex<
+        std::collections::HashMap<(u32, u32), Arc<std::sync::atomic::AtomicBool>>,
+    >,
 }
 
 /// Bounds for [`R2ConnState::pre_hello`]: only the first optimistic frames
@@ -937,9 +971,34 @@ pub(crate) const MAX_PENDING_DNS_OPENS: usize = 16;
 /// RAII entry for one in-flight domain OPEN: removes the `(session, id)`
 /// coalescing key when the lookup task exits, on every path (success, refusal,
 /// timeout, cancellation).
+///
+/// The entry also owns the task's cancellation flag: a `CTL SESS_CLOSE` for
+/// the session sets it while the lookup is in flight, and the task checks it
+/// before publishing the session. The key is removed only here, so a duplicate
+/// OPEN that races the cancel still coalesces (it must not spawn a second
+/// resolver while the first is draining).
 pub(crate) struct PendingDnsOpen {
     state: Arc<R2ConnState>,
     key: (u32, u32),
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PendingDnsOpen {
+    /// Whether the session this OPEN belongs to was closed while the lookup
+    /// was in flight. Relaxed is sound for the same reason it is on the
+    /// reader-side close flag: the flag only selects "abandon now" vs "the
+    /// normal path", and the normal path's session-table write lock provides
+    /// the ordering against `take_session` (see
+    /// [`R2ConnState::cancel_pending_opens_for_session`]).
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The flag as a borrow, for the guarded session creation
+    /// ([`get_or_create_sess_guarded`]).
+    pub(crate) fn cancelled_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.cancelled
+    }
 }
 
 impl Drop for PendingDnsOpen {
@@ -969,7 +1028,7 @@ impl R2ConnState {
             stage: Arc::new(parking_lot::Mutex::new(R2Stager::new())),
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
             pre_hello: parking_lot::Mutex::new((Vec::new(), 0)),
-            pending_dns_opens: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            pending_dns_opens: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -979,17 +1038,52 @@ impl R2ConnState {
     pub(crate) fn begin_pending_open(self: &Arc<Self>, sess: u32, id: u32) -> PendingOpen {
         let key = (sess, id);
         let mut set = self.pending_dns_opens.lock();
-        if set.contains(&key) {
+        if set.contains_key(&key) {
             return PendingOpen::Duplicate;
         }
         if set.len() >= MAX_PENDING_DNS_OPENS {
             return PendingOpen::Full;
         }
-        set.insert(key);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        set.insert(key, Arc::clone(&cancelled));
         PendingOpen::Started(PendingDnsOpen {
             state: Arc::clone(self),
             key,
+            cancelled,
         })
+    }
+
+    /// Cancel every in-flight domain OPEN belonging to `sess` (`CTL
+    /// SESS_CLOSE`). The entries are **flagged, not removed**: the key stays
+    /// owned by the lookup task's RAII guard, so an OPEN retransmitted in the
+    /// same window still coalesces instead of spawning a second resolver.
+    ///
+    /// Ordering proof (the whole reason a flag is enough): this runs *before*
+    /// `r2_close_session`'s `take_session`, which removes the entry under the
+    /// session's shard write lock. The lookup task checks the flag **inside**
+    /// the same `sh.write()` critical section, immediately before publishing
+    /// the session, so the two interleavings are:
+    /// - the flag store happens first → the task's check sees it and rolls the
+    ///   insert back (aborts its reader, returns the global permit), so no
+    ///   session is published;
+    /// - the task's check runs first (flag still false) → it holds the shard
+    ///   write lock across the insert, so `take_session` is serialized after it
+    ///   and removes the just-published entry.
+    ///
+    /// Either way no session (and no binding/ACK for a closed association)
+    /// outlives the close. The flag is only ever set false→true, and a session
+    /// id is never reused by a conforming client, so a stale flag cannot
+    /// cancel an unrelated future OPEN.
+    pub(crate) fn cancel_pending_opens_for_session(&self, sess: u32) {
+        let set = self.pending_dns_opens.lock();
+        for ((s, _), cancelled) in set.iter() {
+            if *s == sess {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // The guards remove their keys on task exit; this loop deliberately
+        // does not, so a retransmitted OPEN still coalesces onto the task that
+        // is about to notice the flag and stop.
     }
 
     /// Whether this HELLO may be answered with CAPS now (100 ms throttle).
@@ -1039,6 +1133,27 @@ fn r2_send_ctl(cd: &quinn::Connection, ctl: &Ctl) {
     let _ = try_send_datagram(cd, r2::encode_ctl(ctl));
 }
 
+/// Tell the client that session `sess` is gone (`CTL SESS_CLOSE`), cloned and
+/// sent up to three times best-effort — the same shape the client's association
+/// exit uses, because a CTL frame may be lost or reordered and the close is
+/// idempotent on the receiver.
+///
+/// Every **server-side reap path** calls this after it removed the session
+/// (idle sweep, fair-share / session-pool sweeps, the reply reader's own exit):
+/// without it the client keeps sending steady frames for a session the server
+/// no longer has — each one fails lookup and is silently dropped — until its
+/// own idle path notices. A terminal/blocked verdict stops the repeats: a dead
+/// or backed-up DATAGRAM path cannot carry them and the receiver's idle sweep is
+/// the correctness backstop.
+pub(crate) fn r2_send_sess_close(cd: &quinn::Connection, sess: u32) {
+    let frame = r2::encode_ctl(&Ctl::SessClose { sess, reason: 0 });
+    for _ in 0..3 {
+        if try_send_datagram(cd, frame.clone()) != DatagramSend::Sent {
+            return;
+        }
+    }
+}
+
 /// Count one rev2 policy/gate refusal (shared `REFUSED` plus the rev2 counter).
 fn r2_refuse(counter: Option<&std::sync::atomic::AtomicU64>) {
     dgram_drops::bump(&dgram_drops::REFUSED);
@@ -1057,7 +1172,17 @@ fn r2_reject(cd: &quinn::Connection, id: u32, reason: u8) {
 ///
 /// The target has already accepted the payload when this runs; an install
 /// failure therefore only means "no compression", never "payload lost".
-fn r2_install(
+///
+/// Both tables must be published or neither: a binding that lives only in the
+/// forward registry would accept compressed uplink frames for a flow the reply
+/// side cannot classify (replies then degrade to `INLINE` at best), and it
+/// would keep a registry slot until the connection ends — the session's
+/// reverse table is the only thing `r2_remove_flow`/`r2_close_entry_bindings`
+/// can find it through. The reverse-table insert can fail only when a
+/// concurrent install filled one of the 64 per-session slots between the
+/// `is_full` check above and this `rcu`; the registry entry is rolled back then
+/// and the caller reports `TABLE_FULL` instead of ACKing a half-installed flow.
+pub(crate) fn r2_install(
     state: &Arc<R2ConnState>,
     ss: &SessTable,
     sess: u32,
@@ -1083,11 +1208,26 @@ fn r2_install(
     // The server has installed the binding and is about to send FLOW_ACK.
     binding.mark_open();
     let inserted = state.registry.insert(binding)?;
+    // `rcu` may retry its closure; the last attempt's verdict is what the
+    // published snapshot reflects (a published attempt is never superseded by a
+    // later failing one, because once `insert` returned true the id is present
+    // forever after).
+    let mut published = false;
     flows.rcu(|old| {
         let mut next = (**old).clone();
-        let _ = next.insert(inserted.clone());
+        published = next.insert(inserted.clone());
         Arc::new(next)
     });
+    if !published {
+        // The reverse table filled concurrently: undo the registry entry so the
+        // two tables stay consistent, and report the same refusal a full
+        // session table reports. `mark_closed` makes any Arc still held by an
+        // in-flight reader snapshot fail the `Closed` check.
+        if let Some(removed) = state.registry.remove(wire_id) {
+            removed.mark_closed();
+        }
+        return Err(RegistryError::Full);
+    }
     Ok(inserted)
 }
 
@@ -1202,22 +1342,34 @@ fn r2_handle_ctl(
             }
         }
         Ctl::FlowClose { id } => {
-            // Idempotent: a close retransmission (or a close for an id this
-            // side already reaped) is a no-op, not a policy refusal. Release any
-            // in-flight rev2 partial for the flow as well.
-            let dropped = r2_reasm.drop_flow(id);
-            let _ = state.stage.lock().drop_flow(id);
-            if dropped > 0 {
-                r2_stats::SESSION_END_BINDINGS
-                    .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-            if r2_remove_flow(ss, state, id).is_some() {
-                r2_stats::bump(&r2_stats::FLOW_CLOSES);
-            } else {
-                r2_stats::bump(&r2_stats::STALE_CLOSES);
+            // Remove the binding first: a close for an id this side never
+            // installed (or already reaped with its session) is the common
+            // retransmission case and must cost one registry lookup, not a
+            // whole-stager scan. Only a binding that actually existed can own
+            // queued downstream payloads or in-flight fragments, and its
+            // session scopes the stager purge to that association's queue.
+            match r2_remove_flow(ss, state, id) {
+                Some(binding) => {
+                    let dropped = r2_reasm.drop_flow(id);
+                    let _ = state.stage.lock().drop_flow_scoped(binding.session, id);
+                    if dropped > 0 {
+                        r2_stats::SESSION_END_BINDINGS
+                            .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    r2_stats::bump(&r2_stats::FLOW_CLOSES);
+                }
+                // Idempotent: an already-reaped id is a counted no-op, never a
+                // policy refusal, and it never pays the queue scans above.
+                None => r2_stats::bump(&r2_stats::STALE_CLOSES),
             }
         }
         Ctl::SessClose { sess, .. } => {
+            // Cancel in-flight domain OPENs for this session *before* the
+            // session is removed: the flag must be visible to the lookup task's
+            // guarded insert, or a late DNS answer would recreate the session
+            // (and a wire binding) the close is about to reap. See
+            // `cancel_pending_opens_for_session` for the ordering proof.
+            state.cancel_pending_opens_for_session(sess);
             let dropped = r2_reasm.drop_session(sess);
             let _ = state.stage.lock().drop_session(sess);
             if dropped > 0 {
@@ -1361,7 +1513,14 @@ pub(crate) fn policy_resolved(addrs: &[SocketAddr], allow_private: bool) -> Vec<
 /// resolution + SSRF filtering, session creation (which may await a session
 /// permit), the target send, and the idempotent install + `FLOW_ACK`.
 ///
-/// `_pending` removes the `(session, id)` coalescing entry on every exit path.
+/// `pending` removes the `(session, id)` coalescing entry on every exit path
+/// and carries the session's cancellation flag: if a `CTL SESS_CLOSE` for
+/// `sess` lands while the lookup is in flight, that flag is set *before* the
+/// session is removed, and the guarded creation below refuses to publish a
+/// session for a closed association. Without it, a DNS answer slower than the
+/// close resurrected the session (socket, global permit and wire binding) after
+/// `SESS_CLOSE` had already reaped it.
+///
 /// Repeated OPENs for the same id while this task is in flight are dropped by
 /// [`R2ConnState::begin_pending_open`]; the client repeats OPEN until ACK, so
 /// dropping a duplicate payload is ordinary UDP loss, never a stuck flow.
@@ -1377,7 +1536,7 @@ async fn r2_forward_domain_open_bg(
     host: String,
     port: u16,
     payload: Bytes,
-    _pending: PendingDnsOpen,
+    pending: PendingDnsOpen,
 ) {
     if cd.close_reason().is_some() {
         return;
@@ -1408,24 +1567,42 @@ async fn r2_forward_domain_open_bg(
     if cd.close_reason().is_some() {
         return;
     }
+    // Cheap post-DNS check: the client may have closed the association while
+    // the lookup was in flight. The guarded creation below closes the remaining
+    // window; this exit just avoids creating a socket that would be thrown away.
+    if pending.is_cancelled() {
+        return;
+    }
     let dst = usable[0];
-    let sock = match get_or_create_sess(
+    let sock = match get_or_create_sess_guarded(
         &ss,
         &cd,
         conn_id,
         sess,
         Some((host.as_str(), port, dst, DNS_CACHE_TTL_MS)),
         Some(&state),
+        Some(pending.cancelled_flag()),
     )
     .await
     {
         Some(s) => s,
         None => {
-            // Session/share/permit refusal: no flow can be installed around it.
+            // Session/share/permit refusal (or the cancelled-creation rollback):
+            // no flow can be installed around it. A cancelled OPEN must not ACK
+            // or bind a closed session either — the client already dropped the
+            // association.
             r2_reject(&cd, id, r2::R2_REJECT_TABLE_FULL);
             return;
         }
     };
+    // A cancel that raced the guarded insert's check has already had the session
+    // removed by the close's `take_session` (same shard write lock): do not send
+    // or install around a session that no longer exists. `r2_install` also
+    // re-checks `session_r2_flows`, so this is the cheap half of the same
+    // guard.
+    if pending.is_cancelled() {
+        return;
+    }
     remember_dst(&ss, sess, dst);
     // No `arm_fast` here: the fast table is owned by the datagram loop. The
     // next datagram for this session takes the slow path once, finds the dest
@@ -2027,8 +2204,14 @@ pub(crate) async fn handle_conn(
                         // rev2 bindings of every reaped session go with it, so a
                         // stale `wire_id` can only fail lookup afterwards.
                         let evicted = sess.sweep_all(now);
+                        // The client's association is gone on this side: tell it
+                        // (three best-effort, idempotent `SESS_CLOSE` frames) so
+                        // it stops sending steady frames for it — those could
+                        // only fail lookup here. Sent before the reader tasks are
+                        // aborted, and on the connection clone this task owns.
                         for entry in &evicted {
                             r2_close_entry_bindings(&r2_sweep, entry);
+                            r2_send_sess_close(&conn, entry.sess);
                         }
                         abort_evicted(evicted);
                     }
@@ -2466,7 +2649,7 @@ pub(crate) async fn handle_conn(
     // process-wide (not per connection) so many connections cannot exhaust fds
     // together.
     //
-    // Admission is **two-stage**, and each stage has its own process-wide pool:
+    // Admission is **two-stage**, and each stage has its own pool:
     // 1. a [`HEADER_TASK_CREDIT`] is taken before the spawn and released once
     //    the 5 s header read has returned (success or failure) — this is what
     //    bounds parked header tasks, which the transport's per-connection
@@ -2475,6 +2658,15 @@ pub(crate) async fn handle_conn(
     //    header, inside `handle_tcp_stream`, and cover the dial plus the whole
     //    relay — so a trickling header cannot exhaust the stream pool and a
     //    long-lived flow cannot sit on header credit.
+    // On top of the two-stage flow, the header stage also has a per-connection
+    // share ([`HEADER_CREDIT_PER_CONN`]): [`HEADER_TASK_CREDIT`] is a
+    // process-wide bound, and one admitted peer can open its whole transport
+    // stream allowance, so without the share the first peer to arrive parks
+    // every header task the host can afford (each stream may also pin up to
+    // quinn-proto's 1024 reassembly gap chunks) and every other client is reset
+    // `0x05` until the trickle finishes. The share permit is passed into the
+    // handler and dropped together with the global credit when the header read
+    // resolves, so a live relay flow occupies neither.
     // The stream-task pool is process-wide, and one connection may open
     // `MAX_BIDI_STREAMS_PER_CONN` (8192) streams — more than the whole pool — so
     // each connection also has to stay inside its own share of it. Without this,
@@ -2482,6 +2674,7 @@ pub(crate) async fn handle_conn(
     // and every other client's CONNECT is reset after its SOCKS success
     // reply — with nothing logged server-side.
     let streams_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let header_share = Arc::new(tokio::sync::Semaphore::new(HEADER_CREDIT_PER_CONN));
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
             Ok(x) => x,
@@ -2497,6 +2690,26 @@ pub(crate) async fn handle_conn(
             Err(_) => {
                 let n = HEADER_TASK_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 warn_header_credit_refused(n);
+                send.reset(0x05u32.into()).ok();
+                continue;
+            }
+        };
+        // This connection's own slice of the parked-header budget. Taken after
+        // the global credit (so the process-wide pool is never held by a
+        // connection that is refused its own share) and fail-fast like it: a
+        // peer that already parked its slice is flooding this host, not asking
+        // for a flow, so a reset is the honest answer.
+        let header_share_permit = match header_share.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let n = HEADER_SHARE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if warn_once_per_sec() {
+                    warn!(
+                        "per-connection parked-stream limit {HEADER_CREDIT_PER_CONN} reached \
+                         ({n} refused so far); resetting the stream"
+                    );
+                }
+                drop(header_credit);
                 send.reset(0x05u32.into()).ok();
                 continue;
             }
@@ -2517,6 +2730,7 @@ pub(crate) async fn handle_conn(
             send,
             recv,
             header_credit,
+            header_share_permit,
             streams_held.clone(),
             share,
             admitted,

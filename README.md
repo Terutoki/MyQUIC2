@@ -6,7 +6,7 @@
 </picture>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.1-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-436_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-476_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -41,7 +41,7 @@ The client is a pool of independent QUIC endpoints. The server is admission-firs
 | **UDP-native** | UDP stays unreliable and unordered. There is no retransmission layer, no head-of-line blocking and no per-payload ACK. A lost fragment drops that payload; a lost `TRAIN` drops the payloads it carried. |
 | **Full-duplex by construction** | Both endpoints allocate flow ids from disjoint halves of the id space. Client-owned, server-owned, domain, port-rebound and full-cone flows all use the same tables and the same frame set. |
 | **Cross-session aggregation** | One connection-level stager packs small payloads from every association into same-flow or dictionary `TRAIN` frames, with per-session FIFO order and a round-robin cursor. |
-| **Bounded memory** | Every peer-fillable structure has a hard bound: stager, reassembly, flow registry, DNS in-flight set, pre-HELLO buffer and the per-connection admission charge. |
+| **Bounded memory** | Every peer-fillable structure has a hard bound: stager, both reassemblers, flow registry, DNS in-flight set, pre-HELLO buffer, quinn's per-stream reassembly metadata (via the parked-header-stream credit) and the admission charge. The admission bound also charges the process-wide pools a peer can drive (retry, DNS waiters, worker scratch, stream assembly). |
 | **Zero-copy TCP** | TCP rides a QUIC stream. The SOCKS5 success reply is optimistic, and the relay uses borrowed QUIC halves and vectored writes. |
 | **One revision, fail-fast** | `wire_ver=2` lives in `CTL HELLO/CAPS`. A peer that does not answer CAPS is closed after 2 s; there is no silent downgrade to MQP-2 or the v0.2.0 wire. |
 | **Observable by default** | Frame kinds, `TRAIN` items, inline fallbacks, flow open/ack/reject/close, compression ratio, drop reasons and transport stats are counted and periodically reported. |
@@ -273,7 +273,7 @@ OPEN ── FLOW_CLOSE / SESS_CLOSE / connection close / idle sweep ──▶ CL
 - **Server-initiated flow.** With `udp_full_cone = true`, an unsolicited source can create an `owner=1` id. The server sends `DATA OPEN|SRC(id, sess, source, payload)`; the client installs the binding and delivers the payload. The app's reply on the same id is a steady frame, so the return path is compressed too.
 - **Rebind.** A domain flow, an anycast reply, or a source-port change is handled by `OPEN|SRC` on the existing id. The client updates `reply_src` and the SOCKS5 reply header; the application sees no API change.
 - **Reject.** `policy`, `table_full` and `dns` are distinct reasons. The client falls back to `INLINE` for that target and may retry after a TTL; the payload is still delivered without a binding.
-- **Close.** `SESS_CLOSE` is sent three times on association exit (idempotent, best-effort). `FLOW_CLOSE` retires one binding. The server's 180 s idle sweep is the backstop. Close purges the registry, the session's stager items and the in-flight reassembly partials; a late frame then finds no live binding.
+- **Close.** `SESS_CLOSE` is sent three times on association exit (idempotent, best-effort). `FLOW_CLOSE` retires one binding. The server also sends `SESS_CLOSE` when *it* reaps a session without a client request (idle sweep, admission-pressure sweep, reply-reader exit), so a client binding never stays `Open` against a session the server no longer holds. The 180 s idle sweep is the backstop. Close purges the registry, the session's stager items and the in-flight reassembly partials; a late frame then finds no live binding.
 - **ACK is an optimization.** It unlocks the 2 B steady path. It is not a reliability mechanism, and payload delivery is never acknowledged.
 
 ### 6. Uplink: client to server
@@ -355,12 +355,12 @@ The control plane is intentionally small and loss-tolerant. `CTL` frames travel 
 | `0x10` | `FLOW_ACK` | once per successful install; duplicate OPENs are re-ACKed | moves the sender to `Open` and enables compression |
 | `0x11` | `FLOW_REJECT` | once per refused OPEN | reason `policy`, `table_full` or `dns` |
 | `0x12` | `FLOW_CLOSE` | on flow retirement | removes one binding and its queued state |
-| `0x20` | `SESS_CLOSE` | three best-effort datagrams on association exit | removes a session, its flows, stager items and partials |
+| `0x20` | `SESS_CLOSE` | three best-effort datagrams on association exit, and on a server-side reap (idle sweep, admission-pressure sweep, reply-reader exit) | removes a session, its flows, stager items and partials |
 
 - **HELLO/CAPS is the only version gate.** A wrong `wire_ver` is answered with CAPS but does not release buffered data. A missing CAPS for two seconds closes the connection; there is no fallback to MQP-2 or the v0.2.0 wire.
 - **CAPS is a capability update, not a first-packet gate.** It can arrive after the first payload. The server's pre-HELLO buffer (8 frames / 16 KiB) holds early rev2 frames and releases them after a valid HELLO, in arrival order.
 - **ACK is not delivery.** It confirms that the receiver installed the binding. If an ACK is lost, the sender keeps using `OPEN` for that flow; the duplicate is idempotent. Payload delivery remains the job of the unreliable DATAGRAM.
-- **Close is best-effort.** `SESS_CLOSE` is repeated three times because losing it only delays reclamation. The 180 s idle sweep is the correctness backstop. `FLOW_CLOSE` is idempotent and may be repeated.
+- **Close is best-effort and symmetric.** `SESS_CLOSE` is repeated three times because losing it only delays reclamation; the server emits the same frame when it reaps a session the client did not close (idle/admission sweeps, reply-reader exit), so a live client binding is never left pointing at a reaped session. The 180 s idle sweep is the correctness backstop. `FLOW_CLOSE` is idempotent and may be repeated; a repeat or an unknown id costs one lookup, not a queue scan.
 - **Unknown opcodes, truncated bodies and unknown flags are dropped and counted.** They do not panic and do not tear down the connection. A malformed control frame must not become a denial-of-service primitive.
 
 ### 11. Loss, ordering and backpressure
@@ -401,16 +401,29 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | `TRAIN` | 64 items | packer and decoder |
 | Stager | 1,024 items / 256 KiB per connection | enqueue admission |
 | Pack batch | 4 frames / 64 items | stager drain |
-| Reassembly | 2 s / 256 partials / 256 KiB per connection | reassembler sweep |
+| Reassembly | 2 s / 256 partials / 256 KiB per connection | reassembler sweep (both MQP-2 and rev2; the rev2 ordering index is pruned, not just the partials) |
+| QUIC stream reassembly | 1,024 gap spans per peer-opened stream (quinn-proto) | charged process-wide via the parked-header-stream credit |
+| Header-stage parked streams | 4,096 process-wide / 256 per connection | `HEADER_TASK_CREDIT` / `HEADER_CREDIT_PER_CONN` fail-fast reset |
+| Pre-auth stream credit | 4 bidi + 2 uni streams, raised to 8,192 bidi after the token check | handshake transport parameters / `MAX_STREAMS` |
 | Fragmented payload | 8 KiB / 64 fragments | fragmenter and decoder |
 | Client associations | 4,032 per process | UDP hub |
 | Global sessions | 8,192 | server session pool |
 | Connections | 4,096 | admission / listener |
-| Per-connection admission | 19,062.5 KiB (19,988,480 B) | checked before state allocation |
+| Per-connection admission | 19,625 KiB (20,578,304 B) | checked before state allocation |
 
-The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 32 KiB of fixed ingress state (16 KiB pre-HELLO + 16-slot fast table + maps), and 4,096 × 904 B of flow-registry capacity (3.53 MiB). The total is 19.0625 MiB. At the full 4,096 connections that is **76.25 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
+The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 32 KiB of fixed ingress state (16 KiB pre-HELLO + 16-slot fast table + maps), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (6 streams × 1,024 gap spans × 96 B = 576 KiB; the server advertises 4 bidi + 2 uni streams until the token is verified, then raises bidi to 8,192). The total is 19.625 MiB. At the full 4,096 connections that is **78.5 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
 
-The session pool is accounted separately: 8,192 sessions, each with a 64 KiB socket and a reader. The per-connection admission charge covers state that a single connection can pin; the global pool covers state that many connections can pin together. Both are checked before allocation, so a flood of half-open associations cannot consume the budget of established traffic.
+A second, **process-wide fixed term** is subtracted from the budget once before the remainder is divided into connections. It covers state a peer can drive regardless of the connection count:
+
+- **UDP session pool** — 8,192 sessions. Each session charges the kernel's 64 KiB socket caps per direction (doubled by Linux's `SO_*BUF` bookkeeping) plus both per-session flow tables at their worst case: the MQP-3 v0.2 table at 64 domain targets (**22 KiB**, not the old IP-only 4 KiB) and the rev2 copy-on-write bookkeeping (2 KiB). That is **~2.25 GiB on Linux**, ~1.25 GiB where the kernel does not double the caps.
+- **QUIC ingress endpoints** — each endpoint's resident GRO receive buffer plus its kernel socket caps.
+- **TCP relay pumps** — two 16 KiB buffers for every one of the process-wide 16,384 stream-task slots (**512 MiB**).
+- **UDP retry pool** — 16 shards × (256 queued + 16 in flight) × an 8 KiB payload (**34 MiB**); peer-driven, because a black-holed target or a full `SO_SNDBUF` makes `WouldBlock` the steady state.
+- **DNS slow-path waiters** — 1,024 permits × (payload + host + task structure) (**8.75 MiB**); each unique unresolvable domain parks one waiter until the lookup times out.
+- **Datagram-worker scratch** — the `recvmmsg` burst buffer plus the session read-buffer pool held per worker thread (hundreds of KiB × the shard-thread count).
+- **quinn stream-reassembly metadata** — every peer-opened stream can park up to **1,024 gap spans** in quinn's receive assembler, and QUIC flow control counts payload bytes rather than span metadata. The header-read stage caps how many such streams can be parked at once (4,096 process-wide, 256 per connection), so admission charges 4,096 × 1,024 × 96 B ≈ **384 MiB** as a fixed term; previously none of it was charged and one connection could pin hundreds of MiB against a 19 MiB charge.
+
+The per-connection charge covers state that a single connection can pin; the fixed term covers state many connections can pin together. Both are checked before allocation, so a flood of half-open associations cannot consume the budget of established traffic. The client is not exposed to the stream-assembly term at all: it advertises **zero** incoming stream credit (it opens every stream it uses and the server never opens one), so a peer cannot create a receive assembler on it.
 
 ### 13. Security invariants
 
@@ -435,6 +448,9 @@ MQP-3 is a passenger, not a replacement. The transport choices that matter most:
 - **Congestion control.** BBR with ECN, not a custom controller. MQP has no window, no slow start and no retransmission timer of its own.
 - **GSO/GRO.** The server uses UDP segmentation and coalescing offload where the platform supports it; the client does the same per pool slot.
 - **Receive isolation.** Each pool slot owns its endpoint, socket and runtime; the server uses `SO_REUSEPORT` with one endpoint per usable core, capped at 8. There is no shared receive lock between slots.
+- **No incoming streams on the client.** The client advertises `max_concurrent_bidi_streams = 0` and `max_concurrent_uni_streams = 0`. It opens every stream it uses (one bidi stream per SOCKS TCP relay, one uni stream for the auth token) and the server never opens one, so an advertised slot would only let the peer pin quinn receive-assembler state (up to 1,024 gap spans per stream) on a side that never accepts a stream. A peer that opens one anyway is violating our transport parameters, and quinn closes the connection before buffering any stream data.
+- **Pre-auth stream credit on the server.** The server's handshake advertises only 4 bidi + 2 uni streams; the unauthenticated peer must not be able to park a receive assembler per advertised stream while it stalls the token exchange (the full 8,192-stream credit would allow hundreds of MiB on one connection). `MAX_STREAMS` is increase-only, so the accept loop raises bidi to 8,192 as soon as authentication succeeds — one client may still legitimately place every admitted TCP flow on one connection. The post-auth parked-stream bound is charged process-wide; the pre-auth one is charged per connection.
+- **Runtime topology.** The client pins one current-thread runtime per pool slot (7 at the shipped defaults) and sizes the multi-threaded main runtime to the cores those pinned threads leave over, so saturation cannot put `cores + slots` runnable threads on `cores` CPUs. `MYQUIC2_SHARD_RUNTIME=0` restores the single shared runtime (full worker width).
 - **Session sockets.** Each UDP association gets one 64 KiB socket and one reader. `recvmmsg` and `sendmmsg` batch up to 32 datagrams; the per-session fair share prevents one association from monopolizing the exit.
 - **TCP path.** TCP rides a QUIC bidirectional stream: optimistic SOCKS5 success, borrowed QUIC halves, vectored writes, 300 s idle timeout, 250 ms happy-eyeballs delay, and `RST`/`STOP_SENDING` (`0x04`) on failure.
 - **Liveness.** The QUIC idle timeout is `max(3 × keepalive, 15 s)`; the client watchdog is `max(2 × keepalive, 8 s)`; reconnect backoff is 200 ms to 5 s. A dead path is detected below the QUIC idle timeout so the next request does not wait for it.
@@ -478,7 +494,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **436 tests** on macOS (lib 207 + client 125 + server 104) and **440** in the Linux CI-equivalent environment, where four `cfg`-gated tests are enabled. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **476 tests** on macOS (lib 235 + client 132 + server 109); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -625,8 +641,8 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **436 tests** on the macOS dev box (lib 207 + client 125 + server 104).
-- **440 tests** in the Linux CI-equivalent environment (Linux adds 4 `cfg`-gated tests).
+- **476 tests** on the macOS dev box (lib 235 + client 132 + server 109).
+- The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, and legacy MQP-2 receive paths.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
 - **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
@@ -1586,7 +1602,7 @@ subgraph RAMP["📈 PMTU discovery"]
 
 #### CI pipeline
 
-_Every push: format, lint, 436/440 tests, musl and glibc builds._
+_Every push: format, lint, the full macOS/Linux test sets, musl and glibc builds._
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
@@ -1594,7 +1610,7 @@ flowchart LR
 subgraph CHECK["✅ checks"]
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>436 macOS · 440 Linux"]
+        L --> T["🧪 cargo test<br/>476 macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         M["musl static"]

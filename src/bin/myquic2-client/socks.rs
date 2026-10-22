@@ -144,9 +144,9 @@ pub(crate) async fn handle_socks(
             .unwrap_or_else(|_| SocketAddr::new(unmap("127.0.0.1".parse().unwrap()), 0))
     });
 
-    let slot = pool.pick_tcp(&target);
+    let slot_idx = pool.pick_tcp_index(&target);
+    let slot = pool.slot(slot_idx);
     let mut gen_rx = slot.gen_rx.clone();
-    let gen_tx = slot.gen_tx.clone();
     let conn = match slot.wait_conn(&mut gen_rx, timeout).await {
         Ok(c) => c,
         Err(e) => {
@@ -178,10 +178,18 @@ pub(crate) async fn handle_socks(
                     // `stable_id` and folds the `live = false` into the same `rcu`
                     // closure, so the decision, the store and the liveness bit
                     // cannot be split by a concurrent publish.
-                    // Matches the reconnect loop's own clear path.
-                    if slot.clear_if_and_mark_dead(&conn) {
-                        bump_gen(&gen_tx);
-                    }
+                    //
+                    // The SOCKS failure is a second writer on this slot, and it
+                    // shares the reconnect loop's one death commit: on top of the
+                    // clear, `retire_dead_slot` releases the dead generation's
+                    // egress-cache handles and its rev2 registry/staged payloads
+                    // and bumps the generation, exactly as the loop does when its
+                    // own future ends. Without it a connection death first noticed
+                    // here would leave the previous generation's state behind
+                    // until the loop's watchdog noticed, and a dead egress handle
+                    // could outlive the redial. Whichever writer wins the clear
+                    // owns the whole cleanup, so nothing is released twice.
+                    retire_dead_slot(&slot, slot_idx, &egress_shared, &conn);
                     write_socks_reply(
                         &mut s,
                         fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,

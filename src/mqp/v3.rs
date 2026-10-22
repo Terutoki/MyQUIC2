@@ -46,9 +46,37 @@ pub const MQP3_TRAIN_SAME_FLOW: u8 = 0x1;
 pub const MQP3_NO_FLOW: u8 = 0xFF;
 
 /// Conservative per-session charge for the flow table, used by admission
-/// accounting. The table itself is 64 `Option<Arc<TargetAddr>>` slots plus the
-/// monotonic cursor; each live IP flow also owns one `Arc<TargetAddr>`.
-pub const MQP3_FLOW_TABLE_MAX_BYTES: usize = 4096;
+/// accounting.
+///
+/// The inline table is 64 `Option<Arc<TargetAddr>>` slots plus the monotonic
+/// cursor (520 B on a 64-bit host), and each live flow additionally owns the
+/// pointee behind its `Arc`. The peer-fillable worst case is a table full of
+/// **domain** targets: every flow costs an `Arc` header (16 B: strong + weak)
+/// plus a `TargetAddr` (40 B — the `SocketAddr` payload plus the enum tag), and
+/// the domain variant also owns a `String` at the 255-byte wire limit, which an
+/// allocator rounds up by at least 32 B of size-class overhead. That is
+/// `64 x (16 + 40 + 255 + 32) = 21,952 B`, plus the 520-byte inline table =
+/// **22,472 B**; `22 * 1024` covers it with 56 B to spare.
+///
+/// The previous 4,096 B was the *IP-only* derivation (64 x (slot 8 + `Arc` 16 +
+/// `SocketAddr` 32 + 8 slack) = 4,096), which under-counted a domain-filled
+/// table by ~5x — exactly the kind of under-count an admission bound must not
+/// have, because the peer controls whether its targets are domains.
+pub const MQP3_FLOW_TABLE_MAX_BYTES: usize = 22 * 1024;
+
+const _: () = {
+    // Admission must bound the domain-target worst case: per flow = Arc header
+    // + TargetAddr + a 255-byte name rounded up by allocator size-class
+    // overhead (32 B is the documented round-up), plus the inline table and its
+    // cursor. Spelled out from real `size_of` values rather than hard-coded so
+    // a layout change fails here instead of silently under-counting.
+    let per_domain = 2 * std::mem::size_of::<usize>() // Arc strong + weak counts
+        + std::mem::size_of::<TargetAddr>()
+        + (255 + 32);
+    let inline = MQP3_MAX_FLOWS * std::mem::size_of::<Option<Arc<TargetAddr>>>()
+        + std::mem::size_of::<usize>(); // monotonic cursor
+    assert!(MQP3_FLOW_TABLE_MAX_BYTES >= MQP3_MAX_FLOWS * per_domain + inline);
+};
 
 /// Flows 0..=63 fit in the fixed per-session table. The wire supports the full
 /// u8 range, but the table is deliberately small (the analysis budgets 64
@@ -1059,6 +1087,28 @@ mod tests {
             .insert(TargetAddr::Ip(SocketAddr::from(([203, 0, 113, 9], 9))))
             .expect("the table has free capacity");
         assert_eq!(next, 1, "the removed id must not be reused");
+    }
+
+    /// The admission charge must bound a *domain*-filled table, not only the
+    /// IP-target case the old 4 KiB figure priced: a peer chooses whether its
+    /// targets are domains, so the worst case is 64 live `Arc<TargetAddr>` with
+    /// a wire-limit name each, plus the 520-byte inline table.
+    #[test]
+    fn flow_table_charge_covers_domain_targets() {
+        let per_domain = 16 + 40 + 255 + 32; // Arc header + TargetAddr + name + rounding
+        let inline = MQP3_MAX_FLOWS * std::mem::size_of::<Option<Arc<TargetAddr>>>()
+            + std::mem::size_of::<usize>();
+        assert!(
+            MQP3_FLOW_TABLE_MAX_BYTES >= MQP3_MAX_FLOWS * per_domain,
+            "{MQP3_FLOW_TABLE_MAX_BYTES} B must cover {MQP3_MAX_FLOWS} domain targets"
+        );
+        assert!(
+            MQP3_FLOW_TABLE_MAX_BYTES >= MQP3_MAX_FLOWS * per_domain + inline,
+            "the inline table and cursor must fit too"
+        );
+        // Pinned to the constant's own documented size, so shrinking it back
+        // toward the old IP-only figure fails here.
+        assert_eq!(MQP3_FLOW_TABLE_MAX_BYTES, 22 * 1024);
     }
 
     #[test]

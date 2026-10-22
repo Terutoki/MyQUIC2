@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
         })
         .clamp(1, MAX_CONNECTIONS);
     let per_conn_bytes = per_connection_memory_bytes(&tuning);
-    // Three process-wide *fixed* terms, charged once against the memory budget
+    // Process-wide *fixed* terms, charged once against the memory budget
     // before the remainder is divided into connections — none of them scales
     // with the admitted-connection count, so charging them per connection (or
     // not at all, as the endpoint and relay-pump terms previously were) would
@@ -201,16 +201,44 @@ async fn main() -> Result<()> {
     // - every QUIC ingress endpoint's resident userspace receive buffer plus
     //   its kernel socket caps;
     // - the TCP relay pump buffers of the whole process-wide stream-task pool
-    //   (two 16 KiB buffers per active relay flow).
+    //   (two 16 KiB buffers per active relay flow);
+    // - the UDP retry pool (16 shards x (256 queued + 16 in flight) x 8 KiB
+    //   payloads): peer-driven, because a black-holed target / full sndbuf makes
+    //   `WouldBlock` the steady state;
+    // - the DNS slow-path waiter set (1,024 permits x payload + host + task):
+    //   every unique unresolvable domain spawns one waiter until it times out;
+    // - per-worker thread-locals (recvmmsg burst scratch + session buffer pool)
+    //   on the threads that run the ingress/dispatcher paths;
+    // - quinn's stream-reassembly gap-span metadata for the streams parked in
+    //   the header-read stage (`HEADER_TASK_CREDIT`): each accepted stream can
+    //   hold up to 1024 spans, and flow control counts payload bytes, not that
+    //   metadata. This was the largest uncharged term (a peer could park
+    //   ~400 MiB with one 8 MiB receive window before it was charged).
     // This is also what the "worst case" line below now prints, so the printed
     // figure matches the bound the admission cap was computed from.
     let per_session_bytes = per_session_memory_bytes();
     let session_pool_bytes = session_pool_memory_bytes(MAX_SESSIONS_GLOBAL);
     let endpoint_bytes = endpoint_memory_bytes(ep_count);
     let pump_bytes = stream_pump_memory_bytes(MAX_STREAM_TASKS);
+    let retry_pool_bytes = retry_pool_memory_bytes();
+    let dns_inflight_bytes = dns_inflight_memory_bytes();
+    // Scratch lives on the threads that run datagram readers: one per ingress
+    // shard with the sharded topology, or the shared runtime's worker count when
+    // that topology is disabled.
+    let scratch_threads = if shard_runtime_enabled() {
+        ep_count
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    };
+    let worker_scratch = worker_scratch_bytes(scratch_threads);
+    let assembler_bytes = stream_assembler_memory_bytes(HEADER_TASK_CREDIT);
     let fixed_bytes = session_pool_bytes
         .saturating_add(endpoint_bytes)
-        .saturating_add(pump_bytes);
+        .saturating_add(pump_bytes)
+        .saturating_add(retry_pool_bytes)
+        .saturating_add(dns_inflight_bytes)
+        .saturating_add(worker_scratch)
+        .saturating_add(assembler_bytes);
     let cap = admission_cap(conn_cap, c.max_peer_memory_mb, per_conn_bytes, fixed_bytes);
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(cap));
     let pending_limit = Arc::new(tokio::sync::Semaphore::new(MAX_UNAUTH_CONNECTIONS.min(cap)));
@@ -218,13 +246,27 @@ async fn main() -> Result<()> {
     let session_mib = session_pool_bytes / (1024 * 1024);
     let endpoint_mib = endpoint_bytes / (1024 * 1024);
     let pump_mib = pump_bytes / (1024 * 1024);
-    let worst_mib = transport_mib + (session_mib + endpoint_mib + pump_mib) as u128;
+    let retry_mib = retry_pool_bytes / (1024 * 1024);
+    let dns_mib = dns_inflight_bytes / (1024 * 1024);
+    let scratch_mib = worker_scratch / (1024 * 1024);
+    let assembler_mib = assembler_bytes / (1024 * 1024);
+    let worst_mib = transport_mib
+        + (session_mib
+            + endpoint_mib
+            + pump_mib
+            + retry_mib
+            + dns_mib
+            + scratch_mib
+            + assembler_mib) as u128;
     info!(
         "admission: up to {cap} connection(s); worst case {worst_mib} MiB pinned \
          ({transport_mib} MiB transport at {per_conn_bytes} B/connection + {session_mib} MiB \
          UDP session pool for {MAX_SESSIONS_GLOBAL} sessions at {per_session_bytes} B each + \
          {endpoint_mib} MiB for {ep_count} QUIC ingress endpoint(s) + {pump_mib} MiB TCP relay \
-         pump buffers for {MAX_STREAM_TASKS} flows; auth={}, configured cap={conn_cap}{})",
+         pump buffers for {MAX_STREAM_TASKS} flows + {retry_mib} MiB UDP retry pool + {dns_mib} MiB \
+         DNS waiters + {scratch_mib} MiB worker scratch on {scratch_threads} thread(s) + \
+         {assembler_mib} MiB quinn stream-assembly metadata for {HEADER_TASK_CREDIT} parked \
+         stream(s); auth={}, configured cap={conn_cap}{})",
         if auth_enabled { "on" } else { "off" },
         match c.max_peer_memory_mb {
             Some(mb) => format!(", memory budget {mb} MiB"),
@@ -700,6 +742,15 @@ async fn accept_loop(
             // Authentication done: free the pre-auth slot so other new peers
             // can handshake while this connection lives on.
             drop(pending);
+            // Raise the handshake's small pre-auth bidi credit to the full
+            // client-facing credit now that the peer has proven it holds the
+            // token. MAX_STREAMS is increase-only, so this sequence is
+            // protocol-legal; it is what keeps an unauthenticated peer from
+            // parking a quinn receive assembler per advertised stream (see
+            // `SERVER_PRE_AUTH_BIDI_CREDIT`). Uni stays at the small credit: the
+            // protocol uses one client→server uni stream (the token) and the
+            // server never opens one.
+            conn.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(MAX_BIDI_STREAMS_PER_CONN));
             if let Err(e) =
                 handle_conn(conn, allow_private, reply_filter, conn_limit_for_conn, cap).await
             {

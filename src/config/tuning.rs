@@ -9,9 +9,12 @@ use super::server_conf::ServerConf;
 // split); refer to it at the crate root until it moves with that section.
 use crate::DATAGRAM_BUFFER;
 use crate::FRAG_MAX_HELD_BYTES;
-use crate::mqp::r2_flow::{FlowBinding, R2_MAX_FLOWS_PER_CONN};
+use crate::dns::resolve::DNS_SLOW_PATH_PERMITS;
+use crate::mqp::r2_flow::{FlowBinding, R2_MAX_FLOWS_PER_CONN, SessionFlows};
 use crate::mqp::v3::MQP3_FLOW_TABLE_MAX_BYTES;
 use crate::udp::r2_stage::{R2_STAGE_MAX_BYTES, R2_STAGE_MAX_ITEMS, R2StageItem};
+use crate::udp::retry::{UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT, UDP_RETRY_SHARDS};
+use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 
 /// Rev2 ingress state outside the transport windows and outside this crate's
 /// type-visible per-connection structures: the pre-HELLO frame buffer
@@ -99,17 +102,25 @@ pub const DEFAULT_UDP_EGRESS_CONNS: usize = 2;
 /// remaining parallelism comes from the TCP pool and per-association tasks.
 pub const MAX_UDP_EGRESS_CONNS: usize = 8;
 
-/// Concurrent bidirectional streams one QUIC connection may carry.
+/// Concurrent bidirectional streams one QUIC connection may carry **after
+/// authentication**.
 ///
-/// This is the credit each endpoint advertises, and `Connection::open_bi()`
-/// parks until the *peer's* credit allows — so it must cover the largest number
-/// of TCP flows that can land on a single connection. The client admits up to
-/// `MAX_SOCKS_CONNS` (8192) SOCKS connections process-wide and
-/// `interactive_ports` pinning can put every TCP flow on slot 0, hence 8192;
-/// every smaller value lets an *admitted* flow stall in `open_bi()` for the
-/// client's 5 s timeout and then answer SOCKS `REP=0x01` while the process still
-/// has stream-task capacity. The server's `MAX_STREAM_TASKS` process-wide task
-/// bound stays the overload backstop, exactly as before.
+/// This is the credit the server raises to once the client's token is verified,
+/// and `Connection::open_bi()` parks until the *peer's* credit allows — so it
+/// must cover the largest number of TCP flows that can land on a single
+/// connection. The client admits up to `MAX_SOCKS_CONNS` (8192) SOCKS
+/// connections process-wide and `interactive_ports` pinning can put every TCP
+/// flow on slot 0, hence 8192; every smaller value lets an *admitted* flow stall
+/// in `open_bi()` for the client's 5 s timeout and then answer SOCKS `REP=0x01`
+/// while the process still has stream-task capacity. The server's
+/// `MAX_STREAM_TASKS` process-wide task bound stays the overload backstop,
+/// exactly as before.
+///
+/// The handshake itself advertises only
+/// [`SERVER_PRE_AUTH_BIDI_CREDIT`] bidi streams: every advertised slot is a
+/// peer-pinnable quinn receive assembler, and an unauthenticated peer must not
+/// be able to park them. MAX_STREAMS is increase-only, so raising to this value
+/// after the token check is protocol-legal.
 ///
 /// (An earlier revision hard-coded 1024 here, which was inconsistent with the
 /// client's 8192-connection admission cap: with the default four-connection
@@ -117,6 +128,28 @@ pub const MAX_UDP_EGRESS_CONNS: usize = 8;
 /// stalled before failing. The client bin asserts `MAX_SOCKS_CONNS <=
 /// MAX_BIDI_STREAMS_PER_CONN` so the two can never drift apart again.)
 pub const MAX_BIDI_STREAMS_PER_CONN: u32 = 8192;
+
+/// Bidirectional-stream credit the server advertises **before authentication**.
+///
+/// The full [`MAX_BIDI_STREAMS_PER_CONN`] credit is what an authenticated client
+/// needs, but a peer that completes the handshake and then stalls the token
+/// exchange can fill the whole connection receive window with gapped one-byte
+/// frames; each peer-opened stream keeps up to quinn's `MAX_CHUNKS = 1024` gap
+/// spans, so advertising the full credit in the handshake would let one
+/// unauthenticated connection pin hundreds of MiB before proving it holds the
+/// token. The handshake therefore advertises this small credit, and the server
+/// raises it to [`MAX_BIDI_STREAMS_PER_CONN`] with MAX_STREAMS as soon as
+/// authentication succeeds. Four concurrent pre-auth streams are far more than
+/// a real client needs: it opens only its auth uni stream before the token is
+/// verified.
+pub const SERVER_PRE_AUTH_BIDI_CREDIT: u32 = 4;
+
+/// Unidirectional-stream credit the server advertises (and keeps).
+///
+/// The protocol uses exactly one client→server uni stream (the auth token); the
+/// client never sends another and the server never opens one, so the old
+/// 100-stream credit was pure peer-pinnable assembler memory.
+pub const SERVER_UNI_STREAM_CREDIT: u32 = 2;
 
 /// Concurrent UDP associations one *client process* may admit.
 ///
@@ -295,7 +328,12 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 ///   overhead), the pre-HELLO/fast-session ingress state, and the connection's
 ///   flow registry at its 4096-binding cap (each binding is an `Arc` plus its
 ///   target/resolved set). Those are peer-fillable even though they are not
-///   part of quinn's transport state.
+///   part of quinn's transport state;
+/// - the quinn receive assemblers for the streams the **handshake** advertises
+///   (see [`pre_auth_stream_memory_bytes`]): an unauthenticated connection can
+///   hold that many stream slots for the authentication budget, so it is
+///   charged per admitted connection. The larger post-auth parked-header bound
+///   is a process-wide fixed term instead.
 ///
 /// Per-stream windows are not added: they are bounded by the connection window.
 /// The result is a ceiling, not a reservation — quinn allocates on demand — which
@@ -322,11 +360,61 @@ pub fn per_connection_memory_bytes(tuning: &TransportTuning) -> u64 {
         .saturating_add(stager)
         .saturating_add(R2_INGRESS_FIXED_BYTES)
         .saturating_add(registry)
+        .saturating_add(pre_auth_stream_memory_bytes())
 }
+
+/// Inline size of the rev2 reverse table ([`SessionFlows`]): a fixed
+/// `[Option<Arc<FlowBinding>>; R2_MAX_FLOWS_PER_SESSION]` array. Computed from
+/// the type itself so a layout change cannot silently escape admission.
+const SESSION_FLOWS_BYTES: u64 = std::mem::size_of::<SessionFlows>() as u64;
+
+/// Inline size of the server's `RecentAddrs` destination ring
+/// (`src/bin/myquic2-server/pin.rs`, binary-private): a 16-slot
+/// `[Option<IpAddr>; 16]` array (272 B — [`IpAddr`](std::net::IpAddr) is 17 B
+/// and `Option<IpAddr>` has no niche to shrink it) plus the 8-byte write
+/// position = 280 B.
+const RECENT_ADDRS_BYTES: u64 =
+    (16 * std::mem::size_of::<Option<std::net::IpAddr>>() + std::mem::size_of::<usize>()) as u64;
+
+/// Conservative per-session charge for the server's rev2 bookkeeping tables,
+/// on top of the MQP-3 v0.2 flow table covered by
+/// [`MQP3_FLOW_TABLE_MAX_BYTES`] and the socket/reader terms in
+/// [`per_session_memory_bytes`].
+///
+/// The server keeps two more per-session tables, both published as
+/// clone-on-write `ArcSwap` snapshots so the reply reader validates a source
+/// without taking a lock:
+///
+/// - [`SessionFlows`]: the rev2 reverse table, `SESSION_FLOWS_BYTES` inline
+///   (512 B on a 64-bit host);
+/// - `RecentAddrs`: the destination allowlist, `RECENT_ADDRS_BYTES` inline
+///   (280 B on a 64-bit host).
+///
+/// 792 B of inline data is not the bound. An `ArcSwap` store keeps the
+/// previous snapshot alive until every reader's hazard pointer is released, so
+/// two copies of each can coexist, and each snapshot is itself a heap
+/// allocation with an `Arc` header:
+/// `2 x (16 + 512) + 2 x (16 + 280) = 1,648 B` on a 64-bit host. The charge
+/// derives from the two table sizes and rounds up to the next power of two
+/// (2,048 B, asserted below), which also covers allocator size-class rounding.
+pub const R2_SESSION_TABLES_BYTES: u64 = {
+    let arc_header = std::mem::size_of::<usize>() as u64;
+    let two_snapshots =
+        2 * (arc_header + SESSION_FLOWS_BYTES) + 2 * (arc_header + RECENT_ADDRS_BYTES);
+    two_snapshots.next_power_of_two()
+};
+
+// Pin the round charge: the derived worst case must stay inside the documented
+// 2 KiB figure, or admission is under-counting the copy-on-write tables.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(R2_SESSION_TABLES_BYTES == 2048);
 
 /// Worst-case memory one UDP session can pin, in bytes: the session socket's
 /// send *and* receive caps (`sess_socket_buf()` each way) plus the reply
-/// reader's userspace receive buffer (`UDP_RECV_MAX + UDP_RECV_SLACK`).
+/// reader's userspace receive buffer (`UDP_RECV_MAX + UDP_RECV_SLACK`), plus
+/// the session's two flow tables — the MQP-3 v0.2 table at its domain-target
+/// worst case ([`MQP3_FLOW_TABLE_MAX_BYTES`]) and the rev2 copy-on-write
+/// bookkeeping ([`R2_SESSION_TABLES_BYTES`]).
 ///
 /// These are caps, not reservations — the kernel only accounts what is actually
 /// queued — but they are what a peer can hold, and a cap is what an admission
@@ -351,6 +439,7 @@ pub fn per_session_memory_bytes() -> u64 {
         2 * crate::sess_socket_buf()
     };
     (socket_terms + crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK + MQP3_FLOW_TABLE_MAX_BYTES) as u64
+        + R2_SESSION_TABLES_BYTES
 }
 
 /// Worst-case memory the *whole* UDP session pool can pin: the process-wide
@@ -415,6 +504,134 @@ pub fn stream_pump_memory_bytes(max_streams: usize) -> u64 {
     (max_streams as u64).saturating_mul(2 * crate::tcp::pump::COPY_CHUNK as u64)
 }
 
+/// Worst-case payload bytes the process-wide UDP retry pools can hold.
+///
+/// Each of the `UDP_RETRY_SHARDS` shard workers owns a `UDP_RETRY_DEPTH`-slot
+/// pending queue plus up to `UDP_RETRY_INFLIGHT` sends waiting on their
+/// retransmit timers, and every entry carries one payload buffer of up to
+/// [`UDP_RECV_MAX`](crate::UDP_RECV_MAX) bytes (the retry units are whole
+/// datagrams, so the payload is copied into the pool, not borrowed from the
+/// caller).
+///
+/// This is not a transient burst allowance: it is a pool a peer can drive to
+/// its cap. A datagram addressed to a black-holed target is retried until the
+/// retry deadline, and on a saturated uplink (full `SO_SNDBUF`, where
+/// `WouldBlock` is the steady state rather than an exception) every send goes
+/// through this queue, so the depth stays full as long as the peer keeps
+/// sending. Charged once, process-wide, because every peer shares the shards.
+#[must_use]
+pub fn retry_pool_memory_bytes() -> u64 {
+    let per_shard = (UDP_RETRY_DEPTH + UDP_RETRY_INFLIGHT) as u64 * crate::UDP_RECV_MAX as u64;
+    (UDP_RETRY_SHARDS as u64).saturating_mul(per_shard)
+}
+
+/// Host-name bytes counted per DNS slow-path waiter: the DNS wire limit.
+const DNS_WAITER_HOST_BYTES: u64 = 255;
+
+/// Fixed structure overhead counted per DNS slow-path waiter, on top of the
+/// payload and host name: the spawned task's header, the future state the
+/// resolver await holds, and the `Arc` handles it clones into the task. The
+/// payload retention is already covered by the payload term above.
+const DNS_WAITER_STRUCT_BYTES: u64 = 512;
+
+/// Worst-case resolver-waiter state the DNS slow path can hold.
+///
+/// The slow path is gated by the [`DNS_SLOW_PATH_PERMITS`]-permit semaphore in
+/// `dns::resolve`; a permit can have one spawned resolver task alive, and that
+/// task owns the datagram payload it was spawned for (at most
+/// [`UDP_RECV_MAX`](crate::UDP_RECV_MAX) bytes) plus an owned copy of the host
+/// name (at most the 255-byte DNS wire limit) plus fixed task/future structure
+/// (`DNS_WAITER_STRUCT_BYTES`). A peer drives this to the cap with unique
+/// unresolvable domain targets — every one spawns a waiter that sits in the
+/// upstream query until it times out — so admission charges the full permit
+/// count, once, process-wide.
+#[must_use]
+pub fn dns_inflight_memory_bytes() -> u64 {
+    (DNS_SLOW_PATH_PERMITS as u64).saturating_mul(
+        crate::UDP_RECV_MAX as u64 + DNS_WAITER_HOST_BYTES + DNS_WAITER_STRUCT_BYTES,
+    )
+}
+
+/// Idle session read buffers the server pools per worker thread.
+///
+/// Mirrors `SESS_BUF_POOL_DEPTH` in `src/bin/myquic2-server/reader.rs` (binary
+/// private, so it cannot be imported here): the thread-local pool holds at most
+/// this many buffers, each `UDP_RECV_MAX + UDP_RECV_SLACK` bytes. A change
+/// there must update this constant.
+const SERVER_SESS_BUF_POOL_DEPTH: usize = 8;
+
+/// Worst-case per-thread scratch memory the server's datagram paths allocate.
+///
+/// Two thread-locals live on every server worker thread that runs an ingress
+/// or dispatcher path, and neither is released while the thread lives:
+///
+/// - the `recvmmsg` burst scratch ([`LAST_HOP_DRAIN`] slots of [`BURST_SLOT`]
+///   bytes each) — a peer filling every slot drives it to the full size;
+/// - the session read-buffer pool (`SERVER_SESS_BUF_POOL_DEPTH` buffers of
+///   `UDP_RECV_MAX + UDP_RECV_SLACK` bytes), which a peer fills by keeping that
+///   many session readers idle-but-live on one thread.
+///
+/// `threads` is the number of OS worker threads running those paths (the
+/// server's shard runtimes), not the number of tasks; charged once as a
+/// process-wide fixed term because the thread count is bounded by the runtime
+/// topology, not by the admitted-connection count.
+#[must_use]
+pub fn worker_scratch_bytes(threads: usize) -> u64 {
+    let burst = (LAST_HOP_DRAIN * BURST_SLOT) as u64;
+    let sess_pool =
+        (SERVER_SESS_BUF_POOL_DEPTH * (crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK)) as u64;
+    (threads as u64).saturating_mul(burst + sess_pool)
+}
+
+/// quinn-proto 0.11's per-stream reassembly cap: `src/connection/assembler.rs`
+/// keeps at most `MAX_CHUNKS = 1024` gap spans per stream (`Assembler::insert`
+/// calls `defragment()` once the span count would exceed it).
+const QUINN_ASSEMBLER_MAX_CHUNKS: usize = 1024;
+
+/// Bytes charged per quinn assembler span: the span itself plus its retained
+/// allocation.
+///
+/// In quinn-proto 0.11.19 (`src/connection/assembler.rs`, `struct Buffer`) a
+/// span is `offset: u64` + `bytes: Bytes` (32 B) + `allocation_size: usize` +
+/// `defragmented: bool` = 56 B after padding; each span also pins the packet
+/// allocation it was sliced from, of which 40 B is the conservative minimum for
+/// the retained datagram/allocator overhead. The admission charge uses this
+/// 96-byte figure.
+const QUINN_ASSEMBLER_SPAN_BYTES: u64 = 96;
+
+/// Worst-case quinn stream-assembler memory for `parked_streams` streams.
+///
+/// A TCP stream that delivered a first payload byte but not a complete header
+/// keeps quinn's per-stream reassembler state parked for the header-read budget
+/// (5 s server-side), and each gap span in it retains a packet allocation. The
+/// server bounds the header stage with `HEADER_TASK_CREDIT` parked streams
+/// (`src/bin/myquic2-server/accept.rs`), so admission charges this term once as
+/// a process-wide fixed cost. The previous bound charged none of it: 4,096
+/// header-parked streams can hold 4,096 x 1024 spans, and a peer that never
+/// sends a full header controls how many are parked.
+#[must_use]
+pub fn stream_assembler_memory_bytes(parked_streams: usize) -> u64 {
+    let per_stream = (QUINN_ASSEMBLER_MAX_CHUNKS as u64) * QUINN_ASSEMBLER_SPAN_BYTES;
+    (parked_streams as u64).saturating_mul(per_stream)
+}
+
+/// Worst-case quinn stream-assembler metadata one **pre-auth** connection can
+/// park, in bytes.
+///
+/// The handshake advertises [`SERVER_PRE_AUTH_BIDI_CREDIT`] bidi and
+/// [`SERVER_UNI_STREAM_CREDIT`] uni stream slots, and each of those slots can
+/// hold a quinn assembler with up to `MAX_CHUNKS = 1024` gap spans. Charged per
+/// admitted connection because any connection slot can be in its pre-auth
+/// phase; the larger post-auth parked-stream bound is the process-wide
+/// [`stream_assembler_memory_bytes`] term instead. Without this term an
+/// unauthenticated peer could park stream-assembly state outside every
+/// admission charge.
+#[must_use]
+pub fn pre_auth_stream_memory_bytes() -> u64 {
+    let streams = (SERVER_PRE_AUTH_BIDI_CREDIT + SERVER_UNI_STREAM_CREDIT) as u64;
+    streams.saturating_mul((QUINN_ASSEMBLER_MAX_CHUNKS as u64) * QUINN_ASSEMBLER_SPAN_BYTES)
+}
+
 impl ServerConf {
     pub fn tuning(&self) -> TransportTuning {
         TransportTuning {
@@ -449,4 +666,159 @@ pub fn load_toml<T: for<'de> Deserialize<'de>>(path: &str) -> Result<T> {
     // error, and "unknown field ... in config-client.toml" is what makes it
     // actionable without the operator guessing which file was parsed.
     toml::from_str(&s).with_context(|| format!("parse {path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retry pool is priced as shards x (queued + in-flight) x one
+    /// max-size payload. Pin the product against the constants and the
+    /// documented numbers: a typo here under-counts a peer-drivable pool that
+    /// is tens of MiB, i.e. a real admission term.
+    #[test]
+    fn retry_pool_is_shards_times_slots_times_payload() {
+        assert_eq!(UDP_RETRY_SHARDS, 16);
+        assert_eq!(UDP_RETRY_DEPTH, 256);
+        assert_eq!(UDP_RETRY_INFLIGHT, 16);
+        assert_eq!(crate::UDP_RECV_MAX, 8192);
+        assert_eq!(retry_pool_memory_bytes(), 16 * 272 * 8192);
+        assert!(
+            retry_pool_memory_bytes() > 32 * 1024 * 1024,
+            "the retry pool is worth a fixed admission term (got {} B)",
+            retry_pool_memory_bytes()
+        );
+    }
+
+    /// The DNS term must price one full permit count of worst-case waiters
+    /// (max payload + wire-limit name + fixed structure), not just the payload.
+    #[test]
+    fn dns_inflight_budget_covers_every_permit_at_the_worst_waiter() {
+        assert_eq!(DNS_SLOW_PATH_PERMITS, 1024);
+        let per_waiter =
+            crate::UDP_RECV_MAX as u64 + DNS_WAITER_HOST_BYTES + DNS_WAITER_STRUCT_BYTES;
+        assert_eq!(
+            dns_inflight_memory_bytes(),
+            DNS_SLOW_PATH_PERMITS as u64 * per_waiter
+        );
+        assert!(
+            dns_inflight_memory_bytes() > 8 * 1024 * 1024,
+            "a full waiter set must be charged in MiB (got {} B)",
+            dns_inflight_memory_bytes()
+        );
+    }
+
+    /// Worker scratch is linear in the thread count and must include both
+    /// thread-locals: the burst scratch and the session read-buffer pool.
+    #[test]
+    fn worker_scratch_is_linear_in_threads_and_covers_both_thread_locals() {
+        let burst = (LAST_HOP_DRAIN * BURST_SLOT) as u64;
+        let pool =
+            (SERVER_SESS_BUF_POOL_DEPTH * (crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK)) as u64;
+        assert_eq!(
+            BURST_SLOT,
+            crate::UDP_RECV_MAX + crate::SOCKS_UDP_HDR_MAX + crate::UDP_RECV_SLACK
+        );
+        assert_eq!(worker_scratch_bytes(0), 0);
+        assert_eq!(worker_scratch_bytes(1), burst + pool);
+        for threads in 1..8 {
+            assert_eq!(
+                worker_scratch_bytes(threads),
+                threads as u64 * (burst + pool)
+            );
+        }
+        assert!(
+            worker_scratch_bytes(1) > 256 * 1024,
+            "one worker's scratch is 256+ KiB (got {} B)",
+            worker_scratch_bytes(1)
+        );
+    }
+
+    /// The quinn assembler charge is `parked streams x MAX_CHUNKS x per-span`,
+    /// with `MAX_CHUNKS = 1024` and 96 B per span (see the quinn-proto
+    /// assembler citation on the constants).
+    #[test]
+    fn stream_assembler_charge_covers_parked_quinn_streams() {
+        assert_eq!(QUINN_ASSEMBLER_MAX_CHUNKS, 1024);
+        assert_eq!(QUINN_ASSEMBLER_SPAN_BYTES, 96);
+        assert_eq!(stream_assembler_memory_bytes(0), 0);
+        assert_eq!(stream_assembler_memory_bytes(1), 1024 * 96);
+        for parked in [1usize, 2, 64, 4096] {
+            assert_eq!(
+                stream_assembler_memory_bytes(parked),
+                parked as u64 * stream_assembler_memory_bytes(1)
+            );
+        }
+        // The server's header credit is what admission multiplies: 4,096
+        // parked streams x 1,024 spans x 96 B = 384 MiB, which is why the term
+        // has to be charged.
+        assert_eq!(stream_assembler_memory_bytes(4096), 384 * 1024 * 1024);
+    }
+
+    /// The per-session rev2 tables are real, bounded heap: a single-copy inline
+    /// size plus the copy-on-write snapshot overhead must fit the constant.
+    #[test]
+    fn r2_session_tables_cover_two_live_snapshots() {
+        let arcs = std::mem::size_of::<std::sync::Arc<()>>() as u64;
+        assert_eq!(
+            SESSION_FLOWS_BYTES,
+            (crate::mqp::r2_flow::R2_MAX_FLOWS_PER_SESSION
+                * std::mem::size_of::<Option<std::sync::Arc<FlowBinding>>>()) as u64,
+            "SessionFlows is one fixed array of Arc slots"
+        );
+        // `RecentAddrs` is a 16-slot `[Option<IpAddr>; 16]` ring
+        // (`Option<IpAddr>` is 17 B: IpAddr has no niche) plus the write pos.
+        assert_eq!(
+            RECENT_ADDRS_BYTES,
+            16 * std::mem::size_of::<Option<std::net::IpAddr>>() as u64
+                + std::mem::size_of::<usize>() as u64
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(SESSION_FLOWS_BYTES, 512);
+            assert_eq!(RECENT_ADDRS_BYTES, 280);
+        }
+        let two_snapshots = 2 * (SESSION_FLOWS_BYTES + arcs) + 2 * (RECENT_ADDRS_BYTES + arcs);
+        assert!(
+            R2_SESSION_TABLES_BYTES >= two_snapshots,
+            "the charge must cover two live COW snapshots of both tables ({} < {two_snapshots})",
+            R2_SESSION_TABLES_BYTES
+        );
+    }
+
+    /// The per-session charge is the socket/reader terms plus both flow tables;
+    /// dropping a table term is an under-count of the whole global session pool.
+    #[test]
+    fn per_session_charge_includes_both_flow_tables() {
+        let socket_terms = if cfg!(target_os = "linux") {
+            2 * (2 * crate::sess_socket_buf())
+        } else {
+            2 * crate::sess_socket_buf()
+        };
+        let expected = (socket_terms
+            + crate::UDP_RECV_MAX
+            + crate::UDP_RECV_SLACK
+            + MQP3_FLOW_TABLE_MAX_BYTES) as u64
+            + R2_SESSION_TABLES_BYTES;
+        assert_eq!(per_session_memory_bytes(), expected);
+        assert!(
+            per_session_memory_bytes()
+                > (MQP3_FLOW_TABLE_MAX_BYTES as u64 + R2_SESSION_TABLES_BYTES),
+            "both table terms must be visible in the total"
+        );
+    }
+
+    #[test]
+    fn session_pool_is_the_per_session_charge_times_the_cap() {
+        for sessions in [0usize, 1, 4096, 8192] {
+            assert_eq!(
+                session_pool_memory_bytes(sessions),
+                sessions as u64 * per_session_memory_bytes()
+            );
+        }
+        assert!(
+            session_pool_memory_bytes(8192) > 1024 * 1024 * 1024,
+            "the global session pool is a GiB-scale fixed term"
+        );
+    }
 }
