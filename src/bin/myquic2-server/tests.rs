@@ -2,7 +2,8 @@
 use super::*;
 use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{
-    FlowBinding, FlowState, R2_MAX_RESOLVED_ADDRS, RegistryError, SessionFlows, SourceMatch,
+    CTL_MAX_PER_SEC, FlowBinding, FlowState, R2_MAX_RESOLVED_ADDRS, RegistryError, SessionFlows,
+    SourceMatch,
 };
 use myquic2::udp::{R2Fragmenter, R2Reassembler, R2StageItem, R2StageKind, R2Stager};
 
@@ -915,14 +916,14 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
 ///
 /// The client allocates session ids from a monotonic counter and never reuses
 /// them, so on a long-lived connection the live ids are a *sparse* subset of the
-/// id space rather than a dense `1..=N` interval. `1009` and `1025` share the
-/// home slot (`s & 15 == 1`) but are nowhere near `FAST_SESS_SLOTS` apart, which
-/// is exactly the shape the old direct map could only ever treat as a
-/// permanent collision: after a few hundred associations a real client's live
-/// ids land on the same low bits at random. Both must arm and both must hit —
-/// the second is published in the first free slot after its home — and a table
-/// that is genuinely over `FAST_SESS_SLOTS` live sessions must evict the
-/// quietest rather than grow or mis-route.
+/// id space rather than a dense `1..=N` interval. `S1 + k * FAST_SESS_SLOTS`
+/// share the home slot (`s & (FAST_SESS_SLOTS - 1) == constant`) but are a full
+/// table apart, which is exactly the shape the old direct map could only ever
+/// treat as a permanent collision: after a few hundred associations a real
+/// client's live ids land on the same low bits at random. Both must arm and both
+/// must hit — the second is published in the first free slot after its home —
+/// and a table that is genuinely over `FAST_SESS_SLOTS` live sessions must evict
+/// the quietest rather than grow or mis-route.
 #[tokio::test]
 async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
@@ -931,10 +932,14 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
     let dst: SocketAddr = "198.51.100.7:53".parse().unwrap();
 
-    // Sparse ids from a counter that has run for a while. `s2`/`s3` collide on
-    // the home slot; none is `FAST_SESS_SLOTS` from another, i.e. no fixture
-    // relies on the old direct-map pigeonhole argument.
-    let (s1, s2, s3) = (1001u32, 1009u32, 1025u32);
+    // Sparse ids from a counter that has run for a while: `s2`/`s3` land on the
+    // same home slot as each other (linear probing publishes the second one in
+    // the next free slot), `s1` on a different home. The spacing is derived from
+    // `FAST_SESS_SLOTS` so a future table resize cannot silently invalidate the
+    // fixture.
+    let base = 1_001u32;
+    let step = FAST_SESS_SLOTS as u32;
+    let (s1, s2, s3) = (base + 1, base + step, base + 2 * step);
     assert_eq!(fast_slot(s2), fast_slot(s3), "fixture: same home slot");
     assert_ne!(fast_slot(s1), fast_slot(s2));
 
@@ -1842,8 +1847,10 @@ fn admission_cap_bounds_connections_by_memory() {
     );
     assert_eq!(
         pump,
-        MAX_STREAM_TASKS as u64 * 2 * 16 * 1024,
-        "two COPY_CHUNK (16 KiB) buffers per concurrent relay flow"
+        MAX_STREAM_TASKS as u64
+            * (2 * 16 * 1024 + myquic2::linux::relay_tcp_kernel_bytes_per_flow()),
+        "two COPY_CHUNK (16 KiB) userspace pump buffers plus the relay socket \
+         kernel caps per concurrent relay flow (MEM-3)"
     );
     assert!(pump > 256 * 1024 * 1024, "pump term must be a real bound");
     assert!(retry > 32 * 1024 * 1024, "retry pool must be a real term");
@@ -1863,41 +1870,38 @@ fn admission_cap_bounds_connections_by_memory() {
     );
     assert_eq!(admission_cap(1, None, per_conn, fixed), 1);
 
-    // A 4 GiB budget: the fixed term comes off the top, the rest is divided
-    // by the per-connection figure.
-    let budget = 4096 * 1024 * 1024u64;
-    let expected = ((budget - fixed) / per_conn) as usize;
+    // The budget is derived from the formula's own terms: the process-wide
+    // fixed term (now ~5.6 GiB at Linux defaults: session pool + endpoint +
+    // relay pump with kernel caps + assembler + retry + DNS + scratch) plus
+    // room for 64 connections. A fixed literal budget (the old 4 GiB) can fall
+    // below the fixed term as more real charges are discovered, which used to
+    // make these division assertions vacuous.
+    let budget_bytes = fixed + 64 * per_conn;
+    let budget_mib = budget_bytes.div_ceil(1 << 20);
+    let budget_bytes = budget_mib << 20;
+    let expected = ((budget_bytes - fixed) / per_conn) as usize;
     assert_eq!(
-        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
+        admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn, fixed),
         expected
     );
-    // The rev2 data-plane ceilings (stager, ingress state and the 4096-flow
-    // registry) add ~4.5 MiB per connection on top of the transport and
-    // reassembly terms, and the process-wide fixed terms now also include the
-    // retry pool, DNS waiters, worker scratch and quinn's parked-stream
-    // reassembly metadata (~430 MiB). Linux charges the doubled session socket
-    // caps too, so a 4 GiB budget admits roughly 43 connections there (~98 on
-    // macOS, which does not double the caps). Keep a floor that still catches a
-    // runaway fixed term without treating the documented admission ceiling as a
-    // regression.
     assert!(
-        expected >= 32,
-        "a 4 GiB budget must still admit a useful pool (got {expected})"
+        expected >= 64,
+        "the derived budget must still admit a useful pool (got {expected})"
     );
     // Charging the fixed term is the whole point: without it the same budget
     // would admit `budget / per_conn` connections and pin that much *plus* the
     // session pool, endpoint buffers and relay pump buffers.
     assert!(
-        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, 0)
-            > admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
+        admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn, 0)
+            > admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn, fixed),
         "the fixed term must reduce the admitted count"
     );
     // The endpoint + pump terms are additional to the session pool and must
     // tighten the cap further; a formula that only charged the pool would let
     // the same budget admit more.
     assert!(
-        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, pool)
-            > admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
+        admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn, pool)
+            > admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn, fixed),
         "endpoint + relay-pump terms must reduce the admitted count"
     );
     // Raising the windows must lower the admitted count for the same budget.
@@ -1910,12 +1914,12 @@ fn admission_cap_bounds_connections_by_memory() {
     let per_conn_wide = per_connection_memory_bytes(&wide);
     assert!(per_conn_wide > per_conn);
     assert!(
-        admission_cap(MAX_CONNECTIONS, Some(4096), per_conn_wide, fixed)
-            < admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
+        admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn_wide, fixed)
+            < admission_cap(MAX_CONNECTIONS, Some(budget_mib), per_conn, fixed),
         "the same budget must admit fewer wide-window connections"
     );
     // Count cap still wins when it is the smaller of the two.
-    assert_eq!(admission_cap(8, Some(4096), per_conn, fixed), 8);
+    assert_eq!(admission_cap(8, Some(budget_mib), per_conn, fixed), 8);
     // A budget too small for even one connection admits exactly one, and a
     // budget at or below the fixed term is the same case rather than zero.
     assert_eq!(admission_cap(MAX_CONNECTIONS, Some(1), per_conn, fixed), 1);
@@ -5006,6 +5010,11 @@ fn r2_inline_frame(sess: u32, target: &TargetAddr, payload: &[u8]) -> Bytes {
 }
 
 fn r2_count(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    // The per-reply-frame counters (`STEADY_SENT`/`OPEN_SRC_SENT`) are
+    // thread-locally batched (OBS-2). Flush this thread's pending cell first so
+    // a test running on the counting thread sees its own records exactly — the
+    // same rule `udp_stats::snapshot` documents for its batched counters.
+    r2_stats::flush_thread();
     counter.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -5839,7 +5848,26 @@ async fn rev2_domain_open_and_downlink_rebind() {
     );
     assert_eq!(data.payload, b"domain-first");
 
-    // Second reply is compressed: the client already knows the source.
+    // LOGIC-3: the client confirms every `OPEN|SRC` it decodes with
+    // `CTL FLOW_ACK`; only then does the server classify the learned source as
+    // steady. Wait for the server to process the ACK before relying on it.
+    let acks_before = r2_count(&r2_stats::FLOW_ACKS_RECV);
+    client
+        .send_datagram(r2::encode_ctl(&r2::Ctl::FlowAck {
+            id,
+            status: r2::R2_ACK_OPEN,
+        }))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while r2_count(&r2_stats::FLOW_ACKS_RECV) == acks_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the client FLOW_ACK must be processed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Second reply is compressed: the client confirmed the source.
     target.send_to(b"domain-steady", relay).await.unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(5), client.read_datagram())
         .await
@@ -5925,6 +5953,18 @@ async fn rev2_downlink_steady_train_and_port_rebind() {
     assert_eq!(data.addr, Some(TargetAddrRef::Ip(other_port)));
     assert_eq!(data.payload, b"port");
     assert_eq!(binding.reply_src(), Some(other_port));
+    // LOGIC-3: teaching the peer the source only queued the binding frame, so
+    // the shared table keeps classifying the learned source as `Rebind` until
+    // the peer confirms it (`CLT FLOW_ACK`). A lost binding frame can therefore
+    // never strand the flow on steady frames the peer cannot route.
+    assert!(!binding.reply_src_acked());
+    assert!(matches!(
+        h.r2.flows.load().match_source(other_port),
+        Some(SourceMatch::Rebind(_))
+    ));
+    // The peer decodes the `OPEN|SRC` and ACKs it (`mark_reply_src_acked` is
+    // what the server's `FlowAck` handler calls; see the handler-level test).
+    binding.mark_reply_src_acked();
     assert!(matches!(
         h.r2.flows.load().match_source(other_port),
         Some(SourceMatch::Exact(_))
@@ -6494,7 +6534,7 @@ async fn rev2_frag_large_downlink_modes() {
     assert_eq!(done.addr, None);
     assert_eq!(done.payload, Bytes::from(big.clone()));
     assert!(
-        r2_stats::STEADY_SENT.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        r2_count(&r2_stats::STEADY_SENT) > 0,
         "the steady fragment send must be counted"
     );
 
@@ -6996,4 +7036,449 @@ async fn rev2_full_cone_falls_back_to_inline_when_bounds_reached() {
 
     client.close(0u32.into(), b"done");
     server.close(0u32.into(), b"done");
+}
+
+// ---------------------------------------------------------------------------
+// Severe-issue regression tests (2026-10-22 batch)
+// ---------------------------------------------------------------------------
+
+/// LOGIC-1 (server half): the generic datagram slow path registers a cancellable
+/// waiter per session, and `SESS_CLOSE` flags exactly that session's waiters.
+/// The entries are RAII-owned by the lookup task: a finished waiter removes its
+/// own registration, so a long-lived connection cannot accumulate flags for the
+/// sessions the peer churned through.
+#[test]
+fn generic_dns_waiters_are_registered_and_cancelled_per_session() {
+    let state = R2ConnState::new();
+    let ours = state.begin_dns_waiter(7);
+    let other = state.begin_dns_waiter(8);
+    assert_eq!(state.dns_waiter_count(7), 1);
+    assert_eq!(state.dns_waiter_count(8), 1);
+    assert!(!ours.is_cancelled() && !other.is_cancelled());
+
+    state.cancel_dns_waiters_for_session(7);
+    assert!(
+        ours.is_cancelled(),
+        "the closed session's generic DNS waiter must be flagged"
+    );
+    assert!(
+        !other.is_cancelled(),
+        "another session's waiter must be left alone"
+    );
+    // The entry survives the cancel: the lookup task owns its lifetime, so a
+    // duplicate datagram in the same window still finds the flag.
+    assert_eq!(state.dns_waiter_count(7), 1);
+    drop(ours);
+    assert_eq!(
+        state.dns_waiter_count(7),
+        0,
+        "a finished waiter removes its own registration"
+    );
+    drop(other);
+    assert_eq!(state.dns_waiter_count(8), 0);
+}
+
+/// LOGIC-1: a generic slow-path waiter that a `CTL SESS_CLOSE` cancelled while
+/// its DNS lookup was in flight must not recreate the session (socket, reader
+/// task and global permit) after the close reaped it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_generic_dns_waiter_does_not_create_a_session() {
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(std::sync::atomic::Ordering::Relaxed);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let state = R2ConnState::new();
+    let waiter = state.begin_dns_waiter(41);
+    // A `SESS_CLOSE` for session 41 landed while the lookup was in flight.
+    state.cancel_dns_waiters_for_session(41);
+
+    let delivered = deliver_resolved_server_dgram(
+        &ss,
+        &server_conn,
+        0,
+        41,
+        "localhost",
+        19811,
+        Bytes::from_static(b"late"),
+        true,
+        Some(&state),
+        Some(&waiter),
+    )
+    .await;
+    assert!(
+        !delivered,
+        "a cancelled waiter reports no DNS verdict (nothing to cache)"
+    );
+    assert_eq!(
+        ss.len(),
+        0,
+        "a late DNS answer must not publish a session for a closed association"
+    );
+    assert_eq!(
+        session_holders().load(std::sync::atomic::Ordering::Relaxed),
+        holders_before,
+        "no session table may be registered as a holder"
+    );
+    drop(waiter);
+    assert_eq!(state.dns_waiter_count(41), 0);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// LOGIC-6: the generic slow path passes the DNS entry's *remaining* life into
+/// the session destination memo, not the fresh-resolution `DNS_CACHE_TTL_MS`;
+/// the `pin_life_ms` clamp is then real instead of being subverted by a hot
+/// (already near-expiry) cache entry.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_dns_slow_path_clamps_the_session_memo_to_the_entry_life() {
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(std::sync::atomic::Ordering::Relaxed);
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let host = "slowpath-ttl.test";
+    let port = dst.port();
+    // Entry is 100 s old: only ~20 s of its 120 s TTL is left.
+    dns_cache_seed_aged(
+        host,
+        port,
+        dst,
+        Duration::from_millis(DNS_CACHE_TTL_MS - 20_000),
+    )
+    .await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let state = R2ConnState::new();
+
+    let delivered = deliver_resolved_server_dgram(
+        &ss,
+        &server_conn,
+        0,
+        42,
+        host,
+        port,
+        Bytes::from_static(b"clamped"),
+        true,
+        Some(&state),
+        None,
+    )
+    .await;
+    assert!(!delivered, "a delivered datagram is not a DNS verdict");
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("the slow-path datagram must be delivered")
+        .unwrap();
+    assert_eq!(&buf[..n], b"clamped");
+    let now = coarse_millis();
+    let (_, life) = sess_dest_lookup_ttl(&ss, now, 42, host, port)
+        .expect("the resolved destination must be memoized on the session");
+    assert!(
+        life <= 20_500,
+        "the session memo must not outlive the DNS entry it came from (got {life} ms)"
+    );
+    assert!(life > 0, "the memo must still be live");
+
+    // Return the session (and its global permit) before leaving the holder lock.
+    if let Some(entry) = ss.take_session(42) {
+        entry.reader.abort();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session_holders().load(std::sync::atomic::Ordering::Relaxed) != holders_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session holder count must return after the session is taken"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// LOGIC-3 (server half): the `FLOW_ACK` handler is what confirms a learned
+/// downlink reply source. Until it runs, `SessionFlows::match_source` keeps
+/// classifying the source as `Rebind` (re-send the idempotent `OPEN|SRC`, so a
+/// lost binding frame cannot strand the flow); after it, the source is steady.
+#[tokio::test]
+async fn flow_ack_confirms_a_learned_reply_source() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    insert_test_session(&ss, 7);
+    let state = R2ConnState::new();
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let learned: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+    let (r2_flows, binding) = insert_r2_binding(&ss, 7, 1, TargetAddr::Ip(src), Vec::new());
+    assert!(state.registry.insert(binding.clone()).is_ok());
+
+    // The reply side learned a source but has not yet been confirmed: the
+    // binding frame may have been lost, so the shared table must keep rebinding.
+    binding.set_reply_src(learned);
+    assert!(!binding.reply_src_acked());
+    assert!(matches!(
+        r2_flows.load().match_source(learned),
+        Some(SourceMatch::Rebind(_))
+    ));
+
+    let acks_before = r2_count(&r2_stats::FLOW_ACKS_RECV);
+    let ack = r2::encode_ctl(&r2::Ctl::FlowAck {
+        id: binding.wire_id,
+        status: r2::R2_ACK_OPEN,
+    });
+    r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &ack);
+    assert!(
+        binding.reply_src_acked(),
+        "FLOW_ACK must confirm the learned reply source"
+    );
+    assert_eq!(r2_count(&r2_stats::FLOW_ACKS_RECV), acks_before + 1);
+    assert!(matches!(
+        r2_flows.load().match_source(learned),
+        Some(SourceMatch::Exact(_))
+    ));
+
+    // An ACK for an id this side never installed is a cheap no-op.
+    let stray = r2::make_wire_id(99, false).unwrap();
+    let ack = r2::encode_ctl(&r2::Ctl::FlowAck {
+        id: stray,
+        status: r2::R2_ACK_OPEN,
+    });
+    r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &ack);
+    assert_eq!(
+        r2_count(&r2_stats::FLOW_ACKS_RECV),
+        acks_before + 1,
+        "an ACK for an unknown id confirms nothing"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// PERF-1: the per-connection CTL rate budget refuses excess
+/// `SESS_CLOSE`/`FLOW_CLOSE`/`FLOW_REJECT` frames as counted refusals without
+/// touching any session/flow state.
+#[tokio::test]
+async fn ctl_rate_budget_drops_excess_close_frames() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let state = R2ConnState::new();
+    // Spend this connection's one-second CTL budget directly: the handler uses
+    // the same `CtlState::ctl_allowed` gate.
+    let now = mono_millis();
+    for _ in 0..CTL_MAX_PER_SEC {
+        assert!(state.ctl.ctl_allowed(now));
+    }
+    let closes_before = r2_count(&r2_stats::SESS_CLOSES) + r2_count(&r2_stats::STALE_CLOSES);
+    let refused_before = dgram_drops::snapshot().refused;
+    let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess: 5, reason: 0 });
+    r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &frame);
+    assert_eq!(
+        dgram_drops::snapshot().refused,
+        refused_before + 1,
+        "an over-budget CTL is a counted refusal"
+    );
+    assert_eq!(
+        r2_count(&r2_stats::SESS_CLOSES) + r2_count(&r2_stats::STALE_CLOSES),
+        closes_before,
+        "a refused frame must not touch session state"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// PERF-1: a `SESS_CLOSE` naming a session this connection never had (the common
+/// duplicate/forged case) is O(1) in the registry's session index and must not
+/// purge a live session's bindings.
+#[tokio::test]
+async fn unknown_sess_close_does_not_touch_a_live_sessions_bindings() {
+    let _holder_guard = holder_test_guard();
+    let holders_before = session_holders().load(std::sync::atomic::Ordering::Relaxed);
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _r2_flows, binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    let state = R2ConnState::new();
+    assert!(state.registry.insert(binding.clone()).is_ok());
+
+    assert!(
+        !r2_close_session(&ss, &state, 99),
+        "there was no session 99 to reap"
+    );
+    assert!(
+        state.registry.get(binding.wire_id).is_some(),
+        "a close for an unknown session must not purge another session's bindings"
+    );
+    assert_ne!(
+        binding.state(),
+        FlowState::Closed,
+        "the live binding must not be marked closed"
+    );
+    assert!(
+        ss.shard(7).read().get(&7).is_some(),
+        "the untouched session entry must still be live"
+    );
+    assert_eq!(
+        session_holders().load(std::sync::atomic::Ordering::Relaxed),
+        holders_before + 1,
+        "premise: the close's `take_session` registered the fixture table as a holder"
+    );
+    // Drain the fixture session so the table leaves the global holder count
+    // exactly as this test found it (`take_session` pairs its own removal with a
+    // `note_empty_state`, the same way `conn.closed`/`SESS_CLOSE` teardown do).
+    if let Some(entry) = ss.take_session(7) {
+        entry.reader.abort();
+    }
+    assert_eq!(
+        session_holders().load(std::sync::atomic::Ordering::Relaxed),
+        holders_before,
+        "the test must leave the process-global holder count untouched"
+    );
+}
+
+/// LOGIC-5: the stager retry trigger is "frames are still queued after a
+/// drain". The probe is false for an empty stager, true while frames are
+/// queued, and false again once a drain empties it — so the session reader's
+/// retry timer exists only while a quiet tail is actually stranded.
+#[tokio::test]
+async fn stage_backlog_probe_arms_only_while_frames_are_queued() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    assert!(!stage_has_backlog(&stage), "an empty stager arms nothing");
+    for i in 0..2u32 {
+        stage
+            .lock()
+            .push(R2StageItem {
+                session: 7,
+                kind: R2StageKind::Steady {
+                    wire_id: r2::make_wire_id(i + 1, false).unwrap(),
+                },
+                payload: Bytes::from_static(b"tail"),
+            })
+            .expect("a fresh stager has room");
+    }
+    assert!(
+        stage_has_backlog(&stage),
+        "queued frames are what arms the retry timer"
+    );
+    let mut limit = server_conn.max_datagram_size().unwrap_or(0);
+    let mut probe = 0u64;
+    assert_eq!(
+        drain_stage(&server_conn, &stage, &mut limit, &mut probe),
+        StageDrain::Ok
+    );
+    assert!(
+        !stage_has_backlog(&stage),
+        "an emptied stager disarms the retry timer"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// OBS-1 (server half): a large reply's drop is booked exactly once, in the
+/// class that actually lost it. Single-frame `Blocked`/`TooLarge` verdicts are
+/// booked here (nothing else sees them); a fragmented drop is *not* re-booked
+/// (the shared fragmenter accounts its own per-payload drop); `Terminal` ends
+/// the reader.
+#[tokio::test]
+async fn large_reply_verdict_books_its_drop_once() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let mut limit = server_conn.max_datagram_size().unwrap_or(0);
+    let mut probe = 0u64;
+
+    let before = dgram_drops::snapshot();
+    assert_eq!(
+        large_reply_disposition(R2LargeReply::Sent, &server_conn, &mut limit, &mut probe),
+        ReplyDisposition::Continue
+    );
+    assert_eq!(
+        large_reply_disposition(R2LargeReply::Blocked, &server_conn, &mut limit, &mut probe),
+        ReplyDisposition::Continue
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.buffer_full, 1,
+        "a single-frame Blocked large reply is a BUFFER_FULL drop"
+    );
+
+    let before = dgram_drops::snapshot();
+    assert_eq!(
+        large_reply_disposition(R2LargeReply::TooLarge, &server_conn, &mut limit, &mut probe),
+        ReplyDisposition::Continue
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.too_large, 1,
+        "a single-frame TooLarge large reply is a TOO_LARGE drop"
+    );
+
+    // The fragmenter books its own drop: the reader must not double-book it.
+    let before = dgram_drops::snapshot();
+    assert_eq!(
+        large_reply_disposition(
+            R2LargeReply::FragDropped { reprobe: true },
+            &server_conn,
+            &mut limit,
+            &mut probe
+        ),
+        ReplyDisposition::Continue
+    );
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(d.buffer_full, 0, "fragmented drops are not re-booked");
+    assert_eq!(d.too_large, 0, "fragmented drops are not re-booked");
+
+    assert_eq!(
+        large_reply_disposition(R2LargeReply::Terminal, &server_conn, &mut limit, &mut probe),
+        ReplyDisposition::BreakSession
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// P2-12: the binary-private `RecentAddrs` layout must match the derivation the
+/// lib's admission charge (`config::tuning::RECENT_ADDRS_BYTES`) uses — a
+/// 16-slot `[Option<IpAddr>; 16]` ring plus an 8-byte cursor = 280 B on a
+/// 64-bit host. `RECENT_ADDRS_BYTES` is private to the lib, so this asserts the
+/// same expression and the concrete 280.
+#[test]
+fn recent_addrs_layout_matches_the_admission_derivation() {
+    assert_eq!(RECENT_DST_CAP, 16);
+    let derived = 16 * std::mem::size_of::<Option<IpAddr>>() + std::mem::size_of::<usize>();
+    assert_eq!(
+        std::mem::size_of::<RecentAddrs>(),
+        derived,
+        "the type layout must stay exactly the 16-slot ring plus its cursor"
+    );
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(derived, 280, "16 x 16 B slots + 8 B cursor");
+    }
+}
+
+/// PERF-2 regression: the per-source share of the pre-auth window must cap one
+/// host at `MAX_PENDING_PER_IP` stalled handshakes, leave other source IPs
+/// unaffected, and release reservations on every drop path (so a normal
+/// connect/reconnect flow never stays refused).
+#[test]
+fn pending_window_has_a_per_ip_share_that_releases() {
+    let slots = PendingAddrSlots::new();
+    let ip: IpAddr = "192.0.2.9".parse().unwrap();
+    let other: IpAddr = "192.0.2.10".parse().unwrap();
+    let mut guards: Vec<_> = (0..MAX_PENDING_PER_IP)
+        .map(|_| slots.try_acquire(ip).expect("under the per-IP share"))
+        .collect();
+    assert!(
+        slots.try_acquire(ip).is_none(),
+        "the whole process-wide pending budget must not be holdable by one IP"
+    );
+    // Another source has its own share (this is what turns a one-host denial
+    // into a many-IP one).
+    let other_guard = slots.try_acquire(other).expect("independent per-IP share");
+    drop(other_guard);
+    // Releasing any reservation makes room for the same IP again.
+    guards.pop();
+    drop(slots.try_acquire(ip).expect("one slot was released"));
+    // Dropping the task's reservations (the failure/timeout paths) returns the
+    // share completely: a stream of normal connects must never leave the IP
+    // throttled.
+    drop(guards);
+    for _ in 0..MAX_PENDING_PER_IP {
+        drop(slots.try_acquire(ip).expect("share released"));
+    }
 }

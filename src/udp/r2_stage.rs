@@ -178,13 +178,17 @@ pub struct R2Stager {
     max_train_items: usize,
     /// Scratch for the run being packed. Cleared per frame and owned by the
     /// stager, so packing a queue full of frames costs no fresh allocation:
-    /// the per-frame `run`/`unique`/dict-flow `Vec`s this used to allocate
-    /// are three of the four hot spots of every drain burst on both ends.
-    /// (The dict item views stay a per-frame `Vec` at the codec call — a
-    /// stager field cannot hold non-static payload slices.)
+    /// the per-frame `run`/`unique` `Vec`s this used to allocate are the two
+    /// hot spots of every drain burst on both ends, and the dict item views
+    /// live in a fixed stack array at the codec call (their payload borrows
+    /// cannot live in a stager field) rather than a fresh per-frame `Vec`.
     run_scratch: Vec<R2StageItem>,
     unique_scratch: Vec<u32>,
-    flows_scratch: Vec<u32>,
+    /// `wire_id -> index into the frame's dict flow list`, rebuilt per train
+    /// frame from [`Self::unique_scratch`] and reused across frames (clear
+    /// keeps the allocation). Replaces the per-item `flows_scratch.iter()
+    /// .position(..)` scan, which was O(flows x items) inside the stager lock.
+    flow_idx_scratch: HashMap<u32, u8, foldhash::fast::RandomState>,
 }
 
 impl Default for R2Stager {
@@ -213,7 +217,7 @@ impl R2Stager {
             max_train_items: r2::R2_MAX_TRAIN_ITEMS,
             run_scratch: Vec::new(),
             unique_scratch: Vec::new(),
-            flows_scratch: Vec::new(),
+            flow_idx_scratch: HashMap::with_hasher(foldhash::fast::RandomState::default()),
         }
     }
 
@@ -495,6 +499,7 @@ impl R2Stager {
         // per-session pops).
         let mut run = std::mem::take(&mut self.run_scratch);
         let mut unique = std::mem::take(&mut self.unique_scratch);
+        let mut flow_idx = std::mem::take(&mut self.flow_idx_scratch);
         run.clear();
         unique.clear();
         let mut cost = 4usize; // kind/form/count/nfl
@@ -517,6 +522,7 @@ impl R2Stager {
             }
             self.run_scratch = run;
             self.unique_scratch = unique;
+            self.flow_idx_scratch = flow_idx;
             return true;
         }
         let encoded = if run_len == 1 {
@@ -525,7 +531,7 @@ impl R2Stager {
             };
             r2::encode_data_steady(wire_id, &run[0].payload, limit)
         } else {
-            self.encode_train_run(&run, limit)
+            Self::encode_train_run(unique.as_slice(), &mut flow_idx, &run, limit)
         };
         match encoded {
             Some(body) => {
@@ -545,6 +551,7 @@ impl R2Stager {
         // was appended into `q`, so the empty Vec keeps its allocation).
         self.run_scratch = run;
         self.unique_scratch = unique;
+        self.flow_idx_scratch = flow_idx;
         true
     }
 
@@ -613,35 +620,37 @@ impl R2Stager {
 
     /// Build the dict-form `TRAIN` for a multi-item steady run.
     ///
-    /// The flow dedupe list is the reusable [`Self::flows_scratch`] (cleared
-    /// per frame); the item views are built at the codec call, where their
-    /// payload borrows live (a stager field cannot store `&[u8]` views of a
-    /// local run).
-    fn encode_train_run(&mut self, run: &[R2StageItem], limit: usize) -> Option<Bytes> {
-        self.flows_scratch.clear();
-        for item in run {
+    /// `flows` is the run's deduped flow list in first-appearance order — the
+    /// same list [`Self::take_steady_head`] already maintains for its cost
+    /// bound, so no second scan of `run` rebuilds it. The item views are built
+    /// into a fixed stack array (at most [`r2::R2_MAX_TRAIN_ITEMS`] entries, a
+    /// few KiB) instead of a fresh per-frame `Vec`: their payload borrows are
+    /// local to this call and cannot live in a stager field. Flow indices come
+    /// from the reused [`Self::flow_idx_scratch`] map, so resolving an item's
+    /// dict index is O(1) instead of the O(flows) `position` scan per item.
+    fn encode_train_run(
+        flows: &[u32],
+        flow_idx: &mut HashMap<u32, u8, foldhash::fast::RandomState>,
+        run: &[R2StageItem],
+        limit: usize,
+    ) -> Option<Bytes> {
+        debug_assert!(run.len() <= r2::R2_MAX_TRAIN_ITEMS);
+        debug_assert!(flows.len() <= u8::MAX as usize);
+        flow_idx.clear();
+        for (i, wire_id) in flows.iter().enumerate() {
+            flow_idx.insert(*wire_id, i as u8);
+        }
+        let mut items: [(u8, &[u8]); r2::R2_MAX_TRAIN_ITEMS] = [(0, &[]); r2::R2_MAX_TRAIN_ITEMS];
+        for (view, item) in items[..run.len()].iter_mut().zip(run) {
             let R2StageKind::Steady { wire_id } = item.kind else {
                 unreachable!("a steady run only holds steady items");
             };
-            if !self.flows_scratch.contains(&wire_id) {
-                self.flows_scratch.push(wire_id);
-            }
+            let idx = *flow_idx
+                .get(&wire_id)
+                .expect("every run flow was deduped into the flow list");
+            *view = (idx, item.payload.as_ref());
         }
-        let items: Vec<(u8, &[u8])> = run
-            .iter()
-            .map(|item| {
-                let R2StageKind::Steady { wire_id } = item.kind else {
-                    unreachable!("a steady run only holds steady items");
-                };
-                let idx = self
-                    .flows_scratch
-                    .iter()
-                    .position(|f| *f == wire_id)
-                    .expect("every run flow was deduped into the flow list");
-                (idx as u8, item.payload.as_ref())
-            })
-            .collect();
-        r2::encode_train_dict(self.flows_scratch.as_slice(), &items, limit)
+        r2::encode_train_dict(flows, &items[..run.len()], limit)
     }
 
     /// Pop the next session that has a non-empty queue, rotating the cursor.
@@ -820,9 +829,11 @@ impl Drop for R2Stager {
 /// of the split ([`R2Stager::pack_batch`] comment). The *failed* frame's
 /// payloads are accounted here, per item and exactly (drop accounting is
 /// deliberately per-event): `Blocked` (the path's DATAGRAM budget is exhausted)
-/// books `BUFFER_FULL`, every other verdict books `EGRESS_DEAD`. Sent payloads
-/// book `udp_stats::payload` here, not at encode time: a `Blocked` frame is
-/// retried on the next drain and must not be counted twice.
+/// books `BUFFER_FULL`, `TooLarge` (the path MTU shrank under the cached
+/// `limit`) books `TOO_LARGE`, and only `Unsupported`/`ConnectionLost` — the
+/// verdicts that really mean the connection is unusable — book `EGRESS_DEAD`.
+/// Sent payloads book `udp_stats::payload` here, not at encode time: a frame is
+/// dropped (not retried) on a failed verdict, and must not be counted twice.
 ///
 /// `q` keeps the unsent tail: its frames beyond the failure still own their
 /// items, and frame bodies either moved into quinn (`Sent`) or were released
@@ -845,15 +856,29 @@ pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOut
                 }
             }
             other => {
-                out.items_dropped = q.frames[idx].item_len;
+                let dropped = q.frames[idx].item_len;
+                out.items_dropped = dropped;
                 out.failed = Some(other);
-                let counter = if other == DatagramSend::Blocked {
-                    &dgram_drops::BUFFER_FULL
-                } else {
-                    &dgram_drops::EGRESS_DEAD
-                };
-                for _ in 0..q.frames[idx].item_len {
-                    dgram_drops::bump(counter);
+                match other {
+                    DatagramSend::Blocked => {
+                        for _ in 0..dropped {
+                            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+                        }
+                    }
+                    DatagramSend::TooLarge => {
+                        // A size-class drop: the connection is alive and the
+                        // caller only re-probes its budget, so this must not be
+                        // booked as an egress death (the old code did exactly
+                        // that, inventing `egress_dead` spikes).
+                        book_too_large(dropped as usize);
+                    }
+                    // `Unsupported`/`ConnectionLost`: the connection is (or can
+                    // never be) usable for DATAGRAMs.
+                    _ => {
+                        for _ in 0..dropped {
+                            dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                        }
+                    }
                 }
                 break;
             }
@@ -1051,6 +1076,32 @@ mod tests {
             ]
         );
         assert!(s.is_empty());
+    }
+
+    /// P2-3 lock-in: the dict form must carry one slot per distinct flow (in
+    /// first-appearance order) while every item keeps its own flow's slot and
+    /// the run's order. The encoder now reuses the `take_steady_head` dedupe
+    /// list and an O(1) index map instead of re-scanning the run per item —
+    /// the wire bytes must be identical to the old encoder.
+    #[test]
+    fn train_dict_keeps_one_slot_per_flow_and_item_order() {
+        let mut s = R2Stager::new();
+        // One session, three items across two flows, interleaved by flow.
+        s.push(steady(1, 1, b"a1")).unwrap();
+        s.push(steady(1, 2, b"b1")).unwrap();
+        s.push(steady(1, 1, b"a2")).unwrap();
+        let f = s.next_frame(1162).expect("a dict train");
+        let t = r2::decode_train(&f.body).expect("dict train");
+        let got: Vec<(u32, &[u8])> = t.items().collect();
+        assert_eq!(
+            got,
+            vec![
+                (id(1), &b"a1"[..]),
+                (id(2), &b"b1"[..]),
+                (id(1), &b"a2"[..])
+            ],
+            "repeated flows must reuse their dict slot without reordering items"
+        );
     }
 
     #[test]

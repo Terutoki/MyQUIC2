@@ -93,6 +93,20 @@ pub struct FlowBinding {
     /// from the first inline reply / `OPEN|SRC` rebind, so it is the actual
     /// source address (same semantics as today's inline replies).
     reply_src: ArcSwapOption<SocketAddr>,
+    /// Whether the peer confirmed the `OPEN|SRC` frame that taught it
+    /// `reply_src`.
+    ///
+    /// `reply_src` is set when the binding frame is handed to quinn, but a
+    /// QUIC DATAGRAM is unreliable: if that frame is lost the peer never learns
+    /// the source, and a steady (address-less) frame for the same id can never
+    /// be delivered. [`SessionFlows::match_source`] therefore only classifies a
+    /// learned source as `Exact` once this flag is set; until then it keeps
+    /// returning `Rebind`, i.e. every reply re-sends the idempotent `OPEN|SRC`
+    /// (which carries its own payload, so this costs header bytes, not a
+    /// datagram). The peer confirms with `CTL FLOW_ACK`; a binding whose target
+    /// is the exact reply address needs no confirmation because the peer can
+    /// deliver from the target it already knows.
+    reply_src_acked: AtomicBool,
     /// Server side, domain flows: addresses the name resolved to. Used to
     /// decide whether a reply source belongs to this flow (and may be
     /// compressed) before an exact source binding exists.
@@ -113,6 +127,7 @@ impl FlowBinding {
             target,
             state: AtomicU8::new(FlowState::Opening as u8),
             reply_src: ArcSwapOption::const_empty(),
+            reply_src_acked: AtomicBool::new(false),
             resolved: ArcSwap::from_pointee(Vec::new()),
         })
     }
@@ -143,8 +158,26 @@ impl FlowBinding {
         self.state.store(FlowState::Closed as u8, Ordering::Relaxed);
     }
 
+    /// Record the actual reply source of a downlink flow and clear its
+    /// confirmation: the binding frame that teaches the peer this source has
+    /// only been queued to quinn, not acknowledged. Re-sending the same source
+    /// (the idempotent retry path) re-arms the wait, which is harmless: the
+    /// next ACK confirms whichever retransmission reached the peer.
     pub fn set_reply_src(&self, src: SocketAddr) {
         self.reply_src.store(Some(Arc::new(src)));
+        self.reply_src_acked.store(false, Ordering::Relaxed);
+    }
+
+    /// Record that the peer confirmed the `OPEN|SRC` binding frame (it decoded
+    /// the source or rejected the flow).
+    pub fn mark_reply_src_acked(&self) {
+        self.reply_src_acked.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the peer has confirmed the learned reply source.
+    #[must_use]
+    pub fn reply_src_acked(&self) -> bool {
+        self.reply_src_acked.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -265,6 +298,14 @@ impl SessionFlows {
     /// is remembered and resolved only after the scan. Older revisions scanned
     /// the table three times (and re-loaded every `reply_src` on the first
     /// pass) for every incoming reply.
+    ///
+    /// A learned source is only `Exact` once the peer confirmed the binding
+    /// frame (`FLOW_ACK`) or when the binding's target *is* that source (the
+    /// peer can already deliver from the target it knows: an IP flow whose
+    /// reply port never changed). Otherwise the frame must be re-sent as
+    /// `OPEN|SRC`: QUIC DATAGRAMs are unreliable and a lost binding frame
+    /// would otherwise leave every later steady frame for this flow
+    /// undeliverable forever.
     #[must_use]
     pub fn match_source(&self, src: SocketAddr) -> Option<SourceMatch> {
         let mut exact: Option<&Arc<FlowBinding>> = None;
@@ -273,7 +314,16 @@ impl SessionFlows {
             // A learned reply source is the strongest match (covers domain
             // targets and port changes after the first rebind).
             if b.reply_src() == Some(src) {
-                return Some(SourceMatch::Exact(b.clone()));
+                let target_names_src = matches!(&b.target, TargetAddr::Ip(a) if *a == src);
+                if b.reply_src_acked() || target_names_src {
+                    return Some(SourceMatch::Exact(b.clone()));
+                }
+                // Unconfirmed: re-send the idempotent binding frame instead of
+                // compressing a frame the peer may be unable to route.
+                if rebind.is_none() {
+                    rebind = Some(b);
+                }
+                continue;
             }
             if exact.is_none()
                 && let TargetAddr::Ip(a) = &b.target
@@ -294,8 +344,9 @@ impl SessionFlows {
         if let Some(b) = exact {
             return Some(SourceMatch::Exact(b.clone()));
         }
-        // Same-IP different-port, or a domain flow whose resolved address
-        // matches: needs one inline binding frame before compression.
+        // Same-IP different-port, a domain flow whose resolved address matches,
+        // or a learned-but-unconfirmed source: needs one binding frame before
+        // compression.
         rebind.map(|b| SourceMatch::Rebind(b.clone()))
     }
 
@@ -338,10 +389,28 @@ pub enum RegistryError {
 }
 
 /// Per-connection forward table `wire_id -> binding`.
+///
+/// Besides the id map the registry keeps two indexes, both maintained under
+/// the same write lock so they can never drift from `map`:
+///
+/// - `by_session`: `session -> [wire_id]`. `SESS_CLOSE` purging and the server's
+///   reap paths need "every binding of this association"; without the index that
+///   was a full `HashMap::retain` over every binding — expensive for a 7-byte
+///   control frame and repeated three times per association exit. With it the
+///   cost is O(flows of that session), and a close for an unknown session
+///   touches nothing (the common duplicate/forged case).
+/// - `server_flow_count`: lock-free count of server-owned bindings. The client
+///   uplink's `find_server_flow` scan only runs when a server-owned flow could
+///   exist at all; a normal uplink-only client never scans the 4096-entry map.
+///
+/// Both indexes are only mutated by insert/remove paths, all of which hold the
+/// write lock; the count is mirrored into an atomic for the lock-free probe.
 #[derive(Debug)]
 pub struct FlowRegistry {
     cap: usize,
     map: RwLock<HashMap<u32, Arc<FlowBinding>, foldhash::fast::RandomState>>,
+    by_session: RwLock<HashMap<u32, Vec<u32>, foldhash::fast::RandomState>>,
+    server_flow_count: std::sync::atomic::AtomicUsize,
 }
 
 impl FlowRegistry {
@@ -350,6 +419,44 @@ impl FlowRegistry {
         Self {
             cap,
             map: RwLock::new(HashMap::with_hasher(foldhash::fast::RandomState::default())),
+            by_session: RwLock::new(HashMap::with_hasher(foldhash::fast::RandomState::default())),
+            server_flow_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Record `binding` in the session index and the server-owned counter.
+    /// Callers hold the map write lock; the session index has its own lock so a
+    /// purge by session does not serialize against unrelated inserts (both are
+    /// short critical sections, and no path takes them in the other order).
+    fn index_binding(&self, binding: &Arc<FlowBinding>) {
+        self.by_session
+            .write()
+            .entry(binding.session)
+            .or_default()
+            .push(binding.wire_id);
+        if r2::wire_id_server_owned(binding.wire_id) {
+            self.server_flow_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Remove `wire_id` from the session index and update the server-owned
+    /// counter from the binding that was removed.
+    fn unindex_binding(&self, binding: &FlowBinding) {
+        {
+            let mut by_session = self.by_session.write();
+            if let Some(ids) = by_session.get_mut(&binding.session) {
+                if let Some(pos) = ids.iter().position(|id| *id == binding.wire_id) {
+                    ids.swap_remove(pos);
+                }
+                if ids.is_empty() {
+                    by_session.remove(&binding.session);
+                }
+            }
+        }
+        if r2::wire_id_server_owned(binding.wire_id) {
+            self.server_flow_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -396,6 +503,7 @@ impl FlowRegistry {
             return Err(RegistryError::Full);
         }
         map.insert(binding.wire_id, binding.clone());
+        self.index_binding(&binding);
         Ok(binding)
     }
 
@@ -444,6 +552,7 @@ impl FlowRegistry {
             return Err(RegistryError::Conflict);
         }
         map.insert(binding.wire_id, binding.clone());
+        self.index_binding(&binding);
         Ok(binding)
     }
 
@@ -473,14 +582,23 @@ impl FlowRegistry {
     /// client's uplink reuses a flow the server opened for a full-cone /
     /// server-initiated reply source: without it the app's reply would open a
     /// second (client-owned) flow to the same address, losing compression.
-    /// Scans the live map, so it is only for the new-target path, never the
-    /// per-payload path.
+    ///
+    /// The counter probe is lock-free and makes an uplink-only client (the
+    /// common case: no server-owned flows at all) skip the O(registry) scan
+    /// entirely on every new target.
     #[must_use]
     pub fn find_server_flow(
         &self,
         session: u32,
         addr: &TargetAddrRef<'_>,
     ) -> Option<Arc<FlowBinding>> {
+        if self
+            .server_flow_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return None;
+        }
         self.map
             .read()
             .values()
@@ -492,25 +610,88 @@ impl FlowRegistry {
             .cloned()
     }
 
+    /// Number of live server-owned bindings (lock-free probe).
+    #[must_use]
+    pub fn server_flow_count(&self) -> usize {
+        self.server_flow_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Remove and return a binding (close/teardown).
     pub fn remove(&self, wire_id: u32) -> Option<Arc<FlowBinding>> {
-        self.map.write().remove(&wire_id)
+        let mut map = self.map.write();
+        let binding = map.remove(&wire_id)?;
+        self.unindex_binding(&binding);
+        Some(binding)
     }
 
     /// Remove every binding that belongs to `session`, returning how many were
     /// dropped. Used by `SESS_CLOSE` teardown so a closed association cannot
     /// leave receive-only bindings behind until the connection dies.
+    ///
+    /// O(bindings of this session): the per-session index means a duplicate or
+    /// forged `SESS_CLOSE` for an unknown session costs one hash probe, not a
+    /// walk over the whole per-connection table.
     pub fn remove_session(&self, session: u32) -> usize {
+        let ids = match self.by_session.write().remove(&session) {
+            Some(ids) => ids,
+            None => return 0,
+        };
         let mut map = self.map.write();
-        let before = map.len();
-        map.retain(|_, b| b.session != session);
-        before - map.len()
+        let mut removed = 0usize;
+        for wire_id in ids {
+            if let Some(binding) = map.remove(&wire_id) {
+                if r2::wire_id_server_owned(binding.wire_id) {
+                    self.server_flow_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Remove every binding of every `session` in `sessions` under **one** map
+    /// write-lock hold, returning how many were dropped.
+    ///
+    /// The server reap paths (idle/fair-share/session-pool sweeps, reader exit)
+    /// remove a batch of sessions at once; doing so through
+    /// [`Self::remove_session`] per entry paid one write lock and one map walk
+    /// per session. This pays one lock for the whole batch.
+    pub fn remove_sessions(&self, sessions: &[u32]) -> usize {
+        if sessions.is_empty() {
+            return 0;
+        }
+        let indexed: Vec<Vec<u32>> = {
+            let mut by_session = self.by_session.write();
+            sessions
+                .iter()
+                .filter_map(|s| by_session.remove(s))
+                .collect()
+        };
+        let mut map = self.map.write();
+        let mut removed = 0usize;
+        for ids in indexed {
+            for wire_id in ids {
+                if let Some(binding) = map.remove(&wire_id) {
+                    if r2::wire_id_server_owned(binding.wire_id) {
+                        self.server_flow_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// Close every binding and return how many were dropped. Used when the
     /// connection or a session is torn down.
     pub fn clear(&self) -> usize {
         let mut map = self.map.write();
+        self.by_session.write().clear();
+        self.server_flow_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let n = map.len();
         map.clear();
         n
@@ -564,7 +745,30 @@ pub struct CtlState {
     caps: RwLock<Option<Caps>>,
     /// Server side: a valid HELLO for this wire version was seen.
     hello_seen: AtomicBool,
+    /// Rate budget for idempotent-but-costly CTL frames (`SESS_CLOSE`,
+    /// `FLOW_CLOSE`, `FLOW_REJECT`). See [`CTL_MAX_PER_SEC`].
+    ctl_rate: parking_lot::Mutex<CtlRate>,
 }
+
+/// One fixed one-second CTL-observation window.
+#[derive(Debug)]
+struct CtlRate {
+    window_ms: u64,
+    count: u32,
+}
+
+/// Maximum CTL frames one connection may have processed in a one-second
+/// window before the excess is dropped (counted by the caller with the
+/// connection's normal refusal counter).
+///
+/// The rev2 spec requires "control frames have rate/total caps"; before this,
+/// a peer could send `SESS_CLOSE`/`FLOW_CLOSE` at line rate. Those opcodes are
+/// idempotent but not free (even with the O(flows-of-session) purge, every
+/// frame takes the session shard, the stager queue and the reassembler). The
+/// cap is deliberately far above any legitimate control-plane rate (one
+/// `SESS_CLOSE` per association exit ×3, plus an ACK per downlink rebind) and
+/// only exists to stop a CPU-amplification loop.
+pub const CTL_MAX_PER_SEC: u32 = 8_192;
 
 impl Default for CtlState {
     fn default() -> Self {
@@ -578,6 +782,10 @@ impl CtlState {
         Self {
             caps: RwLock::new(None),
             hello_seen: AtomicBool::new(false),
+            ctl_rate: parking_lot::Mutex::new(CtlRate {
+                window_ms: 0,
+                count: 0,
+            }),
         }
     }
 
@@ -598,6 +806,26 @@ impl CtlState {
     #[must_use]
     pub fn hello_seen(&self) -> bool {
         self.hello_seen.load(Ordering::Relaxed)
+    }
+
+    /// Consume one unit of the per-connection CTL rate budget.
+    ///
+    /// Returns `false` when the peer exceeded [`CTL_MAX_PER_SEC`] in the
+    /// current one-second window; the caller then drops the frame and counts
+    /// it as a refusal. The window advances on the first CTL of a new second;
+    /// `now_ms` is the caller's coarse/mono clock and only needs
+    /// second-resolution monotonicity.
+    pub fn ctl_allowed(&self, now_ms: u64) -> bool {
+        let mut rate = self.ctl_rate.lock();
+        if now_ms.saturating_sub(rate.window_ms) >= 1_000 {
+            rate.window_ms = now_ms;
+            rate.count = 0;
+        }
+        if rate.count >= CTL_MAX_PER_SEC {
+            return false;
+        }
+        rate.count += 1;
+        true
     }
 }
 
@@ -723,12 +951,30 @@ mod tests {
             Some(SourceMatch::Rebind(_))
         ));
 
-        // A learned reply source becomes an exact match.
+        // A learned reply source only becomes an exact match once the peer
+        // confirmed the binding frame; before that the server must keep
+        // re-sending the idempotent OPEN|SRC.
         let learned = binding(3, 7, TargetAddr::Ip(v4(88)));
         learned.set_reply_src(v4(89));
-        assert!(flows.insert(learned));
+        assert!(!learned.reply_src_acked());
+        assert!(flows.insert(learned.clone()));
         assert!(matches!(
             flows.match_source(v4(89)),
+            Some(SourceMatch::Rebind(_))
+        ));
+        learned.mark_reply_src_acked();
+        assert!(matches!(
+            flows.match_source(v4(89)),
+            Some(SourceMatch::Exact(_))
+        ));
+
+        // An IP flow whose target is the exact reply source needs no
+        // confirmation: the peer can deliver from the target it already knows.
+        let same = binding(4, 7, TargetAddr::Ip(v4(90)));
+        same.set_reply_src(v4(90));
+        assert!(flows.insert(same));
+        assert!(matches!(
+            flows.match_source(v4(90)),
             Some(SourceMatch::Exact(_))
         ));
     }
@@ -873,10 +1119,82 @@ mod tests {
         assert!(reg.insert(c).is_ok());
         assert_eq!(reg.remove_session(7), 2);
         assert_eq!(reg.len(), 1);
+        // A duplicate/forged close for an unknown session costs one probe and
+        // must not touch the remaining binding.
+        assert_eq!(reg.remove_session(7), 0);
+        assert_eq!(reg.remove_session(9_999), 0);
+        assert_eq!(reg.len(), 1);
         assert!(
             reg.get(reg.map.read().keys().next().copied().unwrap())
                 .is_some()
         );
+        // The index stays consistent for the survivor: a batch remove sees it.
+        assert_eq!(reg.remove_sessions(&[8]), 1);
+        assert_eq!(reg.len(), 0);
+        assert_eq!(reg.clear(), 0);
+    }
+
+    #[test]
+    fn registry_remove_sessions_batches_one_lock() {
+        let reg = FlowRegistry::new(16);
+        for (local, session) in [(1u32, 7u32), (2, 7), (3, 8), (4, 9), (5, 9)] {
+            let b = binding(local, session, TargetAddr::Ip(v4(50 + local as u16)));
+            assert!(reg.insert(b).is_ok());
+        }
+        assert_eq!(reg.remove_sessions(&[7, 9, 42]), 4);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.remove_sessions(&[]), 0);
+        assert_eq!(reg.remove_sessions(&[8]), 1);
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn registry_server_flow_count_and_fast_skip() {
+        let reg = FlowRegistry::new(8);
+        assert_eq!(reg.server_flow_count(), 0);
+        assert!(
+            reg.find_server_flow(7, &TargetAddrRef::Ip(v4(53)))
+                .is_none()
+        );
+        let client = binding(1, 7, TargetAddr::Ip(v4(53)));
+        let server = FlowBinding::new_shared(
+            r2::make_wire_id(2, true).unwrap(),
+            7,
+            TargetAddr::Ip(v4(53)),
+        );
+        assert!(reg.insert(client.clone()).is_ok());
+        assert_eq!(
+            reg.server_flow_count(),
+            0,
+            "client-owned flows are not counted"
+        );
+        assert!(reg.insert(server).is_ok());
+        assert_eq!(reg.server_flow_count(), 1);
+        assert!(
+            reg.find_server_flow(7, &TargetAddrRef::Ip(v4(53)))
+                .is_some()
+        );
+        assert!(reg.remove(client.wire_id).is_some());
+        assert_eq!(reg.server_flow_count(), 1);
+        assert_eq!(reg.remove_session(7), 1);
+        assert_eq!(reg.server_flow_count(), 0);
+        assert!(
+            reg.find_server_flow(7, &TargetAddrRef::Ip(v4(53)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ctl_rate_budget_is_per_second_and_bounded() {
+        let s = CtlState::new();
+        // A full window of CTLs is allowed; the next one is refused.
+        for _ in 0..CTL_MAX_PER_SEC {
+            assert!(s.ctl_allowed(1_000));
+        }
+        assert!(!s.ctl_allowed(1_000));
+        // The next second starts a fresh budget.
+        assert!(s.ctl_allowed(2_000));
+        assert!(s.ctl_allowed(2_001));
     }
 
     #[test]

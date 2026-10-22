@@ -220,6 +220,26 @@ impl SharedEgress {
         EGRESS_MEMO.with(|slots| slots.borrow_mut()[bind.index] = None);
     }
 
+    /// The published handle for `bind`, **without** the freshness/liveness
+    /// gates of [`Self::acquire`].
+    ///
+    /// Exists for the association-exit path: releasing a session's
+    /// connection-scoped state must not depend on winning a refresh window or
+    /// on the generation being ready (an exit inside the handshake window would
+    /// otherwise leak its bindings/staged payloads for the connection's life),
+    /// and the cached handle also names the exact pool slot the association's
+    /// frames left on. Whether the returned connection may carry a datagram is
+    /// still decided at the call site (ready + not closed).
+    pub(crate) fn cached_handle(
+        &self,
+        bind: UdpBind,
+    ) -> Option<(quinn::Connection, Arc<ConnRev2>)> {
+        self.cached[bind.index]
+            .load()
+            .as_ref()
+            .map(|c| (c.conn.clone(), c.rev2.clone()))
+    }
+
     /// Resolve a usable `(connection, limit, stamp)` from the process-wide
     /// cache, refreshing through the single-flight gate when the cached handle
     /// is expired. Returns `None` only when no handle is available, in which
@@ -401,7 +421,12 @@ impl SharedEgress {
                 // limits. `HELLO` itself is sent immediately by the reconnect
                 // loop, so the server-side buffer usually holds nothing.
                 Some(c) if c.close_reason().is_none() => {
-                    let Some(rev2) = slot.rev2() else {
+                    // Coherent pair: the rev2 state is re-checked against the
+                    // still-published connection (see `ConnSlot::rev2_for`), so
+                    // a death+redial between the `shared` load above and this
+                    // read can never pair the old connection with the next
+                    // generation's id tables.
+                    let Some(rev2) = slot.rev2_for(c) else {
                         continue;
                     };
                     match c.max_datagram_size() {

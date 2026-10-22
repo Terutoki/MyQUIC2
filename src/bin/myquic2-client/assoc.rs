@@ -140,6 +140,101 @@ enum AppDgram {
     BreakAssoc,
 }
 
+/// Whether the app-IP pin accepts a datagram source.
+///
+/// Exact equality after [`unmap`] (which folds v4-mapped/translated forms into
+/// IPv4) is the primary rule. On top of it, a **loopback** or **unspecified**
+/// address is equivalent across address families: a dual-stack app may open the
+/// SOCKS control connection over one loopback family (`127.0.0.1` or `[::1]`)
+/// and send its UDP datagrams over the other. Both name this host, and the old
+/// exact comparison silently ignored every datagram — no counter, no log — so
+/// the association appeared up and starved until its 180 s reap.
+pub(crate) fn app_ip_matches(actual: IpAddr, expected: IpAddr) -> bool {
+    let actual = unmap(actual);
+    let expected = unmap(expected);
+    if actual == expected {
+        return true;
+    }
+    (actual.is_loopback() && expected.is_loopback())
+        || (actual.is_unspecified() && expected.is_unspecified())
+}
+
+/// Full source-address equivalence for the association's first-source lock:
+/// the same family-tolerant rule as [`app_ip_matches`] plus the same port (a
+/// different port is a different socket, i.e. the hijack case the lock exists
+/// for).
+fn same_app_source(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port() && app_ip_matches(a.ip(), b.ip())
+}
+
+/// Book one refused app datagram and emit a rate-limited debug line.
+///
+/// Every app-datagram reject path used to be debug-only (or silent): the
+/// framing rejects in particular, where `FRAG != 0` is legal SOCKS5 the proxy
+/// does not implement, so a locally fragmenting app saw complete UDP failure
+/// with no counter and no log line. The app controls the rate, so the line is
+/// rate-limited (one per window, with the window's suppressed count available
+/// through the existing helper) and the payload detail is built only when it is
+/// emitted.
+fn refuse_app_dgram(what: &'static str, detail: impl FnOnce() -> String) {
+    let n = dgram_drops::bump(&dgram_drops::REFUSED);
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NEVER_LOGGED);
+    static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()).is_some() {
+        tracing::debug!(
+            "udp assoc datagram dropped ({what}): {n} so far{}",
+            detail()
+        );
+    }
+}
+
+/// Validate one SOCKS5 UDP datagram's framing and return its target plus the
+/// payload offset, or `None` after booking the drop.
+///
+/// Framing: `RSV | FRAG | ATYP | ADDR | PORT | payload`. Split out of
+/// [`AppDgramCtx::process`] so every reject arm is unit-testable without a live
+/// association (and so the accounting cannot drift between them).
+pub(crate) fn socks_udp_frame<'a>(sess: u32, msg: &'a [u8]) -> Option<(TargetAddrRef<'a>, usize)> {
+    if msg.len() < 4 {
+        refuse_app_dgram("short SOCKS5 UDP header", || {
+            format!("; association {sess}, {} B", msg.len())
+        });
+        return None;
+    }
+    if msg[0] != 0 || msg[1] != 0 {
+        refuse_app_dgram("bad SOCKS5 UDP reserved bytes", || {
+            format!("; association {sess}, RSV={:#04x}", msg[0])
+        });
+        return None;
+    }
+    if msg[2] != 0 {
+        // FRAG != 0 is RFC 1928-legal; a proxy may refuse it (§7), but the
+        // refusal must be observable: the client advertises no fragmentation
+        // support, so the app's only signal is this drop (counted above).
+        refuse_app_dgram("SOCKS5 UDP fragmentation unsupported", || {
+            format!("; association {sess}, FRAG={}", msg[2])
+        });
+        return None;
+    }
+    let (addr, hdr_len) = match TargetAddrRef::decode(&msg[3..]) {
+        Ok(x) => x,
+        Err(_) => {
+            refuse_app_dgram("bad SOCKS5 UDP target address", || {
+                format!("; association {sess}")
+            });
+            return None;
+        }
+    };
+    let payload_off = 3 + hdr_len;
+    if payload_off > msg.len() {
+        refuse_app_dgram("truncated SOCKS5 UDP target address", || {
+            format!("; association {sess}")
+        });
+        return None;
+    }
+    Some((addr, payload_off))
+}
+
 /// Mutable association state the per-datagram body reads and writes, bundled so
 /// the awaited head (`recv_from` into `buf`) and the zero-copy burst arm
 /// ([`with_burst_msg`]) share exactly one body.
@@ -210,11 +305,16 @@ impl AppDgramCtx<'_> {
             return AppDgram::Continue;
         }
         // Pin the source IP: any host that can reach the relay port could
-        // otherwise become "the app" and steal all replies.
+        // otherwise become "the app" and steal all replies. The match is
+        // family-tolerant for loopback/unspecified addresses (a dual-stack app
+        // may use the other loopback family for UDP) and the reject is counted
+        // and rate-limit logged instead of being invisible.
         if let Some(expected) = expected_app_ip
-            && unmap(app.ip()) != expected
+            && !app_ip_matches(app.ip(), expected)
         {
-            tracing::debug!("udp assoc {sess}: datagram from unauthorized app {app} ignored");
+            refuse_app_dgram("unauthorized app source", || {
+                format!("; association {sess}, from {app}, expected {expected}")
+            });
             return AppDgram::Continue;
         }
         // The coarse epoch: this value feeds the 1 s liveness throttle and the
@@ -231,34 +331,31 @@ impl AppDgramCtx<'_> {
         // then went to that sender, the legitimate app's datagrams were dropped
         // as a "changed source", and because dropped packets deliberately do
         // not touch the liveness stamp the association also starved to death at
-        // 180 s. Only a well-formed RSV/FRAG + address frame may lock.
-        if msg.len() < 4 || msg[0] != 0 || msg[1] != 0 || msg[2] != 0x00 {
+        // 180 s. Only a well-formed RSV/FRAG + address frame may lock. Every
+        // reject arm books a drop (`REFUSED`, the closest existing class: the
+        // datagram is refused, not truncated) plus a rate-limited debug line.
+        let Some((addr, payload_off)) = socks_udp_frame(sess, msg) else {
             return AppDgram::Continue;
-        }
-        // Single decode: reuse header length for the payload offset.
-        let (addr, hdr_len) = match TargetAddrRef::decode(&msg[3..]) {
-            Ok((a, n)) => (a, n),
-            Err(_) => return AppDgram::Continue,
         };
-        let payload_off = 3 + hdr_len;
-        if payload_off > msg.len() {
+        let payload = &msg[payload_off..];
+        // Lock to the first app address: IP-only pinning would let a different
+        // socket on the same host (same IP, another port) take over the
+        // association and steal its replies. A legitimate client uses one UDP
+        // socket per association, so its source never changes; a changed source
+        // is a hijack attempt, not a rebinding, and is ignored instead of
+        // published — before the liveness stamp below, so dropped packets cannot
+        // keep a dead association alive. The comparison is family-tolerant for
+        // loopback/unspecified addresses (see [`same_app_source`]) so a
+        // dual-stack app is not locked out of its own association.
+        if let Some(first) = *published_app
+            && !same_app_source(first, app)
+        {
+            refuse_app_dgram("changed app source", || {
+                format!("; association {sess}, from {app}, locked to {first}")
+            });
             return AppDgram::Continue;
         }
-        let payload = &msg[payload_off..];
-        if *published_app != Some(app) {
-            // Lock to the first app address: IP-only pinning would let a
-            // different socket on the same host (same IP, another port) take
-            // over the association and steal its replies. A legitimate client
-            // uses one UDP socket per association, so its source never changes;
-            // a changed source is a hijack attempt, not a rebinding, and is
-            // ignored instead of published — before the liveness stamp below,
-            // so dropped packets cannot keep a dead association alive.
-            if let Some(first) = *published_app {
-                tracing::debug!(
-                    "udp assoc {sess}: datagram from {app} ignored (locked to {first})"
-                );
-                return AppDgram::Continue;
-            }
+        if published_app.is_none() {
             entry.app.store(Some(Arc::new(app)));
             *published_app = Some(app);
         }
@@ -672,14 +769,13 @@ pub(crate) async fn udp_associate_inner(
     // teardown.
     if let Some(b) = bind {
         drain_assoc_stage(&egress_shared, &pool, b);
-        // Best-effort session teardown on the rev2 control plane: three
-        // `CTL SESS_CLOSE` datagrams on the association's current egress
-        // connection, so the server can reclaim the session immediately instead
-        // of waiting for its 180 s idle sweep. Loss is harmless (idempotent
-        // frame, the sweep is the backstop); a missing egress is not an error
-        // here.
-        send_sess_close(&egress_shared, &pool, b, sess);
     }
+    // Session teardown runs even when no egress handle was ever acquired or the
+    // generation is still in its handshake window: the local half (registry
+    // bindings + staged payloads + the pending close notification) must not
+    // wait for `is_ready()`/a refresh, and only the best-effort `SESS_CLOSE`
+    // datagram is conditional on a negotiated, live connection (LOGIC-8).
+    send_sess_close(&egress_shared, &pool, bind, sess, uplink.epoch);
     assoc_recycle_buf(buf);
     Ok(())
 }

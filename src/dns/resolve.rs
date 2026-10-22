@@ -30,10 +30,15 @@
 //!   caches them. Negative verdicts are per name too: a dead name is dead for
 //!   all ports, so port-diverse traffic to it learns the verdict once instead
 //!   of once per port (each learning holding a `dns_slow_path_limiter` permit
-//!   for the lookup budget).
+//!   for the lookup budget). A cached set retains at most
+//!   [`DNS_CACHE_MAX_ADDRS`] addresses in preferred-family-first order: the
+//!   cache is bounded in entries, not bytes, and a hostile authoritative server
+//!   can answer with thousands of records.
 //! - **upstream**: hickory, cancellable, with its internal response cache
 //!   disabled — the caches above are the only TTL authority (see
-//!   [`upstream_resolver`]).
+//!   [`upstream_resolver`]). When hickory cannot be built, the blocking
+//!   `getaddrinfo` fallback runs under its own permit set so the timeout's
+//!   inability to cancel it does not unbound live resolver threads.
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -44,8 +49,10 @@ use anyhow::{Context, Result};
 use super::key::{
     DNS_HOST_KEY_BUF, DNS_KEY_BUF, dns_host_key, dns_host_key_owned, dns_key, dns_key_owned,
 };
-use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, neg_epoch};
-use super::store::{DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, negatives, positives};
+use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, memo_put_with_epoch, neg_epoch};
+use super::store::{
+    DNS_CACHE_MAX_ADDRS, DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, negatives, positives,
+};
 use crate::coarse_millis;
 
 /// Serializes the few cache tests that assert on a *negative* thread memo or
@@ -180,20 +187,76 @@ async fn resolve_ips(host: &str, port: u16, timeout: Duration) -> Result<Vec<IpA
                 lookup.iter().collect()
             }
             // The platform DNS configuration could not be read (see
-            // `upstream_resolver`): degrade to the previous blocking
-            // `getaddrinfo` path instead of losing name resolution entirely.
+            // `upstream_resolver`): degrade to the blocking `getaddrinfo` path
+            // instead of losing name resolution entirely. That path is bounded
+            // by its own permit set, because its work cannot be cancelled by
+            // the timeout wrapping this future (see [`getaddrinfo_ips`]).
             Err(why) => {
                 tracing::debug!("hickory resolver unavailable ({why}); using getaddrinfo");
-                tokio::net::lookup_host((host, port))
-                    .await?
-                    .map(|sa| sa.ip())
-                    .collect()
+                getaddrinfo_ips(host, port).await?
             }
         };
         Ok::<Vec<IpAddr>, anyhow::Error>(ips)
     })
     .await
     .context("dns lookup timed out")??;
+    Ok(ips)
+}
+
+/// Permits for the blocking `getaddrinfo` fallback.
+///
+/// One permit owns one Tokio blocking-pool thread for the whole libc resolver
+/// call. The outer [`DNS_LOOKUP_TIMEOUT`] cannot stop that call: dropping the
+/// future detaches the `spawn_blocking` closure (dropping a `JoinHandle` does
+/// not abort it), so a permit released on future-drop would let a timed-out
+/// caller start another libc resolve while the previous one still runs — the
+/// limiter would then bound *waiters*, not live resolver work. The permit is
+/// therefore acquired inside the blocking closure and released only when the
+/// thread returns.
+pub(crate) const DNS_BLOCKING_FALLBACK_PERMITS: usize = 128;
+
+/// Process-wide permit set for [`getaddrinfo_ips`]. See
+/// [`DNS_BLOCKING_FALLBACK_PERMITS`] for why the permit must outlive the
+/// future.
+fn dns_blocking_fallback_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIM.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(DNS_BLOCKING_FALLBACK_PERMITS))
+    })
+}
+
+/// Resolve `(host, port)` through the platform's blocking `getaddrinfo`,
+/// bounded by [`DNS_BLOCKING_FALLBACK_PERMITS`].
+///
+/// Runs in a `spawn_blocking` closure because `ToSocketAddrs` is synchronous.
+/// The permit is taken *inside* that closure so it is held until the libc call
+/// actually returns, not until this future is dropped: the caller's timeout can
+/// abandon this future while the thread keeps running, and the bound has to
+/// cover the thread. Exhaustion fails fast with a clear error instead of letting
+/// the blocking pool grow to `max_blocking_threads`; the failure is then
+/// single-flighted/negatively cached by the callers like any other lookup
+/// failure.
+async fn getaddrinfo_ips(host: &str, port: u16) -> Result<Vec<IpAddr>> {
+    use std::net::ToSocketAddrs as _;
+    let host = host.to_owned();
+    let limiter = std::sync::Arc::clone(dns_blocking_fallback_limiter());
+    let ips = tokio::task::spawn_blocking(move || -> Result<Vec<IpAddr>> {
+        let _permit = limiter.try_acquire_owned().map_err(|_| {
+            anyhow::anyhow!(
+                "dns getaddrinfo fallback saturated ({DNS_BLOCKING_FALLBACK_PERMITS} blocking \
+                 resolvers already running)"
+            )
+        })?;
+        let ips: Vec<IpAddr> = (host.as_str(), port)
+            .to_socket_addrs()
+            .context("getaddrinfo")?
+            .map(|sa| sa.ip())
+            .collect();
+        Ok(ips)
+    })
+    .await
+    .context("getaddrinfo task join")??;
     Ok(ips)
 }
 
@@ -216,10 +279,16 @@ fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts)
 
 /// Process-wide upstream resolver, built once from the platform's own DNS
 /// configuration: resolv.conf on Linux/OpenWrt, the System Configuration
-/// dynamic store on macOS. Unlike `getaddrinfo` on the tokio blocking pool,
-/// its lookups are cancellable async futures, so the `timeout` wrapper above
-/// actually stops the work instead of leaving a blocking thread to finish it
-/// after the caller gave up.
+/// dynamic store on macOS. Its lookups are cancellable async futures, so the
+/// `timeout` wrapper around the caller actually stops the work instead of
+/// leaving a thread to finish it after the caller gave up.
+///
+/// The *fallback* when this resolver cannot be built is the blocking
+/// `getaddrinfo` path ([`getaddrinfo_ips`]), which the same timeout cannot
+/// cancel. That fallback therefore has its own permit set
+/// ([`DNS_BLOCKING_FALLBACK_PERMITS`]) held until the blocking thread returns,
+/// so a failed hickory init cannot turn the DNS budget into an unbounded number
+/// of live libc resolver calls.
 ///
 /// Its internal response cache is disabled (see
 /// [`configure_resolver_options`]): the moka caches above ([`DNS_CACHE_TTL`]
@@ -451,23 +520,41 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // per-datagram task rate). The deadline cannot outlive the shared entry:
     // it is derived from the entry's own insertion instant, which the negative
     // cache stores for exactly this reason.
+    //
+    // The epoch is sampled **before** the probe. A concurrent success removes
+    // the negative entry and bumps `NEG_EPOCH`; if this write sampled the epoch
+    // afterwards (as `memo_put` does) it would tag the just-read verdict with
+    // the new epoch, the fast path would trust it as current, and this thread
+    // would keep refusing a name that now resolves for up to `DNS_NEG_TTL`.
+    // `memo_put_with_epoch` re-checks the epoch at publication and drops the
+    // write if it moved; the shared caches stay the authority either way.
+    let epoch_before_probe = neg_epoch();
     if let Some(inserted_at) = negatives().get(host_key).await {
         let remaining = DNS_NEG_TTL.saturating_sub(inserted_at.elapsed());
-        memo_put(memo_key, None, Instant::now() + remaining);
+        let _written = memo_put_with_epoch(
+            memo_key,
+            None,
+            Instant::now() + remaining,
+            epoch_before_probe,
+        );
         anyhow::bail!("dns negative cached");
     }
     let outcome = positives()
         .try_get_with_by_ref(host_key, async {
             match resolve_ips(host, port, DNS_LOOKUP_TIMEOUT).await {
-                Ok(mut ips) => {
+                Ok(ips) => {
                     let now = Instant::now();
                     // The cache's invariant: every stored set is ordered with
                     // the configured preferred family first (the resolver's own
                     // order within a family is kept by the stable sort), so a
                     // hit for another port hands back the same order a fresh
-                    // resolution would.
-                    let pref = ip_preference();
-                    ips.sort_by_key(|ip| pref.sort_key_ip(*ip));
+                    // resolution would. The retained set is then capped: a DNS
+                    // answer can carry thousands of A/AAAA records (a truncated
+                    // UDP answer is retried over TCP), and the cache is bounded
+                    // in entries, not bytes (`store::DNS_CACHE_MAX_ADDRS`).
+                    // Every consumer uses at most 16 addresses, so the cap
+                    // bounds memory without changing which address leads.
+                    let ips = prepare_cache_ips(ips);
                     let ips: Arc<[IpAddr]> = Arc::from(ips);
                     // A success clears the negative entry (the name resolves
                     // now) and bumps the epoch so other threads' stale
@@ -497,6 +584,22 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         Ok((inserted, ips)) => Ok(materialize_cached(memo_key, inserted, &ips, port)),
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
+}
+
+/// Order a resolved answer preferred-family-first and cap what the positive
+/// cache retains ([`DNS_CACHE_MAX_ADDRS`]).
+///
+/// The order is part of the cache's contract: every stored set is ordered with
+/// the configured preferred family first (the resolver's own order within a
+/// family is kept by the stable sort), so a hit for another port hands back the
+/// same order a fresh resolution would. The cap bounds the cache's bytes — it
+/// is capacity-bounded in entries only — while keeping the head of that order,
+/// which is the only part any consumer reads first.
+fn prepare_cache_ips(mut ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let pref = ip_preference();
+    ips.sort_by_key(|ip| pref.sort_key_ip(*ip));
+    ips.truncate(DNS_CACHE_MAX_ADDRS);
+    ips
 }
 
 /// Attach the caller's port to a cached, port-free address set and warm this
@@ -608,7 +711,7 @@ pub async fn dns_cache_seed_set(host: &str, port: u16, addrs: &[SocketAddr]) {
 async fn seed_positive(
     host: &str,
     port: u16,
-    ips: Vec<IpAddr>,
+    mut ips: Vec<IpAddr>,
     memo_addr: Option<SocketAddr>,
     age: Duration,
 ) {
@@ -616,6 +719,9 @@ async fn seed_positive(
     let memo_key = dns_key_owned(host, port);
     let now = Instant::now();
     let inserted = now.checked_sub(age).unwrap_or(now);
+    // Keep the test-only seeds under the same retained-set bound as production
+    // inserts (the invariant is what the cache and its readers assume).
+    ips.truncate(DNS_CACHE_MAX_ADDRS);
     positives()
         .insert(host_key.clone(), (inserted, Arc::from(ips)))
         .await;
@@ -639,8 +745,15 @@ async fn seed_positive(
 /// contention window that no longer exists).
 async fn record_negative(host_key: &str, memo_key: &str) {
     let now = Instant::now();
+    // Sample the epoch before publishing the shared verdict, then fence the
+    // thread-memo write on it: an unrelated success that bumps `NEG_EPOCH` in
+    // between must not produce a memo tagged as newer than the entry it was
+    // derived from (see `memo_put_with_epoch`). A dropped write only costs this
+    // thread one slow-path probe on its next lookup; the shared negative entry
+    // is still the authority for every port.
+    let epoch = neg_epoch();
     negatives().insert(host_key.to_owned(), now).await;
-    memo_put(memo_key, None, now + DNS_NEG_TTL);
+    let _ = memo_put_with_epoch(memo_key, None, now + DNS_NEG_TTL, epoch);
 }
 
 /// Accept `IP:port` or `hostname:port` for the QUIC server address.
@@ -1050,5 +1163,132 @@ mod tests {
             .expect("waiter joins");
         assert_eq!(v, 2, "the waiter's own init must have run");
         drop(release_tx);
+    }
+
+    /// The cache is `DNS_CACHE_MAX` *entries*; a positive entry's value is
+    /// attacker-sized unless it is capped. A hostile authoritative server can
+    /// return thousands of A/AAAA records (truncated UDP → TCP retry), so the
+    /// retained set must be the capped, preferred-family-first prefix — never
+    /// the whole answer.
+    #[test]
+    fn cache_prefix_keeps_preferred_family_and_caps_the_retained_set() {
+        let v6: Vec<IpAddr> = (1..=40u16)
+            .map(|i| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
+            .collect();
+        let v4: Vec<IpAddr> = (1..=40u8)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)))
+            .collect();
+        let out = prepare_cache_ips([v4.clone(), v6.clone()].concat());
+        assert_eq!(
+            out.len(),
+            DNS_CACHE_MAX_ADDRS,
+            "a {}-record answer must be capped at {DNS_CACHE_MAX_ADDRS}",
+            v4.len() + v6.len()
+        );
+        assert!(
+            out.iter().all(IpAddr::is_ipv6),
+            "the default preference keeps the IPv6 prefix ahead of IPv4"
+        );
+        assert_eq!(&out[..], &v6[..DNS_CACHE_MAX_ADDRS]);
+        // And a small answer keeps every record, in the same order.
+        let small = prepare_cache_ips(vec![v6[0], v4[0]]);
+        assert_eq!(&small[..], &[v6[0], v4[0]]);
+    }
+
+    /// The seeding helpers must obey the same retained-set invariant as the
+    /// production insert: a test/binary that seeds a huge answer must not be
+    /// able to put an uncapped set in the cache.
+    #[tokio::test]
+    async fn seeded_name_retains_at_most_the_cap() {
+        let host = "many-records.resolve.test";
+        let port = 19_811u16;
+        let addrs: Vec<SocketAddr> = (1..=(DNS_CACHE_MAX_ADDRS + 8))
+            .map(|i| SocketAddr::from(([203, 0, 113, (i % 250 + 1) as u8], port)))
+            .collect();
+        dns_cache_seed_set(host, port, &addrs).await;
+        let got = resolve_all_cached(host, port).await.expect("seeded hit");
+        assert_eq!(got.len(), DNS_CACHE_MAX_ADDRS, "the seed must be capped");
+        assert_eq!(
+            &got[..],
+            &addrs[..DNS_CACHE_MAX_ADDRS],
+            "the retained prefix keeps its order (and each address its caller port)"
+        );
+        assert_eq!(
+            positives().get(host).await.expect("entry present").1.len(),
+            DNS_CACHE_MAX_ADDRS
+        );
+    }
+
+    /// LOGIC-7 regression: the thread-memo epoch must be sampled *before* the
+    /// negative-cache probe. If a concurrent success bumps the epoch between the
+    /// probe and the memo write, the write must be refused — otherwise the fast
+    /// path would trust a stale negative entry that was tagged with the newer
+    /// epoch and keep refusing a name that now resolves for `DNS_NEG_TTL`.
+    #[tokio::test]
+    async fn negative_memo_write_is_refused_when_the_epoch_moved() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
+        let key = dns_key_owned("epoch-race.resolve.test", 19_812);
+        assert!(memo_peek_both(&key).1.is_none(), "premise: cold memo slot");
+
+        // The epoch at the negative-cache probe…
+        let epoch_at_probe = neg_epoch();
+        // …then a concurrent success removes the negative entry and bumps it…
+        bump_neg_epoch();
+        // …so the memo write must be dropped instead of tagged as current.
+        assert!(
+            !memo_put_with_epoch(&key, None, Instant::now() + DNS_NEG_TTL, epoch_at_probe),
+            "a negative memo tagged with a superseded epoch must not be written"
+        );
+        assert!(
+            memo_peek_both(&key).1.is_none(),
+            "the fast path must fall through to the shared caches, not serve the stale verdict"
+        );
+
+        // With the current epoch the same write is accepted (the non-race path).
+        assert!(memo_put_with_epoch(
+            &key,
+            None,
+            Instant::now() + DNS_NEG_TTL,
+            neg_epoch()
+        ));
+        assert!(memo_peek_both(&key).1.is_some());
+
+        // `memo_put` keeps serving callers that do not hold a pre-probe epoch
+        // (it samples the epoch at write time).
+        let plain = dns_key_owned("epoch-plain.resolve.test", 19_812);
+        memo_put(&plain, None, Instant::now() + DNS_NEG_TTL);
+        assert!(memo_peek_both(&plain).1.is_some());
+    }
+
+    /// LOGIC-10: the blocking fallback cannot be cancelled by the lookup
+    /// timeout, so its permits must bound *live libc resolver threads*. Pin the
+    /// permit count and the fail-fast behaviour: holding every permit must make
+    /// the next acquisition fail (that is the error the blocking closure
+    /// returns), not queue.
+    #[test]
+    fn blocking_fallback_permits_bound_live_resolvers() {
+        assert_eq!(
+            DNS_BLOCKING_FALLBACK_PERMITS, 128,
+            "the charged/bounded fallback size is part of the contract"
+        );
+        let lim = dns_blocking_fallback_limiter();
+        let available = lim.available_permits();
+        assert!(
+            available <= DNS_BLOCKING_FALLBACK_PERMITS,
+            "the limiter can never hold more than the documented permits"
+        );
+        // Hold everything this process currently has; the next try must fail
+        // fast instead of parking a caller behind the blocking pool.
+        let mut held = Vec::with_capacity(available);
+        while let Ok(permit) = lim.clone().try_acquire_owned() {
+            held.push(permit);
+        }
+        assert_eq!(held.len(), available);
+        assert!(
+            lim.clone().try_acquire_owned().is_err(),
+            "an exhausted fallback must fail fast"
+        );
+        drop(held);
+        assert!(lim.available_permits() >= available, "permits are returned");
     }
 }

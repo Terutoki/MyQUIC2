@@ -3,9 +3,13 @@ use super::*;
 
 /// Rate limit for the per-connection stream-share refusal line (1/s, with a
 /// suppressed count, like the other per-flow abort logs).
+///
+/// The slot starts at [`NEVER_LOGGED`], not `0`: the mono epoch starts at
+/// process start, so a `0`-initialised slot swallows the first second — exactly
+/// the startup/reconnect burst these lines exist for.
 pub(crate) fn warn_stream_share_refused() -> bool {
     use std::sync::atomic::AtomicU64;
-    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_LOGGED);
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
     match claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()) {
         None => false,
@@ -21,7 +25,7 @@ pub(crate) fn warn_stream_share_refused() -> bool {
 /// Rate limit for "refusing new connection" logs under a flood.
 pub(crate) fn warn_once_per_sec() -> bool {
     use std::sync::atomic::AtomicU64;
-    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_LOGGED);
     claim_log_window(&LAST, mono_millis())
 }
 
@@ -30,7 +34,7 @@ pub(crate) fn warn_once_per_sec() -> bool {
 /// storm must not silence the connection-limit warning, and vice versa.
 pub(crate) fn warn_sess_create_failed() -> bool {
     use std::sync::atomic::AtomicU64;
-    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(NEVER_LOGGED);
     claim_log_window(&LAST, mono_millis())
 }
 
@@ -156,6 +160,14 @@ pub(crate) fn spawn_udp_reporter() {
         let mut prev_d = dgram_drops::snapshot();
         loop {
             tick.tick().await;
+            // Flush this thread's pending batched rev2 reply-frame counts into
+            // the shared statics, the same way `udp_stats::snapshot` flushes its
+            // caller's cells: the reporter task runs on a runtime worker, and a
+            // pending count there would otherwise stay invisible until the
+            // 256-record threshold. The bounded-visibility model (a count on
+            // another worker becomes visible at its next flush) is the same one
+            // `udp_stats` documents.
+            r2_stats::flush_thread();
             let now = udp_stats::snapshot();
             let now_w = udp_write::snapshot();
             let d = now.since(&prev);

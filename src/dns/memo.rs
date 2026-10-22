@@ -120,7 +120,19 @@ impl DnsMemoSlot {
     };
 
     /// A slot for `key`, or `None` when it is too long to store inline.
-    fn new(key: &str, hash: u64, addr: Option<SocketAddr>, expires: Instant) -> Option<Self> {
+    ///
+    /// `neg_epoch` is the epoch a **negative** slot is tagged with; positive
+    /// slots ignore it (0) because their own deadline bounds them. The caller
+    /// decides which epoch to tag: [`memo_put`] samples it at write time, while
+    /// [`memo_put_with_epoch`] passes an epoch sampled *before* the negative
+    /// cache probe so a concurrent success cannot re-tag a stale verdict.
+    fn new(
+        key: &str,
+        hash: u64,
+        addr: Option<SocketAddr>,
+        expires: Instant,
+        neg_epoch: u64,
+    ) -> Option<Self> {
         if key.len() > MEMO_KEY_BYTES {
             return None;
         }
@@ -133,7 +145,7 @@ impl DnsMemoSlot {
         s.expires_ms = coarse_deadline(expires);
         // Only a negative slot needs the tag: a positive hit is never
         // invalidated by the epoch (its own deadline bounds it).
-        s.neg_epoch = if addr.is_none() { neg_epoch() } else { 0 };
+        s.neg_epoch = if addr.is_none() { neg_epoch } else { 0 };
         Some(s)
     }
 
@@ -220,14 +232,67 @@ pub(crate) fn memo_peek_both(key: &str) -> (Option<MemoHit>, Option<MemoHit>) {
 /// Insert into the set, promoting to way 0 and demoting the previous way 0.
 /// A write is two `Copy`s of an inline struct: no allocation and no key
 /// `String`, which is why the slot stores key bytes rather than a `Box<str>`.
+///
+/// A **negative** write samples [`neg_epoch`] at write time (the historical
+/// behaviour). Callers that read the negative cache *before* writing should use
+/// [`memo_put_with_epoch`] instead: if a concurrent success removed that
+/// negative entry and bumped the epoch between the read and this write, the slot
+/// would be tagged with the *new* epoch and the fast path would trust it as
+/// current — refusing a name that now resolves for up to `DNS_NEG_TTL`.
 pub(crate) fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
+    let epoch = if addr.is_none() { neg_epoch() } else { 0 };
+    let _ = memo_store(key, addr, expires, epoch, None);
+}
+
+/// Epoch-fenced negative insert: write a **negative** memo only while the global
+/// epoch is still `expected_epoch`, sampled by the caller *before* it probed the
+/// shared negative cache.
+///
+/// Returns `true` when the slot was written. `false` means a concurrent success
+/// bumped the epoch between the caller's negative-cache probe and this write, so
+/// the verdict the caller is about to record may already be stale: the write is
+/// dropped and the fast path stays a miss (the async path re-probes the shared
+/// caches, which are the authority). A positive `addr` is never fenced — its own
+/// deadline is the bound.
+pub(crate) fn memo_put_with_epoch(
+    key: &str,
+    addr: Option<SocketAddr>,
+    expires: Instant,
+    expected_epoch: u64,
+) -> bool {
+    if addr.is_some() {
+        return memo_store(key, addr, expires, 0, None);
+    }
+    if neg_epoch() != expected_epoch {
+        return false;
+    }
+    memo_store(key, addr, expires, expected_epoch, Some(expected_epoch))
+}
+
+/// Shared single-slot write. `epoch_guard` is `Some(e)` for an epoch-fenced
+/// negative write: the epoch is re-read inside the thread-local borrow, after
+/// the slot has been built but immediately before it is published, so a bump
+/// that lands after the caller's probe still refuses the write.
+fn memo_store(
+    key: &str,
+    addr: Option<SocketAddr>,
+    expires: Instant,
+    epoch: u64,
+    epoch_guard: Option<u64>,
+) -> bool {
     let hash = dns_memo_hash(key);
     let set = dns_memo_set(hash);
-    let Some(slot) = DnsMemoSlot::new(key, hash, addr, expires) else {
-        return; // too long for an inline slot: stays a cache-path-only name
+    let Some(slot) = DnsMemoSlot::new(key, hash, addr, expires, epoch) else {
+        // Too long for an inline slot: a miss, never a mis-serve.
+        return false;
     };
     DNS_MEMO.with(|c| {
         let mut c = c.borrow_mut();
+        if let Some(expected) = epoch_guard
+            && neg_epoch() != expected
+        {
+            return false;
+        }
         let ways = &mut c[set];
         if ways[0].matches(hash, key) {
             // Same key already newest: overwrite in place (its address or TTL
@@ -243,7 +308,8 @@ pub(crate) fn memo_put(key: &str, addr: Option<SocketAddr>, expires: Instant) {
             ways[1] = ways[0];
             ways[0] = slot;
         }
-    });
+        true
+    })
 }
 
 /// Translate an `Instant` deadline into the [`coarse_millis`] epoch.

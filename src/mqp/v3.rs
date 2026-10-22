@@ -139,17 +139,27 @@ fn put_varint(out: &mut Vec<u8>, mut n: u32) {
 
 fn get_varint(b: &[u8], off: &mut usize) -> Result<usize, MqpError> {
     let mut value = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
+    for i in 0..5u32 {
         let byte = *b
             .get(*off)
             .ok_or(MqpError::Malformed("truncated train varint"))?;
         *off += 1;
-        value |= u32::from(byte & 0x7F).wrapping_shl(shift);
+        if i == 4 {
+            // Only the low four bits fit at shift 28: a continuation bit or
+            // any higher payload bit means the value overflowed a u32. The
+            // rev2 codec rejects this too; accepting it silently truncated the
+            // length (wrapping shift) and made the old-v3 decoder disagree
+            // with a conforming encoder on hostile input.
+            if byte & 0xF0 != 0 {
+                return Err(MqpError::Malformed("train varint overflow"));
+            }
+            value |= u32::from(byte) << 28;
+            return Ok(value as usize);
+        }
+        value |= u32::from(byte & 0x7F) << (7 * i);
         if byte & 0x80 == 0 {
             return Ok(value as usize);
         }
-        shift += 7;
     }
     Err(MqpError::Malformed("train varint too long"))
 }
@@ -1118,5 +1128,30 @@ mod tests {
         assert_eq!(varint_len(128), 2);
         assert_eq!(varint_len(16383), 2);
         assert_eq!(varint_len(16384), 3);
+    }
+
+    /// Hostile-input hardening: a 5-byte LEB128 whose fifth byte sets any bit
+    /// above the four that fit in a u32 must be rejected, not silently
+    /// truncated by a wrapping shift. The largest legal value still decodes.
+    #[test]
+    fn varint_rejects_overflow_instead_of_truncating() {
+        let mut off = 0;
+        assert!(
+            get_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F], &mut off).is_err(),
+            "5th byte 0x7F overflows a u32"
+        );
+        let mut off = 0;
+        assert!(
+            get_varint(&[0x80, 0x80, 0x80, 0x80, 0x10], &mut off).is_err(),
+            "5th byte 0x10 overflows a u32"
+        );
+        let mut off = 0;
+        assert_eq!(
+            get_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F], &mut off).unwrap(),
+            u32::MAX as usize,
+            "the largest legal u32 still decodes"
+        );
+        let mut off = 0;
+        assert_eq!(get_varint(&[0x80, 0x01], &mut off).unwrap(), 128);
     }
 }

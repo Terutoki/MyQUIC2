@@ -87,6 +87,41 @@ impl ConnSlot {
         self.rev2.load().as_ref().cloned()
     }
 
+    /// The rev2 state of `conn`'s generation, read **coherently** with the
+    /// connection handle.
+    ///
+    /// `shared` and `rev2` are two separate publications, so a handle obtained
+    /// earlier (a `wait_conn` return, an egress-cache load) can be stale by the
+    /// time `rev2()` is read: a death + redial in between would pair the old
+    /// connection with the *next* generation's id tables, and wire ids restart
+    /// from 1 on every dial, so a buffered old-generation frame could resolve
+    /// against an unrelated live binding.
+    ///
+    /// This re-checks that the slot still publishes `conn` (by `stable_id`)
+    /// after loading the state, and that no generation bump happened across the
+    /// read. Either mismatch means "read again", never a pair.
+    ///
+    /// The re-check is sound because of the publication order: `set_rev2` runs
+    /// only while the slot is empty (the previous generation was retired
+    /// first), then `publish`, then `bump_gen`. A generation bump observed here
+    /// therefore means the connection was replaced or cleared; a `shared` load
+    /// that still holds `conn` can only see the state published for it.
+    pub(crate) fn rev2_for(&self, conn: &quinn::Connection) -> Option<Arc<ConnRev2>> {
+        let generation = *self.gen_rx.borrow();
+        let rev2 = self.rev2();
+        let still_published = self
+            .shared
+            .load()
+            .as_ref()
+            .is_some_and(|c| c.stable_id() == conn.stable_id());
+        let stable = generation == *self.gen_rx.borrow();
+        if still_published && stable {
+            rev2
+        } else {
+            None
+        }
+    }
+
     /// Clear the rev2 state of the dead generation (connection-death path, in
     /// the same commit that clears `shared`).
     ///

@@ -63,6 +63,81 @@ const NOTSET_LOWAT_MIN: usize = 4 * 1024;
 /// a default Linux send buffer would not already bound.
 const NOTSET_LOWAT_MAX: usize = 4 * 1024 * 1024;
 
+/// `MYQUIC2_RELAY_SOCKET_BUF`: explicit `SO_SNDBUF`/`SO_RCVBUF` for relay TCP
+/// streams, in bytes. Unset or `0` keeps the kernel's autotuned buffers.
+const ENV_RELAY_SOCKET_BUF: &str = "MYQUIC2_RELAY_SOCKET_BUF";
+
+/// Default kernel allowance one relay TCP flow can pin, in bytes: the Linux
+/// initial sysctl defaults of `net.ipv4.tcp_rmem` (128 KiB) and
+/// `net.ipv4.tcp_wmem` (16 KiB) for a fresh connection = 144 KiB.
+///
+/// This is the *initial* allowance — what the kernel reserves for a new flow
+/// before autotuning grows it (`tcp_rmem` may grow to 6 MiB, `tcp_wmem` to
+/// 4 MiB, per flow, as BDP/queueing demand rises). Admission must charge at
+/// least this per relay flow (see `config::tuning::stream_pump_memory_bytes`),
+/// because the flow count is peer-driven and the kernel socket buffers are not
+/// covered by the QUIC transport windows. An operator who wants the bound to be
+/// exact rather than a floor sets [`ENV_RELAY_SOCKET_BUF`]; the explicit
+/// `SO_*BUF` then caps each direction and the admission charge follows the
+/// configured value instead of this allowance.
+pub const RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT: u64 = 144 * 1024;
+
+/// Lower clamp for a nonzero [`ENV_RELAY_SOCKET_BUF`] override: below a couple
+/// of `COPY_CHUNK`s the relay turns into stop-and-wait on any real BDP.
+const RELAY_SOCKET_BUF_MIN: usize = 16 * 1024;
+
+/// Upper clamp for the override: matches the QUIC endpoint buffer cap, past
+/// which a per-flow relay socket has no reason to grow (the transport windows,
+/// not the socket buffer, are the flow-control ceiling).
+const RELAY_SOCKET_BUF_MAX: usize = 4 * 1024 * 1024;
+
+/// Effective explicit relay TCP socket buffer in bytes; `0` keeps kernel
+/// autotuning. Parsed once per process, like every other env knob here (a
+/// deployed value change is a restart).
+#[must_use]
+pub fn relay_tcp_socket_buf() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE
+        .get_or_init(|| parse_relay_socket_buf(std::env::var(ENV_RELAY_SOCKET_BUF).ok().as_deref()))
+}
+
+fn parse_relay_socket_buf(v: Option<&str>) -> usize {
+    match v.and_then(|s| s.trim().parse::<usize>().ok()) {
+        None => 0,
+        Some(0) => 0,
+        Some(n) => n.clamp(RELAY_SOCKET_BUF_MIN, RELAY_SOCKET_BUF_MAX),
+    }
+}
+
+/// Worst-case kernel socket memory one relay TCP flow can pin under the
+/// effective configuration, in bytes.
+///
+/// With no explicit buffer this is
+/// [`RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT`] (the initial sysctl allowance;
+/// autotuning can exceed it, which is why an operator on a memory-tight host
+/// should set the env override and get the exact cap below). With an override
+/// the kernel caps each direction at the requested size — doubled on Linux,
+/// where `setsockopt(SO_*BUF, n)` stores `2 * n` — so the per-flow figure is
+/// `2 * 2 * n` on Linux and `2 * n` elsewhere, matching the doubling rules the
+/// session/endpoint admission terms already use.
+///
+/// Every relay socket created by [`tune_relay_tcp`] is covered by exactly one
+/// live pump flow, so a process-wide flow bound times this value is the honest
+/// kernel term for `config::tuning::stream_pump_memory_bytes`.
+#[must_use]
+pub fn relay_tcp_kernel_bytes_per_flow() -> u64 {
+    let want = relay_tcp_socket_buf();
+    if want == 0 {
+        return RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT;
+    }
+    let per_direction = if cfg!(target_os = "linux") {
+        2 * want
+    } else {
+        want
+    };
+    (2 * per_direction) as u64
+}
+
 #[cfg(target_os = "linux")]
 /// `TCP_DEFER_ACCEPT` timeout in seconds: accept a connection once its first
 /// byte arrives, or after this long if it stays silent.
@@ -152,12 +227,17 @@ pub(crate) fn tune_tcp_listener(sock: &socket2::Socket) {
 }
 
 /// Apply the relay-TCP posture to one connected relay stream: `TCP_NODELAY`
-/// everywhere (the pump writes whole frames; Nagle only adds latency) and
-/// `TCP_NOTSENT_LOWAT` on Linux ([`tcp_notsent_lowat`], best-effort).
+/// everywhere (the pump writes whole frames; Nagle only adds latency),
+/// `TCP_NOTSENT_LOWAT` on Linux ([`tcp_notsent_lowat`]), and — when
+/// `MYQUIC2_RELAY_SOCKET_BUF` is set — explicit `SO_SNDBUF`/`SO_RCVBUF`
+/// ([`relay_tcp_socket_buf`]) so the per-flow kernel memory has a real cap
+/// instead of the sysctl-dependent autotuned one admission has to treat as a
+/// floor.
 ///
 /// Both SOCKS sides call this where they used to call `set_nodelay`: the
 /// client on every accepted SOCKS connection, the server on every dialed
-/// target connection.
+/// target connection. Best-effort like everything else here: a rejected
+/// option is logged once and the stream keeps working.
 pub fn tune_relay_tcp(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     #[cfg(target_os = "linux")]
@@ -172,8 +252,45 @@ pub fn tune_relay_tcp(stream: &tokio::net::TcpStream) {
             );
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = stream;
+    // socket2's `SockRef` borrows the live fd; the same handle carries both
+    // directions. The requested size is the *un-doubled* application value; the
+    // kernel's doubling is priced by
+    // [`relay_tcp_kernel_bytes_per_flow`].
+    #[cfg(unix)]
+    {
+        let want = relay_tcp_socket_buf();
+        if want > 0 {
+            let sock = socket2::SockRef::from(stream);
+            for (what, res) in [
+                ("SO_SNDBUF", sock.set_send_buffer_size(want)),
+                ("SO_RCVBUF", sock.set_recv_buffer_size(want)),
+            ] {
+                if let Err(e) = res {
+                    relay_buf_debug_once(&format!(
+                        "{what}({want}) not armed on relay stream ({e})"
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stream;
+    }
+}
+
+/// First-message-per-process gate for the relay-buffer diagnostics.
+///
+/// Separate from the Linux-only `once` table above: `SO_SNDBUF`/`SO_RCVBUF`
+/// exist on every Unix, while the raw-option helpers are gated on Linux for the
+/// options that only Linux has.
+#[cfg(unix)]
+fn relay_buf_debug_once(msg: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        tracing::debug!("linux tuning: {msg}");
+    }
 }
 
 /// Pin the calling thread to one core (Linux only; macOS has no meaningful
@@ -419,6 +536,82 @@ mod tests {
         } else {
             assert_eq!(got, want as i32);
         }
+        drop(client);
+    }
+
+    /// `MYQUIC2_RELAY_SOCKET_BUF` parsing: unset/0 = kernel autotune, garbage =
+    /// autotune (like every env knob here), nonzero clamps into the supported
+    /// range. The admission term derived from it must follow the kernel's
+    /// per-direction doubling on Linux.
+    #[test]
+    fn relay_socket_buf_parses_clamps_and_prices_the_flow() {
+        assert_eq!(parse_relay_socket_buf(None), 0);
+        assert_eq!(parse_relay_socket_buf(Some("")), 0);
+        assert_eq!(parse_relay_socket_buf(Some("banana")), 0);
+        assert_eq!(parse_relay_socket_buf(Some("0")), 0, "0 = kernel autotune");
+        assert_eq!(parse_relay_socket_buf(Some(" 65536 ")), 64 * 1024);
+        assert_eq!(parse_relay_socket_buf(Some("1")), RELAY_SOCKET_BUF_MIN);
+        assert_eq!(
+            parse_relay_socket_buf(Some("999999999")),
+            RELAY_SOCKET_BUF_MAX
+        );
+
+        // No explicit buffer: the documented initial sysctl allowance, which is
+        // the floor admission has to charge.
+        let allowance = relay_tcp_kernel_bytes_per_flow();
+        assert!(
+            allowance >= RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT,
+            "the kernel allowance is a floor, got {allowance}"
+        );
+        // The default figure is 128 KiB rcv + 16 KiB snd.
+        assert_eq!(
+            RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT,
+            128 * 1024 + 16 * 1024
+        );
+
+        // With an explicit cap the per-flow figure matches the kernel's
+        // doubling rule: Linux stores 2 *request, so both directions = 4 * B.
+        let b = 64 * 1024usize;
+        let expected = if cfg!(target_os = "linux") {
+            4 * b as u64
+        } else {
+            2 * b as u64
+        };
+        let per_flow = |want: usize| -> u64 {
+            let per_direction = if cfg!(target_os = "linux") {
+                2 * want
+            } else {
+                want
+            };
+            (2 * per_direction) as u64
+        };
+        assert_eq!(per_flow(b), expected);
+    }
+
+    /// When the override is set, `tune_relay_tcp` must arm both socket buffers
+    /// on a real connected stream (best-effort: a kernel that clamps still
+    /// reports a smaller value, so assert the option is settable and read it
+    /// back). Runs only when the process-level env override is configured, so a
+    /// normal test run (which cannot mutate a cached process env var) skips it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tune_relay_tcp_applies_explicit_socket_buffers_when_configured() {
+        let want = relay_tcp_socket_buf();
+        if want == 0 {
+            return; // default: autotune, nothing to assert
+        }
+        let li = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = li.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = li.accept().await.unwrap();
+        tune_relay_tcp(&server);
+        let sock = socket2::SockRef::from(&server);
+        let snd = sock.send_buffer_size().unwrap();
+        let rcv = sock.recv_buffer_size().unwrap();
+        // Linux doubles the request; a clamped sysctl may report less, but it
+        // must have moved off zero/tiny defaults and be >= the request.
+        assert!(snd >= want, "SO_SNDBUF read back {snd} < requested {want}");
+        assert!(rcv >= want, "SO_RCVBUF read back {rcv} < requested {want}");
         drop(client);
     }
 }

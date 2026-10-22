@@ -6,7 +6,7 @@
 </picture>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.1-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-476_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-530_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -23,7 +23,7 @@
 > [!IMPORTANT]
 > **Wire-breaking by design.** This tree speaks **MQP-3 wire rev2**. It does not interoperate with v0.2.0 (v3 wire) or v0.1.x / MQP-2. Upgrade client and server together; mixed-version deployment is not supported.
 >
-> The protocol is still called **MQP-3**. The revision lives in `CTL HELLO/CAPS wire_ver = 2`, not in the name. There is no MQP-4.
+> The protocol is still called **MQP-3**. The revision lives in `CTL HELLO/CAPS wire_ver = 2`, not in the product name.
 
 ---
 
@@ -130,7 +130,7 @@ The design center is **small packets, not bulk throughput**. MQP headers are bel
 | Idempotent control | HELLO/CAPS/ACK/REJECT/CLOSE may be lost and repeated | Correctness never depends on a control datagram arriving |
 | Safe coexistence | `0x0X` first-byte space and `wire_ver=2` | Old parsers drop rev2 frames instead of misrouting them |
 
-**Non-goals.** Bulk-stream header optimization, payload compression, reliable UDP, retransmission, fragment trains, a u16 fragment id, and mixed-version deployment. The protocol name remains MQP-3; there is no MQP-4. The revision is a wire fact, not a product name.
+**Non-goals.** Bulk-stream header optimization, payload compression, reliable UDP, retransmission, fragment trains, a u16 fragment id, and mixed-version deployment. The protocol name remains MQP-3; the revision is a wire fact, not a product name.
 
 ### 2. Revision negotiation and first-byte safety
 
@@ -393,10 +393,11 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | Resource | Bound | Enforcement |
 |---|---|---|
 | Pre-HELLO buffer | 8 frames / 16 KiB per connection | `accept.rs` before HELLO |
-| Fast session table | 16 slots | server ingress |
+| Fast session table | 64 slots | server ingress |
 | Flow registry | 4096 live flows per connection | send: `INLINE` fallback; receive: `FLOW_REJECT(table_full)` |
 | Flows per session | 64 | same fallback/reject path |
 | Resolved addresses | 16 per flow | DNS result truncation |
+| DNS positive cache | 10,240 names x at most 32 retained addresses (120 s) | entry-capped moka; per-name address-set cap (`DNS_CACHE_MAX_ADDRS`) so a hostile multi-record answer cannot grow the cache |
 | Pending DNS opens | 16 | admission gate on the domain slow path |
 | `TRAIN` | 64 items | packer and decoder |
 | Stager | 1,024 items / 256 KiB per connection | enqueue admission |
@@ -409,15 +410,15 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | Client associations | 4,032 per process | UDP hub |
 | Global sessions | 8,192 | server session pool |
 | Connections | 4,096 | admission / listener |
-| Per-connection admission | 19,625 KiB (20,578,304 B) | checked before state allocation |
+| Per-connection admission | 19,687.5 KiB (20,643,840 B) | checked before state allocation |
 
-The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 32 KiB of fixed ingress state (16 KiB pre-HELLO + 16-slot fast table + maps), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (6 streams × 1,024 gap spans × 96 B = 576 KiB; the server advertises 4 bidi + 2 uni streams until the token is verified, then raises bidi to 8,192). The total is 19.625 MiB. At the full 4,096 connections that is **78.5 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
+The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 96 KiB of fixed ingress state (16 KiB pre-HELLO + the 64-slot fast session table with inline destination pins + maps), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (6 streams × 1,024 gap spans × 96 B = 576 KiB; the server advertises 4 bidi + 2 uni streams until the token is verified, then raises bidi to 8,192). The total is 19.6875 MiB. At the full 4,096 connections that is **78.75 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
 
 A second, **process-wide fixed term** is subtracted from the budget once before the remainder is divided into connections. It covers state a peer can drive regardless of the connection count:
 
 - **UDP session pool** — 8,192 sessions. Each session charges the kernel's 64 KiB socket caps per direction (doubled by Linux's `SO_*BUF` bookkeeping) plus both per-session flow tables at their worst case: the MQP-3 v0.2 table at 64 domain targets (**22 KiB**, not the old IP-only 4 KiB) and the rev2 copy-on-write bookkeeping (2 KiB). That is **~2.25 GiB on Linux**, ~1.25 GiB where the kernel does not double the caps.
 - **QUIC ingress endpoints** — each endpoint's resident GRO receive buffer plus its kernel socket caps.
-- **TCP relay pumps** — two 16 KiB buffers for every one of the process-wide 16,384 stream-task slots (**512 MiB**).
+- **TCP relay pumps** — per stream-task slot, two 16 KiB userspace buffers **plus the relay TCP socket's kernel send/receive buffers**. The kernel half is peer-driven (a target that stops reading, or a fast target while the app stops reading) and is not covered by the QUIC transport windows: by default it is charged at the Linux initial sysctl allowance (128 KiB receive + 16 KiB send = 144 KiB per flow; autotuning can exceed it), or at the exact doubled cap when `MYQUIC2_RELAY_SOCKET_BUF` sets explicit `SO_SNDBUF`/`SO_RCVBUF`. Across 16,384 slots that is **512 MiB userspace + ~2.25 GiB kernel allowance** — the largest fixed term after the session pool, and the reason a memory-tight host should set the override.
 - **UDP retry pool** — 16 shards × (256 queued + 16 in flight) × an 8 KiB payload (**34 MiB**); peer-driven, because a black-holed target or a full `SO_SNDBUF` makes `WouldBlock` the steady state.
 - **DNS slow-path waiters** — 1,024 permits × (payload + host + task structure) (**8.75 MiB**); each unique unresolvable domain parks one waiter until the lookup times out.
 - **Datagram-worker scratch** — the `recvmmsg` burst buffer plus the session read-buffer pool held per worker thread (hundreds of KiB × the shard-thread count).
@@ -494,7 +495,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **476 tests** on macOS (lib 235 + client 132 + server 109); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **530 tests** on macOS (lib 262 + client 149 + server 119); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -635,13 +636,13 @@ The client and server must run the **same revision**. Certificates are generated
 
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_egress_conns`, `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
-- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
+- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
 The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **476 tests** on the macOS dev box (lib 235 + client 132 + server 109).
+- **530 tests** on the macOS dev box (lib 262 + client 149 + server 119).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, and legacy MQP-2 receive paths.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -1610,7 +1611,7 @@ flowchart LR
 subgraph CHECK["✅ checks"]
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>476 macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>530 macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         M["musl static"]

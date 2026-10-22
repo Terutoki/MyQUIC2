@@ -71,29 +71,47 @@ fn main() -> Result<()> {
 
 /// Worker count for the process's multi-threaded main runtime.
 ///
-/// The sharded topology (`MYQUIC2_SHARD_RUNTIME`, on by default) pins one
+/// The sharded topology (`MYQUIC2_SHARD_RUNTIME`, on by default) runs one
 /// current-thread runtime — and therefore one OS thread — per pool slot: 7 at
 /// the shipped defaults (4 TCP + 1 interactive UDP + 2 bulk shards). The main
 /// runtime is where every SOCKS accept, TCP relay pump and UDP association
-/// task runs, so Tokio's `#[tokio::main]` default (`available_parallelism`
-/// workers) would put `cores + slots` runnable threads on `cores` CPUs: under
-/// saturation each hot task then gets `cores / (cores + slots)` of a core, and
-/// each pinned receive/dispatch thread competes on its own core with a
-/// work-stealing worker the scheduler lands there. Sizing the workers to the
-/// cores the pinned slot threads leave over keeps
-/// `pinned_slots + workers <= cores` (with a floor of one worker: the runtime
-/// must exist). The shared-runtime topology has no pinned slot threads, so it
-/// keeps the full default width.
+/// task runs.
+///
+/// The subtraction of the slot count is only justified where those slot threads
+/// are actually **pinned**: `linux::pin_to_core` is implemented only on Linux.
+/// There, `pinned_slots + workers <= cores` keeps the app-side pool from
+/// oversubscribing the machine (each pinned receive/dispatch thread owns its
+/// core, so a work-stealing worker landing there would timeshare it). The
+/// subtraction has a floor of one worker: the runtime must exist.
+///
+/// Off Linux `pin_to_core` is a no-op, so the slot threads are ordinary threads
+/// the scheduler timeshares with everything else; subtracting them would only
+/// shrink the app-side pool — at the shipped 7 slots an 8-core macOS host ran
+/// every SOCKS/TCP/UDP task on a single worker (LOGIC/PERF-3 regression). There
+/// the full default width is kept. `main_runtime_workers_for` is the pure rule
+/// so both platform behaviours stay testable on one host.
 fn main_runtime_workers(c: &ClientConf) -> usize {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    if !shard_runtime_enabled() {
+    main_runtime_workers_for(
+        cores,
+        shard_runtime_enabled(),
+        planned_slot_count(c.conn_count(), c.udp_split(), c.udp_egress_cnt()),
+        cfg!(target_os = "linux"),
+    )
+}
+
+/// Pure sizing rule behind [`main_runtime_workers`].
+///
+/// `pins_slots` is whether `linux::pin_to_core` really places each sharded slot
+/// thread on its own core (true only on Linux). Parameters instead of `cfg!`
+/// inside the body so a unit test can pin both platform behaviours without a
+/// second target.
+fn main_runtime_workers_for(cores: usize, sharded: bool, slots: usize, pins_slots: bool) -> usize {
+    let cores = cores.max(1);
+    if !sharded || !pins_slots {
         return cores;
     }
-    cores
-        .saturating_sub(
-            planned_slot_count(c.conn_count(), c.udp_split(), c.udp_egress_cnt()).min(cores),
-        )
-        .max(1)
+    cores.saturating_sub(slots.min(cores)).max(1)
 }
 
 async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {

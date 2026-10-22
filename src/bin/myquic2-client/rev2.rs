@@ -40,6 +40,7 @@ use myquic2::udp::r2_frag::R2FragFlow;
 use myquic2::udp::{
     R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
 };
+use std::collections::VecDeque;
 
 /// Retry cadence for `CTL HELLO` until `CAPS` arrives.
 pub(crate) const HELLO_RETRY: Duration = Duration::from_millis(200);
@@ -48,10 +49,21 @@ pub(crate) const HELLO_RETRY: Duration = Duration::from_millis(200);
 /// which is the spec's fail-fast rule (no silent old-wire fallback).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Bounded set of server-closed sessions recorded for the association to
-/// consume. Bounded because a peer controls `SESS_CLOSE`: past the cap the
-/// notification is dropped (compression just waits for the redial) instead of
-/// growing an unbounded set.
+/// Bounded set of server-closed sessions recorded for an association to
+/// consume.
+///
+/// Only a session with a **live association** is recorded (the dispatcher
+/// checks the hub before calling [`ConnRev2::note_session_closed`]) and the
+/// association forgets its id when it exits
+/// ([`ConnRev2::forget_session_closed`]), so the set only ever holds closes
+/// something can still consume and returns to empty in steady state.
+///
+/// Bounded because a peer controls `SESS_CLOSE`. When the set is full the
+/// **oldest** entry is evicted, never the newest: dropping a freshly arrived
+/// close would blackhole that live session's traffic (the uplink never learns
+/// to re-`OPEN`, and the server already purged its bindings), while evicting
+/// an older id at worst makes that association wait for the redial / the
+/// server's 180 s sweep.
 const MAX_CLOSED_SESSIONS: usize = 64;
 
 /// How long a target the server rejected (`CTL FLOW_REJECT`: policy / table
@@ -111,14 +123,16 @@ pub(crate) struct ConnRev2 {
     /// non-blocking send), never across an await, and never nested with another
     /// stager lock.
     pub(crate) stager: Arc<parking_lot::Mutex<R2Stager>>,
-    /// Sessions the server closed (see [`MAX_CLOSED_SESSIONS`]).
+    /// Sessions the server closed that an association has still to consume (see
+    /// [`MAX_CLOSED_SESSIONS`]).
     ///
-    /// The `take` guard is the datagram's very first shared read, and the vector
-    /// is empty in steady state (populated only by a server `SESS_CLOSE`): the
+    /// The `take` guard is the datagram's very first shared read, and the deque
+    /// is empty in steady state (populated only by a `SESS_CLOSE` for a **live**
+    /// association, and forgotten when that association exits): the
     /// `closed_len` counter below turns the per-datagram probe into one relaxed
     /// load, and the exclusive write lock is taken only while a close is
-    /// actually pending.
-    closed_sessions: parking_lot::RwLock<Vec<u32>>,
+    /// actually pending. Deque order is insertion order, i.e. eviction order.
+    closed_sessions: parking_lot::RwLock<VecDeque<u32>>,
     /// Live `closed_sessions` length, maintained under the write lock. A stale
     /// *overshoot* is impossible (writes under the lock refresh it last); a
     /// stale zero short-takes one extra payload before the next sync re-checks,
@@ -166,7 +180,7 @@ impl ConnRev2 {
             ready: std::sync::atomic::AtomicBool::new(false),
             max_frame_bytes: std::sync::atomic::AtomicU16::new(0),
             stager: Arc::new(parking_lot::Mutex::new(stager)),
-            closed_sessions: parking_lot::RwLock::new(Vec::new()),
+            closed_sessions: parking_lot::RwLock::new(VecDeque::new()),
             closed_len: std::sync::atomic::AtomicUsize::new(0),
             rejected: parking_lot::RwLock::new(Vec::new()),
         })
@@ -269,11 +283,27 @@ impl ConnRev2 {
 
     /// Record `CTL SESS_CLOSE` from the server for `sess`. Bounded (see
     /// [`MAX_CLOSED_SESSIONS`]) and idempotent.
+    ///
+    /// The caller only records a close for a session whose association is still
+    /// live (the dispatcher checks the hub): an id with no consumer would stay
+    /// here forever, keeping the per-datagram `closed_len` short-circuit open
+    /// and — at the cap — evicting a live association's close. The association
+    /// drops its entry on exit ([`Self::forget_session_closed`]), which is the
+    /// other half of "the set returns to empty".
+    ///
+    /// At the cap the **oldest** pending id is evicted, never the newest: see
+    /// [`MAX_CLOSED_SESSIONS`]. A duplicate note for an already-present id is a
+    /// no-op (the existing entry keeps its position, so a replayed frame cannot
+    /// promote itself past older pending closes).
     pub(crate) fn note_session_closed(&self, sess: u32) {
         let mut closed = self.closed_sessions.write();
-        if closed.len() < MAX_CLOSED_SESSIONS && !closed.contains(&sess) {
-            closed.push(sess);
+        if closed.contains(&sess) {
+            return;
         }
+        if closed.len() >= MAX_CLOSED_SESSIONS {
+            closed.pop_front();
+        }
+        closed.push_back(sess);
         // Refresh under the same lock hold: a concurrent `take` that saw the
         // pre-push length then did not find its id cannot pass a stale zero to
         // the *next* sync.
@@ -283,10 +313,10 @@ impl ConnRev2 {
 
     /// Consume a recorded `SESS_CLOSE` for `sess`.
     pub(crate) fn take_session_closed(&self, sess: u32) -> bool {
-        // The steady-state short-circuit: an empty vector (the common case)
+        // The steady-state short-circuit: an empty deque (the common case)
         // costs one relaxed load instead of an exclusive lock acquisition per
         // uplink datagram. `closed_len` only says "the lock may be worth
-        // taking" — the vector itself stays the authority, so a concurrent
+        // taking" — the deque itself stays the authority, so a concurrent
         // `note` racing an in-flight probe is refuted (not lost): it refreshes
         // the count under its own write hold and the next sync picks it up.
         if self.closed_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -295,7 +325,7 @@ impl ConnRev2 {
         let mut closed = self.closed_sessions.write();
         match closed.iter().position(|&s| s == sess) {
             Some(i) => {
-                closed.swap_remove(i);
+                let _ = closed.remove(i);
                 self.closed_len
                     .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
                 true
@@ -308,6 +338,39 @@ impl ConnRev2 {
                 false
             }
         }
+    }
+
+    /// Drop a recorded `SESS_CLOSE` for `sess` without consuming it.
+    ///
+    /// The association-exit path is the only other consumer of a session's own
+    /// close: once the association is gone nothing will call
+    /// [`Self::take_session_closed`] for its id, so leaving it behind keeps the
+    /// bounded set non-empty for the connection's life — the every-datagram
+    /// exclusive lock of LOGIC-2 — and lets it occupy a slot that a live
+    /// association's close could need. No-op when nothing is recorded (the
+    /// common exit case, one relaxed load).
+    pub(crate) fn forget_session_closed(&self, sess: u32) {
+        if self.closed_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut closed = self.closed_sessions.write();
+        if let Some(i) = closed.iter().position(|&s| s == sess) {
+            let _ = closed.remove(i);
+        }
+        self.closed_len
+            .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Live length of the closed-session set (test/observability probe).
+    #[cfg(test)]
+    pub(crate) fn closed_sessions_len(&self) -> usize {
+        self.closed_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot of the closed-session set in insertion order (test probe).
+    #[cfg(test)]
+    pub(crate) fn closed_sessions_snapshot(&self) -> Vec<u32> {
+        self.closed_sessions.read().iter().copied().collect()
     }
 
     /// Record that the server rejected a flow for `target`. The uplink then
@@ -424,43 +487,118 @@ pub(crate) async fn handshake_with(
     }
 }
 
-/// Best-effort `CTL SESS_CLOSE` on association exit: three datagrams on the
-/// association's current egress connection, exactly as the spec's control
-/// plane asks (the frame is idempotent and loss only delays reclamation; the
-/// server's 180 s idle sweep is the backstop). Nothing is awaited and a
-/// missing egress is not an error — the association is already gone.
-pub(crate) fn send_sess_close(egress: &SharedEgress, pool: &ConnPool, bind: UdpBind, sess: u32) {
+/// Best-effort rev2 control frame on `conn`.
+///
+/// Mirrors the server's helper: control frames are loss-tolerant by design
+/// (every opcode is idempotent and its sender retries or waits for the sweep),
+/// so the verdict is reported for counting and nothing is retried here.
+pub(crate) fn r2_send_ctl(conn: &quinn::Connection, ctl: &r2::Ctl) -> DatagramSend {
+    try_send_datagram(conn, r2::encode_ctl(ctl))
+}
+
+/// Association-exit rev2 session teardown: release the session's
+/// connection-scoped state unconditionally, then send the best-effort
+/// `CTL SESS_CLOSE` when a negotiated, live connection is reachable.
+///
+/// The local cleanup half ([`FlowRegistry::remove_session`] +
+/// [`R2Stager::drop_session`]) must not depend on `CAPS` or on winning an
+/// egress refresh: an association that exits inside the 0-RTT→CAPS window, or
+/// while another thread holds the per-binding single-flight gate, would
+/// otherwise leave its bindings and staged payloads behind for the
+/// connection's life and its server session to the 180 s sweep (whose later
+/// reap notification is exactly the stale-close source LOGIC-2 used to leak).
+/// The generation the association actually sent on is reached through the
+/// egress cache (which names the pool slot the frames left on) and, when that
+/// is empty, through the binding's own pool slot — neither requires
+/// `is_ready()` or a fresh handle.
+///
+/// Only the datagram half is conditional: a handshake-window connection would
+/// count as a refusal server-side, so `SESS_CLOSE` goes out only when the
+/// reached generation negotiated rev2 (`is_ready`) and its connection is still
+/// alive. Loss is harmless: the frame is idempotent and the server's 180 s idle
+/// sweep is the correctness backstop.
+///
+/// `epoch` is the generation the association's [`UplinkFlows`] last synced to.
+/// The local cleanup is gated on it: wire ids are connection-scoped and never
+/// reused, so a newer generation's tables cannot hold this session's bindings,
+/// and touching them could only clear another generation's fresh state (a
+/// retired generation is already cleared by `retire_dead_slot`).
+pub(crate) fn send_sess_close(
+    egress: &SharedEgress,
+    pool: &ConnPool,
+    bind: Option<UdpBind>,
+    sess: u32,
+    epoch: u64,
+) {
+    // Reachable generation, in preference order: the published egress handle
+    // (names the slot the association's frames actually left on), then the
+    // binding's own pool slot. The handle is read without the freshness gate —
+    // an expired stamp does not change which generation owns the state.
+    let cached = bind.and_then(|b| egress.cached_handle(b));
+    let fallback = match &cached {
+        Some(_) => None,
+        None => bind.and_then(|b| pool.slot(pool.udp_global_slot(b.index)).rev2()),
+    };
+    let reached = cached.as_ref().map(|(_, rev2)| rev2.clone()).or(fallback);
+    if let Some(rev2) = &reached {
+        if epoch != 0 && rev2.epoch == epoch {
+            // Release the session's bindings (client-owned and accepted
+            // server-owned alike) and any payload still queued for it, so a
+            // later drain cannot send frames for a session the server is about
+            // to reap. The stager books each dropped payload as an egress
+            // death, exactly like a closed connection.
+            let _ = rev2.registry.remove_session(sess);
+            let _ = rev2.stager.lock().drop_session(sess);
+        }
+        // The association is the only consumer of its recorded close; drop it
+        // so an exit that never syncs again cannot leave the bounded set
+        // non-empty (LOGIC-2). Harmless when nothing is recorded.
+        rev2.forget_session_closed(sess);
+    }
+    // Every dispatcher generation can hold a note for this session (the close
+    // is recorded on whichever connection's dispatcher received it). A slot's
+    // `rev2()` is a lock-free load, and exit is rare, so sweep them all: with
+    // `bind == None` (an association that never sent) this is the only place
+    // the note can be released.
+    for i in 0..pool.slots_total() {
+        if let Some(rev2) = pool.slot(i).rev2() {
+            rev2.forget_session_closed(sess);
+        }
+    }
+
+    // The SESS_CLOSE itself: three datagrams on the association's current
+    // egress connection, exactly as the spec's control plane asks.
     let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess, reason: 0 });
-    let send = |conn: &quinn::Connection, rev2: &ConnRev2| {
+    let send = |conn: &quinn::Connection, rev2: &ConnRev2| -> bool {
         // Only a negotiated connection is allowed to carry rev2 frames; a
         // handshake-window connection would just count as REFUSED server-side.
-        if !rev2.is_ready() {
-            return;
+        if !rev2.is_ready() || conn.close_reason().is_some() {
+            return false;
         }
-        // The association is gone: release its connection-scoped bindings
-        // (client-owned and accepted server-owned alike) and any payload still
-        // queued for it, so a later drain cannot send frames for a session the
-        // server is about to reap. The stager books each dropped payload as an
-        // egress death, exactly like a closed connection.
-        let _ = rev2.registry.remove_session(sess);
-        let _ = rev2.stager.lock().drop_session(sess);
         for _ in 0..3 {
             match try_send_datagram(conn, frame.clone()) {
                 DatagramSend::Sent => counters::sess_close_tx(),
-                DatagramSend::ConnectionLost | DatagramSend::Unsupported => return,
-                DatagramSend::Blocked | DatagramSend::TooLarge => return,
+                DatagramSend::ConnectionLost
+                | DatagramSend::Unsupported
+                | DatagramSend::Blocked
+                | DatagramSend::TooLarge => return true,
             }
         }
+        true
     };
-    let now = coarse_millis();
-    if let Some(()) = egress.with_fresh(bind, now, |c, _limit, rev2| send(c, rev2)) {
+    if let Some((conn, rev2)) = &cached
+        && send(conn, rev2)
+    {
         return;
     }
-    // Generation read before the cached read, the same contract the per-datagram
-    // miss path documents: a concurrent mutation then invalidates the memo.
-    let generation = egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
-    if let Some(h) = egress.acquire(pool, bind, now) {
-        egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+    // No usable cached handle (handshake window, or the cache was invalidated):
+    // refresh once through the same single-flight gate an uplink datagram uses,
+    // so a lost earlier refresh still lets this exit tell the server.
+    let Some(b) = bind else { return };
+    let now = coarse_millis();
+    let generation = egress.generation[b.index].load(std::sync::atomic::Ordering::Acquire);
+    if let Some(h) = egress.acquire(pool, b, now) {
+        egress.memo_store(b, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
         send(&h.conn, &h.rev2);
     }
 }
@@ -864,13 +1002,16 @@ fn bad_address_header() -> PayloadSend {
 /// Everything past the memo miss is ordered cheapest-and-most-decisive first:
 /// the session-table scan, the full-table fail-safe, the rejection window
 /// (checked *before* any registry scan so a rejected target never pays the
-/// connection-wide map walk on every payload of its window), the connection
-/// registry's capacity probe (a full table can only fall back to `INLINE`,
-/// so the server-owned-flow scan is skipped), then that scan, and finally the
-/// atomic allocate-and-insert. [`FlowRegistry::insert_new`] re-checks capacity
-/// under its write lock before allocating an id, so a table that fills between
-/// the probe and the insert still cannot consume one: ids are never reused, and
-/// such a leak would eventually force every payload to `INLINE`.
+/// connection-wide map walk on every payload of its window), the
+/// server-owned-flow **reuse** scan (it needs no capacity: the binding is
+/// already installed, and the shared API turns it into one lock-free counter
+/// check for the common uplink-only client), then the capacity probe (a full
+/// table can only fall back to `INLINE`, and only after reuse was ruled out),
+/// and finally the atomic allocate-and-insert. [`FlowRegistry::insert_new`]
+/// re-checks capacity under its write lock before allocating an id, so a table
+/// that fills between the probe and the insert still cannot consume one: ids
+/// are never reused, and such a leak would eventually force every payload to
+/// `INLINE`.
 fn ensure_binding(
     rev2: &ConnRev2,
     up: &mut UplinkFlows,
@@ -907,19 +1048,17 @@ fn ensure_binding(
     if rev2.is_rejected(addr, coarse_millis()) {
         return None;
     }
-    // A full connection registry means no flow can be bound: `INLINE` is the
-    // only possible outcome, so skip the server-owned-flow scan (a full table
-    // is exactly when that scan is longest). Advisory only — `insert_new`
-    // re-checks the cap under its write lock and stays the authority.
-    if !rev2.registry.has_capacity() {
-        return None;
-    }
     // Full-cone symmetry: the server may already own a flow for this exact
     // (session, target) — it announced it with `DATA OPEN|SRC` and the
     // dispatcher installed it. Reuse that id so the app's reply rides the same
     // flow (steady/stager/fragment encoders carry the owner bit already)
     // instead of opening a parallel client-owned one. The binding is already in
-    // the registry, so it is never inserted again.
+    // the registry, so it is never inserted again — which is exactly why this
+    // runs **before** the capacity probe: a full registry is the case where
+    // reuse is the only way to keep the reply path compressed, and the probe
+    // must never turn it into `INLINE`. For the common uplink-only client the
+    // shared API's lock-free server-flow counter makes this a single atomic
+    // load, not the O(registry) scan.
     if let Some(server) = rev2.registry.find_server_flow(sess, addr) {
         // Only a confirmed server-owned flow is reusable: it was announced by
         // an `OPEN|SRC` (which the dispatcher marks open), so steady/stager
@@ -936,6 +1075,13 @@ fn ensure_binding(
         if server.state() == FlowState::Closed {
             let _ = rev2.registry.remove(server.wire_id);
         }
+    }
+    // A full connection registry means no *new* flow can be bound: `INLINE` is
+    // the only remaining outcome (reuse was ruled out above). Advisory only —
+    // `insert_new` re-checks the cap under its write lock and stays the
+    // authority.
+    if !rev2.registry.has_capacity() {
+        return None;
     }
     // One write-lock hold: capacity re-check, id allocation, insert. An id
     // allocated before a refused insert would be lost for the connection's
@@ -1118,12 +1264,24 @@ pub(crate) mod counters {
         caps_rx,
         /// `CTL FLOW_ACK` frames that resolved an uplink binding.
         flow_ack_rx,
+        /// `CTL FLOW_ACK` frames queued to confirm a learned `OPEN|SRC` reply
+        /// source (client side of the binding-confirmation contract).
+        flow_ack_tx,
         /// `CTL FLOW_REJECT` frames that closed an uplink binding.
         flow_reject_rx,
+        /// `CTL FLOW_REJECT` frames queued for a binding frame this side could
+        /// not install (`TABLE_FULL`/`POLICY`), so the peer stops re-sending it.
+        flow_reject_tx,
         /// `CTL FLOW_CLOSE` frames that closed a binding.
         flow_close_rx,
         /// `CTL SESS_CLOSE` frames decoded (from the server).
         sess_close_rx,
+        /// Peer `CTL` frames dropped by the per-connection rate budget.
+        ctl_rate_limited,
+        /// Best-effort `FLOW_ACK`/`FLOW_REJECT` sends that did not queue
+        /// (blocked buffer or dead connection). Loss is recovered by the
+        /// peer's idempotent rebind, so this only feeds the 60 s line.
+        ctl_tx_fail,
         /// `CTL SESS_CLOSE` frames queued (association exit).
         sess_close_tx,
         /// New uplink flows bound on this process's connections.
@@ -1219,6 +1377,10 @@ pub(crate) mod counters {
         flow_close_rx,
         sess_close_rx,
         sess_close_tx,
+        flow_ack_tx,
+        flow_reject_tx,
+        ctl_rate_limited,
+        ctl_tx_fail,
         // Per-flow / queue-exception events: too rare for a TLS cell to reach
         // its flush boundary, so a direct increment is both simpler and exact.
         open_tx,
@@ -1240,17 +1402,19 @@ pub(crate) mod counters {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(
                 f,
-                "hello={} handshake={}/{} caps={} frames_rx={} ack={} reject={} close={} \
+                "hello={} handshake={}/{} caps={} frames_rx={} ack={}/{} reject={}/{} close={} \
                  sess_close={}/{} flow_open={} srv={}/{} open={} steady={} inline={}/{} \
                  stage={}p/{}d/{}f/{}i/{}x/{}full frag={}/{}/{} unknown_id={} drops={} \
-                 resets={}/{}",
+                 resets={}/{} ctl={}/{}/{}",
                 self.hello_tx,
                 self.handshake_ok,
                 self.handshake_fail,
                 self.caps_rx,
                 self.rx_frame,
                 self.flow_ack_rx,
+                self.flow_ack_tx,
                 self.flow_reject_rx,
+                self.flow_reject_tx,
                 self.flow_close_rx,
                 self.sess_close_rx,
                 self.sess_close_tx,
@@ -1274,6 +1438,9 @@ pub(crate) mod counters {
                 self.rx_drop,
                 self.flow_table_reset,
                 self.session_reset,
+                self.ctl_drop,
+                self.ctl_rate_limited,
+                self.ctl_tx_fail,
             )
         }
     }
@@ -1325,22 +1492,74 @@ mod tests {
     }
 
     #[test]
-    fn closed_sessions_are_bounded_and_consumed_once() {
+    fn closed_sessions_are_consumed_once_and_the_set_empties() {
         let r = ConnRev2::new();
+        assert_eq!(r.closed_sessions_len(), 0);
         assert!(!r.take_session_closed(7));
         r.note_session_closed(7);
+        assert_eq!(r.closed_sessions_len(), 1);
         assert!(r.take_session_closed(7));
-        assert!(!r.take_session_closed(7));
-        for s in 0..(MAX_CLOSED_SESSIONS as u32 * 3) {
+        assert!(
+            !r.take_session_closed(7),
+            "a close is consumed exactly once"
+        );
+        assert_eq!(
+            r.closed_sessions_len(),
+            0,
+            "the len short-circuit must close again once consumed"
+        );
+        // A duplicate note is one id, not one per frame.
+        r.note_session_closed(9);
+        r.note_session_closed(9);
+        assert_eq!(r.closed_sessions_len(), 1);
+        assert_eq!(r.closed_sessions_snapshot(), vec![9]);
+        assert!(r.take_session_closed(9));
+        assert_eq!(r.closed_sessions_len(), 0);
+    }
+
+    #[test]
+    fn closed_sessions_cap_evicts_the_oldest() {
+        let r = ConnRev2::new();
+        // One past the cap: the *oldest* id must be the one evicted, never the
+        // newest (dropping a fresh close would blackhole a live association).
+        for s in 1..=(MAX_CLOSED_SESSIONS as u32 + 1) {
             r.note_session_closed(s);
         }
-        let mut hits = 0;
-        for s in 0..(MAX_CLOSED_SESSIONS as u32 * 3) {
-            if r.take_session_closed(s) {
-                hits += 1;
-            }
-        }
-        assert!(hits <= MAX_CLOSED_SESSIONS, "the set must stay bounded");
+        assert_eq!(r.closed_sessions_len(), MAX_CLOSED_SESSIONS);
+        let kept = r.closed_sessions_snapshot();
+        assert_eq!(kept.len(), MAX_CLOSED_SESSIONS);
+        assert!(!kept.contains(&1), "the oldest id was evicted");
+        assert!(kept.contains(&(MAX_CLOSED_SESSIONS as u32 + 1)));
+        assert!(
+            !r.take_session_closed(1),
+            "the evicted id is not consumable"
+        );
+        assert!(
+            r.take_session_closed(2),
+            "the next-oldest entry is untouched"
+        );
+        assert!(r.take_session_closed(MAX_CLOSED_SESSIONS as u32 + 1));
+    }
+
+    #[test]
+    fn forget_session_closed_returns_the_set_to_empty() {
+        let r = ConnRev2::new();
+        r.note_session_closed(1);
+        r.note_session_closed(2);
+        r.note_session_closed(3);
+        // Association exit: its own pending close must not outlive it.
+        r.forget_session_closed(2);
+        assert_eq!(r.closed_sessions_len(), 2);
+        assert!(!r.take_session_closed(2));
+        // Forgetting an absent id (the common exit case) is a no-op.
+        r.forget_session_closed(99);
+        assert_eq!(r.closed_sessions_snapshot(), vec![1, 3]);
+        // The final exit forgets the rest: the per-datagram short-circuit is
+        // back to one relaxed load with no lock.
+        r.forget_session_closed(1);
+        r.forget_session_closed(3);
+        assert_eq!(r.closed_sessions_len(), 0);
+        assert!(!r.take_session_closed(1));
     }
 
     #[test]
@@ -1396,6 +1615,46 @@ mod tests {
             "repeated new-target attempts against a full table must not leak ids"
         );
         assert!(up.flows.is_empty(), "no half-bound session entries either");
+    }
+
+    /// PERF-8 regression: a **full** registry must still reuse an installed
+    /// server-owned flow.
+    ///
+    /// `find_server_flow` needs no capacity (the binding is already there), so
+    /// the reuse scan must run before the capacity probe. With the probe first
+    /// (the 8f0d685 order), a full-cone client at cap sent every reply `INLINE`
+    /// even though the server-owned id existed locally.
+    #[test]
+    fn full_registry_still_reuses_a_server_owned_flow() {
+        let r = ConnRev2::new();
+        let sess = 1u32;
+        let addr: SocketAddr = "198.51.100.44:443".parse().unwrap();
+        let server = FlowBinding::new_shared(
+            r2::make_wire_id(1, true).unwrap(),
+            sess,
+            TargetAddr::Ip(addr),
+        );
+        server.set_reply_src(addr);
+        server.mark_open();
+        assert!(r.registry.insert(server.clone()).is_ok());
+        // Fill the rest of the table; a full registry is exactly the state the
+        // reuse path exists for.
+        let filler = TargetAddr::Ip("203.0.113.7:9".parse().unwrap());
+        for i in 2..=R2_MAX_FLOWS_PER_CONN as u32 {
+            let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 2, filler.clone());
+            assert!(r.registry.insert(b).is_ok());
+        }
+        assert!(!r.registry.has_capacity(), "premise: the table is full");
+        let mut up = UplinkFlows::new();
+        let reused = ensure_binding(&r, &mut up, sess, &TargetAddrRef::Ip(addr))
+            .expect("a full registry must still reuse an installed server-owned flow");
+        assert_eq!(reused.wire_id, server.wire_id);
+        assert_eq!(up.flows.len(), 1, "the flow is joined, not re-created");
+        assert_eq!(
+            r.ids.allocated(),
+            0,
+            "reuse must not allocate a never-reused id"
+        );
     }
 
     /// A target inside a `FLOW_REJECT` window takes the `INLINE` fail-safe: the

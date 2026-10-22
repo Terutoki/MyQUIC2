@@ -3748,8 +3748,8 @@ mod tests {
         // rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            80384,
-            "4096 x 19.625 MiB is the 78.5 GiB worst case for the default windows"
+            80640,
+            "4096 x 19.6875 MiB is the 78.75 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested
@@ -3795,8 +3795,15 @@ mod tests {
         }
         assert_eq!(endpoint_memory_bytes(1), recv + caps as u64);
         assert_eq!(endpoint_memory_bytes(16), 16 * endpoint_memory_bytes(1));
-        // Two 16 KiB pump buffers per active TCP relay flow.
-        assert_eq!(stream_pump_memory_bytes(8192), 8192 * 32 * 1024);
+        // Per active TCP relay flow: two 16 KiB userspace pump buffers plus the
+        // relay socket's kernel send/receive allowance (the initial sysctl
+        // default in the shipped configuration, or the exact doubled cap when
+        // MYQUIC2_RELAY_SOCKET_BUF sets explicit SO_SNDBUF/SO_RCVBUF).
+        assert_eq!(
+            stream_pump_memory_bytes(8192),
+            8192 * (2 * crate::tcp::pump::COPY_CHUNK as u64
+                + crate::linux::RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT)
+        );
         // The remaining process-wide fixed terms are peer-driven pools and
         // quinn's per-stream reassembly metadata; pin their arithmetic so the
         // startup worst-case line cannot silently drift.

@@ -25,7 +25,18 @@ fn bump(c: &AtomicU64) -> u64 {
 }
 thread_local! {
     static L_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Coarse-epoch stamp of this thread's last publish; see
+    /// [`crate::udp_stats::PUBLISH_INTERVAL_MS`]. The count threshold alone
+    /// cannot bound a low-rate session's reporting lag: 256 sends at 1 pps is
+    /// ~4 minutes, so the line used to dwell at zero for many reporting
+    /// intervals. The time gate publishes at most every interval, for one cheap
+    /// atomic read per send.
+    static L_LAST_PUBLISH_MS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(NEVER_PUBLISHED) };
 }
+
+/// Sentinel for "this thread has never published".
+const NEVER_PUBLISHED: u64 = u64::MAX;
 
 fn flush_sent() {
     L_SENT.with(|c| {
@@ -36,11 +47,26 @@ fn flush_sent() {
         }
     });
 }
+
+/// Publish this thread's pending `sent` count when the time gate is open.
+#[inline]
+fn maybe_time_publish() {
+    L_LAST_PUBLISH_MS.with(|last| {
+        let now = crate::coarse_millis();
+        if crate::udp_stats::publish_due(last.get(), now) {
+            last.set(now);
+            flush_sent();
+        }
+    });
+}
+
 /// One successful last-hop write.
 ///
 /// Batching matches [`crate::udp_stats::payload`]: one shared atomic RMW per
-/// 256 sends, so the 60 s `udp write` line cannot dwell at zero for a
-/// low-rate session.
+/// 256 sends, plus a time-based publish at
+/// [`crate::udp_stats::PUBLISH_INTERVAL_MS`] so the 60 s `udp write` line tracks
+/// a low-rate session too (the count threshold alone could hold a sub-256 send
+/// count for minutes).
 pub fn sent() {
     stats_only! {
         L_SENT.with(|c| {
@@ -52,6 +78,7 @@ pub fn sent() {
                 c.set(v);
             }
         });
+        maybe_time_publish();
     }
 }
 pub fn retried() -> u64 {
@@ -70,11 +97,13 @@ pub fn retry_failed() -> u64 {
     bump(&RETRY_FAILED)
 }
 
-/// Totals since process start. `sent` is thread-local batched (flushed at
-/// 256 or by a `snapshot` on the same thread); the other counters are
-/// direct `fetch_add` calls from the send paths.
+/// Totals since process start. `sent` is thread-local batched (published at
+/// 256 or every [`crate::udp_stats::PUBLISH_INTERVAL_MS`] on the counting
+/// thread, or by a `snapshot` on the same thread); the other counters are
+/// direct `fetch_add` calls from the send paths and are always exact.
 pub fn snapshot() -> UdpWriteSnapshot {
     flush_sent();
+    L_LAST_PUBLISH_MS.with(|last| last.set(crate::coarse_millis()));
     UdpWriteSnapshot {
         sent: SENT.load(Ordering::Relaxed),
         retried: RETRIED.load(Ordering::Relaxed),
@@ -129,5 +158,51 @@ impl std::fmt::Display for UdpWriteSnapshot {
             self.no_app,
             self.retry_failed
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sent_publishes_on_the_time_gate_below_the_count_threshold() {
+        L_LAST_PUBLISH_MS.with(|last| last.set(NEVER_PUBLISHED));
+        let before = SENT.load(Ordering::Relaxed);
+        sent();
+        assert!(
+            SENT.load(Ordering::Relaxed) > before,
+            "one send after a stale gate must be published, not held in the cell"
+        );
+    }
+
+    #[test]
+    fn snapshot_flushes_and_rearms_the_caller_gate() {
+        L_LAST_PUBLISH_MS.with(|last| last.set(NEVER_PUBLISHED));
+        let before = snapshot();
+        sent();
+        let after = snapshot();
+        assert!(
+            after.sent > before.sent,
+            "snapshot on the counting thread must flush its own cell"
+        );
+    }
+
+    /// The other counters are exact (direct `fetch_add`) and must never be
+    /// batched: a drop that a rate-limited report has to show immediately.
+    #[test]
+    fn loss_counters_are_exact_per_event() {
+        let before = snapshot();
+        retried();
+        dropped_no_permit();
+        failed();
+        no_app();
+        retry_failed();
+        let after = snapshot();
+        assert_eq!(after.retried, before.retried + 1);
+        assert_eq!(after.dropped_no_permit, before.dropped_no_permit + 1);
+        assert_eq!(after.failed, before.failed + 1);
+        assert_eq!(after.no_app, before.no_app + 1);
+        assert_eq!(after.retry_failed, before.retry_failed + 1);
     }
 }

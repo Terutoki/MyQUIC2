@@ -18,10 +18,18 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 
 /// Rev2 ingress state outside the transport windows and outside this crate's
 /// type-visible per-connection structures: the pre-HELLO frame buffer
-/// (16 KiB, `accept.rs::PRE_HELLO_MAX_BYTES`), the 16-slot fast session table
-/// (a few KiB), and the small fixed maps next to them. A conservative single
-/// term keeps the admission bound from depending on binary-private types.
-pub const R2_INGRESS_FIXED_BYTES: u64 = 32 * 1024;
+/// (16 KiB, `accept.rs::PRE_HELLO_MAX_BYTES`), the fast session table, and the
+/// small fixed maps next to them. A conservative single term keeps the
+/// admission bound from depending on binary-private types.
+///
+/// The fast session table is now 64 slots (`FAST_SESS_SLOTS` in
+/// `myquic2-server/accept.rs`, up from 16): each `FastSess` carries an inline
+/// `ConnPin` (255-byte name + address + deadline, ~304 B), a weak socket
+/// handle, the abort handle and the flow-table `Arc` — ~350 B per slot, so the
+/// table is ~22 KiB. With the 16 KiB pre-HELLO buffer (~38 KiB), the per-slot
+/// pins and the surrounding maps, 96 KiB is a round, conservative charge; the
+/// server's unit tests pin `FAST_SESS_SLOTS` against this constant's comment.
+pub const R2_INGRESS_FIXED_BYTES: u64 = 96 * 1024;
 
 /// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`
 /// header (16 B), the target's domain name up to the 255-byte wire limit, and
@@ -29,6 +37,13 @@ pub const R2_INGRESS_FIXED_BYTES: u64 = 32 * 1024;
 /// plus the `Arc`/`Vec` headers). That is 823 B; 832 keeps the arithmetic
 /// round. Name and resolved set exist only for domain flows, but admission
 /// must bound the peer-fillable worst case.
+///
+/// The newer per-binding `reply_src` `ArcSwapOption<SocketAddr>` allocation and
+/// the transient retention of a previous copy-on-write snapshot are not in the
+/// 823 B derivation; they are small (~48 B + one retired snapshot) relative to
+/// this slack and are left to the round-up, but a layout change that grows
+/// `FlowBinding` must re-derive the figure (the size term above picks up inline
+/// fields automatically; heap fields do not).
 pub const R2_FLOW_HEAP_SLACK_BYTES: u64 = 832;
 
 /// `VecDeque` allocates a minimum of eight slots on its first push. With one
@@ -373,6 +388,13 @@ const SESSION_FLOWS_BYTES: u64 = std::mem::size_of::<SessionFlows>() as u64;
 /// `[Option<IpAddr>; 16]` array (272 B — [`IpAddr`](std::net::IpAddr) is 17 B
 /// and `Option<IpAddr>` has no niche to shrink it) plus the 8-byte write
 /// position = 280 B.
+///
+/// **Cross-crate invariant.** The 16 here mirrors `RECENT_DST_CAP` in the
+/// server binary, which cannot be imported (binary-private). The server's tests
+/// assert `RECENT_DST_CAP` against a matching constant, so a future change that
+/// raises the ring must update this derivation too — otherwise admission
+/// silently under-counts the per-session tables by
+/// `(cap - 16) * size_of::<Option<IpAddr>>()` per session.
 const RECENT_ADDRS_BYTES: u64 =
     (16 * std::mem::size_of::<Option<std::net::IpAddr>>() + std::mem::size_of::<usize>()) as u64;
 
@@ -494,14 +516,35 @@ pub fn endpoint_memory_bytes(count: usize) -> u64 {
 }
 
 /// Worst-case buffers held by `max_streams` concurrent TCP <-> QUIC pump
-/// flows: two [`COPY_CHUNK`](crate::tcp::pump::COPY_CHUNK) buffers per flow
-/// (the c2s double buffer, held for the flow's whole life). The flow count is
-/// bounded by the server's `MAX_STREAM_TASKS` / the client's `MAX_SOCKS_CONNS`,
-/// and these buffers are *not* part of `per_connection_memory_bytes`, so
-/// admission charges them as a process-wide fixed term.
+/// flows.
+///
+/// Two parts per flow, because the relay holds memory in two places:
+///
+/// - **userspace**: two [`COPY_CHUNK`](crate::tcp::pump::COPY_CHUNK) buffers
+///   (the c2s double buffer, held for the flow's whole life);
+/// - **kernel**: the relay TCP socket's send/receive buffers. Those are not
+///   covered by the QUIC transport windows and are peer-drivable (the peer
+///   points a flow at a target that stops reading, or that floods while the app
+///   stops reading), so they are charged here.
+///   [`crate::linux::relay_tcp_kernel_bytes_per_flow`] prices the effective
+///   configuration: by default the Linux initial sysctl allowance
+///   (128 KiB rcv + 16 KiB snd = 144 KiB; autotuning can exceed it), or the
+///   exact doubled cap when `MYQUIC2_RELAY_SOCKET_BUF` sets explicit
+///   `SO_SNDBUF`/`SO_RCVBUF`.
+///
+/// The flow count is bounded by the server's `MAX_STREAM_TASKS` / the client's
+/// `MAX_SOCKS_CONNS`, and neither term is part of
+/// `per_connection_memory_bytes`, so admission charges the product as a
+/// process-wide fixed term. At the default allowance the server's 16,384-flow
+/// bound is ~2.8 GiB (512 MiB userspace + ~2.25 GiB kernel allowance), which is
+/// why the startup line prints this term separately; an operator on a
+/// memory-tight host lowers it with `MYQUIC2_RELAY_SOCKET_BUF` (the charge
+/// follows the env override) or by accepting fewer concurrent flows.
 #[must_use]
 pub fn stream_pump_memory_bytes(max_streams: usize) -> u64 {
-    (max_streams as u64).saturating_mul(2 * crate::tcp::pump::COPY_CHUNK as u64)
+    let per_flow =
+        2 * crate::tcp::pump::COPY_CHUNK as u64 + crate::linux::relay_tcp_kernel_bytes_per_flow();
+    (max_streams as u64).saturating_mul(per_flow)
 }
 
 /// Worst-case payload bytes the process-wide UDP retry pools can hold.
@@ -805,6 +848,55 @@ mod tests {
             per_session_memory_bytes()
                 > (MQP3_FLOW_TABLE_MAX_BYTES as u64 + R2_SESSION_TABLES_BYTES),
             "both table terms must be visible in the total"
+        );
+    }
+
+    /// The TCP relay pump term must price both memory sites per flow: the two
+    /// userspace `COPY_CHUNK` buffers *and* the relay socket's kernel buffers
+    /// (the initial sysctl allowance by default, the doubled explicit cap when
+    /// `MYQUIC2_RELAY_SOCKET_BUF` sets one). Dropping the kernel half was a
+    /// fixed-term under-count of gigabytes at the server's flow bound.
+    #[test]
+    fn stream_pump_charges_userspace_and_relay_kernel_buffers() {
+        let userspace = 2 * crate::tcp::pump::COPY_CHUNK as u64;
+        let kernel = crate::linux::relay_tcp_kernel_bytes_per_flow();
+        let per_flow = userspace + kernel;
+        assert!(
+            kernel >= crate::linux::RELAY_TCP_KERNEL_BYTES_PER_FLOW_DEFAULT,
+            "the kernel term is at least the documented initial allowance"
+        );
+        assert_eq!(stream_pump_memory_bytes(0), 0);
+        for flows in [1usize, 8192, 16_384] {
+            assert_eq!(
+                stream_pump_memory_bytes(flows),
+                flows as u64 * per_flow,
+                "the pump term must be linear in the flow count"
+            );
+        }
+        // Default allowance: 512 MiB userspace + ~2.25 GiB kernel at the
+        // server's 16,384-flow bound, i.e. a multi-GiB fixed term.
+        assert!(
+            stream_pump_memory_bytes(16_384) > 2 * 1024 * 1024 * 1024,
+            "got {} B",
+            stream_pump_memory_bytes(16_384)
+        );
+    }
+
+    /// PERF-4: the rev2 ingress term grew for the 64-slot fast session table
+    /// (each slot carries an inline `ConnPin`); it must stay a round,
+    /// conservative 96 KiB rather than drifting back to the 32 KiB figure that
+    /// covered 16 slots.
+    #[test]
+    fn r2_ingress_term_covers_the_64_slot_fast_table() {
+        assert_eq!(R2_INGRESS_FIXED_BYTES, 96 * 1024);
+        // 64 slots x (inline ConnPin ~304 B + handles) ~= 22 KiB, plus the
+        // 16 KiB pre-HELLO buffer and the surrounding maps: 96 KiB is
+        // conservative with headroom for the per-slot fields.
+        let slots = 64u64;
+        let per_slot = std::mem::size_of::<std::net::SocketAddr>() as u64 + 255 + 8 + 8 + 8 + 16;
+        assert!(
+            R2_INGRESS_FIXED_BYTES >= 16 * 1024 + slots * per_slot / 2,
+            "term must cover the pre-HELLO buffer and the fast table"
         );
     }
 

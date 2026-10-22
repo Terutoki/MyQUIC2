@@ -64,8 +64,37 @@ pub(crate) const DNS_NEG_TTL: Duration = Duration::from_secs(10);
 /// entries. Host-only keys make each entry span every port of its name, so the
 /// same capacities cover strictly more traffic than the per-port keys they
 /// replaced.
+///
+/// These capacities are **entry** counts; the retained bytes per positive
+/// entry are bounded separately by [`DNS_CACHE_MAX_ADDRS`], so `DNS_CACHE_MAX ×
+/// (normalized name + 32 addresses)` is the cache's worst-case footprint. (A
+/// byte-weighted moka `weigher` would express the same bound directly; the cap
+/// is cheaper and keeps the "first N records" semantics callers already rely
+/// on.)
 pub(crate) const DNS_CACHE_MAX: usize = 10_240;
 pub(crate) const DNS_NEG_MAX: usize = 4096;
+
+/// Maximum addresses retained per positive-cache entry.
+///
+/// A DNS answer's size is not bounded by the query: an authoritative server can
+/// return thousands of A/AAAA records (a truncated UDP answer is retried over
+/// TCP, where a DNS message is length-prefixed by a `u16`), and the positive
+/// cache above is bounded in **entries** (`DNS_CACHE_MAX`), not bytes. Retaining
+/// the whole answer would let a peer that controls a domain pin hundreds of MiB
+/// inside a 10,240-entry cache — far outside the DNS admission term
+/// (`config::tuning::dns_inflight_memory_bytes`, which prices resolver waiters,
+/// not cache values). The cached set is therefore the first
+/// [`DNS_CACHE_MAX_ADDRS`] records in the caller's order; the init path has
+/// already sorted the answer preferred-family-first, so the order semantics
+/// every consumer sees are unchanged.
+///
+/// 32 is far more than any consumer uses: a rev2 flow retains at most
+/// `R2_MAX_RESOLVED_ADDRS` (16), the server's TCP happy-eyeballs list at most 8,
+/// and every UDP datagram uses the first address. A name that legitimately
+/// answers with more records still gets enough of them for dual-stack and
+/// multi-homed rotation; the dropped tail only bounds memory, never a lookup's
+/// ability to find *a* usable address for a real service.
+pub(crate) const DNS_CACHE_MAX_ADDRS: usize = 32;
 /// Wall-clock budget for a single upstream DNS lookup. Client-side dial
 /// timeouts are sized to cover this plus the TCP connect budget.
 pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);

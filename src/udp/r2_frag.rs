@@ -31,7 +31,7 @@
 
 use quinn::Connection;
 
-use super::send::{DatagramSend, PayloadSend, try_send_datagram};
+use super::send::{DatagramSend, PayloadSend, note_send_buffer_full, try_send_datagram};
 use crate::mqp::addr::TargetAddrRef;
 use crate::mqp::fragment::{MQP_FRAG_MAX_PAYLOAD, MQP_FRAG_MAX_TOTAL};
 use crate::mqp::r2;
@@ -196,6 +196,11 @@ impl R2Fragmenter {
         // prefix would be queued and never reassembled.
         if self.last_blocked {
             if conn.datagram_send_buffer_space() < plan.footprint(payload.len()) {
+                // One lost datagram, dropped whole: count it like the MQP-2
+                // fragmenter's identical aggregate gate (`send_encoded` books
+                // the per-frame case), so a saturated send buffer is visible
+                // in `dgram_drops` on the fragmented path too.
+                note_send_buffer_full();
                 return PayloadSend {
                     frames: 0,
                     failed: Some(DatagramSend::Blocked),
@@ -232,6 +237,8 @@ impl R2Fragmenter {
             let Some(body) = encoded else {
                 // Only reachable if the plan and the encoder disagree; report
                 // it rather than send a payload that can never reassemble.
+                // `frames` keeps the prefix that already went out.
+                self.note_too_large("plan and rev2 encoder disagree on a frame size");
                 return PayloadSend {
                     frames,
                     failed: Some(DatagramSend::TooLarge),
@@ -241,6 +248,23 @@ impl R2Fragmenter {
                 DatagramSend::Sent => frames += 1,
                 other => {
                     self.last_blocked = other == DatagramSend::Blocked;
+                    match other {
+                        // The frame quinn refused is one lost datagram; the
+                        // MQP-2 fragmenter books exactly the same two classes
+                        // through `send_encoded`.
+                        DatagramSend::Blocked => note_send_buffer_full(),
+                        DatagramSend::TooLarge => {
+                            // The path budget shrank under the cached `limit`:
+                            // a size drop, not a dead connection (the caller
+                            // re-probes its budget).
+                            self.note_too_large(
+                                "path DATAGRAM budget shrank under a rev2 fragment",
+                            );
+                        }
+                        // `Unsupported`/`ConnectionLost` are the caller's to
+                        // account: it tears the flow/egress down.
+                        _ => {}
+                    }
                     return PayloadSend {
                         frames,
                         failed: Some(other),
@@ -260,9 +284,17 @@ impl R2Fragmenter {
         }
     }
 
-    fn too_large(&self, why: &'static str) -> PayloadSend {
+    /// Book one size-class drop: an oversized payload/header, a plan/encoder
+    /// disagreement, or quinn's `TooLarge` verdict (the path budget shrank
+    /// under the cached limit). A size drop is not a dead connection — the
+    /// caller may re-probe `max_datagram_size` and retry.
+    fn note_too_large(&self, why: &'static str) {
         let n = dgram_drops::bump(&dgram_drops::TOO_LARGE);
         warn_datagram_drop(DatagramDropKind::Large, why, n, String::new);
+    }
+
+    fn too_large(&self, why: &'static str) -> PayloadSend {
+        self.note_too_large(why);
         PayloadSend {
             frames: 0,
             failed: Some(DatagramSend::TooLarge),
@@ -330,5 +362,23 @@ mod tests {
         let f = R2Fragmenter::new();
         assert_eq!(f.next_id, 0);
         assert!(!f.last_blocked);
+    }
+
+    /// Every size refusal must be visible in `dgram_drops`: the rev2 path used
+    /// to drop an oversized/failed-encode payload without booking anything,
+    /// unlike the MQP-2 fragmenter it replaces. One bump per refused payload.
+    #[test]
+    fn too_large_verdict_books_the_size_counter() {
+        use crate::dgram_drops;
+        let f = R2Fragmenter::new();
+        let before = dgram_drops::snapshot();
+        let out = f.too_large("plan refused");
+        let d = dgram_drops::snapshot().since(&before);
+        assert_eq!(out.frames, 0);
+        assert_eq!(out.failed, Some(DatagramSend::TooLarge));
+        assert!(
+            d.too_large >= 1,
+            "a size refusal must be visible in dgram_drops: {d:?}"
+        );
     }
 }

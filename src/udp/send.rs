@@ -169,14 +169,14 @@ pub(crate) fn send_udp_datagram_with_prefix(
 
 /// Book one DATAGRAM dropped because quinn's outgoing DATAGRAM buffer is full.
 ///
-/// The single accounting site for `Blocked`: [`send_encoded`] reaches it from
-/// quinn's verdict on a frame, and
-/// [`DgramFragmenter::send`](crate::udp::DgramFragmenter) reaches it from the
-/// aggregate space pre-check that drops a multi-frame payload whole instead of
-/// queueing a prefix that the peer can never reassemble (see the gate in
-/// `fragmenter.rs`). One bump per lost payload either way — the pre-checked
-/// drop owns the frame that would have failed first, so the two paths are
-/// mutually exclusive.
+/// The shared accounting site for `Blocked`: [`send_encoded`] reaches it from
+/// quinn's verdict on a frame, and both fragmenters reach it from the aggregate
+/// space pre-check that drops a multi-frame payload whole instead of
+/// queueing a prefix that the peer can never reassemble
+/// ([`DgramFragmenter::send`](crate::udp::DgramFragmenter),
+/// [`R2Fragmenter::send`](crate::udp::R2Fragmenter)). One bump per lost
+/// payload either way — the pre-checked drop owns the frame that would have
+/// failed first, so the two paths are mutually exclusive.
 pub(crate) fn note_send_buffer_full() {
     let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
     warn_datagram_drop(

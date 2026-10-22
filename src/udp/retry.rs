@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::stats::{NEVER_WARNED, claim_drop_warning};
 use crate::udp_write;
@@ -82,12 +83,15 @@ pub(crate) fn retry_shards() -> &'static [RetryShard; UDP_RETRY_SHARDS] {
 /// lives. `send_to(...).await` parks until the socket is writable, and a
 /// destination that never becomes writable — a peer that stopped reading, a full
 /// qdisc, a black-holed route — parks it forever. That pinned the fd (and the
-/// session's 2 x 32 KiB kernel buffers on the server) for the process lifetime
-/// *and* wedged the whole shard: a worker parked in `send_to` retries nothing
-/// else, so every later datagram hashing to that shard was silently dropped.
+/// session's 2 x 32 KiB kernel buffers on the server) for the process lifetime;
 /// 200 ms is far above the loopback/LAN drain this path exists for and far below
-/// any user-visible retry interval; the datagram is best-effort UDP either way,
-/// and now the fd and the shard are released on a bounded schedule.
+/// any user-visible retry interval, so it is the retention bound: the datagram
+/// is best-effort UDP either way, and the fd is released on a bounded schedule.
+///
+/// The in-flight retries are futures polled by their shard's single worker (not
+/// tasks of their own, see [`spawn_retry_worker`]), so one slow destination
+/// occupies one slot instead of wedging the shard; the deadline is still what
+/// bounds how long that slot and the fd can live.
 pub(crate) const UDP_RETRY_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Await one send under [`UDP_RETRY_TIMEOUT`].
@@ -103,7 +107,7 @@ pub(crate) async fn under_retry_deadline<F: std::future::Future>(fut: F) -> Resu
 }
 
 /// Send one queued retry under the retry deadline. Returns the reason on
-/// failure, so the worker's only job is counting and logging.
+/// failure, so the in-flight future's only job is counting and logging.
 async fn retry_one(req: &UdpRetry) -> Result<(), String> {
     match under_retry_deadline(req.sock.send_to(&req.payload, req.dst)).await {
         Ok(Ok(_)) => Ok(()),
@@ -119,27 +123,46 @@ async fn retry_one(req: &UdpRetry) -> Result<(), String> {
 /// ≈ 51 s of head-of-line blocking, during which the shard also refused every
 /// *new* retry, including ones for destinations that were perfectly writable.
 /// Sixteen in flight bound the cost of one slow destination to one slot while
-/// still bounding the tasks, sockets and payloads a shard can hold.
+/// still bounding the futures, sockets and payloads a shard can hold — as
+/// futures polled by the one worker, not as spawned tasks.
 pub(crate) const UDP_RETRY_INFLIGHT: usize = 16;
 
+/// Spawn one shard's worker task and return the sender that feeds it.
+///
+/// The worker is the shard's *only* task: each retry is a future in its bounded
+/// [`FuturesUnordered`] set, polled by this worker, never a task of its own.
+/// That matters because `WouldBlock` is the saturated steady state this pool
+/// exists for — under egress backpressure every datagram would otherwise pay a
+/// task allocation, a scheduler enqueue and a task wake on top of the payload
+/// copy and the timer, exactly on the path where the buffer is already the
+/// bottleneck. The set is bounded by [`UDP_RETRY_INFLIGHT`] (the worker awaits
+/// a completion before accepting another retry while full), and each future
+/// owns its [`UdpRetry`] — so the payload copy and the **strong** socket handle
+/// live exactly as long as the retry itself and are dropped when it completes
+/// or its [`UDP_RETRY_TIMEOUT`] fires.
 pub(crate) fn spawn_retry_worker() -> tokio::sync::mpsc::Sender<UdpRetry> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpRetry>(UDP_RETRY_DEPTH);
     tokio::spawn(async move {
-        let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // One homogeneous future type (the async block below is written once),
+        // so the set needs neither boxing nor a task per entry.
+        let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
         loop {
             tokio::select! {
                 biased;
                 // Reap finished sends first, so a continuously busy queue can
                 // never grow the in-flight set past the bound.
-                Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
+                Some(()) = inflight.next(), if !inflight.is_empty() => {}
                 maybe = rx.recv() => {
                     let Some(req) = maybe else { break };
+                    // Full set: wait for one retry to finish before queueing
+                    // the next, which is exactly the old JoinSet bound.
                     while inflight.len() >= UDP_RETRY_INFLIGHT {
-                        inflight.join_next().await;
+                        inflight.next().await;
                     }
-                    inflight.spawn(async move {
+                    inflight.push(async move {
                         // `req` is dropped here whatever the outcome, which is
-                        // what releases the last strong `Arc<UdpSocket>`.
+                        // what releases the last strong `Arc<UdpSocket>` (and
+                        // the deadline future releases it after 200 ms).
                         if let Err(reason) = retry_one(&req).await {
                             let n = udp_write::retry_failed();
                             warn_udp_write(UdpWriteDrop::RetryFailed, n, || reason);
@@ -149,8 +172,8 @@ pub(crate) fn spawn_retry_worker() -> tokio::sync::mpsc::Sender<UdpRetry> {
             }
         }
         // Channel closed: the shard is being re-armed or its runtime is ending.
-        // The JoinSet drop aborts any send still in flight, so no retry (and no
-        // socket it holds) outlives its worker.
+        // Dropping the set cancels any send still in flight, so no retry (and
+        // no socket it holds) outlives its worker.
     });
     tx
 }
@@ -202,9 +225,10 @@ fn retry_shard_for(dst: &SocketAddr) -> &'static RetryShard {
 /// attempting the syscall while a freshly registered socket has no cached
 /// writable readiness, which would silently drop the first packet of every new
 /// session. A genuinely full socket buffer is real backpressure too. In both
-/// cases the packet is queued to a sharded global retry pool (one worker per
-/// shard, selected by destination ip+port) so the caller never stalls, no task is
-/// spawned per packet, and one slow destination cannot head-of-line-block every
+/// cases the packet is queued to a sharded global retry pool (one worker task
+/// per shard, selected by destination ip+port) so the caller never stalls, no
+/// task is spawned per retried packet (the worker polls each retry as a future
+/// in a bounded set), and one slow destination cannot head-of-line-block every
 /// other session behind a single queue; a full shard drops (UDP semantics).
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
     match sock.try_send_to(&payload, dst) {
@@ -215,11 +239,11 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                 dst,
                 payload,
             };
-            // Counted *after* the queue accepts it. `retried` means "handed to a
-            // detached task", and the old order counted the hand-off before
-            // knowing whether it happened, so a datagram dropped on a full shard
-            // was booked as both retried and dropped — one datagram, two mutually
-            // exclusive outcomes.
+            // Counted *after* the queue accepts it. `retried` means "handed to
+            // the shard's detached retry worker", and the old order counted the
+            // hand-off before knowing whether it happened, so a datagram dropped
+            // on a full shard was booked as both retried and dropped — one
+            // datagram, two mutually exclusive outcomes.
             if udp_retry_submit(&dst, req) {
                 udp_write::retried();
             } else {
@@ -494,8 +518,9 @@ fn warn_udp_write(kind: UdpWriteDrop, total: u64, detail: impl FnOnce() -> Strin
 ///   `dropped_no_permit` + one `Budget` warning (newest-drop UDP semantics).
 /// - any other error → `failed`.
 /// - one detached retry runs under the 200 ms deadline; at most 16 in flight
-///   per shard; shards are selected by destination ip+port; a shard whose
-///   worker died with its runtime is re-armed via `ArcSwap`.
+///   per shard, polled as futures by the shard's single worker (no task per
+///   retried datagram); shards are selected by destination ip+port; a shard
+///   whose worker died with its runtime is re-armed via `ArcSwap`.
 /// - `udp_try_send_grouped` shares one `sendmmsg` per same-destination burst
 ///   (Linux only; portable one-`try_send_to`-per-frame fallback elsewhere,
 ///   bounded by `LAST_HOP_DRAIN` = 32). Per-frame outcomes are identical to
@@ -506,8 +531,10 @@ fn warn_udp_write(kind: UdpWriteDrop, total: u64, detail: impl FnOnce() -> Strin
 ///
 /// NOTE (last-hop batching, production): grouped sends are on the hot path
 /// for same-destination reply bursts. Still no `UDP_SEGMENT` options
-/// (quinn-udp owns GSO), no blocking `send_to().await` on the hot path, no
-/// per-packet spawn.
+/// (quinn-udp owns GSO), no blocking `send_to().await` on the hot path, and no
+/// per-packet spawn: a `WouldBlock` datagram becomes one owned `UdpRetry` in
+/// the shard queue, and the shard's single worker polls it as one of at most
+/// 16 in-flight futures.
 #[cfg(test)]
 mod contract_tests {
     use super::*;
@@ -759,7 +786,13 @@ mod contract_tests {
         const N: usize = 6;
         let bodies: Vec<[u8; 4]> = (0..N).map(|i| [i as u8; 4]).collect();
         let refs: Vec<SendFrame<'_>> = bodies.iter().map(|x| (HDR, &x[..])).collect();
-        udp_try_send_grouped(&sock, dst, &refs);
+        {
+            // Serialise with the tests that assert exact `sent` deltas: this
+            // test does not measure, but its sends must not land inside a
+            // measured window on another test thread.
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            udp_try_send_grouped(&sock, dst, &refs);
+        }
 
         let mut got = [false; N];
         let mut seen = 0usize;
@@ -904,7 +937,12 @@ mod contract_tests {
         let frames: Vec<[u8; 4]> = (0..N).map(|i| [i as u8; 4]).collect();
         let empty: &[u8] = &[];
         let refs: Vec<SendFrame<'_>> = frames.iter().map(|f| (empty, &f[..])).collect();
-        udp_try_send_grouped(&sock, dst, &refs);
+        {
+            // Same lock as the measured tests: the 40-frame tail must not land
+            // inside their exact-delta windows.
+            let _guard = CONTRACT_LOCK.lock().unwrap();
+            udp_try_send_grouped(&sock, dst, &refs);
+        }
         let mut seen = 0usize;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while seen < N {
@@ -1009,5 +1047,57 @@ mod contract_tests {
             drop_warn_due(1_000, 1_000 + 10_000),
             "Budget drop after the window must warn again"
         );
+    }
+
+    /// PERF-5 lock-in: a queued retry is a **future** polled by the shard's one
+    /// worker task, not a task of its own. The worker must still drain more
+    /// retries than the in-flight bound (the full-set path awaits a completion
+    /// before queueing the next) and deliver every datagram, on a
+    /// current-thread runtime — a per-retry `spawn` would not make delivery
+    /// wrong, but this pins that the replacement keeps the pool's contract.
+    #[tokio::test]
+    async fn retry_worker_polls_queued_retries_and_delivers() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tx = spawn_retry_worker();
+        // More entries than UDP_RETRY_INFLIGHT: the bound must throttle, not
+        // drop, the surplus.
+        const N: u32 = UDP_RETRY_INFLIGHT as u32 + 4;
+        for i in 0..N {
+            tx.send(UdpRetry {
+                sock: sock.clone(),
+                dst,
+                payload: Bytes::from(vec![i as u8]),
+            })
+            .await
+            .expect("the shard queue accepts the test retries");
+        }
+        let mut got = [false; N as usize];
+        let mut seen = 0usize;
+        let mut b = [0u8; 8];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while seen < N as usize {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, listener.recv_from(&mut b)).await {
+                Ok(Ok((1, _))) => {
+                    let i = b[0] as usize;
+                    if i < got.len() && !got[i] {
+                        got[i] = true;
+                        seen += 1;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            seen, N as usize,
+            "every queued retry must be polled and delivered: {seen}/{N}"
+        );
+        drop(tx);
     }
 }

@@ -4,7 +4,7 @@
 > This file is the implementation contract: land the codec first, then wire it up phase by phase. All version identification appears only in `wire_ver=2` of `CTL HELLO/CAPS`;
 > code/docs/logs **must not contain "MQP-4"**.
 >
-> **Status (2026-10-22, audit-hardened):** the contract below is current; the implementation-status snapshot in §10 is dated and retains historical test counts. The current tree has **476 macOS tests**, with server-owned full-cone flows, the connection-level stager, the reassembler purge hooks and the full audit-hardening batch (§10.6) landed.
+> **Status (2026-10-22, audit-hardened):** the contract below is current; the implementation-status snapshot in §10 is dated and retains historical test counts. The current tree has **530 macOS tests**, with server-owned full-cone flows, the connection-level stager, the reassembler purge hooks and the full audit-hardening batch (§10.6) landed.
 
 ---
 
@@ -94,8 +94,11 @@ resolved: SmallVec<SocketAddr>        // server downlink: resolution results for
 - Allocation/insertion happens only for new flows; the hot path only reads `Arc` + atomics.
 - `FlowRegistry` uses `parking_lot::RwLock<HashMap<u32, Arc<FlowBinding>>>` (read-heavy, write-light; Phase 1 prioritizes correctness;
   if profiling shows lock contention, Phase 2 switches to sharded/ArcSwap snapshots).
-- Per-connection live flow cap: `max_conn_flows` (default 4096, negotiated via `CAPS`); per-session cap 64 (negotiable).
-  Over limit: the send side falls back to `INLINE`; the receive side `FLOW_REJECT`.
+- Per-connection live flow cap: 4096 live flows (`R2_MAX_FLOWS_PER_CONN`); per-session cap 64
+  (`R2_MAX_FLOWS_PER_SESSION`). Both are **compile-time constants**: `CAPS.max_conn_flows` and
+  `CAPS.max_flows_sess` are reserved fields (§3.4) — decoded for forward compatibility, not
+  enforced and not used to resize the tables. Over limit: the send side falls back to `INLINE`;
+  the receive side `FLOW_REJECT`.
 
 ---
 
@@ -176,6 +179,16 @@ Old peers always drop the `0x0C` first byte, so it is inherently safe.
 0x20 SESS_CLOSE  : sess u32 | reason u8
 ```
 
+- **Reserved CAPS fields.** `max_conn_flows`, `max_flows_sess` and `max_reassembly` are
+  **reserved**: this implementation decodes and range-checks them so the frame layout is
+  forward-compatible, but it does **not** enforce or resize anything from them. The live bounds
+  stay at their compile-time constants — the per-connection flow registry
+  (`R2_MAX_FLOWS_PER_CONN`), the per-session reverse table (`R2_MAX_FLOWS_PER_SESSION`) and the
+  reassembly budgets (`FRAG_MAX_HELD_BYTES`) — and those constants are what admission charges.
+  A sender must not assume a receiver will honour a smaller advertised value. Only
+  `max_train_items` (stager framing) and `max_frame_bytes` (frame sizing) take effect today;
+  negotiation of the other three is follow-up work (§10.5).
+
 - **HELLO/CAPS**: the client sends HELLO immediately after the connection is established, but **does not wait for CAPS** before sending the first UDP packet (optimistic first packet);
   the server replies with CAPS once per HELLO received (100 ms throttle), and releases rev2 data frames that arrived before HELLO in order after a valid HELLO.
   Version mismatch → the client closes the connection and reports an error (fail-fast).
@@ -236,7 +249,10 @@ full-cone unsolicited (no matching flow):
 4. Half-space ids must not be resolved across sessions: registry entries must carry the session; the client looks up its local table by each item's id.
 5. full-cone remains opt-in; server-owned flows are created only under full-cone and are counted as unsolicited.
 6. Length/range validation before parsing control/data frames; unknown first byte/opcode/flag → counted and dropped, no panic.
-7. Tables are bounded and counted in admission; `max_conn_flows`/`max_flows_sess`/`max_frame_bytes` are negotiated by CAPS.
+7. Tables are bounded by compile-time constants and counted in admission. `CAPS` carries
+   `max_conn_flows`/`max_flows_sess`/`max_reassembly` as **reserved** fields (decoded, not enforced)
+   and `max_frame_bytes`/`max_train_items` as the only negotiated limits consumed today; changing
+   the former three from the wire is follow-up work, never an implicit resize.
 8. Non-reusable wire_id (monotonic) ⇒ no splice risk; exhaustion falls back to INLINE.
 
 ---
@@ -336,7 +352,7 @@ full-cone unsolicited (no matching flow):
 
 ## 10. Implementation Status (2026-10-21, Phase 1a landed)
 
-> **Status note (2026-10-22).** This section is a dated implementation snapshot, not a live tracker. Since the snapshot, server-owned/full-cone flows, the connection-level stager with cross-session `TRAIN dict`, `R2Reassembler::{drop_session, drop_flow}` purge hooks and the audit-hardening batch (§10.6) have landed; the current tree has **476 macOS tests**. Items below that describe these as remaining are retained as history. See the README verification section for the current counts.
+> **Status note (2026-10-22).** This section is a dated implementation snapshot, not a live tracker. Since the snapshot, server-owned/full-cone flows, the connection-level stager with cross-session `TRAIN dict`, `R2Reassembler::{drop_session, drop_flow}` purge hooks and the audit-hardening batch (§10.6) have landed; the current tree has **530 macOS tests**. Items below that describe these as remaining are retained as history. See the README verification section for the current counts.
 
 ### 10.1 Delivered
 
@@ -394,8 +410,8 @@ full-cone unsolicited (no matching flow):
 ### 10.5 Unfinished (rest of Phase 2)
 
 1. **CAPS negotiated limits actually take effect**: of `max_conn_flows/max_flows_sess/max_frame_bytes/max_reassembly`, the client already uses
-   `max_frame_bytes` for frame sizing, while the rest still use compile-time defaults; the registry/session/frame length caps need to be
-   changed to connection-level negotiated values.
+   `max_frame_bytes` for frame sizing (and the stager uses `max_train_items`), while the rest are reserved fields that are decoded but not enforced
+   (see §3.4) and still use compile-time defaults; the registry/session/frame length caps need to be changed to connection-level negotiated values.
 2. **server-owned / full-cone flow** (complete D2/D4): id half-space/FlowIds are ready, not yet wired.
 3. **Phase 2**: connection-level stager + cross-session `TRAIN dict` + per-session quota/fairness; `udpbidir` acceptance threshold.
 4. **Linux 2–4 core target machine** benchmark (netem 70/140 ms, 0/0.5/2 % loss) — local macOS loopback cannot be extrapolated.

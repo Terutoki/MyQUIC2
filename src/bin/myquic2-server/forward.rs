@@ -513,6 +513,15 @@ pub(crate) async fn forward_server_dgram(
             // it, the reply reader's rev2 handle). Cloned here because the task
             // outlives this frame.
             let r2_task = r2.map(Arc::clone);
+            // Register this waiter's cancellation flag **synchronously**, before
+            // the spawn: the datagram reader processes frames in order, so a
+            // `CTL SESS_CLOSE` that arrives after this datagram is handled after
+            // the registration and will find the flag. Without it, a DNS answer
+            // that lands after the close re-created the session (socket, reader
+            // task and global permit leaked until the 180 s idle sweep) — this
+            // generic path has no per-flow coalescing key for the close to
+            // cancel (see `R2ConnState::dns_waiters`).
+            let waiter = r2.map(|st| st.begin_dns_waiter(s));
             tokio::spawn(async move {
                 let _permit = permit;
                 let unusable = deliver_resolved_server_dgram(
@@ -525,14 +534,17 @@ pub(crate) async fn forward_server_dgram(
                     payload,
                     allow_private,
                     r2_task.as_ref(),
+                    waiter.as_ref(),
                 )
                 .await;
                 // Success or a name-level failure: always complete the claim, or
                 // every later datagram for this target would be dropped as
-                // in-flight until the backstop expires.
+                // in-flight until the backstop expires. The waiter guard drops
+                // after this, removing its cancellation registry entry.
                 task_ss
                     .dns_gate
                     .finish(s, &host, p, generation, unusable, coarse_millis());
+                drop(waiter);
             });
             // The resolution happens in the spawned task above (it awaits), so
             // this datagram is delivered there and there is no pin for the caller
@@ -552,7 +564,7 @@ pub(crate) async fn forward_server_dgram(
 /// resource refusal from `get_or_create_sess` is not a DNS verdict and returns
 /// `false`, so it never suppresses the next datagram's retry.
 #[allow(clippy::too_many_arguments)]
-async fn deliver_resolved_server_dgram(
+pub(crate) async fn deliver_resolved_server_dgram(
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -562,6 +574,7 @@ async fn deliver_resolved_server_dgram(
     payload: Bytes,
     allow_private: bool,
     r2: Option<&Arc<R2ConnState>>,
+    waiter: Option<&DnsWaiter>,
 ) -> bool {
     let dst = match resolve_all_cached(host, port).await {
         Ok(v) => match v
@@ -582,23 +595,45 @@ async fn deliver_resolved_server_dgram(
             return true;
         }
     };
-    let sock = match get_or_create_sess(
+    // The client may have closed the association while the DNS lookup was in
+    // flight. Check the close before paying socket()/permit and again through
+    // the guarded creation (which re-reads the flag inside the session shard's
+    // write critical section, so it cannot race `take_session`). A cancelled
+    // waiter returns "not a DNS verdict" so the gate does not cache anything
+    // for the next datagram.
+    if waiter.is_some_and(DnsWaiter::is_cancelled) {
+        return false;
+    }
+    // The DNS *entry* may be older than `DNS_CACHE_TTL_MS`: `resolve_all_cached`
+    // serves a host-keyed cache hit (every port shares one entry) and only then
+    // memoizes this `(host, port)`. Pass the entry's actual remaining life so
+    // the session destination memo / pin cannot outlive the resolution behind
+    // them (`pin_life_ms` clamping); a miss (e.g. the memo was overwritten by
+    // another thread) falls back to the fresh-resolution bound.
+    let remaining_ms = {
+        let (_, life) = lookup_cached_fast_with_ttl(host, port);
+        if life == 0 { DNS_CACHE_TTL_MS } else { life }
+    };
+    let sock = match get_or_create_sess_guarded(
         ss,
         cd,
         conn_id,
         s,
-        Some((host, port, dst, DNS_CACHE_TTL_MS)),
+        Some((host, port, dst, remaining_ms)),
         r2,
+        waiter.map(DnsWaiter::cancelled_flag),
     )
     .await
     {
         Some(v) => Some(v),
-        // `get_or_create_sess` already bumps the specific budget counter for
-        // every resource refusal (FAIR_SHARE / SESSION_FULL /
+        // `get_or_create_sess_guarded` already bumps the specific budget
+        // counter for every resource refusal (FAIR_SHARE / SESSION_FULL /
         // SESS_CREATE_FAILED); the only silent None is the no-DATAGRAM path,
         // counted here so the spawned datagram never vanishes from the 60 s
         // budget line. Guarded (not unconditional) so a refusal is never bumped
-        // twice.
+        // twice. A cancelled creation is not a resource refusal: it returns
+        // `None` here with no counter, and the cancel check below turns it into
+        // "nothing to deliver".
         None => {
             if cd.max_datagram_size().is_none() {
                 dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
@@ -607,6 +642,9 @@ async fn deliver_resolved_server_dgram(
         }
     };
     if let Some(sock) = sock {
+        if waiter.is_some_and(DnsWaiter::is_cancelled) {
+            return false;
+        }
         remember_dst(ss, s, dst);
         udp_try_send(&sock, map_for_dual(dst), payload);
     }

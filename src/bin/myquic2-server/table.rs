@@ -349,6 +349,13 @@ impl ShardedSessTable {
     /// process-wide session slot. The reply reader may be mid-drain on its way
     /// out; its own removal re-checks the entry it published (there is none any
     /// more), so the two removals cannot double-decrement the live count.
+    ///
+    /// Production `SESS_CLOSE` (`r2_close_session`) cannot use this shape: it
+    /// must remove the entry and purge the rev2 registry bindings in the *same*
+    /// shard write critical section (see the note there), so it inlines the
+    /// removal. This entry point remains for test fixtures and teardown
+    /// assertions.
+    #[cfg(test)]
     pub(crate) fn take_session(&self, s: u32) -> Option<SessEntry> {
         let mut w = self.shard(s).write();
         let entry = w.remove(&s);
@@ -360,7 +367,29 @@ impl ShardedSessTable {
         entry
     }
 
+    #[cfg(test)]
     pub(crate) fn sweep_all(&self, now: u64) -> Vec<SessEntry> {
+        self.sweep_all_with(now, |_| {})
+    }
+
+    /// [`Self::sweep_all`] with a purge callback invoked for each shard's
+    /// removed sessions **while that shard's write lock is still held**.
+    ///
+    /// The rev2 registry purge needs that lock hold: purging bindings *by
+    /// session id* is only collision-safe while no datagram path can recreate a
+    /// session with the same id. A hostile peer can always reuse an id after
+    /// the reap, and `get_or_create_sess` inserts under this same shard write
+    /// lock, so under the guard every binding the registry still indexes under
+    /// a just-removed session id belongs to the entry that was just removed.
+    /// That makes the whole shard's purge one `remove_sessions` call — one
+    /// registry write lock per shard instead of one per binding (4096 write
+    /// locks on a full-connection reap; PERF-7).
+    ///
+    /// The callback receives the removed session ids. It runs under the shard
+    /// write guard and must not take another session-table lock (the purge it
+    /// performs takes the registry's own locks, which is the established
+    /// shard -> registry order of `r2_install`).
+    pub(crate) fn sweep_all_with(&self, now: u64, mut purge: impl FnMut(&[u32])) -> Vec<SessEntry> {
         let mut out = Vec::new();
         for sh in &self.shards {
             let expired: Vec<u32> = {
@@ -379,6 +408,11 @@ impl ShardedSessTable {
             let mut m = sh.write();
             let evicted = take_idle(&mut m, &expired, now);
             self.note_live_remove(evicted.len());
+            if !evicted.is_empty() {
+                let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
+                purge(&ids);
+            }
+            drop(m);
             out.extend(evicted);
         }
         self.note_empty_state();

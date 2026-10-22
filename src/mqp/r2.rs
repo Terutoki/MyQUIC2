@@ -467,6 +467,12 @@ fn valid_train_flows(flows: &[u32], items: &[(u8, &[u8])]) -> Option<()> {
     if flows.is_empty() || flows.len() > u8::MAX as usize || flows.len() > R2_MAX_TRAIN_ITEMS {
         return None;
     }
+    // Encoder symmetry: `decode_train` rejects `nfl > count` (there cannot be
+    // more flows than items). Refuse to emit that shape instead of producing a
+    // frame the peer would reject wholesale.
+    if flows.len() > items.len() {
+        return None;
+    }
     for (i, f) in flows.iter().enumerate() {
         if !valid_wire_id(*f) || flows[..i].contains(f) {
             return None;
@@ -617,7 +623,13 @@ pub fn decode_train(b: &[u8]) -> Result<TrainFrame<'_>, MqpError> {
         }
         _ => return Err(MqpError::Malformed("bad r2 train form")),
     };
-    // Validate items eagerly: lengths must fit exactly to the end of the frame.
+    // Validate items eagerly: every length must fit inside the frame.
+    //
+    // A zero-length item is legal: the common rules allow an empty `DATA`
+    // payload, the encoders emit one for an empty UDP datagram, and the
+    // connection stager packs such a payload into a `TRAIN`. Rejecting it here
+    // made a single empty payload poison the whole frame (up to 64 payloads,
+    // possibly from many sessions), so only the end bound is enforced.
     let mut p = off;
     for _ in 0..count {
         if form == R2_TRAIN_FORM_DICT {
@@ -631,7 +643,7 @@ pub fn decode_train(b: &[u8]) -> Result<TrainFrame<'_>, MqpError> {
         let end = p
             .checked_add(len)
             .ok_or(MqpError::Malformed("r2 train item overflow"))?;
-        if end > b.len() || len == 0 {
+        if end > b.len() {
             return Err(MqpError::Malformed("bad r2 train item length"));
         }
         p = end;
@@ -1071,7 +1083,7 @@ mod tests {
     fn first_bytes_are_safe_for_old_parsers() {
         let flows = [5u32, 9];
         let payloads: [&[u8]; 1] = [b"x"];
-        let items: [(u8, &[u8]); 1] = [(0, b"x")];
+        let items: [(u8, &[u8]); 2] = [(0, b"x"), (1, b"y")];
         let frames: Vec<Bytes> = vec![
             encode_data_steady(5, b"x", 1500).unwrap(),
             encode_data_open(5, 7, &v4(53), false, b"x", 1500).unwrap(),
@@ -1185,6 +1197,41 @@ mod tests {
         let flows = [5u32];
         let items: [(u8, &[u8]); 1] = [(1, b"x")];
         assert!(encode_train_dict(&flows, &items, 1500).is_none());
+        // More flows than items can never decode (`nfl > count`), so the
+        // encoder must refuse the shape instead of emitting a frame the peer
+        // drops wholesale.
+        let flows = [5u32, 9];
+        let items: [(u8, &[u8]); 1] = [(0, b"x")];
+        assert!(encode_train_dict(&flows, &items, 1500).is_none());
+    }
+
+    /// An empty UDP payload is legal and the stager packs it into a TRAIN as a
+    /// `len == 0` item. Both the same-flow and dict encoders must round-trip it
+    /// and the decoder must accept it — otherwise one empty payload made the
+    /// receiver drop the whole frame (and every other session's items in it).
+    #[test]
+    fn train_roundtrips_zero_length_items() {
+        let payloads: [&[u8]; 2] = [b"", b"x"];
+        let d = encode_train_same(5, &payloads, 1500).unwrap();
+        assert_eq!(&d[..], &[0x04, 0x00, 0x02, 0x05, 0x00, 0x01, b'x']);
+        let t = decode_train(&d).unwrap();
+        assert_eq!(
+            t.items().collect::<Vec<_>>(),
+            vec![(5, &b""[..]), (5, &b"x"[..])]
+        );
+
+        let flows = [5u32, 9];
+        let items: [(u8, &[u8]); 3] = [(0, b""), (1, b"x"), (0, b"")];
+        let d = encode_train_dict(&flows, &items, 1500).unwrap();
+        let t = decode_train(&d).unwrap();
+        assert_eq!(
+            t.items().collect::<Vec<_>>(),
+            vec![(5, &b""[..]), (9, &b"x"[..]), (5, &b""[..])]
+        );
+        // A hostile frame whose only item is empty still parses to exactly one
+        // empty payload, and a trailing byte after it is still rejected.
+        assert!(decode_train(&[0x04, 0x00, 0x01, 0x05, 0x00]).is_ok());
+        assert!(decode_train(&[0x04, 0x00, 0x01, 0x05, 0x00, 0x00]).is_err());
     }
 
     #[test]

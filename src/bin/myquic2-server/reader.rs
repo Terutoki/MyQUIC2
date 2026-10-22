@@ -327,6 +327,31 @@ pub(crate) fn drain_stage(
     verdict
 }
 
+/// Whether the stager still holds frames after a drain.
+///
+/// [`StageDrain::Ok`] conflates "everything sent" with "buffer full, the rest
+/// stayed queued" (backpressure is not a fault, see [`stage_verdict`]). A
+/// session reader uses this one-lock probe at its burst boundary to arm the
+/// short retry timer ([`STAGE_RETRY_MS`]) only when frames are actually
+/// stranded; an idle connection whose stager is empty never arms it, so steady
+/// state pays nothing.
+pub(crate) fn stage_has_backlog(stage: &Arc<parking_lot::Mutex<R2Stager>>) -> bool {
+    !stage.lock().is_empty()
+}
+
+/// How long a session reader waits before retrying a drain that left frames
+/// queued because the DATAGRAM send buffer was full.
+///
+/// Such a drain returns `StageDrain::Ok` and keeps the remaining items queued;
+/// the only other trigger to drain is the end of some session's reply burst.
+/// A quiet tail — the last replies of a burst, with no further traffic on any
+/// session — therefore used to sit in the stager until connection close and was
+/// then dropped (accounted only by the stager's own teardown path). Twenty
+/// milliseconds bounds the tail's added latency well inside one app-visible
+/// RTT while costing two wakeups per second and *only* while frames are
+/// queued.
+pub(crate) const STAGE_RETRY_MS: u64 = 20;
+
 /// Push one staged item; when the bounded queue is full, drain once and retry.
 ///
 /// A push that still fails after a drain is a local-buffer drop: the payload is
@@ -432,11 +457,19 @@ fn reprobe_large(c2: &quinn::Connection, limit: &mut usize, last_too_large_probe
 pub(crate) enum R2LargeReply {
     /// Every frame was queued (per-reply payload accounting already done).
     Sent,
-    /// The DATAGRAM buffer was full; the payload is an ordinary UDP drop.
+    /// A single-frame send found the DATAGRAM buffer full; the payload is an
+    /// ordinary UDP drop and *nothing has counted it*, so the reader books
+    /// `dgram_drops::BUFFER_FULL` (OBS-1).
     Blocked,
-    /// The live path budget cannot carry it; the caller re-probes under the
-    /// usual 100 ms throttle.
+    /// A single-frame encoding does not fit the live path budget; the payload is
+    /// a drop the reader books as `dgram_drops::TOO_LARGE` and re-probes the
+    /// budget under the usual 100 ms throttle.
     TooLarge,
+    /// A fragmented send dropped the payload. The shared fragmenter books its
+    /// own per-payload drop (the udp module's contract: a partial fragmented
+    /// payload is booked there, so the reader must not double-book), but a
+    /// *size* verdict still re-probes the live budget here.
+    FragDropped { reprobe: bool },
     /// DATAGRAM support / the connection is gone: the reader should flush and
     /// exit.
     Terminal,
@@ -452,10 +485,15 @@ impl R2LargeReply {
         }
     }
 
+    /// Map a fragmented send's verdict. A dropped fragment set is accounted by
+    /// the fragmenter itself (see the enum docs), so only the *size* verdict is
+    /// surfaced for a budget re-probe.
     fn from_payload(sent: &PayloadSend) -> Self {
         match sent.outcome() {
             DatagramSend::Sent => Self::Sent,
-            other => Self::from_send(other),
+            DatagramSend::TooLarge => Self::FragDropped { reprobe: true },
+            DatagramSend::Blocked => Self::FragDropped { reprobe: false },
+            DatagramSend::Unsupported | DatagramSend::ConnectionLost => Self::Terminal,
         }
     }
 }
@@ -500,7 +538,7 @@ fn r2_send_large_reply(
                 let out = R2LargeReply::from_send(sent);
                 if out == R2LargeReply::Sent {
                     udp_stats::payload(n);
-                    r2_stats::bump(&r2_stats::STEADY_SENT);
+                    r2_stats::bump_steady_sent();
                 }
                 out
             } else {
@@ -513,7 +551,7 @@ fn r2_send_large_reply(
                     payload,
                 );
                 if sent.complete() {
-                    r2_stats::bump(&r2_stats::STEADY_SENT);
+                    r2_stats::bump_steady_sent();
                 }
                 R2LargeReply::from_payload(&sent)
             }
@@ -527,7 +565,7 @@ fn r2_send_large_reply(
                 if out == R2LargeReply::Sent {
                     binding.set_reply_src(src);
                     udp_stats::payload(n);
-                    r2_stats::bump(&r2_stats::OPEN_SRC_SENT);
+                    r2_stats::bump_open_src_sent();
                 }
                 out
             } else {
@@ -547,7 +585,7 @@ fn r2_send_large_reply(
                     // the actual source when it reassembles, so the next reply
                     // from it compresses.
                     binding.set_reply_src(src);
-                    r2_stats::bump(&r2_stats::OPEN_SRC_SENT);
+                    r2_stats::bump_open_src_sent();
                 }
                 R2LargeReply::from_payload(&sent)
             }
@@ -1079,7 +1117,7 @@ pub(crate) fn handle_session_reply(
                 if let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref() {
                     binding.set_reply_src(src);
                 }
-                r2_stats::bump(&r2_stats::OPEN_SRC_SENT);
+                r2_stats::bump_open_src_sent();
             }
             verdict
         } else {
@@ -1104,21 +1142,60 @@ pub(crate) fn handle_session_reply(
     // DATA/OPEN|SRC/INLINE frame when it fits the live budget, otherwise rev2
     // FRAG. The legacy MQP-2 fragmenter is not a production reply sender.
     let sent = r2_send_large_reply(c2, s, &mut *frag2, r2_match.as_ref(), src, payload, *limit);
+    match large_reply_disposition(sent, c2, limit, last_too_large_probe_ms) {
+        ReplyDisposition::Continue => {}
+        ReplyDisposition::BreakSession => return ReplyDisposition::BreakSession,
+    }
+    ReplyDisposition::Continue
+}
+
+/// Book one large-reply verdict and decide the reader's next move (OBS-1).
+///
+/// Kept separate from [`handle_session_reply`] so the OBS-1 accounting contract
+/// is unit-testable: a single-frame `Blocked`/`TooLarge` drop is booked here
+/// (nothing else sees it), a fragmented drop is **not** re-booked (the shared
+/// fragmenter accounts its own per-payload drop), and a size verdict re-probes
+/// the live path budget at most once per probe interval.
+pub(crate) fn large_reply_disposition(
+    sent: R2LargeReply,
+    c2: &quinn::Connection,
+    limit: &mut usize,
+    last_too_large_probe_ms: &mut u64,
+) -> ReplyDisposition {
+    // A size verdict (single-frame or fragmented) re-reads the live budget, at
+    // most once per throttle interval: a PMTU shrink otherwise cost one quinn
+    // connection-state lock per oversized reply on top of the send's own take.
+    // `.max(1)`: the zero stamp means "never probed" (see
+    // `too_large_probe_due`), and the mono epoch counts from process start, so
+    // a verdict inside the first millisecond must still arm the throttle.
+    let reprobe_budget = |limit: &mut usize, last: &mut u64| {
+        let now_probe = mono_millis().max(1);
+        if too_large_probe_due(*last, now_probe) {
+            *last = now_probe;
+            *limit = c2.max_datagram_size().unwrap_or(0);
+        }
+    };
     match sent {
-        R2LargeReply::Sent | R2LargeReply::Blocked => {}
+        R2LargeReply::Sent => {}
+        // The single-frame send was refused by the full DATAGRAM buffer and
+        // nothing else books that drop. Without this counter a saturated
+        // downlink silently loses exactly the replies larger than the staging
+        // threshold, and the only signal ("UDP works for small replies") says
+        // nothing.
+        R2LargeReply::Blocked => {
+            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+        }
+        // The live budget cannot carry one frame of this reply: booked as
+        // `TOO_LARGE` (the MTU/path class), distinct from buffer pressure.
         R2LargeReply::TooLarge => {
-            // Size verdict, never a connection fault: keep the reader and the
-            // cached budget, re-reading the live budget at most once per probe
-            // interval. Unthrottled, every oversized reply in a PMTU-shrink
-            // window took quinn's connection-state lock on top of the one
-            // per-frame take the send itself already paid. `.max(1)`: the zero
-            // stamp means "never probed" (see `too_large_probe_due`), and the
-            // mono epoch counts from process start, so a verdict inside the
-            // first millisecond must still arm the throttle.
-            let now_probe = mono_millis().max(1);
-            if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
-                *last_too_large_probe_ms = now_probe;
-                *limit = c2.max_datagram_size().unwrap_or(0);
+            dgram_drops::bump(&dgram_drops::TOO_LARGE);
+            reprobe_budget(limit, last_too_large_probe_ms);
+        }
+        // The shared fragmenter booked this payload's drop itself; only the
+        // size verdict still needs the budget re-probe.
+        R2LargeReply::FragDropped { reprobe } => {
+            if reprobe {
+                reprobe_budget(limit, last_too_large_probe_ms);
             }
         }
         R2LargeReply::Terminal => return ReplyDisposition::BreakSession,
@@ -1177,12 +1254,32 @@ pub(crate) async fn sess_reader_task(
     // and binding install). Small replies are pushed to the connection-scoped
     // `stage`; nothing is retained in this task across awaits.
     let mut r2 = R2ReplyState::new(r2_flows, r2_conn);
+    // Retry timer for a drain that left frames queued on a full DATAGRAM send
+    // buffer (see `stage_has_backlog`/`STAGE_RETRY_MS`). The first `tick()`
+    // consumes the interval's immediate first fire; from then on the arm only
+    // exists while `stage_backlog` is true, so a connection with nothing queued
+    // polls no timer at all.
+    let mut stage_retry = tokio::time::interval(Duration::from_millis(STAGE_RETRY_MS));
+    stage_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    stage_retry.tick().await;
+    let mut stage_backlog = false;
     'session: loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(_) => break,
             },
+            _ = stage_retry.tick(), if stage_backlog => {
+                // Backpressure cleared our earlier drain: retry now. Terminal
+                // keeps the reader's flush-and-exit contract; on success the
+                // queue is empty and the arm disappears again.
+                match drain_stage(&c2, &stage, &mut limit, &mut last_too_large_probe_ms) {
+                    StageDrain::Terminal => break 'session,
+                    StageDrain::Ok | StageDrain::TooLarge => {}
+                }
+                stage_backlog = stage_has_backlog(&stage);
+                continue;
+            }
             _ = tick.tick() => {
                 if c2.close_reason().is_some()
                     || mono_millis()
@@ -1322,6 +1419,11 @@ pub(crate) async fn sess_reader_task(
         {
             break 'session;
         }
+        // A `Blocked` verdict left the remaining items queued; arm the retry
+        // timer so a quiet tail cannot wait for another session's burst (or
+        // connection close). One stager-lock probe per burst, and the timer is
+        // disarmed as soon as the queue is empty.
+        stage_backlog = stage_has_backlog(&stage);
         record_drain_batch(drained);
     }
     // Every exit above breaks to here, so the buffer is recycled exactly once
@@ -1330,6 +1432,10 @@ pub(crate) async fn sess_reader_task(
     sess_recycle_buf(buf);
     sess_memo_forget(conn_id, s, &rs);
     let mut removed_r2 = None;
+    // Bindings purged while the shard write guard that removed the dead entry
+    // is still held (PERF-7: one registry write lock for the whole association
+    // instead of one per binding).
+    let mut purged_on_exit = 0usize;
     // Set by the removal block below; read after it to decide whether this
     // reader's exit is the reap the client must be told about.
     let removed_own;
@@ -1342,12 +1448,29 @@ pub(crate) async fn sess_reader_task(
             && let Some(entry) = w.remove(&s)
         {
             removed = true;
+            // Purge by session id under the shard write guard: the guard
+            // excludes both a recreation of this session id and any in-flight
+            // install (`r2_install` holds the same shard's read guard across its
+            // registry insert), so every binding the registry still indexes
+            // under `s` belongs to the entry just removed — one registry write
+            // lock replaces one per binding, and the purge can only touch this
+            // dead entry (wire ids are never reused).
+            if let Some(registry) = r2_registry.as_ref() {
+                // Singular purge: a session that never installed a rev2 binding
+                // (the common TCP-only / INLINE shape) exits after one index
+                // probe instead of taking the forward table's write lock.
+                purged_on_exit = registry.remove_session(s);
+            }
             removed_r2 = Some(entry.r2_flows);
         }
         if removed {
             ss2.note_live_remove(1);
         }
         removed_own = removed;
+    }
+    if purged_on_exit > 0 {
+        r2_stats::SESSION_END_BINDINGS
+            .fetch_add(purged_on_exit as u64, std::sync::atomic::Ordering::Relaxed);
     }
     // Tell the client this association is gone (idle reap, socket read error or
     // a terminal egress verdict). Without it the client keeps sending steady
@@ -1358,44 +1481,21 @@ pub(crate) async fn sess_reader_task(
     if removed_own && c2.close_reason().is_none() {
         r2_send_sess_close(&c2, s);
     }
-    // The session is gone: drop its rev2 bindings from the connection-wide
-    // registry too, so a steady frame for an id that belonged to this session
-    // can only fail lookup (never route on a stale binding). The 180 s sweeper
-    // and `SESS_CLOSE` perform the same cleanup for entries they remove.
-    //
-    // Only when *this* reader removed its entry: a reader that lost the race to
-    // a recreation must leave the live session's bindings alone. Two guards
-    // enforce that, because a hostile peer can put an arbitrary session id on
-    // the wire, so "same session id" does not imply the same session:
-    // 1. the purge runs only when the table no longer holds an entry for `s`
-    //    (checked under the shard read lock, so the decision is not split from
-    //    a concurrent create), and
-    // 2. the purge is scoped to this entry's own reverse-table snapshot (by
-    //    wire id), never `remove_session(s)` — so bindings a recreated session
-    //    installed for the same id are untouched.
-    // The old code used `remove_session(s)` *after* dropping the shard lock: a
-    // session recreated under the same id in that window had its fresh
-    // bindings purged, leaving its steady frames permanently `UNKNOWN_ID`.
-    if let Some(registry) = r2_registry
-        && let Some(r2_flows) = removed_r2
-    {
-        let no_live_entry = {
-            let sh = ss2.shard(s);
-            let r = sh.read();
-            !r.contains_key(&s)
-        };
-        if no_live_entry {
-            let mut n = 0usize;
-            for binding in r2_flows.load().iter() {
-                binding.mark_closed();
-                if registry.remove(binding.wire_id).is_some() {
-                    n += 1;
-                }
-            }
-            if n > 0 {
-                r2_stats::SESSION_END_BINDINGS
-                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+    // Mark this dead entry's bindings `Closed` from its own reverse-table
+    // snapshot, so a reply reader still draining cannot match a torn-down
+    // binding. The registry entries themselves were already purged above, under
+    // the shard guard that removed the entry (LOGIC-9 removed the old
+    // "does the table still hold an entry?" guard: it leaked the dead entry's
+    // bindings whenever a same-id session had been recreated, and snapshot /
+    // guard scoping is what protects a recreated session's fresh bindings —
+    // wire ids are never reused, so those ids cannot appear here).
+    if let Some(r2_flows) = removed_r2 {
+        let flows = r2_flows.load();
+        for binding in flows.iter() {
+            binding.mark_closed();
+        }
+        if !flows.is_empty() {
+            r2_flows.store(Arc::new(SessionFlows::new()));
         }
     }
     // The table may now be empty: if this was its last session, drop out of the
@@ -1405,16 +1505,21 @@ pub(crate) async fn sess_reader_task(
     ss2.note_empty_state();
 }
 
-/// Drop the rev2 bindings of session entries this path reaped itself, so a
-/// session freed under permit/fair-share pressure cannot leave `wire_id`
-/// entries in the connection registry (the 180 s and connection sweepers do the
-/// same for the entries they reap).
-fn r2_cleanup_evicted(r2: Option<&Arc<R2ConnState>>, entries: &[SessEntry]) {
-    if let Some(state) = r2 {
-        for entry in entries {
-            r2_close_entry_bindings(state, entry);
-        }
+/// Finish a reap batch whose rev2 registry purge already ran (batched under
+/// the session shard's write lock by the caller): mark the dead entries'
+/// reverse-table snapshots closed so a reply reader still draining cannot match
+/// a torn-down binding, and account the removed bindings.
+///
+/// The purge itself is *not* done here: calling [`FlowRegistry::remove_session`]
+/// per entry would take one registry write lock per session (the PERF-7 stall),
+/// and purging by wire id one at a time is worse. The caller holds the shard
+/// write guard that removed the entries, which is exactly the condition that
+/// makes a single `remove_sessions(&sessions)` collision-safe.
+fn r2_finish_reaped(r2: Option<&Arc<R2ConnState>>, entries: &[SessEntry], purged: usize) {
+    if r2.is_none() {
+        return;
     }
+    r2_finish_reaped_entries(entries, purged);
 }
 
 /// Resolve this session's socket, creating it (and its reply reader) when the
@@ -1422,8 +1527,9 @@ fn r2_cleanup_evicted(r2: Option<&Arc<R2ConnState>>, entries: &[SessEntry]) {
 ///
 /// The plain entry point: every caller here is a *live* datagram path whose
 /// session cannot be cancelled behind its back, so there is nothing to check
-/// before publishing. The domain-OPEN lookup task, which runs after the client
-/// may already have closed the association, uses
+/// before publishing. The two DNS lookup tasks — the rev2 `DATA OPEN` resolver
+/// and the generic slow path (`forward_server_dgram`'s `Unresolved` arm), both
+/// of which run after the client may already have closed the association — use
 /// [`get_or_create_sess_guarded`] instead.
 pub(crate) async fn get_or_create_sess(
     ss: &SessTable,
@@ -1439,7 +1545,8 @@ pub(crate) async fn get_or_create_sess(
 /// [`get_or_create_sess`] with a cancellation flag for an association that a
 /// `CTL SESS_CLOSE` may close while this creation is in flight.
 ///
-/// `cancelled` is owned by the domain-OPEN lookup task. `SESS_CLOSE` sets it
+/// Both DNS waiter tasks (rev2 `DATA OPEN`, and the generic datagram slow path
+/// via its [`DnsWaiter`]) pass their own flag here. `SESS_CLOSE` sets the flag
 /// *before* `take_session`, and the creation path re-reads it inside the shard
 /// write critical section immediately before publishing the entry; together
 /// those two facts mean the close either sees the flag (and the creation rolls
@@ -1556,14 +1663,22 @@ pub(crate) async fn get_or_create_sess_guarded(
     let now = mono_millis();
     if ss.len_upper_bound(now) >= fair_cap {
         if claim_fair_sweep(now) {
-            let evicted = ss.sweep_all(now);
-            r2_cleanup_evicted(r2, &evicted);
+            // Each shard's bindings are purged in one registry call under that
+            // shard's write lock (`sweep_all_with`); the notifications are sent
+            // from a detached chunked task so this creation path is not blocked
+            // for thousands of sends.
+            let mut purged = 0usize;
+            let evicted = ss.sweep_all_with(now, |ids| {
+                if let Some(state) = r2 {
+                    purged += state.registry.remove_sessions(ids);
+                }
+            });
+            r2_finish_reaped(r2, &evicted, purged);
             // The client's association is gone on this side: tell it, so its
             // next steady frames do not target a session the server no longer
             // has (they could only fail lookup). Best-effort and idempotent.
-            for entry in &evicted {
-                r2_send_sess_close(cd, entry.sess);
-            }
+            let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
+            spawn_sess_close_notifications(cd.clone(), ids);
             abort_evicted(evicted);
             let now2 = mono_millis();
             let n2 = ss.len();
@@ -1605,11 +1720,15 @@ pub(crate) async fn get_or_create_sess_guarded(
                 dgram_drops::bump(&dgram_drops::SESSION_FULL);
                 return None;
             }
-            let evicted = ss.sweep_all(mono_millis());
-            r2_cleanup_evicted(r2, &evicted);
-            for entry in &evicted {
-                r2_send_sess_close(cd, entry.sess);
-            }
+            let mut purged = 0usize;
+            let evicted = ss.sweep_all_with(mono_millis(), |ids| {
+                if let Some(state) = r2 {
+                    purged += state.registry.remove_sessions(ids);
+                }
+            });
+            r2_finish_reaped(r2, &evicted, purged);
+            let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
+            spawn_sess_close_notifications(cd.clone(), ids);
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -1692,7 +1811,7 @@ pub(crate) async fn get_or_create_sess_guarded(
     // `cancelled_insert` is the third outcome of the publish critical section:
     // the owning domain-OPEN task was cancelled by `SESS_CLOSE` while this
     // creation was in flight, so the session must not be published at all.
-    let (inserted, memo_data, reader_died, cancelled_insert) = {
+    let (inserted, memo_data, reader_died, cancelled_insert, purged_reaped) = {
         let sh = ss.shard(s);
         // Blocks for the same reason the read path does: a losing `try_lock_write`
         // used to abort the freshly spawned reader, release the global permit and
@@ -1739,6 +1858,20 @@ pub(crate) async fn get_or_create_sess_guarded(
             swept = sweep_local(&mut w);
             ss.note_live_remove(swept.len());
         }
+        // Batched rev2 purge for both reap batches, under this shard's write
+        // guard: purge-by-session is collision-safe here (no datagram path can
+        // recreate an id or install a binding while the guard is held) and the
+        // whole batch costs one registry write lock instead of one per
+        // session/binding. PERF-7: this is the reap that runs on the datagram
+        // reader under memory pressure, so the lock count matters.
+        let mut purged_reaped = 0usize;
+        if !stale_dead.is_empty() || !swept.is_empty() {
+            let mut ids: Vec<u32> = stale_dead.iter().map(|e| e.sess).collect();
+            ids.extend(swept.iter().map(|e| e.sess));
+            if let Some(state) = r2 {
+                purged_reaped = state.registry.remove_sessions(&ids);
+            }
+        }
         // The owning domain-OPEN task was cancelled by a `CTL SESS_CLOSE` while
         // this creation was in flight: do not publish the session. `SESS_CLOSE`
         // sets the flag *before* its `take_session` (which needs this same
@@ -1753,7 +1886,7 @@ pub(crate) async fn get_or_create_sess_guarded(
         if cancelled.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
             h_pre.abort();
             drop(permit);
-            (false, None, false, true)
+            (false, None, false, true, purged_reaped)
         } else {
             let dead = h_pre.is_finished();
             w.insert(
@@ -1788,13 +1921,14 @@ pub(crate) async fn get_or_create_sess_guarded(
                 // The insert above is undone while this guard is still held, so
                 // the decrement always pairs with its increment.
                 ss.note_live_remove(1);
-                (false, None, true, false)
+                (false, None, true, false, purged_reaped)
             } else {
                 (
                     true,
                     Some((sock.clone(), last_pre.clone(), reader_abort.clone())),
                     false,
                     false,
+                    purged_reaped,
                 )
             }
         }
@@ -1805,11 +1939,10 @@ pub(crate) async fn get_or_create_sess_guarded(
         // entries) and report "no session" to the caller, which rejects the
         // OPEN instead of ACKing a closed association.
         ss.note_empty_state();
-        r2_cleanup_evicted(r2, &stale_dead);
-        r2_cleanup_evicted(r2, &swept);
-        for entry in &swept {
-            r2_send_sess_close(cd, entry.sess);
-        }
+        r2_finish_reaped(r2, &stale_dead, purged_reaped);
+        r2_finish_reaped(r2, &swept, 0);
+        let ids: Vec<u32> = swept.iter().map(|e| e.sess).collect();
+        spawn_sess_close_notifications(cd.clone(), ids);
         abort_evicted(stale_dead);
         abort_evicted(swept);
         return None;
@@ -1836,16 +1969,16 @@ pub(crate) async fn get_or_create_sess_guarded(
             warn!("udp session {s} reader exited before publish ({n} so far)");
         }
     }
-    r2_cleanup_evicted(r2, &stale_dead);
-    r2_cleanup_evicted(r2, &swept);
+    r2_finish_reaped(r2, &stale_dead, purged_reaped);
+    r2_finish_reaped(r2, &swept, 0);
     // The over-share reaps above removed live associations from this side: tell
-    // the client (`SESS_CLOSE` ×3, idempotent, best-effort) before the readers
-    // are aborted, so its steady frames do not target a session the server has
-    // already dropped. `stale_dead` needs no notification — those readers had
-    // already exited, so the client's own idle/exit path is what closed them.
-    for entry in &swept {
-        r2_send_sess_close(cd, entry.sess);
-    }
+    // the client (`SESS_CLOSE` ×3, idempotent, best-effort) from a detached
+    // chunked task, so its steady frames do not target a session the server has
+    // already dropped while this creation path is not blocked by the sends.
+    // `stale_dead` needs no notification — those readers had already exited, so
+    // the client's own idle/exit path is what closed them.
+    let ids: Vec<u32> = swept.iter().map(|e| e.sess).collect();
+    spawn_sess_close_notifications(cd.clone(), ids);
     abort_evicted(stale_dead);
     abort_evicted(swept);
     if inserted { Some(sock) } else { None }

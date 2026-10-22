@@ -25,6 +25,7 @@ use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 
+use crate::dgram_drops;
 use crate::mqp::addr::TargetAddr;
 use crate::mqp::fragment::{
     FRAG_MAX_HELD_BYTES, FRAG_MAX_PARTIALS, FRAG_TIMEOUT_MS, MQP_FRAG_MAX_PAYLOAD,
@@ -66,30 +67,83 @@ struct FragCtx {
     src: bool,
 }
 
+/// Book one dropped/refused fragment against an existing process-wide counter.
+///
+/// The rev2 reassembler refuses and expires payloads in several distinct ways
+/// and — unlike the legacy MQP-2 reassembler it replaces — used to book none of
+/// them, so a peer that filled the 256 KiB budget made all later fragmented
+/// traffic vanish from every counter. This module may not add stats fields, so
+/// the closest existing [`crate::dgram_drops`] classes are used:
+/// - `BUFFER_FULL`: the fragment was refused because a bounded capacity was
+///   exhausted (the held-bytes budget, a partial cap or the payload cap), a
+///   partial was evicted to make room, or a partial expired with fragments
+///   still missing. That is capacity pressure causing payload loss.
+/// - `TOO_LARGE`: a fragment claimed a position past the protocol payload cap
+///   (hostile geometry), i.e. the frame is oversized for the payload it names.
+/// - `REFUSED`: a fragment was rejected on policy/validation grounds (shape,
+///   context splice, total or unit-width disagreement).
+///
+/// A duplicate fragment is *not* counted: UDP duplicates are expected, the
+/// payload is still delivered (or will be) once, and booking them would report
+/// ordinary duplication as tunnel loss.
+fn book_drop(counter: &'static std::sync::atomic::AtomicU64) {
+    dgram_drops::bump(counter);
+}
+
 /// One out-of-order-arrival chunk that cannot be written into the assembly
 /// buffer yet: its position needs a determinator (the first fragment's length,
 /// plus the unit width from the index 2) that has not landed.
 ///
-/// The chunk is held as a *view* of the frame it arrived on (an owned
-/// refcount clone of the [`Bytes`] plus offset/len), so it is copied exactly
-/// once — into the assembly buffer when a later fragment unlocks it. The
-/// clone is one atomic increment against the incoming frame; the per-index
-/// slot table this replaces paid one owned heap allocation + a full chunk
-/// memcpy per arrival *and* a whole-payload copy at completion.
+/// The chunk **owns** exactly its bytes. The arrived frame `d` is a narrow
+/// slice of quinn's per-`recvmsg` receive batch (up to `max_udp_payload_size x
+/// gro_segments` ≈ 92 KiB on Linux, where quinn-udp enables `UDP_GRO`), and
+/// [`Bytes`] cannot report the allocation behind a slice — so a refcount view
+/// would pin the whole batch while the budget charged only the chunk's length
+/// (a padded frame can carry a one-byte chunk: 49 charged bytes pinning up to
+/// ~92 KiB would make [`FRAG_MAX_HELD_BYTES`] fiction). The legacy MQP-2
+/// reassembler removed the same view for the same reason; this is its
+/// out-of-order half. The copy is paid only for a fragment whose position is
+/// not derivable yet, and the bytes are written into the assembly buffer when
+/// a determinator unlocks it.
 #[derive(Debug)]
 struct PendingChunk {
     idx: u8,
-    /// The arrived frame (refcount view: the chunk never escapes the frame's
-    /// allocation).
-    d: Bytes,
-    chunk_off: usize,
-    len: usize,
+    /// Owned copy of exactly this chunk's bytes (`bytes.len()` is the chunk
+    /// length; there is no offset into a parent frame to keep).
+    bytes: Bytes,
 }
-/// Cost of one [`PendingChunk`] in the retained-bytes budget: the view
-/// (idx + offset + len + the `Bytes` header) and its share of the frame it
-/// pins. 48 B is the same per-datagram bookkeeping charge the fragmenter
-/// uses.
+
+/// Cost of one [`PendingChunk`] **beyond** its owned `bytes.len()` in the
+/// retained-bytes budget: the allocator's rounding of the exact-size chunk
+/// allocation (the `Bytes` handle itself is counted through
+/// `pending.capacity() * size_of::<PendingChunk>()` below). 48 B is the same
+/// per-datagram bookkeeping charge the fragmenter uses and is a safe upper
+/// bound on that per-allocation overhead, so `held_bytes()` never under-states
+/// what the pending set retains.
 const PENDING_CHUNK_COST: usize = 48;
+
+/// Budget charge for one pending chunk arriving at `pending_len`/`pending_cap`
+/// and owning `n` bytes: the bytes, the per-chunk overhead, and — when the
+/// `pending` `Vec` has to grow — the **whole new slot array**, not just the
+/// added slot. `Vec` amortises to at most 2x length, and charging the new
+/// capacity (rather than the delta) keeps the admission bound honest across
+/// the growth step instead of discovering the overshoot after the fact.
+fn pending_charge(pending_len: usize, pending_cap: usize, n: usize) -> usize {
+    let slots = if pending_len < pending_cap {
+        0
+    } else {
+        // `RawVec`'s amortised grow for a 40-byte element: 4 on the first
+        // allocation, then doubling; charging the whole new array is
+        // conservative either way (a bigger growth only over-charges).
+        let next = if pending_cap == 0 {
+            4
+        } else {
+            pending_cap.saturating_mul(2)
+        };
+        next.saturating_mul(std::mem::size_of::<PendingChunk>())
+    };
+    n.saturating_add(PENDING_CHUNK_COST).saturating_add(slots)
+}
 
 #[derive(Debug)]
 struct Partial {
@@ -119,15 +173,17 @@ struct Partial {
     /// payload with two different middle widths is not the shipped
     /// fragmenter (and the positions below would not be derivable).
     unit: Option<usize>,
-    /// Chunks whose positions are not determinable yet.
+    /// Chunks whose positions are not determinable yet, each owning exactly
+    /// its own bytes (see [`PendingChunk`]).
     pending: Vec<PendingChunk>,
     /// Sum of accepted chunk lengths, bounded by [`MQP_FRAG_MAX_PAYLOAD`]
     /// per arrival — the assembled payload is at most that big.
     bytes: usize,
-    /// Retained footprint: `buf.capacity()` + the pending views. Charged
-    /// against [`FRAG_MAX_HELD_BYTES`] like the previous scheme and re-derived
-    /// after every mutation, because capacity-based accounting has no
-    /// per-chunk free event.
+    /// Retained footprint: `buf.capacity()` + the owned pending bytes and
+    /// their per-chunk/slot overhead. Charged against
+    /// [`FRAG_MAX_HELD_BYTES`] like the previous scheme and re-derived after
+    /// every mutation, because capacity-based accounting has no per-chunk
+    /// free event.
     retained: usize,
     first_ms: u64,
 }
@@ -166,6 +222,12 @@ impl Partial {
     /// never grow past the payload bound: `bytes` admission caps the sum of
     /// chunk lengths, but not the positions a hostile wide `unit` could
     /// pretend, so this is checked where the resize would happen.
+    ///
+    /// The in-order append case (`pos == buf.len()`, every fragment of a
+    /// conforming sender's payload after the first) uses `extend_from_slice`:
+    /// one pass that copies the chunk into spare capacity (growing without
+    /// zero-filling), instead of `resize` zero-filling the tail and
+    /// `copy_from_slice` immediately overwriting it.
     fn buf_write(buf: &mut Vec<u8>, pos: usize, bytes: &[u8]) -> bool {
         let Some(end) = pos.checked_add(bytes.len()) else {
             return false;
@@ -173,10 +235,14 @@ impl Partial {
         if end > MQP_FRAG_MAX_PAYLOAD {
             return false;
         }
-        if buf.len() < end {
-            buf.resize(end, 0);
+        if pos == buf.len() {
+            buf.extend_from_slice(bytes);
+        } else {
+            if buf.len() < end {
+                buf.resize(end, 0);
+            }
+            buf[pos..end].copy_from_slice(bytes);
         }
-        buf[pos..end].copy_from_slice(bytes);
         true
     }
 
@@ -192,41 +258,34 @@ impl Partial {
                 i += 1;
                 continue;
             };
-            let end = pos.checked_add(c.len);
-            if !end.is_some_and(|end| {
-                end <= MQP_FRAG_MAX_PAYLOAD
-                    && c.chunk_off
-                        .checked_add(c.len)
-                        .is_some_and(|e| e <= c.d.len())
-            }) {
-                // Hostile geometry: the view never fits its own frame or the
-                // payload. Leave it queued (it can never be written).
+            let end = pos.checked_add(c.bytes.len());
+            if !end.is_some_and(|end| end <= MQP_FRAG_MAX_PAYLOAD) {
+                // Hostile geometry: the chunk never fits inside the payload.
+                // Leave it queued (it can never be written).
                 i += 1;
                 continue;
             }
-            let end = end.expect("checked above");
             let c = self.pending.swap_remove(i);
-            if self.buf.len() < end {
-                self.buf.resize(end, 0);
-            }
-            self.buf[pos..end].copy_from_slice(&c.d[c.chunk_off..c.chunk_off + c.len]);
+            let placed = Self::buf_write(&mut self.buf, pos, &c.bytes);
+            debug_assert!(placed, "the bound check above keeps every drain in range");
         }
     }
 
     /// Re-derive the retained footprint (`Self::retained`) from the current
-    /// buffer capacity and pending views.
+    /// buffer capacity, the owned pending chunks and their slot array.
     ///
-    /// Charged: the assembly buffer's capacity, each pending chunk's view cost
-    /// plus the `PendingChunk` slots their `Vec` reserves, and this `Partial`
-    /// node itself (it lives in the partial `HashMap`, whose entry is not
-    /// otherwise charged). The last two terms are what keep `retained` honest
-    /// when the reassembler is full of small partials: without them the budget
-    /// under-counts a few hundred bytes per live partial.
+    /// Charged: the assembly buffer's capacity, each pending chunk's owned
+    /// bytes plus [`PENDING_CHUNK_COST`] (allocation rounding), the `pending`
+    /// `Vec`'s slot array, and this `Partial` node itself (it lives in the
+    /// partial `HashMap`, whose entry is not otherwise charged). The last two
+    /// terms are what keep `retained` honest when the reassembler is full of
+    /// small partials: without them the budget under-counts a few hundred
+    /// bytes per live partial.
     fn recompute_retained(&mut self) {
         let pending: usize = self
             .pending
             .iter()
-            .map(|c| c.len + PENDING_CHUNK_COST)
+            .map(|c| c.bytes.len() + PENDING_CHUNK_COST)
             .sum::<usize>()
             + self.pending.capacity() * std::mem::size_of::<PendingChunk>();
         self.retained = self.buf.capacity() + pending + std::mem::size_of::<Partial>();
@@ -293,20 +352,28 @@ impl R2Reassembler {
     ///
     /// Copy policy: a single-fragment payload is delivered as a **view** of
     /// `d` (zero copies); each multi-part chunk is copied exactly once —
-    /// straight into its final position in the partial's assembly buffer, or
-    /// (while its position is undeterminable) held as a view of `d` and copied
-    /// once a later determinator unlocks it.
+    /// straight into its final position in the partial's assembly buffer, or,
+    /// while its position is undeterminable, into an owned [`PendingChunk`]
+    /// (a copy of exactly the chunk, never a view of the frame — see there)
+    /// that is written into the assembly buffer when a later determinator
+    /// unlocks it.
     pub fn push(&mut self, d: &Bytes, f: &r2::FragRef<'_>, now_ms: u64) -> Option<R2Assembled> {
-        // Shape checks before anything allocates.
+        // Shape checks before anything copies. A malformed FRAG is a refused
+        // datagram like any other validation failure.
         if f.total < 1 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total || f.chunk.is_empty() {
+            book_drop(&dgram_drops::REFUSED);
             return None;
         }
         if f.chunk.len() > MQP_FRAG_MAX_PAYLOAD {
+            // Oversized chunk for the payload it names: the size class.
+            book_drop(&dgram_drops::TOO_LARGE);
             return None;
         }
-        // The caller contract: `f` is decoded from this very buffer. The view
-        // arithmetic below depends on it (and never worries about it again).
+        // The caller contract: `f` is decoded from this very buffer (the
+        // `total == 1` delivery below slices it). A violation is a caller bug
+        // or a misdecoded frame, not a payload this module may hold.
         if f.chunk_off.checked_add(f.chunk.len()) != Some(d.len()) {
+            book_drop(&dgram_drops::REFUSED);
             return None;
         }
         let key = match (f.id, f.sess) {
@@ -320,7 +387,10 @@ impl R2Reassembler {
                 id: sess,
                 frag_id: f.frag_id,
             },
-            _ => return None,
+            _ => {
+                book_drop(&dgram_drops::REFUSED);
+                return None;
+            }
         };
         // The inline form must be self-describing on every fragment; a flow
         // form may carry a one-time OPEN context on its first fragment.
@@ -331,9 +401,13 @@ impl R2Reassembler {
                 src: f.src,
             }),
             (None, None) => None,
-            _ => return None,
+            _ => {
+                book_drop(&dgram_drops::REFUSED);
+                return None;
+            }
         };
         if key.inline && incoming.is_none() {
+            book_drop(&dgram_drops::REFUSED);
             return None;
         }
 
@@ -356,15 +430,22 @@ impl R2Reassembler {
         let is_new = !self.parts.contains_key(&key);
         if let Some(p) = self.parts.get(&key) {
             if p.total != f.total {
+                book_drop(&dgram_drops::REFUSED);
                 return None;
             }
             match (&p.ctx, &incoming) {
-                (Some(old), Some(new)) if old != new => return None,
+                (Some(old), Some(new)) if old != new => {
+                    // A peer trying to splice two sessions/targets into one
+                    // payload: refused on policy.
+                    book_drop(&dgram_drops::REFUSED);
+                    return None;
+                }
                 _ => {}
             }
             if p.got & (1u64 << idx) != 0 {
                 // Duplicate fragment: UDP permits it, delivery already
-                // happened (or will) once. Ignore, don't disturb the partial.
+                // happened (or will) once. Ignore, don't disturb the partial
+                // — and don't book it as a drop: the payload is not lost.
                 return None;
             }
             if middle
@@ -373,9 +454,13 @@ impl R2Reassembler {
             {
                 // The segmentation contract: one unit width per payload; a
                 // second width means the positions below are not derivable.
+                book_drop(&dgram_drops::REFUSED);
                 return None;
             }
             if p.bytes.saturating_add(n) > MQP_FRAG_MAX_PAYLOAD {
+                // The payload cap: this fragment would push one partial past
+                // the protocol's payload ceiling.
+                book_drop(&dgram_drops::BUFFER_FULL);
                 return None;
             }
             let placeable = Partial::pos_of(p.first_len, p.unit, idx).is_some();
@@ -394,7 +479,9 @@ impl R2Reassembler {
                 };
                 n.max(reserve)
             } else {
-                n + PENDING_CHUNK_COST
+                // Owned chunk: its exact bytes, its per-chunk overhead, and
+                // the slot-array growth when `pending` has to reallocate.
+                pending_charge(p.pending.len(), p.pending.capacity(), n)
             };
             // Charge the stale `order` backlog too: those slots are resident
             // bytes this type is responsible for. The prune bounds the backlog
@@ -402,12 +489,16 @@ impl R2Reassembler {
             // traffic is unaffected; a stale tail still cannot make the live
             // set overshoot the stated bound.
             if self.held_bytes().saturating_add(charge) > FRAG_MAX_HELD_BYTES {
+                // The 256 KiB held-bytes budget: this fragment cannot be
+                // retained without breaking the per-connection bound.
+                book_drop(&dgram_drops::BUFFER_FULL);
                 return None;
             }
         } else {
             // New partial: charge its physical footprint estimate (the first
             // fragment will reserve `total x len` assembly capacity at most,
-            // later ones a view), and evict under the same pressures as
+            // later ones an owned pending chunk) **plus the `order` slot the
+            // insertion queues**, and evict under the same pressures as
             // before — this cannot happen mid-payload. The budget is
             // `held_bytes` (live retained bytes plus the bounded stale-slot
             // backlog): eviction reclaims the slots it walks past, and the
@@ -415,12 +506,18 @@ impl R2Reassembler {
             let est = if idx == 0 {
                 (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
             } else {
-                n + PENDING_CHUNK_COST
-            } + std::mem::size_of::<Partial>();
+                pending_charge(0, 0, n)
+            } + std::mem::size_of::<Partial>()
+                + ORDER_SLOT_BYTES;
             while self.parts.len() >= FRAG_MAX_PARTIALS
                 || self.held_bytes().saturating_add(est) > FRAG_MAX_HELD_BYTES
             {
+                // Every evicted partial is an incomplete payload a peer can no
+                // longer complete; the counters are booked per eviction below.
                 if !self.evict_oldest() {
+                    // Nothing left to evict and the new partial still does not
+                    // fit: capacity refusal.
+                    book_drop(&dgram_drops::BUFFER_FULL);
                     return None;
                 }
             }
@@ -454,7 +551,9 @@ impl R2Reassembler {
                 // just-created empty partial cannot trigger this (its only
                 // placeable fragment is index 0, whose position is `n`); a
                 // live one keeps its state and the fragment is refused — the
-                // payload times out rather than assembling garbage.
+                // payload times out rather than assembling garbage. The frame
+                // is oversized for the payload it names.
+                book_drop(&dgram_drops::TOO_LARGE);
                 if partial.got == 0 {
                     self.parts.remove(&key);
                 }
@@ -485,15 +584,18 @@ impl R2Reassembler {
                     let placed = Partial::buf_write(&mut partial.buf, pos, f.chunk);
                     debug_assert!(placed, "the bound check above keeps every write in range");
                 }
-                None => partial.pending.push(PendingChunk {
-                    idx,
-                    d: d.clone(),
-                    chunk_off: f.chunk_off,
-                    len: n,
-                }),
+                None => {
+                    // Own exactly the chunk's bytes: a refcount view of `d`
+                    // would pin quinn's whole receive batch (see
+                    // [`PendingChunk`]).
+                    partial.pending.push(PendingChunk {
+                        idx,
+                        bytes: Bytes::copy_from_slice(f.chunk),
+                    });
+                }
             }
             // A determinator landed with this fragment: it may unlock queued
-            // views (their writes grow `buf`, so retention is derived after
+            // chunks (their writes grow `buf`, so retention is derived after
             // the drain).
             if partial.first_len != first_was || partial.unit != unit_was {
                 partial.drain_pending();
@@ -587,6 +689,11 @@ impl R2Reassembler {
     /// Drop partials older than [`FRAG_TIMEOUT_MS`]. The caller owns the clock
     /// tick (the relays already tick a reassembler), so a peer that stops
     /// sending cannot pin partials for the connection's lifetime.
+    ///
+    /// Every expired live partial is a payload that never completed: it books
+    /// `BUFFER_FULL` (the closest existing capacity class — the partial was
+    /// occupying the bounded held-bytes budget until the timeout released it).
+    /// Stale `order` slots are not payloads and book nothing.
     pub fn expire(&mut self, now_ms: u64) {
         while let Some((key, first_ms)) = self.order.front().copied() {
             let expired = match self.parts.get(&key) {
@@ -606,6 +713,7 @@ impl R2Reassembler {
             {
                 let p = self.parts.remove(&key).expect("checked above");
                 self.held = self.held.saturating_sub(p.retained);
+                book_drop(&dgram_drops::BUFFER_FULL);
             }
         }
         // The sweep can stop at the first live blocker while stale slots sit
@@ -644,6 +752,10 @@ impl R2Reassembler {
     }
 
     /// Evict the oldest live partial; `false` when none is left.
+    ///
+    /// An evicted partial is a payload a peer can no longer complete, dropped
+    /// because a bounded capacity (partial count or held bytes) was exhausted:
+    /// each live removal books `BUFFER_FULL`.
     fn evict_oldest(&mut self) -> bool {
         while let Some((key, first_ms)) = self.order.pop_front() {
             self.order_bytes = self.order_bytes.saturating_sub(ORDER_SLOT_BYTES);
@@ -651,6 +763,7 @@ impl R2Reassembler {
                 Some(p) if p.first_ms == first_ms => {
                     let p = self.parts.remove(&key).expect("checked above");
                     self.held = self.held.saturating_sub(p.retained);
+                    book_drop(&dgram_drops::BUFFER_FULL);
                     return true;
                 }
                 _ => continue,
@@ -662,6 +775,7 @@ impl R2Reassembler {
         if let Some(key) = self.parts.keys().next().copied() {
             let p = self.parts.remove(&key).expect("just observed");
             self.held = self.held.saturating_sub(p.retained);
+            book_drop(&dgram_drops::BUFFER_FULL);
             return true;
         }
         false
@@ -1128,5 +1242,227 @@ mod tests {
             id: b,
             frag_id: 2
         }));
+    }
+
+    /// The retained-bytes accounting must be exact: `held` is the sum of every
+    /// live partial's `retained`, and `retained` is the partial's real
+    /// footprint — assembly buffer capacity, owned pending bytes, per-chunk
+    /// overhead, the pending slot array and the `Partial` node — plus the
+    /// resident `order` deque. This is the invariant the old view-based scheme
+    /// could not satisfy (it charged `len` while pinning a receive batch).
+    fn assert_held_exact(r: &R2Reassembler) {
+        let mut live = 0usize;
+        for p in r.parts.values() {
+            let pending_owned: usize = p.pending.iter().map(|c| c.bytes.len()).sum();
+            let want = p.buf.capacity()
+                + pending_owned
+                + p.pending.len() * PENDING_CHUNK_COST
+                + p.pending.capacity() * std::mem::size_of::<PendingChunk>()
+                + std::mem::size_of::<Partial>();
+            assert_eq!(
+                p.retained, want,
+                "partial retained must be its real footprint, not a view cost"
+            );
+            live = live.saturating_add(want);
+        }
+        assert_eq!(r.held, live, "held must equal the live partials' sum");
+        assert_eq!(
+            r.held_bytes(),
+            live.saturating_add(r.order_bytes),
+            "held_bytes must be the live partials plus the resident order deque"
+        );
+    }
+
+    /// MEM-1 lock-in: a pending (out-of-order) chunk must **own** exactly its
+    /// bytes. The arrived frame is a narrow slice of quinn's per-`recvmsg`
+    /// receive batch (up to ~92 KiB with GRO on Linux), and `Bytes` cannot
+    /// report the allocation behind a slice — so a stored view would pin the
+    /// whole batch while the budget charged only the chunk's length.
+    /// `Bytes::try_into_mut` only succeeds when no clone of the frame survived,
+    /// and the payload must stay byte-exact after the parent batch is
+    /// clobbered the way the next `recvmsg` reuses its buffer.
+    #[test]
+    fn pending_chunk_owns_its_bytes_and_never_pins_the_arrived_frame() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(12, false).unwrap();
+        // One GRO batch worth of backing bytes; the fragment is a 20 B window
+        // at its end (the frame must end at the chunk: chunk_off + len == d.len()).
+        let mut batch = vec![0xABu8; 64 * 1472];
+        let off = batch.len() - 20;
+        let want: Vec<u8> = (0..20).map(|i| (i % 251) as u8).collect();
+        batch[off..].copy_from_slice(&want);
+        let d = Bytes::from(batch);
+        let f = r2::FragRef {
+            id: Some(id),
+            sess: None,
+            addr: None,
+            src: false,
+            frag_id: 1,
+            idx: 1,
+            total: 2,
+            chunk_off: off,
+            chunk: &d[off..],
+        };
+        assert!(r.push(&d, &f, 0).is_none());
+        assert_held_exact(&r);
+        assert!(
+            r.held_bytes() < 1_000,
+            "a 20 B pending chunk must charge ~20 B, not pin the 92 KiB frame: {}",
+            r.held_bytes()
+        );
+        // No refcount view survived: the frame is uniquely owned again.
+        let mut owner = d
+            .try_into_mut()
+            .expect("the pending chunk must own its bytes, not clone the arrived frame");
+        owner.fill(0xFF);
+        drop(owner);
+        // The owned copy is unaffected by the clobbered batch, and the payload
+        // is complete and byte-exact once the missing first fragment lands.
+        let done = feed(&mut r, frag(Some(id), None, None, 0, 2, 1, b"hello ")).unwrap();
+        let mut expect = b"hello ".to_vec();
+        expect.extend_from_slice(&want);
+        assert_eq!(done.payload, Bytes::from(expect));
+        assert_held_exact(&r);
+    }
+
+    /// The charge for an out-of-order chunk is its real retained footprint:
+    /// the owned bytes plus the per-chunk overhead show up in `held_bytes`,
+    /// the determinator's drain gives them back, and every step keeps `held`
+    /// exactly equal to the live partials' sum.
+    #[test]
+    fn held_bytes_tracks_owned_pending_bytes() {
+        let mut r = R2Reassembler::new();
+        let id = r2::make_wire_id(13, false).unwrap();
+        assert!(feed(&mut r, frag(Some(id), None, None, 1, 2, 1, b"world")).is_none());
+        assert_held_exact(&r);
+        let partial = r.parts.values().next().expect("one live partial");
+        assert_eq!(partial.pending.len(), 1, "the tail's position is unknown");
+        assert_eq!(partial.pending[0].bytes, Bytes::from_static(b"world"));
+        assert!(
+            r.held_bytes() >= 5 + PENDING_CHUNK_COST,
+            "the owned pending chunk is charged its bytes plus its overhead: {}",
+            r.held_bytes()
+        );
+        let done = feed(&mut r, frag(Some(id), None, None, 0, 2, 1, b"hello ")).unwrap();
+        assert_eq!(done.payload, Bytes::from_static(b"hello world"));
+        assert_held_exact(&r);
+        assert_eq!(
+            r.held_bytes(),
+            ORDER_SLOT_BYTES,
+            "only the completed partial's stale order slot remains"
+        );
+        assert_eq!(r.order_bytes, ORDER_SLOT_BYTES);
+        r.expire(FRAG_TIMEOUT_MS);
+        assert_held_exact(&r);
+        assert_eq!(r.held_bytes(), 0);
+    }
+
+    /// A fragment flood that never completes must not break the per-connection
+    /// bound: every pending chunk owns exactly its bytes, the accounting is
+    /// re-derived on every push, and eviction keeps `held_bytes()` (including
+    /// the stale `order` slots) under [`FRAG_MAX_HELD_BYTES`] no matter how
+    /// many partials arrive.
+    #[test]
+    fn pending_fragment_flood_stays_within_the_held_bytes_bound() {
+        let mut r = R2Reassembler::new();
+        let chunk = vec![0x5Au8; 3000];
+        for i in 0..400u32 {
+            let id = r2::make_wire_id(20_000 + i, false).unwrap();
+            // Index 1 of a 2-fragment payload whose first fragment never
+            // arrives: the chunk's position is unknown, so it is retained as
+            // an owned pending chunk instead of being written into `buf`.
+            assert!(feed(&mut r, frag(Some(id), None, None, 1, 2, 1, &chunk)).is_none());
+            assert_held_exact(&r);
+            assert!(
+                r.held_bytes() <= FRAG_MAX_HELD_BYTES,
+                "the held-bytes bound must hold on every push: {} after {i}",
+                r.held_bytes()
+            );
+            assert!(
+                r.inflight() <= FRAG_MAX_PARTIALS,
+                "the partial cap must hold on every push"
+            );
+        }
+        // Capacity, not the flood, bounded the live set.
+        assert!(r.inflight() > 1, "the flood kept a bounded live set");
+        assert!(r.inflight() <= FRAG_MAX_PARTIALS);
+    }
+
+    /// `dgram_drops` must see the rev2 reassembler's refusals: without them a
+    /// peer that filled the budget made all later fragmented traffic vanish
+    /// from every counter. Capacity refusals/expiry book `BUFFER_FULL`,
+    /// hostile geometry books `TOO_LARGE` and policy refusals book `REFUSED`
+    /// (the closest existing classes; see [`book_drop`]). Only lower bounds are
+    /// asserted: these counters are process-wide and other modules' tests run
+    /// concurrently, so a delta can only over-count, never under-count.
+    #[test]
+    fn refusals_expiry_and_eviction_are_counted() {
+        let full = |before: &crate::stats::dgram_drops::DropSnapshot| {
+            crate::stats::dgram_drops::snapshot().buffer_full - before.buffer_full
+        };
+        let too_large = |before: &crate::stats::dgram_drops::DropSnapshot| {
+            crate::stats::dgram_drops::snapshot().too_large - before.too_large
+        };
+        let refused = |before: &crate::stats::dgram_drops::DropSnapshot| {
+            crate::stats::dgram_drops::snapshot().refused - before.refused
+        };
+
+        let mut r = R2Reassembler::new();
+        // REFUSED: a fragment whose context disagrees with the live partial
+        // (a peer trying to splice two sessions into one payload).
+        let id = r2::make_wire_id(14, false).unwrap();
+        let target = TargetAddrRef::Ip(v4(53));
+        assert!(feed(&mut r, frag(Some(id), Some(7), Some(target), 0, 2, 1, b"a")).is_none());
+        let before = crate::stats::dgram_drops::snapshot();
+        assert!(feed(&mut r, frag(Some(id), Some(8), Some(target), 1, 2, 1, b"b")).is_none());
+        assert!(refused(&before) >= 1, "a context splice must book REFUSED");
+
+        // TOO_LARGE: a locked wide unit makes the next position claim bytes
+        // past the protocol payload cap (hostile geometry).
+        let id = r2::make_wire_id(15, false).unwrap();
+        let wide = vec![0u8; 4000];
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 4, 2, &wide)).is_none());
+        assert!(feed(&mut r, frag(Some(id), None, None, 1, 4, 2, &wide)).is_none());
+        let before = crate::stats::dgram_drops::snapshot();
+        assert!(feed(&mut r, frag(Some(id), None, None, 3, 4, 2, b"x")).is_none());
+        assert!(
+            too_large(&before) >= 1,
+            "a position past the payload cap must book TOO_LARGE"
+        );
+
+        // BUFFER_FULL: a partial that expires with fragments still missing is
+        // a payload lost to the bounded reassembly budget.
+        let id = r2::make_wire_id(16, false).unwrap();
+        assert!(feed(&mut r, frag(Some(id), None, None, 0, 2, 3, b"ab")).is_none());
+        let before = crate::stats::dgram_drops::snapshot();
+        r.expire(FRAG_TIMEOUT_MS);
+        assert_eq!(r.inflight(), 0);
+        assert!(
+            full(&before) >= 1,
+            "an expired incomplete partial must book BUFFER_FULL"
+        );
+    }
+
+    /// P2-4: the in-order placement path writes each byte once. `buf_write`
+    /// appends straight into spare capacity when the chunk continues the
+    /// buffer; only the out-of-order gap case keeps the zero-fill + overwrite
+    /// behaviour, and the payload bound is enforced in both cases.
+    #[test]
+    fn buf_write_appends_in_order_and_zero_fills_gaps_only() {
+        let mut buf = b"ab".to_vec();
+        assert!(Partial::buf_write(&mut buf, 2, b"cd"));
+        assert_eq!(buf, b"abcd", "an in-order chunk appends at the end");
+        // Out-of-order write with a gap in front of it: the gap is zero-filled
+        // (the buffer must stay contiguous) and the chunk is written once.
+        assert!(Partial::buf_write(&mut buf, 6, b"gh"));
+        assert_eq!(buf, b"abcd\0\0gh");
+        // Out-of-order overwrite of existing bytes keeps the old behaviour.
+        assert!(Partial::buf_write(&mut buf, 1, b"XY"));
+        assert_eq!(buf, b"aXYd\0\0gh");
+        // A write past the protocol payload cap is refused without touching
+        // the buffer.
+        let before = buf.clone();
+        assert!(!Partial::buf_write(&mut buf, MQP_FRAG_MAX_PAYLOAD, b"x"));
+        assert_eq!(buf, before);
     }
 }

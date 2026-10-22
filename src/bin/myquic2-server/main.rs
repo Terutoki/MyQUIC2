@@ -68,9 +68,9 @@ async fn main() -> Result<()> {
     let _ = coarse_millis();
     let a = Args::parse();
     let c: ServerConf = load_toml(&a.config)?;
-    if c.auth_token.len() > AUTH_MAX_BYTES {
+    if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {
         anyhow::bail!(
-            "auth_token is {} B, over the {AUTH_MAX_BYTES} B wire cap (server only reads the first {AUTH_MAX_BYTES} B, so a longer token can never authenticate)",
+            "auth_token is {} B, over the {AUTH_TOKEN_MAX_BYTES} B wire cap (server only reads the first {AUTH_TOKEN_MAX_BYTES} B, so a longer token can never authenticate)",
             c.auth_token.len()
         );
     }
@@ -201,7 +201,9 @@ async fn main() -> Result<()> {
     // - every QUIC ingress endpoint's resident userspace receive buffer plus
     //   its kernel socket caps;
     // - the TCP relay pump buffers of the whole process-wide stream-task pool
-    //   (two 16 KiB buffers per active relay flow);
+    //   (two 16 KiB userspace buffers per active relay flow) plus the relay
+    //   sockets' kernel `SO_SNDBUF`/`SO_RCVBUF` caps, which the userspace
+    //   figures alone did not count (MEM-3);
     // - the UDP retry pool (16 shards x (256 queued + 16 in flight) x 8 KiB
     //   payloads): peer-driven, because a black-holed target / full sndbuf makes
     //   `WouldBlock` the steady state;
@@ -359,6 +361,7 @@ async fn main() -> Result<()> {
     let st = Arc::new(AcceptState {
         conn_limit: conn_limit.clone(),
         pending_limit: pending_limit.clone(),
+        pending_by_ip: PendingAddrSlots::new(),
         auth_token,
         auth_enabled,
         allow_private: c.allow_private,
@@ -581,12 +584,97 @@ fn spawn_ingress_shard(
 /// the credential are shared across endpoints on purpose: the documented
 /// connection cap is what the *process* admits, however many ingress
 /// endpoints run.
+/// Maximum connections one source IP may hold in the pending
+/// (handshake + pre-auth) window at a time.
+///
+/// The process-wide pre-auth budget is a *count* ([`MAX_UNAUTH_CONNECTIONS`],
+/// or `conn_limit` when the token is empty), and a peer only has to stall a
+/// handshake for `PRE_AUTH_TIMEOUT`/`HANDSHAKE_TIMEOUT` (5-10 s) to keep one
+/// slot: ~26-51 stalled handshakes per second from a single host denied every
+/// new connection, legitimate token holders included. A per-source share makes
+/// that denial cost several source IPs instead of one host for the whole
+/// budget.
+///
+/// The value is sized for legitimate bursts, not just for attackers: one client
+/// opens all of its pool connections concurrently (seven at the shipped
+/// defaults) and a NAT/CGNAT IP can aggregate several clients, so a small
+/// number would refuse real dials and force client retries. 16 is above any
+/// single client's burst and still means filling the 256-slot tokenless budget
+/// needs 16 distinct source IPs. A refusal here is counted and the client
+/// retries, so the failure mode is a transient dial delay rather than a drop.
+pub(crate) const MAX_PENDING_PER_IP: usize = 16;
+
+/// Connections refused by the per-source pending share (distinct from the
+/// process-wide `pending_limit` refusals).
+pub(crate) static PENDING_PER_IP_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-source-IP accounting for the pending window.
+///
+/// Bounded by construction: an entry exists only while that IP holds at least
+/// one pending connection, and the process-wide pending budget bounds the live
+/// total, so a spoofed-source flood cannot grow the map past the number of
+/// admitted pending slots.
+#[derive(Debug, Default)]
+pub(crate) struct PendingAddrSlots {
+    by_ip: parking_lot::Mutex<HashMap<IpAddr, u16>>,
+}
+
+impl PendingAddrSlots {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            by_ip: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Reserve one pending slot for `ip`; `None` when the IP already holds its
+    /// share.
+    pub(crate) fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PendingAddrGuard> {
+        let mut map = self.by_ip.lock();
+        let n = map.entry(ip).or_insert(0);
+        if usize::from(*n) >= MAX_PENDING_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(PendingAddrGuard {
+            slots: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+/// One source IP's pending reservation; releases on every exit path (handshake
+/// failure, timeout, auth failure, or handover to the live connection).
+#[derive(Debug)]
+pub(crate) struct PendingAddrGuard {
+    slots: Arc<PendingAddrSlots>,
+    ip: IpAddr,
+}
+
+impl Drop for PendingAddrGuard {
+    fn drop(&mut self) {
+        let mut map = self.slots.by_ip.lock();
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// One ingress endpoint's accept state plus the admission budgets it shares
+/// with every other endpoint of this process.
+#[derive(Debug)]
 struct AcceptState {
     /// Process-wide admitted-connection budget.
     conn_limit: Arc<tokio::sync::Semaphore>,
     /// Pre-auth (handshake-in-flight) budget: bounds receive-window memory a
     /// peer that never sends a token can pin; see the loop.
     pending_limit: Arc<tokio::sync::Semaphore>,
+    /// Per-source share of the same pending window (see
+    /// [`MAX_PENDING_PER_IP`]): one host cannot stall the whole budget.
+    pending_by_ip: Arc<PendingAddrSlots>,
     auth_token: Arc<Vec<u8>>,
     auth_enabled: bool,
     allow_private: bool,
@@ -635,6 +723,28 @@ async fn accept_loop(
                 continue;
             }
         };
+        // Per-source share of the pending window, taken before the process-wide
+        // pre-auth slot: a stalled-handshake flood from one host must not be
+        // able to hold every slot and deny new connections process-wide. The
+        // guard is released when this connection leaves the pending window
+        // (handshake completes in tokenless mode, authentication completes
+        // otherwise) or when its task exits on any failure path.
+        let remote_ip = incoming.remote_address().ip();
+        let ip_guard = match st.pending_by_ip.try_acquire(remote_ip) {
+            Some(g) => Some(g),
+            None => {
+                let n =
+                    PENDING_PER_IP_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if warn_once_per_sec() {
+                    warn!(
+                        "pre-auth per-IP limit {MAX_PENDING_PER_IP} reached from {remote_ip}; \
+                         refusing new connection ({n} refused so far)"
+                    );
+                }
+                drop(incoming);
+                continue;
+            }
+        };
         // Bound pre-auth receive-window memory: a peer that never sends a
         // token must not pin the whole MAX_CONNECTIONS budget. Released as
         // soon as `authenticate` returns.
@@ -661,6 +771,7 @@ async fn accept_loop(
         // process-wide stream-task pool (a clone per accepted connection).
         let conn_limit_for_conn = st.conn_limit.clone();
         let cap = st.cap;
+        let auth_enabled = st.auth_enabled;
         // One deadline for the handshake while a slot is held (see
         // `PRE_AUTH_TIMEOUT`); without a token there is no slot to free and the
         // more generous handshake budget applies. The token exchange below gets
@@ -676,6 +787,10 @@ async fn accept_loop(
         // one slow/malicious client stalls every other new connection.
         tokio::spawn(async move {
             let _permit = permit;
+            // This task owns the source IP's pending reservation for every exit
+            // path; it is released below once the connection leaves the pending
+            // window (or dropped with the task on any failure/timeout return).
+            let mut ip_guard = Some(ip_guard);
             // 0.5-RTT accept: streams usable before handshake completes on resumption.
             let conn = match incoming.accept() {
                 Ok(connecting) => match connecting.into_0rtt() {
@@ -726,6 +841,12 @@ async fn accept_loop(
                     return;
                 }
             };
+            // The handshake is done; in tokenless mode the pending window ends
+            // here, so release the per-IP share immediately. With a token the
+            // share stays held through the bounded token read (AUTH_TIMEOUT).
+            if !auth_enabled {
+                drop(ip_guard.take());
+            }
             if let Err(e) = authenticate(
                 &conn,
                 &auth_token,
@@ -742,6 +863,7 @@ async fn accept_loop(
             // Authentication done: free the pre-auth slot so other new peers
             // can handshake while this connection lives on.
             drop(pending);
+            drop(ip_guard.take());
             // Raise the handshake's small pre-auth bidi credit to the full
             // client-facing credit now that the peer has proven it holds the
             // token. MAX_STREAMS is increase-only, so this sequence is

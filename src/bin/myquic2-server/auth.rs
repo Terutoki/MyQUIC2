@@ -19,10 +19,6 @@ pub(crate) const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// (`auth_token` unset, so there is no memory budget to defend). With
 /// authentication enabled, [`PRE_AUTH_TIMEOUT`] bounds the handshake instead.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// One-way token authentication: the client opens a uni stream and writes the
-/// configured shared secret before any other traffic. Empty = disabled.
-pub(crate) const AUTH_MAX_BYTES: usize = 256;
-
 pub(crate) async fn authenticate(
     conn: &quinn::Connection,
     expected: &[u8],
@@ -33,7 +29,7 @@ pub(crate) async fn authenticate(
     }
     let got = tokio::time::timeout_at(deadline, async {
         let mut uni = conn.accept_uni().await?;
-        uni.read_to_end(AUTH_MAX_BYTES)
+        uni.read_to_end(AUTH_TOKEN_MAX_BYTES)
             .await
             .map_err(anyhow::Error::from)
     })

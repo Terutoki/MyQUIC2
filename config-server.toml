@@ -38,19 +38,29 @@ auth_token = ""
 # Optional cap, in MiB, on the peer-pinnable memory the admitted connections may
 # represent. The fixed process-wide terms are charged first — the UDP session
 # pool: MAX_SESSIONS_GLOBAL (8192) x (2 x MYQUIC2_SESS_SOCKET_BUF + its reader
-# buffer + 4 KiB MQP-3 flow table) = ~1.09 GiB at the shipped 64 KiB buffers on non-Linux, ~2.09 GiB on
-# Linux (the kernel stores/returns SO_*BUF at twice the requested value); the
-# per-endpoint buffers: ~19 MiB each (quinn's 2.875 MiB userspace receive
-# scratch + 16 MiB Linux kernel socket caps) x quic_endpoints; and the TCP pump
-# buffers: 2 x 16 KiB per active stream x MAX_STREAM_TASKS = ~512 MiB — and
-# what is left is divided by receive window + send budget + both DATAGRAM
-# buffers + the reassembly budget = 14.5 MiB with the default 4/8/4 MB
-# windows. Raising the windows therefore admits fewer connections instead of
-# multiplying the memory ceiling, and a budget at or below the fixed terms
-# admits exactly one connection (warned about at startup). The worst case
-# (fixed terms + connections x per-connection figure) is logged at startup
-# either way.
-# max_peer_memory_mb = 512
+# buffer + the 22 KiB MQP-3 flow table + 2 KiB rev2 copy-on-write tables)
+# = ~2.25 GiB on Linux (the kernel stores/returns SO_*BUF at twice the requested
+# value), ~1.25 GiB where it does not double them; the per-endpoint buffers:
+# ~19 MiB each on Linux (quinn's 2.875 MiB userspace receive scratch + 16 MiB
+# kernel socket caps) x quic_endpoints; the TCP relay pumps: 2 x 16 KiB
+# userspace per stream x MAX_STREAM_TASKS (512 MiB) PLUS the relay TCP socket
+# kernel buffers at 144 KiB per flow by default (~2.25 GiB; set
+# MYQUIC2_RELAY_SOCKET_BUF to cap them explicitly); the UDP retry pool (~34 MiB);
+# the DNS slow-path waiters (~8.75 MiB); the datagram-worker thread scratch; and
+# quinn's parked-header stream-reassembly metadata (4,096 x 1,024 x 96 B
+# = 384 MiB) — together ~5.6 GiB at the Linux defaults. What is left is divided
+# by 19.6875 MiB per connection at the default windows (14 MiB QUIC transport
+# buffers + both reassemblers + stager + ingress state + flow registry + the
+# pre-auth stream-assembler credit). Raising the windows therefore admits fewer
+# connections instead of multiplying the memory ceiling, and a budget at or
+# below the fixed terms admits exactly one connection (warned about at startup).
+# The worst case (fixed terms + connections x per-connection figure) is logged
+# at startup either way. Note the fixed term (~5.6 GiB at the Linux defaults,
+# dominated by the session pool and the TCP relay kernel allowance) is charged
+# first, so a small example like 512 would admit exactly one connection: size
+# the budget above the fixed term or lower MYQUIC2_SESS_SOCKET_BUF /
+# MYQUIC2_RELAY_SOCKET_BUF / quic_endpoints first.
+# max_peer_memory_mb = 8192
 # Default 4/8/4 MB matches code defaults; must mirror the client (download
 # capped by receiver, upload by sender, so change both sides together).
 # Omit all five to use defaults; the 2/4/2 MB low-memory preset (~114 Mb/s,

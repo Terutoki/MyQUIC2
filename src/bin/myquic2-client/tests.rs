@@ -1720,13 +1720,19 @@ async fn rev2_handshake_negotiates_caps() {
     // `handle_r2_ctl` path from a reader task here.
     let client_for_reader = client_conn.clone();
     let reader_state = state.clone();
+    let reader_hub = UdpHub::new();
     let reader = tokio::spawn(async move {
         while !reader_state.is_ready() {
             let Ok(d) = client_for_reader.read_datagram().await else {
                 return;
             };
             if r2::kind(&d) == Some(r2::R2Kind::Ctl) {
-                handle_r2_ctl(&reader_state, &mut myquic2::udp::R2Reassembler::new(), &d);
+                handle_r2_ctl(
+                    &reader_state,
+                    &reader_hub,
+                    &mut myquic2::udp::R2Reassembler::new(),
+                    &d,
+                );
             }
         }
     });
@@ -4732,7 +4738,15 @@ async fn dispatch_rev2_steady_resolves_binding_and_marks_it_open() {
     let mut out: Vec<StagedReply> = Vec::new();
     let frame = r2::encode_data_steady(binding.wire_id, b"reply-1", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         1
     );
     assert_eq!(
@@ -4779,7 +4793,15 @@ async fn dispatch_rev2_domain_open_src_binds_reply_source() {
     // to deliver: the requested name is not a valid SOCKS5 reply address.
     let frame = r2::encode_data_steady(binding.wire_id, b"lost", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         0
     );
     assert!(
@@ -4799,7 +4821,15 @@ async fn dispatch_rev2_domain_open_src_binds_reply_source() {
     )
     .unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         1
     );
     assert_eq!(out[0].dst, src);
@@ -4810,7 +4840,15 @@ async fn dispatch_rev2_domain_open_src_binds_reply_source() {
     // Subsequent steady frames resolve through the learned reply source.
     let frame = r2::encode_data_steady(binding.wire_id, b"second", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         1
     );
     assert_eq!(out[1].dst, src);
@@ -4838,7 +4876,15 @@ async fn dispatch_rev2_train_resolves_same_flow() {
     let mut out: Vec<StagedReply> = Vec::new();
     let frame = r2::encode_train_same(binding.wire_id, &[b"x", b"yy"], 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         2
     );
     assert_eq!(out[0].dst, target);
@@ -4864,7 +4910,15 @@ async fn dispatch_rev2_inline_downlink_delivers() {
     let mut r2_reasm = R2Reassembler::new();
     let mut out: Vec<StagedReply> = Vec::new();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         1
     );
     assert_eq!(out[0].dst, src);
@@ -4885,7 +4939,15 @@ async fn dispatch_rev2_unknown_id_is_dropped() {
     let before = counters::snapshot();
     let frame = r2::encode_data_steady(999, b"stale", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut r2_reasm, frame, &mut out),
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut r2_reasm,
+            None,
+            frame,
+            &mut out
+        ),
         0
     );
     assert!(out.is_empty());
@@ -4900,12 +4962,16 @@ async fn dispatch_rev2_unknown_id_is_dropped() {
 async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
     let rev2 = ConnRev2::new();
     let hub = UdpHub::new();
+    // SESS_CLOSE is only recorded for a session with a live association (the
+    // only thing that can consume it); publish one for 42 below.
+    let assoc = test_assoc().await;
+    hub.publish(42, assoc.entry.clone());
     let mut cache = empty_dispatch_cache();
     let mut r2_reasm = R2Reassembler::new();
     let mut out: Vec<StagedReply> = Vec::new();
     let mut send = |rev2: &ConnRev2, ctl: r2::Ctl, cache: &mut [DispatchSlot; DISPATCH_CACHE]| {
         let frame = r2::encode_ctl(&ctl);
-        dispatch_r2(rev2, cache, &hub, &mut r2_reasm, frame, &mut out)
+        dispatch_r2(rev2, cache, &hub, &mut r2_reasm, None, frame, &mut out)
     };
 
     // CAPS: negotiated limits become the connection state.
@@ -4991,6 +5057,27 @@ async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
     );
     assert!(rev2.take_session_closed(42));
     assert!(!rev2.take_session_closed(42));
+    assert_eq!(
+        rev2.closed_sessions_len(),
+        0,
+        "a consumed close leaves no stale id behind"
+    );
+    // A close for a session this process has no association for is NOT
+    // recorded: nothing could consume it, so it would keep the set non-empty
+    // (per-datagram lock path) and could evict a live association's close.
+    assert_eq!(
+        send(
+            &rev2,
+            r2::Ctl::SessClose {
+                sess: 43,
+                reason: 0
+            },
+            &mut cache
+        ),
+        0
+    );
+    assert!(!rev2.take_session_closed(43));
+    assert_eq!(rev2.closed_sessions_len(), 0);
 }
 
 /// A `SESS_CLOSE` makes the association forget its bindings so the next uplink
@@ -5622,7 +5709,7 @@ async fn dispatch_rev2_frag_open_src_out_of_order() {
     // whichever fragment carries it.
     let tail = r2::encode_frag_steady(binding.wire_id, 99, 1, 2, b"world", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, tail, &mut out),
         0,
         "a partial payload delivers nothing"
     );
@@ -5639,7 +5726,7 @@ async fn dispatch_rev2_frag_open_src_out_of_order() {
     )
     .unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, head, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, head, &mut out),
         1
     );
     assert_eq!(out[0].dst, src, "OPEN|SRC fragments learn the reply source");
@@ -5667,11 +5754,11 @@ async fn dispatch_rev2_frag_inline_and_unknown_id() {
     let tail =
         r2::encode_frag_inline(sess, &TargetAddrRef::Ip(src), false, 3, 1, 2, b"cd", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, head, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, head, &mut out),
         0
     );
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, tail, &mut out),
         1
     );
     assert_eq!(out[0].dst, src);
@@ -5687,7 +5774,7 @@ async fn dispatch_rev2_frag_inline_and_unknown_id() {
             r2::encode_frag_steady(unknown, 77, 1, 2, b"yy", 1400).unwrap()
         };
         assert_eq!(
-            dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, d, &mut out),
+            dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, d, &mut out),
             0
         );
     }
@@ -5717,7 +5804,7 @@ async fn dispatch_rev2_frag_partial_expires() {
     let mut out: Vec<StagedReply> = Vec::new();
     let half = r2::encode_frag_steady(binding.wire_id, 42, 0, 2, b"half", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, half, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, half, &mut out),
         0
     );
     assert_eq!(reasm.inflight(), 1);
@@ -5730,7 +5817,7 @@ async fn dispatch_rev2_frag_partial_expires() {
     // The missing fragment arriving after expiry cannot complete the payload.
     let tail = r2::encode_frag_steady(binding.wire_id, 42, 1, 2, b"tail", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, tail, &mut out),
         0
     );
     assert!(out.is_empty());
@@ -6216,7 +6303,7 @@ async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
     )
     .unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
         1
     );
     assert_eq!(out[0].dst, src);
@@ -6237,7 +6324,7 @@ async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
     // A later compressed frame on that id resolves through the new binding.
     let frame = r2::encode_data_steady(server_id, b"more", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
         1
     );
     assert_eq!(out[1].dst, src);
@@ -6247,7 +6334,7 @@ async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
     let client_unknown = r2::make_wire_id(9999, false).unwrap();
     let frame = r2::encode_data_steady(client_unknown, b"stale", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
         0
     );
     assert!(rev2.registry.get(client_unknown).is_none());
@@ -6255,7 +6342,7 @@ async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
     let server_unknown = r2::make_wire_id(4242, true).unwrap();
     let frame = r2::encode_train_same(server_unknown, &[b"y"], 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, frame, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
         0
     );
     assert!(rev2.registry.get(server_unknown).is_none());
@@ -6333,11 +6420,11 @@ async fn rev2_server_owned_fragmented_open_installs() {
     .unwrap();
     let tail = r2::encode_frag_steady(server_id, 11, 1, 2, b"reply", 1400).unwrap();
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, head, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, head, &mut out),
         0
     );
     assert_eq!(
-        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, tail, &mut out),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, tail, &mut out),
         1
     );
     assert_eq!(out[0].dst, src);
@@ -6376,16 +6463,13 @@ async fn rev2_sess_close_purges_registry_entries() {
     let mut cache = empty_dispatch_cache();
     let mut reasm = R2Reassembler::new();
     let mut out: Vec<StagedReply> = Vec::new();
+    // The close notification is only recorded for a live association.
+    let hub = UdpHub::new();
+    let assoc = test_assoc().await;
+    hub.publish(7, assoc.entry.clone());
     let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess: 7, reason: 0 });
     assert_eq!(
-        dispatch_r2(
-            &rev2,
-            &mut cache,
-            &UdpHub::new(),
-            &mut reasm,
-            frame,
-            &mut out
-        ),
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
         0
     );
     assert!(rev2.registry.get(client_owned.wire_id).is_none());
@@ -6399,4 +6483,708 @@ async fn rev2_sess_close_purges_registry_entries() {
     // association's own `sync` marks the ones it still holds closed when it
     // consumes the `SESS_CLOSE` flag, so no tombstone is needed here.
     assert_eq!(client_owned.session, 7);
+}
+
+// ---------------- Client severe-issue hardening (LOGIC-2/3/8/11, PERF-3) ----------------
+
+/// LOGIC-8: association-exit cleanup must run even when the generation is still
+/// in its handshake window (rev2 not ready) and even when no *fresh* egress
+/// handle can be acquired. Only the `SESS_CLOSE` datagram is conditional; the
+/// bindings and staged payloads must not leak for the connection's life.
+#[tokio::test]
+async fn sess_close_cleanup_runs_in_the_handshake_window() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
+    let bind = pool.udp_bind_shard(EgressClass::Bulk, 0);
+    let slot = pool.slot(pool.udp_global_slot(bind.index));
+    // A connection published before CAPS, exactly the 0-RTT→CAPS window: the
+    // egress cache publishes it optimistically (first packet before the
+    // handshake finishes), so a refresh succeeds while `is_ready()` is false.
+    let state = ConnRev2::new();
+    assert!(
+        !state.is_ready(),
+        "premise: the handshake has not completed"
+    );
+    slot.set_rev2(state.clone());
+    slot.publish(&client_conn);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    bump_gen(&slot.gen_tx);
+    let now = mono_millis();
+    let h = egress
+        .refresh_global(&pool, bind, now)
+        .expect("a pre-CAPS rev2 generation is still publishable for UDP");
+    egress.memo_store(
+        bind,
+        egress.generation[bind.index].load(std::sync::atomic::Ordering::Relaxed),
+        &h.conn,
+        h.limit,
+        h.stamp_ms,
+        &h.rev2,
+    );
+
+    let wire_id = r2::make_wire_id(1, false).unwrap();
+    let binding = FlowBinding::new_shared(
+        wire_id,
+        7,
+        TargetAddr::Ip("198.51.100.9:4242".parse().unwrap()),
+    );
+    assert!(state.registry.insert(binding).is_ok());
+    assert!(
+        state
+            .push_stage(R2StageItem {
+                session: 7,
+                kind: R2StageKind::Steady { wire_id },
+                payload: bytes::Bytes::from_static(b"queued"),
+            })
+            .is_ok()
+    );
+
+    send_sess_close(&egress, &pool, Some(bind), 7, state.epoch);
+
+    assert!(
+        state.registry.is_empty(),
+        "the exit must release the session's bindings even before CAPS"
+    );
+    assert_eq!(
+        state.stage_len(),
+        0,
+        "and its staged payloads, so a later drain cannot send them"
+    );
+    // Only the control frame is skipped: nothing may be put on the wire for a
+    // generation that has not negotiated rev2.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "a handshake-window exit must not send SESS_CLOSE"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// LOGIC-8: a lost egress refresh (no published handle at all) must not block
+/// the exit cleanup — the binding's own pool slot still names the generation.
+#[tokio::test]
+async fn sess_close_cleanup_reaches_the_slot_without_a_published_handle() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
+    let bind = pool.udp_bind_shard(EgressClass::Bulk, 0);
+    let slot = pool.slot(pool.udp_global_slot(bind.index));
+    let state = rev2_state();
+    slot.set_rev2(state.clone());
+    slot.publish(&client_conn);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    bump_gen(&slot.gen_tx);
+    // Deliberately no `refresh_global`/`memo_store`: this is the association
+    // whose only refresh lost the single-flight race.
+    assert!(
+        egress.cached_handle(bind).is_none(),
+        "premise: no published egress handle"
+    );
+    let wire_id = r2::make_wire_id(1, false).unwrap();
+    let binding = FlowBinding::new_shared(
+        wire_id,
+        7,
+        TargetAddr::Ip("198.51.100.9:4242".parse().unwrap()),
+    );
+    assert!(state.registry.insert(binding).is_ok());
+    assert!(
+        state
+            .push_stage(R2StageItem {
+                session: 7,
+                kind: R2StageKind::Steady { wire_id },
+                payload: bytes::Bytes::from_static(b"lost"),
+            })
+            .is_ok()
+    );
+
+    send_sess_close(&egress, &pool, Some(bind), 7, state.epoch);
+
+    assert!(
+        state.registry.is_empty(),
+        "the slot-direct fallback must still release the bindings"
+    );
+    assert_eq!(state.stage_len(), 0);
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// LOGIC-8/LOGIC-2: the exit cleanup is generation-gated and forgets a pending
+/// close on every reachable generation. A newer generation's fresh tables must
+/// never be touched by the old association's exit.
+#[test]
+fn sess_close_cleanup_never_touches_a_newer_generation() {
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress = SharedEgress::default();
+    let bind = pool.udp_bind_shard(EgressClass::Bulk, 0);
+    let slot = pool.slot(pool.udp_global_slot(bind.index));
+    let old = ConnRev2::new();
+    let new = ConnRev2::with_stager_capacity(4, 4096);
+    assert_ne!(old.epoch, new.epoch);
+    slot.set_rev2(new.clone());
+    // The new generation's own state (a different session) must survive.
+    let keep = FlowBinding::new_shared(
+        r2::make_wire_id(1, false).unwrap(),
+        9,
+        TargetAddr::Ip("203.0.113.9:53".parse().unwrap()),
+    );
+    assert!(new.registry.insert(keep.clone()).is_ok());
+    assert!(
+        new.push_stage(R2StageItem {
+            session: 9,
+            kind: R2StageKind::Steady {
+                wire_id: keep.wire_id
+            },
+            payload: bytes::Bytes::from_static(b"new-gen"),
+        })
+        .is_ok()
+    );
+    // A close was recorded on the new generation's dispatcher while the
+    // association was still live; its exit must release that note too.
+    new.note_session_closed(7);
+    assert_eq!(new.closed_sessions_len(), 1);
+
+    // The old association exits: its epoch no longer matches the slot's.
+    send_sess_close(&egress, &pool, Some(bind), 7, old.epoch);
+
+    assert!(
+        new.registry.get(keep.wire_id).is_some(),
+        "a newer generation's bindings are never touched"
+    );
+    assert_eq!(
+        new.stage_len(),
+        1,
+        "nor its staged payloads (they belong to other sessions)"
+    );
+    assert_eq!(
+        new.closed_sessions_len(),
+        0,
+        "the exit still forgets the pending close recorded for its session"
+    );
+}
+
+/// LOGIC-2: an association that never sent a datagram has no `UdpBind`, but its
+/// pending close note must still be released at exit (otherwise the bounded set
+/// never drains and every uplink datagram pays the lock).
+#[test]
+fn sess_close_without_bind_still_forgets_pending_close() {
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress = SharedEgress::default();
+    let state = rev2_state();
+    pool.slot(0).set_rev2(state.clone());
+    state.note_session_closed(7);
+    assert_eq!(state.closed_sessions_len(), 1);
+    send_sess_close(&egress, &pool, None, 7, 0);
+    assert_eq!(state.closed_sessions_len(), 0);
+}
+
+/// LOGIC-3: an `OPEN|SRC` binding frame (server-owned install or a rebind of a
+/// client-owned flow) is confirmed with `CTL FLOW_ACK {id, status: 0}`, and a
+/// duplicate binding frame is re-acked idempotently (a lost ACK is recovered by
+/// the peer's rebind, so the receiver must keep answering).
+#[tokio::test]
+async fn dispatch_rev2_open_src_sends_flow_ack_idempotently() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let assoc = test_assoc().await;
+    let sess = 7u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let src: SocketAddr = "203.0.113.9:53".parse().unwrap();
+    let server_id = r2::make_wire_id(1, true).unwrap();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let before = counters::snapshot();
+
+    let frame = r2::encode_data_open(
+        server_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        b"unsolicited",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut reasm,
+            Some(&client_conn),
+            frame.clone(),
+            &mut out
+        ),
+        1
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the OPEN|SRC must be confirmed")
+        .unwrap();
+    match r2::decode_ctl(&d).expect("the confirmation must be a CTL frame") {
+        r2::Ctl::FlowAck { id, status } => {
+            assert_eq!(id, server_id);
+            assert_eq!(status, r2::R2_ACK_OPEN);
+        }
+        other => panic!("expected FLOW_ACK, got {other:?}"),
+    }
+    assert!(counters::since(&before).flow_ack_tx >= 1);
+
+    // The same idempotent binding frame again (the peer missed the first ACK):
+    // it resolves through the registry and must be re-acked.
+    assert_eq!(
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut reasm,
+            Some(&client_conn),
+            frame,
+            &mut out
+        ),
+        1
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("a duplicate binding frame is re-acked")
+        .unwrap();
+    assert!(matches!(
+        r2::decode_ctl(&d).expect("second confirmation"),
+        r2::Ctl::FlowAck { id, status } if id == server_id && status == r2::R2_ACK_OPEN
+    ));
+    assert_eq!(
+        rev2.registry.len(),
+        1,
+        "the duplicate install did not create a second binding"
+    );
+
+    // Client-owned rebind: the server teaches the actual source of a flow this
+    // side opened; the client must confirm that too.
+    let client_id = r2::make_wire_id(2, false).unwrap();
+    let client_binding = FlowBinding::new_shared(
+        client_id,
+        sess,
+        TargetAddr::Ip("198.51.100.7:443".parse().unwrap()),
+    );
+    assert!(rev2.registry.insert(client_binding).is_ok());
+    let rebind = r2::encode_data_open(
+        client_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        b"rebound",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut reasm,
+            Some(&client_conn),
+            rebind,
+            &mut out
+        ),
+        1
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("a client-owned rebind is confirmed")
+        .unwrap();
+    assert!(matches!(
+        r2::decode_ctl(&d).expect("rebind confirmation"),
+        r2::Ctl::FlowAck { id, status } if id == client_id && status == r2::R2_ACK_OPEN
+    ));
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// LOGIC-3: a binding frame this side cannot install is answered with
+/// `FLOW_REJECT` — `TABLE_FULL` when the per-connection registry is at its cap,
+/// `POLICY` otherwise — so the peer can stop re-sending it and fall back to
+/// `INLINE`.
+#[tokio::test]
+async fn dispatch_rev2_install_failure_sends_flow_reject() {
+    // The TABLE_FULL arm books a REFUSED drop, like every other counter test
+    // that can bump the process-wide counter.
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let assoc = test_assoc().await;
+    let sess = 7u32;
+    let hub = UdpHub::new();
+    hub.publish(sess, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+
+    // Fill the registry so a server-owned install cannot fit.
+    let filler = TargetAddr::Ip("203.0.113.7:9".parse().unwrap());
+    for i in 1..=R2_MAX_FLOWS_PER_CONN as u32 {
+        let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 2, filler.clone());
+        assert!(rev2.registry.insert(b).is_ok());
+    }
+    assert!(!rev2.registry.has_capacity(), "premise: the table is full");
+    let server_id = r2::make_wire_id(1, true).unwrap();
+    let src: SocketAddr = "198.51.100.44:443".parse().unwrap();
+    let frame = r2::encode_data_open(
+        server_id,
+        sess,
+        &TargetAddrRef::Ip(src),
+        true,
+        b"cannot-install",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut reasm,
+            Some(&client_conn),
+            frame,
+            &mut out
+        ),
+        0
+    );
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("a full registry must be reported to the peer")
+        .unwrap();
+    assert!(matches!(
+        r2::decode_ctl(&d).expect("reject control frame"),
+        r2::Ctl::FlowReject { id, reason }
+            if id == server_id && reason == r2::R2_REJECT_TABLE_FULL
+    ));
+
+    // An unknown id that is not server-owned (a frame the peer still thinks is
+    // bound) gets POLICY: this side cannot install it for any reason.
+    let client_unknown = r2::make_wire_id(4242, false).unwrap();
+    let steady = r2::encode_data_steady(client_unknown, b"stale", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut reasm,
+            Some(&client_conn),
+            steady,
+            &mut out
+        ),
+        0
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("an uninstallable id is rejected")
+            .map(|d| r2::decode_ctl(&d).expect("reject control frame")),
+        Ok(r2::Ctl::FlowReject {
+            id: client_unknown,
+            reason: r2::R2_REJECT_POLICY
+        })
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// LOGIC-2: the dispatcher records a `SESS_CLOSE` only for a live association,
+/// so duplicate/forged closes cannot accumulate stale ids in the bounded set.
+#[tokio::test]
+async fn dispatch_rev2_sess_close_for_a_dead_association_is_not_recorded() {
+    let assoc = test_assoc().await;
+    let hub = UdpHub::new();
+    hub.publish(7, assoc.entry.clone());
+    let rev2 = rev2_state();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let mut send = |rev2: &ConnRev2, cache: &mut [DispatchSlot; DISPATCH_CACHE], sess: u32| {
+        let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess, reason: 0 });
+        dispatch_r2(rev2, cache, &hub, &mut reasm, None, frame, &mut out)
+    };
+    // Live association: recorded, consumed once.
+    assert_eq!(send(&rev2, &mut cache, 7), 0);
+    assert_eq!(rev2.closed_sessions_len(), 1);
+    assert!(rev2.take_session_closed(7));
+    assert_eq!(rev2.closed_sessions_len(), 0);
+    // Exiting association (hub entry still served but no longer alive): not
+    // recorded, so a peer cannot fill the set with ids nobody will consume.
+    assoc
+        .entry
+        .alive
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(send(&rev2, &mut cache, 7), 0);
+    assert_eq!(rev2.closed_sessions_len(), 0);
+    // Unknown session: same verdict.
+    assert_eq!(send(&rev2, &mut cache, 99), 0);
+    assert_eq!(rev2.closed_sessions_len(), 0);
+}
+
+/// LOGIC-11: every SOCKS5 UDP framing reject books a drop (notably `FRAG != 0`,
+/// which used to be dropped in total silence).
+#[tokio::test]
+async fn socks_udp_framing_rejects_are_counted() {
+    // REFUSED is process-wide and several dispatch tests assert exact deltas.
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let before = dgram_drops::snapshot();
+    let valid = [0u8, 0, 0, 0x01, 127, 0, 0, 1, 0, 53, b'x'];
+    let (addr, off) = socks_udp_frame(1, &valid).expect("a well-formed frame is accepted");
+    assert_eq!(addr, TargetAddrRef::Ip("127.0.0.1:53".parse().unwrap()));
+    assert_eq!(&valid[off..], b"x");
+    // FRAG != 0: legal SOCKS5 the proxy does not implement.
+    let mut frag = valid;
+    frag[2] = 1;
+    assert!(socks_udp_frame(1, &frag).is_none());
+    // Short header and an undecodable target address are refused the same way.
+    assert!(socks_udp_frame(1, &[0, 0]).is_none());
+    assert!(socks_udp_frame(1, &[0, 0, 0, 0x07]).is_none());
+    let d = dgram_drops::snapshot().since(&before);
+    assert_eq!(
+        d.refused, 3,
+        "every framing reject is counted exactly once, including FRAG != 0"
+    );
+}
+
+/// LOGIC-11: the app-IP pin tolerates the v4/v6 family difference for loopback
+/// and unspecified addresses (a dual-stack app must not be locked out of its
+/// own association) while still rejecting a real address mismatch.
+#[test]
+fn app_ip_pin_is_family_tolerant() {
+    let l4: IpAddr = "127.0.0.1".parse().unwrap();
+    let l6: IpAddr = "::1".parse().unwrap();
+    let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+    assert!(
+        app_ip_matches(l4, l6),
+        "loopback is the same host in both families"
+    );
+    assert!(app_ip_matches(l6, l4));
+    assert!(
+        app_ip_matches(l4, mapped),
+        "v4-mapped forms are unmapped first"
+    );
+    let u4: IpAddr = "0.0.0.0".parse().unwrap();
+    let u6: IpAddr = "::".parse().unwrap();
+    assert!(app_ip_matches(u4, u6));
+    assert!(
+        !app_ip_matches(l4, u4),
+        "a loopback pin is not the wildcard"
+    );
+    let pub4: IpAddr = "198.51.100.7".parse().unwrap();
+    let pub6: IpAddr = "2001:db8::7".parse().unwrap();
+    assert!(
+        !app_ip_matches(pub4, pub6),
+        "only loopback/unspecified are family-equivalent"
+    );
+    assert!(!app_ip_matches(l4, pub4));
+}
+
+/// PERF-3: the main runtime only loses workers to the sharded slot runtimes
+/// where those slots are really pinned (Linux). Elsewhere the subtraction had no
+/// basis and collapsed the app-side pool to one worker at the shipped defaults.
+#[test]
+fn main_runtime_worker_count_only_subtracts_real_pinning() {
+    // Linux: 7 pinned slots on 8 cores leave one worker (floor), and the
+    // subtraction scales with the core count.
+    assert_eq!(main_runtime_workers_for(8, true, 7, true), 1);
+    assert_eq!(main_runtime_workers_for(16, true, 7, true), 9);
+    assert_eq!(
+        main_runtime_workers_for(4, true, 7, true),
+        1,
+        "floor of one"
+    );
+    assert_eq!(main_runtime_workers_for(1, true, 7, true), 1);
+    // Off Linux pinning is a no-op: the slot threads reserve no core, so the
+    // full default width is kept (this was the one-worker regression).
+    assert_eq!(main_runtime_workers_for(8, true, 7, false), 8);
+    assert_eq!(main_runtime_workers_for(4, true, 7, false), 4);
+    // Shared-runtime topology: no pinned slot threads at all.
+    assert_eq!(main_runtime_workers_for(8, false, 7, true), 8);
+    // A degenerate core count still yields a usable runtime.
+    assert_eq!(main_runtime_workers_for(0, true, 7, true), 1);
+    assert_eq!(main_runtime_workers_for(0, false, 7, false), 1);
+}
+
+/// PERF-9: a `TRAIN dict` resolves every distinct id through one `get_batch`
+/// hold, stages items in wire order, and keeps per-item unknown-id accounting.
+#[tokio::test]
+async fn dispatch_rev2_train_dict_batches_ids() {
+    let hub = UdpHub::new();
+    let a = test_assoc().await;
+    let b = test_assoc().await;
+    let sess_a = 3u32;
+    let sess_b = 4u32;
+    hub.publish(sess_a, a.entry.clone());
+    hub.publish(sess_b, b.entry.clone());
+    let rev2 = rev2_state();
+    let dst_a: SocketAddr = "192.0.2.7:5353".parse().unwrap();
+    let dst_b: SocketAddr = "198.51.100.8:443".parse().unwrap();
+    let id_a = r2::make_wire_id(1, false).unwrap();
+    let id_b = r2::make_wire_id(2, false).unwrap();
+    for (id, sess, dst) in [(id_a, sess_a, dst_a), (id_b, sess_b, dst_b)] {
+        let binding = FlowBinding::new_shared(id, sess, TargetAddr::Ip(dst));
+        assert!(rev2.registry.insert(binding).is_ok());
+    }
+    let flows = [id_a, id_b];
+    let items: [(u8, &[u8]); 3] = [(0, b"a1"), (1, b"b1"), (0, b"a2")];
+    let frame = r2::encode_train_dict(&flows, &items, 1400).expect("dict train encodes");
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
+        3
+    );
+    assert_eq!(out[0].dst, dst_a);
+    assert_eq!(out[0].payload, &b"a1"[..]);
+    assert_eq!(out[1].dst, dst_b);
+    assert_eq!(out[1].payload, &b"b1"[..]);
+    assert_eq!(out[2].dst, dst_a, "a repeated id reuses its slot");
+    assert_eq!(out[2].payload, &b"a2"[..]);
+    out.clear();
+
+    // An unknown id is still counted per item and never installs a flow.
+    let unknown = r2::make_wire_id(4242, false).unwrap();
+    let flows = [id_a, unknown];
+    let items: [(u8, &[u8]); 2] = [(0, b"ok"), (1, b"lost")];
+    let frame = r2::encode_train_dict(&flows, &items, 1400).expect("dict train encodes");
+    let before = counters::snapshot();
+    assert_eq!(
+        dispatch_r2(&rev2, &mut cache, &hub, &mut reasm, None, frame, &mut out),
+        1
+    );
+    assert_eq!(out[0].payload, &b"ok"[..]);
+    assert!(rev2.registry.get(unknown).is_none());
+    assert!(counters::since(&before).rx_unknown_id >= 1);
+}
+
+/// C10: the connection handle and the rev2 id tables are paired structurally —
+/// a handle from the previous generation is never paired with the next
+/// generation's state (wire ids restart at 1 on every dial, so such a pair could
+/// resolve a buffered frame against an unrelated live binding).
+#[tokio::test]
+async fn conn_rev2_pairing_rejects_a_replaced_generation() {
+    let (c1, _e1, _s1) = real_connection().await;
+    let (c2, _e2, _s2) = real_connection().await;
+    let slot = ConnSlot::fresh();
+    let r1 = ConnRev2::new();
+    slot.set_rev2(r1.clone());
+    slot.publish(&c1);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    bump_gen(&slot.gen_tx);
+    assert_eq!(
+        slot.rev2_for(&c1).map(|r| r.epoch),
+        Some(r1.epoch),
+        "the paired state is the published generation's"
+    );
+
+    // Death + redial publishes a fresh generation: the old handle must not pair
+    // with the new state (and no pair may be reported during the transition).
+    assert!(slot.clear_if_and_mark_dead(&c1));
+    let r2_state = ConnRev2::new();
+    slot.set_rev2(r2_state.clone());
+    slot.publish(&c2);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    bump_gen(&slot.gen_tx);
+    assert!(
+        slot.rev2_for(&c1).is_none(),
+        "an old connection must not pair with the next generation's id tables"
+    );
+    assert_eq!(
+        slot.rev2_for(&c2).map(|r| r.epoch),
+        Some(r2_state.epoch),
+        "the fresh pair is returned"
+    );
+    c1.close(0u32.into(), b"done");
+    c2.close(0u32.into(), b"done");
+}
+
+/// LOGIC-2/PERF-1 client half: peer-controlled `SESS_CLOSE`/`FLOW_CLOSE`/
+/// `FLOW_REJECT` frames are rate-limited per connection; the excess is dropped
+/// and counted instead of doing purge work at line rate.
+#[test]
+fn peer_ctl_frames_are_rate_limited() {
+    let rev2 = rev2_state();
+    let hub = UdpHub::new();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let before = counters::snapshot();
+    let frame = r2::encode_ctl(&r2::Ctl::FlowClose { id: 999 });
+    // Two windows' worth + a margin: even if the coarse clock advances across
+    // the loop (resetting the budget once), the tail still exceeds the cap and
+    // must be dropped.
+    let n = myquic2::mqp::r2_flow::CTL_MAX_PER_SEC * 2 + 8;
+    for _ in 0..n {
+        assert_eq!(
+            dispatch_r2(
+                &rev2,
+                &mut cache,
+                &hub,
+                &mut reasm,
+                None,
+                frame.clone(),
+                &mut out
+            ),
+            0
+        );
+    }
+    assert!(
+        counters::since(&before).ctl_rate_limited >= 1,
+        "the CTL rate budget must drop the excess frames"
+    );
+    // FLOW_ACK is exempt: it is needed for the confirmation contract and is one
+    // cheap map probe, so a legitimate ack is never refused by the budget.
+    let ack = r2::encode_ctl(&r2::Ctl::FlowAck {
+        id: 999,
+        status: r2::R2_ACK_OPEN,
+    });
+    let before_ack = counters::since(&before).ctl_rate_limited;
+    for _ in 0..16 {
+        dispatch_r2(
+            &rev2,
+            &mut cache,
+            &hub,
+            &mut reasm,
+            None,
+            ack.clone(),
+            &mut out,
+        );
+    }
+    assert_eq!(
+        counters::since(&before).ctl_rate_limited,
+        before_ack,
+        "FLOW_ACK is deliberately outside the rate budget"
+    );
+}
+
+/// P2-8: the hub's "published but already dead" arm is an unknown-session drop
+/// too, so it must bump the counter its own documentation names (it used to
+/// return silently, leaving the dead-entry race uncounted).
+#[tokio::test]
+async fn dispatch_dead_hub_entry_counts_unknown_session() {
+    let assoc = test_assoc().await;
+    let hub = UdpHub::new();
+    hub.publish(7, assoc.entry.clone());
+    // An exiting association: the hub still serves the entry between
+    // `AliveGuard` clearing the bit and `UdpHub::release` unpublishing it.
+    assoc
+        .entry
+        .alive
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    let before = dgram_drops::snapshot();
+    dispatch_one(&mut cache, &hub, 7, dgram(7, b"late"), &mut reasm, &mut pkt);
+    assert!(
+        dgram_drops::snapshot().since(&before).unknown_sess >= 1,
+        "a dead hub entry must be counted as an unknown session"
+    );
 }

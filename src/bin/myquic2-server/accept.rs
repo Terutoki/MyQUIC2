@@ -193,14 +193,19 @@ pub(crate) fn warn_header_credit_refused(total: u64) {
 ///   semaphore is shared by every peer),
 /// - every QUIC ingress endpoint's resident receive buffer and socket caps
 ///   ([`endpoint_memory_bytes`]),
-/// - the TCP relay pump buffers of the whole process-wide stream-task pool
-///   ([`stream_pump_memory_bytes`]).
+/// - the relay pump buffers of the whole process-wide stream-task pool: two
+///   16 KiB userspace buffers per flow **plus** the relay sockets' kernel
+///   `SO_SNDBUF`/`SO_RCVBUF` caps ([`stream_pump_memory_bytes`]),
+/// - the UDP retry pools ([`retry_pool_memory_bytes`]), the DNS slow-path
+///   waiter set ([`dns_inflight_memory_bytes`]), per-worker thread-locals
+///   ([`worker_scratch_bytes`]) and quinn's parked-stream reassembly metadata
+///   ([`stream_assembler_memory_bytes`]).
 ///
-/// Charging all three here is what makes the printed worst case match what the
-/// process can actually pin; charging only the session pool left the endpoint
-/// and relay-buffer terms invisible to `max_peer_memory_mb`. A budget too small
-/// for even one connection clamps to one rather than zero: an endpoint that
-/// admits nothing cannot be diagnosed from the outside.
+/// Charging all of it here is what makes the printed worst case match what the
+/// process can actually pin; charging only the session pool left the endpoint,
+/// relay-pump and assembler terms invisible to `max_peer_memory_mb`. A budget
+/// too small for even one connection clamps to one rather than zero: an
+/// endpoint that admits nothing cannot be diagnosed from the outside.
 ///
 /// Pure so the arithmetic is testable without a live endpoint.
 pub(crate) fn admission_cap(
@@ -284,8 +289,10 @@ pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
 ///
 /// See the note at the declaration site in [`handle_conn`] for why this is a
 /// table and not the single `(session, dst)` pair it used to be; the sizing
-/// argument is there too.
-pub(crate) const FAST_SESS_SLOTS: usize = 16;
+/// argument is there too. 64 is the documented "hundreds of associations per
+/// connection" shape rounded to the probing table's power of two, and is
+/// charged to admission by `R2_INGRESS_FIXED_BYTES`.
+pub(crate) const FAST_SESS_SLOTS: usize = 64;
 // `fast_slot` masks instead of taking a modulo, and every probe step is a mask.
 const _: () = assert!(FAST_SESS_SLOTS.is_power_of_two());
 
@@ -301,8 +308,9 @@ pub(crate) struct FastSess {
     /// second owner of the session's socket, and it outlives the session. The
     /// 180 s sweeper removes the table entry and aborts the reply reader, which
     /// drops both of *their* handles — but a strong slot would keep the socket
-    /// (and its 2 x 32 KiB kernel buffers) alive outside the
-    /// `MAX_SESSIONS_GLOBAL` budget until the next datagram happened to evict
+    /// (and its kernel send/receive buffer caps, `2 x sess_socket_buf()` per
+    /// direction) alive outside the `MAX_SESSIONS_GLOBAL` budget until the next
+    /// datagram happened to evict
     /// this slot, or until the connection closed. `abort.is_finished()` already
     /// stops the fast path from *using* such a socket, so retaining it bought
     /// nothing. An `upgrade` that fails is also the sharpest possible liveness
@@ -358,7 +366,9 @@ impl FastSess {
 /// counter (`hub.rs::alloc_sess`), so on a long-lived connection the live ids
 /// are a *sparse* subset of the 32-bit space, not a dense `1..=N` interval: two
 /// live sessions land on the same home slot at random (with A live ids the
-/// chance all homes are distinct is `∏(16-i)/16`, i.e. ~50 % already at A=5).
+/// chance all homes are distinct is `∏(N-i)/N`; at N=64 it stays above 60 %
+/// through A=8 (16 slots were already down to ~12 % there), which is why the
+/// table was widened.
 /// Probing past the home slot is what keeps every such collision from parking
 /// both sessions on the slow path forever — see [`fast_probe`].
 pub(crate) fn fast_slot(s: u32) -> usize {
@@ -387,8 +397,8 @@ pub(crate) fn fast_probe(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> 
 }
 
 /// Where [`arm_fast`] publishes a session: its existing slot, else the first
-/// empty slot from home, else the least-recently-active slot when all 16 are
-/// taken.
+/// empty slot from home, else the least-recently-active slot when all
+/// [`FAST_SESS_SLOTS`] are taken.
 ///
 /// The eviction order is the session's own liveness stamp (`last`, refreshed at
 /// most once a second per session), so a table that is genuinely over
@@ -819,15 +829,24 @@ pub(crate) fn r2_caps_due(last_ms: u64, now_ms: u64) -> bool {
 
 /// Rev2 counters that are not part of the shared `dgram_drops`/`udp_stats`
 /// surface (shared with the client, so not extended here). Relaxed atomics for
-/// everything except `TRAIN_ITEMS`, which is per *item* (a TRAIN datagram can
-/// carry up to 64) and therefore thread-locally batched on the same shape as
-/// `udp_stats::payload`: same-thread reads flush the caller's cell first, and
-/// a pending count on another thread becomes visible at the next 256 boundary
-/// — the same bound the `udp_stats` reporter documents, tolerable for a 60 s
-/// report. Tests never assert `TRAIN_ITEMS`, so the batch stays invisible.
-/// The rest are read directly by tests, so those stay one shared RMW per
-/// frame (a per-frame cost next to a QUIC DATAGRAM send reads as noise).
+/// everything except the two hot families, which are thread-locally batched on
+/// the same shape as `udp_stats::payload` (flush at 256 records or once per
+/// second, whichever comes first; same-thread readers flush the caller's cell
+/// first):
+///
+/// - `TRAIN_ITEMS` is per *item* (a TRAIN datagram can carry up to 64);
+/// - `STEADY_SENT` / `OPEN_SRC_SENT` are per **sent reply frame**, i.e. the
+///   downlink hot path: a direct process-wide `fetch_add` there put one shared
+///   cache-line RMW on every relayed reply (the same contention the `udp_stats`
+///   counters avoid at 1/256).
+///
+/// The bounded visibility of a batched counter is the one every `udp_stats`
+/// counter already has: a pending count becomes visible at the next 256-mark or
+/// 1 s check, and the 60 s report's accuracy is unaffected. The rest are read
+/// directly by tests, so those stay one shared RMW per frame (a per-frame cost
+/// next to a QUIC DATAGRAM send reads as noise).
 pub(crate) mod r2_stats {
+    use crate::coarse_millis;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Rev2 data/control frames accepted into the pre-HELLO buffer.
@@ -858,8 +877,16 @@ pub(crate) mod r2_stats {
     /// Bindings dropped because their session ended (expiry/SESS_CLOSE/teardown).
     pub(crate) static SESSION_END_BINDINGS: AtomicU64 = AtomicU64::new(0);
     /// Downlink frames sent (steady `DATA`, same-flow `TRAIN`, `OPEN|SRC`).
+    /// Thread-locally batched: see [`bump_steady_sent`].
     pub(crate) static STEADY_SENT: AtomicU64 = AtomicU64::new(0);
+    /// See [`bump_open_src_sent`].
     pub(crate) static OPEN_SRC_SENT: AtomicU64 = AtomicU64::new(0);
+    /// Peer `FLOW_ACK` frames processed: the peer confirmed it decoded an
+    /// `OPEN|SRC` binding frame, which is what lets the server compress
+    /// (`SourceMatch::Exact`) instead of re-sending the idempotent binding
+    /// frame forever. Not batched: it only moves per rebind (rare), and the
+    /// tests synchronize on it.
+    pub(crate) static FLOW_ACKS_RECV: AtomicU64 = AtomicU64::new(0);
     /// `DATA OPEN`s dropped while another lookup for the same
     /// `(session, id)` was in flight, or because the per-connection
     /// pending-open cap was reached. Duplicates are expected under
@@ -879,6 +906,91 @@ pub(crate) mod r2_stats {
 
     thread_local! {
         static L_TRAIN_ITEMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_STEADY_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_OPEN_SRC_SENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static L_REPLY_LAST_FLUSH_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Records per thread before a reply-frame counter is flushed (the
+    /// `udp_stats` threshold: one shared RMW per 256 records keeps a flood off
+    /// the cache line while staying honest down to a few records per second).
+    const FLUSH_PER_FRAME: u64 = 256;
+    /// Wall bound for the flush: a low-rate worker flushes on its next reply
+    /// once a second has passed, so a 60 s report can never miss a worker that
+    /// counted fewer than 256 replies. `coarse_millis` (not the precise clock):
+    /// this sits on the reply path and only whole seconds are at stake.
+    const FLUSH_PER_FRAME_MS: u64 = 1_000;
+
+    /// Flush this thread's pending batched reply-frame counts into the shared
+    /// statics.
+    fn flush_locals() {
+        L_STEADY_SENT.with(|c| {
+            let v = c.get();
+            if v != 0 {
+                STEADY_SENT.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
+        L_OPEN_SRC_SENT.with(|c| {
+            let v = c.get();
+            if v != 0 {
+                OPEN_SRC_SENT.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
+    }
+
+    /// Batched `+= 1` for a per-thread reply-frame counter: count flush at
+    /// [`FLUSH_PER_FRAME`], time flush at [`FLUSH_PER_FRAME_MS`].
+    #[inline]
+    fn bump_reply(
+        local: &'static std::thread::LocalKey<std::cell::Cell<u64>>,
+        global: &'static AtomicU64,
+    ) {
+        local.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            if v >= FLUSH_PER_FRAME {
+                global.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
+        let due = L_REPLY_LAST_FLUSH_MS.with(|c| {
+            let now = coarse_millis();
+            let last = c.get();
+            if now.saturating_sub(last) >= FLUSH_PER_FRAME_MS {
+                c.set(now);
+                true
+            } else {
+                false
+            }
+        });
+        if due {
+            flush_locals();
+        }
+    }
+
+    /// One downlink steady frame (or same-flow TRAIN) handed to quinn.
+    #[inline]
+    pub(crate) fn bump_steady_sent() {
+        bump_reply(&L_STEADY_SENT, &STEADY_SENT);
+    }
+
+    /// One downlink `OPEN|SRC` binding frame handed to quinn.
+    #[inline]
+    pub(crate) fn bump_open_src_sent() {
+        bump_reply(&L_OPEN_SRC_SENT, &OPEN_SRC_SENT);
+    }
+
+    /// Flush this thread's pending reply-frame counts into the shared statics.
+    ///
+    /// The batched counters are documented with the same bounded-visibility
+    /// model as `udp_stats`: a reporter or a test that reads them on the
+    /// counting thread calls this first to see its own records exactly. (A
+    /// pending count on another thread becomes visible at its next flush
+    /// threshold.)
+    pub(crate) fn flush_thread() {
+        flush_locals();
     }
 
     /// One TRAIN item accepted for the data plane.
@@ -954,6 +1066,27 @@ pub(crate) struct R2ConnState {
     pending_dns_opens: parking_lot::Mutex<
         std::collections::HashMap<(u32, u32), Arc<std::sync::atomic::AtomicBool>>,
     >,
+    /// Domain datagrams resolved by the **generic slow path**
+    /// ([`forward_server_dgram`]'s `Unresolved` arm), keyed by session.
+    ///
+    /// That path has no per-flow coalescing key (`pending_dns_opens` only
+    /// exists for rev2 `DATA OPEN`), so a `CTL SESS_CLOSE` used to have no way
+    /// to cancel a lookup that was already in flight: the spawned waiter would
+    /// finish the DNS await and call the unguarded `get_or_create_sess`,
+    /// recreating the just-closed association (socket + reader task + global
+    /// session permit leaked until the 180 s idle sweep — the generic-path half
+    /// of the SESS_CLOSE × DNS defect). Each waiter registers its cancellation
+    /// flag here for the session it is resolving for; the close flags every
+    /// matching entry (`cancel_dns_waiters_for_session`) and the waiter checks
+    /// the flag before creating/delivering, with the creation itself routed
+    /// through the guarded variant.
+    ///
+    /// Bounded by the process-wide [`dns_slow_path_limiter`](myquic2::dns_slow_path_limiter)
+    /// permits: every waiter holds one for its whole lifetime, and it is
+    /// dropped (with this entry) when the task ends, so one connection cannot
+    /// grow the map past the 1024 concurrent lookups the process admits.
+    dns_waiters:
+        parking_lot::Mutex<std::collections::HashMap<u32, Vec<Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 /// Bounds for [`R2ConnState::pre_hello`]: only the first optimistic frames
@@ -1029,7 +1162,54 @@ impl R2ConnState {
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
             pre_hello: parking_lot::Mutex::new((Vec::new(), 0)),
             pending_dns_opens: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dns_waiters: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Register one generic-slow-path DNS waiter for `sess`, returning the RAII
+    /// guard that owns its cancellation flag (see the [`dns_waiters`] field).
+    ///
+    /// The waiter is registered **before** it is spawned (the only slow-path
+    /// datagram's spawn is synchronous), and the datagram reader processes
+    /// datagrams in order, so a `SESS_CLOSE` for the session always runs after
+    /// the registration and finds the flag; the waiter's guarded creation then
+    /// refuses to publish a session for the closed association.
+    pub(crate) fn begin_dns_waiter(self: &Arc<Self>, sess: u32) -> DnsWaiter {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.dns_waiters
+            .lock()
+            .entry(sess)
+            .or_default()
+            .push(Arc::clone(&flag));
+        DnsWaiter {
+            state: Arc::clone(self),
+            session: sess,
+            flag,
+        }
+    }
+
+    /// Flag every in-flight generic-slow-path waiter of `sess` (`CTL
+    /// SESS_CLOSE`). Like [`Self::cancel_pending_opens_for_session`], the
+    /// entries are flagged, not removed: the task's RAII guard owns the entry's
+    /// lifetime and clears it on exit.
+    ///
+    /// Ordering proof is the same: this runs before `r2_close_session`'s
+    /// `take_session` (the shard write lock), and the waiter's guarded creation
+    /// re-reads the flag inside that same lock, immediately before publishing.
+    pub(crate) fn cancel_dns_waiters_for_session(&self, sess: u32) {
+        let set = self.dns_waiters.lock();
+        for flag in set.get(&sess).into_iter().flatten() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only count of registered generic-slow-path waiters for `sess`.
+    #[cfg(test)]
+    pub(crate) fn dns_waiter_count(&self, sess: u32) -> usize {
+        self.dns_waiters
+            .lock()
+            .get(&sess)
+            .map_or(0, std::vec::Vec::len)
     }
 
     /// Begin (or coalesce) one domain OPEN. The returned guard owns the
@@ -1128,6 +1308,49 @@ impl R2ConnState {
     }
 }
 
+/// RAII registration of one generic-slow-path DNS waiter (see
+/// [`R2ConnState::begin_dns_waiter`]).
+///
+/// Owns the waiter's cancellation flag until the lookup task exits on every
+/// path (delivered, refused, timed out, cancelled), at which point the entry is
+/// removed from the waiter registry so a long-lived connection cannot
+/// accumulate flags for sessions the peer has churned through.
+pub(crate) struct DnsWaiter {
+    state: Arc<R2ConnState>,
+    session: u32,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DnsWaiter {
+    /// Whether `CTL SESS_CLOSE` closed the session while the lookup was in
+    /// flight. Relaxed is sound for the same reason as
+    /// [`PendingDnsOpen::is_cancelled`].
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The flag as a borrow, for [`get_or_create_sess_guarded`].
+    pub(crate) fn cancelled_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.flag
+    }
+}
+
+impl Drop for DnsWaiter {
+    fn drop(&mut self) {
+        let mut map = self.state.dns_waiters.lock();
+        let empty = match map.get_mut(&self.session) {
+            Some(flags) => {
+                flags.retain(|f| !Arc::ptr_eq(f, &self.flag));
+                flags.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            map.remove(&self.session);
+        }
+    }
+}
+
 /// Best-effort control-frame send (control frames are loss-tolerant).
 fn r2_send_ctl(cd: &quinn::Connection, ctl: &Ctl) {
     let _ = try_send_datagram(cd, r2::encode_ctl(ctl));
@@ -1154,6 +1377,42 @@ pub(crate) fn r2_send_sess_close(cd: &quinn::Connection, sess: u32) {
     }
 }
 
+/// Send the reap-time `SESS_CLOSE` notifications **off the reaping task**.
+///
+/// A connection may hold up to the per-connection session cap; a 60 s idle
+/// sweep or a pool/fair-share reap can evict thousands of sessions at once, and
+/// three best-effort control datagrams each was ~12k non-blocking sends plus
+/// the registry purges on the datagram-reader/shard runtime that also drives
+/// every connection's QUIC. The reap therefore hands the session ids to this
+/// detached task: bounded work per wake (one chunk of ids), then `yield_now`
+/// so the runtime can service the shard between chunks.
+///
+/// Best-effort by construction: the frames are loss-tolerant and the peer's
+/// own idle sweep is the correctness backstop, so a closed/backed-up connection
+/// just stops early (`close_reason` check per chunk). The batch is bounded by
+/// the reap itself (the per-connection session cap); the `Vec<u32>` costs 16
+/// KiB only in the pathological full-reap case.
+pub(crate) fn spawn_sess_close_notifications(cd: quinn::Connection, sessions: Vec<u32>) {
+    if sessions.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        // ~64 sessions (192 datagrams) per wakeup: long enough that the detach
+        // still removes thousands of sends from the reap path, short enough
+        // that a saturated connection does not hold a worker for long.
+        const CHUNK: usize = 64;
+        for chunk in sessions.chunks(CHUNK) {
+            if cd.close_reason().is_some() {
+                return;
+            }
+            for &sess in chunk {
+                r2_send_sess_close(&cd, sess);
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
 /// Count one rev2 policy/gate refusal (shared `REFUSED` plus the rev2 counter).
 fn r2_refuse(counter: Option<&std::sync::atomic::AtomicU64>) {
     dgram_drops::bump(&dgram_drops::REFUSED);
@@ -1177,7 +1436,7 @@ fn r2_reject(cd: &quinn::Connection, id: u32, reason: u8) {
 /// forward registry would accept compressed uplink frames for a flow the reply
 /// side cannot classify (replies then degrade to `INLINE` at best), and it
 /// would keep a registry slot until the connection ends — the session's
-/// reverse table is the only thing `r2_remove_flow`/`r2_close_entry_bindings`
+/// reverse table is the only thing `r2_remove_flow`/the reap purge
 /// can find it through. The reverse-table insert can fail only when a
 /// concurrent install filled one of the 64 per-session slots between the
 /// `is_full` check above and this `rcu`; the registry entry is rolled back then
@@ -1190,11 +1449,30 @@ pub(crate) fn r2_install(
     target: TargetAddr,
     resolved: Vec<SocketAddr>,
 ) -> Result<Arc<FlowBinding>, RegistryError> {
-    let Some(flows) = session_r2_flows(ss, sess) else {
+    // The "session still live" check and both table publications are one
+    // critical section under the session's shard **read** lock. That is what
+    // closes the residual install-vs-close race: `SESS_CLOSE` removes the entry
+    // *and* purges its bindings under the same shard's write lock (see
+    // `r2_close_session`) and the idle sweep does the same via
+    // `sweep_all_with`, so a concurrent close either
+    // - runs before this guard is acquired: the liveness check below sees no
+    //   entry and the install aborts (nothing is forwarded into a dead
+    //   session), or
+    // - is serialized after this guard is dropped: its batched purge (or the
+    //   removed entry's own reverse-table snapshot) removes exactly the binding
+    //   published here, so no orphaned `Open` binding outlives the session.
+    // Without the guard the check and the insert were two separate critical
+    // sections; a close landing between them left an `Open` binding in the
+    // registry whose session no longer existed (its steady frames later
+    // re-created the session through the unguarded datagram path).
+    let sh = ss.shard(sess);
+    let guard = sh.read();
+    let Some(entry) = guard.get(&sess).filter(|e| !e.reader.is_finished()) else {
         // The session vanished between the forward and the install; the payload
         // was delivered, but there is nothing left to bind.
         return Err(RegistryError::Full);
     };
+    let flows = entry.r2_flows.clone();
     {
         let snap = flows.load();
         if snap.is_full() && snap.find_id(wire_id).is_none() {
@@ -1228,6 +1506,7 @@ pub(crate) fn r2_install(
         }
         return Err(RegistryError::Full);
     }
+    drop(guard);
     Ok(inserted)
 }
 
@@ -1250,34 +1529,80 @@ pub(crate) fn r2_remove_flow(
     Some(binding)
 }
 
-/// Drop every rev2 binding of a session entry (session removal paths: the 180 s
-/// sweeper, `SESS_CLOSE`, connection teardown). Returns how many were dropped.
-pub(crate) fn r2_close_entry_bindings(state: &R2ConnState, entry: &SessEntry) -> usize {
+/// Mark every rev2 binding in a reaped entry's own reverse-table snapshot
+/// `Closed` and empty the snapshot. **No registry access** (the registry purge
+/// for the same entries is batched separately, under the session-shard write
+/// lock that removed them — see [`ShardedSessTable::sweep_all_with`]).
+///
+/// Marking the snapshot is what stops a reply reader that is still draining
+/// (it is aborted right after) from matching a torn-down binding. It is also
+/// cheap: one `ArcSwap` load per entry and a relaxed store per binding, no
+/// locks.
+pub(crate) fn r2_mark_reaped_entry_closed(entry: &SessEntry) {
     let flows = entry.r2_flows.load();
-    let mut n = 0usize;
+    if flows.is_empty() {
+        return;
+    }
     for binding in flows.iter() {
-        if state.registry.remove(binding.wire_id).is_some() {
-            binding.mark_closed();
-            n += 1;
-        }
+        binding.mark_closed();
     }
     // Publish an empty reverse table too: a reply reader that still holds this
-    // session's handle (it is being aborted) must not match a torn-down binding
-    // from its snapshot.
-    if n > 0 {
-        entry.r2_flows.store(Arc::new(SessionFlows::new()));
+    // session's handle must not match a torn-down binding from its snapshot.
+    entry.r2_flows.store(Arc::new(SessionFlows::new()));
+}
+
+/// Account + mark a batch of reaped sessions: adds `purged` bindings to the
+/// `SESSION_END_BINDINGS` counter (already removed from the registry by the
+/// caller's batched purge) and marks each entry's snapshot closed.
+pub(crate) fn r2_finish_reaped_entries(entries: &[SessEntry], purged: usize) {
+    if purged > 0 {
+        r2_stats::SESSION_END_BINDINGS
+            .fetch_add(purged as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    n
+    for entry in entries {
+        r2_mark_reaped_entry_closed(entry);
+    }
 }
 
 /// `CTL SESS_CLOSE`: reap the session (socket, reader task, permit) and every
 /// binding it owns from the connection registry, immediately.
+///
+/// Cost is O(1) for an unknown session: [`FlowRegistry::remove_session`] looks
+/// the id up in its per-session index (one hash probe) and touches nothing else
+/// when the entry is absent, so the retransmission/forged-id storm the spec's
+/// 3x `SESS_CLOSE` repeat produces cannot walk the 4096-entry forward table.
+/// The by-id purge stays unconditional (even when the table held no entry)
+/// because a reply reader that exited first may have left receive-only bindings
+/// whose session is already gone from the table.
 pub(crate) fn r2_close_session(ss: &SessTable, state: &R2ConnState, sess: u32) -> bool {
-    let entry = ss.take_session(sess);
-    // Purge by session id, which is authoritative even if the table entry was
-    // already gone (a reply reader that exited first, or a retransmitted close):
-    // a receive-only binding must never outlive its association.
-    let purged = state.registry.remove_session(sess);
+    // Remove the table entry and purge the registry bindings in **one** shard
+    // write critical section: `get_or_create_sess` recreates a session id and
+    // `r2_install` installs a binding both under this shard's write/read lock,
+    // so a datagram for a *recreated* association can only make progress after
+    // the guard drops — this close therefore cannot purge a recreated session's
+    // fresh binding (the residual close-vs-install race). The purge stays
+    // authoritative even when the table entry was already gone (a reply reader
+    // that exited first, or a retransmitted close): a receive-only binding must
+    // never outlive its association, and an unknown session costs one index
+    // probe (the singular purge exits before taking the forward-table lock).
+    let purged;
+    let entry = {
+        let sh = ss.shard(sess);
+        let mut w = sh.write();
+        let entry = w.remove(&sess);
+        if entry.is_some() {
+            ss.note_live_remove(1);
+        }
+        // The singular call is the cheap path for an unknown session: it
+        // returns after one index probe without taking the forward table's
+        // write lock (the batch variant always locks the map, which is the
+        // right trade for a multi-session reap and the wrong one for a 7-byte
+        // forged close).
+        purged = state.registry.remove_session(sess);
+        drop(w);
+        entry
+    };
+    ss.note_empty_state();
     if purged > 0 {
         r2_stats::SESSION_END_BINDINGS
             .fetch_add(purged as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1299,7 +1624,12 @@ pub(crate) fn r2_close_session(ss: &SessTable, state: &R2ConnState, sess: u32) -
 }
 
 /// Handle one rev2 `CTL` DATAGRAM.
-fn r2_handle_ctl(
+///
+/// `pub(crate)` so the unit tests can drive individual opcodes (notably
+/// `FLOW_ACK`, whose only observable effect is the shared binding's
+/// confirmation flag) against a fixture state instead of through a live QUIC
+/// connection.
+pub(crate) fn r2_handle_ctl(
     ss: &SessTable,
     cd: &quinn::Connection,
     state: &Arc<R2ConnState>,
@@ -1310,6 +1640,23 @@ fn r2_handle_ctl(
         r2_refuse(None);
         return;
     };
+    // Spec §3.4 ("control frames have rate/total caps"): the three
+    // idempotent-but-costly opcodes below all touch per-session shard/stager/
+    // reassembler state. They are trivially cheap now (O(flows of the session),
+    // or O(1) for an unknown id), but a peer can still drive them at line rate
+    // — the cap bounds the per-connection CTL CPU share without ever touching
+    // any legitimate control rate (it is far above one close per association
+    // exit x3 plus one ACK per downlink rebind). Refused frames are dropped and
+    // counted like any other refusal. `HELLO`/`FLOW_ACK` are one registry/shared
+    // flag access and stay outside the budget (they are also the startup path).
+    if matches!(
+        ctl,
+        Ctl::FlowReject { .. } | Ctl::FlowClose { .. } | Ctl::SessClose { .. }
+    ) && !state.ctl.ctl_allowed(mono_millis())
+    {
+        r2_refuse(None);
+        return;
+    }
     match ctl {
         Ctl::Hello { wire_ver, .. } => {
             if wire_ver == r2::R2_WIRE_VER {
@@ -1326,10 +1673,19 @@ fn r2_handle_ctl(
                 r2_send_ctl(cd, &Ctl::Caps(caps));
             }
         }
-        // Server-owned flows are Phase 1b; a client ACK can only confirm one.
+        // The peer confirms an installed flow. Besides marking the binding
+        // open (the Phase-1b server-owned case), this is what confirms a
+        // learned downlink `reply_src`: the server sets the source when the
+        // binding frame is only *queued* to quinn, so until the peer ACKs it
+        // `SessionFlows::match_source` keeps returning `Rebind` and re-sends
+        // the idempotent `OPEN|SRC` every time (a lost DATAGRAM cannot leave
+        // the flow permanently unaddressable). The client ACKs every
+        // `OPEN|SRC` it decodes, so one ACK makes the source steady.
         Ctl::FlowAck { id, .. } => {
             if let Some(binding) = state.registry.get(id) {
                 binding.mark_open();
+                binding.mark_reply_src_acked();
+                r2_stats::bump(&r2_stats::FLOW_ACKS_RECV);
             }
         }
         Ctl::FlowReject { id, .. } => {
@@ -1364,12 +1720,16 @@ fn r2_handle_ctl(
             }
         }
         Ctl::SessClose { sess, .. } => {
-            // Cancel in-flight domain OPENs for this session *before* the
-            // session is removed: the flag must be visible to the lookup task's
-            // guarded insert, or a late DNS answer would recreate the session
-            // (and a wire binding) the close is about to reap. See
-            // `cancel_pending_opens_for_session` for the ordering proof.
+            // Cancel in-flight domain lookups for this session *before* the
+            // session is removed: the flags must be visible to the lookup
+            // tasks' guarded inserts, or a late DNS answer would recreate the
+            // session (and a wire binding) the close is about to reap. Two
+            // registries: the rev2 `DATA OPEN` coalescer (`pending_dns_opens`)
+            // and the generic datagram slow path (`dns_waiters`, which has no
+            // per-flow key and would otherwise resurrect the session after its
+            // DNS await). See the ordering proofs on both cancel methods.
             state.cancel_pending_opens_for_session(sess);
+            state.cancel_dns_waiters_for_session(sess);
             let dropped = r2_reasm.drop_session(sess);
             let _ = state.stage.lock().drop_session(sess);
             if dropped > 0 {
@@ -1574,12 +1934,22 @@ async fn r2_forward_domain_open_bg(
         return;
     }
     let dst = usable[0];
+    // Pass the DNS entry's *remaining* life, not the fresh-resolution constant:
+    // `resolve_all_cached` may have served a host-keyed cache hit (other ports
+    // share the entry) that is already close to expiry, and the session
+    // destination memo must not outlive the resolution behind it
+    // (`pin_life_ms` clamping). A miss — the memo being overwritten by another
+    // worker — falls back to the fresh bound.
+    let remaining_ms = {
+        let (_, life) = lookup_cached_fast_with_ttl(&host, port);
+        if life == 0 { DNS_CACHE_TTL_MS } else { life }
+    };
     let sock = match get_or_create_sess_guarded(
         &ss,
         &cd,
         conn_id,
         sess,
-        Some((host.as_str(), port, dst, DNS_CACHE_TTL_MS)),
+        Some((host.as_str(), port, dst, remaining_ms)),
         Some(&state),
         Some(pending.cancelled_flag()),
     )
@@ -1715,8 +2085,13 @@ async fn r2_ingress_open(
                     return;
                 }
                 PendingOpen::Full => {
-                    r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
-                    dgram_drops::bump(&dgram_drops::DNS_BUDGET);
+                    // This is a *per-connection* resource refusal (16 in-flight
+                    // OPENs), never DNS-budget exhaustion: charging it to
+                    // `DNS_BUDGET` made the 60 s report claim the process-wide
+                    // resolver budget was drained while the share cap was the
+                    // actual gate. REFUSED is the correct policy-drop class,
+                    // plus the per-connection pending-open counter.
+                    r2_refuse(Some(&r2_stats::DNS_OPEN_DROPS));
                     r2_reject(cd, id, r2::R2_REJECT_DNS);
                     return;
                 }
@@ -2200,26 +2575,37 @@ pub(crate) async fn handle_conn(
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = mono_millis();
-                        // Shard-by-shard sweep, abort after all locks drop. The
-                        // rev2 bindings of every reaped session go with it, so a
-                        // stale `wire_id` can only fail lookup afterwards.
-                        let evicted = sess.sweep_all(now);
-                        // The client's association is gone on this side: tell it
-                        // (three best-effort, idempotent `SESS_CLOSE` frames) so
-                        // it stops sending steady frames for it — those could
-                        // only fail lookup here. Sent before the reader tasks are
-                        // aborted, and on the connection clone this task owns.
-                        for entry in &evicted {
-                            r2_close_entry_bindings(&r2_sweep, entry);
-                            r2_send_sess_close(&conn, entry.sess);
-                        }
+                        // Shard-by-shard sweep, abort after all locks drop. Each
+                        // shard's rev2 bindings are purged in **one** registry
+                        // call while that shard's write lock is still held
+                        // (`sweep_all_with`): the purge-by-session is collision
+                        // safe there, and a full-connection reap costs one
+                        // registry write lock per shard instead of one per
+                        // binding.
+                        let mut purged = 0usize;
+                        let evicted = sess.sweep_all_with(now, |ids| {
+                            purged += r2_sweep.registry.remove_sessions(ids);
+                        });
+                        r2_finish_reaped_entries(&evicted, purged);
+                        // The client's associations are gone on this side: tell
+                        // it (`SESS_CLOSE`, idempotent, three best-effort frames
+                        // each) so it stops sending steady frames that could only
+                        // fail lookup here. Detached and chunked with a yield
+                        // between chunks: a full reap is thousands of sends, and
+                        // they must not block the shard runtime that also drives
+                        // every connection's QUIC.
+                        let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
+                        spawn_sess_close_notifications(conn.clone(), ids);
                         abort_evicted(evicted);
                     }
                     _ = conn.closed() => {
                         let drained = sess.drain_all();
-                        for entry in &drained {
-                            r2_close_entry_bindings(&r2_sweep, entry);
-                        }
+                        // Connection teardown: one registry purge for the whole
+                        // drain (the connection is closed, so no notification is
+                        // sent), then abort the readers.
+                        let ids: Vec<u32> = drained.iter().map(|e| e.sess).collect();
+                        let purged = r2_sweep.registry.remove_sessions(&ids);
+                        r2_finish_reaped_entries(&drained, purged);
                         abort_evicted(drained);
                         break;
                     }
@@ -2313,32 +2699,39 @@ pub(crate) async fn handle_conn(
         // syscall amplification of one `sendto` per datagram against one
         // `sendmmsg` per 32.
         //
-        // Sizing: 16 slots (~420 B each, on this task's heap future — the pin
-        // buffer dominates) covers the shape a multi-association client actually
-        // presents (DNS + a game + a handful of flows) and matches the
-        // `RECENT_DST_CAP` the reply side already uses.
+        // Sizing: 64 slots (~420 B each, on this task's heap future — the pin
+        // buffer dominates). The multi-association shape this comment documents
+        // ("hundreds of sessions") is beyond one heap array, but 64 covers the
+        // DNS + game + handful-of-flows case with headroom and, unlike the old
+        // 16, keeps a realistic number of simultaneous associations on the fast
+        // path. Admission charges the array through `R2_INGRESS_FIXED_BYTES`;
+        // the delivered figure is `FAST_SESS_SLOTS * 420 B ~= 26.25 KiB` per
+        // connection.
         //
         // **Probed, not direct-mapped.** Session ids come from the client's
         // monotonic counter and are never reused, so the live ids on a
         // long-lived connection are a *sparse* subset of the id space rather
-        // than a dense interval: a raw `s & 15` maps two live sessions to the
+        // than a dense interval: a raw `s & (N-1)` maps two live sessions to the
         // same slot at random, and an earlier revision's "N <= 16 live ids land
         // on N distinct slots" was only true for consecutive ids. After churn
-        // the chance all A live homes are distinct is `∏(16-i)/16` — ~50 % at
-        // A=5, ~12 % at A=8 — so collisions were the *common* multi-association
-        // case, and a colliding pair evicted each other on every arm and paid
-        // the whole slow path (an unbatched `udp_try_send` per datagram, a
-        // `remember_dst` shard read lock, an epoch bump) forever. With linear
-        // probing any set of ≤ 16 live sessions finds a slot; only a genuinely
-        // over-16-live table evicts the quietest, and a probe miss is never a
-        // mis-route: every slot re-validates the exact session id, the reader's
-        // liveness and the socket's liveness before it stages anything, and a
-        // miss only means "run the slow path, which re-arms".
+        // the chance all A live homes are distinct falls off as `∏(N-i)/N`; at
+        // N=16 it was already ~50 % at A=5 and ~12 % at A=8, so collisions were
+        // the *common* multi-association case, and a colliding pair evicted each
+        // other on every arm and paid the whole slow path (an unbatched
+        // `udp_try_send` per datagram, a `remember_dst` shard read lock, an
+        // epoch bump) forever. With linear probing any set of ≤ N live sessions
+        // finds a slot; only a genuinely over-N-live table evicts the quietest,
+        // and a probe miss is never a mis-route: every slot re-validates the
+        // exact session id, the reader's liveness and the socket's liveness
+        // before it stages anything, and a miss only means "run the slow path,
+        // which re-arms".
         //
         // The slot count stays a compromise rather than as large as possible:
         // every slot carries a 255-byte pin buffer for the domain-target
         // shortcut, and this table lives per *connection* (4096 admitted
-        // connections would be ~27 MiB at this size).
+        // connections would be ~105 MiB at this size — the reason the admission
+        // charge was raised alongside the slot count, see
+        // `R2_INGRESS_FIXED_BYTES` in `config::tuning`).
         let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
         // Target sends staged for the current drain burst, flushed grouped per
         // `(sock, dst)` run by `flush_staged_sends` (one `sendmmsg` per 32 on
