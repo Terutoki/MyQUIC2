@@ -1847,10 +1847,15 @@ fn admission_cap_bounds_connections_by_memory() {
         admission_cap(MAX_CONNECTIONS, Some(4096), per_conn, fixed),
         expected
     );
+    // The rev2 data-plane ceilings (stager, ingress state and the 4096-flow
+    // registry) add ~4.5 MiB per connection on top of the transport and
+    // reassembly terms. Linux also charges the doubled session socket caps, so
+    // a 4 GiB budget now admits ~74 connections instead of the pre-rev2 ~99.
+    // Keep a floor that still catches a runaway fixed term without treating the
+    // documented admission ceiling as a regression.
     assert!(
-        expected > 90,
-        "a 4 GiB budget must still admit a useful pool (got {expected}); \
-         Linux's doubled session socket caps leave ~99 at this budget"
+        expected >= 64,
+        "a 4 GiB budget must still admit a useful pool (got {expected})"
     );
     // Charging the fixed term is the whole point: without it the same budget
     // would admit `budget / per_conn` connections and pin that much *plus* the
