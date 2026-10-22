@@ -3699,14 +3699,25 @@ mod tests {
     #[test]
     fn per_connection_memory_tracks_the_windows() {
         let d = per_connection_memory_bytes(&TransportTuning::default());
+        let stager = crate::udp::r2_stage::R2_STAGE_MAX_BYTES as u64
+            + (crate::udp::r2_stage::R2_STAGE_MAX_ITEMS
+                * std::mem::size_of::<crate::udp::r2_stage::R2StageItem>()
+                * crate::config::tuning::R2_STAGER_SLOT_FACTOR) as u64;
+        let registry = crate::mqp::r2_flow::R2_MAX_FLOWS_PER_CONN as u64
+            * (std::mem::size_of::<crate::mqp::r2_flow::FlowBinding>() as u64
+                + crate::config::tuning::R2_FLOW_HEAP_SLACK_BYTES);
         // 8 MB receive + 4 MB send + 2 x 1 MB DATAGRAM buffers + both
-        // per-connection reassembly budgets (legacy MQP-2 + rev2).
+        // per-connection reassembly budgets (legacy MQP-2 + rev2) + the rev2
+        // stager, ingress state, and flow registry.
         assert_eq!(
             d,
             8 * 1024 * 1024
                 + 4 * 1024 * 1024
                 + 2 * DATAGRAM_BUFFER as u64
                 + 2 * FRAG_MAX_HELD_BYTES as u64
+                + stager
+                + crate::config::tuning::R2_INGRESS_FIXED_BYTES
+                + registry
         );
         let wide = TransportTuning {
             receive_window: 16 * 1024 * 1024,
@@ -3722,13 +3733,14 @@ mod tests {
         };
         assert_eq!(per_connection_memory_bytes(&narrow_streams), d);
         // A full house of the shipped defaults: 4096 x (transport 14 MB +
-        // two reassembly budgets of 256 KiB). The UDP session pool is a
-        // *separate*, global term (`session_pool_memory_bytes`), charged once
-        // by the admission bound rather than per connection.
+        // two reassembly budgets of 256 KiB + the rev2 data-plane ceilings).
+        // The UDP session pool is a *separate*, global term
+        // (`session_pool_memory_bytes`), charged once by the admission bound
+        // rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            59392,
-            "4096 x 14.5 MB is the 58 GiB worst case for the default windows"
+            78080,
+            "4096 x 19.0625 MiB is the 76.25 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested

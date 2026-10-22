@@ -1,7 +1,9 @@
 //! Server unit tests (moved verbatim from the single-file bin).
 use super::*;
 use myquic2::mqp::r2;
-use myquic2::mqp::r2_flow::{FlowBinding, FlowState, SessionFlows, SourceMatch};
+use myquic2::mqp::r2_flow::{
+    FlowBinding, FlowState, R2_MAX_RESOLVED_ADDRS, SessionFlows, SourceMatch,
+};
 use myquic2::udp::{R2Fragmenter, R2Reassembler, R2StageItem, R2StageKind, R2Stager};
 
 /// Serializes the tests that mutate the process-global session-holder
@@ -1771,10 +1773,21 @@ fn fair_shard_trigger_fires_below_the_static_shard_cap() {
 #[test]
 fn admission_cap_bounds_connections_by_memory() {
     let per_conn = per_connection_memory_bytes(&TransportTuning::default());
+    let stager = myquic2::udp::r2_stage::R2_STAGE_MAX_BYTES as u64
+        + (myquic2::udp::r2_stage::R2_STAGE_MAX_ITEMS
+            * std::mem::size_of::<myquic2::udp::r2_stage::R2StageItem>()
+            * myquic2::config::tuning::R2_STAGER_SLOT_FACTOR) as u64;
+    let registry = myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_CONN as u64
+        * (std::mem::size_of::<myquic2::mqp::r2_flow::FlowBinding>() as u64
+            + myquic2::config::tuning::R2_FLOW_HEAP_SLACK_BYTES);
     assert_eq!(
         per_conn,
-        14 * 1024 * 1024 + 2 * FRAG_MAX_HELD_BYTES as u64,
-        "4/8/4 MB windows + 2 x 1 MB packets + both per-connection reassembly budgets"
+        14 * 1024 * 1024
+            + 2 * FRAG_MAX_HELD_BYTES as u64
+            + stager
+            + myquic2::config::tuning::R2_INGRESS_FIXED_BYTES
+            + registry,
+        "4/8/4 MB windows + 2 x 1 MB packets + both reassembly budgets + rev2 stager/ingress/flow registry"
     );
     let per_session = per_session_memory_bytes();
     // Linux stores and reports SO_RCVBUF/SO_SNDBUF at 2x the requested value,
@@ -3292,6 +3305,78 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
          exhaustion to `session_full` reported a slow upstream as a full host"
     );
     assert_eq!(d.refused, 0, "budget loss is not policy refusal");
+}
+
+/// The per-connection domain-OPEN coalescer: one in-flight lookup per
+/// `(session, id)`, a hard cap of `MAX_PENDING_DNS_OPENS`, and RAII release on
+/// every task exit path (ACK, reject, timeout, cancellation).
+#[test]
+fn pending_domain_opens_coalesce_cap_and_release() {
+    let state = R2ConnState::new();
+    let first = match state.begin_pending_open(7, 9) {
+        PendingOpen::Started(g) => g,
+        _ => panic!("the first OPEN must start a lookup"),
+    };
+    assert!(
+        matches!(state.begin_pending_open(7, 9), PendingOpen::Duplicate),
+        "a retransmitted OPEN coalesces onto the in-flight lookup"
+    );
+    // A different session (or a different id) is a different flow.
+    assert!(matches!(
+        state.begin_pending_open(8, 9),
+        PendingOpen::Started(_)
+    ));
+    assert!(matches!(
+        state.begin_pending_open(7, 10),
+        PendingOpen::Started(_)
+    ));
+    drop(first);
+    assert!(
+        matches!(state.begin_pending_open(7, 9), PendingOpen::Started(_)),
+        "dropping the guard must release the coalescing key"
+    );
+
+    // Fill the per-connection cap with held guards.
+    let mut held = Vec::new();
+    for id in 100..(100 + MAX_PENDING_DNS_OPENS as u32) {
+        match state.begin_pending_open(1, id) {
+            PendingOpen::Started(g) => held.push(g),
+            _ => panic!("the cap must admit exactly MAX_PENDING_DNS_OPENS"),
+        }
+    }
+    assert!(
+        matches!(state.begin_pending_open(1, 9999), PendingOpen::Full),
+        "past the cap the OPEN is refused instead of spawning another task"
+    );
+    drop(held);
+    assert!(
+        matches!(state.begin_pending_open(1, 9999), PendingOpen::Started(_)),
+        "releasing the in-flight guards must make room again"
+    );
+}
+
+/// The domain-flow address set is SSRF-filtered first and then capped: a
+/// peer-controlled name cannot pin an unbounded resolved set (or make every
+/// reply scan thousands of addresses).
+#[test]
+fn resolved_set_is_ssrf_filtered_before_it_is_capped() {
+    let private = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 443));
+    let first_public = SocketAddr::from((Ipv4Addr::new(93, 184, 216, 1), 443));
+    let mut addrs = vec![private];
+    for i in 0..(R2_MAX_RESOLVED_ADDRS + 8) {
+        addrs.push(SocketAddr::from((
+            Ipv4Addr::new(93, 184, 216, 1 + i as u8),
+            443,
+        )));
+    }
+    let kept = policy_resolved(&addrs, false);
+    assert_eq!(kept.len(), R2_MAX_RESOLVED_ADDRS);
+    assert!(kept.iter().all(|a| a.ip() != private.ip()));
+    assert_eq!(kept[0], first_public);
+    // `allow_private` keeps the first (private) record but still caps.
+    let kept = policy_resolved(&addrs, true);
+    assert_eq!(kept.len(), R2_MAX_RESOLVED_ADDRS);
+    assert_eq!(kept[0], private);
 }
 
 /// A domain target whose answer is only in the **session destination memo**
@@ -5305,6 +5390,22 @@ async fn rev2_train_delivers_known_flows_and_drops_unknown_items() {
         got.push(buf[..n].to_vec());
     }
     assert_eq!(got, vec![b"via-a".to_vec(), b"via-b".to_vec()]);
+
+    // Repeated flow indices in one dict train (multiple payloads of the same
+    // flow) must resolve to one registry slot and dispatch every item: the
+    // client stager legitimately batches a flow this way.
+    let train = r2::encode_train_dict(&[a], &[(0, &b"dup-1"[..]), (0, &b"dup-2"[..])], 1472)
+        .expect("repeated-index dict train must encode");
+    client.send_datagram(train).unwrap();
+    let mut dup = Vec::new();
+    for _ in 0..2 {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+            .await
+            .expect("both duplicate-id items must be forwarded")
+            .unwrap();
+        dup.push(buf[..n].to_vec());
+    }
+    assert_eq!(dup, vec![b"dup-1".to_vec(), b"dup-2".to_vec()]);
 
     rev2_teardown(client, task, holders_before).await;
 }

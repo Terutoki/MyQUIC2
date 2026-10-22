@@ -6,7 +6,7 @@
 </picture>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.1-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-424_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-436_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -16,7 +16,7 @@
 
 **SOCKS5 in · QUIC / TLS 1.3 out · MQP-3 rev2 in between**
 
-[Architecture](#-architecture) · [Wire](#-mqp-3-rev2-wire) · [Full duplex](#-full-duplex) · [Stager](#-cross-session-stager) · [Performance](#-performance) · [Security](#-security) · [Mermaid atlas](#-mermaid-atlas) · [Install](#-install) · [Quick start](#-quick-start) · [Verify](#-verification)
+[Architecture](#-architecture) · [Wire](#-mqp-3-rev2-wire) · [Protocol in depth](#-mqp-3-rev2-protocol-in-depth) · [Full duplex](#-full-duplex) · [Stager](#-cross-session-stager) · [Performance](#-performance) · [Security](#-security) · [Mermaid atlas](#-mermaid-atlas) · [Install](#-install) · [Quick start](#-quick-start) · [Verify](#-verification)
 
 </div>
 
@@ -29,12 +29,29 @@
 
 ## ✨ What it is
 
-A SOCKS5 proxy made of **two binaries, one wire, and very little ceremony**.
+MyQUIC2 is a **SOCKS5 proxy built for the shape of modern UDP traffic**: DNS, QUIC handshakes, game state, VoIP, telemetry, small RPCs and multiplexed application fan-out. It accepts ordinary SOCKS5 `CONNECT` and `UDP ASSOCIATE` requests, carries both over one QUIC / TLS 1.3 tunnel, and uses **MQP-3 wire rev2** to keep the UDP data plane small, stateless in the right places, and bounded in memory.
+
+The client is a pool of independent QUIC endpoints. The server is admission-first: it checks the token and the memory budget before it allocates per-connection state, then resolves, authorizes and forwards each datagram. There are exactly two binaries and one wire revision. No mixed-version negotiation, no hidden control stream, no payload compression, and no attempt to turn UDP into a reliable stream.
+
+### Why MyQUIC2
+
+| Property | What it means in practice |
+|---|---|
+| **Small-packet first** | A steady UDP frame is 2 B with a one-byte flow id, a `FRAG` header is 8 B, and several payloads can share one DATAGRAM. The gains land on DNS, gaming, VoIP and RPC traffic, not on bulk streams that are already header-insignificant. |
+| **UDP-native** | UDP stays unreliable and unordered. There is no retransmission layer, no head-of-line blocking and no per-payload ACK. A lost fragment drops that payload; a lost `TRAIN` drops the payloads it carried. |
+| **Full-duplex by construction** | Both endpoints allocate flow ids from disjoint halves of the id space. Client-owned, server-owned, domain, port-rebound and full-cone flows all use the same tables and the same frame set. |
+| **Cross-session aggregation** | One connection-level stager packs small payloads from every association into same-flow or dictionary `TRAIN` frames, with per-session FIFO order and a round-robin cursor. |
+| **Bounded memory** | Every peer-fillable structure has a hard bound: stager, reassembly, flow registry, DNS in-flight set, pre-HELLO buffer and the per-connection admission charge. |
+| **Zero-copy TCP** | TCP rides a QUIC stream. The SOCKS5 success reply is optimistic, and the relay uses borrowed QUIC halves and vectored writes. |
+| **One revision, fail-fast** | `wire_ver=2` lives in `CTL HELLO/CAPS`. A peer that does not answer CAPS is closed after 2 s; there is no silent downgrade to MQP-2 or the v0.2.0 wire. |
+| **Observable by default** | Frame kinds, `TRAIN` items, inline fallbacks, flow open/ack/reject/close, compression ratio, drop reasons and transport stats are counted and periodically reported. |
+
+### At a glance
 
 - **TCP is a QUIC stream.** The SOCKS5 success reply is optimistic; payload bytes are pumped with zero-copy buffers and borrowed QUIC halves.
-- **UDP is an MQP-3 rev2 DATAGRAM plane.** Connection-scoped flow ids, 2 B steady headers, full-duplex flows, cross-association TRAIN packing, compact 8 KiB FRAG.
+- **UDP is an MQP-3 rev2 DATAGRAM plane.** Connection-scoped flow ids, 2 B steady headers, full-duplex flows, cross-association `TRAIN` packing, compact 8 KiB `FRAG`.
 - **One client, one server, one config each.** No mixed-version negotiation, no payload compression, no hidden control stream.
-- **UDP stays unreliable.** A lost fragment drops that payload; a lost TRAIN drops the payloads it carried. Bounded reassembly and stager queues cap the fate sharing.
+- **UDP stays unreliable.** A lost fragment drops that payload; a lost `TRAIN` drops the payloads it carried. Bounded reassembly and stager queues cap the fate sharing.
 
 ## 🧭 Architecture
 
@@ -45,7 +62,19 @@ A SOCKS5 proxy made of **two binaries, one wire, and very little ceremony**.
 </picture>
 </p>
 
-- **Pool-first client.** Every pool slot owns a QUIC endpoint, a UDP socket and a pinned runtime. TCP and UDP egress are isolated; the thread-local egress memo is lock-free.
+MyQUIC2 is split along the only boundary that matters for latency: **per-connection state lives with the connection, and the data plane never shares a receive path**. On the client, every pool slot owns its own QUIC endpoint, UDP socket and pinned runtime; TCP and UDP egress can be isolated by class, and the thread-local egress memo turns a steady flow into a handful of atomic loads. On the server, `SO_REUSEPORT` endpoints accept in parallel, the token gate and memory admission run before per-connection allocation, and each UDP association gets one 64 KiB session socket and one reader task.
+
+| Layer | Responsibility | Key design choice |
+|---|---|---|
+| **Client pool** | 4 TCP + 3 UDP slots by default; interactive and bulk sharding | One endpoint, socket and runtime per slot; selection-time path health; reconnect watchdog below the QUIC idle timeout |
+| **Associations** | SOCKS5 `CONNECT` and `UDP ASSOCIATE`; app address pinning | The first valid UDP packet locks the app address; one association maps to one `session` |
+| **Shared codec** | MQP-3 rev2 frames, flow tables, fragmentation, stager, reassembly | One implementation used by both binaries and by the tests |
+| **Transport** | QUIC / TLS 1.3, BBR + ECN, PMTU, GSO/GRO | No custom congestion control and no custom crypto; QUIC does the hard part |
+| **Server ingress** | `SO_REUSEPORT` endpoints, token gate, connection and memory admission | Admission before per-connection allocation; one endpoint per core, at most 8 |
+| **Forwarding** | DNS, SSRF policy, TCP happy-eyeballs, UDP `sendmmsg` / `recvmmsg` | Resolve and authorize at the exit, never at the client |
+| **Observability** | Counters, periodic reporter, drop warnings | Every frame kind and every drop reason is observable without a packet capture |
+
+- **Pool-first client.** Every pool slot owns a QUIC endpoint, a UDP socket and a pinned runtime. TCP and UDP egress are isolated; the thread-local egress memo is lock-free, and the UDP hub caps the process at 4032 associations.
 - **One wire, two transports.** TCP rides a QUIC stream; UDP rides MQP-3 rev2 DATAGRAMs. Shared pieces: TLS 1.3, BBR, PMTU discovery, GSO/GRO.
 - **Admission-first server.** `SO_REUSEPORT` ingress endpoints, token auth, memory/connection admission, one 64 KiB session socket per association.
 
@@ -58,13 +87,408 @@ A SOCKS5 proxy made of **two binaries, one wire, and very little ceremony**.
 </picture>
 </p>
 
+MQP-3 rev2 is a compact framing layer inside QUIC DATAGRAMs. It is deliberately **not** a reliable transport: QUIC supplies confidentiality, congestion control, loss detection and PMTU; MQP-3 supplies flow identity, first-frame addressing, aggregation and fragmentation. The revision is negotiated once, in `CTL HELLO/CAPS wire_ver = 2`; the protocol name stays MQP-3.
+
+| Frame | First byte | Job | Steady header |
+|---|---|---|---|
+| `DATA` | `0x00` / `0x01` | one payload for a known flow, or the first `OPEN` / `INLINE` frame | **2 B** for `wire_id < 128` |
+| `TRAIN` | `0x04` | several payloads in one DATAGRAM, same-flow or dictionary form | 3–4 B + ids; 1 B per item length |
+| `FRAG` | `0x08` / `0x09` | one payload split across up to 64 fragments | **8 B** |
+| `CTL` | `0x0C` | HELLO/CAPS and idempotent flow/session control | 2 B + opcode body |
+
 - **`DATA` — 2 B steady.** A connection-scoped monotonic `wire_id` and the payload. No session, no address, no length.
 - **`DATA OPEN / INLINE` — the first frame.** Self-describing `(session, address)`; OPEN repeats until ACKed. INLINE is the table-full fail-safe.
 - **`TRAIN` — one frame, many payloads.** Same-flow: 3 B header + 1 B/item. Dict form mixes flows and associations in one DATAGRAM.
 - **`FRAG` — 8 B steady.** Payloads up to 8 KiB; `(wire_id, frag_id)` reassembly; context only on the first fragment.
 - **First-byte safety.** All rev2 frames start with `0x0X`, disjoint from MQP-2 and the v0.2.0 wire; old parsers drop them safely. A non-rev2 peer fails fast at HELLO/CAPS.
 
-**Implementation contract:** [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md)
+| First byte | Decoder |
+|---|---|
+| `0x00`, `0x01`, `0x04`, `0x08`, `0x09`, `0x0C` | MQP-3 rev2 |
+| `0x02`, `0x05`, `0x06` | MQP-2 legacy — receive/tests only |
+| `0x1X` … `0x4X` | v0.2.0 v3 legacy — receive/tests only |
+| anything else | drop and count |
+
+**Implementation contract:** [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md) · **Deep dive:** [MQP-3 rev2 protocol in depth](#-mqp-3-rev2-protocol-in-depth)
+
+## 🧬 MQP-3 rev2 protocol in depth
+
+MQP-3 rev2 is the application framing layer that MyQUIC2 runs inside QUIC DATAGRAMs. QUIC already provides the hard transport guarantees: TLS 1.3 confidentiality and integrity, authenticated peers, congestion control, loss detection, PMTU discovery and connection migration. MQP-3 does not duplicate them. It adds the narrow set of things a multiplexed UDP relay needs: a connection-scoped flow id, a compact way to name a session and a target on the first frame, aggregation of several payloads into one DATAGRAM, fragmentation for payloads larger than one DATAGRAM, and an idempotent control plane.
+
+The design center is **small packets, not bulk throughput**. MQP headers are below 1–3% of a bulk stream, so shaving them further would not move a bulk benchmark. The traffic that benefits is the long tail: DNS, QUIC handshakes, game state, VoIP, telemetry, small RPCs and mixed-association fan-out. Rev2 therefore optimizes three things: header bytes per steady datagram, DATAGRAM send calls per payload burst, and the amount of peer-fillable state one connection can pin. It deliberately does **not** add payload compression, retransmission, or a reliable mode on top of QUIC.
+
+### 1. Goals and non-goals
+
+| Goal | Mechanism | Why it matters |
+|---|---|---|
+| Minimum steady overhead | `wire_id` + payload in `DATA`; no session, address or length | 2 B instead of 5–6 B; the saving repeats on every packet |
+| First-frame self-description | `DATA OPEN` / `INLINE` carries `(session, address)` once | A flow can start without a separate handshake |
+| Full duplex | Disjoint id halves; both ends can open, ack and close | A server-owned or full-cone flow needs no second protocol |
+| Aggregation | `TRAIN` same/dict + connection-level stager | Several associations share one DATAGRAM and one send call |
+| Large payloads | `FRAG` with an 8 B steady header and an 8 KiB cap | UDP payloads above one DATAGRAM stay on the same wire |
+| Bounded fate sharing | Fixed stager, reassembly, registry and DNS limits | One lost packet or hostile peer cannot pin unbounded memory |
+| Idempotent control | HELLO/CAPS/ACK/REJECT/CLOSE may be lost and repeated | Correctness never depends on a control datagram arriving |
+| Safe coexistence | `0x0X` first-byte space and `wire_ver=2` | Old parsers drop rev2 frames instead of misrouting them |
+
+**Non-goals.** Bulk-stream header optimization, payload compression, reliable UDP, retransmission, fragment trains, a u16 fragment id, and mixed-version deployment. The protocol name remains MQP-3; there is no MQP-4. The revision is a wire fact, not a product name.
+
+### 2. Revision negotiation and first-byte safety
+
+Every rev2 frame starts with a byte whose high nibble is zero (`0x0X`) and avoids the legacy `0x02`, `0x05` and `0x06` opcodes. Old MQP-2 and v0.2.0 v3 decoders treat that space as unknown and drop it, so a rev2 frame can never be misrouted by an old parser. In the other direction, rev2 decoders reject the old first-byte ranges. This is deliberately a **fail-fast** design, not a compatibility layer.
+
+```text
+first byte = 0b0000_0000 | kind
+  0x00 DATA steady        0x01 DATA extended
+  0x04 TRAIN              0x08 FRAG steady
+  0x09 FRAG extended      0x0C CTL
+```
+
+The client sends `CTL HELLO(wire_ver=2)` as soon as the QUIC connection is published and retries until `CAPS` arrives or two seconds pass. The server answers each HELLO with `CAPS` (throttled to one per 100 ms). A missing CAPS closes and redials; there is no silent downgrade. `CAPS` carries the negotiated `max_conn_flows`, `max_flows_sess`, `max_train_items`, `max_frame_bytes` and `max_reassembly` values.
+
+**The first UDP packet does not wait for CAPS.** A published connection can carry UDP immediately. The server buffers up to **8 pre-HELLO rev2 data frames / 16 KiB**, releases them in arrival order after a valid `HELLO(wire_ver=2)`, and counts overflow. A wrong-version HELLO gets a CAPS with the server's own version, but does not open the gate or release the buffer. CAPS is a capability update, not a first-packet admission gate.
+
+### 3. Flow identity, ownership and tables
+
+```text
+wire_id: u32 = (local_id << 1) | owner
+  owner = 0  client-allocated
+  owner = 1  server-allocated
+  local_id starts at 1, increases monotonically, and is never reused while
+  the connection lives.
+  wire_id = 0 is reserved (invalid data frame; use INLINE).
+  local_id <= 0x7FFF_FFFF; exhaustion falls back to INLINE.
+```
+
+`wire_id` is a LEB128 varint. A common active id (local id below 64) encodes in one byte, which is what makes the 2 B steady header possible. Never reusing an id removes the need for tombstones or a reuse window: a late frame either finds the live binding or finds no binding and is dropped. It can never be delivered to a new flow that happens to reuse the number.
+
+The `session` field appears only in the `OPEN` / `INLINE` extension of `DATA` or `FRAG` and in the control plane (`CTL SESS_CLOSE`). A steady frame carries only `wire_id`; the receiver resolves it through a per-connection table.
+
+| Table | Scope | Key | Value | Purpose |
+|---|---|---|---|---|
+| `FlowRegistry` | one per QUIC connection, both ends | `wire_id` | `Arc<FlowBinding>` | resolve an incoming id; read-mostly, insert only on open |
+| `SessionFlows` | one per session | client: `TargetAddr`; server: reply `SocketAddr` | `wire_id` + binding | find the id for an outgoing target; find the flow for an incoming source |
+| `FlowBinding` | shared by both tables | — | state + metadata | `wire_id`, `session`, `target`, `state` (`Opening`/`Open`/`Closed`), `reply_src`, `resolved` |
+
+`FlowBinding` keeps the hot state in atomics and `ArcSwap` fields: the data path clones one `Arc`, reads the state and does not take a table lock per packet. The registry is a `parking_lot::RwLock<HashMap<...>>` with a fast hasher because inserts are cold; reads dominate and are short.
+
+Defaults are **4096 live flows per connection** and **64 flows per session**. Both are negotiable through CAPS; the per-connection registry is charged to admission, and the per-session cap bounds one session's share. A sender that cannot allocate a flow falls back to `INLINE`; a receiver that cannot install one answers `FLOW_REJECT` with reason `table_full`. The id space is split by ownership so both endpoints can allocate concurrently without a global allocator.
+
+### 4. Frame catalog
+
+Common rules:
+
+- One MQP frame per QUIC DATAGRAM body; the payload is the rest of the body.
+- All integers are LEB128 `u32` varints unless a fixed width is shown.
+- The decoder validates lengths and ranges **before** allocating or slicing. A truncated frame, unknown flag or unknown opcode drops only the current frame and increments a counter; it never panics or closes the connection.
+- Payload bytes are never compressed, transformed or interpreted. Encrypted and random UDP looks exactly like plaintext to MQP.
+
+#### 4.1 `DATA` — `0x00` steady, `0x01` extended
+
+```text
+steady:   0x00 | wire_id:varint | payload
+extended: 0x01 | flags:u8 |
+          [wire_id:varint if !INLINE] |
+          [sess:u32 if OPEN or INLINE] |
+          [addr if OPEN or INLINE] |
+          payload
+
+flags: OPEN=0x01  INLINE=0x02  SRC=0x04
+       OPEN and INLINE are mutually exclusive; every other bit must be zero.
+```
+
+- **OPEN** binds `wire_id` to `(session, address)` and carries the first payload. The address is the destination for a client-initiated flow, the observed reply source for a server-owned flow, or the new source on a rebind.
+- **INLINE** has no `wire_id`. `session` and `address` make it self-describing. It is the fail-safe for a full table, an exhausted id space, a one-shot target, or a diagnostic payload that should not create state.
+- **SRC** marks the address as the actual source rather than the target. `OPEN|SRC` is the rebind frame in both directions.
+- `OPEN` is idempotent: the same id with the same `(session, target)` returns the existing binding and re-ACKs. A conflicting target for the same id is rejected.
+
+| Form | IPv4 header | IPv6 header | Domain header |
+|---|---:|---:|---:|
+| steady, `wire_id < 128` | **2 B** | 2 B | 2 B |
+| steady, `wire_id < 16384` | 3 B | 3 B | 3 B |
+| `OPEN` | 14 B | 26 B | 11 + L B |
+| `INLINE` | 13 B | 25 B | 10 + L B |
+
+`L` is the domain-name length. The first frame costs about the same as the old inline frame; the steady state saves 3–4 B on every subsequent datagram. That trade is the whole point: pay once per flow, save on every packet.
+
+#### 4.2 `TRAIN` — `0x04`
+
+```text
+0x04 | form:u8 | count:u8 | ...
+
+form 0 (same):  wire_id:varint | count × (len:varint | payload)
+form 1 (dict):  nfl:u8 | nfl × wire_id:varint |
+                count × (idx:u8 | len:varint | payload)
+```
+
+- `count <= 64` (`CAPS.max_train_items` may lower it); `nfl <= min(count, 64)`; dictionary flow ids are distinct; every item index is below `nfl`.
+- Same-flow form is `3 B + one id varint`; each item adds a one-byte length for payloads up to 127 B. Dict form adds one byte per item index.
+- Only confirmed (`Open`) flows may appear. A new flow's first payload is always a standalone `DATA OPEN`; `TRAIN` never carries per-item inline context.
+- An item whose id is not installed is dropped and counted; the remaining items in the frame are still delivered.
+- A dictionary train may carry items for several sessions because each id resolves to its own binding. This is what lets one DATAGRAM serve several associations.
+
+#### 4.3 `FRAG` — `0x08` steady, `0x09` extended
+
+```text
+steady:   0x08 | wire_id:varint | frag_id:u32le | idx:u8 | total:u8 | chunk
+extended: 0x09 | flags:u8 | [wire_id if !INLINE] | frag_id:u32le |
+          idx:u8 | total:u8 | [sess if OPEN or INLINE] |
+          [addr if OPEN or INLINE] | chunk
+```
+
+- `1 <= total <= 64`, `idx < total`, and `chunk` is non-empty.
+- The steady header is **8 B** for a one-byte id: kind, id varint, 4 B `frag_id`, 1 B index, 1 B total. The legacy MQP-2 header was 18 B for IPv4 (up to 30 B for IPv6); the v3 prefix was 11 B plus the address.
+- The reassembly key is `(wire_id, frag_id)`, or `(session, frag_id)` for the `INLINE` form. `frag_id` remains 32-bit to keep the reuse guard and late-arrival behavior of the previous wire.
+- The first fragment may carry `OPEN` context so a flow can be reassembled before the binding is installed; later fragments are steady. The `INLINE` form has no flow id, so every fragment carries `sess` and the address.
+- The payload cap is 8 KiB, the partial timeout is 2 s, and there are at most 256 partials / 256 KiB per connection. Those bounds are protocol invariants, not implementation accidents.
+
+#### 4.4 `CTL` — `0x0C`
+
+```text
+0x0C | opcode:u8 | body
+
+0x01 HELLO:       "M3" | wire_ver:u16 (=2) | flags:u16
+0x02 CAPS:        "M3" | wire_ver:u16 | flags:u16 | max_conn_flows:u16 |
+                  max_flows_sess:u16 | max_train_items:u8 |
+                  max_frame_bytes:u16 | max_reassembly:u16
+0x10 FLOW_ACK:    wire_id:varint | status:u8 (0 = open/confirmed)
+0x11 FLOW_REJECT: wire_id:varint | reason:u8
+                  (1 = policy, 2 = table full, 3 = DNS)
+0x12 FLOW_CLOSE:  wire_id:varint
+0x20 SESS_CLOSE:  sess:u32 | reason:u8
+```
+
+Control frames ride DATAGRAMs, are idempotent, and may be lost. Their only jobs are to confirm a binding, refuse one, or reclaim state. Losing one delays compression or reclamation; it never corrupts or blackholes user payload. A HELLO/CAPS exchange is the only version gate; an ACK is not a delivery ACK.
+
+### 5. Flow lifecycle and idempotency
+
+```text
+INLINE ── DATA OPEN ──▶ OPENING ── FLOW_ACK / compressed downlink ──▶ OPEN
+                           │
+                           └── FLOW_REJECT ──▶ INLINE (retry after TTL)
+
+OPEN ── FLOW_CLOSE / SESS_CLOSE / connection close / idle sweep ──▶ CLOSED
+```
+
+- **Client-initiated flow.** The first payload is `DATA OPEN(id, sess, target, payload)`. The server validates the SSRF/policy decision, resolves the target if needed, creates or reuses the session, forwards the payload, installs the binding, and replies `FLOW_ACK`. Until the ACK arrives the client keeps sending `OPEN` for that flow; duplicate OPENs are safe.
+- **Server-initiated flow.** With `udp_full_cone = true`, an unsolicited source can create an `owner=1` id. The server sends `DATA OPEN|SRC(id, sess, source, payload)`; the client installs the binding and delivers the payload. The app's reply on the same id is a steady frame, so the return path is compressed too.
+- **Rebind.** A domain flow, an anycast reply, or a source-port change is handled by `OPEN|SRC` on the existing id. The client updates `reply_src` and the SOCKS5 reply header; the application sees no API change.
+- **Reject.** `policy`, `table_full` and `dns` are distinct reasons. The client falls back to `INLINE` for that target and may retry after a TTL; the payload is still delivered without a binding.
+- **Close.** `SESS_CLOSE` is sent three times on association exit (idempotent, best-effort). `FLOW_CLOSE` retires one binding. The server's 180 s idle sweep is the backstop. Close purges the registry, the session's stager items and the in-flight reassembly partials; a late frame then finds no live binding.
+- **ACK is an optimization.** It unlocks the 2 B steady path. It is not a reliability mechanism, and payload delivery is never acknowledged.
+
+### 6. Uplink: client to server
+
+The uplink path starts at a SOCKS5 `UDP ASSOCIATE`. The association allocates a `session` (the client hub caps the process at **4032** associations), returns the relay address, and locks the app's source IP and port on the first valid UDP packet. From then on, every payload follows the same decision tree:
+
+1. **Find or create a binding.** `SessionFlows` maps the target to a `wire_id`. If there is no id — because the table is full, the id space is exhausted, or the target is one-shot — the payload uses `INLINE`.
+2. **Choose the frame.** A confirmed flow that fits the live DATAGRAM budget uses steady `DATA`. Several small payloads use the stager and `TRAIN`. A payload above one frame uses `FRAG`. An opening flow uses `DATA OPEN`.
+3. **Stage or send.** Small payloads (at most 512 B) enter the connection-level stager. The stager drains at the end of a burst, before a large payload, when an association exits, and when the queue is full.
+4. **Forward at the exit.** The server dispatches on the first byte, resolves the target, applies the SSRF policy, creates or reuses a 64 KiB session socket, and sends with `sendmmsg` bursts of up to 32. The session is subject to the global 8192-session pool and the per-connection fair share.
+5. **Confirm.** After a successful install, the server sends `FLOW_ACK`. The client moves the binding from `Opening` to `Open` and starts compressing subsequent payloads.
+
+The stager is covered in detail in §9. The important property here is that the sender never holds a lock across a QUIC send: packing moves item ownership under a short lock, the send happens outside it, and a failed send requeues only the unsent tail. A blocked send buffer is detected with `datagram_send_buffer_space()` before any encoding, so a full buffer costs a cheap check rather than a full-queue re-encode.
+
+### 7. Downlink: server to client, domain targets and rebinding
+
+The server's reply path starts at a session socket and a `recvmmsg` burst. `SessionFlows::match_source` classifies the reply source in **one pass** over the session's bindings:
+
+| Match | Result | Wire |
+|---|---|---|
+| `reply_src == source` (learned) | strongest match | steady `DATA` / `TRAIN` |
+| exact IP target | exact flow | steady `DATA` / `TRAIN` |
+| same IP, different port; or domain whose resolved set contains the source IP | rebind candidate | `DATA OPEN\|SRC` once, then steady |
+| no match | full-cone (opt-in) or drop | server-owned `OPEN\|SRC`, or nothing |
+
+A domain target is resolved **off the datagram loop**. The lookup walks thread memo → shared moka cache → hickory; a miss is bounded by a 5 s timeout and a global slow-path limiter. The result is filtered through the SSRF policy and capped at **16 resolved addresses per flow**; the first accepted address receives the OPEN. The binding stores the set so a reply from any retained address can be compressed. A reply from an address outside the cap is treated like any other unmatched source: inline under full-cone, refused by the restricted filter.
+
+The first reply from a new source is `DATA OPEN|SRC(id, sess, actual_source, payload)`. The client installs `reply_src`, writes the actual source into the SOCKS5 reply header, and delivers the payload. The server installs the reverse `(session, source) → id` mapping. Every later reply from that source is a 2 B steady frame. Downlink compression is driven by the client's local binding (`reply_src`); it does not wait for an uplink ACK.
+
+With `udp_full_cone = true`, an unmatched source can create a **server-owned** flow using the `owner=1` half of the id space. The flow is counted as unsolicited and is only created under that explicit opt-in. Without it, an unmatched source is dropped and counted. The default remains restricted.
+
+On the client, the dispatcher resolves `wire_id → binding → session`, reassembles `FRAG` when needed, and hands the payload to the association, which sends it to the locked app address with `sendmmsg`. `TRAIN` items are dispatched individually; a missing or closed id drops only that item.
+
+### 8. Fragmentation and reassembly
+
+`FRAG` exists because a UDP payload can be larger than one QUIC DATAGRAM, and because a single lost DATAGRAM should not destroy an arbitrarily large object. The cap is **8 KiB** and **64 fragments**. The first fragment may carry `OPEN` context; the rest carry only `wire_id` and `(frag_id, idx, total)`. The `INLINE` form has no flow id, so it repeats `sess` and the address on every fragment.
+
+Reassembly is keyed by `(wire_id, frag_id)`, or `(session, frag_id)` for `INLINE`. The reassembler:
+
+- validates `total`, `idx`, non-empty chunks and the first-fragment context before allocating;
+- holds at most **256 partials** and **256 KiB** per connection;
+- expires a partial after **2 s**;
+- drops a payload if any fragment is missing — there is no retransmission;
+- purges a session's or flow's partials on `SESS_CLOSE` / `FLOW_CLOSE`;
+- accounts for the order deque's resident slots in `held_bytes()`, so the sweep still runs after every partial has completed and stale bookkeeping cannot accumulate indefinitely.
+
+Because ids are never reused, the rev2 reassembler needs no tombstone for a completed `(wire_id, frag_id)`; a late fragment that arrives after completion finds no partial and is dropped. The 8 KiB cap bounds both the per-payload reassembly cost and the amount of state one lost fragment can pin.
+
+### 9. `TRAIN` and the cross-session stager
+
+A single association that sends one 40 B datagram at a time would pay one QUIC DATAGRAM and one syscall per payload. At eight associations × 1,000 pps that is 8,000 tiny sends per second, and most of the cost is not the MQP header — it is the per-send overhead. The stager and `TRAIN` attack that cost without changing UDP semantics.
+
+| Form | Header | Per item | Best use |
+|---|---:|---:|---|
+| Same-flow `TRAIN` | 3 B + one `wire_id` varint | 1 B length (≤127 B payload) + payload | a burst to one target, e.g. a game server or DNS resolver |
+| Dictionary `TRAIN` | 4 B + `nfl` id varints | 1 B index + 1 B length + payload | a mixed burst across associations or targets |
+| Steady `DATA` | 2 B | — | one payload, no aggregation opportunity |
+| `FRAG` | 8 B | — | one payload larger than the DATAGRAM budget |
+
+Packing is deliberately simple and bounded:
+
+1. Each association owns a FIFO queue inside the connection-level stager. A round-robin cursor visits sessions, so one busy association cannot starve the others.
+2. A run of steady items for the same flow becomes a same-flow `TRAIN`. A mix of flows or sessions becomes a dictionary `TRAIN`; each item's id resolves through the receiver's registry to its own session.
+3. A standalone `OPEN` / `INLINE` is never folded into a `TRAIN`. The first payload of a flow must establish the binding first.
+4. A batch is at most **4 frames / 64 items** and at most **64 items per `TRAIN`**, further reduced by `CAPS.max_train_items`. The stager holds at most **1,024 items / 256 KiB** per connection.
+5. The stager drains at the end of a burst, before a large payload, when an association exits, and when the queue is full. If the QUIC send buffer is full, only the unsent tail is requeued; already-packed items are not duplicated.
+6. If the destination MTU is too small for the packed frame, the send reports `TooLarge`; the stager re-reads the budget (throttled to once per 100 ms) and repacks rather than spinning.
+
+The measured effect is **0.743 frames per payload** on the mixed small-packet benchmark, with about **25% fewer client DATAGRAM sends** than v0.2.0. The gain is conditional: it appears when multiple payloads are ready at the same drain point. A single isolated datagram still pays one frame; the protocol does not add latency waiting for a train to fill.
+
+### 10. Control plane
+
+The control plane is intentionally small and loss-tolerant. `CTL` frames travel as QUIC DATAGRAMs, may be reordered or lost, and are idempotent. Their jobs are to negotiate capabilities, confirm a binding, refuse a binding or reclaim state. No user payload depends on a control frame arriving.
+
+| Opcode | Frame | Cadence | Effect |
+|---|---|---|---|
+| `0x01` | `HELLO` | immediately after the QUIC connection is published; retried until CAPS | announces `wire_ver=2` |
+| `0x02` | `CAPS` | one per HELLO, throttled to 100 ms | publishes flow/train/frame/reassembly limits |
+| `0x10` | `FLOW_ACK` | once per successful install; duplicate OPENs are re-ACKed | moves the sender to `Open` and enables compression |
+| `0x11` | `FLOW_REJECT` | once per refused OPEN | reason `policy`, `table_full` or `dns` |
+| `0x12` | `FLOW_CLOSE` | on flow retirement | removes one binding and its queued state |
+| `0x20` | `SESS_CLOSE` | three best-effort datagrams on association exit | removes a session, its flows, stager items and partials |
+
+- **HELLO/CAPS is the only version gate.** A wrong `wire_ver` is answered with CAPS but does not release buffered data. A missing CAPS for two seconds closes the connection; there is no fallback to MQP-2 or the v0.2.0 wire.
+- **CAPS is a capability update, not a first-packet gate.** It can arrive after the first payload. The server's pre-HELLO buffer (8 frames / 16 KiB) holds early rev2 frames and releases them after a valid HELLO, in arrival order.
+- **ACK is not delivery.** It confirms that the receiver installed the binding. If an ACK is lost, the sender keeps using `OPEN` for that flow; the duplicate is idempotent. Payload delivery remains the job of the unreliable DATAGRAM.
+- **Close is best-effort.** `SESS_CLOSE` is repeated three times because losing it only delays reclamation. The 180 s idle sweep is the correctness backstop. `FLOW_CLOSE` is idempotent and may be repeated.
+- **Unknown opcodes, truncated bodies and unknown flags are dropped and counted.** They do not panic and do not tear down the connection. A malformed control frame must not become a denial-of-service primitive.
+
+### 11. Loss, ordering and backpressure
+
+MQP-3 does not add reliability on top of QUIC DATAGRAM. The rules are explicit so applications can reason about them:
+
+- A QUIC DATAGRAM is delivered whole or not at all. One MQP frame occupies one DATAGRAM body.
+- A lost `DATA` loses one payload. A lost `TRAIN` loses every item it carried. A lost `FRAG` loses that reassembled payload even if the other fragments arrived.
+- There is no retransmission, no per-payload ACK, no retry queue and no head-of-line blocking. A lost datagram does not delay later datagrams.
+- Within a session, the stager preserves FIFO order among staged payloads. A large payload that hits `Blocked` while items remain queued may be bypassed (UDP semantics; strict ordering would need retry-later). Across sessions there is no ordering guarantee, and UDP reordering is always allowed.
+- `OPEN` and `ACK` are idempotent. A duplicate `OPEN` is safe; a duplicate `ACK` is harmless. Monotonic, never-reused ids prevent a late frame from being misdelivered to a new flow.
+- If an application needs reliability or ordered delivery, it must provide it above the SOCKS5 datagram API. MyQUIC2 deliberately does not turn UDP into a stream.
+
+Backpressure is handled at the sender, not by unbounded queues:
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| `Sent` | the datagram was accepted by QUIC | count the payload and release the buffer |
+| `Blocked` | the QUIC send buffer is full | requeue only the unsent tail; retry on the next drain |
+| `TooLarge` | the frame exceeds the current DATAGRAM budget | re-read the budget (100 ms throttle) and repack |
+| `ConnectionLost` | the QUIC connection is gone | fail the send; the association reconnects |
+| `Unsupported` | the peer or transport cannot carry DATAGRAMs | fall back or close with a clear error |
+
+The stager drops the **newest** item when its bound is reached, never the oldest: dropping old data would break per-session FIFO and silently reorder the stream. Every drop is counted by reason, so a full queue is visible rather than silent.
+
+### 12. Resource bounds and admission
+
+Every peer-fillable structure is bounded, and the bounds are part of the protocol contract rather than incidental implementation details.
+
+| Resource | Bound | Enforcement |
+|---|---|---|
+| Pre-HELLO buffer | 8 frames / 16 KiB per connection | `accept.rs` before HELLO |
+| Fast session table | 16 slots | server ingress |
+| Flow registry | 4096 live flows per connection | send: `INLINE` fallback; receive: `FLOW_REJECT(table_full)` |
+| Flows per session | 64 | same fallback/reject path |
+| Resolved addresses | 16 per flow | DNS result truncation |
+| Pending DNS opens | 16 | admission gate on the domain slow path |
+| `TRAIN` | 64 items | packer and decoder |
+| Stager | 1,024 items / 256 KiB per connection | enqueue admission |
+| Pack batch | 4 frames / 64 items | stager drain |
+| Reassembly | 2 s / 256 partials / 256 KiB per connection | reassembler sweep |
+| Fragmented payload | 8 KiB / 64 fragments | fragmenter and decoder |
+| Client associations | 4,032 per process | UDP hub |
+| Global sessions | 8,192 | server session pool |
+| Connections | 4,096 | admission / listener |
+| Per-connection admission | 19,062.5 KiB (19,988,480 B) | checked before state allocation |
+
+The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 32 KiB of fixed ingress state (16 KiB pre-HELLO + 16-slot fast table + maps), and 4,096 × 904 B of flow-registry capacity (3.53 MiB). The total is 19.0625 MiB. At the full 4,096 connections that is **76.25 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
+
+The session pool is accounted separately: 8,192 sessions, each with a 64 KiB socket and a reader. The per-connection admission charge covers state that a single connection can pin; the global pool covers state that many connections can pin together. Both are checked before allocation, so a flood of half-open associations cannot consume the budget of established traffic.
+
+### 13. Security invariants
+
+MQP-3 assumes the peer is untrusted and the network is hostile. The invariants are:
+
+- **Authorize before staging.** Every payload is checked against the flow's policy before it enters the stager. An unknown `wire_id`, a closed binding or an id owned by another session is dropped; it cannot be used to reach a target that the sender was never allowed to reach.
+- **Session-scoped resolution.** `wire_id` resolves to exactly one `session` and one target. A dictionary `TRAIN` does not bypass this: each item's id is resolved independently, and an item for a closed flow is dropped without affecting the rest.
+- **SSRF and private-address policy.** The exit resolves names and filters private, loopback, link-local and otherwise disallowed addresses before dialing or sending. `allow_private` is an explicit opt-in, not a default.
+- **Reply-source policy.** A reply is accepted only from the live flow's `reply_src`, from an address in the flow's resolved set, or from an address in the 16-entry per-session allowlist. `udp_full_cone` is opt-in; unsolicited flows are counted separately.
+- **No cross-session ids.** The client registry and the server registry are connection-scoped. An id from one session cannot name a target in another session.
+- **Transport authentication.** TLS 1.3 with ALPN `h3`; the token is sent on a 1-RTT unidirectional stream and never in 0-RTT. The comparison is constant-time, and the gate is checked before per-connection state is allocated.
+- **Fail-fast versioning.** Unknown first bytes, wrong `wire_ver`, missing CAPS and malformed control frames cannot silently fall back to an older wire. They are dropped or closed, with a counter.
+- **No payload transformation.** MQP does not compress or inspect payload bytes. Encrypted, random and already-compressed UDP traffic is carried as-is; there is no compression oracle and no per-payload CPU surprise.
+- **Bounds are security controls.** The stager, reassembly, DNS, flow and admission limits are what stop a peer from turning small packets into unbounded memory. They are tested as invariants, not tuned as best-effort heuristics.
+
+### 14. Interaction with QUIC and transport tuning
+
+MQP-3 is a passenger, not a replacement. The transport choices that matter most:
+
+- **DATAGRAM budget.** The usable payload is `MTU − 38` bytes: 1,162 B at the initial 1,200 B MTU, 1,434 B at 1,472 B. The budget is re-read on `TooLarge`, not assumed to be constant.
+- **PMTU.** The path starts at 1,200 B and probes 1,336, 1,404, 1,438 and 1,472 B. A probe failure falls back without losing the connection; the stager repacks to the smaller budget.
+- **Congestion control.** BBR with ECN, not a custom controller. MQP has no window, no slow start and no retransmission timer of its own.
+- **GSO/GRO.** The server uses UDP segmentation and coalescing offload where the platform supports it; the client does the same per pool slot.
+- **Receive isolation.** Each pool slot owns its endpoint, socket and runtime; the server uses `SO_REUSEPORT` with one endpoint per usable core, capped at 8. There is no shared receive lock between slots.
+- **Session sockets.** Each UDP association gets one 64 KiB socket and one reader. `recvmmsg` and `sendmmsg` batch up to 32 datagrams; the per-session fair share prevents one association from monopolizing the exit.
+- **TCP path.** TCP rides a QUIC bidirectional stream: optimistic SOCKS5 success, borrowed QUIC halves, vectored writes, 300 s idle timeout, 250 ms happy-eyeballs delay, and `RST`/`STOP_SENDING` (`0x04`) on failure.
+- **Liveness.** The QUIC idle timeout is `max(3 × keepalive, 15 s)`; the client watchdog is `max(2 × keepalive, 8 s)`; reconnect backoff is 200 ms to 5 s. A dead path is detected below the QUIC idle timeout so the next request does not wait for it.
+
+### 15. Implementation map and observability
+
+| Area | Files | Responsibility |
+|---|---|---|
+| Codec | `src/mqp/r2.rs` | frame encode/decode, CTL bodies, limits, first-byte dispatch |
+| Flow state | `src/mqp/r2_flow.rs` | `FlowBinding`, `FlowRegistry`, `SessionFlows`, `match_source`, id allocation |
+| Stager | `src/udp/r2_stage.rs` | per-session FIFO, round-robin, batch packing, bounds |
+| Fragmenter | `src/udp/r2_frag.rs` | rev2 fragmentation on the client |
+| Reassembler | `src/udp/r2_reasm.rs` | rev2 reassembly on the server; legacy `src/udp/reassembler.rs` remains for MQP-2 receive/tests |
+| Client lifecycle | `src/bin/myquic2-client/rev2.rs` | open/ack/reject/close, downlink dispatch, `SESS_CLOSE` |
+| Client dispatch | `src/bin/myquic2-client/dispatcher.rs` | DATAGRAM receive path and per-frame routing |
+| Client pool | `src/bin/myquic2-client/pool.rs`, `egress.rs` | slot selection, reconnect, thread-local egress memo |
+| UDP hub | `src/bin/myquic2-client/hub.rs`, `assoc.rs` | SOCKS5 UDP association, 4,032 cap, app address lock |
+| Server ingress | `src/bin/myquic2-server/accept.rs` | HELLO/CAPS, pre-HELLO buffer, flow install, admission |
+| Server forwarding | `src/bin/myquic2-server/reader.rs`, `table.rs`, `forward.rs`, `pin.rs` | session sockets, source matching, DNS/SSRF, reply pinning |
+| Observability | `src/stats/*`, reporter | frame/item/drop/flow counters and periodic summaries |
+| Benchmarks | `examples/hotpath_bench.rs`, `scripts/linux-bench-matrix.sh` | all-size sweep, mixed small-packet load, pacing, full duplex |
+
+The counters are intentionally granular: bytes and frames by kind, `TRAIN` items, inline fallbacks, flow opens/acks/rejects/closes, compression ratio, reassembly partials, stager depth, drop reason and transport stats. A regression in framing shows up as a ratio change, not as a vague latency wobble. For packet-level work, qlog and `tcpdump` see one MQP frame per DATAGRAM; for CPU work, the hot-path bench isolates encode, decode, staging and send.
+
+### 16. Compatibility and failure behavior
+
+| Situation | Behavior |
+|---|---|
+| Rev2 client + rev2 server | full feature set; steady 2 B headers, TRAIN, FRAG, full duplex |
+| Rev2 client + old server | HELLO is dropped, no CAPS arrives, the client closes and retries; optimistic early datagrams are unknown first bytes and are dropped. No silent downgrade. |
+| Old client + rev2 server | rev2 frames are unknown to the client and counted/dropped; the server does not fall back. Mixed versions are unsupported. |
+| MTU shrinks | `TooLarge` triggers a budget re-read and repack; the connection survives |
+| Flow table full (send) | fall back to `INLINE`; the payload still goes out |
+| Flow table full (receive) | `FLOW_REJECT(table_full)`; the sender falls back to `INLINE` |
+| DNS failure | `FLOW_REJECT(dns)`; the sender falls back to `INLINE` or drops with a reason |
+| SSRF/private target | policy refusal before dial/send; counted |
+| Stager full | drop the newest item, count the reason; FIFO is preserved for what remains |
+| Connection lost | in-flight payloads are lost; the pool reconnects and the association reopens; there is no replay |
+| Peer crash | QUIC close or the 180 s idle sweep reclaims flows, stager items and partials |
+| Unknown first byte / opcode / flag | drop and count; no panic, no connection teardown |
+
+### 17. Verification snapshot
+
+The current tree has **436 tests** on macOS (lib 207 + client 125 + server 104) and **440** in the Linux CI-equivalent environment, where four `cfg`-gated tests are enabled. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+
+The data-plane evidence is deliberately end-to-end:
+
+- **All-size sweep:** 8 B through 8 KiB payloads, all OK, including the 2 B steady path, `TRAIN`, `FRAG` and the `OPEN` / `INLINE` forms.
+- **Mixed small-packet benchmark:** 8 associations × 1,000 pps × 128 B × 65 s delivered 519,992 / 519,990 payloads at 0.000% loss, with 0.743 frames per payload and about 25% fewer client DATAGRAM sends than v0.2.0.
+- **Full duplex:** 30,000 / 30,000 payloads in both directions.
+- **Paced:** 325,000 / 325,000 payloads with no loss.
+- **Safety:** malformed, truncated, unknown-flag, unknown-opcode and wrong-version inputs are covered by unit tests; the first-byte matrix is checked against the legacy decoders.
+
+See [Verification](#-verification) for the exact commands and the CI matrix.
 
 ## 🔁 Full duplex
 
@@ -75,11 +499,13 @@ A SOCKS5 proxy made of **two binaries, one wire, and very little ceremony**.
 </picture>
 </p>
 
-- **Both endpoints can open a flow.** Client-owned and server-owned ids share one table. `FLOW_ACK` confirms; a compressed downlink is also an implicit ACK.
-- **Everything worth compressing compresses.** Domain targets, pure-uplink flows, and — with `udp_full_cone = true` — server-owned flows for unsolicited sources. The app replies on the same id.
-- **Source changes rebind the same id.** One `OPEN|SRC` teaches the actual reply source; the client writes it into the SOCKS5 reply header, unchanged for apps.
-- **Optimistic first packet.** A new UDP connection does not wait for CAPS: the first payload can leave immediately. The server buffers up to 8 pre-HELLO frames (16 KiB) and releases them in order after a valid HELLO. Wrong-version HELLOs never release the buffer.
-- **Close means close.** `SESS_CLOSE` / `FLOW_CLOSE` purge bindings, queued stager items and in-flight partials on both ends.
+Full duplex is not an afterthought in rev2: the id space is split by owner, both endpoints run the same open/ack/rebind/close state machine, and the connection-level tables hold client-owned and server-owned flows side by side. That matters for the traffic MyQUIC2 is built for. A game server or a DNS resolver replies from a source the client never explicitly dialed; an anycast target changes its reply address; a restricted NAT still needs a return path. Rev2 handles all three without a second protocol or a separate control channel.
+
+- **Both endpoints can open a flow.** Client-owned (`owner=0`) and server-owned (`owner=1`) ids share one registry. `FLOW_ACK` confirms; a compressed downlink is also an implicit ACK, so a lost ACK only delays compression.
+- **Everything worth compressing compresses.** Domain targets, pure-uplink flows, and — with `udp_full_cone = true` — server-owned flows for unsolicited sources. The app replies on the same id, so the return path is 2 B steady `DATA` too.
+- **Source changes rebind the same id.** One `OPEN|SRC` teaches the actual reply source; the client writes it into the SOCKS5 reply header, unchanged for apps. No new association and no new id are required.
+- **Optimistic first packet.** A new UDP connection does not wait for CAPS: the first payload can leave immediately. The server buffers up to 8 pre-HELLO frames (16 KiB) and releases them in order after a valid HELLO. Wrong-version HELLOs never release the buffer, so optimism does not weaken the version gate.
+- **Close means close.** `SESS_CLOSE` / `FLOW_CLOSE` purge bindings, queued stager items and in-flight partials on both ends. A late frame finds no live binding and is dropped; it can never be misdelivered to a reused id.
 
 ## 🚀 Cross-session stager
 
@@ -90,7 +516,16 @@ A SOCKS5 proxy made of **two binaries, one wire, and very little ceremony**.
 </picture>
 </p>
 
-One stager per QUIC connection, not per association. Small payloads from every app share a per-session FIFO with a round-robin cursor; one `TRAIN dict` can carry them all. Bounded queue, exact drop accounting, per-session fairness, `CAPS.max_train_items` honored.
+One stager per QUIC connection, not per association. This is the difference between compressing one app's burst and compressing the **aggregate** traffic of every SOCKS5 association that shares the tunnel. Small payloads from every app share a per-session FIFO with a round-robin cursor; a single `TRAIN dict` can carry items from several sessions, because each `wire_id` resolves to its own binding at the receiver.
+
+Packing is demand-driven, not timer-driven: a drain happens at the end of a burst, before a large payload, when an association exits, or when the queue is full. The stager never waits to fill a train, so a lone datagram is not delayed for aggregation. A batch carries at most **4 frames / 64 items**, and each frame at most **64 items**, further reduced by `CAPS.max_train_items`. The queue is capped at **1,024 items / 256 KiB per connection**; a full queue drops the newest item and books the exact reason. A blocked QUIC send requeues only the unsent tail, never duplicates a packed item.
+
+Fairness is structural: each session has its own FIFO, and the round-robin cursor means a busy association cannot starve a quiet one. Ordering is per-session FIFO; there is no cross-session order to preserve.
+
+- **Fewer sends, not just fewer bytes.** One DATAGRAM can carry up to 64 payloads, so the per-send cost is amortized across associations.
+- **No added latency.** There is no aggregation timer and no “wait for a full train” path. A single ready payload goes out immediately.
+- **Bounded and observable.** Depth, items, bytes, drops and pack outcomes are counted; a growing queue is visible before it becomes loss.
+- **Negotiated, not assumed.** `CAPS.max_train_items` lets the peer lower the item count; the packer honors it per frame.
 
 ## 📊 Performance
 
@@ -101,10 +536,22 @@ One stager per QUIC connection, not per association. Small payloads from every a
 </picture>
 </p>
 
-- **Steady UDP header:** 5–6 B → **2 B**. **FRAG header:** 18–30 B → **8 B**. **TRAIN item:** 2 B → **1 B**.
-- **8 associations × 1000 pps × 128 B × 65 s:** 519,992 / 519,990 delivered, **0.000 % loss**, **0.743 frames/payload** (≈ **−25 %** client DATAGRAM sends vs the v0.2.0 wire).
-- **All-size sweep:** 8 B … 8 KiB **ALL OK**. **Full duplex:** 30,000 / 30,000. **Paced:** 325,000 / 325,000.
-- These are macOS loopback measurements on release binaries. The Linux 2–4 core + `tc netem` matrix is the deployment gate: [`scripts/linux-bench-matrix.sh`](scripts/linux-bench-matrix.sh).
+Performance work is framed around the **small-packet path**, not bulk throughput. The benchmark is deliberately adversarial for framing: many associations, 128 B payloads, a mix of uplink and downlink, and a long enough run to expose queue growth or loss. It measures delivered payloads, frames per payload and DATAGRAM sends, not just throughput.
+
+| Path | Before rev2 | Rev2 steady | Saving |
+|---|---:|---:|---:|
+| Steady UDP `DATA` | 5–6 B | **2 B** | 3–4 B per frame |
+| `FRAG` | 18–30 B | **8 B** | 10–22 B per fragment |
+| `TRAIN` item | 2 B | **1 B** | 1 B per item |
+
+The first frame of a flow is not the steady state: `OPEN` / `INLINE` carries the session and address and costs more once. The saving repeats on every subsequent datagram, which is exactly where small-packet traffic spends its budget.
+
+**Measured results:**
+
+- **8 associations × 1,000 pps × 128 B × 65 s:** 519,992 / 519,990 delivered, **0.000 % loss**, **0.743 frames/payload** — fewer than one frame leaves per payload because `TRAIN` amortizes the per-frame overhead. The measured client issued about **25 % fewer DATAGRAM sends** than on the v0.2.0 wire.
+- **All-size sweep:** 8 B … 8 KiB **ALL OK**, covering the 2 B steady path, same-flow and dictionary `TRAIN`, `FRAG`, `OPEN` and `INLINE`. No size falls back to a silent copy or a different transport.
+- **Full duplex:** 30,000 / 30,000 payloads in both directions, including server-owned and rebind paths. **Paced:** 325,000 / 325,000 with no loss.
+- **Where the numbers come from:** macOS loopback on release binaries. The Linux 2–4 core + `tc netem` matrix is the deployment gate: [`scripts/linux-bench-matrix.sh`](scripts/linux-bench-matrix.sh). These are not WAN predictions; they isolate framing and scheduling effects.
 
 ## 🛡️ Security
 
@@ -115,10 +562,13 @@ One stager per QUIC connection, not per association. Small payloads from every a
 </picture>
 </p>
 
-- **Every packet is authorized.** A compressed id resolves only a live binding; unknown ids drop that item, never guess a route. SSRF/private-IP filtering is unchanged.
-- **Reply-source policy.** A 16-entry per-session IP allowlist plus the exact live flow mapping; `udp_full_cone` is opt-in, off by default and warned at startup.
-- **Transport and token.** TLS 1.3 with ALPN `h3`; the bearer token is sent only on a 1-RTT uni stream, never in 0-RTT. Token comparison is constant-time.
-- **No payload compression.** Encrypted or random UDP is left untouched; gains are framing, fewer frames and fewer sends.
+The security model assumes an untrusted peer and a hostile network. TLS 1.3 authenticates and encrypts the tunnel; MQP's job is narrower but critical: a compressed id must not become an authorization bypass, a rebind must not become an open relay, and a malformed frame must not become a memory or CPU primitive. The defaults are deliberately restrictive — full-cone off, private targets off, token required, and every peer-fillable structure bounded.
+
+- **Every packet is authorized.** A compressed id resolves only a live, session-scoped binding; an unknown id drops that item and never guesses a route. Authorization happens before the payload enters the stager, so a dictionary `TRAIN` cannot smuggle an item past the target policy. SSRF and private-IP filtering run at the exit.
+- **Reply-source policy.** A reply is accepted from the exact live flow mapping, from the flow's resolved address set, or from a 16-entry per-session IP allowlist. `udp_full_cone` is opt-in, off by default, warned at startup, and counts unsolicited flows separately.
+- **Transport and token.** TLS 1.3 with ALPN `h3`; the bearer token is sent only on a 1-RTT uni stream, never in 0-RTT. Token comparison is constant-time, and the gate runs before per-connection state is allocated.
+- **No payload compression.** Encrypted or random UDP is left untouched; there is no compression oracle and no per-payload CPU surprise. The gains are framing, fewer frames and fewer sends.
+- **What is not claimed.** MQP does not inspect or transform payloads, does not provide anonymity, and does not protect a compromised endpoint. The TLS tunnel is the trust boundary; defense in depth lives in the SSRF policy, reply-source checks and admission bounds.
 
 ## 📦 Install
 
@@ -175,8 +625,9 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **424 tests** on the macOS dev box (lib 199 + client 124 + server 101).
-- **428 tests** in the Linux CI-equivalent environment (Linux adds 4 `cfg`-gated tests).
+- **436 tests** on the macOS dev box (lib 207 + client 125 + server 104).
+- **440 tests** in the Linux CI-equivalent environment (Linux adds 4 `cfg`-gated tests).
+- **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, and legacy MQP-2 receive paths.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
 - **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
 
@@ -1135,7 +1586,7 @@ subgraph RAMP["📈 PMTU discovery"]
 
 #### CI pipeline
 
-_Every push: format, lint, 424/428 tests, musl and glibc builds._
+_Every push: format, lint, 436/440 tests, musl and glibc builds._
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
@@ -1143,7 +1594,7 @@ flowchart LR
 subgraph CHECK["✅ checks"]
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>424 macOS · 428 Linux"]
+        L --> T["🧪 cargo test<br/>436 macOS · 440 Linux"]
     end
     subgraph BUILD["📦 builds"]
         M["musl static"]
@@ -1172,9 +1623,13 @@ subgraph CHECK["✅ checks"]
 
 ## 📚 Documentation
 
-- [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md) — wire format, state machine, security contract.
-- [MQP3_REFACTOR_ANALYSIS.md](MQP3_REFACTOR_ANALYSIS.md) — design rationale, models, roadmap.
-- [analysis/mqp3-refactor/](analysis/mqp3-refactor/) — five deep-dive reports + byte/CPU model.
+All project documents are maintained in **English**. The split is deliberate: the README is the operator-facing overview; the spec is the implementation contract; the analyses preserve the reasoning, measurements and fix history behind the current wire.
+
+- [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md) — wire format, state machine, security contract and the implementation checklist.
+- [MQP3_REFACTOR_ANALYSIS.md](MQP3_REFACTOR_ANALYSIS.md) — design rationale, byte/CPU models, alternatives considered and roadmap.
+- [PROTOCOL_ANALYSIS.md](PROTOCOL_ANALYSIS.md) — end-to-end protocol/architecture analysis and the evidence behind the design.
+- [PERF_ANALYSIS.md](PERF_ANALYSIS.md) — performance work, benchmark results and the fix history that produced them.
+- [analysis/mqp3-refactor/](analysis/mqp3-refactor/) — five deep dives: [wire](analysis/mqp3-refactor/01-wire.md), [uplink](analysis/mqp3-refactor/02-uplink.md), [downlink](analysis/mqp3-refactor/03-downlink.md), [transport](analysis/mqp3-refactor/04-transport.md) and [evidence](analysis/mqp3-refactor/05-evidence.md).
 - [examples/hotpath_bench.rs](examples/hotpath_bench.rs) — TCP/UDP load, correctness, latency and full-duplex harness.
 - [scripts/linux-bench-matrix.sh](scripts/linux-bench-matrix.sh) — Linux deployment benchmark matrix.
 - [config-server.toml](config-server.toml) · [config-client.toml](config-client.toml) — documented configuration samples.

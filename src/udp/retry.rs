@@ -1,25 +1,26 @@
-//! UDP `WouldBlock` 分片重试池：逐行搬运自 `src/lib.rs`（零改动抽取，`lib.rs` 未碰）。
+//! UDP `WouldBlock` fragment retry pool: moved line by line from `src/lib.rs`
+//! (zero-change extraction; `lib.rs` untouched).
 //!
-//! 搬运区间（以符号为准）：
-//! - `UdpRetry`：lib.rs:1719-1731
-//! - `UDP_RETRY_SHARDS`/`UDP_RETRY_DEPTH`：lib.rs:1733-1734
-//! - `RetryShard`：lib.rs:1736-1749
-//! - `retry_shards`：lib.rs:1751-1758
-//! - `UDP_RETRY_TIMEOUT`：lib.rs:1760-1774
-//! - `under_retry_deadline`：lib.rs:1776-1786
-//! - `retry_one`：lib.rs:1788-1796
-//! - `UDP_RETRY_INFLIGHT`：lib.rs:1798-1806
-//! - `spawn_retry_worker`：lib.rs:1808-1839
-//! - `udp_retry_submit`：lib.rs:1841-1858
-//! - `retry_shard_for`：lib.rs:1860-1879
-//! - `udp_try_send`：lib.rs:1881-1920
-//! - `udp_try_send_slice`：lib.rs:1922-1958
-//! - `UdpWriteDrop`：lib.rs:1960-1978
-//! - `warn_udp_write`：lib.rs:1980-1996
-//! - 止于 lib.rs:1998（`udp_socket_dual` 起为 socket 构造，非重试池，不搬）
+//! Moved ranges (keyed by symbol):
+//! - `UdpRetry`: lib.rs:1719-1731
+//! - `UDP_RETRY_SHARDS`/`UDP_RETRY_DEPTH`: lib.rs:1733-1734
+//! - `RetryShard`: lib.rs:1736-1749
+//! - `retry_shards`: lib.rs:1751-1758
+//! - `UDP_RETRY_TIMEOUT`: lib.rs:1760-1774
+//! - `under_retry_deadline`: lib.rs:1776-1786
+//! - `retry_one`: lib.rs:1788-1796
+//! - `UDP_RETRY_INFLIGHT`: lib.rs:1798-1806
+//! - `spawn_retry_worker`: lib.rs:1808-1839
+//! - `udp_retry_submit`: lib.rs:1841-1858
+//! - `retry_shard_for`: lib.rs:1860-1879
+//! - `udp_try_send`: lib.rs:1881-1920
+//! - `udp_try_send_slice`: lib.rs:1922-1958
+//! - `UdpWriteDrop`: lib.rs:1960-1978
+//! - `warn_udp_write`: lib.rs:1980-1996
+//! - Ends at lib.rs:1998 (`udp_socket_dual` onward is socket construction, not the retry pool; not moved)
 //!
-//! 接线：`stats`（`udp_write::*`、`claim_drop_warning`、`NEVER_WARNED`）
-//! 经 `crate::stats` 绝对路径引用；`warn_udp_write`/`UdpWriteDrop` 为本文件内定义。
+//! Wiring: `stats` (`udp_write::*`, `claim_drop_warning`, `NEVER_WARNED`)
+//! are referenced through `crate::stats` absolute paths; `warn_udp_write`/`UdpWriteDrop` are defined in this file.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

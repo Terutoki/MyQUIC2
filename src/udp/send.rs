@@ -1,14 +1,14 @@
-//! QUIC DATAGRAM 发送路径：逐行搬运自 `src/lib.rs`（零改动抽取）。
+//! QUIC DATAGRAM send path: moved line by line from `src/lib.rs` (zero-change extraction).
 //!
-//! 搬运区间（以符号为准）：
-//! - `DatagramSend`：旧 lib.rs `DatagramSend` 全体（含分隔线与文档）
-//! - `try_send_datagram`：旧 lib.rs `try_send_datagram` 全体
-//! - `send_udp_datagram` / `send_udp_datagram_with_header` / `send_encoded`：旧 lib.rs 同名项
-//! - `PayloadSend`：旧 lib.rs `PayloadSend` 全体
+//! Moved ranges (keyed by symbol):
+//! - `DatagramSend`: the entire old lib.rs `DatagramSend` (including separators and docs)
+//! - `try_send_datagram`: the entire old lib.rs `try_send_datagram`
+//! - `send_udp_datagram` / `send_udp_datagram_with_header` / `send_encoded`: same-named items from old lib.rs
+//! - `PayloadSend`: the entire old lib.rs `PayloadSend`
 //!
-//! 接线：`mqp`（`AddrHeader`/`TargetAddrRef`/`encode_datagram_with_header`/`DGRAM_PREFIX_LEN`）、
-//! `stats`（`dgram_drops::*`、`udp_stats::payload`、`warn_datagram_drop`、
-//! `DatagramDropKind`、`budget_detail`）均经 `crate::` 绝对路径引用。
+//! Wiring: `mqp` (`AddrHeader`/`TargetAddrRef`/`encode_datagram_with_header`/`DGRAM_PREFIX_LEN`),
+//! `stats` (`dgram_drops::*`, `udp_stats::payload`, `warn_datagram_drop`,
+//! `DatagramDropKind`, `budget_detail`) are all referenced through absolute `crate::` paths.
 
 use bytes::Bytes;
 use futures_util::future::FutureExt;

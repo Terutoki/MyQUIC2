@@ -38,8 +38,7 @@ use myquic2::mqp::r2_flow::{
 };
 use myquic2::udp::r2_frag::R2FragFlow;
 use myquic2::udp::{
-    PackedFrames, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager,
-    send_packed_frames,
+    R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
 };
 
 /// Retry cadence for `CTL HELLO` until `CAPS` arrives.
@@ -229,39 +228,23 @@ impl ConnRev2 {
 
     /// Two-phase drain of the connection's queued payloads.
     ///
-    /// Phase A packs the whole queue under one short lock hold; phase B sends
-    /// the frames without any lock; phase C (only on a failed send) requeues
-    /// the unsent tail behind a fresh hold. Packing is serialised by the
-    /// stager lock, but the send phase is not: two concurrent associations
-    /// drain disjoint batches, and their DATAGRAMs can interleave on the wire
-    /// (a later-packed batch may be sent first). That is inside the UDP /
-    /// MQP-3 contract — every frame is self-describing and FRAG reassembly is
-    /// keyed by index — and it is the price of keeping quinn sends outside the
-    /// stager lock. A single batch is still put on the wire in queue order.
+    /// Each batch packs a bounded number of frames under one short lock hold;
+    /// the QUIC writes happen outside it. The loop keeps draining until the
+    /// queue is empty, the item budget for one call is spent, or a send fails.
+    /// On a failure the unsent tail is requeued behind a fresh hold, so a full
+    /// send buffer can never make every subsequent payload re-encode the whole
+    /// queue. Packing is serialised by the stager lock, but the send phase is
+    /// not: two concurrent associations drain disjoint batches, and their
+    /// DATAGRAMs can interleave on the wire (a later-packed batch may be sent
+    /// first). That is inside the UDP / MQP-3 contract — every frame is
+    /// self-describing and FRAG reassembly is keyed by index — and it is the
+    /// price of keeping quinn sends outside the stager lock.
     pub(crate) fn drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainOutcome {
-        let mut q = PackedFrames::default();
-        {
-            let mut st = self.stager.lock();
-            st.pack(limit, &mut q);
-        }
-        let outcome = send_packed_frames(conn, &mut q);
-        if outcome.failed.is_some() {
-            let overflow = self
-                .stager
-                .lock()
-                .requeue_unsent(&mut q, outcome.frames as usize);
-            // The requeue should never overflow (the queue was emptied by this
-            // drain and its budget has not moved), but a concurrent
-            // association can legitimately refill it inside the unlocked send
-            // window; each such item takes the same full-queue policy the
-            // push path uses.
-            for _ in 0..overflow {
-                counters::stage_full();
-                let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-                warn_stage_full(n);
-            }
-        }
-        outcome
+        drain_staged(conn, &self.stager, limit, || {
+            counters::stage_full();
+            let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+            warn_stage_full(n);
+        })
     }
 
     /// Number of payloads currently queued on this connection.
@@ -676,12 +659,14 @@ fn stage_or_count(
         }
     }
     // Still full after a drain: the payload is dropped and accounted with the
-    // same verdict a full DATAGRAM send buffer produces.
+    // same verdict a full DATAGRAM send buffer produces — unless the drain saw
+    // a more severe verdict (a dead connection), which the caller must still
+    // act on.
     let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
     warn_stage_full(n);
     PayloadSend {
         frames: drained.frames,
-        failed: Some(DatagramSend::Blocked),
+        failed: drained.failed.or(Some(DatagramSend::Blocked)),
     }
 }
 
@@ -1161,15 +1146,11 @@ pub(crate) mod counters {
     // `FLUSH_EVERY`. None of these is a regression-test observable read on a
     // different thread, which is what keeps cross-thread reads exact.
     rev2_counter_fns_tls! {
-        open_tx,
         steady_tx,
-        inline_tx,
         stage_push,
         stage_drains,
         stage_frames,
         stage_items,
-        stage_drop,
-        stage_full,
         frag_tx,
         frag_rx,
         frag_complete,
@@ -1188,6 +1169,12 @@ pub(crate) mod counters {
         flow_close_rx,
         sess_close_rx,
         sess_close_tx,
+        // Per-flow / queue-exception events: too rare for a TLS cell to reach
+        // its flush boundary, so a direct increment is both simpler and exact.
+        open_tx,
+        inline_tx,
+        stage_drop,
+        stage_full,
         flow_open,
         server_flow_accept,
         server_flow_reuse,

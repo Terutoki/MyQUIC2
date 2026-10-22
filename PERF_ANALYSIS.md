@@ -1,563 +1,560 @@
-# MyQUIC2 数据面性能分析报告（代码逻辑层面）
+# MyQUIC2 Data Plane Performance Analysis Report (Code-Logic Level)
 
-> 分析日期：2026-10-19 · 基线提交：`d73809f` · 只读分析，未修改任何源码。
-> 范围约束：**只分析代码逻辑**，不分析配置参数取值（窗口/MTU/buffer size/timeout/核数等），
-> 所有修复建议均为代码逻辑、数据结构、批处理或调度结构层面的改动。
+> Analysis date: 2026-10-19 · Baseline commit: `d73809f` · Read-only analysis, no source code modified.
+> Scope constraint: **analyze code logic only**, do not analyze configuration parameter values (window/MTU/buffer size/timeout/core count, etc.),
+> all fix recommendations are changes at the level of code logic, data structures, batching, or scheduling structure.
 
 ---
 
-## 0. 分析范围与方法
+## 0. Analysis Scope and Method
 
-- 四路并行深读 + Lead 逐条复核：
-  - `src/udp/**` + `src/mqp/**`（~4.7k 行）
-  - `src/bin/myquic2-server/**`（~3.6k 行）
-  - `src/bin/myquic2-client/**`（~3.2k 行）
-  - `src/lib.rs` 生产段、`src/dns/**`、`src/stats/**`、`src/transport/**`、`src/linux.rs`
-- 关键结论均有代码行号证据；量化数字来自各分析者的 `/tmp` 微基准（Apple M4/macOS，**只用于量级**），
-  以及代码/README 内已有的测量记录（如 `accept.rs` 的 +8.8% CPU、`frame_bench` 的池化否决数据）。
-  端到端收益仍需在 Linux 目标机用 `examples/hotpath_bench.rs` 复测。
+- Four parallel deep reads + Lead line-by-line review:
+  - `src/udp/**` + `src/mqp/**` (~4.7k lines)
+  - `src/bin/myquic2-server/**` (~3.6k lines)
+  - `src/bin/myquic2-client/**` (~3.2k lines)
+  - `src/lib.rs` production sections, `src/dns/**`, `src/stats/**`, `src/transport/**`, `src/linux.rs`
+- Key conclusions all carry code line-number evidence; quantitative numbers come from each analyst's `/tmp` microbenchmarks (Apple M4/macOS, **used only for orders of magnitude**),
+  plus existing measurement records in code/README (e.g. `accept.rs`'s +8.8% CPU, `frame_bench`'s pooling-rejection data).
+  End-to-end gains still need re-measurement on a Linux target machine with `examples/hotpath_bench.rs`.
 
-### 总体判断
+### Overall judgment
 
-主数据路径（UDP 编码 → quinn DATAGRAM → sendmmsg / recvmmsg；TCP 双缓冲 pump）**已经高度优化**：
-稳态每数据报 = 1 次精确容量分配 + 1 次 payload 拷贝 + quinn 内部 1 次状态锁，
-没有逐包 Mutex / 通道 / 任务 / 格式化日志，统计已 thread-local 批处理，BATCH 解码零分配。
-因此本次报告没有 P0；剩余问题集中在 **4 个 P1（其中 2 个是逻辑缺陷型放大）+ 9 个 P2 + 若干 P3**。
+The main data path (UDP encode → quinn DATAGRAM → sendmmsg / recvmmsg; TCP double-buffer pump) **is already highly optimized**:
+steady state per datagram = 1 exact-capacity allocation + 1 payload copy + 1 state lock inside quinn,
+with no per-packet Mutex / channel / task / formatted logging, statistics already thread-local batched, BATCH decoding zero-allocation.
+Therefore this report has no P0; the remaining issues concentrate in **4 P1 (2 of which are logic-defect amplification) + 9 P2 + several P3**.
 
-| 编号 | 优先级 | 位置 | 问题一句话 |
+| ID | Priority | Location | One-line issue |
 |---|---|---|---|
-| F1 | **P1** | `server/forward.rs:55-143` | 域目标被 SSRF 过滤时**每包 spawn 一个 resolver 任务**，且永不 arm 连接 fast table |
-| F2 | **P1** | `server/accept.rs:258-438` | 16 槽直接映射 fast table 与客户端**稀疏单调 session id** 冲突，冲突会话每包退化慢路径 |
-| F3 | **P1（系统级）** | `client/main.rs:49,210-244,473-543` | 分片 slot runtime 叠加主 runtime 默认 worker 数，Linux 默认路径**确定性核心过度订阅** |
-| F4 | **P1** | `udp/reassembler.rs:336-361,603-632` | 分片重组器淘汰用 **O(256) `min_by_key` 全表扫描**，完成率 >~128/s 后每个完成载荷付一次 |
-| F5 | P2 | `server/reader.rs:138-248` + `client/dispatcher.rs:549-563,retry.rs:328-332,391-408` | 下行"单条回复"路径多一次全 payload 拷贝（GROUP_SCRATCH）且被 BATCH-of-1 包装 |
-| F6 | P2 | `udp/batch.rs:553-572` + `assoc.rs:245,255` / `server/reader.rs:345,362` | Linux `recvmmsg` 排空后对每个数据报**再 memcpy 一次**到调用方 buf |
-| F7 | P2 | `server/pin.rs:467-492` + `reader.rs:453-466` | `remember_dst` **无条件** bump allowlist epoch，令 reply reader 的 epoch 门控失效 |
-| F8 | P2 | `client/assoc.rs:195-208,373-449` | 上行小包只做 **2-pack**，同 burst 同目的地本可 8~13 个/帧（server 侧已有 N-pack 参照） |
-| F9 | P2（条件性） | `udp/fragmenter.rs:237-264` | 分片发送遇 quinn 发送缓冲"够 1 片不够 N 片"时**先发前缀丢尾部**，产生孤儿分片浪费隧道带宽 |
-| F10 | P2（结构） | `client/main.rs:379-388` + `assoc.rs:5-10` + `main.rs:508-543` | relay 任务在主 runtime、egress driver 钉在 slot runtime，每出站 DATAGRAM 跨核 state 锁 + driver wake |
-| F11 | P2 | `lib.rs:318-394` + `server/reader.rs:769` + `table.rs:148-158` | 每 UDP session socket 多 4~5 次诊断 `getsockopt`（clamp 时 +2 次注定 EPERM 的 BUFFFORCE）；每次 insert/remove 扫 8 个 shard 读锁 |
-| F12 | P2 | `stats/udp_stats.rs:92-115` | `fragmented()`/`unsolicited()` 未做同类 256 批处理，分片态每载荷一次**全局原子 RMW** |
-| F13 | P2/P3 | `udp/reassembler.rs:288,384,446-448,497,319-329` | 每分片 3 次、完成时 5~6 次重复 hash 探测；完成时对 payload 二次遍历 + 两次额外分配 |
-| F14 | P3 | `stats/drops.rs:239`、`accept.rs:530`、`pin.rs:389`、`fragmenter.rs:213`、`dns/resolve.rs:386-450`、`socks.rs:133-259`、`assoc.rs:45-46` | 一系列逐包/逐流可消除的小开销（见 §4） |
+| F1 | **P1** | `server/forward.rs:55-143` | When a domain target is filtered by SSRF, **one resolver task is spawned per packet**, and the connection fast table is never armed |
+| F2 | **P1** | `server/accept.rs:258-438` | The 16-slot direct-mapped fast table conflicts with the client's **sparse monotonic session ids**; conflicting sessions fall back to the slow path on every packet |
+| F3 | **P1 (system-level)** | `client/main.rs:49,210-244,473-543` | Fragment slot runtimes stack on top of the main runtime's default worker count; the Linux default path has **deterministic core oversubscription** |
+| F4 | **P1** | `udp/reassembler.rs:336-361,603-632` | Fragment reassembler eviction uses an **O(256) `min_by_key` full-table scan**; above a completion rate of ~128/s, it is paid once per completed payload |
+| F5 | P2 | `server/reader.rs:138-248` + `client/dispatcher.rs:549-563,retry.rs:328-332,391-408` | The downlink "single reply" path pays one extra full-payload copy (GROUP_SCRATCH) and is wrapped in BATCH-of-1 |
+| F6 | P2 | `udp/batch.rs:553-572` + `assoc.rs:245,255` / `server/reader.rs:345,362` | After the Linux `recvmmsg` drain, each datagram is **memcpy'd once more** into the caller's buf |
+| F7 | P2 | `server/pin.rs:467-492` + `reader.rs:453-466` | `remember_dst` **unconditionally** bumps the allowlist epoch, defeating the reply reader's epoch gating |
+| F8 | P2 | `client/assoc.rs:195-208,373-449` | Uplink small packets only do **2-pack**; the same burst to the same destination could fit 8~13 per frame (the server side already has an N-pack reference) |
+| F9 | P2 (conditional) | `udp/fragmenter.rs:237-264` | When the quinn send buffer has "room for 1 fragment but not N", fragment send **sends the prefix and drops the tail**, producing orphan fragments that waste tunnel bandwidth |
+| F10 | P2 (structural) | `client/main.rs:379-388` + `assoc.rs:5-10` + `main.rs:508-543` | The relay task runs on the main runtime while the egress driver is pinned to a slot runtime; every outbound DATAGRAM crosses cores for a state lock + driver wake |
+| F11 | P2 | `lib.rs:318-394` + `server/reader.rs:769` + `table.rs:148-158` | Each UDP session socket does 4~5 extra diagnostic `getsockopt` calls (on clamp, +2 BUFFFORCE calls doomed to EPERM); each insert/remove scans 8 shard read locks |
+| F12 | P2 | `stats/udp_stats.rs:92-115` | `fragmented()`/`unsolicited()` don't do the same 256 batching; in the fragmented state, one **global atomic RMW** per payload |
+| F13 | P2/P3 | `udp/reassembler.rs:288,384,446-448,497,319-329` | 3 repeated hash probes per fragment, 5~6 at completion; at completion, a second traversal of the payload + two extra allocations |
+| F14 | P3 | `stats/drops.rs:239`, `accept.rs:530`, `pin.rs:389`, `fragmenter.rs:213`, `dns/resolve.rs:386-450`, `socks.rs:133-259`, `assoc.rs:45-46` | A series of per-packet/per-flow small overheads that can be eliminated (see §4) |
 
-### 0.5 修复落地状态（2026-10-19 实施）
+### 0.5 Fix Landing Status (implemented 2026-10-19)
 
-本报告 §1/§2/§3 的 file:line 是**分析时基线**（`d73809f`）的行号；修复后的对应代码以
-`git diff` 为准。实施结果：
+The file:line references in §1/§2/§3 of this report are the **baseline at analysis time** (`d73809f`); post-fix code is
+as per `git diff`. Implementation results:
 
-| 编号 | 状态 | 落地要点 |
+| ID | Status | Landing points |
 |---|---|---|
-| F1 | ✅ 已修复 | `server/forward.rs` 新增 per-connection `DnsGate`（in-flight 合并 + Unusable 5s 负缓存）+ `resolve_forward_target`（thread memo 被 SSRF 过滤时回退 session DestMemo，命中即 inline 并返回 `Some` 让 `arm_fast` 生效）；全过滤不再逐包 spawn |
-| F2 | ✅ 已修复 | `server/accept.rs` 16 槽改有界线性探测（`fast_probe` / `fast_arm_index`），resolve/try_stage/arm 共用；>16 活会话才按 `last` 淘汰最不活跃 |
-| F3 | ⏸ 待测量 | 线程拓扑改动需 Linux 2~4 核 benchmark 确认后再做（报告 §5 第二批） |
-| F4 | ✅ 已修复 | `udp/reassembler.rs` 两个 map 各加插入序 `VecDeque` + 惰性失效 + `expire` 时 prune/超额重建；淘汰均摊 O(1)，`held` 记账不变 |
-| F5 | ✅ 已修复 | `udp/retry.rs` Linux n==1+header 改两 iovec `sendmmsg`（零拷贝）；`server/reader.rs` 单条 staged 回复改发单个 0x02 帧，不再 BATCH-of-1 |
-| F6 | ✅ 已修复 | `src/udp/batch.rs` 新增 `with_burst_msg`（借用式）；client `assoc.rs` 与 server `reader.rs` 的 recvmmsg 排空路径就地处理，非 Linux 保持 `burst_msg_copy` 回退 |
-| F7 | ✅ 已修复 | `server/pin.rs` `remember_dst` 仅在 rcu 真正 publish 时 bump epoch（Cell 标记），稳态零 epoch RMW |
-| F8 | ⏸ deferred | 量化收益 ~0.25~1% 单核，与 4 条回归测试钉住的丢包/记账/延迟不变量冲突；设计已存档（client 报告） |
-| F9 | ✅ 已修复 | `udp/fragmenter.rs` 记录 `last_blocked`，分片发送在背压下先 `datagram_send_buffer_space()` 聚合预检，装不下整包丢弃（不再发孤儿前缀帧） |
-| F10 | ⏸ 待测量 | 跨 runtime relay 迁移需 `MYQUIC2_SHARD_RUNTIME=0` A/B 实测后再决定 |
-| F11 | ✅ 已修复 | `src/lib.rs` 进程级 socket buffer 探测缓存（后续 socket 跳过 4~6 次 getsockopt/失败 BUFFFORCE）+ `udp_socket_dual_small_addr`；`server/table.rs` 表级 `live` 计数使 `note_empty_state` O(1) |
-| F12 | ✅ 已修复 | `stats/udp_stats.rs` `fragmented()`/`unsolicited()` 并入 thread-local 256 批处理 |
-| F13 | ⏸ deferred | 需重写 `push_with_chunk` 借用/记账结构，收益 ~4ns/分片 + 完成时 30~45ns，风险不划算；留待独立改动 |
-| F14 | ◐ 部分 | 已修：P3-2 重组 tick guard、P3-3 pin 命中免 SSRF 复检、P3-4 fragmenter 时钟惰性化、P3-5 DNS warm-hit 先正后负 + 单次分配、P3-6 SocketAddr 直传；未做：P3-1 丢包计数 padded shard、P3-7 CONNECT 定时器合并、P3-8 dispatcher slice_ref、P3-9 interactive 单连接分片（均低收益/冷路径/设计取舍） |
+| F1 | ✅ Fixed | `server/forward.rs` adds a per-connection `DnsGate` (in-flight coalescing + Unusable 5s negative cache) + `resolve_forward_target` (when the thread memo is filtered by SSRF, fall back to the session DestMemo; on hit, inline and return `Some` so `arm_fast` takes effect); fully filtered no longer spawns per packet |
+| F2 | ✅ Fixed | `server/accept.rs` 16 slots changed to bounded linear probing (`fast_probe` / `fast_arm_index`), shared by resolve/try_stage/arm; only when >16 live sessions does it evict the least active by `last` |
+| F3 | ⏸ Pending measurement | Thread topology changes need Linux 2~4 core benchmark confirmation before proceeding (report §5 second batch) |
+| F4 | ✅ Fixed | `udp/reassembler.rs` each of the two maps gets an insertion-order `VecDeque` + lazy invalidation + prune/over-limit rebuild on `expire`; eviction amortized O(1), `held` accounting unchanged |
+| F5 | ✅ Fixed | `udp/retry.rs` Linux n==1+header changed to a two-iovec `sendmmsg` (zero copy); `server/reader.rs` single staged reply sends a single 0x02 frame, no longer BATCH-of-1 |
+| F6 | ✅ Fixed | `src/udp/batch.rs` adds `with_burst_msg` (borrowed); the recvmmsg drain paths in client `assoc.rs` and server `reader.rs` process in place; non-Linux keeps the `burst_msg_copy` fallback |
+| F7 | ✅ Fixed | `server/pin.rs` `remember_dst` bumps the epoch only when rcu actually publishes (Cell flag); steady state zero epoch RMW |
+| F8 | ⏸ deferred | Quantified gain ~0.25~1% single core, conflicting with the packet-loss/accounting/latency invariants pinned by 4 regression tests; design archived (client report) |
+| F9 | ✅ Fixed | `udp/fragmenter.rs` records `last_blocked`; under backpressure, fragment send first does an aggregate pre-check with `datagram_send_buffer_space()`, and drops the whole packet if it doesn't fit (no more orphan prefix frames) |
+| F10 | ⏸ Pending measurement | Cross-runtime relay migration needs `MYQUIC2_SHARD_RUNTIME=0` A/B measurement before deciding |
+| F11 | ✅ Fixed | `src/lib.rs` process-level socket buffer probe cache (subsequent sockets skip 4~6 getsockopt / failed BUFFFORCE) + `udp_socket_dual_small_addr`; `server/table.rs` table-level `live` count makes `note_empty_state` O(1) |
+| F12 | ✅ Fixed | `stats/udp_stats.rs` `fragmented()`/`unsolicited()` merged into thread-local 256 batching |
+| F13 | ⏸ deferred | Requires rewriting the `push_with_chunk` borrow/accounting structure, gain ~4ns/fragment + 30~45ns at completion, risk not worth it; left for a separate change |
+| F14 | ◐ Partial | Fixed: P3-2 reassembly tick guard, P3-3 pin hit skips SSRF re-check, P3-4 fragmenter clock lazification, P3-5 DNS warm-hit positive-then-negative + single allocation, P3-6 SocketAddr direct pass; Not done: P3-1 drop counting padded shard, P3-7 CONNECT timer merging, P3-8 dispatcher slice_ref, P3-9 interactive single-connection fragmentation (all low gain/cold path/design tradeoff) |
 
-> 约束遵守：未改任何配置参数/默认值（`src/config/**`、`Cargo.toml` 零改动），未加依赖；
-> 全部为代码逻辑、数据结构、批处理与调度结构改动。行为变化见 §7。
+> Constraint compliance: no configuration parameters/defaults changed (`src/config/**`, `Cargo.toml` zero changes), no dependencies added;
+> all are code logic, data structure, batching, and scheduling structure changes. Behavioral changes see §7.
 
-### 0.6 第二批修复落地状态（rev2/R2 路径，2026-10-21 实施）
+### 0.6 Second Batch Fix Landing Status (rev2/R2 path, implemented 2026-10-21)
 
-第二批（T0–T9，rev2/R2 表格化、重组、stager 与统计路径）按
-`T3→T4→T9→T1→T7→T5+T0→T2→T8→T6` 顺序实施；约束同 0.5（零配置/零依赖改动，
-arc-swap 复用既有依赖），为既有行为钉住的测试同步更新以保持断言意图。落地要点
-以 `git diff` 为准：
+The second batch (T0–T9: rev2/R2 tabularization, reassembly, stager and statistics paths) was implemented in the order
+`T3→T4→T9→T1→T7→T5+T0→T2→T8→T6`; constraints same as 0.5 (zero config/zero dependency changes,
+arc-swap reuses the existing dependency), tests pinned for existing behavior updated in sync to preserve assertion intent. Landing
+points per `git diff`:
 
-| 编号 | 状态 | 落地要点 |
+| ID | Status | Landing points |
 |---|---|---|
-| T3 | ✅ 已修复 | `server/accept.rs` r2_stats 新增 `TRAIN_ITEMS` 独立计数 + `bump_train_item()`：逐 **item**（一个 TRAIN 帧最多 64 项）thread-local 256 批回写，唯一一条落在包路径上的 r2_stats 线；其余 r2_stats 保持每帧一次 RMW（由测试直读） |
-| T4/T4b | ✅ 已修复 | `client/rev2.rs` counters 拆 `rev2_counter_fns_tls`（thread-local `Cell` 累计、`FLUSH_EVERY` 周期回写共享）与 direct fn 两类；`Rev2Snapshot::now()` 读前先 `flush_locals()` 当前线程，快照/测试读与批处理互见。可观测计数语义不变 |
-| T9 | ✅ 已修复 | `client/rev2.rs` `UplinkFlows` 单槽 memo（`last: Option<(TargetAddr, Arc<FlowBinding>)>`）服务 steady 目标：命中省 `SessionFlows::find` 线性扫描与 binding 的 Arc clone/drop；memo 槽位与 `mark_closed` 互斥语义由回归测试钉住（闭环后必须用新 id 重开，绝不复用死绑定） |
-| T1 | ✅ 已修复 | `server/accept.rs` TRAIN 两遍解析：pass1 构 `item_slot: Vec<u16>` + ≤64 去重 slot（编码器上限的线性去重），新增 `FlowRegistry::get_batch` **单次读锁**填充全部 slot；pass2 逐 item 走新拆出的 `r2_forward_flow_resolved(state, binding, payload)`（binding 已 `Closed` 不转发）；原逐项入口 `r2_forward_flow_item` 变薄包装 |
-| T7 | ✅ 已修复 | `client/dispatcher.rs` `dispatch_r2_train` 三层 hoist：per-distinct-id memo（跳 registry.get + reply-dst 推导）、per-session-run memo（跳 `r2_lookup` 的 Weak 升级 + is_alive + app 读）、`stage_reply_follow` 令 run 跟随项 `sock: None` 继承 flush 的 relay Arc（每 run 一次 clone）。miss 全部回落逐项路径，计数/拒绝/staging 顺序等可观测面逐项保持 |
-| T5+T0 | ✅ 已修复 | `udp/r2_stage.rs` drain 两段式：`pack(limit, &mut PackedFrames)` 只在锁内编码帧，`send_packed_frames`（自由函数）在**锁外**发 QUIC，`requeue_unsent` 失败帧之后的 items 回插恢复 per-session FIFO（溢出由调用方按满队策略记账：client `BUFFER_FULL`，server 另加 `STAGE_FULL_DROPS`）；`push` 返回排队长度免二次锁定；热路径 reader/drainer 全部走三段组合。**旧的整体 `drain()` 保留但仅剩 `stage_open_src` 一个调用方**（其不变式"本次排空的队列里就是这条 OPEN SRC 且已上线"要求 push→send 单持锁），其内部亦已改为 pack+send+requeue 并断言回插零溢出。**不做 push_batch**：下行回复来自不同 session 无共享可批实体，锁跨 send 已被两段式本身消除 |
-| T2 | ✅ 已修复 | `FlowBinding.resolved` RwLock→`ArcSwap<Vec<SocketAddr>>`：DNS install/rebind `store` 整组原子换、读取方 `load()` 快照永不阻塞写（REP `SourceMatch` 每候选一次快照读） |
-| T8 | ✅ 已修复 | `server/forward.rs` DnsGate 新增单槽 fast hint（hot_key/hot_state/hot_deadline 三个 AtomicU64；publish 序 deadline→state→key，Release 存 key）：同 key 热路径无锁直接返回 InFlight/Unusable；finish 按裁决失效——delivered 清 entry+hint、被淘汰且权威表无此 key 才清 hint、stale finish 不扰动 newer claim 的 hint、过期按 deadline 穿透。行为测试 `dns_gate_fast_hint_is_invalidated_by_a_delivered_finish_and_expires` |
-| T6 | ✅ 已修复 | `udp/r2_reasm.rs` 重组改**单 assembly buf**：total==1 零拷贝返回 `d.slice(chunk_off..)`（payload 与帧共享分配，测试断言指针相等）；多片按 `pos(i)=len(0)+(i-1)*unit`（发端分割契约：middle 等宽、末段短或等宽）**一次**拷入最终位置，位置不可定的分片持"帧视图"（Bytes refcount clone + chunk_off/len）等待 determinator，解锁时恰好一次落位；完成即 `Bytes::from(mem::take(buf))` 零二次拷贝（各 chunk end 单调 ≤ 末段 end，无需 truncate）；middle 宽度与已锁 `unit` 不符**整片拒绝**（任何 mutation 之前返回）；写入终点 > 8 KiB 一律拒绝（防恶意加宽 unit 的 resize 爆炸）。retained 记账改 capacity 基准：`buf.capacity() + pending Σ(len+48)`（`PENDING_CHUNK_COST`），每次 mutation 后重算并对 `held` 饱和增减；首次写 reserve 上限 8 KiB。`mqp/r2.rs` `FragRef` 增信息性 `chunk_off` 字段（decode 时填，wire 不变） |
+| T3 | ✅ Fixed | `server/accept.rs` r2_stats adds an independent `TRAIN_ITEMS` counter + `bump_train_item()`: per **item** (one TRAIN frame holds at most 64 items) thread-local 256-batch writeback, the only r2_stats line that lands on the packet path; the remaining r2_stats keep one RMW per frame (read directly by tests) |
+| T4/T4b | ✅ Fixed | `client/rev2.rs` counters split into `rev2_counter_fns_tls` (thread-local `Cell` accumulation, `FLUSH_EVERY` periodic writeback to the shared value) and direct fn two kinds; `Rev2Snapshot::now()` calls `flush_locals()` for the current thread before reading, so snapshot/test reads and batching see each other. Observable counter semantics unchanged |
+| T9 | ✅ Fixed | `client/rev2.rs` `UplinkFlows` single-slot memo (`last: Option<(TargetAddr, Arc<FlowBinding>)>`) serves steady targets: a hit saves the `SessionFlows::find` linear scan and the binding's Arc clone/drop; memo slot and `mark_closed` mutual-exclusion semantics are pinned by a regression test (after close it must reopen with a new id, never reuse a dead binding) |
+| T1 | ✅ Fixed | `server/accept.rs` TRAIN two-pass parsing: pass1 builds `item_slot: Vec<u16>` + ≤64 dedup slots (linear dedup bounded by the encoder maximum), and the new `FlowRegistry::get_batch` fills all slots under **a single read lock**; pass2 walks items through the newly extracted `r2_forward_flow_resolved(state, binding, payload)` (a binding already `Closed` is not forwarded); the original per-item entry `r2_forward_flow_item` becomes a thin wrapper |
+| T7 | ✅ Fixed | `client/dispatcher.rs` `dispatch_r2_train` three-layer hoist: per-distinct-id memo (skips registry.get + reply-dst derivation), per-session-run memo (skips `r2_lookup`'s Weak upgrade + is_alive + app read), `stage_reply_follow` makes run-following items with `sock: None` inherit the flush's relay Arc (one clone per run). On any miss it falls back to the per-item path; observable surfaces such as counts/rejections/staging order are preserved per item |
+| T5+T0 | ✅ Fixed | `udp/r2_stage.rs` drain two-phase: `pack(limit, &mut PackedFrames)` encodes frames only inside the lock, `send_packed_frames` (free function) sends QUIC **outside the lock**, `requeue_unsent` re-inserts the items after the failed frames to restore per-session FIFO (overflow is accounted by the caller per the full-queue policy: client `BUFFER_FULL`, server additionally `STAGE_FULL_DROPS`); `push` returns the queue length avoiding a second lock; hot-path reader/drainer all use the three-part combination. **The old whole `drain()` is retained but only one caller `stage_open_src` remains** (its invariant "the queue drained this time is exactly this OPEN SRC and it is online" requires push→send to hold the lock throughout), and its internals were also changed to pack+send+requeue with an assertion of zero overflow on re-insert. **No push_batch**: downlink replies come from different sessions with no shared batchable entity, and lock-across-send has already been eliminated by the two-phase design itself |
+| T2 | ✅ Fixed | `FlowBinding.resolved` RwLock→`ArcSwap<Vec<SocketAddr>>`: DNS install/rebind `store` atomically swaps the whole set, readers' `load()` snapshot never blocks writers (REP `SourceMatch` does one snapshot read per candidate) |
+| T8 | ✅ Fixed | `server/forward.rs` DnsGate adds a single-slot fast hint (hot_key/hot_state/hot_deadline three AtomicU64; publish order deadline→state→key, Release store of key): the same-key hot path returns InFlight/Unusable directly without locks; finish invalidates per verdict — delivered clears entry+hint, only evicted with the authoritative table lacking this key clears the hint, a stale finish does not disturb a newer claim's hint, expiry passes through by deadline. Behavior test `dns_gate_fast_hint_is_invalidated_by_a_delivered_finish_and_expires` |
+| T6 | ✅ Fixed | `udp/r2_reasm.rs` reassembly changed to a **single assembly buf**: total==1 returns `d.slice(chunk_off..)` zero-copy (payload shares the allocation with the frame, test asserts pointer equality); for multiple fragments, copies **once** into the final position per `pos(i)=len(0)+(i-1)*unit` (sender split contract: middle segments equal width, last segment short or equal width), fragments whose position cannot be determined hold a "frame view" (Bytes refcount clone + chunk_off/len) waiting for the determinator, and are placed exactly once on unlock; on completion `Bytes::from(mem::take(buf))` with zero second copy (each chunk end is monotonic ≤ last segment end, no truncate needed); a middle width not matching the locked `unit` **rejects the whole fragment** (returns before any mutation); a write end > 8 KiB is always rejected (prevents resize explosion from a maliciously widened unit). retained accounting changed to a capacity basis: `buf.capacity() + pending Σ(len+48)` (`PENDING_CHUNK_COST`), recomputed after each mutation with saturating add/sub on `held`; the first write reserves a cap of 8 KiB. `mqp/r2.rs` `FragRef` adds an informational `chunk_off` field (filled at decode, wire unchanged) |
 
-> **行为变化（仅两处）**：① middle 分片宽度与同 payload 已锁 unit 不符时该分片被拒
-> （旧实现容忍中段异宽并按到达序拼接——发射方契约本就等宽中段）；② `FragRef` 新增
-> `chunk_off` 字段（纯信息，wire/编码不变）。held 记账从"slot 表 + chunk 长度"改为
-> "assembly buf 容量 + pending 视图"，256 KiB/连接上限与满队/淘汰语义不变。
+> **Behavior changes (only two)**: (1) when a middle fragment's width does not match the payload's locked unit, that fragment is rejected
+> (the old implementation tolerated mid-segment differing widths and concatenated in arrival order — the sender contract is equal-width middle segments); (2) `FragRef` adds
+> a `chunk_off` field (purely informational, wire/encoding unchanged). held accounting changed from "slot table + chunk length" to
+> "assembly buf capacity + pending views", with the 256 KiB/connection cap and full-queue/eviction semantics unchanged.
 >
-> **验证（macOS 本机）**：`cargo fmt --all --check` ✅ clean ｜
-> `cargo clippy --all-targets -- -D warnings` ✅ clean ｜
+> **Verification (macOS local)**: `cargo fmt --all --check` ✅ clean |
+> `cargo clippy --all-targets -- -D warnings` ✅ clean |
 > `cargo test --all-targets` ✅ **433 passed / 0 failed**
-> （lib 206 / client 125 / server 102；含 T6 新增 5 个、T8 fast-hint 1 个、
-> T9 回归 1 个、T5 requeue 2 个测试）。审查修复：`total == 64` 的完成掩码改用
-> `checked_shl`（原 `1u64 << 64` 在 debug 下 panic、release 下掩码归零永不完组），
-> 并由 `a_full_width_64_fragment_payload_completes` 钉住。
+> (lib 206 / client 125 / server 102; including 5 new T6, 1 T8 fast-hint,
+> 1 T9 regression, 2 T5 requeue tests). Review fix: the `total == 64` completion mask changed to
+> `checked_shl` (the original `1u64 << 64` panics in debug and yields a zero mask in release and never completes),
+> pinned by `a_full_width_64_fragment_payload_completes`.
 
 ---
 
-## 1. P1 问题（预期影响最大）
+## 1. P1 Issues (Expected Largest Impact)
 
-### F1【P1】域目标解析结果被 SSRF 过滤时，每个 UDP 包 spawn 一个 resolver 任务，fast table 永不 arm
+### F1 [P1] When a domain target's resolution result is filtered by SSRF, one resolver task is spawned per UDP packet, and the fast table is never armed
 
-**位置**
-- `src/bin/myquic2-server/forward.rs:55-70`（解析来源选择）、`:71-87`（spawn 分支）、`:89-107`（任务内解析/过滤）、`:108-137`（任务内发送）、`:138-143`（返回 `None`）
-- `src/dns/resolve.rs:431-450`（线程 DNS memo 只存"排序后首条地址"）
-- `src/bin/myquic2-server/accept.rs:681-692,723-737,752-770,814-816`（只有 `forward_server_dgram` 返回 `Some` 才 `arm_fast`）
+**Location**
+- `src/bin/myquic2-server/forward.rs:55-70` (resolution source selection), `:71-87` (spawn branch), `:89-107` (resolution/filtering inside the task), `:108-137` (send inside the task), `:138-143` (returns `None`)
+- `src/dns/resolve.rs:431-450` (the thread DNS memo stores only the "first address after sorting")
+- `src/bin/myquic2-server/accept.rs:681-692,723-737,752-770,814-816` (`arm_fast` only when `forward_server_dgram` returns `Some`)
 
-**机制（已逐行验证）**
+**Mechanism (verified line by line)**
 
 ```rust
-// forward.rs:55-70 —— 只有 Unknown 分支才查 session DestMemo
+// forward.rs:55-70 —— only the Unknown branch consults the session DestMemo
 let resolved = match lookup_cached_fast_with_ttl(h, p) {
     (CachedLookup::Negative, _) => { bump(REFUSED); return None; }
-    (CachedLookup::Addr(dst), life) => Some((dst, life)),          // ← 被过滤地址也走这里
+    (CachedLookup::Addr(dst), life) => Some((dst, life)),          // ← filtered addresses also take this path
     (CachedLookup::Unknown, _) => sess_dest_lookup_ttl(ss, coarse_millis(), s, h, p),
 };
 if let Some((dst, life)) = resolved
     && (allow_private || is_global_ip_cached(dst.ip())) {
-    ... send ...; return Some((dst, life));                        // 只有这条能 arm_fast
+    ... send ...; return Some((dst, life));                        // only this path can arm_fast
 }
-// forward.rs:77-87 —— 过滤失败 / 未缓存 → 每包 permit + clone + spawn
+// forward.rs:77-87 —— filter failure / not cached → per-packet permit + clone + spawn
 let permit = dns_slow_path_limiter().clone().try_acquire_owned()?;
 let host = h.to_owned();
 tokio::spawn(async move { ... resolve_all_cached(&host, p).await ... });
-// forward.rs:143 —— 返回 None ⇒ accept.rs 永远不 arm_fast
+// forward.rs:143 —— returns None ⇒ accept.rs never arm_fast
 ```
 
-三种持久形态：
-1. **解析结果首条被过滤**（`CachedLookup::Addr(filtered)`）：线程 memo 由 `resolve.rs:431-448`
-   在共享缓存命中时写入"排序后首条地址"，因此下一次同步查询**永远**返回同一条被过滤地址；
-   该分支不再查 session `DestMemo`，直接落 spawn。
-2. **整组记录全被过滤**：spawn 任务 `find(...)` 无可用地址时只 `bump(REFUSED)` 就返回
-   （`forward.rs:98-101`），**不写任何负缓存** ⇒ 下一包完全重来。
-3. **spawn 分支只能返回 `None`** ⇒ 连接级 fast table 永不 arm；后续每个包都重新走
-   `resolve_fast` 未命中 → 全慢路径 → 再 spawn。
+Three persistent shapes:
+1. **The first resolution result is filtered** (`CachedLookup::Addr(filtered)`): the thread memo is written by `resolve.rs:431-448`
+   on a shared cache hit with the "first address after sorting", so the next synchronous query **always** returns the same filtered address;
+   this branch no longer consults the session `DestMemo` and falls straight to spawn.
+2. **The entire record set is filtered**: when the spawn task's `find(...)` has no usable address, it only `bump(REFUSED)` and returns
+   (`forward.rs:98-101`), **writing no negative cache** ⇒ the next packet starts over entirely.
+3. **The spawn branch can only return `None`** ⇒ the connection-level fast table is never armed; every subsequent packet re-runs
+   `resolve_fast` miss → full slow path → spawn again.
 
-`allow_private` 默认 `false`（`config/server_conf.rs:35-37`），因此这是默认配置下的行为。
+`allow_private` defaults to `false` (`config/server_conf.rs:35-37`), so this is the behavior under the default configuration.
 
-**触发条件**：目标域名解析出私网/回环地址（localtest.me、nip.io、自控域名、split-horizon、
-NAT 内网服务），或混合记录中首条是私网（后续有公网地址）。**可被对端驱动**：
-默认空 `auth_token` 时任何能连上 server 的 peer 都可以用域目标数据报驱动该路径；
-1024 permit 的 `dns_slow_path_limiter` 还与 server 的 TCP 拨号共用（`server/tcp.rs:91`），
-占满后合法域目标首解析会按 `DNS_BUDGET` 丢包/复位。
+**Trigger conditions**: the target domain resolves to a private/loopback address (localtest.me, nip.io, self-controlled domains, split-horizon,
+NAT internal services), or the first entry of a mixed record set is private (with public addresses after it). **Peer-drivable**:
+with the default empty `auth_token`, any peer that can connect to the server can drive this path with domain-target datagrams;
+the 1024-permit `dns_slow_path_limiter` is also shared with server TCP dialing (`server/tcp.rs:91`), so once it is exhausted, legitimate domain targets' first resolution is dropped/reset per `DNS_BUDGET`.
 
-**成本**：每包 ≈ `tokio::spawn` + `host.to_owned()` + 2×Arc clone + permit `try_acquire_owned`
-+ 任务内 moka 两次 await 探测 + 成功臂两次分配 + `get_or_create_sess` + `remember_dst`
-+ 一次 `sendto` ≈ **1~3µs/包**；对比正常 fast path 数十~百 ns，放大 **10~30 倍**。
+**Cost**: per packet ≈ `tokio::spawn` + `host.to_owned()` + 2×Arc clone + permit `try_acquire_owned`
++ two moka await probes inside the task + two allocations on a successful arm + `get_or_create_sess` + `remember_dst`
++ one `sendto` ≈ **1~3µs/packet**; versus tens~hundreds of ns on the normal fast path, an amplification of **10~30×**.
 
-**修复方向**（逻辑修复，不改任何参数）
-1. `CachedLookup::Addr(filtered)` 分支先查 session `DestMemo`（两次来源合并），命中可用地址就
-   `send + return Some((dst, life))`，让 `arm_fast` 生效；
-2. 给"整组记录都不可用"加短期负缓存（可复用 `DNS_NEG_TTL` 或 `DestMemo` 的 filtered 变体），
-   后续包 inline 计 `REFUSED`，不再 spawn；
-3. 每 `(conn, sess, host, port)` 加 in-flight 去重：解析在飞时后续包直接按 UDP 语义丢弃
-   （或共享同一 waiter），杜绝"每包一个任务"。
+**Fix direction** (logic fix, no parameter changes)
+1. The `CachedLookup::Addr(filtered)` branch first consults the session `DestMemo` (merging the two sources); on a usable hit do
+   `send + return Some((dst, life))` so `arm_fast` takes effect;
+2. Add a short-term negative cache for "the entire record set is unusable" (can reuse `DNS_NEG_TTL` or the filtered variant of `DestMemo`),
+   so subsequent packets count `REFUSED` inline and no longer spawn;
+3. Add in-flight dedup per `(conn, sess, host, port)`: while a resolution is in flight, subsequent packets are dropped directly per UDP semantics
+   (or share the same waiter), eliminating "one task per packet".
 
-**验证**：用 `dns_cache_seed_set` 构造"首条 filtered、后一条 global"和"全 filtered"两种目标，
-断言连续 N 包 spawn 次数为 1/0（加 test-only 计数）。
-
----
-
-### F2【P1】16 槽直接映射 fast table 与稀疏单调 session id 冲突，冲突会话永久慢路径
-
-**位置**
-- `src/bin/myquic2-server/accept.rs:258`（`FAST_SESS_SLOTS = 16`）
-- `:318-320`（`fast_slot(s) = (s as usize) & 15`）
-- `:364-409`（`try_stage` 要求槽内 `sess == s`，否则返回 `Err`）
-- `:411-438`（`arm_fast` 无条件覆盖该槽）
-- `:574-575`（注释断言："Session ids come from the client's monotonic counter, so N <= 16 live ids land on N distinct slots"）
-- 客户端事实：`src/bin/myquic2-client/hub.rs:295-322`（进程级单调 `fetch_add`，不回退、不复用）
-
-**机制**：注释的前提不成立。客户端 id 是**进程级单调、从不复用**的计数器，
-活跃会话集合是 `[1, next)` 的**稀疏子集**（会话释放留空洞；interactive/bulk 两个 egress class
-的 id 在同一个计数器上交错）。因此 `s & 15` 冲突概率按生日问题估计（活跃数 A）：
-A=5 约 **50%**、A=8 约 **88%**、A=10 约 **97%**。注释里的"17 个才冲突"只在 id 连续时成立。
-
-冲突对会互相覆盖对方的槽，于是两个会话**每个包**都 miss：
-`resolve_fast`（`accept.rs:333-362`）→ `try_stage` 返回 `Err` → 慢路径
-`forward_server_dgram` → `udp_try_send`（**每包一次 `sendto`，绕过 burst 的 sendmmsg 每 32 包一次**）
-+ `remember_dst` 的 shard 读锁 + epoch bump + 两次 memo 探测 + 4×Arc clone → `arm_fast` 又覆盖回去。
-
-**影响**：客户端把某一 egress class 的全部 UDP 关联复用到一个 QUIC 连接是文档化主形态
-（interactive class 固定 index 0，`pool.rs:592-598`）；常见的 5~20 个并发 UDP 流大概率命中冲突。
-代码自己测量过同类慢路径 +8.8% CPU（`accept.rs:564-568`），Linux 上的 `sendto` 放大更大。
-与 F7 叠加后回复方向还要多付 ArcSwap load。
-
-**修复方向**：16 槽 direct-map 改**有界线性探测**（从 `s & 15` 起最多探测 16 个槽，遇到
-`sess == s` 命中 / 空槽停止；arm 取第一个空槽，满表再淘汰），或 4-way set-associative。
-探测只可能 miss、不会 mis-route。不要只靠增大槽数（每槽 ~420B，4096 连接已 ~27MiB）。
-
-**验证**：扩展 `tests.rs` 现有 fast-table 用例，用同余稀疏 id（如 1001/1009/1025）断言两者都能命中。
+**Validation**: use `dns_cache_seed_set` to construct "first filtered, second global" and "all filtered" targets,
+and assert that over N consecutive packets the spawn count is 1/0 (add a test-only counter).
 
 ---
 
-### F3【P1，系统级】分片 slot runtime + 主 runtime 默认 worker 数 ⇒ Linux 默认路径核心过度订阅
+### F2 [P1] The 16-slot direct-mapped fast table conflicts with sparse monotonic session ids; conflicting sessions stay on the slow path permanently
 
-**位置**
-- `src/bin/myquic2-client/main.rs:49`（`#[tokio::main]` = 默认多线程 runtime，worker 数 = `available_parallelism()`）
-- `:210-244`（sharded 拓扑：**每个 pool slot 一条 OS 线程**）
-- `:473-490`（`priority_pin_cores`：前 `cores` 个 slot 钉核）
-- `:508-543`（每条 slot 线程内建 `new_current_thread` runtime，承载该连接的 quinn driver + dispatcher + 重连）
-- `src/bin/myquic2-client/pool.rs:575-598`（默认 pool = 4 TCP + 3 UDP = **7 slot**）
-- `src/linux.rs`（`pin_to_core` 仅 Linux 生效）
+**Location**
+- `src/bin/myquic2-server/accept.rs:258` (`FAST_SESS_SLOTS = 16`)
+- `:318-320` (`fast_slot(s) = (s as usize) & 15`)
+- `:364-409` (`try_stage` requires the slot's `sess == s`, otherwise returns `Err`)
+- `:411-438` (`arm_fast` unconditionally overwrites that slot)
+- `:574-575` (comment assertion: "Session ids come from the client's monotonic counter, so N <= 16 live ids land on N distinct slots")
+- Client fact: `src/bin/myquic2-client/hub.rs:295-322` (process-level monotonic `fetch_add`, no rollback, no reuse)
 
-**机制**：默认配置下 7 条 slot 线程（前 `min(cores,7)` 条钉核）+ 主 runtime 的 `cores` 条
-抢占式 worker。4 核 Linux/OpenWrt 上 = 4 pinned + 3 floating slot 线程 + 4 main worker，
-**11 个可运行线程抢 4 核**；主 runtime 承载全部 SOCKS/TCP pump 与 UDP association relay 任务，
-pinned slot 线程承载收包/回包热路径 ⇒ 每个 pinned 核上同时有两个常驻竞争者。
-macOS 上 `pin_to_core` 是 no-op，所以现有 macOS soak 看不到这个问题；而 Linux 是发布目标。
+**Mechanism**: the comment's premise does not hold. Client ids are a **process-level monotonic, never-reused** counter;
+the active session set is a **sparse subset** of `[1, next)` (session release leaves holes; ids of the two egress classes interactive/bulk
+interleave on the same counter). Therefore the `s & 15` collision probability, estimated by the birthday problem (active count A):
+A=5 about **50%**, A=8 about **88%**, A=10 about **97%**. The comment's "only conflicts at 17" holds only when ids are contiguous.
 
-**影响**：CPU 饱和时 pinned shard 的 driver/dispatcher 可用 CPU 近似按 CFS 均分下降，
-收/发延迟与 pps 上限下降；核越少越重。需 Linux 2~4 核实测确认幅度。
+A conflicting pair overwrites each other's slots, so both sessions miss on **every packet**:
+`resolve_fast` (`accept.rs:333-362`) → `try_stage` returns `Err` → slow path
+`forward_server_dgram` → `udp_try_send` (**one `sendto` per packet, bypassing burst's sendmmsg once per 32 packets**)
++ `remember_dst`'s shard read lock + epoch bump + two memo probes + 4×Arc clone → `arm_fast` overwrites back again.
 
-**修复方向**（调度逻辑）：
-- 显式构建主 runtime：`worker_threads((cores - pinned_slot_count).max(1))`，并用
-  `on_thread_start` + 原子游标把 worker 钉到未被 shard 占用的核；或
-- 当 `slots_total >= cores` 时限制 pin 数（给 ingress 至少留 1 核）/ 缩小默认 pool 宽度。
-原则：`pinned shard 数 + 抢占式 worker 数` 不应超过核数。
+**Impact**: the client multiplexing all UDP associations of one egress class onto one QUIC connection is the documented main form
+(interactive class fixed at index 0, `pool.rs:592-598`); the common 5~20 concurrent UDP flows will most likely hit a conflict.
+The code itself measured this same slow path at +8.8% CPU (`accept.rs:564-568`), and `sendto` amplifies more on Linux.
+Stacked with F7, the reply direction also pays an extra ArcSwap load.
 
----
+**Fix direction**: change the 16-slot direct-map to **bounded linear probing** (probe at most 16 slots starting from `s & 15`, stopping on
+`sess == s` hit / empty slot; arm takes the first empty slot, evicting when the table is full), or 4-way set-associative.
+Probing can only miss, never mis-route. Do not just increase the slot count (each slot ~420B, 4096 connections already ~27MiB).
 
-### F4【P1】分片重组器淘汰用 O(n) `min_by_key` 全表扫描，分片完成率 >~128/s 后每载荷付一次
-
-**位置**
-- `src/udp/reassembler.rs:336-361`（`remember`：每个**完成**的分片载荷插一个 tombstone，然后
-  `while recent.len() > FRAG_MAX_PARTIALS && evict_oldest_tombstone()`、
-  `while held > FRAG_MAX_HELD_BYTES && evict_oldest_tombstone()`）
-- `:603-616`（`evict_oldest_tombstone`：`recent.iter().min_by_key(at_ms)`，最多 256 项）
-- `:618-632`（`evict_oldest`：对 `parts` 同样 `min_by_key`）
-- `:496-517`（完成分支调用 `remember`）
-- `:527-534`（丢包/乱序导致 byte-cap 持续超限时，**每个存储分片**都先逐个淘汰 tombstone，再扫 parts）
-
-**机制**：每个完成的分片载荷都记一个 tombstone（活 `FRAG_TIMEOUT_MS = 2s`，上限 256）。
-只要单个重组器（每条 QUIC 连接一个）的分片载荷完成率 >~128/s，`recent` 就长期饱和，
-**之后每个完成的分片载荷都做一次 256 项 `min_by_key` 全表扫描**（实测 256 项 ~181ns）。
-默认 `initial_mtu = 1200`（`config/tuning.rs:192`）⇒ QUIC DATAGRAM 预算 1162B ⇒ 约 >1150B 的
-UDP payload 就会分片，任何 bulk UDP / VPN 流量都会进入该路径，不是冷路径。
-byte-cap 路径在丢包下还会对 `parts` 每片再扫一次。
-
-**影响**：20k 完成载荷/s ≈ 3.6~4.2ms/s（~0.4% 核）；100k/s ≈ 2%；
-与 F13 的完成路径 hash/assemble 叠加后约占重组器单载荷用户态成本的一半。
-
-**修复方向**（改数据结构，不改上限参数）：淘汰顺序与插入顺序一致（`at_ms`/`first_ms` 单调），
-可在两个 map 旁各维护一个插入序 `VecDeque<key>`：淘汰时从队头 pop，不在 map 或时间戳不匹配则
-惰性跳过，均摊 O(1)；或用单调 seq + `BTreeMap<seq,key>`（O(log n)）。
-对已有 key 的覆盖只需把旧队列项惰性作废。
+**Validation**: extend the existing fast-table cases in `tests.rs`, use congruent sparse ids (e.g. 1001/1009/1025) and assert that both hit.
 
 ---
 
-## 2. P2 问题
+### F3 [P1, system-level] Fragment slot runtimes + main runtime default worker count ⇒ Linux default path core oversubscription
 
-### F5【P2】下行"单条回复"路径多一次全 payload 拷贝，且被 BATCH-of-1 包装
+**Location**
+- `src/bin/myquic2-client/main.rs:49` (`#[tokio::main]` = default multi-thread runtime, worker count = `available_parallelism()`)
+- `:210-244` (sharded topology: **one OS thread per pool slot**)
+- `:473-490` (`priority_pin_cores`: the first `cores` slots are pinned)
+- `:508-543` (each slot thread builds a `new_current_thread` runtime hosting that connection's quinn driver + dispatcher + reconnect)
+- `src/bin/myquic2-client/pool.rs:575-598` (default pool = 4 TCP + 3 UDP = **7 slots**)
+- `src/linux.rs` (`pin_to_core` takes effect on Linux only)
 
-**位置**
-- `src/bin/myquic2-client/dispatcher.rs:549-563`（run 长度 1 时走 `[SendFrame;1]`）
-- `src/udp/retry.rs:328-332`（n==1 直接 per-frame）→ `:391-408`
-  （`GROUP_SCRATCH` 拼接 header + **整包 payload**）
-- `src/bin/myquic2-server/reader.rs:184-248`（`flush_reply_batch` 即使 n==1 也 `encode_batch`）
-- `src/bin/myquic2-client/hub.rs:28-31` / `dispatcher.rs:500-508` 的注释均宣称下行"零 payload 拷贝"
+**Mechanism**: under the default configuration, 7 slot threads (the first `min(cores,7)` pinned) + the main runtime's `cores`
+preemptive workers. On 4-core Linux/OpenWrt = 4 pinned + 3 floating slot threads + 4 main workers,
+**11 runnable threads contending for 4 cores**; the main runtime carries all SOCKS/TCP pump and UDP association relay tasks,
+while pinned slot threads carry the receive/reply hot path ⇒ every pinned core has two resident competitors.
+On macOS `pin_to_core` is a no-op, so existing macOS soak cannot see this problem; but Linux is the release target.
 
-**机制**：server 对 ≤512B 回复做 BATCH（n==1 也包成 0x06 帧），>512B 和重组后的回复走单帧。
-client 收到后按 `(sock,app)` 分组 flush；**run 长度 1 是常见形状**（一条回复一个 drain burst）。
-n==1 时 `udp_try_send_grouped` 走 per-frame 路径：header 非空 ⇒ 把 header+payload 拼进
-`GROUP_SCRATCH` 再 `try_send_to`。即**每个单帧回复付一次整包 memcpy**，与文档"zero-copy"矛盾
-（`retry.rs:387-390` 注释"Linux 不会走到带 header 的分支"也是错的——该分支在 Linux 同样命中）。
-server 侧 n==1 还多付一次 arena 暂存拷贝 + BATCH 头/计数 + client batch 解码。
+**Impact**: when CPU saturates, the pinned shard's driver/dispatcher available CPU drops roughly by the CFS equal share,
+and receive/send latency and the pps ceiling drop; the fewer the cores, the worse. Needs Linux 2~4 core measurement to confirm the magnitude.
 
-**影响**：1.4KB 回复 ~17.5ns/条（实测），20k~100k 回复/s ⇒ 0.04~0.4% 核 + 与 quinn driver 争 L1/L2；
-量不大，但是热路径上白付的全 payload 拷贝，修复约 10 行。
-
-**修复方向**
-- `retry.rs` n==1 且 header 非空时，改用已支持 n==1 的 `sendmmsg_frames(fd,&dst,&frames[..1])`
-  （2 个 iovec、零拷贝；n==1 跳过 `record_send_group` 保持 histogram 语义）；
-- server `flush_reply_batch` 在 `staged.len() == 1` 时直接用 `DgramFragmenter::send` 发 0x02
-  单帧（前缀缓存已在 `frag` 里），不再包 BATCH。
+**Fix direction** (scheduling logic):
+- Explicitly build the main runtime: `worker_threads((cores - pinned_slot_count).max(1))`, and use
+  `on_thread_start` + an atomic cursor to pin workers to cores not occupied by shards; or
+- When `slots_total >= cores`, limit the pin count (leave at least 1 core for ingress) / shrink the default pool width.
+  Principle: `pinned shard count + preemptive worker count` should not exceed the core count.
 
 ---
 
-### F6【P2】`recvmmsg` 排空后每个数据报再 memcpy 一次到调用方 buffer
+### F4 [P1] Reassembler eviction uses an O(n) `min_by_key` full-table scan; above a fragment completion rate of ~128/s it is paid once per payload
 
-**位置**
-- `src/udp/batch.rs:553-572`（`burst_msg_copy`：`dst[..n].copy_from_slice(&b.data[off..off+n])`）
-- `src/udp/batch.rs:425-455`（每线程 32×`BURST_SLOT` ≈270KiB 的 recvmmsg scratch）
-- 调用点：`client/assoc.rs:245,255`（app→QUIC 上行）、`server/reader.rs:345,362`（target→client 下行）
+**Location**
+- `src/udp/reassembler.rs:336-361` (`remember`: inserts a tombstone for every **completed** fragment payload, then
+  `while recent.len() > FRAG_MAX_PARTIALS && evict_oldest_tombstone()`,
+  `while held > FRAG_MAX_HELD_BYTES && evict_oldest_tombstone()`)
+- `:603-616` (`evict_oldest_tombstone`: `recent.iter().min_by_key(at_ms)`, at most 256 entries)
+- `:618-632` (`evict_oldest`: likewise `min_by_key` over `parts`)
+- `:496-517` (the completion branch calls `remember`)
+- `:527-534` (when packet loss/reordering keeps the byte-cap over the limit, **each stored fragment** first evicts tombstones one by one, then scans parts)
 
-**机制**：awaited head 用 `recv_from(&mut buf)`（内核→buf 一次）；drain 余下用 `recv_burst`
-一次 `recvmmsg` 写进线程本地 BURST arena（内核→arena），随后 `burst_msg_copy` 再 arena→buf，
-最后才解码/编码。drain 循环体内**没有 await**，BURST arena 直到下一次 refill 前都有效，
-payload 在同一同步段内被消费 ⇒ 这次 arena→buf 拷贝可删。
+**Mechanism**: every completed fragment payload records a tombstone (live for `FRAG_TIMEOUT_MS = 2s`, cap 256).
+As long as a single reassembler (one per QUIC connection) has a fragment payload completion rate >~128/s, `recent` stays saturated,
+and **after that every completed fragment payload does a 256-entry `min_by_key` full-table scan** (measured ~181ns for 256 entries).
+The default `initial_mtu = 1200` (`config/tuning.rs:192`) ⇒ QUIC DATAGRAM budget 1162B ⇒ UDP payloads over ~1150B get fragmented,
+so any bulk UDP / VPN traffic enters this path; it is not a cold path.
+Under packet loss, the byte-cap path additionally scans `parts` once per fragment.
 
-**影响**：Linux 上每个被 drain 的数据报少一次全 payload memcpy；40~100k pps × ~1KB ≈ 0.5~1% 一核；
-8KB 载荷线性放大。
+**Impact**: 20k completed payloads/s ≈ 3.6~4.2ms/s (~0.4% core); 100k/s ≈ 2%;
+stacked with F13's completion-path hash/assemble, this is about half of the reassembler's per-payload user-space cost.
 
-**修复方向**：在 `udp::batch` 增加借用式访问器（`burst_msg(i) -> Option<(&[u8], SocketAddr)>`
-或闭包作用域 API），caller 直接就地解析/编码；server accept 的慢路径若需 `.await` 再拷贝那一条。
-
----
-
-### F7【P2】`remember_dst` 无条件 bump allowlist epoch，reply reader 的 epoch 门控失效
-
-**位置**：`src/bin/myquic2-server/pin.rs:467-492`（`fetch_add` 在 `:489-490`，rcu 在 `:476-488`）、
-`src/bin/myquic2-server/reader.rs:453-466`（epoch 变化 ⇒ `recent.load_full()` 每个回复一次）
-
-**机制**：epoch 的设计目的是让 reply reader 稳态只付一次 relaxed load（`table.rs:41-50` 注释），
-但 `remember_dst` 在 ring 无变化（稳态同目标）时仍无条件 `fetch_add`。走慢路径的会话
-（F2 冲突会话、多目标会话、域目标未 arm 阶段）每包调用 `remember_dst` ⇒ 其 reply reader
-**每个回复**执行 `ArcSwap::load_full()`（hazard pointer + Arc 引用计数 RMW），
-并和发送侧 epoch RMW 争同一条 cache line。
-
-**修复方向**：只在 ring 真正变化时 bump（放进 `!contains` 分支；rcu 闭包里用本地 flag 记录
-是否实际 push 过，rcu 重试多 bump 一次无害——epoch 只需单调宁多勿少）。
+**Fix direction** (change the data structure, not the cap parameters): eviction order matches insertion order (`at_ms`/`first_ms` are monotonic),
+so an insertion-order `VecDeque<key>` can be maintained beside each of the two maps: pop from the head on eviction, and if the key is not in the map or the
+timestamp doesn't match, skip lazily — amortized O(1); or use a monotonic seq + `BTreeMap<seq,key>` (O(log n)).
+Overwriting an existing key only needs to lazily invalidate the old queue entry.
 
 ---
 
-### F8【P2】客户端上行小包只做 2-pack，N-pack 能力缺口
+## 2. P2 Issues
 
-**位置**：`src/bin/myquic2-client/assoc.rs:195-208`（`pending_buf`/`pending_pack` 状态与注释）、
-`:373-449`（配对逻辑，只把相邻两条拼成 `[&[u8];2]`）、`:511-521`（burst 末尾 flush）；
-参照实现 `src/bin/myquic2-server/reader.rs:138-248`（预算感知 arena + `reply_stage`/`flush_reply_batch`，最多 16 条/帧）
+### F5 [P2] The downlink "single reply" path pays an extra full-payload copy and is wrapped in BATCH-of-1
 
-**机制**：`send_udp_batch` 支持最多 `MAX_BATCH_ITEMS = 16`，但 assoc 只配 2 条就立即发送。
-同目的地 32 包 burst ⇒ 16 次 quinn send，每次 = connection-state mutex + driver wake +
-一帧精确分配 + quinn packet 拷贝。100~200B payload 按 path budget 可装 ~8~13 个/帧。
-interactive class 全部 association 共享同一 egress 连接，减少 send 次数同时降低该 mutex 跨核竞争。
+**Location**
+- `src/bin/myquic2-client/dispatcher.rs:549-563` (when run length is 1, uses `[SendFrame;1]`)
+- `src/udp/retry.rs:328-332` (n==1 goes per-frame directly) → `:391-408`
+  (`GROUP_SCRATCH` concatenates header + **whole payload**)
+- `src/bin/myquic2-server/reader.rs:184-248` (`flush_reply_batch` calls `encode_batch` even when n==1)
+- The comments at `src/bin/myquic2-client/hub.rs:28-31` / `dispatcher.rs:500-508` both claim the downlink does "zero payload copy"
 
-**影响**：send 次数/payload 从 0.5 → ~1/8~1/13；按 40k pps、单次 send 200~300ns 估 ≈ 0.3~0.6% 核，
-并与 README 的 100k pps N=1 小包目标直接相关。**不增加延迟**（仍在 burst 末尾 flush）。
+**Mechanism**: the server BATches replies ≤512B (even n==1 is wrapped as a 0x06 frame); >512B and reassembled replies go single-frame.
+The client groups by `(sock,app)` on flush; **run length 1 is a common shape** (one reply per drain burst).
+With n==1, `udp_try_send_grouped` takes the per-frame path: header non-empty ⇒ concatenates header+payload into
+`GROUP_SCRATCH` then `try_send_to`. That is, **every single-frame reply pays one whole-packet memcpy**, contradicting the doc's "zero-copy"
+(the `retry.rs:387-390` comment "Linux won't reach the header branch" is also wrong — that branch hits on Linux too).
+On the server side, n==1 also pays an extra arena staging copy + BATCH header/count + client batch decode.
 
-**修复方向**：把 `pending_buf` 扩为 arena + `Vec<(off,len)>`，照搬 server 的
-`reply_stage`/`flush_reply_batch` 模式；编码失败回退逐条 `frag.send`，保留现有
-TooLarge/Blocked 语义与记账。
+**Impact**: 1.4KB reply ~17.5ns each (measured), 20k~100k replies/s ⇒ 0.04~0.4% core + contention with the quinn driver for L1/L2;
+the amount is small, but it is a gratuitous full-payload copy on the hot path, and the fix is about 10 lines.
 
----
-
-### F9【P2，条件性】分片发送在发送缓冲饱和窗口"先发前缀、丢尾部"，产生无法重组的孤儿分片
-
-**位置**：`src/udp/fragmenter.rs:237-264`（逐片 `send_encoded`，首个非 `Sent` 立即返回）、
-`src/udp/send.rs:243-252`（`PayloadSend` 文档：partial send 不回滚）、
-`src/udp/send.rs:84-95`（quinn `send_datagram_wait` 按**单条** datagram 检查空间）
-
-**机制**：quinn 0.11.12 的 `send_datagram_wait` 只检查"这一条 datagram"是否能入队
-（`quinn-proto-0.11.19/src/connection/datagrams.rs:49`）。当发送缓冲处于"够 1 片、不够 N 片"
-（饱和时 driver 每次只排空一个包 ≈ 一片大小，属常态窗口），2 片载荷会成功入队第 1 片、
-第 2 片 `Blocked` 返回——第 1 片照样上网，对端永远等不到第 2 片，2s 后丢弃 partial，
-**额外浪费 (F−1) 片的隧道带宽**（F=2 时最多 50% 该载荷字节）。
-
-**修复方向**：`DgramFragmenter` 记录"上次分片发送是否 Blocked"；需分片（F>1）且上次 Blocked 时，
-先调用 quinn 0.11.12 公开的 `Connection::datagram_send_buffer_space()`
-（`quinn-0.11.12/src/connection.rs:508`）预检，空间 < 各帧总长 + bookkeeping 余量就整体丢弃
-（记 `Blocked`，等价于第一片就 Blocked 的情形），否则照常逐片发。健康路径只多一个 bool 判断。
+**Fix direction**
+- In `retry.rs`, when n==1 and the header is non-empty, use the already n==1-capable `sendmmsg_frames(fd,&dst,&frames[..1])`
+  (2 iovecs, zero copy; n==1 skips `record_send_group` to preserve histogram semantics);
+- Server `flush_reply_batch` when `staged.len() == 1` directly uses `DgramFragmenter::send` to send a 0x02
+  single frame (the prefix cache is already in `frag`), no longer wrapping a BATCH.
 
 ---
 
-### F10【P2，结构】客户端 relay 任务与 egress driver 跨 runtime ⇒ 每出站 DATAGRAM 跨核 state 锁 + driver wake
+### F6 [P2] After the `recvmmsg` drain, each datagram is memcpy'd once more into the caller's buffer
 
-**位置**：`src/bin/myquic2-client/socks.rs:139` → `assoc.rs:5-10`（relay 循环在 SOCKS 任务里，
-由 `main.rs:379-388` spawn 在 `#[tokio::main]` 主 runtime）；
-egress driver/dispatcher 在 `main.rs:508-543` 的 slot runtime。
+**Location**
+- `src/udp/batch.rs:553-572` (`burst_msg_copy`: `dst[..n].copy_from_slice(&b.data[off..off+n])`)
+- `src/udp/batch.rs:425-455` (per-thread 32×`BURST_SLOT` ≈270KiB recvmmsg scratch)
+- Call sites: `client/assoc.rs:245,255` (app→QUIC uplink), `server/reader.rs:345,362` (target→client downlink)
 
-**机制**：`try_send_datagram` → quinn `SendDatagram::poll` 每次取 `ConnectionInner.state` 互斥锁并
-`state.wake()`（quinn-0.11.12 `connection.rs:856-876`）；该锁的 partner 是每收一个包都持有的
-driver，而 driver 在 pinned slot 线程、relay 任务在 main worker ⇒ 每个 UDP send 一次跨核
-cache-line 交接 + 一次跨 runtime driver wake（TCP 每 16KiB 分摊，UDP 每包）。
+**Mechanism**: the awaited head uses `recv_from(&mut buf)` (kernel→buf once); the remaining drain uses `recv_burst`
+to write into the thread-local BURST arena with one `recvmmsg` (kernel→arena), then `burst_msg_copy` copies arena→buf again,
+and only then decode/encode. The drain loop body has **no await**, the BURST arena stays valid until the next refill, and the
+payload is consumed within the same synchronous section ⇒ this arena→buf copy can be removed.
 
-**影响**：每个出站 UDP 数据报；每次跨核交接+wake 约 0.1~0.3µs（估算）⇒ 40k pps ≈ 0.5~1.3% 核 +
-延迟抖动。**修复收益不确定、重构成本高，必须先 A/B 实测**（`MYQUIC2_SHARD_RUNTIME=0` 对照
-`hotpath_bench udpmulti/lat`）。方向：首包确定 `UdpBind` 后把 relay 循环挪到对应 slot runtime；
-不建议用跨 runtime channel（会引入同量级 hop）。
+**Impact**: on Linux, one fewer full-payload memcpy per drained datagram; 40~100k pps × ~1KB ≈ 0.5~1% of one core;
+linear amplification for 8KB payloads.
 
----
-
-### F11【P2】每个 UDP session socket 创建多做 4~5 次诊断 `getsockopt`；每次 insert/remove 扫 8 个 shard 读锁
-
-**位置**
-- `src/lib.rs:318-394`（`udp_socket_dual_impl`）：Linux 分支 `:367-373` 先 getsockopt 判 force，
-  `:374-387` 为告警再读回 2 次；`warn_buf_clamped` 每次 2 个 atomic swap；`:414-425` force 失败不缓存
-- 调用点：`server/reader.rs:769`（每个新 UDP session 一次）、`client/assoc.rs:45-46,50`（每个 association）
-- `src/bin/myquic2-server/table.rs:148-158`（`note_empty_state`：`shards.iter().any(|sh| !sh.read().is_empty())`，
-  每个 insert/remove 都调：`reader.rs:894` 与 `:607`）
-
-**机制**：SO_SNDBUF/SO_RCVBUF 的 clamp 判定是 netns/进程级常量，但为了"是否被 clamp"的告警在
-**每个 socket** 上读回；被 clamp 且无 CAP_NET_ADMIN 时每 socket 还发 2 次注定 EPERM 的
-`SO_*BUFFFORCE`。实测（macOS A/B）：4 次读回额外 +1.5~1.7µs/socket；Linux 按 0.3~0.5µs/syscall
-估 ~1.2~3µs/新流。`note_empty_state` 每次 insert/remove 取 8 个 shard 读锁（~百 ns 级）。
-
-**修复方向**：`static PROBE: OnceLock<ClampVerdict>` 进程级缓存一次判定（首个 socket 探测 + 尝试一次
-force 并记录 capability），之后跳过读回/force；`note_empty_state` 改为表级 `AtomicUsize live_count`
-（insert +1、remove -1，0↔1 迁移时更新全局 holders），去掉每次 8 锁扫描。
+**Fix direction**: add a borrowed accessor in `udp::batch` (`burst_msg(i) -> Option<(&[u8], SocketAddr)>`
+or a closure-scoped API), and let callers parse/encode in place; if the server accept slow path needs `.await`, copy that one entry then.
 
 ---
 
-### F12【P2】`udp_stats::fragmented()` / `unsolicited()` 未批处理，分片态每载荷一次全局原子 RMW
+### F7 [P2] `remember_dst` unconditionally bumps the allowlist epoch, defeating the reply reader's epoch gating
 
-**位置**：`src/stats/udp_stats.rs:92-99`（fragmented）、`:111-115`（unsolicited）；
-对照 `:60-89` 的 `payload()` TLS 批处理；调用点 `udp/fragmenter.rs:273`（每个分片载荷发送成功后）、
-`server/reader.rs:471`（full-cone 每个非白名单入站包）
+**Location**: `src/bin/myquic2-server/pin.rs:467-492` (`fetch_add` at `:489-490`, rcu at `:476-488`),
+`src/bin/myquic2-server/reader.rs:453-466` (epoch change ⇒ `recent.load_full()` once per reply)
 
-**机制**：`FRAGMENTED.fetch_add(1, Relaxed)` 直接打全局 cache line，所有 shard/线程争同一条线。
-默认 `initial_mtu=1200` 使 >1150B payload 常态化分片，这是**常态路径**而非异常路径。
-实测共享 `fetch_add` 22.6/24.6ns/op vs 批处理 0.21ns；每分片载荷多 ~5~25ns 且是跨 shard 串行点。
+**Mechanism**: the purpose of the epoch is to let the reply reader pay only one relaxed load in steady state (comment at `table.rs:41-50`),
+but `remember_dst` still unconditionally does `fetch_add` when the ring has not changed (steady state, same target). Sessions on the slow path
+(F2 conflicting sessions, multi-target sessions, the phase when a domain target has not been armed) call `remember_dst` per packet ⇒ their reply reader
+executes `ArcSwap::load_full()` **for every reply** (hazard pointer + Arc refcount RMW),
+and contends with the sending side's epoch RMW for the same cache line.
 
-**修复方向**：在现有 TLS 结构里加 `fragmented` 计数（与 datagrams/bytes 同一 Cell），或新增
-`payload_fragmented(len, frames)` 合并一次 TLS 访问，随 256 阈值一起 flush；`unsolicited` 同法。
-
----
-
-### F13【P2/P3】重组器每分片重复 hash 探测；完成时二次遍历 + 两次额外分配
-
-**位置**：`src/udp/reassembler.rs:288`→`:297-311`（`recent.get`）、`:384`（`parts.get`）、
-`:446-448`（`parts.entry`，同 key 二次探测）、`:497`（完成 `parts.remove` 第三次）、
-`:319-329`（`prints_of` 对每个 chunk 做 hash 并分配 `Box<[Option<ChunkFp>]>`）、
-`:85-91`（`assemble` 分配 BytesMut 再拷贝全部 chunk）
-
-**机制**：普通分片 3 次 hash map 探测；完成分片 5~6 次。完成时先对 payload 全量算指纹
-（实测 2800B ~45ns）再全量 assemble 拷贝（~60ns），同一份数据被独立遍历两次、两次分配
-（另有 Domain 目标 `p.address.clone()` 一次 String 分配）。
-
-**修复方向**：单个 `parts.entry(key)` 服务"存在/超限/重启/完成"四个判断；更彻底可把 tombstone
-并入同一 map（`enum Slot { Partial, Tombstone }`），每分片 1 次探测、完成时原地转换；指纹在
-`push` 存 chunk 的同一 cache-hot 访问里顺手计算，完成时直接移动，省掉二次遍历与 `Box` 分配。
+**Fix direction**: bump only when the ring actually changes (move into the `!contains` branch; inside the rcu closure use a local flag to record
+whether a push actually happened; an extra bump on rcu retry is harmless — the epoch only needs to be monotonic, more is fine).
 
 ---
 
-## 3. P3 清单（小开销，修复零/低风险）
+### F8 [P2] The client uplink only does 2-pack for small packets; N-pack capability gap
 
-| # | 位置 | 问题 |
+**Location**: `src/bin/myquic2-client/assoc.rs:195-208` (`pending_buf`/`pending_pack` state and comments),
+`:373-449` (pairing logic, only joins two adjacent entries into `[&[u8];2]`), `:511-521` (flush at the end of a burst);
+reference implementation `src/bin/myquic2-server/reader.rs:138-248` (budget-aware arena + `reply_stage`/`flush_reply_batch`, up to 16 per frame)
+
+**Mechanism**: `send_udp_batch` supports up to `MAX_BATCH_ITEMS = 16`, but assoc sends immediately after only 2 are paired.
+A 32-packet burst to the same destination ⇒ 16 quinn sends, each = connection-state mutex + driver wake +
+one exact frame allocation + quinn packet copy. 100~200B payloads fit ~8~13 per frame by path budget.
+The whole interactive class's associations share the same egress connection, so reducing send count also reduces that mutex's cross-core contention.
+
+**Impact**: sends/payload from 0.5 → ~1/8~1/13; at 40k pps and 200~300ns per send, ≈ 0.3~0.6% core,
+and directly relevant to the README's 100k pps N=1 small-packet goal. **Does not add latency** (still flushed at the end of the burst).
+
+**Fix direction**: expand `pending_buf` into an arena + `Vec<(off,len)>`, copying the server's
+`reply_stage`/`flush_reply_batch` pattern; on encode failure fall back to per-entry `frag.send`, preserving the existing
+TooLarge/Blocked semantics and accounting.
+
+---
+
+### F9 [P2, conditional] Under a saturated send-buffer window, fragment send "sends the prefix and drops the tail", producing orphan fragments that cannot be reassembled
+
+**Location**: `src/udp/fragmenter.rs:237-264` (per-fragment `send_encoded`, returns immediately on the first non-`Sent`),
+`src/udp/send.rs:243-252` (`PayloadSend` doc: partial sends are not rolled back),
+`src/udp/send.rs:84-95` (quinn `send_datagram_wait` checks space for **a single** datagram)
+
+**Mechanism**: quinn 0.11.12's `send_datagram_wait` only checks whether "this one datagram" can be enqueued
+(`quinn-proto-0.11.19/src/connection/datagrams.rs:49`). When the send buffer is in the "enough for 1 fragment, not N"
+state (under saturation the driver drains only one packet ≈ one fragment per iteration, a normal window), a 2-fragment payload successfully enqueues fragment 1
+and fragment 2 returns `Blocked` — fragment 1 still goes on the wire, the peer never receives fragment 2, and the partial is discarded after 2s,
+**wasting (F−1) fragments' worth of tunnel bandwidth** (up to 50% of that payload's bytes when F=2).
+
+**Fix direction**: have `DgramFragmenter` record "whether the previous fragment send was Blocked"; when fragmentation is needed (F>1) and the previous send was Blocked,
+first call quinn 0.11.12's public `Connection::datagram_send_buffer_space()`
+(`quinn-0.11.12/src/connection.rs:508`) as a pre-check, and if the space is less than the total frame length + bookkeeping margin, drop the whole thing
+(count `Blocked`, equivalent to fragment 1 being Blocked), otherwise send fragment by fragment as usual. The healthy path only adds one bool check.
+
+---
+
+### F10 [P2, structural] Client relay task and egress driver on different runtimes ⇒ every outbound DATAGRAM crosses cores for a state lock + driver wake
+
+**Location**: `src/bin/myquic2-client/socks.rs:139` → `assoc.rs:5-10` (the relay loop lives in the SOCKS task,
+spawned by `main.rs:379-388` on the `#[tokio::main]` main runtime);
+the egress driver/dispatcher lives in the slot runtime at `main.rs:508-543`.
+
+**Mechanism**: `try_send_datagram` → quinn `SendDatagram::poll` takes the `ConnectionInner.state` mutex and
+calls `state.wake()` every time (quinn-0.11.12 `connection.rs:856-876`); the lock's partner is the
+driver, which holds it on every received packet, and the driver is on a pinned slot thread while the relay task is on a main worker ⇒ every UDP send is one cross-core
+cache-line handoff + one cross-runtime driver wake (TCP amortizes it every 16KiB, UDP pays it per packet).
+
+**Impact**: every outbound UDP datagram; each cross-core handoff+wake is about 0.1~0.3µs (estimate) ⇒ 40k pps ≈ 0.5~1.3% core +
+latency jitter. **The fix's benefit is uncertain and the refactor cost is high, so it must be A/B measured first** (`MYQUIC2_SHARD_RUNTIME=0` against
+`hotpath_bench udpmulti/lat`). Direction: after the first packet determines the `UdpBind`, move the relay loop to the corresponding slot runtime;
+a cross-runtime channel is not recommended (it would introduce a hop of the same magnitude).
+
+---
+
+### F11 [P2] Each UDP session socket creation does 4~5 extra diagnostic `getsockopt`; each insert/remove scans 8 shard read locks
+
+**Location**
+- `src/lib.rs:318-394` (`udp_socket_dual_impl`): the Linux branch `:367-373` first does getsockopt to determine force,
+  `:374-387` reads back 2 more times for the warning; `warn_buf_clamped` does 2 atomic swaps each time; `:414-425` does not cache force failure
+- Call sites: `server/reader.rs:769` (once per new UDP session), `client/assoc.rs:45-46,50` (per association)
+- `src/bin/myquic2-server/table.rs:148-158` (`note_empty_state`: `shards.iter().any(|sh| !sh.read().is_empty())`,
+  called on every insert/remove: `reader.rs:894` and `:607`)
+
+**Mechanism**: the SO_SNDBUF/SO_RCVBUF clamp verdict is a netns/process-level constant, but it is read back on
+**every socket** for the "whether clamped" warning; when clamped without CAP_NET_ADMIN, each socket also issues 2 `SO_*BUFFFORCE` calls doomed to EPERM.
+Measured (macOS A/B): 4 readbacks add +1.5~1.7µs/socket; on Linux at 0.3~0.5µs/syscall, ~1.2~3µs/new flow. `note_empty_state` takes 8 shard read locks per insert/remove (~hundreds of ns).
+
+**Fix direction**: a `static PROBE: OnceLock<ClampVerdict>` process-level cached verdict (probe the first socket + attempt
+force once and record the capability), then skip readback/force afterwards; change `note_empty_state` to a table-level `AtomicUsize live_count`
+(insert +1, remove -1, update global holders on the 0↔1 transition), removing the 8-lock scan each time.
+
+---
+
+### F12 [P2] `udp_stats::fragmented()` / `unsolicited()` are not batched; in the fragmented state one global atomic RMW per payload
+
+**Location**: `src/stats/udp_stats.rs:92-99` (fragmented), `:111-115` (unsolicited);
+compare `:60-89`'s `payload()` TLS batching; call sites `udp/fragmenter.rs:273` (after each fragment payload is sent successfully),
+`server/reader.rs:471` (full-cone, every non-whitelisted inbound packet)
+
+**Mechanism**: `FRAGMENTED.fetch_add(1, Relaxed)` hits the global cache line directly, and all shards/threads contend for the same line.
+The default `initial_mtu=1200` makes >1150B payloads routinely fragmented, so this is a **normal path**, not an exceptional path.
+Measured shared `fetch_add` 22.6/24.6ns/op vs batched 0.21ns; ~5~25ns more per fragment payload, and it is a cross-shard serialization point.
+
+**Fix direction**: add a `fragmented` counter to the existing TLS structure (same Cell as datagrams/bytes), or add
+`payload_fragmented(len, frames)` to combine into one TLS access, flushed with the 256 threshold; `unsolicited` likewise.
+
+---
+
+### F13 [P2/P3] The reassembler repeats hash probes per fragment; at completion a second traversal + two extra allocations
+
+**Location**: `src/udp/reassembler.rs:288`→`:297-311` (`recent.get`), `:384` (`parts.get`),
+`:446-448` (`parts.entry`, second probe of the same key), `:497` (completion's `parts.remove`, third time),
+`:319-329` (`prints_of` hashes each chunk and allocates `Box<[Option<ChunkFp>]>`),
+`:85-91` (`assemble` allocates BytesMut then copies all chunks)
+
+**Mechanism**: an ordinary fragment does 3 hash map probes; a completing fragment does 5~6. At completion it first computes a fingerprint over the full payload
+(measured 2800B ~45ns) and then does a full assemble copy (~60ns); the same data is traversed independently twice with two allocations
+(plus one String allocation for `p.address.clone()` on Domain targets).
+
+**Fix direction**: a single `parts.entry(key)` serves the four decisions "exists/over-limit/restart/complete"; more thoroughly, merge the tombstone
+into the same map (`enum Slot { Partial, Tombstone }`), with 1 probe per fragment and in-place conversion at completion; compute the fingerprint
+during the same cache-hot access that stores the chunk in `push`, and move it directly at completion, saving the second traversal and the `Box` allocation.
+
+---
+
+## 3. P3 List (small overheads, zero/low-risk fixes)
+
+| # | Location | Issue |
 |---|---|---|
-| P3-1 | `stats/drops.rs:239`、`stats/udp_write.rs` 的直接计数、`stats/warn.rs:26-38` | 每个丢包一次全局 `fetch_add` + `coarse_millis`；饱和/REFUSED 洪泛时按包发生。可改 padded per-thread shard 数组（snapshot 求和仍精确），告警闸门保留 |
-| P3-2 | `server/accept.rs:530,607` + `client/dispatcher.rs:602-604,692` | 每连接 500ms 重组 tick 无条件唤醒（即使 reassembler 为空，TCP-only 连接也一样）；4096 连接 ≈ 8k wakeup/s。select 分支加 guard `if reasm.held_bytes() > 0` |
-| P3-3 | `server/pin.rs:389` | pin 命中每个域目标包重复一次 `is_global_ip_cached`（纯函数、arm 时已过滤）；可信任 arm 结论直接返回，省 ~10ns/包 |
-| P3-4 | `udp/fragmenter.rs:213` | 每个分片载荷读一次精确 `mono_millis()`，但它只在 2^32 个 id 回绕后才被使用；把时钟求值移进 `last_wrap_ms != 0` 分支 |
-| P3-5 | `dns/resolve.rs:386-450` | warm-hit 每次先 negative 再 positive 两次 moka probe；Ok 分支 `Vec<SocketAddr>` + `Arc::from` 两次分配。positive 先查、端口由调用方 attach |
-| P3-6 | `client/assoc.rs:45-46` + `lib.rs:319` | 每个 association 把 `SocketAddr` 格式化为 String 再 parse 回来；lib 增加收 `SocketAddr` 的构造入口 |
-| P3-7 | `client/socks.rs:133,150,166,218,246-252,377` + `pool.rs:763-771,252-257` | 每 TCP CONNECT ~7 个独立 timeout 定时器；`holds_dead_handle` 与 `wait_conn` 对同一 quinn state 锁探活两次；非 interactive 流多一次 `set_priority(0)`（quinn-proto 0.11 只存 i32 不发帧） |
-| P3-8 | `client/dispatcher.rs:220-243` | BATCH 每 payload 一次 `d.slice_ref` + 每帧一次 `entry.relay.clone()`；可改 `StagedReply{frame,off,len}` 只持 1 个 frame + 1 个 socket Arc/帧 |
-| P3-9 | `client/pool.rs:592-598`、`egress.rs:259-290` | interactive UDP class 硬绑单连接（一个 driver + 一把 state 锁承载所有小包 association）；bulk 已有 shard 轮转，可泛化（设计上限，非缺陷） |
+| P3-1 | `stats/drops.rs:239`, direct counting in `stats/udp_write.rs`, `stats/warn.rs:26-38` | One global `fetch_add` + `coarse_millis` per drop; happens per packet during saturation/REFUSED floods. Can change to a padded per-thread shard array (snapshot sum remains exact), keeping the warning gate |
+| P3-2 | `server/accept.rs:530,607` + `client/dispatcher.rs:602-604,692` | The per-connection 500ms reassembly tick wakes unconditionally (even with an empty reassembler, and for TCP-only connections); 4096 connections ≈ 8k wakeup/s. Add the guard `if reasm.held_bytes() > 0` to the select branch |
+| P3-3 | `server/pin.rs:389` | A pin hit repeats `is_global_ip_cached` once per domain-target packet (pure function, already filtered at arm); the arm verdict can be trusted and returned directly, saving ~10ns/packet |
+| P3-4 | `udp/fragmenter.rs:213` | One precise `mono_millis()` read per fragment payload, but it is only used after 2^32 id wraps; move the clock evaluation into the `last_wrap_ms != 0` branch |
+| P3-5 | `dns/resolve.rs:386-450` | warm-hit does negative then positive, two moka probes each time; the Ok branch does `Vec<SocketAddr>` + `Arc::from`, two allocations. Query positive first, with the port attached by the caller |
+| P3-6 | `client/assoc.rs:45-46` + `lib.rs:319` | Each association formats a `SocketAddr` into a String and parses it back; add a constructor entry in lib that takes `SocketAddr` |
+| P3-7 | `client/socks.rs:133,150,166,218,246-252,377` + `pool.rs:763-771,252-257` | ~7 independent timeout timers per TCP CONNECT; `holds_dead_handle` and `wait_conn` probe liveness twice on the same quinn state lock; non-interactive flows pay an extra `set_priority(0)` (quinn-proto 0.11 only stores the i32 and sends no frame) |
+| P3-8 | `client/dispatcher.rs:220-243` | BATCH does one `d.slice_ref` per payload + one `entry.relay.clone()` per frame; can change to `StagedReply{frame,off,len}` holding just 1 frame + 1 socket Arc per frame |
+| P3-9 | `client/pool.rs:592-598`, `egress.rs:259-290` | The interactive UDP class is hard-bound to a single connection (one driver + one state lock carries all small-packet associations); bulk already has shard rotation, which could be generalized (design cap, not a defect) |
 
 ---
 
-## 4. 已确认优化到位、**不建议动**的点
+## 4. Points Confirmed Optimized and **Not Recommended to Touch**
 
-以下经逐行核对 + 代码内已有测量，属于"再动是负收益或重复劳动"：
+The following, after line-by-line verification + existing in-code measurements, fall into "changing them again is negative gain or duplicated work":
 
-- **每数据报 encode**：`Vec::with_capacity` 精确容量 + `Bytes::from` 走 in-place `into_boxed_slice`
-  （`mqp/datagram.rs:97-135`），1 次分配 + 1 次拷贝；帧池化已被 `examples/frame_bench.rs` 实测否决
-  （+39~52% / +128~324%）。
-- **`DgramPrefixCache`**：稳态同 (sess,dst) 零校验、零 re-encode（`mqp/datagram.rs:168-217`）。
-- **BATCH 编解码**：`decode_batch` 零分配、先整帧校验再惰性迭代（`mqp/batch.rs:141-181`）。
-- **quinn 每帧 state 锁**：`send_datagram_wait` 内部锁，API 内在，本仓库无法绕过。
-- **重组器 chunk 拷贝**：`Bytes::copy_from_slice` 是为让 `FRAG_MAX_HELD_BYTES` 记账精确
-  （否则 20B 分片会钉住 ~92KiB 的 GRO batch，见 `udp/reassembler.rs:266-279` 与对应测试）。
-- **TCP pump**：`read_chunks(8)` + `write_vectored`、≥8KiB `write_chunk` 零拷贝、双缓冲池、
-  固定 5s idle tick（`tcp/pump.rs:229-535`）；无逐 chunk 分配。
-- **thread-local 统计**：`udp_stats::payload`、`udp_write::sent`、`record_drain_batch` 均 256 批处理
-  （F12 只是把漏掉的两个字段补齐）。
-- **egress memo / hub / dispatcher**：`with_fresh` 1×TLS + 1×Acquire load、无 Arc RMW、无 quinn 锁
-  （`egress.rs:139-165`）；hub 256 shard `ArcSwap<HashMap>` 读路径无锁（`hub.rs:210-233`）；
-  dispatcher 每唤醒 drain ≤32 包、无逐包 spawn/通道（`dispatcher.rs:615-693`）。
-- **正常发送路径不付 retry 代价**：`udp_try_send_*` 成功时只有 `try_send_to` + TLS 计数。
-- **正则/日志/format**：所有热路径 warn 都限频且 detail 闭包只在 due 时执行；无逐包格式化。
-- **coarse/mono 时钟**：coarse 1.44ns、mono 3.26ns（实测），逐包路径已用 coarse；不要再改。
-- **transport/TLS/DNS memo**：启动构建一次；DNS memo hit 零分配零锁；`is_global_ip` 只在 cache-miss。
-- **sendmmsg/recvmmsg batching**：last-hop 已按 (sock,dst) run 分组、Linux 一次最多 32 帧；
-  `sendmmsg_frames` 已用 `MaybeUninit` 消除 2.7KB 死存储；F5 只是 n==1+header 的残留。
-
----
-
-## 5. 建议修复顺序与验证方式
-
-**第一批（小改动、大收益、含安全放大）**
-1. **F1**：slow path 合并 session memo + filtered 负缓存 + in-flight 去重（+ seeded DNS 单测）。
-2. **F2**：fast table 有界线性探测（+ 稀疏 id 单测）。
-3. **F5**：client n==1 走 `sendmmsg_frames`；server n==1 直接单帧（+ batch 用例断言）。
-4. **F6**：`udp::batch` 借用式 burst 访问器，client/server 两处就地处理。
-5. **F7**：epoch 只在真正写入时 bump（+ 单测）。
-6. **F12**：fragmented/unsolicited 并入 TLS 批次。
-
-**第二批（需先测量）**
-7. **F3**：Linux 2~4 核 `hotpath_bench udpmulti/lat/lattcp` 复核过度订阅；再限定主 runtime worker 数/钉核。
-8. **F4**：重组器插入序队列 + 惰性淘汰；`udpps` + 分片流量压测对比。
-9. **F8**：client 上行 N-pack（照 server `reply_stage` 模式）。
-10. **F9**：fragmenter blocked 状态 + `datagram_send_buffer_space()` 预检；饱和态带宽对比。
-11. **F10**：先 `MYQUIC2_SHARD_RUNTIME=0` A/B，再决定是否迁移 relay 任务。
-
-**第三批**：F11、F13、P3 清单（低风险清理）。
-
-**共性验证手段**
-- 单元测试：seeded DNS、稀疏 session id、epoch 计数、n==1 单帧、burst 借用访问器。
-- 端到端：`examples/hotpath_bench.rs` 的 `udpps`/`udppaced`/`udpmulti`/`udpdomain`/`bulk`/`lat`，
-  在 Linux 目标机（含 2~4 核小机器）对比修复前后 CPU/pps/延迟。
-- 系统观测：`perf stat`（context-switch、cycles/instruction）、`strace -c`（session 创建的 syscall 数）、
-  `perf record`（确认热点迁移）。
+- **Per-datagram encode**: `Vec::with_capacity` exact capacity + `Bytes::from` goes through in-place `into_boxed_slice`
+  (`mqp/datagram.rs:97-135`), 1 allocation + 1 copy; frame pooling has already been rejected by measurement in `examples/frame_bench.rs`
+  (+39~52% / +128~324%).
+- **`DgramPrefixCache`**: steady state, same (sess,dst) → zero validation, zero re-encode (`mqp/datagram.rs:168-217`).
+- **BATCH encode/decode**: `decode_batch` zero allocation, validates the whole frame first then iterates lazily (`mqp/batch.rs:141-181`).
+- **quinn per-frame state lock**: internal to `send_datagram_wait`, intrinsic to the API, cannot be bypassed by this repository.
+- **Reassembler chunk copy**: `Bytes::copy_from_slice` exists to make `FRAG_MAX_HELD_BYTES` accounting exact
+  (otherwise a 20B fragment would pin a ~92KiB GRO batch, see `udp/reassembler.rs:266-279` and the corresponding tests).
+- **TCP pump**: `read_chunks(8)` + `write_vectored`, ≥8KiB `write_chunk` zero copy, double-buffer pool,
+  fixed 5s idle tick (`tcp/pump.rs:229-535`); no per-chunk allocation.
+- **thread-local statistics**: `udp_stats::payload`, `udp_write::sent`, `record_drain_batch` all do 256 batching
+  (F12 only fills in the two missed fields).
+- **egress memo / hub / dispatcher**: `with_fresh` 1×TLS + 1×Acquire load, no Arc RMW, no quinn lock
+  (`egress.rs:139-165`); hub's 256-shard `ArcSwap<HashMap>` read path is lock-free (`hub.rs:210-233`);
+  dispatcher drains ≤32 packets per wake, no per-packet spawn/channel (`dispatcher.rs:615-693`).
+- **Normal send path pays no retry cost**: on success `udp_try_send_*` only does `try_send_to` + TLS counting.
+- **Regex/logging/format**: all hot-path warns are rate-limited and detail closures only run when due; no per-packet formatting.
+- **coarse/mono clocks**: coarse 1.44ns, mono 3.26ns (measured); the per-packet path already uses coarse; do not change again.
+- **transport/TLS/DNS memo**: built once at startup; DNS memo hit is zero allocation, zero lock; `is_global_ip` only on cache miss.
+- **sendmmsg/recvmmsg batching**: the last hop already groups by (sock,dst) run, Linux up to 32 frames at a time;
+  `sendmmsg_frames` already uses `MaybeUninit` to eliminate the 2.7KB dead store; F5 is only the n==1+header residue.
 
 ---
 
-## 6. 局限
+## 5. Recommended Fix Order and Validation Approach
 
-- 未执行端到端 benchmark；本文百分比/µs 均为"单事件成本 × 频率假设"的估算或代码内既有测量，
-  以量级和相对排序为目的，最终收益需在 Linux 目标机复测。
-- 微基准在 Apple M4/macOS 上运行；Linux 的 syscall 单价通常更低、quanta 精度不同，但
-  syscall 次数、原子争用、拷贝字节数的机制一致，问题方向不变。
-- F3/F9/F10 的触发频率依赖部署形态（核数、饱和程度、跨核拓扑），列为 P1/P2 时已标注条件。
+**First batch (small changes, large gains, includes security amplification)**
+1. **F1**: slow path merge session memo + filtered negative cache + in-flight dedup (+ seeded DNS unit tests).
+2. **F2**: fast table bounded linear probing (+ sparse id unit tests).
+3. **F5**: client n==1 uses `sendmmsg_frames`; server n==1 sends a single frame directly (+ batch case assertions).
+4. **F6**: `udp::batch` borrowed burst accessor, processed in place at both client/server.
+5. **F7**: epoch bumps only on real writes (+ unit test).
+6. **F12**: fragmented/unsolicited merged into the TLS batch.
+
+**Second batch (measure first)**
+7. **F3**: Linux 2~4 core `hotpath_bench udpmulti/lat/lattcp` to re-check oversubscription; then limit the main runtime worker count/pinning.
+8. **F4**: reassembler insertion-order queue + lazy eviction; compare `udpps` + fragmented traffic load tests.
+9. **F8**: client uplink N-pack (following the server `reply_stage` pattern).
+10. **F9**: fragmenter blocked state + `datagram_send_buffer_space()` pre-check; saturated-state bandwidth comparison.
+11. **F10**: first `MYQUIC2_SHARD_RUNTIME=0` A/B, then decide whether to migrate the relay task.
+
+**Third batch**: F11, F13, P3 list (low-risk cleanup).
+
+**Common validation means**
+- Unit tests: seeded DNS, sparse session ids, epoch counting, n==1 single frame, burst borrowed accessor.
+- End-to-end: `examples/hotpath_bench.rs`'s `udpps`/`udppaced`/`udpmulti`/`udpdomain`/`bulk`/`lat`,
+  comparing CPU/pps/latency before and after on a Linux target machine (including 2~4 core small machines).
+- System observation: `perf stat` (context-switch, cycles/instruction), `strace -c` (syscall count on session creation),
+  `perf record` (confirm hotspot migration).
 
 ---
 
-## 7. 实施记录与验证（2026-10-19）
+## 6. Limitations
 
-### 7.1 改动范围
+- No end-to-end benchmark was executed; all percentages/µs here are estimates from "per-event cost × frequency assumption" or existing in-code measurements,
+  intended for orders of magnitude and relative ranking; final gains need re-measurement on a Linux target machine.
+- Microbenchmarks ran on Apple M4/macOS; Linux syscall unit prices are usually lower and quanta precision differs, but
+  the mechanics — syscall counts, atomic contention, copied bytes — are the same, so the problem direction is unchanged.
+- The trigger frequency of F3/F9/F10 depends on deployment shape (core count, saturation level, cross-core topology); conditions were noted where they were listed as P1/P2.
 
-17 个源文件（+3298/−874），未改 `src/config/**`、`Cargo.toml`/`Cargo.lock`：
+---
 
-| 文件组 | 修复 |
+## 7. Implementation Record and Verification (2026-10-19)
+
+### 7.1 Change Scope
+
+17 source files (+3298/−874), no changes to `src/config/**`, `Cargo.toml`/`Cargo.lock`:
+
+| File group | Fixes |
 |---|---|
 | `src/bin/myquic2-server/{accept,forward,pin,reader,table,tests}.rs` | F1/F2/F5-server/F6-server/F7/F11b/P3-2/P3-3 |
-| `src/bin/myquic2-client/assoc.rs` | F6-client、P3-6 |
-| `src/udp/{batch,retry,fragmenter,reassembler,send}.rs`、`src/udp.rs` | F4/F5/F6-API/F9/P3-4 + `note_send_buffer_full` 记账入口 |
-| `src/lib.rs`、`src/stats/udp_stats.rs`、`src/dns/resolve.rs` | F11a/F12/P3-5 + `udp_socket_dual_small_addr` |
-| `src/mqp/fragment.rs` | 淘汰策略注释同步（唯一文档改动） |
+| `src/bin/myquic2-client/assoc.rs` | F6-client, P3-6 |
+| `src/udp/{batch,retry,fragmenter,reassembler,send}.rs`, `src/udp.rs` | F4/F5/F6-API/F9/P3-4 + `note_send_buffer_full` accounting entry |
+| `src/lib.rs`, `src/stats/udp_stats.rs`, `src/dns/resolve.rs` | F11a/F12/P3-5 + `udp_socket_dual_small_addr` |
+| `src/mqp/fragment.rs` | eviction policy comment sync (the only documentation change) |
 
-### 7.2 验证结果（macOS aarch64 本机 + Podman Linux 容器，rustc 1.99.0）
+### 7.2 Verification Results (macOS aarch64 local + Podman Linux container, rustc 1.99.0)
 
-| 命令 | 结果 |
+| Command | Result |
 |---|---|
-| `cargo fmt --all --check` | ✅ clean（已在集成时统一 fmt） |
+| `cargo fmt --all --check` | ✅ clean (fmt unified at integration time) |
 | `cargo clippy --all-targets -- -D warnings` | ✅ clean |
-| `cargo test --all-targets`（macOS 本机） | ✅ **279 passed / 0 failed**（lib 134 / client 76 / server 69；基线约 240，新增 39 个回归测试） |
-| **`cargo test --all-targets`（Podman / Debian 12 aarch64 Linux 容器）** | ✅ **283 passed / 0 failed**（lib 138 / client 76 / server 69；多出的 4 个是 `#[cfg(target_os = "linux")]` 测试） |
-| **`cargo fmt --all --check` + `cargo clippy --all-targets -- -D warnings`（同一 Linux 容器）** | ✅ clean（CI parity） |
-| `cargo zigbuild --target x86_64-unknown-linux-gnu --all-targets` | ✅ exit 0（含 Linux-only cfg 分支：F5 sendmmsg、F6 with_burst_msg、F9 gate、F11a probe） |
-| `cargo zigbuild --target x86_64-unknown-linux-musl --bins` | ✅ exit 0（CI 静态 musl 目标） |
+| `cargo test --all-targets` (macOS local) | ✅ **279 passed / 0 failed** (lib 134 / client 76 / server 69; baseline about 240, 39 new regression tests) |
+| **`cargo test --all-targets` (Podman / Debian 12 aarch64 Linux container)** | ✅ **283 passed / 0 failed** (lib 138 / client 76 / server 69; the extra 4 are `#[cfg(target_os = "linux")]` tests) |
+| **`cargo fmt --all --check` + `cargo clippy --all-targets -- -D warnings` (same Linux container)** | ✅ clean (CI parity) |
+| `cargo zigbuild --target x86_64-unknown-linux-gnu --all-targets` | ✅ exit 0 (including Linux-only cfg branches: F5 sendmmsg, F6 with_burst_msg, F9 gate, F11a probe) |
+| `cargo zigbuild --target x86_64-unknown-linux-musl --bins` | ✅ exit 0 (CI static musl target) |
 | `git diff --check` | ✅ clean |
 
-> Linux 容器运行说明：镜像基于 `localhost/myquic2-ci:1.99`（Rust 1.99.0）加装 `cmake`/`ninja`，
-> 挂载工作区与宿主 cargo registry，`CARGO_TARGET_DIR` 指向 Podman volume。这样
-> `recvmmsg`/`sendmmsg`、`with_burst_msg` 就地分支、F9 backpressure gate、F11a Linux 探测等
-> 运行时路径都真正被执行并通过。剩余未验证项只有**吞吐/延迟收益**本身：建议在 Linux 目标机用
-> `examples/hotpath_bench.rs`（`udpps`/`udppaced`/`udpdomain`/`udpmulti`）做修复前后对比。
+> Linux container run notes: the image is based on `localhost/myquic2-ci:1.99` (Rust 1.99.0) with `cmake`/`ninja` added,
+> with the workspace and host cargo registry mounted, and `CARGO_TARGET_DIR` pointing at a Podman volume. This way
+> `recvmmsg`/`sendmmsg`, the `with_burst_msg` in-place branch, the F9 backpressure gate, F11a Linux probing and other
+> runtime paths are genuinely executed and pass. The only remaining unverified item is the **throughput/latency gain** itself: it is recommended to use
+> `examples/hotpath_bench.rs` (`udpps`/`udppaced`/`udpdomain`/`udpmulti`) on a Linux target machine for a before/after comparison.
 
-### 7.3 行为变化（需要 review 关注）
+### 7.3 Behavior Changes (require review attention)
 
-1. **F1**：解析在飞期间，同一 `(session, name, port)` 的后续数据报现在直接丢弃（UDP 语义，
-   计 `REFUSED`），而不是各自 spawn 一个 resolver；全过滤/失败结论缓存 5s，期间 inline 拒绝。
-   原有 `l2_dns_singleflight_burst_delivers_server` 相应改名为
-   `l2_dns_burst_coalesces_to_one_waiter_per_session`（断言 spawn==1）。
-2. **F5-server**：单条 staged 回复现在发单个 `0x02` DATAGRAM，不再包 1-item BATCH 帧
-   （客户端两种都接受；wire 上每回复少 3 字节包装）。
-3. **F6**：Linux 上 recvmmsg 排空的数据报不再拷贝到调用方 buf（非 Linux/无 recvmmsg 保持原路径）。
-4. **F11a**：socket buffer clamp 判定改为进程级缓存（首个 socket 探测后不再观察运行期
-   `net.core.*mem_max` 变化，重启生效；与 `MYQUIC2_SESS_SOCKET_BUF` 的进程级模型一致）。
-5. **P3-3**：pin 命中不再每包重做 SSRF 判定（arm 前已过滤、pin 地址生命周期内不变、谓词纯函数）；
-   安全语义不变。
-6. **P3-5**：DNS warm-hit 改为先 positive 后 negative（正/负 store 互斥不变式有测试钉住），
-   负缓存命中路径多一次 positive probe，warm 路径少一次。
+1. **F1**: while a resolution is in flight, subsequent datagrams for the same `(session, name, port)` are now dropped directly (UDP semantics,
+   counted `REFUSED`), instead of each spawning a resolver; all-filtered/failure verdicts are cached for 5s, rejected inline during that time.
+   The existing `l2_dns_singleflight_burst_delivers_server` was renamed accordingly to
+   `l2_dns_burst_coalesces_to_one_waiter_per_session` (asserts spawn==1).
+2. **F5-server**: a single staged reply now sends a single `0x02` DATAGRAM, no longer wrapping a 1-item BATCH frame
+   (the client accepts both; 3 fewer wrapping bytes per reply on the wire).
+3. **F6**: on Linux, datagrams drained by recvmmsg are no longer copied into the caller's buf (non-Linux/no recvmmsg keeps the original path).
+4. **F11a**: the socket buffer clamp verdict changed to a process-level cache (after the first socket probe, runtime
+   `net.core.*mem_max` changes are no longer observed, effective on restart; consistent with `MYQUIC2_SESS_SOCKET_BUF`'s process-level model).
+5. **P3-3**: a pin hit no longer redoes the SSRF verdict per packet (already filtered before arm, the pin address is immutable over its lifetime, the predicate is pure);
+   security semantics unchanged.
+6. **P3-5**: DNS warm-hit changed to positive first then negative (the positive/negative store mutual-exclusion invariant is pinned by a test),
+   the negative cache hit path pays one extra positive probe, the warm path one fewer.
 
-### 7.4 后续（deferred，按 §0.5）
+### 7.4 Follow-up (deferred, per §0.5)
 
-F3（线程拓扑）、F8（client N-pack）、F10（跨 runtime）、F13（重组器探测融合）、
-P3-1/P3-7/P3-8/P3-9 —— 均需 Linux benchmark 或收益/风险比不适合本批，已在报告中保留设计方案。
-
+F3 (thread topology), F8 (client N-pack), F10 (cross-runtime), F13 (reassembler probe fusion),
+P3-1/P3-7/P3-8/P3-9 — all need a Linux benchmark or have a gain/risk ratio unsuitable for this batch; design proposals were retained in the report.

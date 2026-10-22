@@ -1,16 +1,18 @@
-//! MQP-2 UDP 分片发送器：逐行搬运自 `src/lib.rs`（零改动抽取，`lib.rs` 未碰）。
+//! MQP-2 UDP fragment sender: moved line by line from `src/lib.rs` (zero-change
+//! extraction; `lib.rs` untouched).
 //!
-//! 搬运区间（以符号为准）：
-//! - `DgramFragmenter`：lib.rs:1059-1070（含 1059-1063 文档与 1064 derive）
-//! - `frag_id_reuse_blocked`：lib.rs:1072-1079
-//! - `impl DgramFragmenter`（含 `send` 全套）：lib.rs:1081-1238
+//! Moved ranges (keyed by symbol):
+//! - `DgramFragmenter`: lib.rs:1059-1070 (including the 1059-1063 docs and the 1064 derive)
+//! - `frag_id_reuse_blocked`: lib.rs:1072-1079
+//! - `impl DgramFragmenter` (including all of `send`): lib.rs:1081-1238
 //!
-//! 接线：`mqp`（`TargetAddrRef`/`FRAG_PREFIX_LEN`/`FRAG_ID_SAFE_WINDOW_MS`/
+//! Wiring: `mqp` (`TargetAddrRef`/`FRAG_PREFIX_LEN`/`FRAG_ID_SAFE_WINDOW_MS`/
 //! `MQP_FRAG_MAX_PAYLOAD`/`MQP_FRAG_MAX_TOTAL`/`DGRAM_PREFIX_LEN`/
-//! `encode_fragment_with_header`）、`time`（`mono_millis`）、
-//! `stats`（`dgram_drops::*`、`udp_stats::*`、`warn_datagram_drop`、
-//! `DatagramDropKind`）、同目录 `send`（`DatagramSend`、`send_udp_datagram_with_header`、
-//! `send_encoded`）均经 `crate::` / `super::` 路径引用。
+//! `encode_fragment_with_header`), `time` (`mono_millis`),
+//! `stats` (`dgram_drops::*`, `udp_stats::*`, `warn_datagram_drop`,
+//! `DatagramDropKind`), and the sibling `send` module (`DatagramSend`,
+//! `send_udp_datagram_with_header`, `send_encoded`) are all referenced through
+//! `crate::` / `super::` paths.
 
 use super::send::{
     DatagramSend, PayloadSend, note_send_buffer_full, send_encoded, send_udp_datagram_with_prefix,

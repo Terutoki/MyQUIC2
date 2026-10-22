@@ -39,6 +39,16 @@ pub const R2_MAX_FLOWS_PER_SESSION: usize = 64;
 /// makes this negotiable; this is the default both endpoints start from.
 pub const R2_MAX_FLOWS_PER_CONN: usize = 4096;
 
+/// Resolved addresses retained per domain flow. The set authorizes downlink
+/// reply sources before an exact `reply_src` is learned. A peer-controlled
+/// name can answer with more records than any real multi-homed service, and
+/// every extra address costs memory per flow plus a comparison per reply.
+/// A reply from an address beyond the cap is treated like any other unmatched
+/// source (inline under full-cone, refused by the restricted filter); the first
+/// address is always kept, so the OPEN still forwards. Sixteen covers real
+/// multi-A/AAAA sets with a wide margin.
+pub const R2_MAX_RESOLVED_ADDRS: usize = 16;
+
 /// Highest sender-local id that still fits `wire_id = (local << 1) | owner`.
 const MAX_LOCAL_FLOW_ID: u32 = u32::MAX >> 1;
 
@@ -249,34 +259,44 @@ impl SessionFlows {
     }
 
     /// Classify a reply source for the downlink direction.
+    ///
+    /// One pass over the table: a learned reply source is the strongest match
+    /// and wins wherever it sits, so the first candidate for the weaker classes
+    /// is remembered and resolved only after the scan. Older revisions scanned
+    /// the table three times (and re-loaded every `reply_src` on the first
+    /// pass) for every incoming reply.
     #[must_use]
     pub fn match_source(&self, src: SocketAddr) -> Option<SourceMatch> {
-        // A learned reply source is the strongest match (covers domain targets
-        // and port changes after the first rebind).
-        if let Some(b) = self
-            .entries
-            .iter()
-            .flatten()
-            .find(|b| b.reply_src() == Some(src))
-        {
-            return Some(SourceMatch::Exact(b.clone()));
+        let mut exact: Option<&Arc<FlowBinding>> = None;
+        let mut rebind: Option<&Arc<FlowBinding>> = None;
+        for b in self.entries.iter().flatten() {
+            // A learned reply source is the strongest match (covers domain
+            // targets and port changes after the first rebind).
+            if b.reply_src() == Some(src) {
+                return Some(SourceMatch::Exact(b.clone()));
+            }
+            if exact.is_none()
+                && let TargetAddr::Ip(a) = &b.target
+                && *a == src
+            {
+                exact = Some(b);
+            }
+            if rebind.is_none() {
+                let hit = match &b.target {
+                    TargetAddr::Ip(a) => a.ip() == src.ip(),
+                    TargetAddr::Domain(..) => b.resolved_contains(src.ip()),
+                };
+                if hit {
+                    rebind = Some(b);
+                }
+            }
         }
-        // Exact IP flow target.
-        if let Some(b) = self.entries.iter().flatten().find(|b| match &b.target {
-            TargetAddr::Ip(a) => *a == src,
-            TargetAddr::Domain(..) => false,
-        }) {
+        if let Some(b) = exact {
             return Some(SourceMatch::Exact(b.clone()));
         }
         // Same-IP different-port, or a domain flow whose resolved address
         // matches: needs one inline binding frame before compression.
-        if let Some(b) = self.entries.iter().flatten().find(|b| match &b.target {
-            TargetAddr::Ip(a) => a.ip() == src.ip(),
-            TargetAddr::Domain(..) => b.resolved_contains(src.ip()),
-        }) {
-            return Some(SourceMatch::Rebind(b.clone()));
-        }
-        None
+        rebind.map(|b| SourceMatch::Rebind(b.clone()))
     }
 
     /// Insert a binding; returns `false` when the table is full or the id is

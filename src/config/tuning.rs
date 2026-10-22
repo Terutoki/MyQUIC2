@@ -9,7 +9,30 @@ use super::server_conf::ServerConf;
 // split); refer to it at the crate root until it moves with that section.
 use crate::DATAGRAM_BUFFER;
 use crate::FRAG_MAX_HELD_BYTES;
+use crate::mqp::r2_flow::{FlowBinding, R2_MAX_FLOWS_PER_CONN};
 use crate::mqp::v3::MQP3_FLOW_TABLE_MAX_BYTES;
+use crate::udp::r2_stage::{R2_STAGE_MAX_BYTES, R2_STAGE_MAX_ITEMS, R2StageItem};
+
+/// Rev2 ingress state outside the transport windows and outside this crate's
+/// type-visible per-connection structures: the pre-HELLO frame buffer
+/// (16 KiB, `accept.rs::PRE_HELLO_MAX_BYTES`), the 16-slot fast session table
+/// (a few KiB), and the small fixed maps next to them. A conservative single
+/// term keeps the admission bound from depending on binary-private types.
+pub const R2_INGRESS_FIXED_BYTES: u64 = 32 * 1024;
+
+/// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`
+/// header (16 B), the target's domain name up to the 255-byte wire limit, and
+/// the bounded resolved set (`R2_MAX_RESOLVED_ADDRS` × 32-byte `SocketAddr`
+/// plus the `Arc`/`Vec` headers). That is 823 B; 832 keeps the arithmetic
+/// round. Name and resolved set exist only for domain flows, but admission
+/// must bound the peer-fillable worst case.
+pub const R2_FLOW_HEAP_SLACK_BYTES: u64 = 832;
+
+/// `VecDeque` allocates a minimum of eight slots on its first push. With one
+/// item in each of `R2_STAGE_MAX_ITEMS` sessions, the stager's item storage is
+/// therefore eight slots per queued item, not one — the packed-burst average is
+/// much lower, but admission has to bound the worst case.
+pub const R2_STAGER_SLOT_FACTOR: usize = 8;
 
 pub(super) fn d_bbr() -> String {
     "bbr".into()
@@ -267,7 +290,12 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 /// - both per-connection reassembly budgets ([`FRAG_MAX_HELD_BYTES`] each): the
 ///   legacy MQP-2 and the rev2 reassembler run side by side during the wire
 ///   transition, and a peer that sends fragments it never completes pins each
-///   until the partials expire.
+///   until the partials expire;
+/// - the rev2 egress stager (its byte cap plus the per-item queue-node/`Bytes`
+///   overhead), the pre-HELLO/fast-session ingress state, and the connection's
+///   flow registry at its 4096-binding cap (each binding is an `Arc` plus its
+///   target/resolved set). Those are peer-fillable even though they are not
+///   part of quinn's transport state.
 ///
 /// Per-stream windows are not added: they are bounded by the connection window.
 /// The result is a ceiling, not a reservation — quinn allocates on demand — which
@@ -282,11 +310,18 @@ fn clamp_window_mb(v: Option<u64>, def_mb: u64) -> u64 {
 /// subtracts the pool from the operator's budget once, globally; see
 /// [`session_pool_memory_bytes`].
 pub fn per_connection_memory_bytes(tuning: &TransportTuning) -> u64 {
+    let stager = R2_STAGE_MAX_BYTES as u64
+        + (R2_STAGE_MAX_ITEMS * std::mem::size_of::<R2StageItem>() * R2_STAGER_SLOT_FACTOR) as u64;
+    let registry = R2_MAX_FLOWS_PER_CONN as u64
+        * (std::mem::size_of::<FlowBinding>() as u64 + R2_FLOW_HEAP_SLACK_BYTES);
     tuning
         .receive_window
         .saturating_add(tuning.send_window)
         .saturating_add(2 * DATAGRAM_BUFFER as u64)
         .saturating_add(2 * FRAG_MAX_HELD_BYTES as u64)
+        .saturating_add(stager)
+        .saturating_add(R2_INGRESS_FIXED_BYTES)
+        .saturating_add(registry)
 }
 
 /// Worst-case memory one UDP session can pin, in bytes: the session socket's

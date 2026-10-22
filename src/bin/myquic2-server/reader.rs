@@ -4,8 +4,8 @@ use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{FlowBinding, FlowRegistry, FlowState, SessionFlows, SourceMatch};
 use myquic2::udp::r2_frag::R2FragFlow;
 use myquic2::udp::{
-    PackedFrames, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager,
-    send_packed_frames,
+    R2Fragmenter, R2StageItem, R2StageKind, R2Stager, book_too_large, drain_staged,
+    encode_standalone_item,
 };
 
 /// Userspace receive buffer per session reader: one full-protocol-cap datagram
@@ -304,12 +304,11 @@ pub(crate) fn stage_verdict(failed: Option<DatagramSend>) -> StageDrain {
 /// The stager books sent payloads itself and accounts the refused frame's
 /// payloads, so this function counts nothing — it must never double-book.
 ///
-/// The drain is the two-phase split ([`R2Stager::pack`] +
-/// [`send_packed_frames`]): packing up to a full queue's worth of frames stays
-/// inside a short lock hold, and the QUIC writes happen unlocked, so this
-/// session's burst no longer blocks every other session's `stage_push` behind
-/// its series of DATAGRAM sends. The post-send requeue takes a fresh hold and
-/// books its (should-never-happen) overflow with the same full-queue policy
+/// The drain packs bounded batches ([`drain_staged`]) so a full send buffer
+/// cannot make every reply re-encode the queue; the QUIC writes happen outside
+/// the stager lock, so this session's burst no longer blocks every other
+/// session's `stage_push`. The post-send requeue takes a fresh hold and books
+/// its (should-never-happen) overflow with the same full-queue policy
 /// `stage_push` uses.
 pub(crate) fn drain_stage(
     c2: &quinn::Connection,
@@ -317,26 +316,13 @@ pub(crate) fn drain_stage(
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
 ) -> StageDrain {
-    let mut q = PackedFrames::default();
-    {
-        let mut st = stage.lock();
-        st.pack(*limit, &mut q);
-    }
-    let outcome: R2DrainOutcome = send_packed_frames(c2, &mut q);
-    if outcome.failed.is_some() {
-        let overflow = stage.lock().requeue_unsent(&mut q, outcome.frames as usize);
-        for _ in 0..overflow {
-            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-            r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
-        }
-    }
+    let outcome = drain_staged(c2, stage, *limit, || {
+        dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+        r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+    });
     let verdict = stage_verdict(outcome.failed);
     if verdict == StageDrain::TooLarge {
-        let now_probe = mono_millis().max(1);
-        if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
-            *last_too_large_probe_ms = now_probe;
-            *limit = c2.max_datagram_size().unwrap_or(0);
-        }
+        reprobe_large(c2, limit, last_too_large_probe_ms);
     }
     verdict
 }
@@ -372,13 +358,18 @@ fn stage_push(
 }
 
 /// Stage the first frame of a rebinding flow (`DATA OPEN|SRC`) and learn the
-/// actual reply source only once that frame was really queued.
+/// actual reply source only once that frame was really sent.
 ///
-/// The push and the drain run under one stager lock, so no other reader can
-/// send or enqueue between them: if the drain reports no failure and no
-/// budget-dropped items, the queue it just emptied contained this `OPEN|SRC`
-/// and it was queued on the wire. Only then is `reply_src` recorded, which is
-/// what lets the *following* replies from the same source compress.
+/// The `OPEN|SRC` is sent as a **standalone frame outside the stager lock**.
+/// Packing the whole queue under one lock just to deliver this one frame used
+/// to serialise every session reader behind the encode + every DATAGRAM send;
+/// and the old "no failure and no dropped items" connection-level verdict
+/// could not distinguish this frame's fate from another session's. Sending it
+/// directly gives an exact per-frame verdict: `reply_src` is learned only on
+/// `Sent`. On `Blocked` the payload is offered to the stager (the burst-end
+/// drain will retry it) and `reply_src` stays unlearned, so the next reply
+/// repeats the OPEN — which is exactly the idempotent rebind the protocol
+/// wants. A queue that is also full is an ordinary UDP drop.
 fn stage_open_src(
     c2: &quinn::Connection,
     stage: &Arc<parking_lot::Mutex<R2Stager>>,
@@ -386,30 +377,54 @@ fn stage_open_src(
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
 ) -> (StageDrain, bool) {
-    let mut st = stage.lock();
-    if let Err(item) = st.push(item) {
-        // Queue already full: drain it once, then push again.
-        let _ = st.drain(c2, *limit);
-        if let Err(item) = st.push(item) {
-            drop(st);
+    let body = match encode_standalone_item(&item, *limit) {
+        Some(body) => body,
+        None => {
+            book_too_large(1);
             drop(item);
-            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-            r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
-            return (StageDrain::Ok, false);
+            reprobe_large(c2, limit, last_too_large_probe_ms);
+            return (StageDrain::TooLarge, false);
+        }
+    };
+    match try_send_datagram(c2, body) {
+        DatagramSend::Sent => {
+            udp_stats::payload(item.payload.len());
+            (StageDrain::Ok, true)
+        }
+        DatagramSend::Blocked => {
+            // Backpressure: keep the payload queued when possible. It carries
+            // no learned `reply_src`; the next reply re-sends the OPEN.
+            match stage.lock().push(item) {
+                Ok(_) => (StageDrain::Ok, false),
+                Err(item) => {
+                    drop(item);
+                    dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+                    r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+                    (StageDrain::Ok, false)
+                }
+            }
+        }
+        DatagramSend::TooLarge => {
+            book_too_large(1);
+            drop(item);
+            reprobe_large(c2, limit, last_too_large_probe_ms);
+            (StageDrain::TooLarge, false)
+        }
+        DatagramSend::Unsupported | DatagramSend::ConnectionLost => {
+            drop(item);
+            dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+            (StageDrain::Terminal, false)
         }
     }
-    let outcome = st.drain(c2, *limit);
-    drop(st);
-    let verdict = stage_verdict(outcome.failed);
-    if verdict == StageDrain::TooLarge {
-        let now_probe = mono_millis().max(1);
-        if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
-            *last_too_large_probe_ms = now_probe;
-            *limit = c2.max_datagram_size().unwrap_or(0);
-        }
+}
+
+/// Re-read the live path budget under the shared probe throttle.
+fn reprobe_large(c2: &quinn::Connection, limit: &mut usize, last_too_large_probe_ms: &mut u64) {
+    let now_probe = mono_millis().max(1);
+    if too_large_probe_due(*last_too_large_probe_ms, now_probe) {
+        *last_too_large_probe_ms = now_probe;
+        *limit = c2.max_datagram_size().unwrap_or(0);
     }
-    let sent = outcome.failed.is_none() && outcome.items_dropped == 0;
-    (verdict, sent)
 }
 
 /// Outcome of the Phase 1b large-reply send (rev2 `DATA` or rev2 `FRAG`).
@@ -1027,7 +1042,7 @@ pub(crate) fn handle_session_reply(
     // - Exact  -> `Steady { wire_id }`, can join any train;
     // - Rebind -> `Open { wire_id, sess, addr, src: true }`, a standalone
     //   `DATA OPEN|SRC`; the reply source is learned only once the frame was
-    //   actually queued (see `stage_open_src`);
+    //   actually sent (see `stage_open_src`);
     // - None   -> `Inline { sess, addr, src: true }`, a standalone DATA INLINE
     //   (the self-describing fail-safe, e.g. a full-cone reply).
     //

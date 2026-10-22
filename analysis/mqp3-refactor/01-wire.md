@@ -1,380 +1,382 @@
-# MQP-3 wire 格式与编解码深度分析（task-1）
+# MQP-3 wire format and codec deep analysis (task-1)
 
-> 分析对象：`/Users/eric/WorkSpace/MyQUIC2`，HEAD `d2f9658` / `v0.2.0`（`git log --oneline -1` 已核对）。
-> 方式：**只读代码审计 + python3 算术建模**；未修改 `src/`、未执行 `cargo build/test`、未做网络测量。
-> 结论中每个字节数都给了**帧布局 + 公式 + 假设**；后文表格中的百分比均为 MQP 层字节，不含 IP/UDP/QUIC 开销（除特别注明）。
+> Subject: `/Users/eric/WorkSpace/MyQUIC2`, HEAD `d2f9658` / `v0.2.0` (verified with `git log --oneline -1`).
+> Method: **read-only code audit + python3 arithmetic modeling**; no modifications to `src/`, no `cargo build/test`, no network measurements.
+> Every byte count in the conclusions comes with **frame layout + formula + assumptions**; all percentages in the tables below are MQP-layer bytes, excluding IP/UDP/QUIC overhead (unless noted otherwise).
 >
-> 证据分级：
-> - **[代码]**：直接读源码得到的结构/常量，附 `file:line`。
-> - **[文档/既有测量]**：仓库 README / `PROTOCOL_ANALYSIS.md` / 代码注释里记录的历史测量，本次未复测。
-> - **[模型]**：本文用 §7.1 公式算出的估算值（无丢包、理想打包、IPv4 默认），用于判断量级与方向。
+> Evidence grading:
+> - **[Code]**: structures/constants obtained by reading the source directly, with `file:line`.
+> - **[Doc/existing measurement]**: historical measurements recorded in the repository README / `PROTOCOL_ANALYSIS.md` / code comments, not re-measured this time.
+> - **[Model]**: estimates computed with the §7.1 formulas (no packet loss, ideal packing, IPv4 default), used to judge magnitude and direction.
 >
-> 术语：上行 = client→server（app→target），下行 = server→client（target→app）；`limit` = `quinn::Connection::max_datagram_size()`，即**一个 QUIC DATAGRAM body 的预算**，`limit = MTU − 38`（README.md:777，`src/mqp/fragment.rs:64` 取 1162 = 1200−38）；本文用 `limit=1162 (MTU 1200)` 与 `limit=1362 (MTU 1400)` 两档。所有域名的地址开销按 `L=30` 字节计算（`4+L=34`，公式对一般 `L` 成立）。
+> Terminology: uplink = client→server (app→target), downlink = server→client (target→app); `limit` = `quinn::Connection::max_datagram_size()`, i.e. the **budget for one QUIC DATAGRAM body**, `limit = MTU − 38` (README.md:777, `src/mqp/fragment.rs:64` takes 1162 = 1200−38); this document uses two settings: `limit=1162 (MTU 1200)` and `limit=1362 (MTU 1400)`. Address overhead for all domain names is computed as `L=30` bytes (`4+L=34`; the formulas hold for general `L`).
+>
+> **README line references** below point to the baseline README at `d2f9658`; the README has since been expanded, so its line numbers have shifted. File-level claims are unaffected.
 
 ---
 
-## 0. 执行摘要（先给结论）
+## 0. Executive summary (conclusions first)
 
-1. **当前 v0.2.0 的 MQP-3 只完成了“同 session、IP 目标、≤512 B”的 flow/TRAIN 压缩**。三条最大结构性缺口是：
-   域名目标两个方向都无法压缩（§4-L1）、纯上行 flow 永远不压缩（§4-L2）、>512 B 全部退回 MQP-2（§4-L3）；再叠加**没有控制面**（§4-L4）和 **v3 FRAG 未接线**（§4-L5）。
-2. **字节上最大的单笔收益是域名目标压缩**：上行查询方向当前每帧 40 B 头（60 B 载荷 + 30 B 域名时占 MQP 字节 40%），加 FLOW_ACK 后可降到 5→2 B 头，**每 1000 个 payload 从 97,564 B 降到约 61,300 B（−37%）**；下行回包方向当前是 `NO_FLOW`+inline IP（v4 13 B / v6 25 B 头），ACK 后同样压到 5→2 B，**v4 −13%、v6 −26%**。[模型]
-3. 纯上行 IP flow（收不到回包、无法被隐式确认）当前每帧 12/13 B 头，FLOW_ACK 后 5→2 B：**稀疏单向流 −9.7%~−13.9%；高速单向流因每 TRAIN 只重复一次地址，约 −2%**。[模型]
-4. >512 B 载荷与分片统一进 v3 帧后，**大包头 12/24 B → 5/6 B（A）/2/3 B（B），分片头 18/30 B → 11（A）/8（B）B/片**；1200 B @MTU1200 的 2 片场景 wire −1.1%~−1.6%，IPv6 2 片 −3.0%~−3.5%，8192 B 8 片 −0.7%~−1.0%。**bulk 吞吐不会因此改变**（MQP 头在 1200 B 包里<1%，§8.3）。
-5. **跨 session 打包**（同一 QUIC 连接上多个 SOCKS association 的小包合成一个 TRAIN）每次调用可换 4×（8 session×4 item）到 16×（32 session×1 item）的 quinn send 次数，wire 省 2%~4.3%；价值在 CPU/锁，不在带宽。[模型]
-6. **推荐方向：候选 B —— 连接级 flow-id 命名空间 + 对称双向所有权 + 完整 CTL 面**（§6.2）。它用 2~3 B 稳态头（去掉每帧 `sess u32`）、8 B 分片头、跨 session TRAIN、域名/单向 flow 的 FLOW_ACK、服务端主动 flow（full-cone）压缩；候选 A（保留 `sess u32` 的增量方案，§6.1）作为低风险子集可先落地；候选 C（u16 sess 折中，§6.3）因 id 复用安全代价**不建议**。
-7. **命名约束**：全程仍称 **MQP-3**；建议在 CTL 的 HELLO/CAPS 里带 wire-version 字节（本文示例 `ver=2`），ALPN 仍叫 `myquic2/3` 或另加后缀——重设计只改变 MQP-3 的 wire 版本，不引入任何新协议代号（§6.2/§9-Q2）。
-8. **未做测量**：本文所有百分比必须理解为模型值；落地前后的 A/B 必须在 Linux 目标机用 `examples/hotpath_bench.rs` + 真实 app 负载复测（§9-Q8）。
-
----
-
-## 1. 背景与本文范围
-
-MyQUIC2 是一个 SOCKS5-over-QUIC 代理：TCP 走 QUIC stream，UDP 走 QUIC DATAGRAM，MQP-3 是 UDP 数据面的自定义帧格式（README.md:145、README.md:590-745）。数据面拓扑（[代码]）：
-
-- 客户端每条 UDP association（SOCKS5 UDP ASSOCIATE，上限 4032，`src/config/tuning.rs:116`）在 `assoc.rs` 里把 app 的 `RSV|FRAG|ATYP|ADDR|PORT|payload` 解出 payload，选一条 egress QUIC 连接（4 条 TCP 连接 + 1 条 interactive UDP + 2 条 bulk UDP shard，`src/config/tuning.rs:38,69`）发 DATAGRAM；同一个 QUIC 连接会被**多个 association 共享**。
-- 服务端每个 UDP session 一个 relay socket + 一个 reader task（`src/bin/myquic2-server/reader.rs:729`），`sess` 由客户端分配（`src/bin/myquic2-client/hub.rs:326-353`，单调 u32、0 保留），服务端 session 表是**每 QUIC 连接一张**（`src/bin/myquic2-server/accept.rs:797`，`SessTable` 按 `sess` 索引，`src/bin/myquic2-server/table.rs:58-64,91-97`）。
-- Flow 表是**每 session 一张**：`FlowTable [Option<Arc<TargetAddr>>; 64] + next`（`src/mqp/v3.rs:683-792`），客户端 uplink 分配、服务端从 inline open 镜像安装（`src/bin/myquic2-server/accept.rs:731-770`），下行用同一张表把“回包源地址”映射回 flow id（`src/bin/myquic2-server/reader.rs:128-171`）。
-
-本文范围：**只分析 wire 帧 / 编解码 / 帧级状态语义**。CPU 热点、调度、连接拓扑的代码级问题见 `PERF_ANALYSIS.md` 与团队其他报告，不重复。
+1. **MQP-3 in the current v0.2.0 only implements flow/TRAIN compression for "same session, IP target, ≤512 B"**. The three biggest structural gaps are:
+   domain targets cannot be compressed in either direction (§4-L1), pure-uplink flows are never compressed (§4-L2), and everything >512 B falls back to MQP-2 (§4-L3); on top of that there is **no control plane** (§4-L4) and **v3 FRAG is not wired** (§4-L5).
+2. **The largest single byte win is domain-target compression**: the uplink query direction currently has a 40 B header per frame (60 B payload + 30 B domain means 40% of MQP bytes); with FLOW_ACK it can drop to a 5→2 B header, **from 97,564 B to about 61,300 B per 1000 payloads (−37%)**; the downlink reply direction currently uses `NO_FLOW`+inline IP (v4 13 B / v6 25 B header), which after ACK also compresses to 5→2 B, **v4 −13%, v6 −26%**. [Model]
+3. Pure-uplink IP flows (no replies received, cannot be implicitly confirmed) currently have 12/13 B headers per frame; after FLOW_ACK 5→2 B: **sparse unidirectional flows −9.7%~−13.9%; high-rate unidirectional flows about −2% because the address is repeated only once per TRAIN**. [Model]
+4. Payloads >512 B and fragmentation unified into v3 frames: **large-packet header 12/24 B → 5/6 B (A)/2/3 B (B), fragment header 18/30 B → 11 (A)/8 (B) B per fragment**; 1200 B @MTU1200 with 2 fragments wire −1.1%~−1.6%, IPv6 2 fragments −3.0%~−3.5%, 8192 B 8 fragments −0.7%~−1.0%. **bulk throughput does not change because of this** (the MQP header is <1% of a 1200 B packet, §8.3).
+5. **Cross-session packing** (merging small packets from multiple SOCKS associations on the same QUIC connection into one TRAIN) can reduce quinn send calls per round by 4× (8 sessions×4 items) to 16× (32 sessions×1 item), saving 2%~4.3% on the wire; the value is in CPU/locks, not bandwidth. [Model]
+6. **Recommended direction: candidate B — connection-level flow-id namespace + symmetric bidirectional ownership + full CTL plane** (§6.2). It uses a 2~3 B steady-state header (removing the per-frame `sess u32`), an 8 B fragment header, cross-session TRAIN, FLOW_ACK for domain/unidirectional flows, and compression of server-initiated flows (full-cone); candidate A (the incremental option that keeps `sess u32`, §6.1) can land first as a low-risk subset; candidate C (u16 sess compromise, §6.3) is **not recommended** because of the id-reuse safety cost.
+7. **Naming constraint**: still called **MQP-3** throughout; it is suggested that the CTL HELLO/CAPS carry a wire-version byte (example in this document `ver=2`), and ALPN remains `myquic2/3` or gets an additional suffix — the redesign only changes MQP-3's wire version and introduces no new protocol codename (§6.2/§9-Q2).
+8. **No measurements were done**: every percentage in this document must be understood as a model value; the A/B before and after landing must be re-measured on a Linux target machine with `examples/hotpath_bench.rs` + real app workloads (§9-Q8).
 
 ---
 
-## 2. 现状 wire 规格（逐帧、精确到字节）
+## 1. Background and scope of this document
 
-### 2.1 帧类型总表
+MyQUIC2 is a SOCKS5-over-QUIC proxy: TCP goes over QUIC stream, UDP goes over QUIC DATAGRAM, and MQP-3 is the custom frame format of the UDP data plane (README.md:145, README.md:590-745). Data-plane topology ([Code]):
 
-| 首字节（高 4 bit = kind，低 4 bit = flags） | 名称 | v0.2.0 生产状态 | 证据 |
+- Each client UDP association (SOCKS5 UDP ASSOCIATE, cap 4032, `src/config/tuning.rs:116`) extracts the payload from the app's `RSV|FRAG|ATYP|ADDR|PORT|payload` in `assoc.rs`, picks an egress QUIC connection (4 TCP connections + 1 interactive UDP + 2 bulk UDP shards, `src/config/tuning.rs:38,69`) and sends a DATAGRAM; the same QUIC connection is **shared by multiple associations**.
+- On the server, each UDP session has one relay socket + one reader task (`src/bin/myquic2-server/reader.rs:729`); `sess` is allocated by the client (`src/bin/myquic2-client/hub.rs:326-353`, monotonic u32, 0 reserved), and the server session table is **one per QUIC connection** (`src/bin/myquic2-server/accept.rs:797`, `SessTable` indexed by `sess`, `src/bin/myquic2-server/table.rs:58-64,91-97`).
+- The flow table is **one per session**: `FlowTable [Option<Arc<TargetAddr>>; 64] + next` (`src/mqp/v3.rs:683-792`), allocated by the client on uplink and installed on the server by mirroring from the inline open (`src/bin/myquic2-server/accept.rs:731-770`); downlink uses the same table to map "reply source address" back to a flow id (`src/bin/myquic2-server/reader.rs:128-171`).
+
+Scope of this document: **only wire frames / codec / frame-level state semantics**. Code-level issues of CPU hotspots, scheduling, and connection topology are covered in `PERF_ANALYSIS.md` and other team reports and are not repeated here.
+
+---
+
+## 2. Current wire specification (frame by frame, byte exact)
+
+### 2.1 Frame type summary table
+
+| First byte (high 4 bits = kind, low 4 bits = flags) | Name | v0.2.0 production status | Evidence |
 |---|---|---|---|
-| `0x10` | `SINGLE` | 生产，双向；仅 ≤512 B 走这里 | `src/mqp/v3.rs:22,29-34`；`src/bin/myquic2-client/assoc.rs:301`；`src/bin/myquic2-server/reader.rs:629` |
-| `0x20` | `TRAIN` | 生产，双向，混合 flow/目的地 | `src/mqp/v3.rs:23,37-42` |
-| `0x30` | `FRAG` | **codec 已写、未接线**（生产走 MQP-2 `0x05`） | `src/mqp/v3.rs:24,66,542-671`；`src/bin/myquic2-client/dispatcher.rs:330-335`；`src/bin/myquic2-server/accept.rs:720-724` |
-| `0x40` | `CTL` | **仅常量**，无任何 opcode/编解码 | `src/mqp/v3.rs:25`；README.md:610 |
-| `0x02` | MQP-2 `DATAGRAM` | 生产：≤512 B 的兜底 + >512 B 单帧 | `src/mqp/datagram.rs:7,11`；`src/bin/myquic2-client/assoc.rs:882`；`src/bin/myquic2-server/reader.rs:199` |
-| `0x05` | MQP-2 `FRAGMENT` | 生产：>limit 的载荷（每片重复完整地址） | `src/mqp/fragment.rs:14,29,178-183`；`src/udp/fragmenter.rs:349-380` |
-| `0x06` | MQP-2 `BATCH` | 两端仍解码（兼容/测试），**生产已不发送** | `src/bin/myquic2-server/accept.rs:1041`；`src/bin/myquic2-client/dispatcher.rs:347`；发送端仅 `#[cfg(test)]`：`src/bin/myquic2-client/assoc.rs:1166-1167` |
+| `0x10` | `SINGLE` | Production, both directions; only ≤512 B goes here | `src/mqp/v3.rs:22,29-34`; `src/bin/myquic2-client/assoc.rs:301`; `src/bin/myquic2-server/reader.rs:629` |
+| `0x20` | `TRAIN` | Production, both directions, mixed flow/destination | `src/mqp/v3.rs:23,37-42` |
+| `0x30` | `FRAG` | **codec written, not wired** (production uses MQP-2 `0x05`) | `src/mqp/v3.rs:24,66,542-671`; `src/bin/myquic2-client/dispatcher.rs:330-335`; `src/bin/myquic2-server/accept.rs:720-724` |
+| `0x40` | `CTL` | **constant only**, no opcode/codec at all | `src/mqp/v3.rs:25`; README.md:610 |
+| `0x02` | MQP-2 `DATAGRAM` | Production: fallback for ≤512 B + single frame for >512 B | `src/mqp/datagram.rs:7,11`; `src/bin/myquic2-client/assoc.rs:882`; `src/bin/myquic2-server/reader.rs:199` |
+| `0x05` | MQP-2 `FRAGMENT` | Production: payloads > limit (each fragment repeats the full address) | `src/mqp/fragment.rs:14,29,178-183`; `src/udp/fragmenter.rs:349-380` |
+| `0x06` | MQP-2 `BATCH` | Both ends still decode (compatibility/tests), **production no longer sends** | `src/bin/myquic2-server/accept.rs:1041`; `src/bin/myquic2-client/dispatcher.rs:347`; sender is `#[cfg(test)]` only: `src/bin/myquic2-client/assoc.rs:1166-1167` |
 
-> 关键事实①：`is_v3` 只把 `0x10/0x20/0x30/0x40` 识别为 v3（`src/mqp/v3.rs:70-75`）。其它 kind 值（`0x50..`）会被当作 v2 解码并 `REFUSED`（`src/bin/myquic2-server/accept.rs:1041-1127`；客户端 `src/bin/myquic2-client/dispatcher.rs:786` 的 `sess_of` 也为 `None`）——**无法前向扩展 kind**。
-> 关键事实②：`CTL 0x40` 帧进入 v3 分支后，内层 `match` 的 `_ => {}` 直接静默丢弃（服务端 `src/bin/myquic2-server/accept.rs:725`；客户端 `src/bin/myquic2-client/dispatcher.rs:341`），**不计数、不报错**；且因为 `v3_sess` 要求前 5 B（`src/mqp/v3.rs:78-83`），长度 <5 B 的 CTL 会被算作 `REFUSED`。将来加控制面必须改这条 drop 规则。
+> Key fact 1: `is_v3` only recognizes `0x10/0x20/0x30/0x40` as v3 (`src/mqp/v3.rs:70-75`). Other kind values (`0x50..`) are decoded as v2 and `REFUSED` (`src/bin/myquic2-server/accept.rs:1041-1127`; the client's `sess_of` in `src/bin/myquic2-client/dispatcher.rs:786` is also `None`) — **the kind space cannot be extended forward**.
+> Key fact 2: after a `CTL 0x40` frame enters the v3 branch, the inner `match`'s `_ => {}` silently drops it (server `src/bin/myquic2-server/accept.rs:725`; client `src/bin/myquic2-client/dispatcher.rs:341`), **without counting and without error**; and because `v3_sess` requires the first 5 B (`src/mqp/v3.rs:78-83`), CTL frames shorter than 5 B are counted as `REFUSED`. Adding a control plane in the future must change this drop rule.
 
-### 2.2 公共地址编码（SOCKS5 同构）
+### 2.2 Common address encoding (isomorphic to SOCKS5)
 
-`atyp u8 | addr | port u16 BE`：`0x01`=IPv4（1+4+2=7 B）、`0x04`=IPv6（1+16+2=19 B）、`0x03`=domain（1+len+host+2=4+L B，L∈1..=255）。不允许 unspecified/带 scope_id 的 v6（`src/mqp/addr.rs:122-160,165-196`）。解码是零分配的借用形式（`TargetAddrRef`，`src/mqp/addr.rs:198-245`）。
+`atyp u8 | addr | port u16 BE`: `0x01`=IPv4 (1+4+2=7 B), `0x04`=IPv6 (1+16+2=19 B), `0x03`=domain (1+len+host+2=4+L B, L∈1..=255). unspecified/v6 with scope_id is not allowed (`src/mqp/addr.rs:122-160,165-196`). Decoding is a zero-allocation borrowed form (`TargetAddrRef`, `src/mqp/addr.rs:198-245`).
 
-### 2.3 `SINGLE`（0x10）
+### 2.3 `SINGLE` (0x10)
 
 ```text
-0x10|flags(1) | sess u32 LE(4) | [flow u8, if flags.F] | [addr, if flags.I] | payload…（到 DATAGRAM 末尾）
-flags: I=0x1 inline address, F=0x2 flow byte present, S=0x4 inline addr 是实际源（覆盖 flow 绑定）
+0x10|flags(1) | sess u32 LE(4) | [flow u8, if flags.F] | [addr, if flags.I] | payload… (to the end of the DATAGRAM)
+flags: I=0x1 inline address, F=0x2 flow byte present, S=0x4 inline addr is the actual source (overrides the flow binding)
 ```
-[代码] `src/mqp/v3.rs:151-245`；golden bytes 见 `src/mqp/v3.rs:814-844`。
+[Code] `src/mqp/v3.rs:151-245`; golden bytes in `src/mqp/v3.rs:814-844`.
 
-- header = `1 + 4 + [1 if flow≠0] + [addr_len if I]`。**flow 0 隐式**，稳态 5 B；额外 flow 6 B；open 首帧 IPv4 12/13 B、IPv6 24/25 B、域名 40 B（NO_FLOW=0xFF 非 0，必须带 flow 字节）。
-- **没有长度字段**：payload 吃到 DATAGRAM 末尾，因此一个 DATAGRAM body 只能放一个 SINGLE。
-- 编解码：[代码] 编码 1 次 `header()` 校验/测长 + 1 次精确 `Vec::with_capacity` + 1 次 payload memcpy + `Bytes::from(Vec)`（`len==capacity` 走 in-place adopt，无二次分配，`src/mqp/v3.rs:151-198`）。解码零分配，仅切片（`src/mqp/v3.rs:200-245`）。
+- header = `1 + 4 + [1 if flow≠0] + [addr_len if I]`. **flow 0 is implicit**, steady state 5 B; extra flow 6 B; open first frame IPv4 12/13 B, IPv6 24/25 B, domain 40 B (NO_FLOW=0xFF is non-zero, so the flow byte must be present).
+- **No length field**: the payload runs to the end of the DATAGRAM, so one DATAGRAM body can hold only one SINGLE.
+- Codec: [Code] encoding does one `header()` validation/length measurement + one exact `Vec::with_capacity` + one payload memcpy + `Bytes::from(Vec)` (`len==capacity` takes the in-place adopt path, no second allocation, `src/mqp/v3.rs:151-198`). Decoding is zero-allocation, slicing only (`src/mqp/v3.rs:200-245`).
 
-### 2.4 `TRAIN`（0x20）
+### 2.4 `TRAIN` (0x20)
 
 ```text
 0x20|flags(1) | sess u32 LE(4) | count u8(1)
   [flow u8, if flags.SAME_FLOW && flow≠0]
   item*: iflg u8(1) | [flow u8, if iflg.F] | len varint(1–2) | [addr, if iflg.I] | payload(len)
-flags: bit0 = SAME_FLOW（所有项同一非 0 flow，flow 只出现在 header）
-iflg: F=0x1 flow byte, I=0x2 inline addr, S=0x4 src override（item flags 与 frame flags 的位含义不同）
+flags: bit0 = SAME_FLOW (all items share the same non-zero flow; flow appears only in the header)
+iflg: F=0x1 flow byte, I=0x2 inline addr, S=0x4 src override (item flags and frame flags have different bit meanings)
 ```
-[代码] `src/mqp/v3.rs:260-347`（编码）、`437-515`（解码）；golden 见 `src/mqp/v3.rs:907-945`。
+[Code] `src/mqp/v3.rs:260-347` (encode), `437-515` (decode); golden in `src/mqp/v3.rs:907-945`.
 
-- header = 6 B（mixed）或 7 B（SAME_FLOW 且 flow≠0）；`count` 1..=64（`src/mqp/v3.rs:60,286-287,449-451`）。
-- 每项固定 1 B `iflg` + 1–2 B LEB128 长度；额外 flow +1 B。**flow 0 项 ≈ 2 B/项**（28/60 B 载荷），128–16383 B 载荷 ≈ 3 B/项。
-- **SAME_FLOW 不能用于 flow 0**：编码端只在 `items[0].flow != 0` 时才写 header 的 flow 字节（`src/mqp/v3.rs:296-309,317-319`），而解码端一见 SAME_FLOW 就读 1 B flow（`452-463`），因此对 flow 0 置位会错位；测试把这一行为钉死（`src/mqp/v3.rs:947-968`）。
-  **但字节上这没有损失**：flow 0 的 mixed 形式 = `6 + n·(1+len)`，而“合法化的 SAME_FLOW+flow0”需要 header 多 1 B、每项不变 = `7 + n·(1+len)`，反而多 1 B；flow 0 的 mixed 已是最小编码（§4-L9 会再次强调）。
-- 编码：[代码] 先整帧校验一遍（每项 `header()` 测长，`src/mqp/v3.rs:285-309`），再 1 次精确 `Vec` 填充（`313-346`）；调用点用栈上固定数组收集 `TrainItem`（64×~40 B，`src/bin/myquic2-client/assoc.rs:972-998`；`src/bin/myquic2-server/reader.rs:243-267`）。
-- 解码：[代码] 先整帧校验（防恶意帧 panic，`src/mqp/v3.rs:464-505`），迭代器再解析一遍（`391-433`）——**每项解码两次**（inline 地址的 `TargetAddrRef::decode` 也执行两次），CPU 常数很小（§4-L16）。
-- 一个 DATAGRAM body 只放一个 TRAIN；TRAIN 不跨 drain burst（客户端在 burst 结束 flush，`src/bin/myquic2-client/assoc.rs:566-572,704-714`；服务端在 burst 结束/大包/退出前 flush，`src/bin/myquic2-server/reader.rs:640-680`）。
-- **run-of-1 不发 TRAIN**：`n==1` 直接发 SINGLE（客户端 `src/bin/myquic2-client/assoc.rs:959-970`；服务端 `src/bin/myquic2-server/reader.rs:293-301`）。
+- header = 6 B (mixed) or 7 B (SAME_FLOW with flow≠0); `count` 1..=64 (`src/mqp/v3.rs:60,286-287,449-451`).
+- Each item has a fixed 1 B `iflg` + 1–2 B LEB128 length; extra flow +1 B. **flow 0 item ≈ 2 B/item** (28/60 B payload), 128–16383 B payload ≈ 3 B/item.
+- **SAME_FLOW cannot be used for flow 0**: the encoder writes the header flow byte only when `items[0].flow != 0` (`src/mqp/v3.rs:296-309,317-319`), while the decoder reads 1 B of flow as soon as it sees SAME_FLOW (`452-463`), so setting the flag for flow 0 misaligns the frame; a test pins this behavior (`src/mqp/v3.rs:947-968`).
+  **But there is no byte loss**: the mixed form for flow 0 = `6 + n·(1+len)`, whereas a "legalized SAME_FLOW+flow0" needs 1 extra B in the header with items unchanged = `7 + n·(1+len)`, which is 1 B larger; the mixed form for flow 0 is already the minimal encoding (§4-L9 will stress this again).
+- Encoding: [Code] validates the whole frame once first (each item's `header()` length measurement, `src/mqp/v3.rs:285-309`), then one exact `Vec` fill (`313-346`); call sites collect `TrainItem`s in a fixed on-stack array (64×~40 B, `src/bin/myquic2-client/assoc.rs:972-998`; `src/bin/myquic2-server/reader.rs:243-267`).
+- Decoding: [Code] validates the whole frame first (to prevent malicious frames from panicking, `src/mqp/v3.rs:464-505`), then the iterator parses it again (`391-433`) — **every item is decoded twice** (the `TargetAddrRef::decode` for inline addresses also runs twice); the CPU constant is very small (§4-L16).
+- One DATAGRAM body holds only one TRAIN; a TRAIN does not span drain bursts (the client flushes at burst end, `src/bin/myquic2-client/assoc.rs:566-572,704-714`; the server flushes at burst end/large packet/before exit, `src/bin/myquic2-server/reader.rs:640-680`).
+- **run-of-1 does not send TRAIN**: `n==1` sends SINGLE directly (client `src/bin/myquic2-client/assoc.rs:959-970`; server `src/bin/myquic2-server/reader.rs:293-301`).
 
-### 2.5 v3 `FRAG`（0x30，未接线）
+### 2.5 v3 `FRAG` (0x30, not wired)
 
 ```text
 0x30|flags(1) | sess u32 LE(4) | [flow u8, if F] | id u32 LE(4) | idx u8 | total u8 | [addr, if I] | chunk…
 ```
-[代码] `src/mqp/v3.rs:66,542-671`；prefix = 11 B（flow 0）/12 B（额外 flow），另有 inline addr 时再加 7/19/4+L。生产无任何调用者（grep `encode_fragment_v3|decode_fragment_v3` 仅命中 `src/mqp/v3.rs`；`dispatcher.rs:330-335`、`accept.rs:720-724` 收到即 `REFUSED`）。所以**该格式当前是纯死重**。
+[Code] `src/mqp/v3.rs:66,542-671`; prefix = 11 B (flow 0)/12 B (extra flow), plus another 7/19/4+L when an inline addr is present. There is no production caller (grep `encode_fragment_v3|decode_fragment_v3` only hits `src/mqp/v3.rs`; `dispatcher.rs:330-335` and `accept.rs:720-724` `REFUSED` it on receipt). So **this format is currently pure dead weight**.
 
-### 2.6 MQP-2 帧（>512 B 与分片的生产路径）
+### 2.6 MQP-2 frames (the production path for >512 B and fragmentation)
 
-| 帧 | 布局 | 固定头（v4 / v6 / domain L） | 代码 |
+| Frame | Layout | Fixed header (v4 / v6 / domain L) | Code |
 |---|---|---|---|
 | `0x02` DATAGRAM | `0x02 \| sess u32 \| addr \| payload` | 12 / 24 / 9+L | `src/mqp/datagram.rs:7,11,73-108` |
-| `0x05` FRAGMENT | `0x05 \| sess u32 \| id u32 \| idx u8 \| total u8 \| addr \| chunk` | 18 / 30 / 15+L（**每个分片都重复完整地址**） | `src/mqp/fragment.rs:14,29,178-183,219-261` |
-| `0x06` BATCH | `0x06 \| sess u32 \| addr \| count u8 \| (len u16 LE \| payload)*` | 13 / 25 / 10+L + 2/项 | `src/mqp/batch.rs:5-9,20-79` |
+| `0x05` FRAGMENT | `0x05 \| sess u32 \| id u32 \| idx u8 \| total u8 \| addr \| chunk` | 18 / 30 / 15+L (**every fragment repeats the full address**) | `src/mqp/fragment.rs:14,29,178-183,219-261` |
+| `0x06` BATCH | `0x06 \| sess u32 \| addr \| count u8 \| (len u16 LE \| payload)*` | 13 / 25 / 10+L + 2/item | `src/mqp/batch.rs:5-9,20-79` |
 
-- 分片参数：`MQP_FRAG_MAX_PAYLOAD=8192`、`MQP_FRAG_MAX_TOTAL=64`、`FRAG_TIMEOUT=2 s`、每连接 `FRAG_MAX_HELD_BYTES=256 KiB`、`FRAG_MAX_PARTIALS=256`（`src/mqp/fragment.rs:47,55,107,116,165,176`）；重组 key = `(sess u32, id u32)`（`src/udp/reassembler.rs:392`）。
-- 发送端 `DgramFragmenter::send`（`src/udp/fragmenter.rs:178-394`）：先走 `DgramPrefixCache` 的 N=1 快路径（缓存 `type|sess|addr`，`src/mqp/datagram.rs:147-217`），装不下才分片；**分片 id 是 u32**，wrap 后有 3 s 复用安全窗（`FRAG_ID_SAFE_WINDOW_MS`，`src/mqp/fragment.rs:145`）。每片一次 frame 分配 + 一次 memcpy；每片一次 `quinn send_datagram`（连接状态锁）。
-- 解码：全部借用、零分配（`src/mqp/datagram.rs:225-232`；`src/mqp/fragment.rs:263-279`；`src/mqp/batch.rs:158-198`），进入重组器时 chunk 被 **malloc+memcpy** 一次（有意为之的内存记账，`src/udp/reassembler.rs:203-289`）。
+- Fragment parameters: `MQP_FRAG_MAX_PAYLOAD=8192`, `MQP_FRAG_MAX_TOTAL=64`, `FRAG_TIMEOUT=2 s`, per-connection `FRAG_MAX_HELD_BYTES=256 KiB`, `FRAG_MAX_PARTIALS=256` (`src/mqp/fragment.rs:47,55,107,116,165,176`); reassembly key = `(sess u32, id u32)` (`src/udp/reassembler.rs:392`).
+- Sender `DgramFragmenter::send` (`src/udp/fragmenter.rs:178-394`): first takes the `DgramPrefixCache` N=1 fast path (caches `type|sess|addr`, `src/mqp/datagram.rs:147-217`), and fragments only if it does not fit; **the fragment id is u32**, and after wrap there is a 3 s reuse-safe window (`FRAG_ID_SAFE_WINDOW_MS`, `src/mqp/fragment.rs:145`). Each fragment costs one frame allocation + one memcpy; each fragment is one `quinn send_datagram` (connection state lock).
+- Decoding: all borrowed, zero-allocation (`src/mqp/datagram.rs:225-232`; `src/mqp/fragment.rs:263-279`; `src/mqp/batch.rs:158-198`); when entering the reassembler the chunk is **malloc+memcpy**'d once (intentional memory accounting, `src/udp/reassembler.rs:203-289`).
 
-### 2.7 生产路径矩阵（谁在什么时候用哪个帧）
+### 2.7 Production path matrix (who uses which frame and when)
 
-| 方向 | 载荷条件 | 当前帧 | 证据 |
+| Direction | Payload condition | Current frame | Evidence |
 |---|---|---|---|
-| 上行 | ≤512 B，可打包 | `TRAIN`（多 flow/目的地） | `src/bin/myquic2-client/assoc.rs:298-401` |
-| 上行 | ≤512 B，run=1 | `SINGLE` | `src/bin/myquic2-client/assoc.rs:959-970` |
-| 上行 | >512 B | MQP-2 `0x02`（装得下）或 `0x05` 分片 | `src/bin/myquic2-client/assoc.rs:301-310,882` |
-| 上行 | 任意尺寸、TRAIN/SINGLE 被 quinn 拒绝（Blocked/TooLarge） | MQP-2 `0x02`/`0x05` 兜底 | `src/bin/myquic2-client/assoc.rs:882,996-1016` |
-| 下行 | ≤512 B，可打包 | `TRAIN`（混合源） | `src/bin/myquic2-server/reader.rs:626-680` |
-| 下行 | ≤512 B，run=1 | `SINGLE` | `src/bin/myquic2-server/reader.rs:176-206,293-301` |
-| 下行 | >512 B | MQP-2 `0x02`/`0x05` | `src/bin/myquic2-server/reader.rs:675-677` |
-| 下行 | 任意尺寸兜底 | MQP-2 `0x02`/`0x05` | `src/bin/myquic2-server/reader.rs:199` |
+| uplink | ≤512 B, packable | `TRAIN` (multiple flows/destinations) | `src/bin/myquic2-client/assoc.rs:298-401` |
+| uplink | ≤512 B, run=1 | `SINGLE` | `src/bin/myquic2-client/assoc.rs:959-970` |
+| uplink | >512 B | MQP-2 `0x02` (if it fits) or `0x05` fragments | `src/bin/myquic2-client/assoc.rs:301-310,882` |
+| uplink | any size, TRAIN/SINGLE rejected by quinn (Blocked/TooLarge) | MQP-2 `0x02`/`0x05` fallback | `src/bin/myquic2-client/assoc.rs:882,996-1016` |
+| downlink | ≤512 B, packable | `TRAIN` (mixed sources) | `src/bin/myquic2-server/reader.rs:626-680` |
+| downlink | ≤512 B, run=1 | `SINGLE` | `src/bin/myquic2-server/reader.rs:176-206,293-301` |
+| downlink | >512 B | MQP-2 `0x02`/`0x05` | `src/bin/myquic2-server/reader.rs:675-677` |
+| downlink | any-size fallback | MQP-2 `0x02`/`0x05` | `src/bin/myquic2-server/reader.rs:199` |
 
-**为什么 512 B 是分界？** 它不是 wire 限制，而是复用旧 BATCH 常量 `BATCH_SMALL_MAX=512`（`src/mqp/batch.rs:9`）作 staging 上限：客户端 `payload.len() > BATCH_SMALL_MAX` 直接走 v2（`src/bin/myquic2-client/assoc.rs:301`），服务端同样 `n <= BATCH_SMALL_MAX` 才进 v3 staging（`src/bin/myquic2-server/reader.rs:629`）。v3 SINGLE 本身可以承载任意 ≤ limit−header 的 payload（`src/mqp/v3.rs:143-174`），代码里没有任何 wire 级理由让 513 B 掉回 v2。
+**Why is 512 B the boundary?** It is not a wire limit, but reuse of the old BATCH constant `BATCH_SMALL_MAX=512` (`src/mqp/batch.rs:9`) as the staging cap: the client goes to v2 directly when `payload.len() > BATCH_SMALL_MAX` (`src/bin/myquic2-client/assoc.rs:301`), and the server likewise only enters v3 staging when `n <= BATCH_SMALL_MAX` (`src/bin/myquic2-server/reader.rs:629`). v3 SINGLE itself can carry any payload ≤ limit−header (`src/mqp/v3.rs:143-174`); there is no wire-level reason in the code for 513 B to fall back to v2.
 
 ---
 
-## 3. 当前每 payload 头开销矩阵
+## 3. Current per-payload header overhead matrix
 
-> 符号：`p`=payload 字节；`L`=domain 长度；`H`=每 payload 的 MQP 头字节；`share=H/(H+p)`。
-> 假设：无丢包；TRAIN 场景假设每个 flush burst 有 32 个 payload（`LAST_HOP_DRAIN=32`，`src/udp/batch.rs:46`）；`limit=1162`；`L=30`。
+> Symbols: `p`=payload bytes; `L`=domain length; `H`=MQP header bytes per payload; `share=H/(H+p)`.
+> Assumptions: no packet loss; TRAIN scenarios assume 32 payloads per flush burst (`LAST_HOP_DRAIN=32`, `src/udp/batch.rs:46`); `limit=1162`; `L=30`.
 
-### 3.1 单帧（standalone，`SINGLE`/`0x02`）：头与占比
+### 3.1 Single frame (standalone, `SINGLE`/`0x02`): header and share
 
-| 场景 | H | p=28 | p=60 | p=200 | p=512 | 说明 |
+| Scenario | H | p=28 | p=60 | p=200 | p=512 | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| IPv4 flow0 steady | 5 | 15.2% | 7.7% | 2.4% | 1.0% | v3；生产实际形态 |
+| IPv4 flow0 steady | 5 | 15.2% | 7.7% | 2.4% | 1.0% | v3; actual production shape |
 | IPv4 extra flow steady | 6 | 17.6% | 9.1% | 2.9% | 1.2% | +flow byte |
-| IPv6 flow0 steady | 5 | 15.2% | 7.7% | 2.4% | 1.0% | 地址不进 wire |
+| IPv6 flow0 steady | 5 | 15.2% | 7.7% | 2.4% | 1.0% | address not on the wire |
 | IPv6 extra flow steady | 6 | 17.6% | 9.1% | 2.9% | 1.2% | |
-| domain 地址（**上行**，永远 inline） | 40 | 58.8% | 40.0% | 16.7% | 7.2% | `NO_FLOW=0xFF`，10+L |
-| domain 目标的**回包**（下行，inline IPv4） | 13 | 31.7% | 17.8% | 6.1% | 2.5% | `NO_FLOW`+IP，1+4+1+7 |
-| domain 目标的**回包**（下行，inline IPv6） | 25 | 47.2% | 29.4% | 11.1% | 4.7% | 1+4+1+19 |
-| IPv4 flow0 first/open | 12 | 30.0% | 16.7% | 5.7% | 2.3% | 带 7 B 地址 |
+| domain address (**uplink**, always inline) | 40 | 58.8% | 40.0% | 16.7% | 7.2% | `NO_FLOW=0xFF`, 10+L |
+| **reply for** domain target (downlink, inline IPv4) | 13 | 31.7% | 17.8% | 6.1% | 2.5% | `NO_FLOW`+IP, 1+4+1+7 |
+| **reply for** domain target (downlink, inline IPv6) | 25 | 47.2% | 29.4% | 11.1% | 4.7% | 1+4+1+19 |
+| IPv4 flow0 first/open | 12 | 30.0% | 16.7% | 5.7% | 2.3% | with 7 B address |
 | IPv4 extra flow first | 13 | 31.7% | 17.8% | 6.1% | 2.5% | |
-| IPv6 flow0 first | 24 | 46.2% | 28.6% | 10.7% | 4.5% | 带 19 B 地址 |
+| IPv6 flow0 first | 24 | 46.2% | 28.6% | 10.7% | 4.5% | with 19 B address |
 | IPv6 extra flow first | 25 | 47.2% | 29.4% | 11.1% | 4.7% | |
-| domain first（=永远） | 40 | 58.8% | 40.0% | 16.7% | 7.2% | |
+| domain first (=always) | 40 | 58.8% | 40.0% | 16.7% | 7.2% | |
 
-> 注：flow 0 的“first”只在 open 帧出现。**生产上“first”的持续长度由“是否收到过压缩下行”决定**（`src/bin/myquic2-client/hub.rs:45-59,139-149`；`src/bin/myquic2-client/assoc.rs:345-377`）；纯上行 flow 永远是 first 形态。
+> Note: the "first" shape for flow 0 only appears in the open frame. **In production, how long the "first" shape persists is determined by "whether a compressed downlink has been received"** (`src/bin/myquic2-client/hub.rs:45-59,139-149`; `src/bin/myquic2-client/assoc.rs:345-377`); pure-uplink flows are always in the first shape.
 
-### 3.2 TRAIN 每项开销（含 header 摊薄）
+### 3.2 TRAIN per-item overhead (including header amortization)
 
-当前每项 = `1 B iflg + [1 B flow if 额外 flow] + (1–2 B) len`；header 6 B（mixed）/7 B（SAME_FLOW 非 0）。`flow0` 是隐式的。
+Current per item = `1 B iflg + [1 B flow if extra flow] + (1–2 B) len`; header 6 B (mixed)/7 B (SAME_FLOW non-zero). `flow0` is implicit.
 
-| 场景 | 每项开销（p<128 / p≥128） | 说明 |
+| Scenario | Per-item overhead (p<128 / p≥128) | Notes |
 |---|---:|---|
-| IPv4 flow0 steady | 2 / 3 | 最常见（同 destination 小包流） |
-| IPv4 extra flow steady（mixed） | 3 / 4 | |
-| IPv4 extra flow steady（SAME_FLOW） | 2 / 3 + header 7 | 同 flow 整帧 |
-| IPv4 flow0 first/open | 9 / 10 | 每帧每 flow 只重复一次开地址（同帧后续项压缩，`already_open` 位图，`src/bin/myquic2-client/assoc.rs:378-396`） |
+| IPv4 flow0 steady | 2 / 3 | most common (small-packet flow to the same destination) |
+| IPv4 extra flow steady (mixed) | 3 / 4 | |
+| IPv4 extra flow steady (SAME_FLOW) | 2 / 3 + header 7 | whole frame same flow |
+| IPv4 flow0 first/open | 9 / 10 | the open address is repeated only once per flow per frame (subsequent items in the same frame are compressed, `already_open` bitmap, `src/bin/myquic2-client/assoc.rs:378-396`) |
 | IPv4 extra first/open | 10 / 11 | |
 | IPv6 flow0 first/open | 21 / 22 | |
 | IPv6 extra first/open | 22 / 23 | |
-| domain（永远 inline） | 37 / 38 | `1+1+len+34` = 37/38 |
+| domain (always inline) | 37 / 38 | `1+1+len+34` = 37/38 |
 
-摊薄到每个 payload：`overhead = H_train/n + item`。以 flow0、60 B 为例：
+Amortized to each payload: `overhead = H_train/n + item`. Taking flow0 and 60 B as an example:
 
-| n（每 TRAIN 项数） | 2 | 4 | 8 | 16 | 18 |
+| n (items per TRAIN) | 2 | 4 | 8 | 16 | 18 |
 |---|---:|---:|---:|---:|---:|
-| 当前（header 6 + 2 B/项） | 5.00 | 3.50 | 2.75 | 2.38 | 2.33 |
+| Current (header 6 + 2 B/item) | 5.00 | 3.50 | 2.75 | 2.38 | 2.33 |
 
-### 3.3 >512 B 的 v2 开销（每 payload / 每分片）
+### 3.3 v2 overhead for >512 B (per payload / per fragment)
 
-`limit=1162`（MTU 1200）：v4 单帧上限=1150 B、分片 chunk=1144 B；v6 单帧上限=1138 B、chunk=1132 B；domain L=30 单帧上限=1123 B、chunk=1117 B。
+`limit=1162` (MTU 1200): v4 single-frame cap=1150 B, fragment chunk=1144 B; v6 single-frame cap=1138 B, chunk=1132 B; domain L=30 single-frame cap=1123 B, chunk=1117 B.
 
-| payload p | v4 头/片数 | v6 头/片数 | domain 头/片数 |
+| payload p | v4 header/fragments | v6 header/fragments | domain header/fragments |
 |---|---:|---:|---:|
-| 513 | 12 / 1 帧 | 24 / 1 | 39 / 1 |
+| 513 | 12 / 1 frame | 24 / 1 | 39 / 1 |
 | 1000 | 12 / 1 | 24 / 1 | 39 / 1 |
-| 1200 | **36 / 2**（18 B×2） | **60 / 2**（30×2） | **90 / 2** |
+| 1200 | **36 / 2** (18 B×2) | **60 / 2** (30×2) | **90 / 2** |
 | 1420 | 36 / 2 | 60 / 2 | 90 / 2 |
 | 8192 | 144 / 8 | 240 / 8 | 360 / 8 |
 
-`limit=1362`（MTU 1400）：v4 单帧上限=1350 B、分片 chunk=1344；v6 上限=1338、chunk=1332；domain 上限=1323、chunk=1317。
+`limit=1362` (MTU 1400): v4 single-frame cap=1350 B, fragment chunk=1344; v6 cap=1338, chunk=1332; domain cap=1323, chunk=1317.
 
-| payload p | v4 头/片数 | v6 头/片数 | domain 头/片数 |
+| payload p | v4 header/fragments | v6 header/fragments | domain header/fragments |
 |---|---:|---:|---:|
 | 1200 | 12 / 1 | 24 / 1 | 39 / 1 |
 | 1420 | 36 / 2 | 60 / 2 | 90 / 2 |
 | 8192 | 126 / 7 | 210 / 7 | 315 / 7 |
 
-> 也就是说：**默认 MTU 1200 时，1200 B 的 payload 必然 2 片、每片重复 7/19/34 B 地址**；把 `initial_mtu` 提到 1400 后 1200 B 变单帧（README.md:777 已有建议）。协议层能做的只是把“每片 18/30 B 头”压到 8–12 B。
+> That is: **with the default MTU of 1200, a 1200 B payload necessarily becomes 2 fragments, each repeating a 7/19/34 B address**; raising `initial_mtu` to 1400 turns 1200 B into a single frame (README.md:777 already has this suggestion). The only thing the protocol layer can do is compress the "18/30 B header per fragment" to 8–12 B.
 
 ---
 
-## 4. 现存 wire 低效 / 限制全清单（带证据与量化）
+## 4. Complete list of existing wire inefficiencies / limitations (with evidence and quantification)
 
-> P0 = 阻断“上下行都优化 / full duplex / 可演进”目标的协议结构问题；P1 = 实际字节/CPU 开销；P2 = 死码/一致性/攻击面。
+> P0 = protocol structure problems that block the "optimize both uplink and downlink / full duplex / evolvable" goals; P1 = actual byte/CPU overhead; P2 = dead code/consistency/attack surface.
 
 ### P0
 
-**L1 域名目标两个方向都无法 flow 压缩**。[代码]
-- 上行：client 对 `TargetAddrRef::Domain` 硬编码 `(MQP3_NO_FLOW, true)`，每帧 inline（`src/bin/myquic2-client/assoc.rs:355-377`）；不分配 flow slot。
-- 下行：server 只对 `flow_for_ip(src)` 命中的 **IP** flow 压缩（`src/bin/myquic2-server/reader.rs:134-152`），而 `FlowTable::flow_for` 比较整个 `TargetAddr`，Domain 项永远不匹配 IP（`src/mqp/v3.rs:722-733`）→ 域名回包一律 `NO_FLOW` inline；`reader.rs:100-107` 的注释确认“domain target 的 resolved IP client 不知道”。
-- 代价：
-  - 上行：**每帧 37–40 B 头**（L=30），60 B DNS 查询时 MQP 字节 100 B、头占 40%；每 1000 payload 97,564 B → 加 FLOW_ACK≈61,300 B（**−37%**）。
-  - 下行：回包是 `NO_FLOW`+**inline IP**（v4 13 B / v6 25 B 头；不是 40 B，因为 server 回的是解析后的 IP），同样无法压缩；ACK 后压到 2–5 B，每 1000 payload v4 70,378→61,189（**−13%**）、v6 82,564→61,189（**−26%**）。[模型]
+**L1 Domain targets cannot be flow-compressed in either direction.** [Code]
+- Uplink: the client hardcodes `(MQP3_NO_FLOW, true)` for `TargetAddrRef::Domain`, inline in every frame (`src/bin/myquic2-client/assoc.rs:355-377`); it does not allocate a flow slot.
+- Downlink: the server compresses only the **IP** flow hit by `flow_for_ip(src)` (`src/bin/myquic2-server/reader.rs:134-152`), while `FlowTable::flow_for` compares the whole `TargetAddr` and a Domain entry never matches an IP (`src/mqp/v3.rs:722-733`) → domain replies are always `NO_FLOW` inline; the comment at `reader.rs:100-107` confirms "the client does not know the resolved IP of a domain target".
+- Cost:
+  - Uplink: **37–40 B header per frame** (L=30); for a 60 B DNS query the MQP bytes are 100 B and the header accounts for 40%; per 1000 payloads 97,564 B → with FLOW_ACK ≈61,300 B (**−37%**).
+  - Downlink: replies are `NO_FLOW`+**inline IP** (v4 13 B / v6 25 B header; not 40 B, because the server returns the resolved IP), and likewise cannot be compressed; after ACK it drops to 2–5 B, per 1000 payloads v4 70,378→61,189 (**−13%**), v6 82,564→61,189 (**−26%**). [Model]
 
-**L2 纯上行 flow 永远不压缩**。[代码]
-- 唯一“确认”来源是客户端成功 stage 一个该 flow 的**压缩下行帧**（`src/bin/myquic2-client/dispatcher.rs:283-289,318-326` → `AssocEntry::confirm_flow`，`src/bin/myquic2-client/hub.rs:139-149`）；没有 FLOW_ACK。
-- 纯上行（日志/遥测/单向游戏输入/DNS 无响应）永远保持 inline：SINGLE 12/13 B、TRAIN 每帧每 flow 重复一次 7/19/34 B 地址。
-- 代价：稀疏单向流 60 B 时 72 B/payload（v4）→ 加 ACK 后 65 B（A）/62 B（B），**−9.7% / −13.9%**；高速单向流（32 payload/burst，每 TRAIN 只重复 1 次地址）约 −2%。[模型]
+**L2 Pure-uplink flows are never compressed.** [Code]
+- The only source of "confirmation" is the client successfully staging a **compressed downlink frame** for that flow (`src/bin/myquic2-client/dispatcher.rs:283-289,318-326` → `AssocEntry::confirm_flow`, `src/bin/myquic2-client/hub.rs:139-149`); there is no FLOW_ACK.
+- Pure uplink (logs/telemetry/unidirectional game input/DNS with no response) always stays inline: SINGLE 12/13 B, TRAIN repeats a 7/19/34 B address once per flow per frame.
+- Cost: a sparse unidirectional flow at 60 B is 72 B/payload (v4) → with ACK 65 B (A)/62 B (B), **−9.7% / −13.9%**; a high-rate unidirectional flow (32 payloads/burst, address repeated only once per TRAIN) about −2%. [Model]
 
-**L3 >512 B 与所有分片退回 MQP-2，地址在每片重复**。[代码]
-- 路径：`src/bin/myquic2-client/assoc.rs:301-310`、`src/bin/myquic2-server/reader.rs:629-677`、`src/bin/myquic2-client/assoc.rs:882`、`src/bin/myquic2-server/reader.rs:199`。
-- 代价：513–1150 B 单帧头 12/24 B（v4/v6）而不是 5/6（A）或 2/3（B）；1200 B @1162 是 36/60 B/2 帧而不是 22/16 B；8192 B 是 144/240 B 而不是 88/64 B。
-- 额外：v2 的每一片都重复 `sess u32`，且重组器按 `(sess,id)` 而不是 `(sess,flow,id)` 键控（`src/udp/reassembler.rs:392`），因此 v3 FRAG 即使接线也要先改重组器（README.md:664-670 已指出）。
+**L3 >512 B and all fragmentation fall back to MQP-2, with the address repeated in every fragment.** [Code]
+- Path: `src/bin/myquic2-client/assoc.rs:301-310`, `src/bin/myquic2-server/reader.rs:629-677`, `src/bin/myquic2-client/assoc.rs:882`, `src/bin/myquic2-server/reader.rs:199`.
+- Cost: 513–1150 B single-frame header 12/24 B (v4/v6) instead of 5/6 (A) or 2/3 (B); 1200 B @1162 is 36/60 B over 2 frames instead of 22/16 B; 8192 B is 144/240 B instead of 88/64 B.
+- Extra: every v2 fragment repeats `sess u32`, and the reassembler keys on `(sess,id)` rather than `(sess,flow,id)` (`src/udp/reassembler.rs:392`), so even wiring v3 FRAG requires changing the reassembler first (README.md:664-670 already points this out).
 
-**L4 完全没有控制面**。[代码]
-- `MQP3_CTL=0x40` 只是常量（`src/mqp/v3.rs:25`），全仓库没有 opcode/encode/decode；README.md:610 明确 “reserved; no CAPS/HELLO/FLOW_ACK opcodes implemented”。
-- 缺失后果：
-  1. 无 HELLO/CAPS → 无能力协商、无 in-band 版本门禁（默认 ALPN 还是 `h3` 伪装，`src/mqp/ack.rs:1-22`；`normalize_alpn` 默认返回 h3），只能靠 TLS 失败或静默丢包。
-  2. 无 FLOW_ACK/REJECT → L1/L2；服务端 table full/SSRF 拒绝时客户端无从得知，只能一直 inline。
-  3. 无 SESS_CLOSE/FLOW_CLOSE → session 只能靠 180 s idle 回收（`src/bin/myquic2-server/table.rs:382`；60 s sweep，`accept.rs:799-812`），服务端 socket/reader task 至少多活 0–180 s；flow id 也因 “never reuse” 只能整会话丢弃（`src/mqp/v3.rs:675-690`）。
-  4. 无法协商 `max_flows`/`max_train_items`/`max_reassembly`/新特性——新格式只能整体升级。
+**L4 There is no control plane at all.** [Code]
+- `MQP3_CTL=0x40` is only a constant (`src/mqp/v3.rs:25`); the whole repository has no opcode/encode/decode; README.md:610 explicitly says "reserved; no CAPS/HELLO/FLOW_ACK opcodes implemented".
+- Consequences of the gap:
+  1. No HELLO/CAPS → no capability negotiation, no in-band version gate (the default ALPN is still the `h3` disguise, `src/mqp/ack.rs:1-22`; `normalize_alpn` returns h3 by default); the only signals are TLS failure or silent packet drops.
+  2. No FLOW_ACK/REJECT → L1/L2; when the server rejects due to table full/SSRF, the client has no way to know and can only stay inline forever.
+  3. No SESS_CLOSE/FLOW_CLOSE → sessions can only be reclaimed by 180 s idle (`src/bin/myquic2-server/table.rs:382`; 60 s sweep, `accept.rs:799-812`), so the server socket/reader task lives at least 0–180 s longer; flow ids can also only be discarded with the whole session because of "never reuse" (`src/mqp/v3.rs:675-690`).
+  4. Cannot negotiate `max_flows`/`max_train_items`/`max_reassembly`/new features — a new format can only be upgraded wholesale.
 
-**L5 v3 FRAG 已实现但未接线**。[代码] `src/mqp/v3.rs:542-671` 无生产调用；两端收到 `0x30` 直接 `REFUSED` 计数（`src/bin/myquic2-client/dispatcher.rs:330-335`；`src/bin/myquic2-server/accept.rs:720-724`）。现状 wire 上它是一段“占着 kind、永远不出现”的死格式。
+**L5 v3 FRAG is implemented but not wired.** [Code] `src/mqp/v3.rs:542-671` has no production caller; both ends directly `REFUSED` and count `0x30` (`src/bin/myquic2-client/dispatcher.rs:330-335`; `src/bin/myquic2-server/accept.rs:720-724`). On the current wire it is a dead format that "occupies a kind and never appears".
 
-### P1（字节 / 每帧开销）
+### P1 (bytes / per-frame overhead)
 
-**L6 每帧 4 B `sess u32`**。[代码] 所有 v3 帧都带：SINGLE/TRAIN/FRAG header（`src/mqp/v3.rs:63,186,313-315,583`）。稳态头 5 B 的 80% 是它。去掉这 4 B（→ 候选 B 的 2 B 头）相当于 28 B payload 的 9.1%、60 B 的 4.6% MQP 字节；只换 u16（省 2 B）则是 6.1%/3.1%。
-- 注意：**单纯缩成 u16 不是免费的**，见候选 C 的复用安全分析（§6.3）。
+**L6 4 B `sess u32` per frame.** [Code] Every v3 frame carries it: SINGLE/TRAIN/FRAG header (`src/mqp/v3.rs:63,186,313-315,583`). It is 80% of the 5 B steady-state header. Removing these 4 B (→ candidate B's 2 B header) equals 9.1% of the MQP bytes for a 28 B payload and 4.6% for 60 B; switching only to u16 (saving 2 B) gives 6.1%/3.1%.
+- Note: **simply shrinking to u16 is not free**, see the reuse-safety analysis of candidate C (§6.3).
 
-**L7 每帧一个 session，TRAIN 不能跨 session 合帧**。[代码]
-- 帧头只有一个 `sess`（`src/mqp/v3.rs:63`）；客户端按 association 任务分别 staging/flush（`src/bin/myquic2-client/assoc.rs:566-580,704-714,1027-1074`），服务端按 `sess_reader_task` 分别 flush（`src/bin/myquic2-server/reader.rs:729-900`）。同一 QUIC 连接上多个 association 的小包**只能各自成帧**。
-- 代价（[模型]）：32 个 session 各 1 个 60 B payload 的一轮，当前 32 帧/2080 B → 合帧后 2 帧/2020 B（wire −2.9%，**send 调用 16×**）；8 session×4 payload/轮：8 帧 → 2 帧（**4×**），wire −2.1%。价值主要在 CPU/锁，不在带宽（§7.3）。
+**L7 One session per frame; TRAIN cannot merge frames across sessions.** [Code]
+- The frame header has only one `sess` (`src/mqp/v3.rs:63`); the client stages/flushes separately per association task (`src/bin/myquic2-client/assoc.rs:566-580,704-714,1027-1074`), and the server flushes separately per `sess_reader_task` (`src/bin/myquic2-server/reader.rs:729-900`). Small packets from multiple associations on the same QUIC connection **can only become separate frames**.
+- Cost ([Model]): for one round of 32 sessions each with 1 60 B payload, currently 32 frames/2080 B → after merging 2 frames/2020 B (wire −2.9%, **send calls 16×**); 8 sessions×4 payloads/round: 8 frames → 2 frames (**4×**), wire −2.1%. The value is mainly CPU/locks, not bandwidth (§7.3).
 
-**L8 TRAIN 每项 2–4 B**。[代码] `1 B iflg + [1 B flow] + 1–2 B len`（`src/mqp/v3.rs:260-267,320-343`）。即使整帧全部是同一 flow 且无 inline/open，也强制每项 1 B flags——该字节在“all-compressed same flow”场景是纯冗余。候选 A 的 COMPACT 项可省 1 B/项（60 B 小包：每 1000 payload ~1,000 B，−1.6%；28 B：−3.3%）。[模型]
+**L8 TRAIN 2–4 B per item.** [Code] `1 B iflg + [1 B flow] + 1–2 B len` (`src/mqp/v3.rs:260-267,320-343`). Even when the entire frame is the same flow with no inline/open, each item is forced to carry 1 B of flags — that byte is pure redundancy in the "all-compressed same flow" case. Candidate A's COMPACT item saves 1 B/item (60 B small packets: ~1,000 B per 1000 payloads, −1.6%; 28 B: −3.3%). [Model]
 
-**L9 “SAME_FLOW 不能用于 flow 0”是表达缺口，不是字节损失**。[代码+推导] 见 §2.4：flow 0 mixed = `6+2n`，若强行 SAME_FLOW+flow0 = `7+2n`，更大。真正可省的是 L8 的每项 flags 字节。把它列进“限制”是因为：flag 位被浪费、解码器多一条不可达分支、且“紧凑项模式”必须重新定义才能同时覆盖 flow 0 与非 0。
+**L9 "SAME_FLOW cannot be used for flow 0" is an expressiveness gap, not a byte loss.** [Code+derivation] See §2.4: flow 0 mixed = `6+2n`; forcing SAME_FLOW+flow0 = `7+2n`, which is larger. What can really be saved is L8's per-item flags byte. It is listed under "limitations" because: a flag bit is wasted, the decoder has one more unreachable branch, and the "compact item mode" must be redefined to cover both flow 0 and non-zero.
 
-**L10 64 flow/session + 单调不复用**。[代码] `MQP3_MAX_FLOWS=64`（`src/mqp/v3.rs:53-56`），`insert` 单调、`next>=64` 后返回 None（`737-746`），`remove` 只在“inline open 与现有 id 冲突”时清空、**不会**降 `next`（`770-791`；测试 `1047-1061` 钉住不复用）；表满后客户端对**新目的地永远 inline**（`src/bin/myquic2-client/assoc.rs:367-377`）。
-- 代价：长时间高 churn 的 association（游戏反复换房、DNS 轮询很多 resolver）在第 65 个目的地后永久退化到 12/13 B 头（小包 +7/8 B/帧）；且 `MQP3_FLOW_TABLE_MAX_BYTES=4096` 作为每 session admission 记账（`src/mqp/v3.rs:48-51`；`src/config/tuning.rs:309-317`），不能简单靠“加大表”解决，需要控制面 + 生命周期。
+**L10 64 flows/session + monotonic no-reuse.** [Code] `MQP3_MAX_FLOWS=64` (`src/mqp/v3.rs:53-56`); `insert` is monotonic and returns None once `next>=64` (`737-746`); `remove` only clears when an "inline open conflicts with an existing id" and does **not** lower `next` (`770-791`; test `1047-1061` pins the no-reuse behavior); once the table is full the client stays inline forever for **new destinations** (`src/bin/myquic2-client/assoc.rs:367-377`).
+- Cost: long-lived high-churn associations (games repeatedly changing rooms, DNS polling many resolvers) permanently degrade to a 12/13 B header after the 65th destination (+7/8 B/frame for small packets); and `MQP3_FLOW_TABLE_MAX_BYTES=4096` serves as per-session admission accounting (`src/mqp/v3.rs:48-51`; `src/config/tuning.rs:309-317`), which cannot be solved simply by "making the table bigger"; it needs a control plane + lifecycle.
 
-**L11 512 B staging cap 是代码政策而不是 wire 限制**。[代码] 复用 `BATCH_SMALL_MAX`（`src/mqp/batch.rs:9`；客户端 `src/bin/myquic2-client/assoc.rs:301`；服务端 `src/bin/myquic2-server/reader.rs:629`；staging 缓冲按 `BATCH_SMALL_MAX*2` 预分配，`assoc.rs:578`）。它直接造成 L3：只要把“大 payload 走 v3 SINGLE/FRAG”接上，就能删掉 v2 数据面（代价是 scheduler 要区分“可入 TRAIN 的小项”和“单独发给大项”）。
+**L11 The 512 B staging cap is code policy, not a wire limit.** [Code] It reuses `BATCH_SMALL_MAX` (`src/mqp/batch.rs:9`; client `src/bin/myquic2-client/assoc.rs:301`; server `src/bin/myquic2-server/reader.rs:629`; the staging buffer is preallocated as `BATCH_SMALL_MAX*2`, `assoc.rs:578`). It directly causes L3: as soon as "large payloads go over v3 SINGLE/FRAG" is wired up, the v2 data plane can be deleted (at the cost of the scheduler having to distinguish "small items that can enter a TRAIN" from "large items sent separately").
 
-**L12 flow 表按 session 存 + 4 KiB/session 记账**。[代码] `AssocEntry.flows: ArcSwap<FlowTable>`（`src/bin/myquic2-client/hub.rs:57-59`）；server 每 `SessEntry.flows`（`src/bin/myquic2-server/table.rs:51-56`）；每 session 收费 4096 B（`src/mqp/v3.rs:51`、`src/config/tuning.rs:316`）。若改成连接级 flow 表，这笔记账要改成“每连接上限”，并进 `per_connection_memory_bytes`（当前只含 `FRAG_MAX_HELD_BYTES`，`src/config/tuning.rs:282-287`）。
+**L12 Flow table stored per session + 4 KiB/session accounting.** [Code] `AssocEntry.flows: ArcSwap<FlowTable>` (`src/bin/myquic2-client/hub.rs:57-59`); server per `SessEntry.flows` (`src/bin/myquic2-server/table.rs:51-56`); 4096 B charged per session (`src/mqp/v3.rs:51`, `src/config/tuning.rs:316`). If changed to a connection-level flow table, this accounting must become a "per-connection cap" and enter `per_connection_memory_bytes` (currently only contains `FRAG_MAX_HELD_BYTES`, `src/config/tuning.rs:282-287`).
 
-**L13 `idx u8/total u8` 与 8 KiB 重组上限：不是当前瓶颈**。[代码] `MQP_FRAG_MAX_TOTAL=64` 在 QUIC 最小 MTU 下已经覆盖 UDP max：`ceil(65507/(1162−11−19))=58 ≤ 64`（`src/mqp/fragment.rs:57-75` 有编译期断言）。真正的限制是 `MQP_FRAG_MAX_PAYLOAD=8192`（`src/mqp/fragment.rs:31-47`，loss-amplification 论证）——它挡住 >8 KiB 的 UDP 载荷（NFS/大 EDNS0 等），但加宽 `total` 并无必要；若未来通过 CAPS 协商更大重组上限，64 片 × ~1132 B 仍 ≥ 64 KiB 的 UDP 上限，保持 u8 即可。
+**L13 `idx u8/total u8` and the 8 KiB reassembly cap: not the current bottleneck.** [Code] `MQP_FRAG_MAX_TOTAL=64` already covers the UDP max at QUIC's minimum MTU: `ceil(65507/(1162−11−19))=58 ≤ 64` (`src/mqp/fragment.rs:57-75` has a compile-time assertion). The real limit is `MQP_FRAG_MAX_PAYLOAD=8192` (`src/mqp/fragment.rs:31-47`, the loss-amplification argument) — it blocks UDP payloads >8 KiB (NFS/large EDNS0 etc.), but widening `total` is unnecessary; if a larger reassembly cap is negotiated through CAPS in the future, 64 fragments × ~1132 B still ≥ the 64 KiB UDP max, so u8 can stay.
 
-### P2（死码 / 一致性 / 攻击面）
+### P2 (dead code / consistency / attack surface)
 
-**L14 CTL/未知 kind 的静默丢弃规则**。[代码] 见 §2.1 关键事实②：CTL 静默丢（`accept.rs:725`、`dispatcher.rs:341`），<5 B 的 CTL 记 `REFUSED`（`v3_sess` 条件，`src/mqp/v3.rs:78-83`），`0x50+` 的未知 kind 被当 v2 丢弃。新格式必须改为“未知 kind/opcode → 计数丢弃 + 不 panic + 不误解析”，并且给 CTL 一条独立于 v3_sess 最小长度的入口。
+**L14 Silent drop rules for CTL/unknown kinds.** [Code] See §2.1 key fact 2: CTL is silently dropped (`accept.rs:725`, `dispatcher.rs:341`), CTL <5 B is counted as `REFUSED` (`v3_sess` condition, `src/mqp/v3.rs:78-83`), and unknown kinds `0x50+` are dropped as v2. The new format must change to "unknown kind/opcode → counted drop + no panic + no misparse", and give CTL an entry point independent of the `v3_sess` minimum length.
 
-**L15 `SRC` flag 是死特性**。[代码] codec 完整实现（`src/mqp/v3.rs:32-34,38-39,229-234`），但**所有生产调用点 `src_override` 都是 `false`**（`src/bin/myquic2-client/assoc.rs:975,992`；`src/bin/myquic2-server/reader.rs:248,259`；只有测试里出现过非 false 的语义讨论）。目标换端口回包的现状是 `NO_FLOW` inline 完整源地址（`src/bin/myquic2-server/reader.rs:134-152`），并不用 `S`。新格式要么用它（压缩“同 flow 但源端口变了”的回包），要么删掉。
+**L15 The `SRC` flag is a dead feature.** [Code] The codec is fully implemented (`src/mqp/v3.rs:32-34,38-39,229-234`), but **all production call sites pass `src_override` as `false`** (`src/bin/myquic2-client/assoc.rs:975,992`; `src/bin/myquic2-server/reader.rs:248,259`; only tests ever discuss non-false semantics). The current handling of a reply from a target on a different port is `NO_FLOW` inline full source address (`src/bin/myquic2-server/reader.rs:134-152`), and it does not use `S`. The new format should either use it (compressing replies "same flow but source port changed") or delete it.
 
-**L16 TRAIN 解码两遍**。[代码] 先 `decode_train` 全帧校验（`src/mqp/v3.rs:464-505`）再 `TrainItems` 重解（`394-428`），inline address 的 decode 执行两次。CPU 常数小（每项几十 ns），不是 wire 问题，但新格式设计时可以让校验与解析共用一次扫描。
+**L16 TRAIN is decoded twice.** [Code] First `decode_train` validates the whole frame (`src/mqp/v3.rs:464-505`), then `TrainItems` re-parses it (`394-428`), so the inline address decode runs twice. The CPU constant is small (tens of ns per item); it is not a wire problem, but a new format design could share a single scan between validation and parsing.
 
-**L17 旧 MQP-2 数据面死码/双实现**。[代码] `0x06 BATCH` 两端仍解码（`accept.rs:1041`；`dispatcher.rs:347`）但生产不发送（客户端发送函数是 `#[cfg(test)]`，`assoc.rs:1151-1167`）；`0x02/0x05` 仍有两套编码器、prefix cache、重组器（`src/mqp/datagram.rs`、`fragment.rs`、`src/udp/fragmenter.rs`、`reassembler.rs`）。新协议若不再兼容 v0.2.0，应把 `0x02/0x05/0x06` 解码一并删除，减少攻击面与代码分叉。
+**L17 Old MQP-2 data plane dead code/dual implementation.** [Code] `0x06 BATCH` is still decoded on both ends (`accept.rs:1041`; `dispatcher.rs:347`) but production no longer sends it (the client send function is `#[cfg(test)]`, `assoc.rs:1151-1167`); `0x02/0x05` still have two encoders, a prefix cache, and a reassembler (`src/mqp/datagram.rs`, `fragment.rs`, `src/udp/fragmenter.rs`, `reassembler.rs`). If the new protocol no longer needs v0.2.0 compatibility, `0x02/0x05/0x06` decoding should be deleted as well, reducing attack surface and code forking.
 
-### 额外的身份/安全面（不是字节问题，但决定新格式能不能安全落地）
+### Extra identity/security surface (not a byte problem, but it determines whether the new format can land safely)
 
-**L18 会话/flow id 的可信边界**。[代码]
-- `sess` 由客户端进程分配（`hub.rs:326-353`，0 保留；服务端拒绝 `s==0`，`src/bin/myquic2-server/reader.rs:956-960`），session 表**每连接独立**（`accept.rs:797`）→ 跨客户端无碰撞面；同一连接内是单 trust domain（客户端进程自己）。
-- flow 压缩帧的 id 解析失败只丢该帧并 `REFUSED`（`accept.rs:640-666,700-719`；`dispatcher.rs:246-289,291-326`），**不会猜路由**；inline open 与已有 id 冲突时服务端删除旧绑定而不是覆盖（`accept.rs:731-770`）→ fail-closed。这些不变量在新格式里必须保留并强化（连接级 id 一旦复用，错路由的后果从“本 session 丢包”升级为“别的 association 收错包”）。
-
----
-
-## 5. 设计空间分析（不兼容重设计，仍叫 MQP-3）
-
-### 5.1 两种寻址模型
-
-| | **Model S：session-scoped（现状/候选 A/C）** | **Model K：connection-scoped（候选 B）** |
-|---|---|---|
-| 数据帧地址 | `sess u32`（每帧）+ `flow u8`（可选） | 只有 `flow id`（连接级）；session 只出现在 open/CTL |
-| flow 表 | 每 session 64 项，session 销毁即释放 | 每连接 N 项；entry = `(sess, target, dir/owner)` |
-| 热路径查找 | 先 sess 表/FastSess，再 session 内数组索引 | 一次连接级 id 表查找；sess 只用于 open 与投递 |
-| 跨 session TRAIN | 不能（帧头单 sess） | 天然可以（item 只带 flow id） |
-| 内存/记账 | 4 KiB/session（`v3.rs:51`） | 需新增 per-connection 上限（建议 4096 项×~40 B≈160 KiB，可配） |
-| 全双工对称性 | 下行依赖上行的 flow 表（镜像） | 双向都可独立 open；服务端可主动流 |
-| 实现改动 | 小：改 codec + 控制面 | 大：连接级表 + 每连接 TX staging + 生命周期/DoS |
-
-> 结论：**要同时满足“上行下行都优化 + 真 full duplex + 跨 session 打包”，Model K（connection-scoped）是唯一自洽的模型**。Model S 能做到 L1/L2/L3 的大部分字节收益，但 L7（跨 session）和“服务端主动 flow”做不到。
-
-### 5.2 flow/session id 编码候选
-
-| 方案 | 稳态每帧 id 成本 | id 空间 | 复用安全 | 评价 |
-|---|---|---|---|---|
-| 现状：`sess u32 + flow u8` | 4 B（+1 可选） | u32×u8 | 会话内不复用 | 太贵；见 L6 |
-| `sess u16 + flow u8` | 2 B（+1） | 65535×64 | **危险**：u16 wrap 65,536 次分配后与 180 s 内仍存活的旧 session 撞 id（§6.3） | 除非配可靠 SESS_CLOSE/ACK，不建议 |
-| `sess u24` | 3 B | 16.7M | wrap 需 93k/s 才在 180 s 内复用，实际安全 | 比 u32 只省 1 B，鸡肋 |
-| 连接级 `u16` varint | 1 B（id≤127）/2 B（≤16383）/3 B | 65,535/连接 | 单调分配 + 3 s 复用窗（同 `FRAG_ID_SAFE_WINDOW_MS` 思路）+ close 后 guard | **推荐**；32k 活 flow 对 1024–4032 session/连接足够 |
-| 连接级 `u32` | 4 B（或 varint 3–5 B） | 4.29e9 | 实际永不复用，最安全 | 字节上没有意义 |
-| 12/20-bit 位域 | 1.5 B 级 | 4096/1M | 中 | 收益 <1 B，解码复杂，不推荐 |
-| “短 id” nibble 模式（可选） | **1 B**（kind 高 4 bit 中留位 +低 4 bit 短 id） | 16 个热 flow/方向 | 与 u16 主空间共存 | 只在稀疏小包场景再省 1 B（60 B 时 1.6%），可作为 B 的可选扩展（§6.2-B′） |
-
-### 5.3 方向与所有权：三种候选
-
-1. **共享双向 id（client 权威）**：现状语义。客户端分配、服务端镜像；下行回包复用客户端 flow id（`reader.rs:128-171` 已经是这个行为）。优点：零额外下行 open、协议简单；缺点：服务端**不能主动开 flow**（full-cone/换端口回包只能 forever inline），且下行完全依赖上行的 open 是否到达。
-2. **per-direction sender-owned（各管各的方向）**：每侧为自己的发送目标分配 id，接收侧按“到达方向”查各自的表。真对称、服务端可主动流；代价是同一逻辑 flow 可能出现两个 id（除非做镜像优化），且下行首包要一次 inline open。
-3. **单一命名空间 + 所有权半区（推荐折中）**：一个连接级表，id 低半区归 client、高半区归 server（用 flags 的 1 bit 表达高半区，使 varint 仍 1–2 B）；两侧都可 open；同一逻辑 flow 只有 1 个 entry，镜像/服务端主动流都只是“谁先 open”。**候选 B 采用这一种。**
-
-### 5.4 session 与 flow 的映射 / 生命周期
-
-- `session` = 一个 SOCKS UDP association（客户端）/ 一个 relay socket（服务端）。**只承载“投递到哪个 app socket / 哪个目标”的路由**。
-- `flow` = `(session, target)`；连接级 id；创建者（client 或 server）在 open 帧里写 `session u32 + addr`；接收侧校验后安装 `flow → (session, target, owner, state)`。
-- session 的创建保持现状的“隐式创建”：第一个引用它的 open 即创建（服务端仍然做 SSRF/私有地址校验后才安装，`forward_server_dgram` 路径）；关闭用 CTL `SESS_CLOSE`（幂等、可重发），180 s idle 仍是兜底。
-- flow 关闭用 `FLOW_CLOSE`；`flow id` 只有在 `now − close ≥ 2×FRAG 窗口` 后才允许复用（与 fragment id 同一套 splice 论证，`src/mqp/fragment.rs:118-145`），否则回退 inline；id 空间耗尽同样回退 inline（不是丢包）。
-
-### 5.5 控制面需求清单
-
-| opcode | 方向 | 必要性 | 内容（建议） | 作用 |
-|---|---|---|---|---|
-| `HELLO` | C→S | 必须 | magic `M3`、wire-ver u8、flags u8/u16 | in-band 版本断言；缺失/版本不符 → 连接级 fail-closed |
-| `CAPS` | S→C | 必须 | ver、feature bits、max_conn_flows、max_flow_per_session、max_reassembly、max_train_items | 能力协商/限额；跨版本灰度 |
-| `FLOW_ACK` | S→C（双向对称版可两侧） | 必须 | `sess u32 + flow id + status + [resolved addr]` | ①纯上行 flow 确认压缩；②域名 open 回传解析到的 IP（client 拿它写 SOCKS5 reply header）；③table full/SSRF reject 时回 REJECT（同帧或独立 opcode） |
-| `FLOW_REJECT` | S→C | 必须 | sess、flow、reason | 客户端对此 flow 永久 inline |
-| `FLOW_CLOSE` | 双向 | 可选（推荐） | sess、flow | 快速释放表项与重组 partial |
-| `SESS_CLOSE` | C→S | 推荐 | sess、reason | 立即释放 relay socket/reader task，不再等 180 s |
-| ACK piggyback（位） | 双向 | 可选 | 帧 flags 的 1 bit + 1 个 flow id | 有反向流量时用“回来的一帧”确认 open，避免额外 CTL 帧 |
-
-控制帧全部是 **DATAGRAM 上的不可靠、幂等**帧；丢一次最多晚一点压缩/晚一点释放，不影响正确性。`HELLO/CAPS` 建议在连接建立后发送 2–3 次（或直到收到 CAPS），但**不阻塞数据**：数据帧的格式由版本决定，二者必须同版本部署（README.md:723-737 已明确 matched deployment）。
-
-### 5.6 安全 / 内存边界
-
-| 风险 | 现状 | 新格式要求 |
-|---|---|---|
-| 压缩帧指向不存在的 flow | 丢该帧+计数（`accept.rs:640-666`；`dispatcher.rs:246-289`） | 保持；未知 id 永不分配 |
-| 延迟帧在 id 复用后错投给**另一个 session** | 现状 id 不复用→不存在 | **关键新增风险**：连接级 id 必须“不复用或复用前 ≥2×FRAG 窗口且旧 session 已关闭”，并保留 tombstone（否则是跨 app 错投，比丢包严重） |
-| inline open 冲突（同 id 不同地址） | 服务端删旧绑定（fail-closed，`accept.rs:731-770`） | 保持 fail-closed，且**不得**跨 owner 半区/跨 session 覆盖 |
-| open 洪水（每条 open 一次 resolve/SSRF/socket） | session 表有 fair-share（1024–4096/连接，`table.rs:416-421`）、全局 8192（`table.rs:374`）、idle 回收 | 连接级 flow 表需 per-conn/per-session 双 cap + 每秒 open 速率限制；超限回 `FLOW_REJECT`，不分配 |
-| 伪造/重放 | TLS 1.3 内，QUIC DATAGRAM 不可重放 | 不需要每帧 MAC；不要把 DATAGRAM 用于 0-RTT 敏感路径（现状 auth token 只 1-RTT，README.md:737） |
-| 内存 | 每 session 4 KiB flow 记账 + 256 KiB/连接重组（`src/config/tuning.rs:282-287,309-317`） | 连接级表（建议默认 4096 项，`~40 B/项`≈160 KiB/连接）计入 `per_connection_memory_bytes`；重组上限不变 |
-
-### 5.7 解码器 DoS 限制（新格式建议，全部在解析前校验）
-
-1. 帧长 ≤ `conn.max_datagram_size()`；截断即丢，不 panic。
-2. `DATA`：flow id varint ≤3 B 且值在已协商范围；`OPEN` 的 `sess` 非 0、addr 经 `TargetAddrRef::decode` 校验（unspecified/scope 拒绝，`src/mqp/addr.rs:122-160`）。
-3. `TRAIN`：`count ∈ 1..=max_train_items(=64)`；flow 字典 `nfl ≤ count` 且 id 互异；每项 len ≤ `min(8192, 帧剩余)`；**必须精确吃到帧尾**（现状如此，`src/mqp/v3.rs:506-508`）。
-4. `FRAG`：`1 ≤ total ≤ 64`、`idx < total`、chunk 非空且 ≤帧剩余；`(flow,id)` 的 partial 总量 ≤8 KiB、每连接 `held ≤256 KiB`、partials ≤256（沿用现状常量，`src/mqp/fragment.rs:165,176`）。
-5. 未知 kind / CTL opcode / 保留 flag 位 → **计数丢弃**（不是静默、不是 panic）；新 kind 不得落入 v2 解析。
-6. flow 安装：校验通过（session 存在或可创建、目标经 SSRF/策略、连接/会话 cap 未满）才 insert；否则 `FLOW_REJECT`。
-7. CTL 帧长度固定/有界；HELLO magic/ver 不符 → 连接级错误码关闭（不做部分解析）。
+**L18 Trust boundary of session/flow ids.** [Code]
+- `sess` is allocated by the client process (`hub.rs:326-353`, 0 reserved; the server rejects `s==0`, `src/bin/myquic2-server/reader.rs:956-960`), and the session table is **independent per connection** (`accept.rs:797`) → no collision surface across clients; within one connection it is a single trust domain (the client process itself).
+- Failed id resolution on a flow-compressed frame only drops that frame and counts `REFUSED` (`accept.rs:640-666,700-719`; `dispatcher.rs:246-289,291-326`); **it never guesses routing**; when an inline open conflicts with an existing id the server deletes the old binding rather than overwriting (`accept.rs:731-770`) → fail-closed. These invariants must be preserved and strengthened in the new format (once connection-level ids can be reused, the consequence of misrouting escalates from "packet loss in this session" to "another association receives the wrong packet").
 
 ---
 
-## 6. 候选 wire 格式（3 个）
+## 5. Design space analysis (incompatible redesign, still called MQP-3)
 
-> 共同约定：一个 QUIC DATAGRAM body 仍只承载**一个** MQP 帧（与现状一致，`encode_single` 无 len 字段；TRAIN 负责打包）；首字节高 4 bit = kind，低 4 bit = flags。**协议名全程 MQP-3**；CAPS 里的 `wire-ver` 只是 MQP-3 的内部 wire 版本号（示例 =2），候选 A/B/C 只是本文的分析代号。
-> 下列所有 `flow id` 均为**连接级**（候选 B）或**session 内 u8**（候选 A/C），示例中的 id 取值按对应假设；`sess u32` 在 open/CTL 中保留 u32（open 频率低，避免任何复用风险）。
+### 5.1 Two addressing models
 
-### 6.1 候选 A —— session-scoped 增量（低风险子集）
+| | **Model S: session-scoped (current/candidates A/C)** | **Model K: connection-scoped (candidate B)** |
+|---|---|---|
+| Data frame address | `sess u32` (per frame) + `flow u8` (optional) | only `flow id` (connection-level); session appears only in open/CTL |
+| flow table | 64 entries per session, freed when the session is destroyed | N entries per connection; entry = `(sess, target, dir/owner)` |
+| Hot-path lookup | sess table/FastSess first, then in-session array index | one connection-level id table lookup; sess only for open and delivery |
+| Cross-session TRAIN | not possible (frame header has a single sess) | naturally possible (items carry only flow id) |
+| Memory/accounting | 4 KiB/session (`v3.rs:51`) | needs a new per-connection cap (suggest 4096 entries×~40 B≈160 KiB, configurable) |
+| Full-duplex symmetry | downlink depends on the uplink's flow table (mirror) | both directions can open independently; the server can initiate flows |
+| Implementation change | small: change codec + control plane | large: connection-level table + per-connection TX staging + lifecycle/DoS |
 
-**目标**：保留现有帧语法，补控制面、把 v3 FRAG 和大包接进生产、加 domain/pure-uplink 压缩与紧凑 TRAIN；不引入连接级表。
+> Conclusion: **to simultaneously satisfy "optimize both uplink and downlink + true full duplex + cross-session packing", Model K (connection-scoped) is the only self-consistent model**. Model S can achieve most of the byte gains of L1/L2/L3, but cannot do L7 (cross-session) or "server-initiated flows".
 
-**帧表**
+### 5.2 flow/session id encoding candidates
 
-| 帧 | 布局（A） | 稳态头 | open 头 | 相对现状变化 |
+| Option | Steady-state per-frame id cost | id space | Reuse safety | Assessment |
+|---|---|---|---|---|
+| Current: `sess u32 + flow u8` | 4 B (+1 optional) | u32×u8 | no reuse within a session | too expensive; see L6 |
+| `sess u16 + flow u8` | 2 B (+1) | 65535×64 | **dangerous**: after 65,536 allocations a u16 wrap collides with an old session still alive within 180 s (§6.3) | not recommended unless paired with reliable SESS_CLOSE/ACK |
+| `sess u24` | 3 B | 16.7M | wrap needs 93k/s to reuse within 180 s, practically safe | saves only 1 B vs u32, neither here nor there |
+| connection-level `u16` varint | 1 B (id≤127)/2 B (≤16383)/3 B | 65,535/connection | monotonic allocation + 3 s reuse window (same idea as `FRAG_ID_SAFE_WINDOW_MS`) + guard after close | **recommended**; 32k live flows is enough for 1024–4032 sessions/connection |
+| connection-level `u32` | 4 B (or varint 3–5 B) | 4.29e9 | practically never reused, safest | meaningless in bytes |
+| 12/20-bit bitfield | on the order of 1.5 B | 4096/1M | medium | gain <1 B, complex decoding, not recommended |
+| "short id" nibble mode (optional) | **1 B** (reserve a slot in the kind's high 4 bits + low 4 bits short id) | 16 hot flows/direction | coexists with the u16 main space | saves another 1 B only in sparse small-packet scenarios (1.6% at 60 B); can be an optional extension of B (§6.2-B′) |
+
+### 5.3 Direction and ownership: three candidates
+
+1. **Shared bidirectional id (client authoritative)**: current semantics. The client allocates, the server mirrors; downlink replies reuse the client's flow id (`reader.rs:128-171` already behaves this way). Pros: zero extra downlink opens, simple protocol; cons: the server **cannot initiate flows** (full-cone/port-changed replies can only be inline forever), and downlink depends entirely on whether the uplink open arrived.
+2. **per-direction sender-owned (each side manages its own direction)**: each side allocates ids for its own send targets, and the receiving side looks up its own table by "arrival direction". Truly symmetric, the server can initiate flows; the cost is that the same logical flow may have two ids (unless a mirror optimization is done), and the first downlink packet needs one inline open.
+3. **Single namespace + ownership half (recommended compromise)**: one connection-level table, the low half of ids belongs to the client and the high half to the server (using 1 flag bit to express the high half so the varint stays 1–2 B); both sides can open; the same logical flow has only 1 entry, and mirroring/server-initiated flows are just "who opens first". **Candidate B uses this one.**
+
+### 5.4 session and flow mapping / lifecycle
+
+- `session` = one SOCKS UDP association (client) / one relay socket (server). **It only carries the routing of "which app socket / which target to deliver to"**.
+- `flow` = `(session, target)`; connection-level id; the creator (client or server) writes `session u32 + addr` in the open frame; the receiving side validates and then installs `flow → (session, target, owner, state)`.
+- Session creation keeps the current "implicit creation": the first open that references it creates it (the server still performs SSRF/private-address validation before installing, on the `forward_server_dgram` path); close uses CTL `SESS_CLOSE` (idempotent, resendable), with 180 s idle still as the fallback.
+- Flow close uses `FLOW_CLOSE`; a `flow id` may be reused only after `now − close ≥ 2×FRAG window` (the same splice argument as fragment id, `src/mqp/fragment.rs:118-145`), otherwise fall back to inline; id space exhaustion also falls back to inline (not packet loss).
+
+### 5.5 Control plane requirements list
+
+| opcode | Direction | Necessity | Content (suggested) | Purpose |
+|---|---|---|---|---|
+| `HELLO` | C→S | required | magic `M3`, wire-ver u8, flags u8/u16 | in-band version assertion; missing/mismatched version → connection-level fail-closed |
+| `CAPS` | S→C | required | ver, feature bits, max_conn_flows, max_flow_per_session, max_reassembly, max_train_items | capability negotiation/limits; cross-version canary |
+| `FLOW_ACK` | S→C (both sides in the symmetric bidirectional version) | required | `sess u32 + flow id + status + [resolved addr]` | ① confirm compression for pure-uplink flows; ② return the resolved IP for a domain open (the client uses it to write the SOCKS5 reply header); ③ reply REJECT on table full/SSRF reject (same frame or separate opcode) |
+| `FLOW_REJECT` | S→C | required | sess, flow, reason | the client stays inline forever for this flow |
+| `FLOW_CLOSE` | both directions | optional (recommended) | sess, flow | quickly release table entries and reassembly partials |
+| `SESS_CLOSE` | C→S | recommended | sess, reason | immediately release the relay socket/reader task instead of waiting 180 s |
+| ACK piggyback (bit) | both directions | optional | 1 bit in frame flags + 1 flow id | when there is reverse traffic, use "the frame coming back" to confirm the open, avoiding an extra CTL frame |
+
+Control frames are all **unreliable, idempotent** frames over DATAGRAM; losing one at most delays compression/release slightly and never affects correctness. `HELLO/CAPS` is suggested to be sent 2–3 times after connection establishment (or until CAPS is received), but **must not block data**: the data frame format is determined by the version, and the two must be deployed with the same version (README.md:723-737 already states matched deployment).
+
+### 5.6 Security / memory boundaries
+
+| Risk | Current state | New format requirement |
+|---|---|---|
+| Compressed frame points to a non-existent flow | drop the frame + count (`accept.rs:640-666`; `dispatcher.rs:246-289`) | keep; never allocate unknown ids |
+| A delayed frame misdelivered to **another session** after id reuse | current ids are not reused → does not exist | **key new risk**: connection-level ids must be "not reused, or reused only after ≥2×FRAG window and the old session is closed", and a tombstone must be kept (otherwise it is cross-app misdelivery, worse than packet loss) |
+| inline open conflict (same id, different address) | server deletes the old binding (fail-closed, `accept.rs:731-770`) | keep fail-closed, and **must not** overwrite across owner halves/sessions |
+| open flood (one resolve/SSRF/socket per open) | session table has fair-share (1024–4096/connection, `table.rs:416-421`), global 8192 (`table.rs:374`), idle reclamation | connection-level flow table needs double caps per-conn/per-session + per-second open rate limit; over limit reply `FLOW_REJECT`, no allocation |
+| Forgery/replay | inside TLS 1.3, QUIC DATAGRAM cannot be replayed | no per-frame MAC needed; do not use DATAGRAM for 0-RTT sensitive paths (current auth token is 1-RTT only, README.md:737) |
+| Memory | 4 KiB flow accounting per session + 256 KiB/connection reassembly (`src/config/tuning.rs:282-287,309-317`) | connection-level table (suggest default 4096 entries, `~40 B/entry`≈160 KiB/connection) counted in `per_connection_memory_bytes`; reassembly cap unchanged |
+
+### 5.7 Decoder DoS limits (suggested for the new format, all validated before parsing)
+
+1. Frame length ≤ `conn.max_datagram_size()`; truncation means drop, no panic.
+2. `DATA`: flow id varint ≤3 B and value within the negotiated range; `OPEN`'s `sess` non-zero, addr validated via `TargetAddrRef::decode` (unspecified/scope rejected, `src/mqp/addr.rs:122-160`).
+3. `TRAIN`: `count ∈ 1..=max_train_items(=64)`; flow dictionary `nfl ≤ count` with distinct ids; each item len ≤ `min(8192, bytes remaining in the frame)`; **must consume exactly to the end of the frame** (current behavior, `src/mqp/v3.rs:506-508`).
+4. `FRAG`: `1 ≤ total ≤ 64`, `idx < total`, chunk non-empty and ≤ bytes remaining in the frame; total partials per `(flow,id)` ≤8 KiB, per connection `held ≤256 KiB`, partials ≤256 (reusing the current constants, `src/mqp/fragment.rs:165,176`).
+5. Unknown kind / CTL opcode / reserved flag bits → **counted drop** (not silent, not panic); new kinds must not fall into v2 parsing.
+6. flow installation: insert only after validation passes (session exists or can be created, target passes SSRF/policy, connection/session caps not full); otherwise `FLOW_REJECT`.
+7. CTL frames have fixed/bounded length; HELLO magic/ver mismatch → close with a connection-level error code (no partial parsing).
+
+---
+
+## 6. Candidate wire formats (3)
+
+> Common conventions: one QUIC DATAGRAM body still carries **exactly one** MQP frame (same as current, `encode_single` has no len field; TRAIN does the packing); the first byte's high 4 bits = kind, low 4 bits = flags. **The protocol name is MQP-3 throughout**; `wire-ver` in CAPS is only MQP-3's internal wire version number (example =2), and candidates A/B/C are only analysis labels in this document.
+> All `flow id`s below are **connection-level** (candidate B) or **in-session u8** (candidates A/C); the id values in the examples follow the corresponding assumption; `sess u32` stays u32 in open/CTL (opens are infrequent, avoiding any reuse risk).
+
+### 6.1 Candidate A — session-scoped incremental (low-risk subset)
+
+**Goal**: keep the existing frame syntax, add the control plane, wire v3 FRAG and large packets into production, add domain/pure-uplink compression and compact TRAIN; do not introduce a connection-level table.
+
+**Frame table**
+
+| Frame | Layout (A) | Steady-state header | open header | Change vs current |
 |---|---|---:|---:|---|
-| `SINGLE 0x10` | `0x10\|flags \| sess u32 \| [flow u8] \| [addr] \| payload` | 5 / 6 | 12/13/24/25/40 | 不变；**用于所有 ≤limit−header 的 payload**（不再 512 截断） |
-| `TRAIN 0x20` | `0x20\|flags \| sess u32 \| count u8 \| [flow u8 if SAME_FLOW≠0] \| item*`；新增 flag `COMPACT=0x2`：所有项已压缩时省略 iflg——整帧同 flow（或全 flow 0）时 item = `len varint \| payload`，混合 flow 时 item = `flow u8 \| len varint \| payload` | header 6/7，item 1–2 | item 9/10/21/22/37 | COMPACT 对“同 flow”项省 1 B/项，对混合 flow 项保持 2 B/项 |
-| `FRAG 0x30` | `0x30\|flags \| sess u32 \| [flow u8] \| id u32 \| idx u8 \| total u8 \| [addr on open] \| chunk` | **11 / 12** | 18/30/46（首片） | 接线；稳态无地址 |
-| `CTL 0x40` | `0x41 HELLO`、`0x42 CAPS`、`0x43 FLOW_ACK(sess u32+flow u8+status+[resolved addr])`、`0x44 FLOW_REJECT`、`0x45 FLOW_CLOSE`、`0x46 SESS_CLOSE` | — | — | 新增 |
+| `SINGLE 0x10` | `0x10\|flags \| sess u32 \| [flow u8] \| [addr] \| payload` | 5 / 6 | 12/13/24/25/40 | unchanged; **used for all payloads ≤limit−header** (no more 512 truncation) |
+| `TRAIN 0x20` | `0x20\|flags \| sess u32 \| count u8 \| [flow u8 if SAME_FLOW≠0] \| item*`; new flag `COMPACT=0x2`: when all items are compressed, omit iflg — for a whole frame of the same flow (or all flow 0) item = `len varint \| payload`, for mixed flows item = `flow u8 \| len varint \| payload` | header 6/7, item 1–2 | item 9/10/21/22/37 | COMPACT saves 1 B/item for "same flow" items and keeps 2 B/item for mixed-flow items |
+| `FRAG 0x30` | `0x30\|flags \| sess u32 \| [flow u8] \| id u32 \| idx u8 \| total u8 \| [addr on open] \| chunk` | **11 / 12** | 18/30/46 (first fragment) | wire it up; steady state has no address |
+| `CTL 0x40` | `0x41 HELLO`, `0x42 CAPS`, `0x43 FLOW_ACK(sess u32+flow u8+status+[resolved addr])`, `0x44 FLOW_REJECT`, `0x45 FLOW_CLOSE`, `0x46 SESS_CLOSE` | — | — | new |
 
-**关键行为**
-- 域名目标：client 给域名分配 flow（不再强制 NO_FLOW），open 帧 inline domain；server 解析/SSRF 通过后安装 `flow→(domain, resolved_ip)` 并回 `FLOW_ACK(resolved_ip)`；之后上行用 flow 压缩，下行从该 resolved_ip 来的回包用**同一 flow id** 压缩（client 用 ACK 里的 IP 写 SOCKS5 reply header）。
-- 纯上行 IP flow：server 在 open 安装成功后回 `FLOW_ACK`（无 addr），client 立即转压缩。
-- 大包/分片：全部走 `SINGLE`/`FRAG`，v2 数据面废弃（解码可留一版）。
-- 不支持：跨 session TRAIN、服务端主动 flow（full-cone 仍 inline）。
+**Key behavior**
+- Domain targets: the client allocates a flow for the domain (no longer forcing NO_FLOW), with the open frame inline domain; after the server resolves and passes SSRF it installs `flow→(domain, resolved_ip)` and replies `FLOW_ACK(resolved_ip)`; afterwards uplink uses flow compression, and downlink replies coming from that resolved_ip use **the same flow id** for compression (the client uses the IP in the ACK to write the SOCKS5 reply header).
+- Pure-uplink IP flows: the server replies `FLOW_ACK` (no addr) after the open installs successfully, and the client switches to compression immediately.
+- Large packets/fragments: all go through `SINGLE`/`FRAG`, and the v2 data plane is deprecated (decoding may be kept for one version).
+- Not supported: cross-session TRAIN, server-initiated flows (full-cone stays inline).
 
-**示例编码（sess=7）**
+**Example encoding (sess=7)**
 ```text
-SINGLE 稳态 IPv4 flow0, payload "abc":
+SINGLE steady IPv4 flow0, payload "abc":
   10 07 00 00 00 61 62 63                          ; 5 B header
 SINGLE open IPv4 flow2 + 1.2.3.4:53:
   13 07 00 00 00 02 01 01 02 03 04 00 35 78        ; I|F, 13 B header
@@ -386,33 +388,33 @@ CTL FLOW_ACK(domain, resolved 1.2.3.4:53):
   43 07 00 00 00 01 00 01 01 02 03 04 00 35        ; 14 B
 ```
 
-### 6.2 候选 B —— connection-scoped 对称全双工（**推荐**）
+### 6.2 Candidate B — connection-scoped symmetric full duplex (**recommended**)
 
-**核心**：数据帧只带连接级 flow id；`session` 只出现在 open（`sess u32`）与 CTL；TRAIN 项可跨 session；两侧都可 open（id 分半区）；FRAG key = `(flow, id)`。
+**Core**: data frames carry only a connection-level flow id; `session` appears only in open (`sess u32`) and CTL; TRAIN items can cross sessions; both sides can open (ids split into halves); FRAG key = `(flow, id)`.
 
-**id 命名空间与 flags（候选 B 定义）**
-- flow id = `u16`：`0x0000` 保留为 “inline/no-flow”；`0x0001..0x7FFE` 归 **client 分配**；`0x8001..0xFFFE` 归 **server 分配**；`0x7FFF/0xFFFF` 保留。
-- 首字节 flags（数据帧）：`0x1 OPEN`（本帧携带 `sess u32 + addr` 的 open 描述）、`0x2 INLINE`（无 flow，`sess u32 + addr` 内联；与 OPEN 互斥，用于表满/一次性源，inline 地址即实际源，无需单独的 SRC 位）、`0x4 HI`（flow id 属服务端半区；解码时 `id |= 0x8000`）、`0x8 ACK`（可选：header 之后、OPEN 描述之前放 `nack u8 + ack 项（1 B flags + idvarint）[nack]`，用于确认对端已收的 flow）。
-- 编码：id 用 LEB128，`HI` 时对 `id−0x8000` 编码 → 常见 1–127 的 id 恒为 1 B。
+**id namespace and flags (candidate B definition)**
+- flow id = `u16`: `0x0000` reserved as "inline/no-flow"; `0x0001..0x7FFE` belong to **client allocation**; `0x8001..0xFFFE` belong to **server allocation**; `0x7FFF/0xFFFF` reserved.
+- First-byte flags (data frames): `0x1 OPEN` (this frame carries the open description `sess u32 + addr`), `0x2 INLINE` (no flow, `sess u32 + addr` inline; mutually exclusive with OPEN, used for table-full/one-off sources; the inline address is the actual source, so no separate SRC bit is needed), `0x4 HI` (the flow id belongs to the server half; on decode `id |= 0x8000`), `0x8 ACK` (optional: after the header and before the OPEN description place `nack u8 + ack item (1 B flags + idvarint) [nack]`, used to confirm flows the peer has received).
+- Encoding: ids use LEB128; with `HI` encode `id−0x8000` → common ids 1–127 are always 1 B.
 
-**帧表**
+**Frame table**
 
-| 帧 | 布局（B） | 稳态头 | open 头（含 sess+addr） | 说明 |
+| Frame | Layout (B) | Steady-state header | open header (incl. sess+addr) | Notes |
 |---|---|---:|---:|---|
-| `DATA 0x10` | `0x10\|flags \| idvarint \| [sess u32 + addr if OPEN] \| payload` | **2**（id≤127）/3/4 | 13 / 25 / 40 | 无长度字段；一个 DATAGRAM 一个 payload |
-| `DATA inline 0x12` | `0x12 \| sess u32 \| addr \| payload` | —（12/24/39） | — | 表满/无 flow 的 fail-safe 路径（≈v2 单帧） |
-| `TRAIN same 0x21` | `0x21 \| count u8 \| idvarint \| item*`；item=`len varint \| payload` | header **3**（id≤127）；item **1–2** | — | 整帧同 flow，全部压缩 |
-| `TRAIN dict 0x22` | `0x22 \| count u8 \| nfl u8 \| entry[nfl] \| item*`；entry = 1 B（bit7=HI 服务端半区、bit6=LONG 后随 varint id、低 6 bit=id 或 0），常见 1 B/flow；item=`idx u8 \| len varint \| payload`（idx 0..63） | header **3+k**（k=本帧不同 flow 数）；item **2–3** | — | 混合 flow；dict 只摊薄“同一 flow 多项”，**每项 1 B flow 引用模式（inline-flow）也必须保留**，当 flow 数≈项数时它更省；item 可跨 session（flow→session 在表里） |
-| `FRAG 0x30` | `0x30\|flags \| idvarint \| id u32 \| idx u8 \| total u8 \| [sess u32 + addr if OPEN] \| chunk` | **8**（id≤127）/9/10 | 19 / 31 / 46（首片） | key=`(flow, frag id)`；重组内存上限沿用现状 |
-| `CTL 0x40` | `0x41 HELLO`、`0x42 CAPS`、`0x43 FLOW_ACK(sess u32+idvarint+status+[addr])`、`0x44 FLOW_REJECT`、`0x45 FLOW_CLOSE`、`0x46 SESS_CLOSE` | — | — | 幂等 |
+| `DATA 0x10` | `0x10\|flags \| idvarint \| [sess u32 + addr if OPEN] \| payload` | **2** (id≤127)/3/4 | 13 / 25 / 40 | no length field; one payload per DATAGRAM |
+| `DATA inline 0x12` | `0x12 \| sess u32 \| addr \| payload` | — (12/24/39) | — | fail-safe path for table full/no flow (≈v2 single frame) |
+| `TRAIN same 0x21` | `0x21 \| count u8 \| idvarint \| item*`; item=`len varint \| payload` | header **3** (id≤127); item **1–2** | — | whole frame same flow, all compressed |
+| `TRAIN dict 0x22` | `0x22 \| count u8 \| nfl u8 \| entry[nfl] \| item*`; entry = 1 B (bit7=HI server half, bit6=LONG followed by varint id, low 6 bits=id or 0), typically 1 B/flow; item=`idx u8 \| len varint \| payload` (idx 0..63) | header **3+k** (k=number of distinct flows in this frame); item **2–3** | — | mixed flows; the dict only amortizes "multiple items of the same flow", **the 1 B per-item flow-reference mode (inline-flow) must also be kept**, since it is cheaper when the flow count ≈ item count; items can cross sessions (flow→session is in the table) |
+| `FRAG 0x30` | `0x30\|flags \| idvarint \| id u32 \| idx u8 \| total u8 \| [sess u32 + addr if OPEN] \| chunk` | **8** (id≤127)/9/10 | 19 / 31 / 46 (first fragment) | key=`(flow, frag id)`; reassembly memory cap unchanged |
+| `CTL 0x40` | `0x41 HELLO`, `0x42 CAPS`, `0x43 FLOW_ACK(sess u32+idvarint+status+[addr])`, `0x44 FLOW_REJECT`, `0x45 FLOW_CLOSE`, `0x46 SESS_CLOSE` | — | — | idempotent |
 
-**打开/确认/关闭**
-- open：`DATA`/`FRAG` 带 `OPEN` + `sess` + `addr`（+payload）。重复 open 幂等（同 id 同 `(sess,addr)` 视为重传；不同则丢弃并计数）。
-- 确认：任一方向的 `ACK` 位/`FLOW_ACK` 都能确认（用于纯上行 + 域名 resolved-IP 回传）；请求/响应流量有**隐式确认**（对方第一个压缩帧即可证明映射已安装，和现状 `confirm_flow` 语义一致，`src/bin/myquic2-client/hub.rs:139-149`）。
-- 关闭：`FLOW_CLOSE`/`SESS_CLOSE`；id 复用 guard ≥ `2×FRAG_TIMEOUT+Sweep`（3 s，与 `FRAG_ID_SAFE_WINDOW_MS` 同一论证，`src/mqp/fragment.rs:118-145`），tombstone 保留同窗口；超限/耗尽回退 `DATA INLINE`。
-- 下行 mirror：服务端若已有该目标的 client flow，直接用 client id 回包（现状行为，零额外 open）；full-cone/换端口等 server-originated 流用自己的半区 id open 一次后压缩。
+**Open/confirm/close**
+- open: `DATA`/`FRAG` carries `OPEN` + `sess` + `addr` (+payload). Repeated opens are idempotent (same id with same `(sess,addr)` is treated as a retransmission; different → discard and count).
+- confirm: the `ACK` bit/`FLOW_ACK` in either direction can confirm (used for pure uplink + domain resolved-IP return); request/response traffic has **implicit confirmation** (the peer's first compressed frame proves the mapping is installed, consistent with the current `confirm_flow` semantics, `src/bin/myquic2-client/hub.rs:139-149`).
+- close: `FLOW_CLOSE`/`SESS_CLOSE`; id reuse guard ≥ `2×FRAG_TIMEOUT+Sweep` (3 s, the same argument as `FRAG_ID_SAFE_WINDOW_MS`, `src/mqp/fragment.rs:118-145`), tombstones kept for the same window; over limit/exhausted → fall back to `DATA INLINE`.
+- downlink mirror: if the server already has a client flow for that target, reply directly with the client id (current behavior, zero extra open); server-originated flows such as full-cone/port-changed open once with an id from its own half and then compress.
 
-**示例编码**
+**Example encoding**
 ```text
 DATA steady client flow 5, payload "abc":
   10 05 61 62 63                                   ; 2 B header
@@ -439,94 +441,94 @@ CTL FLOW_CLOSE(sess=7, flow=5):
   45 07 00 00 00 05                                ; 6 B
 ```
 
-**B′（可选，1 B 稳态头）**：把 `0x50..0x5F` 的 16 个 kind 值定义为 “DATA short”：`0x50|lo` 中低 4 bit = 热 flow 槽号（每方向 16 个，由 `CAPS` 协商或固定为最近使用的 16 个 id），payload 紧跟；稳态头 **1 B**。收益：60 B 时再 −1.6%、28 B 时 −3.3%；代价：多一组 kind、热流映射状态、解码分支。**可以现在就把 kind 空间留出来，实现放第二阶段。**
+**B′ (optional, 1 B steady-state header)**: define the 16 kind values `0x50..0x5F` as "DATA short": the low 4 bits of `0x50|lo` = hot flow slot number (16 per direction, negotiated by `CAPS` or fixed to the 16 most recently used ids), with the payload immediately following; steady-state header **1 B**. Gain: another −1.6% at 60 B, −3.3% at 28 B; cost: one more kind group, hot-flow mapping state, decode branches. **The kind space can be reserved now, with the implementation in the second phase.**
 
-### 6.3 候选 C —— session 桶 + u16 sess（**不推荐**）
+### 6.3 Candidate C — session bucket + u16 sess (**not recommended**)
 
-**想法**：保留“session 是第一等地址”的模型，把 `sess u32→u16`（稳态头 5→3 B），TRAIN 加 `MULTI_SESS` 字典实现跨 session 打包，FRAG 用 `(sess u16, flow u8, id)`。
+**Idea**: keep the "session is a first-class address" model, shrink `sess u32→u16` (steady-state header 5→3 B), add a `MULTI_SESS` dictionary to TRAIN for cross-session packing, and use `(sess u16, flow u8, id)` for FRAG.
 
-| 帧 | 布局（C） | 稳态头 |
+| Frame | Layout (C) | Steady-state header |
 |---|---|---:|
 | `SINGLE 0x10` | `0x10\|flags \| sess u16 \| [flow u8] \| [addr] \| payload` | 3 / 4 |
-| `TRAIN 0x20` | `0x20\|flags \| sess u16 \| count u8 \| [nsess u8 + sess u16×n if MULTI] \| [flow u8 if SAME_FLOW] \| item*`（MULTI 时 item +1 B sess index） | 4 / 5 |
+| `TRAIN 0x20` | `0x20\|flags \| sess u16 \| count u8 \| [nsess u8 + sess u16×n if MULTI] \| [flow u8 if SAME_FLOW] \| item*` (with MULTI, item +1 B sess index) | 4 / 5 |
 | `FRAG 0x30` | `0x30\|flags \| sess u16 \| [flow u8] \| id u32 \| idx \| total \| [addr] \| chunk` | 9 / 10 |
-| `CTL 0x40` | 同 A，但 sess u16 | — |
+| `CTL 0x40` | same as A, but sess u16 | — |
 
-**为什么否决（复用安全）**：
-- 客户端 session id 是**单调分配、从不复用**的 u32（`hub.rs:326-353`），服务端 session 只靠 180 s idle 或 sweep 回收（`table.rs:382`；`accept.rs:799-812`）。改成 u16 后，65,536 次分配就回绕；只要客户端在 180 s 内创建超过 65,536 个 association（平均 364 个/s，繁忙客户端/恶意本地 app 都能做到），**新 association 会拿到一个服务端仍认为属于旧 association 的 sess id**：服务端把新流量的回包投进旧 relay socket（错误的目标/端口），客户端 hub 却把回包投给新 app → 跨 association 串流。
-- 要安全复用必须引入**可靠**的 SESS_CLOSE 确认（QUIC stream 或带重传的 CTL）、或 180 s 复用 guard（把新 session 速率压到 364/s）、或再带 1 B generation（稳态回到 4 B，收益只剩 1 B）。收益（2 B/帧）不足以抵消这套状态机与“串流”风险；而候选 B 把 sess 从数据帧里整个删掉，根本不存在复用问题。
-- 例外：如果 product 明确要求“保留 session 为中心、且流量低 churn”，C 的 `MULTI_SESS` 也能拿到 L7 的 send 调用收益；但此时不如直接做 B。
+**Why rejected (reuse safety)**:
+- The client session id is a **monotonically allocated, never reused** u32 (`hub.rs:326-353`), and server sessions are reclaimed only by 180 s idle or sweep (`table.rs:382`; `accept.rs:799-812`). After changing to u16, 65,536 allocations wrap; as long as the client creates more than 65,536 associations within 180 s (average 364/s, achievable by a busy client or a malicious local app), **a new association gets a sess id that the server still considers to belong to an old association**: the server delivers replies for new traffic into the old relay socket (wrong target/port), while the client hub delivers the replies to the new app → cross-association stream mixing.
+- To reuse safely you must introduce **reliable** SESS_CLOSE confirmation (QUIC stream or CTL with retransmission), or a 180 s reuse guard (limiting new sessions to 364/s), or another 1 B generation (steady state back to 4 B, leaving only 1 B of gain). The gain (2 B/frame) is not enough to offset this state machine and the "stream mixing" risk; candidate B removes sess from data frames entirely, so the reuse problem does not exist at all.
+- Exception: if the product explicitly requires "session-centric, low-churn traffic", C's `MULTI_SESS` can also get L7's send-call gain; but in that case it is better to just do B.
 
 ---
 
-## 7. 字节 / 调用节省模型
+## 7. Byte / call savings model
 
-### 7.1 公式与假设
+### 7.1 Formulas and assumptions
 
-**假设（全部为模型输入，不是测量）**
-- A1：只计 MQP 层，不含 IP/UDP/QUIC 头；每个 DATAGRAM 帧的 QUIC 层还有约 `1 B type + varint(len)` ≈2–3 B（两个候选一样，故不进入对比；帧数少时更省）。
-- A2：`limit = 1162`（MTU 1200）与 `1362`（MTU 1400）。
-- A3：无丢包/乱序；domain L=30；IPv4 默认。
-- A4：TRAIN 只在同一 flush burst 内打包，burst=32 payload（`LAST_HOP_DRAIN=32`，`src/udp/batch.rs:46`）；每帧按预算贪心装，run-of-1 发单帧（现状行为，候选保持）。
-- A5：候选 B 的 flow id ≤127（1 B varint），open 带 `sess u32`；候选 A 保持 `sess u32`。
-- A6：候选的字节数是**按 §6 帧表手算**，未实现、未实测。
+**Assumptions (all model inputs, not measurements)**
+- A1: MQP layer only, excluding IP/UDP/QUIC headers; each DATAGRAM frame has about `1 B type + varint(len)` ≈2–3 B at the QUIC layer (the same for both candidates, so it does not enter the comparison; fewer frames saves more).
+- A2: `limit = 1162` (MTU 1200) and `1362` (MTU 1400).
+- A3: no packet loss/reordering; domain L=30; IPv4 default.
+- A4: TRAIN only packs within the same flush burst, burst=32 payloads (`LAST_HOP_DRAIN=32`, `src/udp/batch.rs:46`); each frame greedily packs to budget, run-of-1 sends a single frame (current behavior, kept by the candidates).
+- A5: candidate B's flow id ≤127 (1 B varint), open carries `sess u32`; candidate A keeps `sess u32`.
+- A6: candidate byte counts are **hand-computed from the §6 frame tables**, not implemented, not measured.
 
-**公式**
+**Formulas**
 ```text
-单帧：            W = p + H_single
-TRAIN(n 项)：     W = H_train + Σ_i (O_item + p_i) ≈ H_train + n·(O_item + p)
-                  n_max = floor((limit − H_train) / (O_item + p))     # 同尺寸项
-分片：            F = ceil(p / (limit − H_frag)) ;  W = p + F·H_frag
-每 1000 payload： W1000 = Σ每帧帧长 ;  Frames1000 = Σ帧数
-省比：            save% = (W_cur − W_new) / W_cur
-调用：            每 DATAGRAM 帧 = 1 次 quinn send（1 次连接状态锁，
-                  src/bin/myquic2-client/egress.rs:110-112；src/bin/myquic2-server/reader.rs:503-506）
-CPU 量级：        ΔCPU ≈ Δframes · c_send，c_send ≈ 200–300 ns/帧
-                  （[文档/既有测量] PROTOCOL_ANALYSIS.md §4 的估算口径，本次未复测）
+Single frame:      W = p + H_single
+TRAIN (n items):   W = H_train + Σ_i (O_item + p_i) ≈ H_train + n·(O_item + p)
+                   n_max = floor((limit − H_train) / (O_item + p))     # same-size items
+Fragmentation:     F = ceil(p / (limit − H_frag)) ;  W = p + F·H_frag
+Per 1000 payloads: W1000 = Σ per-frame length ;  Frames1000 = Σ frame count
+Savings ratio:     save% = (W_cur − W_new) / W_cur
+Calls:             each DATAGRAM frame = 1 quinn send (1 connection state lock,
+                   src/bin/myquic2-client/egress.rs:110-112; src/bin/myquic2-server/reader.rs:503-506)
+CPU magnitude:     ΔCPU ≈ Δframes · c_send, c_send ≈ 200–300 ns/frame
+                   ([Doc/existing measurement] estimation basis from PROTOCOL_ANALYSIS.md §4, not re-measured this time)
 ```
 
-### 7.2 工作负载矩阵（每 1000 payload，`limit=1162`；`1362` 只列不同项）
+### 7.2 Workload matrix (per 1000 payloads, `limit=1162`; `1362` lists only differing entries)
 
-| 工作负载 | 当前 字节/帧数 | A 字节/帧数 | B 字节/帧数 | A save | B save |
+| Workload | Current bytes/frames | A bytes/frames | B bytes/frames | A save | B save |
 |---|---:|---:|---:|---:|---:|
-| W1 IPv4 60 B 同目的地（32/burst） | 62,378 / 63 | 61,378 / 63 | 61,189 / 63 | −1.6% | −1.9% |
-| W1b IPv4 28 B 同目的地 | 30,192 / 32 | 29,192 / 32 | 29,096 / 32 | −3.3% | −3.6% |
-| W2 8 flow 同 session 扇出 60 B | 63,378 / 63 | 62,378 / 63 | 62,189 / 63 | −1.6% | −1.9% |
-| W2b 8 flow 扇出 200 B | 205,314 / 219 | 204,314 / 219 | 203,657 / 219 | −0.5% | −0.8% |
-| W3 **域名上行** 60 B（L=30，domain 地址） | **97,564 / 94** | **61,378 / 63** | **61,189 / 63** | **−37.1%** | **−37.3%** |
-| W3b 域名**下行回包** 60 B（v4，inline IP） | 70,378 / 63 | 61,378 / 63 | 61,189 / 63 | **−12.8%** | **−13.1%** |
-| W3c 域名**下行回包** 60 B（v6，inline IP） | 82,564 / 94 | 61,378 / 63 | 61,189 / 63 | **−25.7%** | **−25.9%** |
-| W4 跨 8 session×4 项 60 B | 63,500 / 250 | 63,500 / 250 | 62,189 / 63 | 0 | **−2.1%（调用 4×）** |
-| W5 跨 32 session×1 项 60 B | 65,000 / 1000 | 65,000 / 1000 | 62,189 / 63 | 0 | **−4.3%（调用 16×）** |
-| W7 高速单向 60 B（32/burst，无回包） | 62,602 / 63 | 61,378 / 63 | 61,189 / 63 | −2.0% | −2.3% |
-| W7b **稀疏单向** 60 B（1/burst） | 72,000 / 1000 | 65,000 / 1000 | 62,000 / 1000 | **−9.7%** | **−13.9%** |
-| W8 bulk 1200 B IPv4（@1162，2 片） | 1,236,000 / 2000 | 1,222,000 / 2000 | 1,216,000 / 2000 | −1.1% | −1.6% |
-| W8 v6 1200 B @1162（2 片） | 1,260,000 / 2000 | 1,222,000 / 2000 | 1,216,000 / 2000 | −3.0% | −3.5% |
-| W9 full-cone 下行 60 B 单源（server-originated，v4 inline IP） | 70,378 / 63 | 70,378 / 63（A 不支持） | 61,201 / 64 | 0 | **−13.0%**（v6 −25.9%） |
+| W1 IPv4 60 B same destination (32/burst) | 62,378 / 63 | 61,378 / 63 | 61,189 / 63 | −1.6% | −1.9% |
+| W1b IPv4 28 B same destination | 30,192 / 32 | 29,192 / 32 | 29,096 / 32 | −3.3% | −3.6% |
+| W2 8 flows same session, fan-out 60 B | 63,378 / 63 | 62,378 / 63 | 62,189 / 63 | −1.6% | −1.9% |
+| W2b 8 flows fan-out 200 B | 205,314 / 219 | 204,314 / 219 | 203,657 / 219 | −0.5% | −0.8% |
+| W3 **domain uplink** 60 B (L=30, domain address) | **97,564 / 94** | **61,378 / 63** | **61,189 / 63** | **−37.1%** | **−37.3%** |
+| W3b domain **downlink replies** 60 B (v4, inline IP) | 70,378 / 63 | 61,378 / 63 | 61,189 / 63 | **−12.8%** | **−13.1%** |
+| W3c domain **downlink replies** 60 B (v6, inline IP) | 82,564 / 94 | 61,378 / 63 | 61,189 / 63 | **−25.7%** | **−25.9%** |
+| W4 across 8 sessions×4 items, 60 B | 63,500 / 250 | 63,500 / 250 | 62,189 / 63 | 0 | **−2.1% (calls 4×)** |
+| W5 across 32 sessions×1 item, 60 B | 65,000 / 1000 | 65,000 / 1000 | 62,189 / 63 | 0 | **−4.3% (calls 16×)** |
+| W7 high-rate unidirectional 60 B (32/burst, no replies) | 62,602 / 63 | 61,378 / 63 | 61,189 / 63 | −2.0% | −2.3% |
+| W7b **sparse unidirectional** 60 B (1/burst) | 72,000 / 1000 | 65,000 / 1000 | 62,000 / 1000 | **−9.7%** | **−13.9%** |
+| W8 bulk 1200 B IPv4 (@1162, 2 fragments) | 1,236,000 / 2000 | 1,222,000 / 2000 | 1,216,000 / 2000 | −1.1% | −1.6% |
+| W8 v6 1200 B @1162 (2 fragments) | 1,260,000 / 2000 | 1,222,000 / 2000 | 1,216,000 / 2000 | −3.0% | −3.5% |
+| W9 full-cone downlink 60 B single source (server-originated, v4 inline IP) | 70,378 / 63 | 70,378 / 63 (A does not support) | 61,201 / 64 | 0 | **−13.0%** (v6 −25.9%) |
 
-`limit=1362` 的差异（其余行与 1162 相同）：
-- W8 bulk 1200 B IPv4：当前 1,212,000/1000 帧 → A 1,205,000 → B 1,202,000（−0.6% / −0.8%）；
-- W8 v6 1200 B：当前 1,224,000/1000 → A 1,205,000 → B 1,202,000（−1.6% / −1.8%）；
-- W8 1420 B（任何 MTU 都 2 片）：v4 当前 36 B → A 22 → B 16（−1.0% / −1.4% of 1456 B）；v6 当前 60 → 22/16（−2.7% / −3.0%）。
-- W2b 200 B 扇出：帧数 219→188，字节曲线同上（−0.5%/−0.8%）。
-- W3c 域名下行（v6）：当前 1362 时为 82,378 B / 63 帧（1162 时 82,564 / 94 帧），A/B 不变 → −25.5%/−25.7%。
+Differences at `limit=1362` (the other rows are the same as 1162):
+- W8 bulk 1200 B IPv4: current 1,212,000/1000 frames → A 1,205,000 → B 1,202,000 (−0.6% / −0.8%);
+- W8 v6 1200 B: current 1,224,000/1000 → A 1,205,000 → B 1,202,000 (−1.6% / −1.8%);
+- W8 1420 B (2 fragments at any MTU): v4 current 36 B → A 22 → B 16 (−1.0% / −1.4% of 1456 B); v6 current 60 → 22/16 (−2.7% / −3.0%).
+- W2b 200 B fan-out: frame count 219→188, byte curve as above (−0.5%/−0.8%).
+- W3c domain downlink (v6): at 1362 currently 82,378 B / 63 frames (at 1162 82,564 / 94 frames), A/B unchanged → −25.5%/−25.7%.
 
-### 7.3 每类工作负载的结论（给决策用）
+### 7.3 Conclusions per workload class (for decision-making)
 
-| 工作负载类 | 字节收益 | 调用收益 | 说明 |
+| Workload class | Byte gain | Call gain | Notes |
 |---|---|---|---|
-| 域名目标（DNS/game by hostname/WebRTC） | 上行 **−35% ~ −38%**；下行 v4 −13%、v6 −26% | 帧数 94→63/1000（上行） | 最大收益；需 FLOW_ACK 带 resolved IP；下行当前是 inline IP（不是 domain 地址）所以降幅小于上行 |
-| 稀疏纯上行（遥测/单向流） | −10% ~ −14% | 1× | 需 FLOW_ACK；B 比 A 多省 3 B/帧 |
-| 高速同目的地小包 | −1.6% ~ −3.4% | ~1× | 现有 TRAIN 已摊销；只剩 header/项开销 |
-| 多目的地同 session 扇出 | −0.5% ~ −1.9% | ~1× | 现有 TRAIN 已支持；B 的 dict 头在“项少 flow 多”时反而不如 A，故 B 需保留 inline-flow 模式 |
-| 跨 session 小包 | −2% ~ −4.3% | **4× ~ 16×** | **CPU/锁收益为主**；需要两端都做 connection 级 staging（最大工程项） |
-| 513 B ~ 单帧上限（新覆盖） | 头 12/24→5/6（A）或 2/3（B）；即每 payload v4 −7（A）/−10（B）、v6 −19（A）/−22（B） | ~1× | 默认 MTU 下 v6 收益翻倍；接近 v2 单帧上限的 payload（v4 1150/v6 1138）在 A/B 下上限 1157/1160，还可能 2 帧→1 帧 |
-| 分片/bulk（1200–8192 B） | −0.7% ~ −3.5% | 1×（片数基本不变） | 协议头不是 bulk 瓶颈（§8.3） |
-| full-cone 下行 | v4 −13%、v6 −26%（仅 B） | 63→64（多 1 个 open 帧） | 需要服务端主动 flow；A/C(client 权威) 做不到；当前回包是 inline IP 而非 domain 地址 |
+| Domain targets (DNS/game by hostname/WebRTC) | uplink **−35% ~ −38%**; downlink v4 −13%, v6 −26% | frame count 94→63/1000 (uplink) | biggest gain; needs FLOW_ACK with resolved IP; downlink is currently inline IP (not a domain address) so the reduction is smaller than uplink |
+| Sparse pure uplink (telemetry/unidirectional) | −10% ~ −14% | 1× | needs FLOW_ACK; B saves 3 B/frame more than A |
+| High-rate same-destination small packets | −1.6% ~ −3.4% | ~1× | existing TRAIN already amortizes; only header/item overhead remains |
+| Multi-destination same-session fan-out | −0.5% ~ −1.9% | ~1× | existing TRAIN already supports it; B's dict header is worse than A when there are "few items, many flows", so B must keep the inline-flow mode |
+| Cross-session small packets | −2% ~ −4.3% | **4× ~ 16×** | **mainly CPU/lock gain**; requires connection-level staging on both ends (largest engineering item) |
+| 513 B ~ single-frame cap (newly covered) | header 12/24→5/6 (A) or 2/3 (B); i.e. per payload v4 −7 (A)/−10 (B), v6 −19 (A)/−22 (B) | ~1× | at the default MTU the v6 gain doubles; payloads near the v2 single-frame cap (v4 1150/v6 1138) have a cap of 1157/1160 under A/B, and may also go from 2 frames to 1 |
+| Fragmentation/bulk (1200–8192 B) | −0.7% ~ −3.5% | 1× (fragment count basically unchanged) | the protocol header is not the bulk bottleneck (§8.3) |
+| full-cone downlink | v4 −13%, v6 −26% (B only) | 63→64 (one more open frame) | needs server-initiated flows; A/C (client authoritative) cannot do it; current replies are inline IP rather than a domain address |
 
-### 7.4 按 §3 矩阵的逐 payload 字节（standalone；省比 = 相对当前同场景）
+### 7.4 Per-payload bytes according to the §3 matrix (standalone; save ratio = relative to current in the same scenario)
 
-| p | 目标 | flow | 形态 | 当前 字节 | A 字节 | B 字节 | A save | B save |
+| p | Target | flow | Shape | Current bytes | A bytes | B bytes | A save | B save |
 |---:|---|---:|---|---:|---:|---:|---:|---:|
 | 28 | v4/v6 | 0 | steady | 5+28=33 | 33 | 30 | 0 | **−9.1%** |
 | 28 | v4/v6 | 1 | steady | 34 | 34 | 30 | 0 | **−11.8%** |
@@ -534,114 +536,114 @@ CPU 量级：        ΔCPU ≈ Δframes · c_send，c_send ≈ 200–300 ns/帧
 | 60 | v4/v6 | 1 | steady | 66 | 66 | 62 | 0 | −6.1% |
 | 200 | v4/v6 | 0 | steady | 205 | 205 | 202 | 0 | −1.5% |
 | 512 | v4/v6 | 0 | steady | 517 | 517 | 514 | 0 | −0.6% |
-| 28 | domain（上行地址） | 0 | steady（当前 inline / A,B 需先 ACK） | 68 | 33 | 30 | **−51.5%** | **−55.9%** |
-| 60 | domain（上行地址） | 0 | steady（同上） | 100 | 65 | 62 | **−35.0%** | **−38.0%** |
-| 200 | domain（上行地址） | 0 | steady（同上） | 240 | 205 | 202 | −14.6% | −15.8% |
-| 512 | domain（上行地址） | 0 | steady（同上） | 552 | 517 | 514 | −6.3% | −6.9% |
-| 60 | domain 回包（v4） | 0 | steady（当前 NO_FLOW+inline IP / A,B 需先 ACK） | 73 | 65 | 62 | −11.0% | **−15.1%** |
-| 60 | domain 回包（v6） | 0 | steady（同上） | 85 | 65 | 62 | −23.5% | **−27.1%** |
-| 28 | v4 | 0 | first（open） | 12+28=40 | 40 | 41 | 0 | −2.5%（B 多 1 B flow id） |
-| 60 | v6 | 0 | first（open） | 24+60=84 | 84 | 85 | 0 | −1.2% |
-| 1200 v4 @1162 | v4 | — | 2 片 | 1,236 | 1,222 | 1,216 | −1.1% | −1.6% |
-| 1200 v6 @1162 | v6 | — | 2 片 | 1,260 | 1,222 | 1,216 | −3.0% | −3.5% |
-| 1200 v4 @1362 | v4 | — | 1 帧 | 1,212 | 1,205 | 1,202 | −0.6% | −0.8% |
-| 1200 v6 @1362 | v6 | — | 1 帧 | 1,224 | 1,205 | 1,202 | −1.6% | −1.8% |
-| 8192 @1162 | v4 | — | 8 片 | 8,336 | 8,280 | 8,256 | −0.7% | −1.0% |
-| 8192 @1162 | v6 | — | 8 片 | 8,432 | 8,280 | 8,256 | −1.8% | −2.1% |
+| 28 | domain (uplink address) | 0 | steady (currently inline / A,B need ACK first) | 68 | 33 | 30 | **−51.5%** | **−55.9%** |
+| 60 | domain (uplink address) | 0 | steady (same as above) | 100 | 65 | 62 | **−35.0%** | **−38.0%** |
+| 200 | domain (uplink address) | 0 | steady (same as above) | 240 | 205 | 202 | −14.6% | −15.8% |
+| 512 | domain (uplink address) | 0 | steady (same as above) | 552 | 517 | 514 | −6.3% | −6.9% |
+| 60 | domain reply (v4) | 0 | steady (currently NO_FLOW+inline IP / A,B need ACK first) | 73 | 65 | 62 | −11.0% | **−15.1%** |
+| 60 | domain reply (v6) | 0 | steady (same as above) | 85 | 65 | 62 | −23.5% | **−27.1%** |
+| 28 | v4 | 0 | first (open) | 12+28=40 | 40 | 41 | 0 | −2.5% (B has 1 extra B for flow id) |
+| 60 | v6 | 0 | first (open) | 24+60=84 | 84 | 85 | 0 | −1.2% |
+| 1200 v4 @1162 | v4 | — | 2 fragments | 1,236 | 1,222 | 1,216 | −1.1% | −1.6% |
+| 1200 v6 @1162 | v6 | — | 2 fragments | 1,260 | 1,222 | 1,216 | −3.0% | −3.5% |
+| 1200 v4 @1362 | v4 | — | 1 frame | 1,212 | 1,205 | 1,202 | −0.6% | −0.8% |
+| 1200 v6 @1362 | v6 | — | 1 frame | 1,224 | 1,205 | 1,202 | −1.6% | −1.8% |
+| 8192 @1162 | v4 | — | 8 fragments | 8,336 | 8,280 | 8,256 | −0.7% | −1.0% |
+| 8192 @1162 | v6 | — | 8 fragments | 8,432 | 8,280 | 8,256 | −1.8% | −2.1% |
 
-> 表中 steady 的 B 列 2 B 假设 flow id ≤127；id 128–16383 时 B 稳态头 3 B，收益相应减 1 B。TRAIN 场景的逐项开销与摊薄见 §3.2 与 §7.2（TRAIN 比单帧再省 2–4 B/帧的固定头，且 B 的 same-flow 项为 1 B/项）。
+> The 2 B in the B column for steady rows assumes flow id ≤127; for ids 128–16383 B's steady-state header is 3 B, and the gain decreases by 1 B accordingly. TRAIN per-item overhead and amortization are in §3.2 and §7.2 (TRAIN saves another 2–4 B/frame of fixed header vs single frames, and B's same-flow item is 1 B/item).
 
 ---
 
-## 8. 推荐
+## 8. Recommendation
 
-### 8.1 方向
+### 8.1 Direction
 
-**做候选 B（连接级 flow 命名空间 + 对称双向 + 完整 CTL 面），分两阶段落地；候选 A 作为该方向的“字节子集”先上线验证。**
+**Do candidate B (connection-level flow namespace + symmetric bidirectional + full CTL plane), landing in two phases; candidate A serves as the "byte subset" of that direction and goes live first for validation.**
 
-理由：
-1. 它同时解决 P0 的 L1（域名双向）、L2（纯上行）、L3（>512/分片）、L4（控制面）、L5（FRAG 接线）、L7（跨 session）——A 只能解决前五个，且拿不到“真 full duplex”（服务端主动 flow）与跨 session。
-2. 稳态头 2 B、分片头 8 B 已接近该模型的熵下界（kind/flags 1 B + id 1 B；分片 + id u32+idx+total）。剩余可选项只有 B′ 的 1 B 短头，收益 1 B/payload，**属于 cosmetic，可在 kind 空间里预留、后做**。
-3. 现状每帧 4 B `sess` 是 5 B 稳态头的 80%；只要还想做“高 pps 小包/受限上行”，这是必须清掉的固定税。
-4. 复用安全反过来证明“保留 session 在数据帧里并缩窄”不划算（候选 C）：B 把 sess 移出数据面后，u16 id + 3 s 复用窗即可安全。
+Reasons:
+1. It simultaneously solves P0's L1 (domain bidirectional), L2 (pure uplink), L3 (>512/fragmentation), L4 (control plane), L5 (FRAG wiring), L7 (cross-session) — A can only solve the first five and cannot get "true full duplex" (server-initiated flows) or cross-session.
+2. The 2 B steady-state header and 8 B fragment header are already close to the entropy lower bound of this model (kind/flags 1 B + id 1 B; fragment + id u32+idx+total). The only remaining option is B′'s 1 B short header, a gain of 1 B/payload, **cosmetic, can be reserved in the kind space and done later**.
+3. The current 4 B `sess` per frame is 80% of the 5 B steady-state header; as long as you still want "high-pps small packets/constrained uplink", this is a fixed tax that must be removed.
+4. Reuse safety conversely proves that "keeping session in the data frame and narrowing it" is not worth it (candidate C): after B moves sess out of the data plane, a u16 id + 3 s reuse window is safe.
 
-**落地顺序（同一 wire，分功能启用；不是两套 wire）**
-- 阶段 0（前置，非 wire）：改 per-connection TX staging 抽象（两端），让连接级聚合有落点；否则跨 session 永远是 0。
-- 阶段 1：CAPS/HELLO + DATA/TRAIN/FRAG 新格式 + v3 FRAG 接线 + 域名/单向 FLOW_ACK；此时可以先只用 client 半区 id（等价于“共享双向 id”），先拿 L1/L2/L3/L5。
-- 阶段 2：server 半区 id + 服务端主动 flow（full-cone）+ 跨 session TRAIN（启用 dict 模式）；需要阶段 0 的 staging。
-- 阶段 3（可选）：B′ 1 B 短头；更大重组上限（CAPS 协商）；删除 v2 解码。
+**Landing order (same wire, features enabled in stages; not two wires)**
+- Phase 0 (prerequisite, non-wire): change the per-connection TX staging abstraction (both ends) so connection-level aggregation has a place to land; otherwise cross-session is always 0.
+- Phase 1: CAPS/HELLO + new DATA/TRAIN/FRAG formats + v3 FRAG wiring + domain/unidirectional FLOW_ACK; at this point you can use only client-half ids first (equivalent to "shared bidirectional id") and get L1/L2/L3/L5 first.
+- Phase 2: server-half ids + server-initiated flows (full-cone) + cross-session TRAIN (enable dict mode); requires the staging from phase 0.
+- Phase 3 (optional): B′ 1 B short header; larger reassembly cap (CAPS negotiation); delete v2 decoding.
 
-### 8.2 哪些改动是“真收益”，哪些是 cosmetic
+### 8.2 Which changes are "real gains" and which are cosmetic
 
-**真收益**（按 ROI 排序）
-1. **域名 flow 压缩（L1）**：上行 −35%~−38% MQP 字节；下行（当前 inline IP 回包）v4 −13%、v6 −26%；实现中等（server 要存 resolved IP 并回 ACK；client 要写 SOCKS5 reply header）。
-2. **纯上行/单向 flow 的 FLOW_ACK（L2）**：稀疏单向 −10%~−14%。
-3. **>512 B 与 FRAG 统一进 v3（L3/L5/L11）**：v2 数据面删除；单帧头 v4 12→5/2、v6 24→5/2（A/B）；分片头 v2 18/30 B → A 11 B / B 8 B（每片 v4 −7~−10、v6 −19~−22）；v6 与接近单帧上限的 payload 收益最大。
-4. **跨 session TRAIN（L7）**：4×–16× send 调用，CPU/锁收益；wire 只 −2%~−4.3%。
-5. **去掉每帧 sess（L6，B）**：稳态 −3 B/帧；稀疏小包 −4.6%（60 B）/ −9.1%（28 B）。
-6. **服务端主动 flow（full-cone，B）**：该场景 v4 −13%、v6 −26%（当前回包是 inline IP，不是 domain 地址）。
-7. **COMPACT TRAIN 项（L8）**：−1 B/项，1.6%~3.4%（小包）。
+**Real gains** (sorted by ROI)
+1. **Domain flow compression (L1)**: uplink −35%~−38% MQP bytes; downlink (currently inline IP replies) v4 −13%, v6 −26%; medium implementation effort (the server must store the resolved IP and reply ACK; the client must write the SOCKS5 reply header).
+2. **FLOW_ACK for pure-uplink/unidirectional flows (L2)**: sparse unidirectional −10%~−14%.
+3. **>512 B and FRAG unified into v3 (L3/L5/L11)**: v2 data plane deleted; single-frame header v4 12→5/2, v6 24→5/2 (A/B); fragment header v2 18/30 B → A 11 B / B 8 B (per fragment v4 −7~−10, v6 −19~−22); the biggest gains are on v6 and payloads near the single-frame cap.
+4. **Cross-session TRAIN (L7)**: 4×–16× send calls, CPU/lock gain; wire only −2%~−4.3%.
+5. **Remove per-frame sess (L6, B)**: steady state −3 B/frame; sparse small packets −4.6% (60 B)/−9.1% (28 B).
+6. **Server-initiated flows (full-cone, B)**: in that scenario v4 −13%, v6 −26% (current replies are inline IP, not a domain address).
+7. **COMPACT TRAIN items (L8)**: −1 B/item, 1.6%~3.4% (small packets).
 
-**cosmetic / 不建议**
-- B′ 1 B 短头、`sess u24`、12/20-bit 拆位：<1 B/帧级别，先预留空间即可。
-- “SAME_FLOW for flow 0”：字节上无收益（§4-L9），只需在新格式里用 COMPACT/显式全 0-flow 语义取代。
-- 加宽 `idx/total`（L13）：无必要；8 KiB→更大重组上限是独立产品决策（loss amplification，`src/mqp/fragment.rs:31-47`）。
-- 内容压缩/FEC/重传：与本文目标无关，不引入。
-- **不要为了 bulk 吞吐改协议**：见 8.3。
+**cosmetic / not recommended**
+- B′ 1 B short header, `sess u24`, 12/20-bit bit-splitting: on the order of <1 B/frame, just reserve the space first.
+- "SAME_FLOW for flow 0": no byte gain (§4-L9), only needs to be replaced by COMPACT/explicit all-0-flow semantics in the new format.
+- Widening `idx/total` (L13): unnecessary; moving the reassembly cap from 8 KiB to larger is a separate product decision (loss amplification, `src/mqp/fragment.rs:31-47`).
+- Content compression/FEC/retransmission: unrelated to this document's goals, not introduced.
+- **Do not change the protocol for bulk throughput**: see 8.3.
 
-### 8.3 bulk 现实检查
+### 8.3 Bulk reality check
 
-1200 B payload 的 MQP 头即使在最差场景（MTU 1200、IPv6、2 片）也只占该 payload 的 5%（60/1260）；IPv4 是 2.9%（36/1236）。改成 B 只能把它降到 1.3%（16/1216，v4/v6 分片头同宽），**IPv4 总 wire 节省 ≤1.6%、IPv6 ≤3.5%**；而同一 1200 B UDP 报文外层的 IP+UDP+QUIC（约 55–80 B）以及 QUIC 拥塞控制/MTU 才是吞吐主项。**bulk 的可行优化是配置（`initial_mtu` 1200→1360/1400，README.md:777）和减少分片/避免丢片放大，不是协议头。** 协议重设计的价值集中在：域名目标、高 pps 小包、多目的地/多 session 扇出、以及“每帧一次 quinn send”的 CPU。
+For a 1200 B payload, the MQP header even in the worst case (MTU 1200, IPv6, 2 fragments) is only 5% of that payload (60/1260); IPv4 is 2.9% (36/1236). Changing to B can only bring it down to 1.3% (16/1216, the v4/v6 fragment header is the same width), **total IPv4 wire savings ≤1.6%, IPv6 ≤3.5%**; meanwhile the IP+UDP+QUIC (about 55–80 B) outer layers of the same 1200 B UDP datagram, plus QUIC congestion control/MTU, are the main throughput factors. **The feasible bulk optimizations are configuration (`initial_mtu` 1200→1360/1400, README.md:777) and reducing fragmentation/avoiding fragment-loss amplification, not the protocol header.** The value of the protocol redesign is concentrated in: domain targets, high-pps small packets, multi-destination/multi-session fan-out, and the CPU of "one quinn send per frame".
 
-### 8.4 风险与对策
+### 8.4 Risks and mitigations
 
-| 风险 | 对策 |
+| Risk | Mitigation |
 |---|---|
-| 连接级表的生命周期/内存/DoS | 双 cap（连接/会话）+ open 速率限制 + `FLOW_REJECT` 回退 inline；默认 4096 项/连接并计入 `per_connection_memory_bytes` |
-| id 复用导致跨 session 错投 | 不复用；复用需 ≥2×FRAG 窗口 + close + tombstone；tombstone 命中 fail-closed |
-| 跨 session staging 的公平性/队头 | 每连接一个 stager 会成为热点：用每 worker/每连接分片、有界队列、按 burst flush；不要跨 burst 等待 |
-| CAPS/HELLO 丢失导致不压缩 | 压缩只在“确认”后启用（现状语义），丢失最多晚压缩；HELLO/CAPS 重发若干次 |
-| 版本错配 | ALPN fail-closed（建议默认用 `myquic2/3` 而不是 `h3` 伪装，或 CAPS magic 不匹配即关连接）；同版本部署前提不变 |
-| 实现回归面大 | 先落候选 A 的字节收益（L1/L2/L3)，B 的连接级表/staging 分阶段；每阶段保留 v2 解码兜底一版 |
+| connection-level table lifecycle/memory/DoS | double caps (connection/session) + open rate limit + `FLOW_REJECT` fallback to inline; default 4096 entries/connection and counted in `per_connection_memory_bytes` |
+| id reuse causing cross-session misdelivery | no reuse; reuse requires ≥2×FRAG window + close + tombstone; tombstone hit fail-closed |
+| cross-session staging fairness/head-of-line | one stager per connection becomes a hotspot: shard per worker/per connection, bounded queues, flush per burst; do not wait across bursts |
+| CAPS/HELLO loss preventing compression | compression only enabled after "confirmation" (current semantics); loss at most delays compression; resend HELLO/CAPS several times |
+| version mismatch | ALPN fail-closed (suggest default `myquic2/3` instead of the `h3` disguise, or close the connection when the CAPS magic mismatches); the same-version deployment prerequisite is unchanged |
+| large implementation regression surface | land candidate A's byte gains first (L1/L2/L3), then B's connection-level table/staging in phases; keep v2 decoding as a fallback for one version per phase |
 
 ---
 
-## 9. 歧义与开放问题（不臆造答案）
+## 9. Ambiguities and open questions (no invented answers)
 
-- **Q1 “full duplex” 的定义**：本文按“双向使用同一套帧语法、双方都能压缩/发数据、下行不依赖上行 open”解释。若用户的意思是“双向独立调度/独立拥塞/独立连接”，那超出 wire 范围，需 Lead 澄清。
-- **Q2 ALPN/版本门禁**：任务只要求协议仍叫 MQP-3；未说明 ALPN 字符串能否改、是否允许灰度期双栈。本文建议 CAPS 带 wire-ver、ALPN 保守用 `myquic2/3`（或另加后缀），不引入新协议代号。
-- **Q3 是否需要兼容 v0.2.0 对端**：任务说允许不兼容重设计，本文按“不需要混合版本、同版本部署”写；若需要灰度，需要额外的“双格式探测/ALPN 后缀”设计，本文未展开。
-- **Q4 域名 ACK 的语义**：server 回传的 resolved IP 与目标实际回包源 IP 可能不同（多 A/anycast/换端口）。本文规则：flow 压缩只用于“与 ACK/已安装映射一致”的源；不一致时用 `INLINE` 一帧回退（inline 地址即实际源）。SOCKS5 reply header 用哪个 IP 需产品确认（现状用回包实际源）。
-- **Q5 服务端主动 flow（full-cone）是否要压缩**：决定 B 是否值得保留 server 半区/双向 ownership；若产品不需要，B 可退化成“单权威共享 id”（更简单，字节相同）。
-- **Q6 flow 表默认上限**：本文建议 4096/连接、64/会话；实际值取决于内存预算（`max_peer_memory_mb`）与客户端 4032 association 上限，需产品给数。
-- **Q7 MTU 分布**：bulk/分片的收益量级取决于部署 MTU（1200 默认 vs 1400 已知路径）；需目标环境数据。
-- **Q8 测量**：本文没有 Linux 目标机数据；域名压缩、跨 session staging 的 CPU 收益必须用 `hotpath_bench` + 真实 app 复测。另：`FRAG_ID_SAFE_WINDOW` 注释里 “under 0.01% below ~1.4M fragmented payloads/s” 与公式 `W/(2^32·1000/pps+W)` 不符（1.4M/s 时约 0.098%），属注释笔误，不影响代码语义——重设计文档时建议修正（`src/mqp/fragment.rs:131-138`）。
-- **Q9 控制面可靠性载体**：CTL 走 DATAGRAM（不可靠、幂等）还是 QUIC stream（可靠但多一条流）？本文倾向 DATAGRAM + 重发；`SESS_CLOSE` 若要求“立即且可靠”可走 QUIC stream。
-
----
-
-## 10. 给 Lead 的摘要（≤30 行）
-
-1. **现状**：v0.2.0 的 MQP-3 只有“同 session、IP 目标、≤512 B”的 flow/TRAIN 压缩；v3 FRAG codec 已写但零调用；CTL 只有常量。
-2. **最大结构性缺口**：域名目标双向都不能压缩（上行每帧 40 B 头、L=30；下行回包 inline IP 13/25 B 头）；纯上行 flow 永久 inline（无 FLOW_ACK）；>512 B 全部回退 MQP-2（每片重复完整地址）；无控制面、无法跨 session 合帧。
-3. **字节最大单笔收益 = 域名 flow 压缩**：上行每 1000 个从 97,564 B → ~61,300 B（**−37%**）；下行回包（当前 inline IP）v4 70,378→61,189（−13%）、v6 82,564→61,189（−26%）；需要 FLOW_ACK 回传 resolved IP。
-4. **纯上行/单向**：稀疏流 60 B 从 72,000 → 62,000~65,000/1000（**−10%~−14%**；高速流因 TRAIN 摊销约 −2%）。
-5. **>512 B / 分片**：头 12/24→5/6（A）或 2/3（B）；片头 18/30→11/8；1200 B@MTU1200 2 片 −1.1%~−1.6%（v6 −3.0%~−3.5%）；8192 B 8 片 −0.7%~−1.0%。
-6. **跨 session TRAIN**：send 调用 4×（8×4）~16×（32×1），wire −2%~−4.3%；价值在 quinn 锁/分配 CPU，但需要两端 connection 级 staging（最大工程项）。
-7. **推荐候选 B**：连接级 flow id（u16，varint 1–2 B；id 半区归 client/server 双方可 open）+ 数据帧去 sess（稳态 2 B、分片 8 B）+ TRAIN 项可跨 session（same-flow 1 B/项、dict 模式 2 B/项）+ 完整 CTL（HELLO/CAPS/FLOW_ACK/REJECT/CLOSE）+ 域名/单向 ACK + 服务端主动 flow。
-8. **候选 A（保留 sess u32 的增量）** 作为低风险子集先做：拿域名/单向压缩、FRAG 接线、大包 v3 化、COMPACT 项（−1 B/项），不做跨 session/服务端主动 flow。
-9. **候选 C（u16 sess 折中）否决**：65,536 次分配即 wrap，180 s 内 >364 assoc/s 就会复用仍在服务端的旧 session → 跨 association 串流；要安全得加可靠 close 或 generation，收益不足以抵消。
-10. **bulk 现实**：1200 B 包 MQP 头 1.0%（v4 单帧）~4.8%（v6 2 片）；重设计对 bulk 吞吐影响 IPv4 ≤1.6%、IPv6 ≤3.5%，**不要为 bulk 改协议**；bulk 该调 `initial_mtu`/窗口。
-11. **cosmetic**：B′ 1 B 短头、sess u24、12/20-bit 拆位、加宽 idx/total、flow0 的 SAME_FLOW——收益 <1 B/帧或本来无字节损失，预留 kind 空间即可，不必为它们单独设计。
-12. **证据与口径**：全部数字 = 只读代码审计 + python3 模型（无丢包、burst=32、L=30、MTU 1200/1400）；未 build/test/实测；落地前需 Linux `hotpath_bench` 复测。
-13. **开放问题**：full duplex 定义；ALPN/版本门禁是否可改；是否要兼容 v0.2.0 灰度；域名 ACK 的 IP 语义（多 A/anycast）；是否要 full-cone 的服务端主动 flow（决定 B vs B-lite）；flow 表上限与内存预算；目标 MTU 分布。
-14. **建议下一步**：Lead 拍板 B（推荐）还是 A（保守）→ 我方可继续输出候选 B 的完整 wire spec + 迁移/测试矩阵（本报告 §6.2 已有帧表与示例编码）。
+- **Q1 Definition of "full duplex"**: this document interprets it as "both directions use the same frame syntax, both sides can compress/send data, and downlink does not depend on uplink open". If the user means "independent scheduling/congestion/connections per direction", that is beyond wire scope and needs Lead clarification.
+- **Q2 ALPN/version gate**: the task only requires the protocol to still be called MQP-3; it does not state whether the ALPN string may change or whether dual-stack during a canary period is allowed. This document suggests CAPS carry wire-ver and ALPN conservatively use `myquic2/3` (or add a suffix), introducing no new protocol codename.
+- **Q3 Whether compatibility with v0.2.0 peers is needed**: the task says an incompatible redesign is allowed; this document is written assuming "no mixed versions, same-version deployment"; if a canary is needed, an additional "dual-format probing/ALPN suffix" design is required, which this document does not elaborate.
+- **Q4 Semantics of the domain ACK**: the resolved IP returned by the server may differ from the target's actual reply source IP (multiple A/anycast/port change). This document's rule: flow compression is only used for sources "consistent with the ACK/installed mapping"; when inconsistent, fall back for one frame with `INLINE` (the inline address is the actual source). Which IP to use in the SOCKS5 reply header needs product confirmation (currently the actual reply source).
+- **Q5 Whether server-initiated flows (full-cone) should be compressed**: determines whether B is worth keeping the server half/bidirectional ownership; if the product does not need it, B can degenerate to "single authoritative shared id" (simpler, same bytes).
+- **Q6 Default flow table cap**: this document suggests 4096/connection, 64/session; the actual values depend on the memory budget (`max_peer_memory_mb`) and the client's 4032 association cap, and need product input.
+- **Q7 MTU distribution**: the magnitude of bulk/fragmentation gains depends on the deployment MTU (1200 default vs 1400 known path); target-environment data is needed.
+- **Q8 Measurement**: this document has no Linux target-machine data; the CPU gains of domain compression and cross-session staging must be re-measured with `hotpath_bench` + a real app. Also: the comment in `FRAG_ID_SAFE_WINDOW` saying "under 0.01% below ~1.4M fragmented payloads/s" does not match the formula `W/(2^32·1000/pps+W)` (about 0.098% at 1.4M/s), a comment typo that does not affect code semantics — worth correcting when the document redesign is done (`src/mqp/fragment.rs:131-138`).
+- **Q9 Control-plane reliability carrier**: should CTL go over DATAGRAM (unreliable, idempotent) or a QUIC stream (reliable but one more stream)? This document leans toward DATAGRAM + resend; `SESS_CLOSE` can go over a QUIC stream if "immediate and reliable" is required.
 
 ---
 
-### 附录 A：关键常量与出处（便于复核）
+## 10. Summary for the Lead (≤30 lines)
 
-| 常量 | 值 | 出处 |
+1. **Current state**: MQP-3 in v0.2.0 only has "same session, IP target, ≤512 B" flow/TRAIN compression; the v3 FRAG codec is written but never called; CTL is only a constant.
+2. **Biggest structural gaps**: domain targets cannot be compressed in either direction (uplink 40 B header per frame, L=30; downlink replies inline IP 13/25 B header); pure-uplink flows stay inline forever (no FLOW_ACK); everything >512 B falls back to MQP-2 (full address repeated in every fragment); no control plane, no cross-session frame merging.
+3. **Largest single byte win = domain flow compression**: uplink per 1000 from 97,564 B → ~61,300 B (**−37%**); downlink replies (currently inline IP) v4 70,378→61,189 (−13%), v6 82,564→61,189 (−26%); requires FLOW_ACK to return the resolved IP.
+4. **Pure uplink/unidirectional**: sparse flow 60 B from 72,000 → 62,000~65,000/1000 (**−10%~−14%**; high-rate flows about −2% due to TRAIN amortization).
+5. **>512 B / fragmentation**: header 12/24→5/6 (A) or 2/3 (B); fragment header 18/30→11/8; 1200 B@MTU1200 2 fragments −1.1%~−1.6% (v6 −3.0%~−3.5%); 8192 B 8 fragments −0.7%~−1.0%.
+6. **Cross-session TRAIN**: send calls 4× (8×4)~16× (32×1), wire −2%~−4.3%; the value is in quinn locks/allocation CPU, but requires connection-level staging on both ends (largest engineering item).
+7. **Recommended candidate B**: connection-level flow id (u16, varint 1–2 B; id halves for client/server, both can open) + remove sess from data frames (2 B steady state, 8 B fragment) + TRAIN items can cross sessions (same-flow 1 B/item, dict mode 2 B/item) + full CTL (HELLO/CAPS/FLOW_ACK/REJECT/CLOSE) + domain/unidirectional ACK + server-initiated flows.
+8. **Candidate A (incremental with sess u32 kept)** as a low-risk subset first: gets domain/unidirectional compression, FRAG wiring, large-packet v3 conversion, COMPACT items (−1 B/item), no cross-session/server-initiated flows.
+9. **Candidate C (u16 sess compromise) rejected**: wraps after 65,536 allocations; >364 assoc/s within 180 s reuses an old session still on the server → cross-association stream mixing; making it safe requires reliable close or generation, and the gain does not offset that.
+10. **Bulk reality**: 1200 B packet MQP header 1.0% (v4 single frame)~4.8% (v6 2 fragments); the redesign affects bulk throughput by IPv4 ≤1.6%, IPv6 ≤3.5%, **do not change the protocol for bulk**; bulk should tune `initial_mtu`/windows.
+11. **cosmetic**: B′ 1 B short header, sess u24, 12/20-bit bit-splitting, widening idx/total, SAME_FLOW for flow0 — gain <1 B/frame or no byte loss at all; just reserve kind space, no need to design for them separately.
+12. **Evidence and basis**: all numbers = read-only code audit + python3 model (no packet loss, burst=32, L=30, MTU 1200/1400); no build/test/measurement; re-measure with Linux `hotpath_bench` before landing.
+13. **Open questions**: full duplex definition; whether the ALPN/version gate can change; whether v0.2.0 canary compatibility is needed; IP semantics of the domain ACK (multiple A/anycast); whether full-cone server-initiated flows are needed (decides B vs B-lite); flow table caps and memory budget; target MTU distribution.
+14. **Suggested next step**: the Lead decides B (recommended) or A (conservative) → we can then produce the complete wire spec + migration/test matrix for candidate B (this report's §6.2 already has the frame tables and example encodings).
+
+---
+
+### Appendix A: Key constants and sources (for verification)
+
+| Constant | Value | Source |
 |---|---:|---|
 | `MQP3_TRAIN_HEADER_LEN` | 6 | `src/mqp/v3.rs:63` |
 | `MQP3_FRAG_PREFIX_LEN` | 11 | `src/mqp/v3.rs:66` |
@@ -657,25 +659,25 @@ CPU 量级：        ΔCPU ≈ Δframes · c_send，c_send ≈ 200–300 ns/帧
 | `LAST_HOP_DRAIN` | 32 | `src/udp/batch.rs:46` |
 | `MAX_UDP_ASSOCS` | 4032 | `src/config/tuning.rs:116` |
 | `MAX_SESSIONS_GLOBAL` / `LOCAL_SESS_MAX` / `SESS_IDLE_MS` | 8192 / 4096 / 180,000 | `src/bin/myquic2-server/table.rs:374,375,382` |
-| `DEFAULT_INITIAL_MTU` / 上下限 | 1200 / 1200..=1472 | `src/config/tuning.rs:193-198` |
-| DATAGRAM 预算 | `MTU − 38` | README.md:777 |
-| ALPN 默认 | `h3`（`myquic2/3` 可选） | `src/mqp/ack.rs:1-22` |
+| `DEFAULT_INITIAL_MTU` / lower and upper bounds | 1200 / 1200..=1472 | `src/config/tuning.rs:193-198` |
+| DATAGRAM budget | `MTU − 38` | README.md:777 |
+| ALPN default | `h3` (`myquic2/3` optional) | `src/mqp/ack.rs:1-22` |
 
-### 附录 B：现状帧的 golden bytes（可直接对拍）
+### Appendix B: Golden bytes of current frames (directly comparable)
 
-| 场景 | 字节（hex） | 总长 |
+| Scenario | Bytes (hex) | Total length |
 |---|---|---:|
 | SINGLE steady flow0, sess=7, payload "abc" | `10 07 00 00 00 61 62 63` | 8 |
 | SINGLE steady flow2, sess=7, payload "abc" | `12 07 00 00 00 02 61 62 63` | 9 |
 | SINGLE open flow0, sess=7, 1.2.3.4:53, "abc" | `11 07 00 00 00 01 01 02 03 04 00 35 61 62 63` | 15 |
 | TRAIN 2×flow0 ("abc","de"), sess=7 | `20 07 00 00 00 02 00 03 61 62 63 00 02 64 65` | 15 |
-| TRAIN SAME_FLOW flow3 2 项, sess=7 | `21 07 00 00 00 02 03 00 03 61 62 63 00 02 64 65` | 16 |
+| TRAIN SAME_FLOW flow3 2 items, sess=7 | `21 07 00 00 00 02 03 00 03 61 62 63 00 02 64 65` | 16 |
 | FRAG v3 steady flow1, sess=7, id=0x12345678, idx=1/3, "abc" | `32 07 00 00 00 01 78 56 34 12 01 03 61 62 63` | 15 |
 | MQP-2 0x02, sess=7, 1.2.3.4:53, "abc" | `02 07 00 00 00 01 01 02 03 04 00 35 61 62 63` | 15 |
 | MQP-2 0x05, sess=7, id=0x12345678, idx=1/3, 1.2.3.4:53, "abc" | `05 07 00 00 00 78 56 34 12 01 03 01 01 02 03 04 00 35 61 62 63` | 19 |
 
-> 现有 golden 测试见 `src/mqp/v3.rs:814-844,907-945,947-968,994-1010`；上表与之一致（`0x12` 的 flow 字节位置、TRAIN item 的 `iflg|len|payload` 顺序）。
+> Existing golden tests are at `src/mqp/v3.rs:814-844,907-945,947-968,994-1010`; the table above matches them (the flow byte position of `0x12`, the `iflg|len|payload` order of TRAIN items).
 
 ---
 
-*（报告完）*
+*(End of report)*

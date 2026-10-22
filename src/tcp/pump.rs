@@ -1,8 +1,8 @@
 //! TCP pump extracted verbatim from `src/lib.rs`.
 //! Source lines cover `copy_tcp_quic` / `copy_tcp_quic_idle` / `copy_tcp_quic_acked`
 //! plus `COPY_CHUNK` / `ZEROCOPY_MIN_WRITE` and the full helper set.
-//! Crate-local items resolve via `crate::` (`coarse_millis` 经根重导出，
-//! `read_mqp_ack` 留在 lib.rs 经 `crate::read_mqp_ack` 引用）。
+//! Crate-local items resolve via `crate::` (`coarse_millis` is re-exported at the
+//! root; `read_mqp_ack` stays in lib.rs and is referenced as `crate::read_mqp_ack`).
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use std::time::Duration;

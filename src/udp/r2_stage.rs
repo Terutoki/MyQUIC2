@@ -27,19 +27,20 @@
 //! # Ownership and accounting
 //!
 //! Payloads are owned [`Bytes`]: an item may be queued by one task and drained
-//! by another, so a borrowed slice cannot outlive the push. A successful frame
-//! books `udp_stats::payload` per item; a refused frame accounts the items it
-//! contained through [`crate::dgram_drops`] and leaves the rest queued for the
-//! next drain. `clear` returns the number of items the caller must account for
-//! when a connection dies.
+//! by another, so a borrowed slice cannot outlive the push. A frame that quinn
+//! accepted books `udp_stats::payload` per item; a refused frame accounts the
+//! items it contained through [`crate::dgram_drops`] and leaves the rest queued
+//! for the next drain. `clear` returns the number of items the caller must
+//! account for when a connection dies.
 //!
 //! # Bounds
 //!
 //! The queue is bounded by item count and bytes; `push` returns the item back
 //! when full so the caller can apply its own drop policy (e.g. count
 //! `NO_EGRESS`/`BUFFER_FULL`). Every drain is itself bounded by the live
-//! DATAGRAM budget, so a hostile local application cannot make one drain loop
-//! unbounded.
+//! DATAGRAM budget and by a fixed batch size, so a hostile local application
+//! cannot make one drain loop unbounded — and a full send buffer cannot make
+//! every subsequent payload re-encode the whole queue.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -57,6 +58,14 @@ use crate::udp_stats;
 /// bound a stalled/never-drained connection, not to shape normal traffic.
 pub const R2_STAGE_MAX_ITEMS: usize = 1024;
 pub const R2_STAGE_MAX_BYTES: usize = 256 * 1024;
+
+/// One unlocked drain step packs at most this many frames / payloads. The
+/// point is the *failure* path: a blocked send buffer used to make every new
+/// payload re-pack the entire queue, only to have the first datagram refused
+/// again. A small batch bounds that repeated work to a few frames while still
+/// amortising enough payloads per DATAGRAM to keep the normal path cheap.
+pub const R2_PACK_BATCH_FRAMES: usize = 4;
+pub const R2_PACK_BATCH_ITEMS: usize = 64;
 
 /// Addressing shape of one staged item.
 #[derive(Debug, Clone)]
@@ -128,6 +137,16 @@ struct PackedFrame {
 pub struct PackedFrames {
     frames: Vec<PackedFrame>,
     items: Vec<R2StageItem>,
+}
+
+impl PackedFrames {
+    /// Release a consumed batch. The send phase already moved the bodies into
+    /// quinn (`Sent`) or accounted the failed frame; the item payloads are
+    /// dead once their frames have been sent or requeued.
+    pub fn clear(&mut self) {
+        self.frames.clear();
+        self.items.clear();
+    }
 }
 
 /// Per-connection stager. One instance lives next to the connection's
@@ -299,9 +318,12 @@ impl R2Stager {
         n
     }
 
-    /// Phase A of the drain: pack **every** queued payload into DATAGRAM
-    /// bodies, moving item ownership into `q` in encounter order and booking
-    /// the per-payload stats exactly like the per-frame drain did.
+    /// Phase A of the drain: pack up to `max_frames` DATAGRAM bodies, stopping
+    /// before a new frame once `max_items` payloads have been moved, and moving
+    /// item ownership into `q` in encounter order. (The frame already in
+    /// progress may overshoot the item cap by up to one train; both bounds are
+    /// still fixed.) Returns `true` when the queue still holds items after the
+    /// batch (the caller can continue with another short lock hold).
     ///
     /// This runs under the caller's stager lock, which is the point of the
     /// split: the burst drains used to hold that lock across encode **and**
@@ -310,8 +332,26 @@ impl R2Stager {
     /// bookkeeping; [`send_packed_frames`] then writes to the wire without
     /// the lock, and [`Self::requeue_unsent`] returns anything left over
     /// behind a fresh (non-blocking-on-send) lock hold.
-    pub fn pack(&mut self, limit: usize, q: &mut PackedFrames) {
-        while self.pack_one_frame(limit, q) {}
+    ///
+    /// The batch bound is what keeps a blocked send buffer cheap: the caller
+    /// only re-encodes a few frames before the first `Blocked` verdict, not
+    /// the entire queue on every payload.
+    pub fn pack_batch(
+        &mut self,
+        limit: usize,
+        max_frames: usize,
+        max_items: usize,
+        q: &mut PackedFrames,
+    ) -> bool {
+        let start_frames = q.frames.len();
+        let start_items = q.items.len();
+        while q.frames.len() - start_frames < max_frames && q.items.len() - start_items < max_items
+        {
+            if !self.pack_one_frame(limit, q) {
+                break;
+            }
+        }
+        !self.is_empty()
     }
 
     /// Pack exactly one DATAGRAM (returns `false` when the queue is empty).
@@ -334,7 +374,6 @@ impl R2Stager {
             };
             match self.encode_standalone(&item, limit) {
                 Some(body) => {
-                    udp_stats::payload(item.payload.len());
                     let item_off = q.items.len() as u32;
                     q.items.push(item);
                     q.frames.push(PackedFrame {
@@ -389,9 +428,6 @@ impl R2Stager {
         };
         match encoded {
             Some(body) => {
-                for item in run.iter() {
-                    udp_stats::payload(item.payload.len());
-                }
                 let item_off = q.items.len() as u32;
                 q.items.append(&mut run);
                 q.frames.push(PackedFrame {
@@ -414,35 +450,12 @@ impl R2Stager {
     /// Account `n` payloads dropped because the live path budget no longer fits
     /// the encoded frame.
     fn drop_too_large(&self, n: usize) {
-        for _ in 0..n {
-            let bumped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
-            if bumped == 1 {
-                crate::stats::warn_datagram_drop(
-                    crate::stats::DatagramDropKind::Large,
-                    "staged rev2 payload no longer fits the path budget",
-                    bumped,
-                    String::new,
-                );
-            }
-        }
+        book_too_large(n);
     }
 
     /// Encode one standalone `Open`/`Inline` item.
     fn encode_standalone(&self, item: &R2StageItem, limit: usize) -> Option<Bytes> {
-        match &item.kind {
-            R2StageKind::Open {
-                wire_id,
-                sess,
-                addr,
-                src,
-            } => r2::encode_data_open(*wire_id, *sess, &addr.as_ref(), *src, &item.payload, limit),
-            R2StageKind::Inline { sess, addr, src } => {
-                r2::encode_data_inline(*sess, &addr.as_ref(), *src, &item.payload, limit)
-            }
-            R2StageKind::Steady { wire_id } => {
-                r2::encode_data_steady(*wire_id, &item.payload, limit)
-            }
-        }
+        encode_standalone_item(item, limit)
     }
 
     /// Pop heads round-robin while they are `Steady` and fit `limit`.
@@ -568,29 +581,6 @@ impl R2Stager {
         Some(item)
     }
 
-    /// Pack and send the whole queue **under the caller's lock**.
-    ///
-    /// Only the rare `stage_open_src` path needs this single-hold shape any
-    /// more: its invariant ("the queue this drain just emptied contained this
-    /// `OPEN|SRC`, and it was queued on the wire") requires that no other
-    /// reader can enqueue or drain between that push and this send. The burst
-    /// drains use [`Self::pack`] + [`send_packed_frames`] +
-    /// [`Self::requeue_unsent`] instead, so the QUIC writes happen outside the
-    /// lock.
-    pub fn drain(&mut self, conn: &Connection, limit: usize) -> R2DrainOutcome {
-        let mut q = PackedFrames::default();
-        self.pack(limit, &mut q);
-        let out = send_packed_frames(conn, &mut q);
-        if out.failed.is_some() {
-            // Under the caller's lock the requeue cannot overflow: the packed
-            // items were popped from this same queue (its bounded budget has
-            // not moved) and nothing else can have pushed in between.
-            let overflow = self.requeue_unsent(&mut q, out.frames as usize);
-            debug_assert_eq!(overflow, 0, "requeue under one lock hold cannot overflow");
-        }
-        out
-    }
-
     /// Phase C of the unlocked drain: after [`send_packed_frames`] stopped at
     /// frame index `failed_frame`, requeue the items of every frame beyond it,
     /// in encounter order — per-session FIFO is exactly what pack popped, and
@@ -671,10 +661,12 @@ impl Drop for R2Stager {
 /// the wire's ordering; a blocked verdict must not reorder what follows).
 ///
 /// This runs with the stager lock already released — that is the entire point
-/// of the split ([`R2Stager::pack`] comment). The *failed* frame's payloads
-/// are accounted here, per item and exactly (drop accounting is deliberately
-/// per-event): `Blocked` (the path's DATAGRAM budget is exhausted) books
-/// `BUFFER_FULL`, every other verdict books `EGRESS_DEAD`.
+/// of the split ([`R2Stager::pack_batch`] comment). The *failed* frame's
+/// payloads are accounted here, per item and exactly (drop accounting is
+/// deliberately per-event): `Blocked` (the path's DATAGRAM budget is exhausted)
+/// books `BUFFER_FULL`, every other verdict books `EGRESS_DEAD`. Sent payloads
+/// book `udp_stats::payload` here, not at encode time: a `Blocked` frame is
+/// retried on the next drain and must not be counted twice.
 ///
 /// `q` keeps the unsent tail: its frames beyond the failure still own their
 /// items, and frame bodies either moved into quinn (`Sent`) or were released
@@ -690,6 +682,11 @@ pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOut
             DatagramSend::Sent => {
                 out.frames = out.frames.saturating_add(1);
                 out.items_sent = out.items_sent.saturating_add(q.frames[idx].item_len);
+                let start = q.frames[idx].item_off as usize;
+                let end = start + q.frames[idx].item_len as usize;
+                for item in &q.items[start..end] {
+                    udp_stats::payload(item.payload.len());
+                }
             }
             other => {
                 out.items_dropped = q.frames[idx].item_len;
@@ -708,6 +705,117 @@ pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOut
         idx += 1;
     }
     out
+}
+
+/// Encode one standalone `Open`/`Inline` item against the live path budget.
+///
+/// Shared with the server's `stage_open_src` path, which sends a rebinding
+/// `DATA OPEN|SRC` directly (outside the stager lock) and must use the exact
+/// same wire encoder as a batched drain.
+pub fn encode_standalone_item(item: &R2StageItem, limit: usize) -> Option<Bytes> {
+    match &item.kind {
+        R2StageKind::Open {
+            wire_id,
+            sess,
+            addr,
+            src,
+        } => r2::encode_data_open(*wire_id, *sess, &addr.as_ref(), *src, &item.payload, limit),
+        R2StageKind::Inline { sess, addr, src } => {
+            r2::encode_data_inline(*sess, &addr.as_ref(), *src, &item.payload, limit)
+        }
+        R2StageKind::Steady { wire_id } => r2::encode_data_steady(*wire_id, &item.payload, limit),
+    }
+}
+
+/// Account `n` payloads dropped because the live path budget no longer fits
+/// their encoded frame.
+pub fn book_too_large(n: usize) {
+    for _ in 0..n {
+        let bumped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
+        if bumped == 1 {
+            crate::stats::warn_datagram_drop(
+                crate::stats::DatagramDropKind::Large,
+                "staged rev2 payload no longer fits the path budget",
+                bumped,
+                String::new,
+            );
+        }
+    }
+}
+
+/// Drain a connection stager in bounded batches, with the QUIC writes outside
+/// the stager lock.
+///
+/// One call handles at most [`R2_STAGE_MAX_ITEMS`] queued payloads (the queue's
+/// own cap): enough for a burst boundary to flush a full queue, bounded enough
+/// that a producer cannot keep the drainer in this loop forever. Work stops
+/// immediately on the first failed send; the failed frame's items are already
+/// accounted by [`send_packed_frames`], and the unsent tail is requeued for the
+/// next drain. `on_requeue_overflow` is invoked once per item the bounded queue
+/// could not take back (a concurrent pusher refilled it during the unlocked
+/// send window); the caller supplies its usual full-queue accounting.
+///
+/// The `datagram_send_buffer_space` check is the cheap backpressure gate: when
+/// quinn's DATAGRAM buffer is already full, no amount of packing can get a
+/// frame onto the wire, so the drain returns `Blocked` without encoding
+/// anything. That is what turns the old "one full-queue pack per payload while
+/// blocked" behaviour into O(1) per payload.
+pub fn drain_staged(
+    conn: &Connection,
+    stage: &parking_lot::Mutex<R2Stager>,
+    limit: usize,
+    mut on_requeue_overflow: impl FnMut(),
+) -> R2DrainOutcome {
+    let mut total = R2DrainOutcome::default();
+    let mut q = PackedFrames::default();
+    let mut handled = 0usize;
+    loop {
+        if stage.lock().is_empty() {
+            break;
+        }
+        if conn.datagram_send_buffer_space() == 0 {
+            total.failed = Some(DatagramSend::Blocked);
+            break;
+        }
+        let more = {
+            let mut st = stage.lock();
+            if st.is_empty() {
+                false
+            } else {
+                let before = st.len();
+                let more = st.pack_batch(limit, R2_PACK_BATCH_FRAMES, R2_PACK_BATCH_ITEMS, &mut q);
+                // Every `pack_one_frame` call removes at least one item, so
+                // this is also the loop's progress bound (including items
+                // dropped as too large, which never enter `q`).
+                handled = handled.saturating_add(before.saturating_sub(st.len()));
+                more
+            }
+        };
+        if q.frames.is_empty() {
+            q.clear();
+            if !more || handled >= R2_STAGE_MAX_ITEMS {
+                break;
+            }
+            continue;
+        }
+        let outcome = send_packed_frames(conn, &mut q);
+        total.frames = total.frames.saturating_add(outcome.frames);
+        total.items_sent = total.items_sent.saturating_add(outcome.items_sent);
+        total.items_dropped = total.items_dropped.saturating_add(outcome.items_dropped);
+        if outcome.failed.is_some() {
+            let overflow = stage.lock().requeue_unsent(&mut q, outcome.frames as usize);
+            for _ in 0..overflow {
+                on_requeue_overflow();
+            }
+            total.failed = outcome.failed;
+            break;
+        }
+        q.clear();
+        if !more || handled >= R2_STAGE_MAX_ITEMS {
+            break;
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -945,7 +1053,7 @@ mod tests {
         s.push(open(1, 9, b"o")).unwrap();
         s.push(steady(1, 3, b"a2")).unwrap();
         let mut q = PackedFrames::default();
-        s.pack(1162, &mut q);
+        while s.pack_batch(1162, usize::MAX, usize::MAX, &mut q) {}
         assert_eq!(q.frames.len(), 3);
         assert_eq!(q.items.len(), 4);
         assert!(s.is_empty(), "pack moved every item out of the queue");
@@ -979,7 +1087,7 @@ mod tests {
         s.push(steady(1, 1, b"a")).unwrap();
         s.push(open(2, 9, b"o")).unwrap();
         let mut q = PackedFrames::default();
-        s.pack(1162, &mut q);
+        while s.pack_batch(1162, usize::MAX, usize::MAX, &mut q) {}
         assert_eq!(q.frames.len(), 2, "one steady frame + one standalone OPEN");
         assert_eq!(q.items.len(), 2);
         // The send window "stalls" while another association fills the queue
@@ -994,5 +1102,35 @@ mod tests {
         assert_eq!(overflow, 1, "the unsent tail item did not fit back");
         assert_eq!(s.len(), 4, "the queue is exactly full again");
         assert!(q.frames.is_empty());
+    }
+
+    /// The blocked-send path must not re-encode the whole queue: one drain
+    /// step stops at the frame cap, and a second at the item cap, leaving the
+    /// tail queued for the next step.
+    #[test]
+    fn pack_batch_bounds_one_drain_step() {
+        let mut s = R2Stager::new();
+        let per_train = r2::R2_MAX_TRAIN_ITEMS;
+        let total = (R2_PACK_BATCH_FRAMES + 2) * per_train;
+        for _ in 0..total {
+            s.push(steady(1, 1, b"x")).unwrap();
+        }
+        let mut q = PackedFrames::default();
+        let more = s.pack_batch(1162, R2_PACK_BATCH_FRAMES, usize::MAX, &mut q);
+        assert!(more, "items remain after one frame-bounded batch");
+        assert_eq!(q.frames.len(), R2_PACK_BATCH_FRAMES);
+        assert_eq!(q.items.len(), R2_PACK_BATCH_FRAMES * per_train);
+        assert_eq!(s.len(), total - q.items.len());
+
+        q.clear();
+        let more = s.pack_batch(1162, usize::MAX, R2_PACK_BATCH_ITEMS, &mut q);
+        assert!(more, "items remain after one item-bounded batch");
+        assert_eq!(
+            q.frames.len(),
+            1,
+            "the item cap stops before a second frame"
+        );
+        assert_eq!(q.items.len(), R2_PACK_BATCH_ITEMS);
+        assert_eq!(s.len(), 2 * per_train - R2_PACK_BATCH_ITEMS);
     }
 }

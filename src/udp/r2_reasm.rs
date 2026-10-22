@@ -45,6 +45,12 @@ struct FragKey {
     frag_id: u32,
 }
 
+/// Resident cost of one `order` entry. The deque slot outlives the partial it
+/// named (completed/expired slots are skipped lazily), so it must be visible to
+/// [`R2Reassembler::held_bytes`] — otherwise a tick that only runs while
+/// `held_bytes() > 0` stops before the stale slots are swept.
+const ORDER_SLOT_BYTES: usize = std::mem::size_of::<(FragKey, u64)>();
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FragCtx {
     sess: u32,
@@ -236,6 +242,11 @@ pub struct R2Reassembler {
     /// match the live entry), so maintaining the order costs no scan.
     order: VecDeque<(FragKey, u64)>,
     held: usize,
+    /// Resident bytes of the `order` deque, including the stale slots of
+    /// completed partials. Kept separate from `held` (the fragment budget) but
+    /// included in [`R2Reassembler::held_bytes`] so the sweep guard sees the
+    /// memory it is responsible for.
+    order_bytes: usize,
 }
 
 impl R2Reassembler {
@@ -244,11 +255,12 @@ impl R2Reassembler {
         Self::default()
     }
 
-    /// Retained chunk/slot bytes across all live partials — the quantity
-    /// [`FRAG_MAX_HELD_BYTES`] bounds.
+    /// Retained chunk/slot bytes across all live partials **and** the stale
+    /// `order` slots left by completed ones — the quantity the sweep guard and
+    /// telemetry see.
     #[must_use]
     pub fn held_bytes(&self) -> usize {
-        self.held
+        self.held + self.order_bytes
     }
 
     /// Number of datagrams waiting for their remaining fragments.
@@ -460,6 +472,7 @@ impl R2Reassembler {
         };
         if is_new {
             self.order.push_back((key, now_ms));
+            self.order_bytes = self.order_bytes.saturating_add(ORDER_SLOT_BYTES);
         }
         if !completed {
             return None;
@@ -540,6 +553,7 @@ impl R2Reassembler {
                 break;
             }
             self.order.pop_front();
+            self.order_bytes = self.order_bytes.saturating_sub(ORDER_SLOT_BYTES);
             if let Some(p) = self.parts.get(&key)
                 && p.first_ms == first_ms
             {
@@ -552,6 +566,7 @@ impl R2Reassembler {
     /// Evict the oldest live partial; `false` when none is left.
     fn evict_oldest(&mut self) -> bool {
         while let Some((key, first_ms)) = self.order.pop_front() {
+            self.order_bytes = self.order_bytes.saturating_sub(ORDER_SLOT_BYTES);
             match self.parts.get(&key) {
                 Some(p) if p.first_ms == first_ms => {
                     let p = self.parts.remove(&key).expect("checked above");
@@ -633,7 +648,12 @@ mod tests {
         assert_eq!(done.sess, None);
         assert_eq!(done.payload, Bytes::from_static(b"hello world"));
         assert_eq!(r.inflight(), 0);
+        // The completed partial's order slot stays until the sweep; it is part
+        // of the retained footprint (and of the tick guard).
+        assert_eq!(r.held_bytes(), ORDER_SLOT_BYTES);
+        r.expire(FRAG_TIMEOUT_MS);
         assert_eq!(r.held_bytes(), 0);
+        assert!(r.order.is_empty());
     }
 
     #[test]
@@ -813,6 +833,9 @@ mod tests {
         assert!(r.held_bytes() > 0);
         assert_eq!(r.drop_flow(id2), 1);
         assert_eq!(r.inflight(), 0);
+        // Both partials are gone; their order slots remain until the sweep.
+        assert_eq!(r.held_bytes(), 2 * ORDER_SLOT_BYTES);
+        r.expire(0);
         assert_eq!(r.held_bytes(), 0);
         // Dropping an unknown id/session is a no-op.
         assert_eq!(r.drop_session(99), 0);
@@ -848,6 +871,8 @@ mod tests {
             "the short tail is written at its exact offset"
         );
         assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), ORDER_SLOT_BYTES);
+        r.expire(FRAG_TIMEOUT_MS);
         assert_eq!(r.held_bytes(), 0);
     }
 
@@ -884,6 +909,8 @@ mod tests {
         let done = feed(&mut r, frag(Some(id), None, None, 3, 4, 6, b"tail")).unwrap();
         assert_eq!(done.payload, Bytes::from_static(b"x0five!five!tail"));
         assert_eq!(r.inflight(), 0);
+        assert_eq!(r.held_bytes(), ORDER_SLOT_BYTES);
+        r.expire(FRAG_TIMEOUT_MS);
         assert_eq!(r.held_bytes(), 0);
     }
 
@@ -903,6 +930,8 @@ mod tests {
                 let done = done.expect("every index landed: the payload completes");
                 assert_eq!(done.payload.len(), usize::from(total));
                 assert_eq!(r.inflight(), 0);
+                assert_eq!(r.held_bytes(), ORDER_SLOT_BYTES);
+                r.expire(FRAG_TIMEOUT_MS);
                 assert_eq!(r.held_bytes(), 0);
             } else {
                 assert!(done.is_none(), "still partial after index {idx}");

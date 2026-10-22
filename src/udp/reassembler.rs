@@ -1,16 +1,17 @@
-//! MQP-2 UDP 分片重组器：逐行搬运自 `src/lib.rs`（零改动抽取，`lib.rs` 未碰）。
+//! MQP-2 UDP fragment reassembler: moved line by line from `src/lib.rs`
+//! (zero-change extraction; `lib.rs` untouched).
 //!
-//! 搬运区间（以符号为准）：
-//! - `Partial`（含 `impl`）：lib.rs:1240-1297
-//! - `Tombstone`（含 `impl`）：lib.rs:1299-1344
-//! - `DgramReassembler`（含 `impl` 全套：`new`/`held_bytes`/`inflight`/`push`/
+//! Moved ranges (keyed by symbol):
+//! - `Partial` (including `impl`): lib.rs:1240-1297
+//! - `Tombstone` (including `impl`): lib.rs:1299-1344
+//! - `DgramReassembler` (including the full `impl`: `new`/`held_bytes`/`inflight`/`push`/
 //!   `is_stale_replay`/`remember`/`push_with_chunk`/`maybe_sweep`/`expire`/
-//!   `evict_oldest_tombstone`/`evict_oldest`）：lib.rs:1346-1717
+//!   `evict_oldest_tombstone`/`evict_oldest`): lib.rs:1346-1717
 //!
-//! 接线：`mqp`（`TargetAddr`/`TargetAddrRef`/`FragmentRef`/
+//! Wiring: `mqp` (`TargetAddr`/`TargetAddrRef`/`FragmentRef`/
 //! `MQP_FRAG_MAX_PAYLOAD`/`MQP_FRAG_MAX_TOTAL`/`FRAG_MAX_HELD_BYTES`/
-//! `FRAG_MAX_PARTIALS`/`FRAG_TIMEOUT_MS`）、`stats`（`udp_stats::*`）
-//! 均经 `crate::` 绝对路径引用。
+//! `FRAG_MAX_PARTIALS`/`FRAG_TIMEOUT_MS`) and `stats` (`udp_stats::*`)
+//! are all referenced through absolute `crate::` paths.
 
 use std::collections::{HashMap, VecDeque};
 

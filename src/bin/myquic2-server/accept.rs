@@ -3,7 +3,8 @@ use super::*;
 use futures_util::future::FutureExt as _;
 use myquic2::mqp::r2::{self, Caps, Ctl, R2Kind};
 use myquic2::mqp::r2_flow::{
-    CtlState, FlowBinding, FlowIds, FlowRegistry, FlowState, RegistryError, SessionFlows,
+    CtlState, FlowBinding, FlowIds, FlowRegistry, FlowState, R2_MAX_RESOLVED_ADDRS, RegistryError,
+    SessionFlows,
 };
 use myquic2::udp::{R2Reassembler, R2Stager};
 
@@ -835,6 +836,11 @@ pub(crate) mod r2_stats {
     /// Downlink frames sent (steady `DATA`, same-flow `TRAIN`, `OPEN|SRC`).
     pub(crate) static STEADY_SENT: AtomicU64 = AtomicU64::new(0);
     pub(crate) static OPEN_SRC_SENT: AtomicU64 = AtomicU64::new(0);
+    /// `DATA OPEN`s dropped while another lookup for the same
+    /// `(session, id)` was in flight, or because the per-connection
+    /// pending-open cap was reached. Duplicates are expected under
+    /// retransmission; the counter makes a name-resolution stall visible.
+    pub(crate) static DNS_OPEN_DROPS: AtomicU64 = AtomicU64::new(0);
     /// Staged small replies dropped because the connection stager was full
     /// (bounded queue) or could not be re-queued after a drain.
     pub(crate) static STAGE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -909,6 +915,11 @@ pub(crate) struct R2ConnState {
     /// Bounded to keep a connection flood from pinning memory; overflow is
     /// counted and dropped.
     pre_hello: parking_lot::Mutex<(Vec<Bytes>, usize)>,
+    /// Domain `DATA OPEN`s whose DNS lookup / first send is running on a
+    /// spawned task, keyed by `(session, wire_id)`. Repeated OPENs for the same
+    /// id are coalesced onto the in-flight lookup instead of spawning a second
+    /// resolver; see [`R2ConnState::begin_pending_open`].
+    pending_dns_opens: parking_lot::Mutex<std::collections::HashSet<(u32, u32)>>,
 }
 
 /// Bounds for [`R2ConnState::pre_hello`]: only the first optimistic frames
@@ -916,6 +927,36 @@ pub(crate) struct R2ConnState {
 /// rather than buffered (the handshake completes in one RTT on any live path).
 pub(crate) const PRE_HELLO_MAX_FRAMES: usize = 8;
 pub(crate) const PRE_HELLO_MAX_BYTES: usize = 16 * 1024;
+
+/// Concurrent domain lookups one connection may have in flight. The global
+/// `dns_slow_path_limiter` bounds the actual resolver work; this is the
+/// per-connection share that keeps one peer from queueing an unbounded set of
+/// tasks (each waits on the limiter while holding its socket/target copies).
+pub(crate) const MAX_PENDING_DNS_OPENS: usize = 16;
+
+/// RAII entry for one in-flight domain OPEN: removes the `(session, id)`
+/// coalescing key when the lookup task exits, on every path (success, refusal,
+/// timeout, cancellation).
+pub(crate) struct PendingDnsOpen {
+    state: Arc<R2ConnState>,
+    key: (u32, u32),
+}
+
+impl Drop for PendingDnsOpen {
+    fn drop(&mut self) {
+        self.state.pending_dns_opens.lock().remove(&self.key);
+    }
+}
+
+/// Result of trying to start a domain OPEN.
+pub(crate) enum PendingOpen {
+    Started(PendingDnsOpen),
+    /// The same `(session, id)` already has a lookup in flight: drop the
+    /// duplicate payload; the client repeats OPEN until the first ACK.
+    Duplicate,
+    /// This connection is already at [`MAX_PENDING_DNS_OPENS`].
+    Full,
+}
 
 impl R2ConnState {
     pub(crate) fn new() -> Arc<Self> {
@@ -928,6 +969,26 @@ impl R2ConnState {
             stage: Arc::new(parking_lot::Mutex::new(R2Stager::new())),
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
             pre_hello: parking_lot::Mutex::new((Vec::new(), 0)),
+            pending_dns_opens: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        })
+    }
+
+    /// Begin (or coalesce) one domain OPEN. The returned guard owns the
+    /// pending-entry lifetime; a duplicate or cap refusal leaves the set
+    /// unchanged.
+    pub(crate) fn begin_pending_open(self: &Arc<Self>, sess: u32, id: u32) -> PendingOpen {
+        let key = (sess, id);
+        let mut set = self.pending_dns_opens.lock();
+        if set.contains(&key) {
+            return PendingOpen::Duplicate;
+        }
+        if set.len() >= MAX_PENDING_DNS_OPENS {
+            return PendingOpen::Full;
+        }
+        set.insert(key);
+        PendingOpen::Started(PendingDnsOpen {
+            state: Arc::clone(self),
+            key,
         })
     }
 
@@ -1270,88 +1331,132 @@ async fn r2_forward_flow_resolved(
     }
 }
 
-/// Resolve and forward the payload of a domain-target `DATA OPEN`.
+/// Filter a resolved address list through the SSRF policy and bound it to
+/// [`R2_MAX_RESOLVED_ADDRS`].
 ///
-/// Returns the validated address set to install in the binding (the set is what
-/// authorizes domain reply sources on the downlink), or `None` after sending the
-/// matching `FLOW_REJECT`.
+/// The cap is what keeps the per-flow admission charge real: 4096 domain flows
+/// cannot each retain a DNS response's full record set, and `match_source`
+/// scans each retained address on the reply path. The first accepted address
+/// is the one the OPEN is forwarded to; later ones only authorize compressed
+/// replies.
+pub(crate) fn policy_resolved(addrs: &[SocketAddr], allow_private: bool) -> Vec<SocketAddr> {
+    let mut usable = Vec::with_capacity(addrs.len().min(R2_MAX_RESOLVED_ADDRS));
+    for a in addrs.iter().copied() {
+        if !(allow_private || is_global_ip(a.ip())) {
+            continue;
+        }
+        usable.push(a);
+        if usable.len() == R2_MAX_RESOLVED_ADDRS {
+            break;
+        }
+    }
+    usable
+}
+
+/// Resolve and forward a domain-target `DATA OPEN` **off the datagram loop**.
+///
+/// DNS is the only potentially seconds-long await on the ingress path (up to
+/// `DNS_LOOKUP_TIMEOUT`), so the reader spawns this task with owned data and
+/// keeps routing other datagrams. The task owns everything it touches:
+/// resolution + SSRF filtering, session creation (which may await a session
+/// permit), the target send, and the idempotent install + `FLOW_ACK`.
+///
+/// `_pending` removes the `(session, id)` coalescing entry on every exit path.
+/// Repeated OPENs for the same id while this task is in flight are dropped by
+/// [`R2ConnState::begin_pending_open`]; the client repeats OPEN until ACK, so
+/// dropping a duplicate payload is ordinary UDP loss, never a stuck flow.
 #[allow(clippy::too_many_arguments)]
-async fn r2_forward_domain_open(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
-    ss: &SessTable,
-    cd: &quinn::Connection,
+async fn r2_forward_domain_open_bg(
+    ss: SessTable,
+    cd: quinn::Connection,
     conn_id: usize,
     allow_private: bool,
-    state: &Arc<R2ConnState>,
+    state: Arc<R2ConnState>,
     id: u32,
     sess: u32,
-    host: &str,
+    host: String,
     port: u16,
     payload: Bytes,
-) -> Option<Vec<SocketAddr>> {
-    // Resolve synchronously: the OPEN is the only frame that carries the name,
-    // so the validated address set must be known before the binding is
-    // installed. The DNS layer's own negative cache makes a repeated OPEN cheap,
-    // and the shared slow-path budget bounds a flood of distinct names (a peer
-    // pays a registry slot and a new flow id per OPEN, so this is only a
-    // second line of defence).
+    _pending: PendingDnsOpen,
+) {
+    if cd.close_reason().is_some() {
+        return;
+    }
     let _dns_permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             dgram_drops::bump(&dgram_drops::DNS_BUDGET);
-            r2_reject(cd, id, r2::R2_REJECT_DNS);
-            return None;
+            r2_reject(&cd, id, r2::R2_REJECT_DNS);
+            return;
         }
     };
-    let addrs = match resolve_all_cached(host, port).await {
+    let addrs = match resolve_all_cached(&host, port).await {
         Ok(v) => v,
         Err(_) => {
             r2_refuse(None);
-            r2_reject(cd, id, r2::R2_REJECT_DNS);
-            return None;
+            r2_reject(&cd, id, r2::R2_REJECT_DNS);
+            return;
         }
     };
-    let usable: Vec<SocketAddr> = addrs
-        .iter()
-        .copied()
-        .filter(|a| allow_private || is_global_ip(a.ip()))
-        .collect();
+    let usable = policy_resolved(&addrs, allow_private);
     if usable.is_empty() {
         // Every record was rejected by the SSRF policy.
         r2_refuse(None);
-        r2_reject(cd, id, r2::R2_REJECT_POLICY);
-        return None;
+        r2_reject(&cd, id, r2::R2_REJECT_POLICY);
+        return;
+    }
+    if cd.close_reason().is_some() {
+        return;
     }
     let dst = usable[0];
     let sock = match get_or_create_sess(
-        ss,
-        cd,
+        &ss,
+        &cd,
         conn_id,
         sess,
-        Some((host, port, dst, DNS_CACHE_TTL_MS)),
-        Some(state),
+        Some((host.as_str(), port, dst, DNS_CACHE_TTL_MS)),
+        Some(&state),
     )
     .await
     {
         Some(s) => s,
         None => {
             // Session/share/permit refusal: no flow can be installed around it.
-            r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL);
-            return None;
+            r2_reject(&cd, id, r2::R2_REJECT_TABLE_FULL);
+            return;
         }
     };
-    remember_dst(ss, sess, dst);
-    arm_fast(
-        fast,
-        ss,
-        conn_id,
-        sess,
-        TargetAddrRef::Domain(host, port),
-        dst,
-        DNS_CACHE_TTL_MS,
-    );
+    remember_dst(&ss, sess, dst);
+    // No `arm_fast` here: the fast table is owned by the datagram loop. The
+    // next datagram for this session takes the slow path once, finds the dest
+    // memo written above, and arms it there — one slow-path hit, never a
+    // reason to keep the DNS wait on the reader.
     udp_try_send(&sock, map_for_dual(dst), payload);
-    Some(usable)
+    match r2_install(
+        &state,
+        &ss,
+        sess,
+        id,
+        TargetAddr::Domain(host, port),
+        usable,
+    ) {
+        Ok(_) => {
+            r2_stats::bump(&r2_stats::OPENS);
+            r2_send_ctl(
+                &cd,
+                &Ctl::FlowAck {
+                    id,
+                    status: r2::R2_ACK_OPEN,
+                },
+            );
+            r2_stats::bump(&r2_stats::ACKS);
+        }
+        Err(RegistryError::Full) => r2_reject(&cd, id, r2::R2_REJECT_TABLE_FULL),
+        Err(RegistryError::Conflict) => {
+            r2_refuse(None);
+            r2_reject(&cd, id, r2::R2_REJECT_POLICY);
+        }
+    }
 }
 
 /// Handle one `DATA OPEN` (client-initiated flow: the address is the target).
@@ -1423,23 +1528,40 @@ async fn r2_ingress_open(
             }
         }
         TargetAddrRef::Domain(host, port) => {
-            match r2_forward_domain_open(
-                fast,
-                ss,
-                cd,
-                conn_id,
-                allow_private,
-                state,
-                id,
-                sess,
-                host,
-                port,
-                payload,
-            )
-            .await
-            {
-                Some(v) => Some(v),
-                None => return,
+            let host = host.to_owned();
+            match state.begin_pending_open(sess, id) {
+                PendingOpen::Duplicate => {
+                    // The first OPEN for this id is already resolving; the
+                    // client repeats OPEN until its FLOW_ACK, so this payload
+                    // is ordinary UDP loss rather than a second resolver.
+                    r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                    return;
+                }
+                PendingOpen::Full => {
+                    r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                    dgram_drops::bump(&dgram_drops::DNS_BUDGET);
+                    r2_reject(cd, id, r2::R2_REJECT_DNS);
+                    return;
+                }
+                PendingOpen::Started(pending) => {
+                    // Owned task: the datagram loop must not await DNS. The
+                    // task performs the same forward-then-install sequence and
+                    // sends its own ACK/reject.
+                    tokio::spawn(r2_forward_domain_open_bg(
+                        ss.clone(),
+                        cd.clone(),
+                        conn_id,
+                        allow_private,
+                        Arc::clone(state),
+                        id,
+                        sess,
+                        host,
+                        port,
+                        payload,
+                        pending,
+                    ));
+                    return;
+                }
             }
         }
     };
@@ -1573,36 +1695,44 @@ async fn r2_ingress_train(
     // frame does two bounded passes:
     //
     //   pass 1 — collect each item's id, deduplicating into at most one slot per
-    //            distinct id (a duplicate that arrives before its original
-    //            resolves into the same slot, so the semantics are the per-item
-    //            ones: every item sees the binding the map holds when the frame
-    //            started);
+    //            distinct id (repeated item indices are legal in the dict form
+    //            and name the same flow; every item then sees the binding the
+    //            map holds when the frame started);
     //   batch  — one `get_batch` under a single read-lock hold fills every slot;
     //   pass 2 — dispatch per item against its slot's binding.
     //
-    // The intermediate lists are bounded by the frame's item count (≤ 64), so
-    // the two `Vec`s stay *well* inside a few hundred bytes and their capacity
-    // covers the codec's maximum frame on the first TRAIN.
-    let mut item_slot: Vec<u16> = Vec::with_capacity(usize::from(train.count));
-    let mut slots: Vec<(u32, Option<Arc<FlowBinding>>)> =
-        Vec::with_capacity(usize::from(train.count));
-    for (wire_id, _) in train.items() {
-        // Bounded linear scan (≤ 64 entries) — the codec already bounds the
-        // count, so the quadratic shape here is capped at 4 096 comparisons,
-        // the same order as the foldhash probes the per-item lookups did.
-        let slot = slots.iter().position(|(id, _)| *id == wire_id);
-        let slot = match slot {
-            Some(i) => i as u16,
-            None => {
-                slots.push((wire_id, None));
-                (slots.len() - 1) as u16
+    // Both lists are fixed-size stack arrays (the codec bounds the count at
+    // 64), and the dedupe is a tiny open-addressing table instead of a
+    // quadratic scan: no allocation, and one probe per item in the common
+    // all-distinct case.
+    const TRAIN_MAX: usize = r2::R2_MAX_TRAIN_ITEMS;
+    const TRAIN_HASH_CAP: usize = 128; // power of two, >= 2 * TRAIN_MAX
+    let mut slots: [(u32, Option<Arc<FlowBinding>>); TRAIN_MAX] =
+        std::array::from_fn(|_| (0, None));
+    let mut slot_of: [u16; TRAIN_HASH_CAP] = [u16::MAX; TRAIN_HASH_CAP];
+    let mut item_slot: [u16; TRAIN_MAX] = [0; TRAIN_MAX];
+    let mut n_slots = 0usize;
+    for (i, (wire_id, _)) in train.items().enumerate() {
+        debug_assert!(i < TRAIN_MAX, "the codec bounds the train item count");
+        let mut h = (wire_id.wrapping_mul(0x9E37_79B1) as usize) & (TRAIN_HASH_CAP - 1);
+        let slot = loop {
+            let s = slot_of[h];
+            if s == u16::MAX {
+                let s = n_slots as u16;
+                n_slots += 1;
+                slot_of[h] = s;
+                slots[usize::from(s)] = (wire_id, None);
+                break s;
             }
+            if slots[usize::from(s)].0 == wire_id {
+                break s;
+            }
+            h = (h + 1) & (TRAIN_HASH_CAP - 1);
         };
-        item_slot.push(slot);
+        item_slot[i] = slot;
     }
-    state.registry.get_batch(&mut slots);
-    for (slot_index, (wire_id, item)) in train.items().enumerate() {
-        let _ = wire_id; // slots hold the ids; the fresh Arcs are what the item uses
+    state.registry.get_batch(&mut slots[..n_slots]);
+    for (slot_index, (_wire_id, item)) in train.items().enumerate() {
         r2_stats::bump_train_item();
         udp_stats::payload(item.len());
         let payload = d.slice_ref(item);
