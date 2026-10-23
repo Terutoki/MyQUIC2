@@ -100,6 +100,26 @@ pub(crate) struct AssocEntry {
     /// working flow, which is the same "evicted a session the client was using"
     /// failure the server-side sweeper was fixed for.
     pub(crate) last: std::sync::atomic::AtomicU64,
+    /// Whether a dispatcher reply must be written to [`Self::relay`] as the
+    /// bare payload (`true`) or prefixed with the SOCKS5 UDP reply header
+    /// (`false`).
+    ///
+    /// SOCKS5 `UDP ASSOCIATE` associations are `false`: the app's datagrams are
+    /// framed and it expects a framed reply. Config-driven UDP forward
+    /// listeners (`forward_udp.rs`) are `true`: the peer is an ordinary UDP
+    /// application, so a `RSV|FRAG|ATYP|ADDR|PORT` prefix would be delivered as
+    /// payload bytes. A plain `bool` because it is fixed at construction and
+    /// never mutated after publication.
+    pub(crate) raw_reply: bool,
+    /// Whether [`Self::relay`] is an IPv6 (dual-stack) socket.
+    ///
+    /// Replies must be addressed with [`map_for_dual`] only when the sending
+    /// socket is dual-stack IPv6: a SOCKS relay is (built from a v4-mapped v6
+    /// bind, see `assoc::bind_relay`), while a forward listener may be bound to
+    /// a plain IPv4 address by config. Mapping a v4 peer to `::ffff:a.b.c.d` on
+    /// an AF_INET socket fails the send (`ENETUNREACH` on macOS) — the reply
+    /// would be counted and dropped instead of delivered.
+    pub(crate) reply_v6: bool,
 }
 
 /// The association's own idle cadence and the deadline it is checked against.
@@ -123,14 +143,30 @@ pub(crate) const ASSOC_TOUCH_INTERVAL_MS: u64 = 1000;
 
 impl AssocEntry {
     pub(crate) fn new(relay: Arc<tokio::net::UdpSocket>) -> Self {
+        Self::with_reply_mode(relay, false)
+    }
+
+    /// A raw-forward association: replies are written to `relay` addressed at
+    /// [`Self::app`] as the bare payload, with no SOCKS5 UDP header (see
+    /// [`Self::raw_reply`]).
+    pub(crate) fn new_raw(relay: Arc<tokio::net::UdpSocket>) -> Self {
+        Self::with_reply_mode(relay, true)
+    }
+
+    fn with_reply_mode(relay: Arc<tokio::net::UdpSocket>, raw_reply: bool) -> Self {
+        // Cold path (once per association/peer session), so the one syscall is
+        // irrelevant; default to the old mapping when the socket is odd.
+        let reply_v6 = relay.local_addr().map(|a| a.is_ipv6()).unwrap_or(true);
         Self {
             relay,
+            reply_v6,
             flows: Arc::new(arc_swap::ArcSwap::from_pointee(FlowTable::default())),
             confirmed: std::sync::atomic::AtomicU64::new(0),
             app: ArcSwapOption::const_empty(),
             alive: std::sync::atomic::AtomicBool::new(true),
             replied: std::sync::atomic::AtomicBool::new(false),
             last: std::sync::atomic::AtomicU64::new(mono_millis()),
+            raw_reply,
         }
     }
 

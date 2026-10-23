@@ -370,12 +370,22 @@ mod tests {
             "one payload after a stale time gate must be published, not held in the cell"
         );
         // The cell is empty afterwards, so the next snapshot cannot double count
-        // it (the publish reset it).
-        let now = DATAGRAMS.load(Ordering::Relaxed);
+        // it (the publish reset it). Assert the **thread-local** cell, never the
+        // process-wide counter: the lib test binary runs its tests in parallel
+        // and other tests publish their own payloads into the same global, so a
+        // global equality check here is inherently racy (it failed under the
+        // default multi-threaded harness as soon as an unrelated payload test
+        // happened to publish in the window). The cell is what the contract is
+        // about anyway: `snapshot` flushes *the caller's* cells.
+        assert_eq!(
+            L_DATAGRAMS.with(|c| c.get()),
+            0,
+            "a time-gate publish must empty this thread's cell"
+        );
         snapshot();
         assert_eq!(
-            DATAGRAMS.load(Ordering::Relaxed),
-            now,
+            L_DATAGRAMS.with(|c| c.get()),
+            0,
             "a publish empties the cell; snapshot must not re-add it"
         );
     }

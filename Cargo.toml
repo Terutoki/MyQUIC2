@@ -227,6 +227,11 @@ metrics = "0.24.6"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
+# Process-level E2E tests (`tests/forward_e2e.rs`): each test needs an isolated
+# directory for the server cert/key pair, both config files and the child
+# processes' logs. `tempfile` removes the hand-rolled unique-name + cleanup
+# dance (and cleans up on panic, which a test that spawns two processes wants).
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

@@ -384,81 +384,140 @@ impl AppDgramCtx<'_> {
         // fragmenter rather than dropped. A first datagram may not be bound yet
         // (an earlier one may have failed framing validation); the send path
         // pins it.
-        let bind = *bind.get_or_insert_with(|| {
-            let c = pool.udp_class(&addr, payload.len());
-            let b = pool.udp_bind(c);
-            tracing::debug!(
-                "udp assoc {sess}: egress class {} shard {} (first payload {} B)",
-                c.name(),
-                b.index,
-                payload.len()
-            );
-            b
-        });
-        let sent = match egress_shared.with_fresh(bind, now, |c, limit, rev2| {
-            send_uplink(c, limit, sess, &addr, payload, bind, rev2, uplink, frag)
-        }) {
-            Some(s) => s,
-            None => {
-                // Load the generation *before* the cached read: any mutation
-                // concurrent with `acquire` then bumps past this tag, so the
-                // memo below is never served for a value the mutation replaced.
-                let generation =
-                    egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
-                match egress_shared.acquire(pool, bind, now) {
-                    Some(h) => {
-                        egress_shared
-                            .memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
-                        send_uplink(
-                            &h.conn, h.limit, sess, &addr, payload, bind, &h.rev2, uplink, frag,
-                        )
-                    }
-                    None => {
-                        // No isolated egress connection right now: this
-                        // binding's dedicated UDP slot(s) have not come up, are
-                        // reconnecting, or another thread owns the refresh gate.
-                        // Counted *exactly* (this counter is not batched) and
-                        // warned once per `DROP_WARN_INTERVAL_MS`, because "is
-                        // `udp_fail_closed` costing me anything" is only
-                        // answerable if a short outage is visible at all. The
-                        // detail separates the three causes, which is the
-                        // difference between "the WAN is flapping" and "another
-                        // thread won the refresh race".
-                        let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
-                        dgram_drops::warn_egress_drop(
-                            dgram_drops::EgressDrop::NoConnection,
-                            n,
-                            || {
-                                format!(
-                                    "; class={} bind={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
-                                    bind.class.name(),
-                                    bind.index,
-                                    pool.udp_fail_closed(),
-                                    pool.slot(pool.udp_global_slot(bind.index)).is_live(),
-                                    egress_shared.refreshing[bind.index]
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                )
-                            },
-                        );
-                        return AppDgram::Continue;
-                    }
-                }
-            }
-        };
-        if sent.fragmented() {
-            tracing::debug!(
-                "udp assoc {sess}: {} B sent as {} fragments",
-                payload.len(),
-                sent.frames
-            );
-        }
-        // Exactly one place for a send verdict's recovery, shared with the
-        // deferred TRAIN flush below. `Blocked`/`TooLarge` are already counted
-        // where they are decided; `ConnectionLost`/`Unsupported` are the states
-        // the memo hit path deliberately defers to the send's verdict.
-        recover_send_outcome(egress_shared, bind, sent);
+        //
+        // The whole egress-selection + send + drop-accounting block lives in
+        // [`send_payload_uplink`] because the UDP forward listeners
+        // (`forward_udp.rs`) run the exact same path with `SessionKind::Forward`.
+        send_payload_uplink(
+            pool,
+            egress_shared,
+            sess,
+            &addr,
+            payload,
+            bind,
+            uplink,
+            frag,
+            now,
+            SessionKind::Socks,
+        );
         AppDgram::Continue
     }
+}
+
+/// Which ingress a UDP payload came from, for the one debug line that names the
+/// session. A `&'static str` (not a formatted string) so the hot path pays
+/// nothing beyond the pre-existing debug-log branch.
+#[derive(Clone, Copy)]
+pub(crate) enum SessionKind {
+    /// SOCKS5 `UDP ASSOCIATE` relay socket.
+    Socks,
+    /// Config-driven raw UDP forward listener (`forward_udp.rs`).
+    Forward,
+}
+
+impl SessionKind {
+    fn label(self) -> &'static str {
+        match self {
+            SessionKind::Socks => "assoc",
+            SessionKind::Forward => "forward",
+        }
+    }
+}
+
+/// Send one UDP payload on the MQP-3 rev2 uplink, choosing the egress binding
+/// from the first payload and recovering from every send verdict.
+///
+/// Extracted verbatim from [`AppDgramCtx::process`] so the SOCKS association
+/// and the raw UDP forward listeners cannot drift apart: the egress class
+/// derivation, the memo hit path, the single-flight refresh, `NO_EGRESS`
+/// accounting and `recover_send_outcome` are subtle and were all tuned
+/// together. The only difference between the two callers is the debug label.
+///
+/// Synchronous (no `.await`), so callers may run it under a recvmmsg burst
+/// borrow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_payload_uplink(
+    pool: &ConnPool,
+    egress_shared: &SharedEgress,
+    sess: u32,
+    target: &TargetAddrRef<'_>,
+    payload: &[u8],
+    bind: &mut Option<UdpBind>,
+    uplink: &mut UplinkFlows,
+    frag: &mut R2Fragmenter,
+    now: u64,
+    kind: SessionKind,
+) {
+    let bind = *bind.get_or_insert_with(|| {
+        let c = pool.udp_class(target, payload.len());
+        let b = pool.udp_bind(c);
+        tracing::debug!(
+            "udp {} {sess}: egress class {} shard {} (first payload {} B)",
+            kind.label(),
+            c.name(),
+            b.index,
+            payload.len()
+        );
+        b
+    });
+    let sent = match egress_shared.with_fresh(bind, now, |c, limit, rev2| {
+        send_uplink(c, limit, sess, target, payload, bind, rev2, uplink, frag)
+    }) {
+        Some(s) => s,
+        None => {
+            // Load the generation *before* the cached read: any mutation
+            // concurrent with `acquire` then bumps past this tag, so the
+            // memo below is never served for a value the mutation replaced.
+            let generation =
+                egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+            match egress_shared.acquire(pool, bind, now) {
+                Some(h) => {
+                    egress_shared
+                        .memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+                    send_uplink(
+                        &h.conn, h.limit, sess, target, payload, bind, &h.rev2, uplink, frag,
+                    )
+                }
+                None => {
+                    // No isolated egress connection right now: this binding's
+                    // dedicated UDP slot(s) have not come up, are reconnecting,
+                    // or another thread owns the refresh gate. Counted *exactly*
+                    // (this counter is not batched) and warned once per
+                    // `DROP_WARN_INTERVAL_MS`, because "is `udp_fail_closed`
+                    // costing me anything" is only answerable if a short outage
+                    // is visible at all. The detail separates the three causes,
+                    // which is the difference between "the WAN is flapping" and
+                    // "another thread won the refresh race".
+                    let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+                    dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, n, || {
+                        format!(
+                            "; class={} bind={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                            bind.class.name(),
+                            bind.index,
+                            pool.udp_fail_closed(),
+                            pool.slot(pool.udp_global_slot(bind.index)).is_live(),
+                            egress_shared.refreshing[bind.index]
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    });
+                    return;
+                }
+            }
+        }
+    };
+    if sent.fragmented() {
+        tracing::debug!(
+            "udp {} {sess}: {} B sent as {} fragments",
+            kind.label(),
+            payload.len(),
+            sent.frames
+        );
+    }
+    // Exactly one place for a send verdict's recovery, shared with the
+    // deferred TRAIN flush below. `Blocked`/`TooLarge` are already counted
+    // where they are decided; `ConnectionLost`/`Unsupported` are the states
+    // the memo hit path deliberately defers to the send's verdict.
+    recover_send_outcome(egress_shared, bind, sent);
 }
 
 /// Portable fallback for one recvmmsg-staged message: copy it out of the
@@ -1047,9 +1106,23 @@ pub(crate) fn send_reply_addr(
     // tick. It used to be a `mono_millis()` here — a vDSO `clock_gettime` per
     // datagram — for a signal whose only consumer compares it against 180 s.
     entry.mark_replied();
+    // Same family-aware addressing as the grouped flush: a forward listener
+    // may be plain IPv4, where mapping the peer to `::ffff:a.b.c.d` fails.
+    let peer = if entry.reply_v6 {
+        map_for_dual(app)
+    } else {
+        app
+    };
+    if entry.raw_reply {
+        // Raw forward listener: this slow path is reached only for a
+        // domain-form reply source (the server normally echoes IP-form), but a
+        // SOCKS5 header here would still be delivered as payload bytes.
+        udp_try_send_slice(&entry.relay, peer, payload);
+        return;
+    }
     pkt.truncate(0);
     encode_reply(pkt, dst, payload);
-    udp_try_send_slice(&entry.relay, map_for_dual(app), &pkt[..]);
+    udp_try_send_slice(&entry.relay, peer, &pkt[..]);
 }
 
 /// Encode one SOCKS5 UDP reply frame (RSV/FRAG + source address + payload).

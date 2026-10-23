@@ -61,3 +61,22 @@ quic_conns = 4
 # (cert+MQP framing stay fingerprintable). alpn="myquic2/3" restores the
 # versioned identifier; set the same value on both sides.
 # alpn = "h3"
+# ---- TCP/UDP forward listeners (optional; omit both = SOCKS5 only) ----
+# Expose a local port that relays raw TCP/UDP through the same QUIC tunnel to a
+# fixed destination — for applications that cannot speak SOCKS5. The server
+# needs no configuration change; a private/loopback target requires the
+# server's allow_private = true, and a non-loopback listen means any host that
+# can reach it can use this tunnel, so keep it on 127.0.0.1 or firewall it.
+#
+# TCP: one accepted connection -> one QUIC bidi stream (half-close and idle
+# semantics match SOCKS CONNECT).
+# [[tcp_forward]]
+# listen = "127.0.0.1:8080"
+# target = "example.com:80"
+#
+# UDP: each client source IP:port gets its own session (shared 4032-session
+# budget, 180 s idle reap); replies are delivered as raw payloads.
+# [[udp_forward]]
+# listen = "127.0.0.1:5353"
+# target = "1.1.1.1:53"
+# max_sessions = 1024

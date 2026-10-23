@@ -27,6 +27,8 @@ mod assoc;
 mod auth;
 mod dispatcher;
 mod egress;
+mod forward;
+mod forward_udp;
 mod hub;
 mod pool;
 mod reporter;
@@ -37,8 +39,8 @@ mod tests;
 mod util;
 
 use crate::{
-    assoc::*, auth::*, dispatcher::*, egress::*, hub::*, pool::*, reporter::*, rev2::*, socks::*,
-    util::*,
+    assoc::*, auth::*, dispatcher::*, egress::*, forward::*, hub::*, pool::*, reporter::*, rev2::*,
+    socks::*, util::*,
 };
 
 // mimalloc on every target (see Cargo.toml): the shipped static / OpenWrt
@@ -126,6 +128,12 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             "auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)"
         );
     }
+    // Forward listeners: validate the whole table before any socket, TLS config
+    // or QUIC endpoint is created. A bad entry must fail startup loudly — a
+    // silently skipped listener is indistinguishable from a working tunnel until
+    // the application starts timing out.
+    let tcp_forwards = c.tcp_forwards()?;
+    let udp_forwards = c.udp_forwards()?;
     if !parse_congestion(&c.congestion) {
         warn!(
             "unknown congestion={:?}, falling back to bbr (want bbr|cubic)",
@@ -359,6 +367,44 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         (eps, Vec::new())
     };
 
+    // Config-driven forward listeners: bound and spawned before the SOCKS
+    // accept loop so a bind failure aborts startup, and so their first
+    // datagram/connection never waits behind SOCKS negotiation.
+    let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
+    for spec in tcp_forwards {
+        // Spawn first (it binds): a log line must never claim a listener that
+        // the following `?` then fails to create.
+        let line = format!(
+            "tcp_forward {} -> {} via QUIC (bound)",
+            spec.listen,
+            display_target(&spec.target)
+        );
+        forward::spawn_tcp_forward(
+            spec,
+            pool.clone(),
+            egress_shared.clone(),
+            timeout,
+            shutdown_rx.clone(),
+        )?;
+        info!("{line}");
+    }
+    for spec in udp_forwards {
+        let listen = spec.listen;
+        let max_sessions = spec.max_sessions;
+        let target = display_target(&spec.target);
+        forward_udp::spawn_udp_forward(
+            spec,
+            pool.clone(),
+            hub.clone(),
+            egress_shared.clone(),
+            shutdown_rx.clone(),
+        )?;
+        info!(
+            "udp_forward {listen} -> {target} (max_sessions={max_sessions}, \
+             per-peer sessions, 180s idle reap)"
+        );
+    }
+
     let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
     let li = tokio::net::TcpListener::from_std(tcp_listener_dual(&c.socks_listen)?)?;
     info!(
@@ -366,7 +412,6 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         if c.auth_token.is_empty() { "off" } else { "on" }
     );
     spawn_udp_reporter();
-    let timeout = Duration::from_secs(c.reconnect_timeout_secs.max(1));
     // SIGTERM/SIGINT: close every slot's endpoint so all pooled connections
     // drop and in-flight SOCKS flows end with a reset instead of being
     // silently killed with the process. There is no drain window; the

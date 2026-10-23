@@ -1,3 +1,6 @@
+use std::net::SocketAddr;
+
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use super::tuning::{
@@ -6,6 +9,7 @@ use super::tuning::{
 };
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
+use crate::mqp::addr::TargetAddr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,6 +139,62 @@ pub struct ClientConf {
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
     pub alpn: Option<String>,
+    // ---- Forward listeners (client-only; both arrays empty = disabled) ----
+    /// TCP forward listeners: bind `listen`, relay every accepted stream
+    /// through the QUIC pool to `target`. Validated by
+    /// [`ClientConf::tcp_forwards`] at startup.
+    #[serde(default)]
+    pub tcp_forward: Vec<ForwardEntry>,
+    /// UDP forward listeners: bind `listen`, one client session per source
+    /// `IP:port`, each datagram relayed through the MQP-3 rev2 DATAGRAM path
+    /// to `target`. Validated by [`ClientConf::udp_forwards`] at startup.
+    #[serde(default)]
+    pub udp_forward: Vec<UdpForwardEntry>,
+}
+
+/// One `[[tcp_forward]]` / `[[udp_forward]]` entry exactly as written in TOML.
+///
+/// The strings are deliberately unparsed here: validation lives in
+/// [`ClientConf::tcp_forwards`] / [`ClientConf::udp_forwards`], which run at
+/// startup and can name the bad entry index. Making the *serde* layer reject a
+/// value would lose that context, and a silently skipped listener is the one
+/// failure mode a forward feature must not have.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardEntry {
+    /// Local listen address, `IP:port` (an IP literal; no hostname resolution).
+    pub listen: String,
+    /// Destination after the QUIC hop, `IP:port` or `host:port`. A domain is
+    /// resolved and policy-checked by the **server**, like every SOCKS target.
+    pub target: String,
+}
+
+/// UDP variant of [`ForwardEntry`] with the optional per-listener session cap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UdpForwardEntry {
+    pub listen: String,
+    pub target: String,
+    /// Concurrent per-peer sessions for this listener. Unset = the process-wide
+    /// `max_udp_assocs` (no extra constraint); clamped to `1..=MAX_UDP_ASSOCS`.
+    #[serde(default)]
+    pub max_sessions: Option<usize>,
+}
+
+/// A validated TCP forward listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpForwardSpec {
+    pub listen: SocketAddr,
+    pub target: TargetAddr,
+}
+
+/// A validated UDP forward listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpForwardSpec {
+    pub listen: SocketAddr,
+    pub target: TargetAddr,
+    /// Effective per-listener peer cap (`1..=MAX_UDP_ASSOCS`).
+    pub max_sessions: usize,
 }
 
 impl ClientConf {
@@ -199,5 +259,417 @@ impl ClientConf {
 
     pub fn alpn_bytes(&self) -> Vec<u8> {
         normalize_alpn(self.alpn.as_deref())
+    }
+
+    /// Validate and lower the `[[tcp_forward]]` tables.
+    ///
+    /// Every failure names the entry index and the offending field: a forward
+    /// listener that "just does not start" is indistinguishable from a typo,
+    /// and the operator has no other signal (the process would look healthy).
+    pub fn tcp_forwards(&self) -> anyhow::Result<Vec<TcpForwardSpec>> {
+        let socks = self.socks_listen.parse::<SocketAddr>().ok();
+        let mut seen: Vec<(usize, SocketAddr)> = Vec::with_capacity(self.tcp_forward.len());
+        let mut out = Vec::with_capacity(self.tcp_forward.len());
+        for (i, e) in self.tcp_forward.iter().enumerate() {
+            let listen = parse_forward_listen("tcp_forward", i, &e.listen)?;
+            if let Some(socks) = socks
+                && listen_overlaps(listen, socks)
+            {
+                bail!(
+                    "tcp_forward[{i}].listen {:?}: overlaps socks_listen {socks} \
+                     (same port, wildcard or identical address)",
+                    e.listen
+                );
+            }
+            if let Some((j, other)) = seen
+                .iter()
+                .find(|(_, other)| listen_overlaps(listen, *other))
+            {
+                bail!(
+                    "tcp_forward[{i}].listen {:?}: overlaps tcp_forward[{j}] listening on {other}",
+                    e.listen
+                );
+            }
+            seen.push((i, listen));
+            out.push(TcpForwardSpec {
+                listen,
+                target: parse_forward_target("tcp_forward", i, &e.target)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Validate and lower the `[[udp_forward]]` tables (see
+    /// [`ClientConf::tcp_forwards`] for the error-shape rationale).
+    pub fn udp_forwards(&self) -> anyhow::Result<Vec<UdpForwardSpec>> {
+        let mut seen: Vec<(usize, SocketAddr)> = Vec::with_capacity(self.udp_forward.len());
+        let mut out = Vec::with_capacity(self.udp_forward.len());
+        for (i, e) in self.udp_forward.iter().enumerate() {
+            let listen = parse_forward_listen("udp_forward", i, &e.listen)?;
+            if let Some((j, other)) = seen
+                .iter()
+                .find(|(_, other)| listen_overlaps(listen, *other))
+            {
+                bail!(
+                    "udp_forward[{i}].listen {:?}: overlaps udp_forward[{j}] listening on {other}",
+                    e.listen
+                );
+            }
+            seen.push((i, listen));
+            let max_sessions = match e.max_sessions {
+                Some(0) => bail!("udp_forward[{i}].max_sessions 0: must be >= 1"),
+                Some(n) => n.clamp(1, MAX_UDP_ASSOCS),
+                None => self.udp_assoc_count(),
+            };
+            out.push(UdpForwardSpec {
+                listen,
+                target: parse_forward_target("udp_forward", i, &e.target)?,
+                max_sessions,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Fold an IPv4-mapped IPv6 address back to IPv4, so `[::ffff:127.0.0.1]` and
+/// `127.0.0.1` name the same listener.
+fn unmap_listen_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+/// Whether two configured listen addresses can accept the same traffic.
+///
+/// Exact equality is not enough. Both sockets are local, on the same port, and
+/// `tcp_listener_dual` binds IPv6 listeners dual-stack; an unspecified address
+/// covers every address of its family and the v4/v6 wildcards overlap each
+/// other. With the shipped `socks_listen = "[::]:1080"`, a
+/// `[[tcp_forward]] listen = "127.0.0.1:1080"` must be rejected: the forward
+/// listener binds first, SOCKS still binds the dual-stack wildcard on some
+/// platforms, and loopback SOCKS clients would silently be relayed to the
+/// forward target.
+fn listen_overlaps(a: SocketAddr, b: SocketAddr) -> bool {
+    if a.port() != b.port() {
+        return false;
+    }
+    let a_ip = unmap_listen_ip(a.ip());
+    let b_ip = unmap_listen_ip(b.ip());
+    a_ip == b_ip || a_ip.is_unspecified() || b_ip.is_unspecified()
+}
+
+/// Parse one forward `listen` value: an `IP:port` literal with a non-zero port.
+///
+/// Local binding never resolves a hostname (the socket API cannot anyway), so
+/// an impossible-but-plausible `"example.com:8080"` is rejected with the field
+/// name instead of surfacing later as a bind error from inside the runtime.
+fn parse_forward_listen(kind: &str, idx: usize, raw: &str) -> anyhow::Result<SocketAddr> {
+    if !raw.contains(':') {
+        bail!("{kind}[{idx}].listen {raw:?}: missing :port");
+    }
+    let addr: SocketAddr = raw
+        .parse()
+        .with_context(|| format!("{kind}[{idx}].listen {raw:?}: not an IP:port address"))?;
+    if addr.port() == 0 {
+        bail!("{kind}[{idx}].listen {raw:?}: port 0 is not a valid listen port");
+    }
+    Ok(addr)
+}
+
+/// Parse one forward `target` value: an `IP:port`/`[v6]:port` literal or a
+/// `host:port` domain target, both non-zero port.
+///
+/// The domain form is passed through untouched: DNS, SSRF policy and
+/// `allow_private` all live at the server exit, and this client must not
+/// resolve (or cache) the name first — that is the property that keeps the
+/// exit the single authorization point.
+fn parse_forward_target(kind: &str, idx: usize, raw: &str) -> anyhow::Result<TargetAddr> {
+    if !raw.contains(':') {
+        bail!("{kind}[{idx}].target {raw:?}: missing :port");
+    }
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            bail!("{kind}[{idx}].target {raw:?}: port 0 is not a valid target port");
+        }
+        if addr.ip().is_unspecified() {
+            bail!("{kind}[{idx}].target {raw:?}: unspecified address is not a valid target");
+        }
+        return Ok(TargetAddr::Ip(addr));
+    }
+    let Some((host, port)) = raw.rsplit_once(':') else {
+        // `contains(':')` above makes this unreachable; kept total anyway.
+        bail!("{kind}[{idx}].target {raw:?}: missing :port");
+    };
+    if host.is_empty() {
+        bail!("{kind}[{idx}].target {raw:?}: empty host");
+    }
+    if host.contains(':') {
+        bail!("{kind}[{idx}].target {raw:?}: IPv6 literal must be bracketed, e.g. [::1]:443");
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("{kind}[{idx}].target {raw:?}: invalid port (want 1..=65535)"))?;
+    if port == 0 {
+        bail!("{kind}[{idx}].target {raw:?}: port 0 is not a valid target port");
+    }
+    if host.len() > 255 {
+        bail!("{kind}[{idx}].target {raw:?}: domain longer than the 255-byte wire limit");
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("{kind}[{idx}].target {raw:?}: domain contains whitespace or control characters");
+    }
+    Ok(TargetAddr::Domain(host.to_string(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal valid client config; each test appends the forward tables it
+    /// exercises. Keeping the shared prefix in one place stops the tests from
+    /// drifting apart as required fields are added.
+    const BASE: &str = r#"
+socks_listen = "127.0.0.1:1080"
+server_addr = "127.0.0.1:8443"
+server_name = "test.com"
+server_cert_file = "server-cert.pem"
+"#;
+
+    fn parse_ok(extra: &str) -> ClientConf {
+        let c: ClientConf = toml::from_str(&format!("{BASE}\n{extra}"))
+            .expect("the base config plus this table must parse");
+        c
+    }
+
+    /// Same as [`parse_ok`] but with a caller-chosen `socks_listen`, for the
+    /// wildcard-overlap cases (the shipped sample binds `[::]:1080`).
+    fn parse_with_socks(socks: &str, extra: &str) -> ClientConf {
+        toml::from_str(&format!(
+            "socks_listen = {socks:?}\n\
+             server_addr = \"127.0.0.1:8443\"\n\
+             server_name = \"test.com\"\n\
+             server_cert_file = \"server-cert.pem\"\n\
+             {extra}"
+        ))
+        .expect("the config with a custom socks_listen must parse")
+    }
+
+    fn validation_err(extra: &str) -> String {
+        let c = parse_ok(extra);
+        match c
+            .tcp_forwards()
+            .map(|_| ())
+            .and_then(|_| c.udp_forwards().map(|_| ()))
+        {
+            Ok(()) => panic!("expected a validation error for:\n{extra}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn forward_tables_parse_and_lower() {
+        let c = parse_ok(
+            r#"
+[[tcp_forward]]
+listen = "127.0.0.1:8080"
+target = "example.com:80"
+
+[[tcp_forward]]
+listen = "127.0.0.1:8081"
+target = "10.0.0.5:443"
+
+[[udp_forward]]
+listen = "127.0.0.1:5353"
+target = "1.1.1.1:53"
+
+[[udp_forward]]
+listen = "0.0.0.0:5354"
+target = "[2001:db8::1]:53"
+max_sessions = 7
+"#,
+        );
+        let tcp = c.tcp_forwards().unwrap();
+        assert_eq!(tcp.len(), 2);
+        assert_eq!(tcp[0].listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(
+            tcp[0].target,
+            TargetAddr::Domain("example.com".to_string(), 80)
+        );
+        assert_eq!(
+            tcp[1].target,
+            TargetAddr::Ip("10.0.0.5:443".parse().unwrap())
+        );
+        let udp = c.udp_forwards().unwrap();
+        assert_eq!(udp.len(), 2);
+        assert_eq!(udp[0].max_sessions, c.udp_assoc_count());
+        assert_eq!(udp[1].max_sessions, 7);
+        assert_eq!(
+            udp[1].target,
+            TargetAddr::Ip("[2001:db8::1]:53".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn forward_tables_are_optional() {
+        let c = parse_ok("");
+        assert!(c.tcp_forward.is_empty());
+        assert!(c.udp_forward.is_empty());
+        assert!(c.tcp_forwards().unwrap().is_empty());
+        assert!(c.udp_forwards().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forward_listen_and_target_rules() {
+        for (table, needle) in [
+            (
+                "[[tcp_forward]]\nlisten = \"127.0.0.1\"\ntarget = \"example.com:80\"",
+                "missing :port",
+            ),
+            (
+                "[[tcp_forward]]\nlisten = \"127.0.0.1:0\"\ntarget = \"example.com:80\"",
+                "port 0",
+            ),
+            (
+                "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"example.com\"",
+                "missing :port",
+            ),
+            (
+                "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"1.1.1.1:0\"",
+                "port 0",
+            ),
+            (
+                "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"0.0.0.0:53\"",
+                "unspecified",
+            ),
+            (
+                "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"::1:80\"",
+                "bracketed",
+            ),
+            (
+                "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"1.1.1.1:53\"\nmax_sessions = 0",
+                "max_sessions",
+            ),
+        ] {
+            let err = validation_err(table);
+            assert!(
+                err.contains(needle),
+                "expected {needle:?} in error for\n{table}\ngot: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_listeners_must_be_unique_and_not_socks() {
+        for table in [
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:1080\"\ntarget = \"example.com:80\"",
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"a.example:80\"\n[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"b.example:80\"",
+            "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"1.1.1.1:53\"\n[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"8.8.8.8:53\"",
+        ] {
+            let err = validation_err(table);
+            assert!(
+                err.contains("overlaps"),
+                "expected an overlap error for\n{table}\ngot: {err}"
+            );
+        }
+        // Same `IP:port` across TCP and UDP is legal: different protocols.
+        let c = parse_ok(
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"example.com:80\"\n[[udp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"1.1.1.1:53\"",
+        );
+        assert!(c.tcp_forwards().is_ok());
+        assert!(c.udp_forwards().is_ok());
+    }
+
+    #[test]
+    fn forward_entry_rejects_unknown_fields() {
+        let err = toml::from_str::<ClientConf>(&format!(
+            "{BASE}\n[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"1.1.1.1:53\"\nlisen = \"typo\""
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown field"),
+            "deny_unknown_fields must name the typo: {err}"
+        );
+    }
+
+    #[test]
+    fn udp_forward_max_sessions_clamps_to_the_global_cap() {
+        let c = parse_ok(&format!(
+            "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"1.1.1.1:53\"\nmax_sessions = {}",
+            MAX_UDP_ASSOCS + 10_000
+        ));
+        assert_eq!(c.udp_forwards().unwrap()[0].max_sessions, MAX_UDP_ASSOCS);
+    }
+
+    /// Overlap validation must catch wildcard-vs-specific on the same port, not
+    /// just exact duplicates: the forward listeners bind before the SOCKS listener,
+    /// so a missed overlap silently routes SOCKS clients into a forward target.
+    #[test]
+    fn forward_listener_overlap_rejects_wildcards_and_specifics() {
+        // The shipped sample: socks_listen = "[::]:1080" plus a loopback forward on
+        // the same port.
+        let c = parse_with_socks(
+            "[::]:1080",
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:1080\"\ntarget = \"example.com:80\"",
+        );
+        let err = format!(
+            "{:#}",
+            c.tcp_forwards()
+                .expect_err("wildcard/specific overlap must be rejected")
+        );
+        assert!(err.contains("overlaps socks_listen"), "{err}");
+
+        // v4 wildcard vs specific between two forwards, and the v6 wildcard form.
+        for table in [
+            "[[tcp_forward]]\nlisten = \"0.0.0.0:8080\"\ntarget = \"a.example:80\"\n[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"b.example:80\"",
+            "[[tcp_forward]]\nlisten = \"[::]:8080\"\ntarget = \"a.example:80\"\n[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"b.example:80\"",
+            "[[tcp_forward]]\nlisten = \"0.0.0.0:8080\"\ntarget = \"a.example:80\"\n[[tcp_forward]]\nlisten = \"[::]:8080\"\ntarget = \"b.example:80\"",
+        ] {
+            let c = parse_ok(table);
+            let err = format!(
+                "{:#}",
+                c.tcp_forwards()
+                    .expect_err("wildcard overlap must be rejected")
+            );
+            assert!(err.contains("overlaps tcp_forward[0]"), "{err}");
+        }
+
+        // An IPv4-mapped IPv6 literal names the same listener as plain IPv4.
+        let c = parse_ok(
+            "[[tcp_forward]]\nlisten = \"[::ffff:127.0.0.1]:8080\"\ntarget = \"a.example:80\"\n[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"b.example:80\"",
+        );
+        assert!(
+            c.tcp_forwards().is_err(),
+            "v4-mapped v6 and v4 must be the same listen address"
+        );
+
+        // UDP uses the same rule.
+        let c = parse_ok(
+            "[[udp_forward]]\nlisten = \"[::]:5353\"\ntarget = \"1.1.1.1:53\"\n[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"8.8.8.8:53\"",
+        );
+        let err = format!(
+            "{:#}",
+            c.udp_forwards()
+                .expect_err("UDP wildcard overlap must be rejected")
+        );
+        assert!(err.contains("overlaps udp_forward[0]"), "{err}");
+
+        // Distinct concrete addresses on one port stay legal, and TCP+UDP may share
+        // a port (different protocols).
+        let c = parse_ok(
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"a.example:80\"\n[[tcp_forward]]\nlisten = \"127.0.0.2:8080\"\ntarget = \"b.example:80\"\n[[udp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"1.1.1.1:53\"",
+        );
+        assert!(
+            c.tcp_forwards().is_ok(),
+            "distinct concrete addresses overlap nothing"
+        );
+        assert!(
+            c.udp_forwards().is_ok(),
+            "TCP and UDP may share a port number"
+        );
     }
 }

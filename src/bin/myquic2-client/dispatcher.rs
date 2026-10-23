@@ -88,9 +88,17 @@ pub(crate) struct StagedReply {
     pub(crate) app: SocketAddr,
     pub(crate) dst: SocketAddr,
     pub(crate) payload: Bytes,
+    /// Write `payload` as-is (config-driven UDP forward listener) instead of
+    /// prefixing the SOCKS5 UDP reply header. Taken from
+    /// [`AssocEntry::raw_reply`] at staging time so the flush does not have to
+    /// consult the hub again.
+    pub(crate) raw: bool,
+    /// The relay socket is dual-stack IPv6, so the app address must be mapped
+    /// with [`map_for_dual`] before `send_to`. See [`AssocEntry::reply_v6`].
+    pub(crate) reply_v6: bool,
 }
 
-fn stage_reply(
+pub(crate) fn stage_reply(
     entry: &AssocEntry,
     app: SocketAddr,
     dst: SocketAddr,
@@ -102,6 +110,8 @@ fn stage_reply(
         app,
         dst,
         payload,
+        raw: entry.raw_reply,
+        reply_v6: entry.reply_v6,
     }
 }
 
@@ -121,6 +131,8 @@ fn stage_reply_follow(
         app,
         dst,
         payload,
+        raw: entry.raw_reply,
+        reply_v6: entry.reply_v6,
     }
 }
 
@@ -209,6 +221,8 @@ fn stage_v3_reply(
     app: SocketAddr,
     addr: TargetAddrRef<'_>,
     payload: Bytes,
+    raw: bool,
+    reply_v6: bool,
     out: &mut Vec<StagedReply>,
     head: &mut Option<Arc<tokio::net::UdpSocket>>,
 ) -> bool {
@@ -220,6 +234,8 @@ fn stage_v3_reply(
                 app,
                 dst,
                 payload,
+                raw,
+                reply_v6,
             });
             true
         }
@@ -231,6 +247,8 @@ fn stage_v3_reply(
                     app,
                     dst,
                     payload,
+                    raw,
+                    reply_v6,
                 });
                 true
             }
@@ -304,6 +322,8 @@ pub(crate) fn dispatch_stage_multi(
                         let off = s.payload.as_ptr() as usize - d.as_ptr() as usize;
                         d.slice(off..off + s.payload.len())
                     },
+                    entry.raw_reply,
+                    entry.reply_v6,
                     out,
                     &mut head,
                 ) {
@@ -345,6 +365,8 @@ pub(crate) fn dispatch_stage_multi(
                             let off = item.payload.as_ptr() as usize - d.as_ptr() as usize;
                             d.slice(off..off + item.payload.len())
                         },
+                        entry.raw_reply,
+                        entry.reply_v6,
                         out,
                         &mut head,
                     ) {
@@ -409,6 +431,8 @@ pub(crate) fn dispatch_stage_multi(
                         app,
                         dst,
                         payload: d.slice_ref(p),
+                        raw: entry.raw_reply,
+                        reply_v6: entry.reply_v6,
                     });
                 }
                 return b.len();
@@ -424,6 +448,8 @@ pub(crate) fn dispatch_stage_multi(
                             app,
                             dst,
                             payload: d.slice_ref(q),
+                            raw: entry.raw_reply,
+                            reply_v6: entry.reply_v6,
                         });
                     }
                     return b.len();
@@ -664,13 +690,24 @@ pub(crate) fn dispatch_one(
     let Some(s) = dispatch_stage(cache, hub, sess, d, reasm) else {
         return;
     };
-    pkt.truncate(0);
-    encode_reply(pkt, s.dst, &s.payload);
     let sock = s
         .sock
         .as_ref()
         .expect("a staged single reply always carries its relay socket");
-    udp_try_send_slice(sock, map_for_dual(s.app), &pkt[..]);
+    let dst = if s.reply_v6 {
+        map_for_dual(s.app)
+    } else {
+        s.app
+    };
+    if s.raw {
+        // Raw forward listener: the peer is an ordinary UDP application, so a
+        // SOCKS5 header would be delivered as payload bytes.
+        udp_try_send_slice(sock, dst, &s.payload);
+        return;
+    }
+    pkt.truncate(0);
+    encode_reply(pkt, s.dst, &s.payload);
+    udp_try_send_slice(sock, dst, &pkt[..]);
 }
 
 /// Flush staged replies grouped by consecutive `(sock, app)` runs.
@@ -709,9 +746,16 @@ pub(crate) fn flush_staged(
             .as_ref()
             .expect("a flush run head always carries the relay socket");
         let run_app = staged[i].app;
+        let run_v6 = staged[i].reply_v6;
+        let run_dst = if run_v6 {
+            map_for_dual(run_app)
+        } else {
+            run_app
+        };
         let mut j = i + 1;
         while j < staged.len()
             && staged[j].app == run_app
+            && staged[j].reply_v6 == run_v6
             && staged[j]
                 .sock
                 .as_ref()
@@ -729,9 +773,17 @@ pub(crate) fn flush_staged(
             hdrs.clear();
             offs.clear();
             for s in &staged[k..k + n] {
-                let start = hdrs.len();
-                encode_reply_header(hdrs, s.dst);
-                offs.push((start, hdrs.len() - start));
+                if s.raw {
+                    // Raw forward listener: zero-length header, the payload is
+                    // the whole datagram. `offs` still gets an entry so the
+                    // frame assembly below is unchanged (the header slice is
+                    // empty and the payload slice is the datagram).
+                    offs.push((hdrs.len(), 0));
+                } else {
+                    let start = hdrs.len();
+                    encode_reply_header(hdrs, s.dst);
+                    offs.push((start, hdrs.len() - start));
+                }
             }
             if n == 1 {
                 // Single-reply run: one header, one payload, one frame. No
@@ -739,7 +791,7 @@ pub(crate) fn flush_staged(
                 // session that receives one reply per burst always takes.
                 let (o, l) = offs[0];
                 let frame: [SendFrame<'_>; 1] = [(&hdrs[o..o + l], &staged[k].payload[..])];
-                udp_try_send_grouped(run_sock, map_for_dual(run_app), &frame);
+                udp_try_send_grouped(run_sock, run_dst, &frame);
                 k += 1;
                 continue;
             }
@@ -747,7 +799,7 @@ pub(crate) fn flush_staged(
             for ((r, (o, l)), s) in refs.iter_mut().zip(offs.iter()).zip(&staged[k..k + n]) {
                 *r = (&hdrs[*o..*o + *l], &s.payload[..]);
             }
-            udp_try_send_grouped(run_sock, map_for_dual(run_app), &refs[..n]);
+            udp_try_send_grouped(run_sock, run_dst, &refs[..n]);
             k += n;
         }
         i = j;

@@ -38,7 +38,7 @@ pub mod transport;
 pub mod udp;
 
 pub use config::{
-    client_conf::ClientConf,
+    client_conf::{ClientConf, ForwardEntry, TcpForwardSpec, UdpForwardEntry, UdpForwardSpec},
     server_conf::ServerConf,
     tuning::{
         DEFAULT_INITIAL_MTU, DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS,

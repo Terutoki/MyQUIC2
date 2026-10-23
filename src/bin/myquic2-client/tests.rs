@@ -1846,6 +1846,8 @@ async fn flush_staged_sends_header_and_payload_as_one_datagram() {
             app: apps[i].local_addr().unwrap(),
             dst: dsts[i],
             payload: bytes::Bytes::copy_from_slice(bodies[i]),
+            raw: false,
+            reply_v6: true,
         });
     }
     let mut hdrs: Vec<u8> = Vec::new();
@@ -1900,6 +1902,8 @@ async fn flush_staged_batch_items_share_one_run() {
             app: app_addr,
             dst: dsts[i],
             payload: bytes::Bytes::copy_from_slice(body),
+            raw: false,
+            reply_v6: true,
         });
     }
     // One extra single for the same app but a *different* relay: it must end
@@ -1912,6 +1916,8 @@ async fn flush_staged_batch_items_share_one_run() {
         app: app_addr,
         dst: dsts[0],
         payload: bytes::Bytes::copy_from_slice(bodies[0]),
+        raw: false,
+        reply_v6: true,
     });
     // Prime writable readiness on both relays: a freshly registered socket
     // may report `WouldBlock` before its first readiness edge (no syscall
@@ -7186,5 +7192,597 @@ async fn dispatch_dead_hub_entry_counts_unknown_session() {
     assert!(
         dgram_drops::snapshot().since(&before).unknown_sess >= 1,
         "a dead hub entry must be counted as an unknown session"
+    );
+}
+
+// ---------------- TCP/UDP forward listeners ----------------
+
+/// A forwarded UDP peer is an ordinary UDP application: raw mode must write the
+/// payload alone. A stray SOCKS5 `RSV|FRAG|ATYP|ADDR|PORT` prefix would be
+/// delivered as payload bytes and silently corrupt every forwarded datagram.
+#[tokio::test]
+async fn raw_reply_frames_payload_without_a_socks5_header() {
+    let listener = Arc::new(
+        tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+    );
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    prime_relay(&listener, &peer, peer_addr).await;
+    let entry = Arc::new(AssocEntry::new_raw(listener));
+    entry.app.store(Some(Arc::new(peer_addr)));
+    let payload = Bytes::from_static(b"raw-reply");
+    let staged = stage_reply(
+        &entry,
+        peer_addr,
+        "198.51.100.9:53".parse().unwrap(),
+        payload.clone(),
+    );
+    assert!(staged.raw, "a forward association must stage raw replies");
+    let mut hdrs = Vec::new();
+    let mut offs = Vec::new();
+    flush_staged(&mut vec![staged], &mut hdrs, &mut offs);
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(REPLY_WAIT, peer.recv_from(&mut buf))
+        .await
+        .expect("the raw reply must arrive")
+        .unwrap();
+    assert_eq!(
+        &buf[..n],
+        &payload[..],
+        "raw mode must deliver exactly the payload"
+    );
+    assert!(hdrs.is_empty(), "raw mode must not encode a SOCKS5 header");
+}
+
+/// The SOCKS5 path keeps its framing: the same staging/flush pair must still
+/// prefix the reply with `RSV|FRAG|ATYP|ADDR|PORT`. This is the behaviour the
+/// raw-mode branch above must not change.
+#[tokio::test]
+async fn socks_reply_still_carries_the_socks5_udp_header() {
+    let listener = Arc::new(
+        tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+    );
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    prime_relay(&listener, &peer, peer_addr).await;
+    let entry = Arc::new(AssocEntry::new(listener));
+    entry.app.store(Some(Arc::new(peer_addr)));
+    let dst: SocketAddr = "198.51.100.9:53".parse().unwrap();
+    let payload = Bytes::from_static(b"framed");
+    let staged = stage_reply(&entry, peer_addr, dst, payload.clone());
+    assert!(!staged.raw, "a SOCKS association must stay framed");
+    let mut hdrs = Vec::new();
+    let mut offs = Vec::new();
+    flush_staged(&mut vec![staged], &mut hdrs, &mut offs);
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(REPLY_WAIT, peer.recv_from(&mut buf))
+        .await
+        .expect("the framed reply must arrive")
+        .unwrap();
+    assert_eq!(&buf[..2], &[0, 0], "RSV must be zero");
+    assert_eq!(buf[2], 0, "FRAG must be zero");
+    let (addr, consumed) = TargetAddrRef::decode(&buf[3..n]).expect("SOCKS5 address");
+    assert_eq!(addr, TargetAddrRef::Ip(dst));
+    assert_eq!(&buf[3 + consumed..n], &payload[..]);
+}
+
+/// A forwarded TCP stream must (a) write the configured target as the MQP
+/// header, (b) write nothing else before the app's bytes, and (c) relay both
+/// directions with half-close propagation.
+#[tokio::test]
+async fn tcp_forward_relays_bytes_and_header_to_the_fixed_target() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    // One TCP slot: `pick_tcp_index` round-robins the bulk slots, and only
+    // slot 0 has a published connection in this test.
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    {
+        let slot = pool.slot(0);
+        slot.shared.store(Some(Arc::new(client_conn.clone())));
+        slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let egress = Arc::new(SharedEgress::default());
+    let target: TargetAddr = TargetAddr::Ip("203.0.113.7:8080".parse().unwrap());
+    let expected = target.clone();
+    // Keep the server-side handle alive until the relay has observed the
+    // stream's FIN: the last `Connection` handle dropping closes it, which
+    // would surface in the pump as "connection lost" before the clean EOF.
+    let server_keepalive = server_conn.clone();
+    let server = tokio::spawn(async move {
+        let (mut send, mut recv) = server_conn.accept_bi().await.unwrap();
+        let mut hdr = [0u8; 7];
+        recv.read_exact(&mut hdr).await.unwrap();
+        let (got, consumed) = TargetAddr::decode(&hdr).unwrap();
+        assert_eq!(consumed, 7);
+        assert_eq!(got, expected, "the forward target must be the MQP header");
+        let bnd: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut ack = [0u8; MAX_TCP_ACK_LEN];
+        let n = encode_tcp_ack_into(bnd, &mut ack);
+        send.write_all(&ack[..n]).await.unwrap();
+        let mut body = [0u8; 16];
+        let n = recv.read(&mut body).await.unwrap().unwrap();
+        send.write_all(&body[..n]).await.unwrap();
+        // Drain the client's FIN before finishing. Dropping a `RecvStream`
+        // with unread data sends STOP_SENDING, which the pump treats as an
+        // abort; the real server pump reads until EOF, and the test must too.
+        while let Ok(Some(_)) = recv.read(&mut body).await {}
+        send.finish().unwrap();
+    });
+    let li = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = li.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), li.accept());
+    let mut client = client.unwrap();
+    let (app_sock, _) = accepted.unwrap();
+    let relay = tokio::spawn(relay_tcp_forward(
+        app_sock,
+        target,
+        pool,
+        egress,
+        Duration::from_secs(5),
+    ));
+    client.write_all(b"ping").await.unwrap();
+    client.shutdown().await.unwrap();
+    let relay_result = tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .expect("the relay must finish")
+        .unwrap();
+    assert!(relay_result.is_ok(), "relay failed: {relay_result:?}");
+    let mut echoed = Vec::new();
+    client.read_to_end(&mut echoed).await.unwrap();
+    assert_eq!(echoed, b"ping");
+    server.await.unwrap();
+    drop(server_keepalive);
+}
+
+/// No usable QUIC generation: the forward must fail fast (and reset the app
+/// socket), never park the accepted connection until the app gives up.
+#[tokio::test]
+async fn tcp_forward_fails_fast_without_a_quic_connection() {
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let li = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = li.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), li.accept());
+    let mut client = client.unwrap();
+    let (app_sock, _) = accepted.unwrap();
+    let target: TargetAddr = TargetAddr::Ip("203.0.113.7:8080".parse().unwrap());
+    let err = relay_tcp_forward(app_sock, target, pool, egress, Duration::from_millis(200))
+        .await
+        .expect_err("there is no live connection to open a stream on");
+    assert!(!err.to_string().is_empty());
+    let mut probe = [0u8; 4];
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut probe)).await;
+    match read {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        other => panic!("app socket must close (FIN or RST) fast, got {other:?}"),
+    }
+}
+
+/// Publish a ready egress handle on `bind` for tests that need a real
+/// `send_uplink` path without the 1 s refresh machinery.
+fn publish_test_egress(
+    egress: &SharedEgress,
+    pool: &ConnPool,
+    bind: UdpBind,
+    conn: &quinn::Connection,
+    rev2: Arc<ConnRev2>,
+) {
+    egress.cached[bind.index].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: mono_millis(),
+        slot: pool.udp_global_slot(bind.index),
+        rev2,
+    })));
+}
+
+/// Two peers on one forward listener get two independent sessions; the server
+/// sees the configured target on each `OPEN`, and an inbound reply for one
+/// session reaches only that peer, as a bare payload.
+#[tokio::test]
+async fn udp_forward_demuxes_peers_and_delivers_raw_replies() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let rev2 = rev2_state();
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    publish_test_egress(&egress, &pool, bind, &client_conn, rev2.clone());
+
+    let hub = Arc::new(UdpHub::new());
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let target_sock = target.socket_addr().unwrap();
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener.clone(),
+        target.clone(),
+        MAX_UDP_ASSOCS,
+        pool.clone(),
+        hub.clone(),
+        egress.clone(),
+    );
+    let peer_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a = peer_a.local_addr().unwrap();
+    let b = peer_b.local_addr().unwrap();
+    let now = mono_millis();
+    let ba = fwd
+        .handle_datagram(a, b"a", now)
+        .expect("first payload sends");
+    let bb = fwd
+        .handle_datagram(b, b"b", now)
+        .expect("first payload sends");
+    assert_eq!(fwd.peer_count(), 2, "one session per peer");
+    let sess_a = fwd.peer_sess(a).expect("peer a session");
+    let sess_b = fwd.peer_sess(b).expect("peer b session");
+    assert_ne!(sess_a, sess_b, "peers must not share a session");
+    assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 2);
+    drain_assoc_stage(&egress, &pool, ba);
+    drain_assoc_stage(&egress, &pool, bb);
+
+    // Each session opened with the configured target; payloads are verbatim.
+    let mut opens = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let d = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+            .await
+            .expect("an OPEN frame must arrive")
+            .unwrap();
+        let f = r2::decode_data(&d).expect("decode DATA");
+        let sess = f.sess.expect("OPEN carries its session");
+        assert_eq!(f.addr, Some(TargetAddrRef::Ip(target_sock)));
+        opens.insert(sess, f.payload.to_vec());
+    }
+    assert_eq!(opens.get(&sess_a).map(Vec::as_slice), Some(&b"a"[..]));
+    assert_eq!(opens.get(&sess_b).map(Vec::as_slice), Some(&b"b"[..]));
+
+    // Downlink: one INLINE reply per session. The dispatcher must write each
+    // bare payload to exactly its own peer.
+    let reply_src: SocketAddr = "198.51.100.9:53".parse().unwrap();
+    let mut cache = empty_dispatch_cache();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut staged: Vec<StagedReply> = Vec::new();
+    for (sess, body) in [(sess_a, &b"reply-a"[..]), (sess_b, &b"reply-b"[..])] {
+        let frame = r2::encode_data_inline(sess, &TargetAddrRef::Ip(reply_src), true, body, 1200)
+            .expect("encode inline reply");
+        assert_eq!(
+            dispatch_r2(
+                &rev2,
+                &mut cache,
+                &hub,
+                &mut r2_reasm,
+                Some(&client_conn),
+                frame,
+                &mut staged,
+            ),
+            1
+        );
+    }
+    // Prime the listener's writable readiness with one drained datagram per
+    // peer: a freshly registered socket can report `WouldBlock` before its
+    // first readiness edge, which would detour the first reply through the
+    // detached retry worker (the cross-runtime flake the flush tests document).
+    for peer in [&peer_a, &peer_b] {
+        prime_relay(&listener, peer, peer.local_addr().unwrap()).await;
+    }
+    let mut hdrs = Vec::new();
+    let mut offs = Vec::new();
+    flush_staged(&mut staged, &mut hdrs, &mut offs);
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(REPLY_WAIT, peer_a.recv_from(&mut buf))
+        .await
+        .expect("peer a reply")
+        .unwrap();
+    assert_eq!(&buf[..n], b"reply-a", "peer a must get its own raw reply");
+    let (n, _) = tokio::time::timeout(REPLY_WAIT, peer_b.recv_from(&mut buf))
+        .await
+        .expect("peer b reply")
+        .unwrap();
+    assert_eq!(&buf[..n], b"reply-b", "peer b must get its own raw reply");
+}
+
+/// The per-listener peer cap admits the first sessions and drops beyond it
+/// without disturbing the admitted ones; the global `UdpHub` budget is a
+/// separate refusal reason.
+#[tokio::test]
+async fn udp_forward_peer_cap_refuses_only_new_peers() {
+    // These tests bump process-wide drop counters (REFUSED / SESSION_FULL /
+    // NO_EGRESS), and the DNS/egress suites assert exact deltas on them under
+    // their own locks. Take both locks so our bumps cannot land inside their
+    // snapshot windows.
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let _egress_guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let hub = Arc::new(UdpHub::new());
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        1,
+        pool.clone(),
+        hub.clone(),
+        egress.clone(),
+    );
+    let a: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+    let b: SocketAddr = "127.0.0.1:2222".parse().unwrap();
+    let now = mono_millis();
+    fwd.handle_datagram(a, b"first", now);
+    fwd.handle_datagram(b, b"over-cap", now);
+    assert_eq!(fwd.peer_count(), 1, "max_sessions=1 admits one peer");
+    assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(fwd.peer_sess(a).is_some());
+    assert!(fwd.peer_sess(b).is_none());
+
+    // The process-wide hub budget is exhausted independently of the listener
+    // cap: a second listener with room must still be refused by alloc_sess.
+    let tiny = Arc::new(UdpHub::with_capacity(1));
+    tiny.alloc_sess().expect("occupy the only hub slot");
+    let mut fwd2 = crate::forward_udp::UdpForwarder::for_test(
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap()),
+        TargetAddr::Ip("198.51.100.9:53".parse().unwrap()),
+        MAX_UDP_ASSOCS,
+        pool,
+        tiny.clone(),
+        egress,
+    );
+    fwd2.handle_datagram(a, b"no-budget", now);
+    assert_eq!(fwd2.peer_count(), 0, "hub exhaustion refuses the peer");
+}
+
+/// The idle sweep closes the server session and releases the hub slot exactly
+/// once, so a long-running listener cannot leak its 4032-session budget.
+#[tokio::test]
+async fn udp_forward_idle_sweep_releases_the_hub_slot() {
+    // These tests bump process-wide drop counters (REFUSED / SESSION_FULL /
+    // NO_EGRESS), and the DNS/egress suites assert exact deltas on them under
+    // their own locks. Take both locks so our bumps cannot land inside their
+    // snapshot windows.
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let _egress_guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let hub = Arc::new(UdpHub::new());
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        MAX_UDP_ASSOCS,
+        pool,
+        hub.clone(),
+        egress,
+    );
+    let src: SocketAddr = "127.0.0.1:3333".parse().unwrap();
+    let t0 = mono_millis();
+    fwd.handle_datagram(src, b"x", t0);
+    let sess = fwd.peer_sess(src).expect("session");
+    assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // One tick past the association idle window: both directions have been
+    // silent since `t0`.
+    fwd.sweep_idle(t0 + ASSOC_IDLE_MS + 1_000);
+    assert_eq!(fwd.peer_count(), 0, "the peer must be reaped");
+    assert!(
+        hub.entry(sess).is_none(),
+        "the hub entry must be unpublished"
+    );
+    assert_eq!(
+        hub.len.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the session slot must be returned"
+    );
+    // A second sweep must not double-release (it would underflow the count).
+    fwd.sweep_idle(t0 + ASSOC_IDLE_MS + 2_000);
+    assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// `udp(7)` delivers ICMP port-unreachable to an unconnected listener as
+/// `ConnectionRefused`; treating that as fatal silently stops the whole UDP
+/// forward listener under normal peer churn. Only genuinely broken-socket
+/// errors may end it.
+#[test]
+fn udp_forward_recv_error_classification_matches_linux_icmp_semantics() {
+    use std::io::ErrorKind;
+    for kind in [
+        ErrorKind::WouldBlock,
+        ErrorKind::Interrupted,
+        ErrorKind::ConnectionRefused,
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::TimedOut,
+    ] {
+        assert!(
+            crate::forward_udp::forward_recv_error_is_transient(kind),
+            "{kind:?} must be retried, not treated as fatal"
+        );
+    }
+    for kind in [
+        ErrorKind::InvalidInput,
+        ErrorKind::NotConnected,
+        ErrorKind::AddrNotAvailable,
+        ErrorKind::PermissionDenied,
+    ] {
+        assert!(
+            !crate::forward_udp::forward_recv_error_is_transient(kind),
+            "{kind:?} means the socket itself is unusable"
+        );
+    }
+}
+
+/// A port that is already bound must fail startup, naming the listener family
+/// and address (plan Task 6). This is the fail-fast half of the startup
+/// contract; the E2E config test covers the validation half.
+#[tokio::test]
+async fn forward_listener_bind_conflicts_fail_startup() {
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+
+    // TCP: a live listener holds the port.
+    let hold = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = hold.local_addr().unwrap();
+    let err = spawn_tcp_forward(
+        TcpForwardSpec {
+            listen,
+            target: target.clone(),
+        },
+        ConnPool::new(2, Vec::new(), true, true, 1),
+        Arc::new(SharedEgress::default()),
+        Duration::from_secs(1),
+        rx.clone(),
+    )
+    .expect_err("an occupied TCP port must fail startup");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("bind forward TCP listener") && msg.contains(&listen.to_string()),
+        "the bind error must name the listener: {msg}"
+    );
+
+    // UDP: same contract.
+    let hold = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listen = hold.local_addr().unwrap();
+    let err = crate::forward_udp::spawn_udp_forward(
+        UdpForwardSpec {
+            listen,
+            target,
+            max_sessions: 1,
+        },
+        ConnPool::new(2, Vec::new(), true, true, 1),
+        Arc::new(UdpHub::new()),
+        Arc::new(SharedEgress::default()),
+        rx,
+    )
+    .expect_err("an occupied UDP port must fail startup");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("forward UDP listener") && msg.contains(&listen.to_string()),
+        "the bind error must name the listener: {msg}"
+    );
+}
+
+/// Every reserved hub slot is returned on both orderly teardown paths:
+/// `shutdown_all` (listener sees the process shutdown) and `Drop` (the task
+/// dies without a sweep). Both are `PeerSession::Drop`'s contract.
+#[tokio::test]
+async fn udp_forward_shutdown_and_drop_release_hub_slots() {
+    // `handle_datagram` without an egress connection books NO_EGRESS; keep the
+    // global-drop-counter suites from seeing our bumps in their windows.
+    let _counter_guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let _egress_guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let hub = Arc::new(UdpHub::new());
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        MAX_UDP_ASSOCS,
+        pool,
+        hub.clone(),
+        egress,
+    );
+    let now = mono_millis();
+    for port in [4444u16, 5555] {
+        fwd.handle_datagram(format!("127.0.0.1:{port}").parse().unwrap(), b"x", now);
+    }
+    assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 2);
+    fwd.shutdown_all();
+    assert_eq!(fwd.peer_count(), 0, "shutdown must drop every peer");
+    assert_eq!(
+        hub.len.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "shutdown must release every reserved hub slot"
+    );
+
+    // Drop path: a listener task that ends without a final sweep (panic/task
+    // abort in dev, runtime teardown) must still return its slots.
+    fwd.handle_datagram("127.0.0.1:6666".parse().unwrap(), b"z", now);
+    assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 1);
+    drop(fwd);
+    assert_eq!(
+        hub.len.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "PeerSession::Drop must release the reserved hub slot"
+    );
+}
+
+/// The idle sweep tells the server to drop the session immediately (the
+/// `SESS_CLOSE` datagram), not only the 180 s server-side backstop.
+#[tokio::test]
+async fn udp_forward_idle_sweep_sends_sess_close() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let rev2 = rev2_state();
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    publish_test_egress(&egress, &pool, bind, &client_conn, rev2);
+    let hub = Arc::new(UdpHub::new());
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        MAX_UDP_ASSOCS,
+        pool.clone(),
+        hub.clone(),
+        egress.clone(),
+    );
+    let peer: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+    let t0 = mono_millis();
+    let bind_used = fwd.handle_datagram(peer, b"q", t0).expect("a binding");
+    let sess = fwd.peer_sess(peer).expect("the peer session");
+    // Flush the OPEN first so the next datagram is unambiguous.
+    drain_assoc_stage(&egress, &pool, bind_used);
+    let _open = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+        .await
+        .expect("the DATA OPEN must arrive")
+        .unwrap();
+    fwd.sweep_idle(t0 + ASSOC_IDLE_MS + 1_000);
+    let close = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+        .await
+        .expect("SESS_CLOSE must be sent")
+        .unwrap();
+    assert_eq!(
+        r2::kind(&close),
+        Some(r2::R2Kind::Ctl),
+        "the sweep must send a CTL SESS_CLOSE, not rely on the server sweep"
+    );
+    assert!(hub.entry(sess).is_none(), "the hub entry must be gone");
+}
+
+/// The legacy DNS slow-path reply helper (used for a domain-form reply source)
+/// must honour raw mode too: a forwarded peer never expects a SOCKS5 header,
+/// and an IPv4 listener socket cannot send to a v4-mapped peer address.
+#[tokio::test]
+async fn raw_forward_slow_path_reply_sends_bare_payload() {
+    let listener = Arc::new(
+        tokio::net::UdpSocket::from_std(udp_socket_dual_small("[::]:0").unwrap()).unwrap(),
+    );
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    prime_relay(&listener, &peer, peer_addr).await;
+    let entry = Arc::new(AssocEntry::new_raw(listener));
+    entry.app.store(Some(Arc::new(peer_addr)));
+    let payload = Bytes::from_static(b"slow-path-raw");
+    let mut pkt = bytes::BytesMut::with_capacity(256);
+    send_reply_addr(
+        &entry,
+        peer_addr,
+        "198.51.100.9:53".parse().unwrap(),
+        &payload,
+        &mut pkt,
+    );
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(REPLY_WAIT, peer.recv_from(&mut buf))
+        .await
+        .expect("the slow-path reply must arrive")
+        .unwrap();
+    assert_eq!(&buf[..n], &payload[..], "raw mode must not frame the reply");
+    assert!(
+        pkt.is_empty(),
+        "raw mode must not encode into the SOCKS5 scratch packet"
     );
 }

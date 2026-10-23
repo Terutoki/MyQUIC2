@@ -636,15 +636,40 @@ The client and server must run the **same revision**. Certificates are generated
 
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_egress_conns`, `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
+- **Forwarding:** `tcp_forward` / `udp_forward` (client-side listeners for raw TCP/UDP to a fixed destination; the server needs no change).
 - **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
 The sample configs are the reference; comments explain defaults and trade-offs.
 
+### 🔀 TCP/UDP forwarding (client listeners)
+
+Besides the SOCKS5 endpoint, the client can expose **fixed-destination** listeners that relay raw TCP/UDP through the same QUIC tunnel. This is for applications that cannot speak SOCKS5 (appliances, game servers, appliances that expect a plain port forward); no new wire protocol or server-side configuration is involved.
+
+```toml
+# One accepted connection -> one QUIC bidi stream (half-close, 300 s idle, RST
+# on failure: the same contract as the SOCKS CONNECT path).
+[[tcp_forward]]
+listen = "127.0.0.1:8080"
+target = "example.com:80"
+
+# Each client source IP:port gets its own session (180 s idle reap); replies are
+# delivered as raw payloads, never SOCKS5-framed. max_sessions is optional.
+[[udp_forward]]
+listen = "127.0.0.1:5353"
+target = "1.1.1.1:53"
+# max_sessions = 1024
+```
+
+- **Target resolution stays at the exit.** `target` may be an IP literal or a domain; a domain is resolved and policy-checked by the **server**, exactly like a SOCKS target. A private or loopback target therefore requires `allow_private = true` on the server — keep `auth_token` set in that posture.
+- **UDP identity.** A UDP listener maps each client `IP:port` to its own server session, because one server session has one upstream socket and cannot otherwise demultiplex replies back to the right peer. Sessions share the process-wide `max_udp_assocs` budget (4032) with SOCKS associations.
+- **Bind loopback (or firewall the port).** A non-loopback listener lets any host that can reach it use this tunnel to that one fixed target; the client logs a warning at startup for it.
+- **Limits.** TCP forwarding shares the process TCP relay admission (8192) with SOCKS; UDP forwarding shares the session budget. Both arrays are opt-in — omitting them leaves the previous SOCKS-only behaviour unchanged.
+
 ## ✅ Verification
 
-- **530 tests** on the macOS dev box (lib 262 + client 149 + server 119).
+- **555 tests** on the macOS dev box (lib 269 + client 161 + server 119 + 6 process-level forwarding E2E).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
-- **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, and legacy MQP-2 receive paths.
+- **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, legacy MQP-2 receive paths, and the client forward listeners (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 6 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
 - **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
 
