@@ -2,11 +2,11 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.svg">
-  <img src="assets/readme/hero-light.svg" alt="MyQUIC2 — the small-packet QUIC proxy. SOCKS5 in, QUIC/TLS 1.3 out, MQP-3 wire rev2 in between." width="100%">
+  <img src="assets/readme/hero-light.svg" alt="MyQUIC2 — the small-packet QUIC proxy. SOCKS5 and fixed-destination TCP/UDP forwarding in, QUIC/TLS 1.3 out, MQP-3 wire rev2 in between." width="100%">
 </picture>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.1-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-530_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-555_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -14,9 +14,9 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux_%7C_macOS_%7C_OpenWrt-6366f1?style=flat-square)](#-install)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](https://github.com/Terutoki/MyQUIC2/blob/main/LICENSE)
 
-**SOCKS5 in · QUIC / TLS 1.3 out · MQP-3 rev2 in between**
+**SOCKS5 + TCP/UDP forwarding in · QUIC / TLS 1.3 out · MQP-3 rev2 in between**
 
-[Architecture](#-architecture) · [Wire](#-mqp-3-rev2-wire) · [Protocol in depth](#-mqp-3-rev2-protocol-in-depth) · [Full duplex](#-full-duplex) · [Stager](#-cross-session-stager) · [Performance](#-performance) · [Security](#-security) · [Mermaid atlas](#-mermaid-atlas) · [Install](#-install) · [Quick start](#-quick-start) · [Verify](#-verification)
+[Architecture](#-architecture) · [TCP/UDP forwarding](#-tcpudp-forwarding) · [Wire](#-mqp-3-rev2-wire) · [Protocol in depth](#-mqp-3-rev2-protocol-in-depth) · [Full duplex](#-full-duplex) · [Stager](#-cross-session-stager) · [Performance](#-performance) · [Security](#-security) · [Mermaid atlas](#-mermaid-atlas) · [Install](#-install) · [Quick start](#-quick-start) · [Verify](#-verification)
 
 </div>
 
@@ -31,6 +31,8 @@
 
 MyQUIC2 is a **SOCKS5 proxy built for the shape of modern UDP traffic**: DNS, QUIC handshakes, game state, VoIP, telemetry, small RPCs and multiplexed application fan-out. It accepts ordinary SOCKS5 `CONNECT` and `UDP ASSOCIATE` requests, carries both over one QUIC / TLS 1.3 tunnel, and uses **MQP-3 wire rev2** to keep the UDP data plane small, stateless in the right places, and bounded in memory.
 
+**Two ingress modes, one tunnel.** Apps that speak SOCKS5 use the familiar `CONNECT` / `UDP ASSOCIATE` endpoint; everything else — appliances, databases, DNS, SIP, game servers, anything that only knows "connect to this address and port" — can use fixed-destination **TCP and UDP forward listeners** (`[[tcp_forward]]` / `[[udp_forward]]`). Forwarding runs over the same pool, the same QUIC / TLS 1.3 tunnel, the same MQP-3 rev2 wire and the **same server binary**, and every listener and target may independently be IPv4, IPv6 or dual-stack.
+
 The client is a pool of independent QUIC endpoints. The server is admission-first: it checks the token and the memory budget before it allocates per-connection state, then resolves, authorizes and forwards each datagram. There are exactly two binaries and one wire revision. No mixed-version negotiation, no hidden control stream, no payload compression, and no attempt to turn UDP into a reliable stream.
 
 ### Why MyQUIC2
@@ -43,11 +45,13 @@ The client is a pool of independent QUIC endpoints. The server is admission-firs
 | **Cross-session aggregation** | One connection-level stager packs small payloads from every association into same-flow or dictionary `TRAIN` frames, with per-session FIFO order and a round-robin cursor. |
 | **Bounded memory** | Every peer-fillable structure has a hard bound: stager, both reassemblers, flow registry, DNS in-flight set, pre-HELLO buffer, quinn's per-stream reassembly metadata (via the parked-header-stream credit) and the admission charge. The admission bound also charges the process-wide pools a peer can drive (retry, DNS waiters, worker scratch, stream assembly). |
 | **Zero-copy TCP** | TCP rides a QUIC stream. The SOCKS5 success reply is optimistic, and the relay uses borrowed QUIC halves and vectored writes. |
+| **Two ingress modes** | SOCKS5 for apps that speak it, plus fixed-destination raw TCP/UDP forward listeners for everything else — no client library, no application change, and no server-side change. IPv4, IPv6 and dual-stack work on both the listener and the target side. |
 | **One revision, fail-fast** | `wire_ver=2` lives in `CTL HELLO/CAPS`. A peer that does not answer CAPS is closed after 2 s; there is no silent downgrade to MQP-2 or the v0.2.0 wire. |
 | **Observable by default** | Frame kinds, `TRAIN` items, inline fallbacks, flow open/ack/reject/close, compression ratio, drop reasons and transport stats are counted and periodically reported. |
 
 ### At a glance
 
+- **Two ways in.** SOCKS5 `CONNECT` / `UDP ASSOCIATE` for proxy-aware apps, and config-driven TCP/UDP forward listeners for raw port-forwarding to a fixed destination — IPv4, IPv6 or dual-stack, with zero server changes.
 - **TCP is a QUIC stream.** The SOCKS5 success reply is optimistic; payload bytes are pumped with zero-copy buffers and borrowed QUIC halves.
 - **UDP is an MQP-3 rev2 DATAGRAM plane.** Connection-scoped flow ids, 2 B steady headers, full-duplex flows, cross-association `TRAIN` packing, compact 8 KiB `FRAG`.
 - **One client, one server, one config each.** No mixed-version negotiation, no payload compression, no hidden control stream.
@@ -68,6 +72,7 @@ MyQUIC2 is split along the only boundary that matters for latency: **per-connect
 |---|---|---|
 | **Client pool** | 4 TCP + 3 UDP slots by default; interactive and bulk sharding | One endpoint, socket and runtime per slot; selection-time path health; reconnect watchdog below the QUIC idle timeout |
 | **Associations** | SOCKS5 `CONNECT` and `UDP ASSOCIATE`; app address pinning | The first valid UDP packet locks the app address; one association maps to one `session` |
+| **Forward listeners** | Raw TCP/UDP to configured fixed destinations (`[[tcp_forward]]` / `[[udp_forward]]`) | Same pool, tunnel and server; one session per UDP peer; IPv4, IPv6 and dual-stack listeners; fail-fast startup validation |
 | **Shared codec** | MQP-3 rev2 frames, flow tables, fragmentation, stager, reassembly | One implementation used by both binaries and by the tests |
 | **Transport** | QUIC / TLS 1.3, BBR + ECN, PMTU, GSO/GRO | No custom congestion control and no custom crypto; QUIC does the hard part |
 | **Server ingress** | `SO_REUSEPORT` endpoints, token gate, connection and memory admission | Admission before per-connection allocation; one endpoint per core, at most 8 |
@@ -76,6 +81,7 @@ MyQUIC2 is split along the only boundary that matters for latency: **per-connect
 
 - **Pool-first client.** Every pool slot owns a QUIC endpoint, a UDP socket and a pinned runtime. TCP and UDP egress are isolated; the thread-local egress memo is lock-free, and the UDP hub caps the process at 4032 associations.
 - **One wire, two transports.** TCP rides a QUIC stream; UDP rides MQP-3 rev2 DATAGRAMs. Shared pieces: TLS 1.3, BBR, PMTU discovery, GSO/GRO.
+- **Two ingress modes.** SOCKS5 and the fixed-destination forward listeners share the pool, the egress classes, the admission budgets and the server; a deployment can use either or both. See [TCP/UDP forwarding](#-tcpudp-forwarding).
 - **Admission-first server.** `SO_REUSEPORT` ingress endpoints, token auth, memory/connection admission, one 64 KiB session socket per association.
 
 ## 📡 MQP-3 rev2 wire
@@ -544,6 +550,393 @@ Fairness is structural: each session has its own FIFO, and the round-robin curso
 - **Bounded and observable.** Depth, items, bytes, drops and pack outcomes are counted; a growing queue is visible before it becomes loss.
 - **Negotiated, not assumed.** `CAPS.max_train_items` lets the peer lower the item count; the packer honors it per frame.
 
+## 🔀 TCP/UDP forwarding
+
+> **A second ingress mode on the same tunnel.** MyQUIC2 can now take **raw TCP and raw UDP** on configurable local listeners and relay it through the existing QUIC / TLS 1.3 tunnel to a **fixed destination** at the server exit. No SOCKS5-capable client, no application library and **no server-side change** are needed — and every useful combination of **IPv4 and IPv6** works on both sides of the tunnel. This is the feature for machines that only understand "connect to this address and port": printers, cameras, PLCs, databases, DNS, SIP, game servers, WireGuard endpoints, and anything else that cannot be told to use a proxy.
+
+The two ingress modes coexist in one client process and share everything below them — the same `ConnPool`, the same per-slot QUIC endpoints, the same egress classes, the same tunnel, the same admission-first server, and the same MQP-3 rev2 wire for UDP. Forwarding is **opt-in**: leave the tables out and the client behaves exactly like the SOCKS5-only build.
+
+### Two ingress modes, one data plane
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+flowchart LR
+    subgraph APPS["🧩 Applications"]
+        direction TB
+        SOCKSAPP["🧦 SOCKS5-aware apps<br/>browser · curl · games"]
+        TCPAPP["🖥️ Legacy TCP clients<br/>database · SSH · MQTT · printer"]
+        UDPAPP["🎮 UDP workloads<br/>DNS · syslog · SIP/RTP · VPN · games"]
+    end
+    subgraph CLIENT["💻 myquic2-client · one process"]
+        direction TB
+        SOCKS["🧦 SOCKS5 ingress<br/>CONNECT · UDP ASSOCIATE"]
+        TFL["🔌 tcp_forward listeners<br/>one accepted connection<br/>= one QUIC stream"]
+        UFL["📮 udp_forward listeners<br/>one session per peer IP:port"]
+        POOL["🎰 ConnPool<br/>4 TCP + 3 UDP connections<br/>interactive / bulk isolation"]
+        SOCKS --> POOL
+        TFL --> POOL
+        UFL --> POOL
+    end
+    subgraph TUNNEL["⚡ QUIC / TLS 1.3 tunnel"]
+        direction TB
+        STREAM["🧵 TCP · MQP target header<br/>then a bidirectional byte pump"]
+        DGRAM["📡 UDP · MQP-3 rev2 DATAGRAMs<br/>OPEN · DATA · TRAIN · FRAG"]
+    end
+    subgraph EXIT["🛰️ myquic2-server · unchanged"]
+        direction TB
+        ING["🚪 SO_REUSEPORT ingress<br/>token gate + admission"]
+        POLICY["🧭 resolve + SSRF policy<br/>at the exit, never the client"]
+        IPV4T["🎯 IPv4 target"]
+        IPV6T["🎯 IPv6 target"]
+        DOMT["🎯 domain target"]
+        ING --> POLICY
+        POLICY --> IPV4T
+        POLICY --> IPV6T
+        POLICY --> DOMT
+    end
+    SOCKSAPP ==> SOCKS
+    TCPAPP ==> TFL
+    UDPAPP ==> UFL
+    POOL ==> STREAM
+    POOL ==> DGRAM
+    STREAM ==> ING
+    DGRAM ==> ING
+    style APPS fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    style CLIENT fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
+    style TUNNEL fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#1e1b4b
+    style EXIT fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef appC fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    classDef edgeC fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef tunC fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef exitC fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class SOCKSAPP,TCPAPP,UDPAPP appC
+    class SOCKS,TFL,UFL,POOL edgeC
+    class STREAM,DGRAM tunC
+    class ING,POLICY,IPV4T,IPV6T,DOMT exitC
+```
+
+### When to use it: the deployment shapes it was built for
+
+Forwarding is the right tool whenever the **destination is known in advance** and the application cannot be taught to use SOCKS5. Five shapes cover most real deployments:
+
+| Shape | What it looks like | Why a forward listener |
+|---|---|---|
+| **Legacy and embedded appliances** | IP camera, printer, NAS, set-top box, PLC/SCADA panel, label printer — the configuration screen only accepts "server address + port". | The appliance keeps speaking its native protocol; the client turns that one fixed address into a tunnel to the configured destination. No firmware or proxy setting required. |
+| **Data services without proxy support** | A JDBC/ODBC driver, `redis-cli`, a message broker client, an SSH client in an appliance, an MQTT firmware stack. | A `tcp_forward` listener on loopback behaves like the database/broker/SSH server locally. The client dials through QUIC; the server dials the real service on its side of the network. |
+| **UDP that SOCKS5 barely serves** | DNS forwarder, syslog, SNMP traps, TFTP/PXE, SIP/RTP, game servers, WireGuard/OpenVPN endpoints, QUIC/HTTP-3 test endpoints. | `udp_forward` carries raw datagrams end to end: no SOCKS5 UDP request header, one server session per client source, replies delivered byte-for-byte from the configured listen port. |
+| **Branch office / home lab consolidation** | One tunnel host exposes a handful of LAN services (HTTP, SSH, DNS) through a single fixed-destination setup, with per-service ports on the client. | Each service gets its own listener and its own fixed target on the server's network; firewall rules and port numbers stay simple and explicit. |
+| **Dual-stack and IPv6 transition** | A v4-only application needs a v6-only service; a v6-only appliance needs a v4-only peer; the two ends of the tunnel do not share an address family. | The listener family and the target family are **independent**: bind IPv4 locally, dial IPv6 at the exit — or bind dual-stack and reach either. The server exit decides the family. |
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+flowchart TB
+    Q{"Does the application<br/>speak SOCKS5?"}
+    Q -->|"yes"| SOCKS["🧦 SOCKS5 ingress<br/>CONNECT · UDP ASSOCIATE<br/>any destination per request"]
+    Q -->|"no"| FIXED{"Is the destination<br/>known and fixed?"}
+    FIXED -->|"yes"| FWD["🔀 Add a forward listener<br/>tcp_forward and/or udp_forward"]
+    FIXED -->|"no"| WRAP["Expose one fixed destination per listener,<br/>or use a SOCKS5-capable wrapper"]
+    FWD --> S1["🖨️ Appliances with only<br/>address + port"]
+    FWD --> S2["🗄️ Database · broker · SSH<br/>clients without proxy settings"]
+    FWD --> S3["📮 UDP services<br/>DNS · syslog · SNMP · TFTP · SIP/RTP"]
+    FWD --> S4["🏢 Branch office / home lab<br/>one listener per LAN service"]
+    FWD --> S5["🌉 Dual-stack bridge<br/>IPv4 app to IPv6 service and back"]
+    style Q fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    style FIXED fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    style SOCKS fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    style FWD fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    style S1 fill:#ffffff,stroke:#94a3b8,color:#0f172a
+    style S2 fill:#ffffff,stroke:#94a3b8,color:#0f172a
+    style S3 fill:#ffffff,stroke:#94a3b8,color:#0f172a
+    style S4 fill:#ffffff,stroke:#94a3b8,color:#0f172a
+    style S5 fill:#ffffff,stroke:#94a3b8,color:#0f172a
+```
+
+### TCP forwarding: one accepted connection, one QUIC stream
+
+A `[[tcp_forward]]` entry binds a local TCP listener. Every accepted connection becomes one QUIC bidirectional stream carrying the configured target as its MQP header, and the bytes are then relayed in both directions by the same pump the SOCKS5 `CONNECT` path uses. There is **no SOCKS5 negotiation and no SOCKS reply** — the application's first byte is not held for a round trip, and the server's dial ACK is consumed only as the failure signal.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+sequenceDiagram
+    autonumber
+    participant APP as 🧑‍💻 App
+    participant LIS as 🔌 tcp_forward listener
+    participant POOL as 🎰 ConnPool
+    participant Q as ⚡ QUIC stream
+    participant SRV as 🛰️ myquic2-server
+    participant DST as 🎯 Target
+    APP->>LIS: connect to the configured listen address
+    LIS->>LIS: accept · nodelay · TCP_NOTSENT_LOWAT
+    LIS->>POOL: pick a slot · wait for a live connection
+    POOL-->>LIS: connection + interactive priority
+    LIS->>Q: open_bi · 5 s budget
+    Q-->>LIS: send half + recv half
+    LIS->>Q: write MQP target header (own flush)
+    Q->>SRV: bidi stream · target header
+    SRV->>SRV: resolve · SSRF / allow_private
+    SRV->>DST: connect (happy eyeballs)
+    DST-->>SRV: accepted
+    SRV->>Q: MQP dial ACK
+    Q-->>LIS: ACK consumed by the pump
+    Note over LIS,Q: no SOCKS reply is sent · app bytes are not gated on the ACK
+    APP->>LIS: request bytes
+    LIS->>Q: vectored / zero-copy chunks
+    Q->>SRV: stream data
+    SRV->>DST: stream data
+    DST-->>SRV: response bytes
+    SRV-->>Q: stream data
+    Q-->>LIS: stream data
+    LIS-->>APP: response bytes
+    APP->>LIS: half-close (FIN)
+    LIS->>Q: finish send stream
+    Q->>SRV: FIN
+    SRV->>DST: shutdown write
+    DST-->>SRV: FIN
+    SRV-->>Q: finish
+    Q-->>LIS: FIN
+    LIS-->>APP: FIN
+    Note over LIS,DST: 300 s bidirectional idle deadline · failure before or during the pump ends in RST
+```
+
+- **Half-close is preserved in both directions.** An app FIN becomes a stream FIN and shuts down the target's write side; a target EOF becomes a FIN on the app socket.
+- **Failure is explicit.** If the stream cannot be opened (`wait_conn` timeout, `open_bi` limit, dead connection, header write timeout) the app socket is RST, not FIN — a forward listener has no SOCKS reply that could carry the error, so a reset is the only honest signal. A dead pool connection also self-heals through the same `retire_dead_slot` path SOCKS uses.
+- **300 s idle deadline.** Same value as the SOCKS relay, so a forwarded stream never outlives its SOCKS equivalent.
+- **Same admission budget.** All forwarded connections share the process-wide 8192 TCP relay admission with SOCKS5, so a second per-listener allowance cannot multiply the fd/task ceiling.
+- **Same slot selection.** Destinations whose port is in `interactive_ports` pin to the interactive connection and get stream priority, exactly like SOCKS CONNECT.
+
+### UDP forwarding: one session per peer, raw replies
+
+A `[[udp_forward]]` entry binds a local UDP socket. Each distinct client source `IP:port` is mapped to **its own MQP-3 rev2 session**, created lazily on the first datagram and kept for the life of the flow. That is what makes the return path work: one server session owns one upstream socket, so replies from the target can only be demultiplexed back to the right peer by their session id. Replies are delivered as **bare payloads** from the configured listen port — never SOCKS5-framed — so an ordinary UDP application sees the same bytes it would see from a local port forward.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+sequenceDiagram
+    autonumber
+    participant A as 🟢 Peer A · IPv4
+    participant B as 🔵 Peer B · IPv6
+    participant LIS as 📮 udp_forward listener
+    participant TBL as 🗂️ peer table
+    participant SA as 📦 session A
+    participant SB as 📦 session B
+    participant Q as 📡 MQP-3 rev2
+    participant SRV as 🛰️ server sessions
+    participant TA as 🎯 target A
+    participant TB as 🎯 target B
+    rect rgb(240, 253, 244)
+    A->>LIS: datagram (source 192.0.2.10:5000)
+    LIS->>TBL: lookup source address
+    TBL-->>LIS: miss · allocate session A
+    LIS->>SA: publish session · raw reply mode
+    SA->>Q: DATA OPEN with the fixed target
+    Q->>SRV: OPEN · target
+    SRV->>TA: sendto from its own session socket
+    B->>LIS: datagram (source fd00::20:6000)
+    LIS->>TBL: lookup source address
+    TBL-->>LIS: miss · allocate session B
+    SB->>Q: DATA OPEN with the same fixed target
+    Q->>SRV: OPEN · target
+    SRV->>TB: sendto from a separate session socket
+    end
+    rect rgb(255, 247, 237)
+    TA-->>SRV: reply (source 192.0.2.10:53)
+    SRV-->>Q: DATA OPEN with source · then steady DATA
+    Q-->>LIS: dispatcher routes by session id
+    LIS-->>A: raw payload from the listen port
+    TB-->>SRV: reply (source fd00::30:53)
+    SRV-->>Q: steady DATA
+    Q-->>LIS: dispatcher routes by session id
+    LIS-->>B: raw payload from the listen port
+    end
+    Note over LIS,SRV: small payloads share a connection-level stager (cross-peer TRAIN) · payloads above one frame use FRAG
+    Note over A,B: 180 s bidirectional idle → SESS_CLOSE + hub slot release
+```
+
+- **Per-peer identity.** The session key is the full client source `IP:port`, so two peers on one listener never share an upstream socket or a reply stream. A peer that reopens from a new source port simply gets a new session; the old one is reaped after the idle window.
+- **No client-side DNS.** The configured target may be a domain; it is resolved and policy-checked by the server, exactly like a SOCKS target. The client never resolves (and never caches) the name.
+- **Datagram semantics preserved.** Payloads up to 8 KiB ride `DATA`/`TRAIN`/`FRAG` and are delivered whole or lost, never turned into a reliable stream. Small payloads from several peers still share one connection-level stager and can be packed into a cross-session `TRAIN dict`.
+- **Egress classes still apply.** The first datagram fixes the session's `UdpBind` (interactive or a bulk shard), so a forwarded DNS/SIP flow cannot queue behind a bulk flow's congestion window.
+- **QUIC reconnect is transparent-ish.** After a redial the same client session id is re-`OPEN`ed on the new connection and the server creates a fresh session; in-flight datagrams are lost (UDP semantics), subsequent traffic continues without a restart.
+- **Peer churn is safe.** A reply written to a peer that has already closed can surface as an ICMP error on an unconnected UDP socket (Linux reports `ECONNREFUSED` on the next receive); the listener treats those as transient, warns once per window and keeps serving every other peer.
+
+### IPv4 and IPv6, on both sides of the tunnel
+
+Forwarding was designed dual-stack from day one. The **listener family and the target family are independent**: you can bind IPv4 locally and dial IPv6 at the exit, bind IPv6 locally and reach an IPv4 service, or bind the dual-stack wildcard and accept both client families on one port. The server exit resolves the target and applies the same SSRF / `allow_private` policy it applies to SOCKS.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+flowchart LR
+    subgraph CLIENTS["clients that connect"]
+        direction TB
+        C4["🟢 IPv4 clients"]
+        C6["🔵 IPv6 clients"]
+    end
+    subgraph LISTENERS["listeners on the client"]
+        direction TB
+        L4["🔌 IPv4 literal<br/>loopback or interface address"]
+        L6["🔌 IPv6 literal<br/>loopback or interface address"]
+        LW["🌐 dual-stack wildcard<br/>accepts IPv4 and IPv6"]
+    end
+    subgraph TARGETS["targets at the server exit"]
+        direction TB
+        T4["🎯 IPv4 literal"]
+        T6["🎯 IPv6 literal"]
+        TD["🎯 domain<br/>resolved at the exit"]
+    end
+    C4 --> L4
+    C4 --> LW
+    C6 --> L6
+    C6 --> LW
+    L4 --> T4
+    L4 --> T6
+    L4 --> TD
+    L6 --> T4
+    L6 --> T6
+    L6 --> TD
+    LW --> T4
+    LW --> T6
+    LW --> TD
+    style CLIENTS fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    style LISTENERS fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
+    style TARGETS fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef clientC fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    classDef listenC fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef targetC fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class C4,C6 clientC
+    class L4,L6,LW listenC
+    class T4,T6,TD targetC
+```
+
+| Listen form | Clients accepted | Notes |
+|---|---|---|
+| IPv4 literal, e.g. `127.0.0.1:8080` | IPv4 only | The safest default for local applications; no exposure beyond the bound interface. |
+| IPv6 literal, e.g. `[::1]:8081` | IPv6 only | Listeners are created with `IPV6_V6ONLY=0`, but a *concrete* v6 address has no v4 route: the wildcard is what makes a listener dual-stack in practice. |
+| Dual-stack wildcard, `[::]:8080` | **Both IPv4 and IPv6** | One port serves both families through v4-mapped addressing. It is not loopback, so the client logs a non-loopback warning at startup — bind a concrete address or firewall the port if that is not intended. |
+
+| Target form | Resolved by | Policy |
+|---|---|---|
+| IPv4 literal, e.g. `192.0.2.10:443` | nobody — sent on the wire as-is | Server-side SSRF filter; private/loopback needs `allow_private = true`. |
+| IPv6 literal, bracketed, e.g. `[fd00::20]:443` | nobody — sent on the wire as-is | Same policy. Link-local literals carrying a scope id are rejected: MQP does not carry scope ids. |
+| Domain, e.g. `dns.example.com:53` | **the server**, at the exit | Resolved and filtered exactly like a SOCKS target; `dns_ip_preference` applies. |
+
+```toml
+# IPv4 listener -> IPv4 service
+[[tcp_forward]]
+listen = "127.0.0.1:8080"
+target = "192.0.2.10:80"
+
+# IPv6 listener -> IPv6 service (ULA target: server needs allow_private = true)
+[[tcp_forward]]
+listen = "[::1]:8081"
+target = "[fd00::20]:443"
+
+# One dual-stack UDP listener for both client families -> domain target
+[[udp_forward]]
+listen = "[::]:5353"
+target = "dns.example.com:53"
+
+# DNS on one port: TCP and UDP may listen on the same port number
+[[tcp_forward]]
+listen = "127.0.0.1:53"
+target = "192.0.2.53:53"
+[[udp_forward]]
+listen = "127.0.0.1:53"
+target = "192.0.2.53:53"
+
+# UDP media: per-listener peer cap, separate from the global budget
+[[udp_forward]]
+listen = "127.0.0.1:5060"
+target = "198.51.100.20:5060"
+# max_sessions = 1024
+```
+
+- **Bracketed IPv6 literals only.** `target = "[fd00::20]:443"` is correct; an unbracketed `fd00::20:443` is ambiguous and rejected at startup → put brackets around every IPv6 literal, including loopback.
+- **Families are independent, not mixed.** A listener accepts the family it is bound to: an IPv4 literal accepts IPv4 clients, a concrete IPv6 literal accepts IPv6 clients, and the dual-stack wildcard `[::]` accepts both. The **target** family is chosen independently at the exit — v4 listener → v6 target is fine, and so is the reverse.
+- **Wildcard listeners are not loopback.** `0.0.0.0` and `[::]` accept traffic from any reachable interface; the client warns once per such listener.
+- **No specific address is special.** Any global or private unicast literal works; whether the server is allowed to reach a *private* one is the server's `allow_private` decision, and global literals need no extra configuration.
+
+### Configuration reference
+
+```toml
+# TCP: raw stream -> one QUIC stream per accepted connection.
+[[tcp_forward]]
+listen = "127.0.0.1:8080"          # local IP:port literal
+target = "example.com:80"          # IP:port / host:port, fixed
+
+# UDP: raw datagrams -> one MQP-3 rev2 session per client source IP:port.
+[[udp_forward]]
+listen = "127.0.0.1:5353"
+target = "1.1.1.1:53"
+# max_sessions = 1024              # optional per-listener peer cap
+```
+
+| Field | Meaning | Default / rule |
+|---|---|---|
+| `listen` | Local bind address. Always an IP literal; local binding never resolves a hostname. | required; non-zero port |
+| `target` | Fixed destination after the tunnel. IPv4 literal, bracketed IPv6 literal, or `host:port` domain. | required; non-zero port; unspecified IPs rejected |
+| `max_sessions` | Concurrent peer sessions for this UDP listener. | `max_udp_assocs` (4032); clamped 1..=4032; ignored by TCP |
+
+Validation runs **before** any TLS, QUIC or socket work, and every listener is bound before it is spawned:
+
+- a bad `listen`/`target`, a port 0, an unknown field (serde `deny_unknown_fields`), or a bad `max_sessions` aborts startup with the entry index and field name;
+- listeners on the **same protocol** may not overlap: the same port with the same address, or with either side unspecified, is rejected (this includes the `[::]:1080` versus `127.0.0.1:1080` wildcard case, and IPv4-mapped forms of the same v4 address);
+- a `tcp_forward` may not overlap `socks_listen`; TCP and UDP may share a port number;
+- if a listener cannot bind (port already in use), client startup fails with the listener address in the error, and the info log line is emitted only after a successful bind.
+
+### Lifecycle, limits and observability
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> Validated : parse + overlap checks
+    Validated --> Failed : bad entry · overlap · busy port
+    Failed --> [*]
+    Validated --> Bound : bind listener
+    Bound --> Serving : spawn listener task
+    Serving --> Serving : TCP accept · UDP datagram
+    Serving --> Reaped : TCP close · UDP idle 180 s
+    Reaped --> Serving : next connection · next datagram
+    Serving --> Draining : SIGTERM / SIGINT
+    Draining --> [*] : close listeners · SESS_CLOSE · release session slots
+    note right of Serving
+        TCP: one stream per connection, 300 s idle
+        UDP: one session per peer, 180 s idle
+    end note
+    note right of Failed
+        exit non-zero; no listener is left half-bound
+    end note
+```
+
+| Resource | Bound | Shared with SOCKS? |
+|---|---|---|
+| TCP forwarded connections | 8192 process-wide relay admission | yes, same semaphore |
+| One TCP forwarded stream | 300 s bidirectional idle; 5 s open/header budgets | same pump and budgets as CONNECT |
+| UDP forwarded sessions | `max_udp_assocs` (4032) process-wide, plus optional per-listener `max_sessions` | yes, same hub budget |
+| One UDP session | 180 s bidirectional idle, then `SESS_CLOSE` (best effort; server sweep is the backstop) | same idle window as an association |
+| UDP payload | 8 KiB per datagram, fragmented above the live DATAGRAM budget | same MQP-3 rev2 limits |
+| Listener task | one task per configured listener; no per-peer task or socket | — |
+
+Observability is deliberately boring: one `info` line per bound listener, a non-loopback `warn`, rate-limited accept/relay/admission/refused warnings, and the existing `dgram_drops` classes (`TOO_LARGE`, `NO_EGRESS`, `EGRESS_DEAD`, `SESSION_FULL`, `REFUSED`, …) plus `udp_stats::session()` for UDP peers. A forwarded flow therefore shows up in the same 60 s report as a SOCKS flow — no separate dashboard.
+
+### SOCKS5 or forwarding?
+
+| | SOCKS5 ingress | Forward listeners |
+|---|---|---|
+| Destination | chosen per connection / UDP packet by the app | fixed in the client config |
+| Client support required | a SOCKS5 library or proxy setting | none — any TCP/UDP application |
+| TCP path | `CONNECT` | `tcp_forward` |
+| UDP path | `UDP ASSOCIATE` with SOCKS5 UDP request headers | `udp_forward`, raw datagrams |
+| Address families | whatever the app asks for | listener and target families are independent; IPv4, IPv6, dual-stack |
+| Admission / limits | shared process budgets | the same shared budgets |
+| Best fit | browsers, `curl`, apps with proxy settings | appliances, databases/brokers/SSH, UDP services, fixed-destination deployments |
+
+### Operational notes
+
+- **Server changes: none.** Forwarding uses the existing TCP target header and the existing rev2 `DATA OPEN`; the server binary, its config schema and the MQP-3 rev2 wire are untouched. A private/loopback/link-local/ULA target still requires the server's `allow_private = true`, and `auth_token` should stay set in that posture.
+- **Bind loopback unless you mean it.** A non-loopback listener lets any host that can reach it use that one fixed tunnel; bind `127.0.0.1` / `[::1]` for local applications, or bind a LAN address and firewall it deliberately.
+- **Plan session capacity.** Each UDP peer costs one client session out of the shared 4032 budget, and one server session out of the server's global pool; a listener with heavy peer churn should set `max_sessions` so it cannot consume the whole budget during a scan or flood.
+- **Same revision on both ends.** Forwarding is a client feature, but the client still needs a matching server revision (same MQP-3 wire rev2, same TLS pinned certificate).
+
 ## 📊 Performance
 
 <p align="center">
@@ -628,6 +1021,10 @@ cargo build --release --bins
 ./target/release/myquic2-client --config config-client.toml
 
 # SOCKS5 endpoint: 127.0.0.1:1080 (TCP streams + UDP ASSOCIATE)
+# Optional: also serve raw TCP/UDP forward listeners, e.g.
+#   [[tcp_forward]] listen = "127.0.0.1:8080" target = "192.0.2.10:80"
+#   [[udp_forward]] listen = "127.0.0.1:5353" target = "dns.example.com:53"
+# Both modes share the same tunnel and server — see TCP/UDP forwarding below.
 ```
 
 The client and server must run the **same revision**. Certificates are generated on first server start; see [`config-server.toml`](config-server.toml) and [`config-client.toml`](config-client.toml) for every documented key.
@@ -636,34 +1033,10 @@ The client and server must run the **same revision**. Certificates are generated
 
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_egress_conns`, `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
-- **Forwarding:** `tcp_forward` / `udp_forward` (client-side listeners for raw TCP/UDP to a fixed destination; the server needs no change).
+- **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
 - **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
 The sample configs are the reference; comments explain defaults and trade-offs.
-
-### 🔀 TCP/UDP forwarding (client listeners)
-
-Besides the SOCKS5 endpoint, the client can expose **fixed-destination** listeners that relay raw TCP/UDP through the same QUIC tunnel. This is for applications that cannot speak SOCKS5 (appliances, game servers, appliances that expect a plain port forward); no new wire protocol or server-side configuration is involved.
-
-```toml
-# One accepted connection -> one QUIC bidi stream (half-close, 300 s idle, RST
-# on failure: the same contract as the SOCKS CONNECT path).
-[[tcp_forward]]
-listen = "127.0.0.1:8080"
-target = "example.com:80"
-
-# Each client source IP:port gets its own session (180 s idle reap); replies are
-# delivered as raw payloads, never SOCKS5-framed. max_sessions is optional.
-[[udp_forward]]
-listen = "127.0.0.1:5353"
-target = "1.1.1.1:53"
-# max_sessions = 1024
-```
-
-- **Target resolution stays at the exit.** `target` may be an IP literal or a domain; a domain is resolved and policy-checked by the **server**, exactly like a SOCKS target. A private or loopback target therefore requires `allow_private = true` on the server — keep `auth_token` set in that posture.
-- **UDP identity.** A UDP listener maps each client `IP:port` to its own server session, because one server session has one upstream socket and cannot otherwise demultiplex replies back to the right peer. Sessions share the process-wide `max_udp_assocs` budget (4032) with SOCKS associations.
-- **Bind loopback (or firewall the port).** A non-loopback listener lets any host that can reach it use this tunnel to that one fixed target; the client logs a warning at startup for it.
-- **Limits.** TCP forwarding shares the process TCP relay admission (8192) with SOCKS; UDP forwarding shares the session budget. Both arrays are opt-in — omitting them leaves the previous SOCKS-only behaviour unchanged.
 
 ## ✅ Verification
 
