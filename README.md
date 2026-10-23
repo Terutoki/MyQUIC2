@@ -5,7 +5,7 @@
   <img src="assets/readme/hero-light.svg" alt="MyQUIC2 — the small-packet QUIC proxy. SOCKS5 and fixed-destination TCP/UDP forwarding in, QUIC/TLS 1.3 out, MQP-3 wire rev2 in between." width="100%">
 </picture>
 
-[![Release](https://img.shields.io/badge/Release-v0.2.1-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.2.2-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
 [![Tests](https://img.shields.io/badge/Tests-555_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
@@ -982,12 +982,12 @@ The security model assumes an untrusted peer and a hostile network. TLS 1.3 auth
 
 ## 📦 Install
 
-**Latest published release: [v0.2.1](https://github.com/Terutoki/MyQUIC2/releases/latest).** Assets are profile-guided (PGO) builds made from the tag by the release workflow.
+**Latest published release: [v0.2.2](https://github.com/Terutoki/MyQUIC2/releases/latest).** Assets are profile-guided (PGO) builds made from the tag by the release workflow.
 
-- `myquic2-v0.2.1-x86_64-unknown-linux-musl.tar.gz` — static musl build, runs on any x86-64 Linux.
-- `myquic2-v0.2.1-x86_64-unknown-linux-gnu.tar.gz` — glibc ≥ 2.36 (Debian 12+, Ubuntu 23.04+).
-- `myquic2-v0.2.1-openwrt-x86_64-v1.tar.gz` — OpenWrt safe default for every x86-64 CPU.
-- `myquic2-v0.2.1-openwrt-x86_64-v2..v4.tar.gz` — SSE4.2 / AVX2 / AVX512 tuned (a mismatch dies with `Illegal instruction`).
+- `myquic2-v0.2.2-x86_64-unknown-linux-musl.tar.gz` — static musl build, runs on any x86-64 Linux.
+- `myquic2-v0.2.2-x86_64-unknown-linux-gnu.tar.gz` — glibc ≥ 2.36 (Debian 12+, Ubuntu 23.04+).
+- `myquic2-v0.2.2-openwrt-x86_64-v1.tar.gz` — OpenWrt safe default for every x86-64 CPU.
+- `myquic2-v0.2.2-openwrt-x86_64-v2..v4.tar.gz` — SSE4.2 / AVX2 / AVX512 tuned (a mismatch dies with `Illegal instruction`).
 - `SHA256SUMS` — checksums for every asset.
 
 ```sh
@@ -1003,7 +1003,7 @@ cargo build --release --bins
 ```
 
 > [!NOTE]
-> `v0.2.1` is the latest published release. The `main` branch adds the optimistic first-packet path described above; those changes ship in the next release. macOS and non-x86-64 targets build from source.
+> `v0.2.2` is the latest published release. It adds fixed-destination **TCP/UDP forward listeners** (IPv4, IPv6 and dual-stack) on top of the v0.2.1 MQP-3 rev2 data plane and audit hardening; the wire is unchanged. macOS and non-x86-64 targets build from source.
 
 ## ⚡ Quick start
 
