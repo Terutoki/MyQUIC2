@@ -1,0 +1,49 @@
+### postfix-latfocus arm=parent rep=1 2026-10-23T11:39:30Z
+lat n=200 payload=64 samples=200 lost=0 stale=0 bad=0 wall=0.040s p50=201 p90=289 p99=429 p999=1844 max=1844 mean=202 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=118 p90=132 p99=294 p999=1484 max=1484 mean=126 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=119 p90=130 p99=283 p999=1446 max=1446 mean=126 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=119 p90=129 p99=281 p999=1490 max=1490 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.062s p50=118 p90=128 p99=258 p999=1391 max=1391 mean=124 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.062s p50=118 p90=128 p99=238 p999=1525 max=1525 mean=124 µs
+lattcp n=300 bytes=64 connect_ok=300 connect_lost=0 echo_ok=300 echo_lost=0 bad=0 wall=0.080s | connect p50=105 p90=150 p99=228 p999=294 max=294 mean=114 µs | echo p50=134 p90=177 p99=387 p999=1616 max=1616 mean=151 µs
+### postfix-latfocus arm=headA rep=1 2026-10-23T11:39:32Z
+lat n=200 payload=64 samples=200 lost=0 stale=0 bad=0 wall=0.038s p50=202 p90=251 p99=383 p999=1690 max=1690 mean=190 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.064s p50=119 p90=137 p99=256 p999=1846 max=1846 mean=129 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.064s p50=118 p90=136 p99=299 p999=1588 max=1588 mean=128 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=118 p90=129 p99=335 p999=1398 max=1398 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=117 p90=130 p99=295 p999=1518 max=1518 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=118 p90=129 p99=310 p999=1449 max=1449 mean=125 µs
+lattcp n=300 bytes=64 connect_ok=300 connect_lost=0 echo_ok=300 echo_lost=0 bad=0 wall=0.078s | connect p50=101 p90=149 p99=213 p999=399 max=399 mean=111 µs | echo p50=134 p90=182 p99=375 p999=1401 max=1401 mean=149 µs
+### postfix-latfocus arm=headA rep=2 2026-10-23T11:39:34Z
+lat n=200 payload=64 samples=200 lost=0 stale=0 bad=0 wall=0.038s p50=190 p90=230 p99=377 p999=1654 max=1654 mean=190 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.064s p50=120 p90=135 p99=307 p999=1695 max=1695 mean=128 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=119 p90=129 p99=242 p999=1493 max=1493 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=119 p90=129 p99=307 p999=1430 max=1430 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=119 p90=130 p99=268 p999=1475 max=1475 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.062s p50=118 p90=129 p99=241 p999=1483 max=1483 mean=125 µs
+lattcp n=300 bytes=64 connect_ok=300 connect_lost=0 echo_ok=300 echo_lost=0 bad=0 wall=0.079s | connect p50=103 p90=142 p99=224 p999=267 max=267 mean=113 µs | echo p50=135 p90=176 p99=345 p999=1308 max=1308 mean=150 µs
+### postfix-latfocus arm=parent rep=2 2026-10-23T11:39:37Z
+lat n=200 payload=64 samples=200 lost=0 stale=0 bad=0 wall=0.049s p50=222 p90=348 p99=566 p999=1872 max=1872 mean=243 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.064s p50=117 p90=132 p99=347 p999=2266 max=2266 mean=128 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=117 p90=134 p99=330 p999=1463 max=1463 mean=126 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.061s p50=116 p90=128 p99=268 p999=1470 max=1470 mean=122 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.061s p50=116 p90=128 p99=270 p999=1426 max=1426 mean=122 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.062s p50=116 p90=127 p99=300 p999=1732 max=1732 mean=123 µs
+lattcp n=300 bytes=64 connect_ok=300 connect_lost=0 echo_ok=300 echo_lost=0 bad=0 wall=0.079s | connect p50=102 p90=144 p99=221 p999=274 max=274 mean=112 µs | echo p50=136 p90=167 p99=378 p999=1312 max=1312 mean=150 µs
+### postfix-latfocus arm=parent rep=3 2026-10-23T11:39:39Z
+lat n=200 payload=64 samples=200 lost=0 stale=0 bad=0 wall=0.039s p50=207 p90=252 p99=417 p999=1746 max=1746 mean=196 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.060s p50=115 p90=127 p99=276 p999=1484 max=1484 mean=121 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=116 p90=130 p99=376 p999=1584 max=1584 mean=126 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.061s p50=116 p90=128 p99=306 p999=1444 max=1444 mean=123 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.061s p50=116 p90=130 p99=282 p999=1447 max=1447 mean=123 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.060s p50=115 p90=128 p99=281 p999=365 max=365 mean=119 µs
+lattcp n=300 bytes=64 connect_ok=300 connect_lost=0 echo_ok=300 echo_lost=0 bad=0 wall=0.080s | connect p50=103 p90=151 p99=206 p999=317 max=317 mean=114 µs | echo p50=136 p90=177 p99=389 p999=1487 max=1487 mean=152 µs
+### postfix-latfocus arm=headA rep=3 2026-10-23T11:39:41Z
+lat n=200 payload=64 samples=200 lost=0 stale=0 bad=0 wall=0.043s p50=206 p90=334 p99=527 p999=1725 max=1725 mean=213 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.068s p50=124 p90=150 p99=350 p999=1800 max=1800 mean=136 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.065s p50=121 p90=139 p99=295 p999=1587 max=1587 mean=129 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.064s p50=123 p90=140 p99=276 p999=381 max=381 mean=129 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=119 p90=133 p99=264 p999=1497 max=1497 mean=126 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.061s p50=115 p90=127 p99=293 p999=1669 max=1669 mean=123 µs
+lattcp n=300 bytes=64 connect_ok=300 connect_lost=0 echo_ok=300 echo_lost=0 bad=0 wall=0.078s | connect p50=104 p90=135 p99=204 p999=250 max=250 mean=111 µs | echo p50=135 p90=167 p99=430 p999=1446 max=1446 mean=150 µs
+POSTFIX_LATFOCUS DONE

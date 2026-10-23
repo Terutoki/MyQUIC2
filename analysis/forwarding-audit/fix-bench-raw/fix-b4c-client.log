@@ -1,0 +1,43 @@
+2026-10-23T11:38:56.250159Z  INFO myquic2_client: dns address preference: Ipv6
+2026-10-23T11:38:56.250223Z  INFO myquic2_client: udp batch backend: portable-fallback (sendmmsg=false, recvmmsg=false); GSO/GRO are auto-probed by quinn-udp
+2026-10-23T11:38:56.250282Z  INFO myquic2_client: quic pool: 4 TCP connection(s) (bulk round-robin + interactive pin) + 3 dedicated UDP connection(s) (interactive slot 4, bulk shards 5..6), UDP is fail-closed: dropped rather than shared while it reconnects (endpoints: one UDP socket per slot)
+2026-10-23T11:38:56.250295Z  INFO myquic2_client: udp associations: max 4032 concurrent (max_udp_assocs)
+2026-10-23T11:38:56.250752Z  INFO myquic2_client: client runtime: 7 sharded current-thread runtime(s), one pool slot each, plus 10 main-runtime worker(s) for SOCKS/TCP/UDP tasks (Linux: slots pinned in priority order — interactive TCP, interactive UDP, then the rest — up to the core count, and the worker count is sized to the cores they leave over; MYQUIC2_SHARD_RUNTIME=0 restores the shared runtime)
+2026-10-23T11:38:56.250809Z  INFO myquic2_client: udp_forward 127.0.0.1:18282 -> 127.0.0.1:19003 (max_sessions=1, forward_session_budget=3024, per-peer sessions, 180s idle reap)
+2026-10-23T11:38:56.250849Z  INFO myquic2_client: socks5 listening on 127.0.0.1:18080 -> QUIC 127.0.0.1:18443 (dns=server-side, token=off, tls13-pinned, 0rtt)
+2026-10-23T11:38:56.291872Z  INFO myquic2_client::auth: QUIC full handshake in 41.12075ms
+2026-10-23T11:38:56.291875Z  INFO myquic2_client::auth: QUIC full handshake in 41.338125ms
+2026-10-23T11:38:56.291946Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.291878Z  INFO myquic2_client::auth: QUIC full handshake in 41.350417ms
+2026-10-23T11:38:56.292033Z  INFO myquic2_client::auth: QUIC full handshake in 41.310208ms
+2026-10-23T11:38:56.291954Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.292061Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.291975Z  INFO myquic2_client::auth: QUIC full handshake in 41.288875ms
+2026-10-23T11:38:56.291875Z  INFO myquic2_client::auth: QUIC full handshake in 41.298ms
+2026-10-23T11:38:56.292038Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.292134Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.292123Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.291968Z  INFO myquic2_client::auth: QUIC full handshake in 41.287833ms
+2026-10-23T11:38:56.292183Z  INFO myquic2_client::auth: QUIC connected to 127.0.0.1:18443
+2026-10-23T11:38:56.493167Z  INFO myquic2_client::auth: watchdog armed rx=13 silence_limit=10s
+2026-10-23T11:38:56.493597Z  INFO myquic2_client::auth: watchdog armed rx=14 silence_limit=10s
+2026-10-23T11:38:56.493601Z  INFO myquic2_client::auth: watchdog armed rx=13 silence_limit=10s
+2026-10-23T11:38:56.493889Z  INFO myquic2_client::auth: watchdog armed rx=14 silence_limit=10s
+2026-10-23T11:38:56.493936Z  INFO myquic2_client::auth: watchdog armed rx=14 silence_limit=10s
+2026-10-23T11:38:56.493908Z  INFO myquic2_client::auth: watchdog armed rx=14 silence_limit=10s
+2026-10-23T11:38:56.493938Z  INFO myquic2_client::auth: watchdog armed rx=14 silence_limit=10s
+2026-10-23T11:39:03.652890Z  INFO myquic2_client: shutdown signal received: closing endpoints so conns drop and peers can reconnect
+2026-10-23T11:39:03.652984Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653040Z  WARN myquic2_client::auth: QUIC close reason: closed
+2026-10-23T11:39:03.653007Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653114Z  WARN myquic2_client::auth: QUIC close reason: closed
+2026-10-23T11:39:03.653042Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653181Z  WARN myquic2_client::auth: QUIC close reason: closed
+2026-10-23T11:39:03.652984Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653266Z  WARN myquic2_client::auth: QUIC close reason: closed by peer: shutdown (code 0)
+2026-10-23T11:39:03.653019Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653325Z  WARN myquic2_client::auth: QUIC close reason: closed
+2026-10-23T11:39:03.653067Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653362Z  WARN myquic2_client::auth: QUIC close reason: closed
+2026-10-23T11:39:03.653060Z  WARN myquic2_client::auth: QUIC connection lost, reconnecting...
+2026-10-23T11:39:03.653391Z  WARN myquic2_client::auth: QUIC close reason: closed

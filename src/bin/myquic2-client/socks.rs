@@ -8,12 +8,16 @@ pub(crate) const TCP_DIAL_ACK_TIMEOUT: Duration = Duration::from_secs(25);
 /// Process-wide caps on client-side resources. Without these a local or LAN
 /// peer can spawn unbounded tasks / relay sockets (each with ~64 KiB kernel
 /// buffers) and exhaust fds and memory on the proxy host.
-pub(crate) const MAX_SOCKS_CONNS: usize = 8192;
-/// The admission cap above is only useful if the QUIC pool can actually carry
-/// that many concurrent TCP flows without parking them in `open_bi()`; the
-/// transport advertises `MAX_BIDI_STREAMS_PER_CONN` per connection, and pinned
-/// flows can all land on one connection. Fail the build if either constant is
-/// changed without the other.
+///
+/// `MAX_SOCKS_CONNS` itself now lives in `myquic2::config::tuning` (imported via
+/// `use myquic2::*`) so the client config can derive the forwarded-connection
+/// budget from the same number this semaphore is built from — see
+/// `DEFAULT_FORWARD_CONNS`.
+/// The admission cap is only useful if the QUIC pool can actually carry that
+/// many concurrent TCP flows without parking them in `open_bi()`; the transport
+/// advertises `MAX_BIDI_STREAMS_PER_CONN` per connection, and pinned flows can
+/// all land on one connection. Fail the build if either constant is changed
+/// without the other.
 const _: () = assert!(MAX_SOCKS_CONNS as u32 <= MAX_BIDI_STREAMS_PER_CONN);
 // `MAX_UDP_ASSOCS` (the concurrent UDP-association cap) now lives in `lib.rs`
 // next to the server's per-connection session target, so the two can never drift

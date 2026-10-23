@@ -186,6 +186,28 @@ pub const SERVER_UNI_STREAM_CREDIT: u32 = 2;
 /// budget, not this number.
 pub const MAX_UDP_ASSOCS: usize = 4032;
 
+/// Concurrent TCP relay connections one *client process* may admit, shared by
+/// the SOCKS5 `CONNECT` accept loop and every `[[tcp_forward]]` listener.
+///
+/// It lives here, next to [`MAX_UDP_ASSOCS`], because the client config derives
+/// the forwarded-connection budget from it: if the config's idea of the cap and
+/// the runtime semaphore's size ever diverged, a `[[tcp_forward]]` entry could
+/// reserve more permits than the process actually owns, and the deliberate
+/// "forwarding cannot multiply the fd/task ceiling" property would silently
+/// break. The client bin imports this through `myquic2::*`.
+pub const MAX_SOCKS_CONNS: usize = 8192;
+
+/// Default process-wide budget for `[[tcp_forward]]` connections: 3/4 of
+/// [`MAX_SOCKS_CONNS`], so at least 1/4 of the relay permits always stays
+/// available to the SOCKS5 endpoint.
+///
+/// Before this budget existed a forward listener had no admission cap at all:
+/// one exposed listener could hold all 8192 permits (a zero-byte flow keeps its
+/// permit for the 300 s idle window) and refuse every subsequent SOCKS5
+/// CONNECT. The budget bounds that shared-resource denial; an operator who
+/// really wants the whole cap for forwarding raises `max_forward_conns`.
+pub const DEFAULT_FORWARD_CONNS: usize = MAX_SOCKS_CONNS - MAX_SOCKS_CONNS / 4;
+
 /// Hard cap on a server's QUIC ingress endpoints (`quic_endpoints`).
 ///
 /// Each endpoint is a full quinn `Endpoint`: its own UDP socket (a

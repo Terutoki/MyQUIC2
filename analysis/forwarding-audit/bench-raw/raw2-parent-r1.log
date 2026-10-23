@@ -1,0 +1,47 @@
+### supplement arm=parent rep=1 cfg=client-parent.toml date=2026-10-23T10:58:37Z
+18:58  up  3:40, 1 user, load averages: 4.53 5.23 4.59
+--- warmup
+== udp 127.0.0.1:18080 127.0.0.1:19001 2000 64
+udp sent=2000 recv=2000 batch=64 wall=0.078s recv_pps=25704
+== tcpecho 127.0.0.1:18080 127.0.0.1:19000 2097152
+tcpecho bytes=2097152 echoed=2097152 mismatched=0 wall=0.035s 60.2 MB/s OK
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 2 128 20000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=2 target_pps=20000 sent=40000 recv=40000 send_errs=0 wall=2.602s sent_pps=20000 recv_pps=15372 loss=0.000%
+--- measured
+# udp n=10000 x10
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.329s recv_pps=30368
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.331s recv_pps=30252
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.313s recv_pps=31981
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=9998 batch=64 wall=5.340s recv_pps=1872
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.357s recv_pps=27995
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=9999 batch=64 wall=5.357s recv_pps=1866
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.355s recv_pps=28157
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.319s recv_pps=31393
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.286s recv_pps=34928
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.306s recv_pps=32699
+# lat 500 x3
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.060s p50=116 p90=124 p99=136 p999=1385 max=1385 mean=119 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.059s p50=116 p90=124 p99=132 p999=1386 max=1386 mean=119 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.059s p50=115 p90=124 p99=136 p999=1454 max=1454 mean=118 µs
+# lattcp 200 x3
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.058s | connect p50=98 p90=160 p99=465 p999=719 max=719 mean=120 µs | echo p50=129 p90=207 p99=646 p999=2679 max=2679 mean=168 µs
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.064s | connect p50=107 p90=211 p99=341 p999=372 max=372 mean=132 µs | echo p50=138 p90=336 p99=562 p999=2372 max=2372 mean=186 µs
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.051s | connect p50=99 p90=134 p99=255 p999=288 max=288 mean=109 µs | echo p50=131 p90=174 p99=387 p999=442 max=442 mean=146 µs
+# tcpecho 8MiB x5
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=1.780s 4.7 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.107s 78.6 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.158s 53.0 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.088s 95.6 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.305s 27.5 MB/s OK
+--- load
+18:58  up  3:40, 1 user, load averages: 4.72 5.23 4.60

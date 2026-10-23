@@ -435,6 +435,12 @@ impl SessionKind {
 ///
 /// Synchronous (no `.await`), so callers may run it under a recvmmsg burst
 /// borrow.
+///
+/// `#[inline]` because both call sites are per-datagram hot paths and the body
+/// was previously inlined into `process`; without the hint a release build that
+/// chooses to outline it would pay a call boundary per datagram for the SOCKS
+/// path as well as the forward listener's.
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_payload_uplink(
     pool: &ConnPool,

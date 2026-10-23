@@ -7625,11 +7625,14 @@ async fn forward_listener_bind_conflicts_fail_startup() {
         TcpForwardSpec {
             listen,
             target: target.clone(),
+            max_conns: 16,
         },
         ConnPool::new(2, Vec::new(), true, true, 1),
         Arc::new(SharedEgress::default()),
         Duration::from_secs(1),
         rx.clone(),
+        Arc::new(tokio::sync::Semaphore::new(16)),
+        Arc::new(tokio::sync::Semaphore::new(16)),
     )
     .expect_err("an occupied TCP port must fail startup");
     let msg = format!("{err:#}");
@@ -7651,6 +7654,7 @@ async fn forward_listener_bind_conflicts_fail_startup() {
         Arc::new(UdpHub::new()),
         Arc::new(SharedEgress::default()),
         rx,
+        Arc::new(tokio::sync::Semaphore::new(16)),
     )
     .expect_err("an occupied UDP port must fail startup");
     let msg = format!("{err:#}");

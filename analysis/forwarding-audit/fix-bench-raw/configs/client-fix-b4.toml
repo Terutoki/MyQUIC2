@@ -1,0 +1,15 @@
+socks_listen = "127.0.0.1:18080"
+server_addr = "127.0.0.1:18443"
+server_name = "test.com"
+server_cert_file = "/tmp/mq2-bench/server-cert.pem"
+auth_token = ""
+congestion = "bbr"
+gso = true
+keep_alive_secs = 5
+reconnect_timeout_secs = 5
+quic_conns = 4
+
+[[udp_forward]]
+listen = "127.0.0.1:18282"
+target = "127.0.0.1:19001"
+max_sessions = 1

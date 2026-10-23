@@ -67,15 +67,42 @@ quic_conns = 4
 # needs no configuration change; a private/loopback target requires the
 # server's allow_private = true, and a non-loopback listen means any host that
 # can reach it can use this tunnel, so keep it on 127.0.0.1 or firewall it.
+# Up to 256 listeners per protocol. A bad entry (missing/zero port, unspecified
+# target, overlapping listener) fails startup before any socket is created.
+#
+# Forwarding has its own process-wide budgets so it cannot deny the SOCKS5
+# endpoint: both default to 3/4 of the shared SOCKS limit, leaving SOCKS at
+# least 1/4. These are top-level keys; write them before the [[table]]s.
+# Raising either up to the full shared cap (8192 / 4032) deliberately removes
+# the SOCKS reserve; the default is the largest value that still leaves the
+# >= 1/4 reserve.
+# max_forward_conns = 6144        # all tcp_forward connections; 3/4 of 8192
+# max_forward_sessions = 3024     # all udp_forward peers; 3/4 of max_udp_assocs
 #
 # TCP: one accepted connection -> one QUIC bidi stream (half-close and idle
-# semantics match SOCKS CONNECT).
+# semantics match SOCKS CONNECT). Admission: per-listener max_conns -> the
+# process-wide max_forward_conns -> the shared 8192 TCP relay permits; a
+# refusal is an RST. Unset max_conns = the process-wide budget (6144 default).
 # [[tcp_forward]]
 # listen = "127.0.0.1:8080"
 # target = "example.com:80"
+# max_conns = 2048
 #
-# UDP: each client source IP:port gets its own session (shared 4032-session
-# budget, 180 s idle reap); replies are delivered as raw payloads.
+# UDP: each client source IP:port gets its own session (180 s idle reap);
+# replies are delivered as raw payloads. Admission: per-listener max_sessions
+# -> the process-wide max_forward_sessions -> the shared 4032-session hub; when
+# a level refuses a new source the listener first evicts its own oldest peer
+# idle >= 5 s and retries once. Unset max_sessions = the process-wide budget
+# (3024).
+#
+# Each peer also costs one full server-side session (~288 KiB Linux worst-case
+# admission charge; server pool 8192 with a 1024..4096 per-connection fair
+# share), so size these limits against the server pool too. Sustained new-peer
+# churn above budget/180 s keeps the budget full even though peers are
+# short-lived: lower max_sessions to protect SOCKS, but raise
+# max_forward_sessions only deliberately (it eats the SOCKS reserve). A
+# wildcard listen replies from a route-chosen source address, so bind a
+# concrete address for UDP peers that validate the reply source.
 # [[udp_forward]]
 # listen = "127.0.0.1:5353"
 # target = "1.1.1.1:53"

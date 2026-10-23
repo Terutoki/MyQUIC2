@@ -6,7 +6,7 @@
 </picture>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.2-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-555_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-566_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -501,7 +501,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **530 tests** on macOS (lib 262 + client 149 + server 119); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **566 tests** on macOS (lib 273 + client 168 + server 119 + 6 process-level forwarding E2E); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -554,7 +554,7 @@ Fairness is structural: each session has its own FIFO, and the round-robin curso
 
 > **A second ingress mode on the same tunnel.** MyQUIC2 can now take **raw TCP and raw UDP** on configurable local listeners and relay it through the existing QUIC / TLS 1.3 tunnel to a **fixed destination** at the server exit. No SOCKS5-capable client, no application library and **no server-side change** are needed — and every useful combination of **IPv4 and IPv6** works on both sides of the tunnel. This is the feature for machines that only understand "connect to this address and port": printers, cameras, PLCs, databases, DNS, SIP, game servers, WireGuard endpoints, and anything else that cannot be told to use a proxy.
 
-The two ingress modes coexist in one client process and share everything below them — the same `ConnPool`, the same per-slot QUIC endpoints, the same egress classes, the same tunnel, the same admission-first server, and the same MQP-3 rev2 wire for UDP. Forwarding is **opt-in**: leave the tables out and the client behaves exactly like the SOCKS5-only build.
+The two ingress modes coexist in one client process and share everything below them — the same `ConnPool`, the same per-slot QUIC endpoints, the same egress classes, the same tunnel, the same admission-first server, and the same MQP-3 rev2 wire for UDP. Forwarding is **opt-in**: leave the tables out and no forward listener is spawned — the SOCKS5 path runs unchanged.
 
 ### Two ingress modes, one data plane
 
@@ -701,12 +701,12 @@ sequenceDiagram
 - **Half-close is preserved in both directions.** An app FIN becomes a stream FIN and shuts down the target's write side; a target EOF becomes a FIN on the app socket.
 - **Failure is explicit.** If the stream cannot be opened (`wait_conn` timeout, `open_bi` limit, dead connection, header write timeout) the app socket is RST, not FIN — a forward listener has no SOCKS reply that could carry the error, so a reset is the only honest signal. A dead pool connection also self-heals through the same `retire_dead_slot` path SOCKS uses.
 - **300 s idle deadline.** Same value as the SOCKS relay, so a forwarded stream never outlives its SOCKS equivalent.
-- **Same admission budget.** All forwarded connections share the process-wide 8192 TCP relay admission with SOCKS5, so a second per-listener allowance cannot multiply the fd/task ceiling.
+- **Three-level admission, with a SOCKS reserve.** A forwarded connection is admitted only if, in order, (1) its listener's `max_conns` has a free slot, (2) the process-wide `max_forward_conns` budget has a free slot, and (3) the shared 8192-permit TCP relay semaphore has a free slot. The forward budget defaults to **6144** (3/4 of the relay cap), so forwarding as a feature always leaves at least 1/4 of the relay permits to SOCKS5 `CONNECT`. All three permits are held for the flow's lifetime (300 s idle), and a refusal is an RST plus a rate-limited `warn` naming which limit was hit — a per-listener or feature-wide refusal spends no shared relay permit.
 - **Same slot selection.** Destinations whose port is in `interactive_ports` pin to the interactive connection and get stream priority, exactly like SOCKS CONNECT.
 
 ### UDP forwarding: one session per peer, raw replies
 
-A `[[udp_forward]]` entry binds a local UDP socket. Each distinct client source `IP:port` is mapped to **its own MQP-3 rev2 session**, created lazily on the first datagram and kept for the life of the flow. That is what makes the return path work: one server session owns one upstream socket, so replies from the target can only be demultiplexed back to the right peer by their session id. Replies are delivered as **bare payloads** from the configured listen port — never SOCKS5-framed — so an ordinary UDP application sees the same bytes it would see from a local port forward.
+A `[[udp_forward]]` entry binds a local UDP socket. Each distinct client source `IP:port` is mapped to **its own MQP-3 rev2 session**, created lazily on the first datagram and kept for the life of the flow. That is what makes the return path work: one server session owns one upstream socket, so replies from the target can only be demultiplexed back to the right peer by their session id. Replies are delivered as **bare payloads** from the configured listen port — never SOCKS5-framed — so an ordinary UDP application sees the same bytes it would see from a local port forward. (On a wildcard-bound listener the reply's source *address* is route-chosen rather than the address the peer sent to; bind a concrete address if peers validate it — see [IPv4 and IPv6](#ipv4-and-ipv6-on-both-sides-of-the-tunnel).)
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
@@ -751,12 +751,13 @@ sequenceDiagram
     Note over A,B: 180 s bidirectional idle → SESS_CLOSE + hub slot release
 ```
 
-- **Per-peer identity.** The session key is the full client source `IP:port`, so two peers on one listener never share an upstream socket or a reply stream. A peer that reopens from a new source port simply gets a new session; the old one is reaped after the idle window.
+- **Per-peer identity.** The session key is the full client source `IP:port`, so two peers on one listener never share an upstream socket or a reply stream. A peer that reopens from a new source port simply gets a new session; the old one is reaped after the idle window (or, when a new source is refused and it has already been idle ≥ 5 s, evicted early — see the admission bullet below).
 - **No client-side DNS.** The configured target may be a domain; it is resolved and policy-checked by the server, exactly like a SOCKS target. The client never resolves (and never caches) the name.
 - **Datagram semantics preserved.** Payloads up to 8 KiB ride `DATA`/`TRAIN`/`FRAG` and are delivered whole or lost, never turned into a reliable stream. Small payloads from several peers still share one connection-level stager and can be packed into a cross-session `TRAIN dict`.
 - **Egress classes still apply.** The first datagram fixes the session's `UdpBind` (interactive or a bulk shard), so a forwarded DNS/SIP flow cannot queue behind a bulk flow's congestion window.
 - **QUIC reconnect is transparent-ish.** After a redial the same client session id is re-`OPEN`ed on the new connection and the server creates a fresh session; in-flight datagrams are lost (UDP semantics), subsequent traffic continues without a restart.
-- **Peer churn is safe.** A reply written to a peer that has already closed can surface as an ICMP error on an unconnected UDP socket (Linux reports `ECONNREFUSED` on the next receive); the listener treats those as transient, warns once per window and keeps serving every other peer.
+- **Peer churn is safe and non-blocking.** A reply written to a peer that has already closed can surface as an ICMP error on an unconnected UDP socket (Linux reports `ECONNREFUSED` on the next receive); the listener treats those as transient, warns once per window, and immediately resumes serving every peer — there is no fixed pause on the shared listener socket.
+- **Three-level peer admission, with idle eviction.** A new peer session is admitted only if, in order, (1) the listener's `max_sessions` has room, (2) the process-wide `max_forward_sessions` budget has room, and (3) the shared 4032-session `UdpHub` has room. The forward budget defaults to **3024** (3/4 of the effective `max_udp_assocs`), so SOCKS5 `UDP ASSOCIATE` always keeps at least 1/4 of the session pool. When any level refuses a new peer source, the listener first evicts **its own oldest peer that has been idle ≥ 5 s** and retries admission once (so ordinary churn need not wait for the 180 s reap); if there is no such peer or the retry is still refused, the datagram is dropped and counted `REFUSED` (listener/feature budget) or `SESSION_FULL` (shared hub).
 
 ### IPv4 and IPv6, on both sides of the tunnel
 
@@ -842,7 +843,7 @@ target = "192.0.2.53:53"
 listen = "127.0.0.1:53"
 target = "192.0.2.53:53"
 
-# UDP media: per-listener peer cap, separate from the global budget
+# UDP media: per-listener peer cap, under the process-wide forward budget
 [[udp_forward]]
 listen = "127.0.0.1:5060"
 target = "198.51.100.20:5060"
@@ -852,6 +853,7 @@ target = "198.51.100.20:5060"
 - **Bracketed IPv6 literals only.** `target = "[fd00::20]:443"` is correct; an unbracketed `fd00::20:443` is ambiguous and rejected at startup → put brackets around every IPv6 literal, including loopback.
 - **Families are independent, not mixed.** A listener accepts the family it is bound to: an IPv4 literal accepts IPv4 clients, a concrete IPv6 literal accepts IPv6 clients, and the dual-stack wildcard `[::]` accepts both. The **target** family is chosen independently at the exit — v4 listener → v6 target is fine, and so is the reverse.
 - **Wildcard listeners are not loopback.** `0.0.0.0` and `[::]` accept traffic from any reachable interface; the client warns once per such listener.
+- **Wildcard UDP reply source is route-chosen.** `udp_forward` replies are sent with `send_to` on the listener socket, so a wildcard-bound UDP listener lets the kernel pick the reply source address per route. On a multi-homed host that may not be the address the peer originally sent to, and a strict or `connect()`ed UDP client drops such a reply. Bind a concrete address for UDP services that validate the reply source; SOCKS5 does not have this caveat because its relay socket binds the address it advertises to the app.
 - **No specific address is special.** Any global or private unicast literal works; whether the server is allowed to reach a *private* one is the server's `allow_private` decision, and global literals need no extra configuration.
 
 ### Configuration reference
@@ -861,6 +863,7 @@ target = "198.51.100.20:5060"
 [[tcp_forward]]
 listen = "127.0.0.1:8080"          # local IP:port literal
 target = "example.com:80"          # IP:port / host:port, fixed
+# max_conns = 2048                 # optional per-listener connection cap
 
 # UDP: raw datagrams -> one MQP-3 rev2 session per client source IP:port.
 [[udp_forward]]
@@ -869,17 +872,30 @@ target = "1.1.1.1:53"
 # max_sessions = 1024              # optional per-listener peer cap
 ```
 
+Per-entry fields (the two entry types do **not** accept each other's cap key — an unknown field is a startup error):
+
 | Field | Meaning | Default / rule |
 |---|---|---|
 | `listen` | Local bind address. Always an IP literal; local binding never resolves a hostname. | required; non-zero port |
 | `target` | Fixed destination after the tunnel. IPv4 literal, bracketed IPv6 literal, or `host:port` domain. | required; non-zero port; unspecified IPs rejected |
-| `max_sessions` | Concurrent peer sessions for this UDP listener. | `max_udp_assocs` (4032); clamped 1..=4032; ignored by TCP |
+| `max_conns` | Concurrent connections **this** `[[tcp_forward]]` listener may relay. | process-wide `max_forward_conns`; clamped 1..=8192; `0` is a startup error |
+| `max_sessions` | Concurrent peer sessions **this** `[[udp_forward]]` listener may own. | process-wide forward-session budget (3024 at defaults); clamped 1..=4032; `0` is a startup error |
+
+Process-wide budgets shared by every forward listener of one protocol (top-level keys; both are optional):
+
+| Field | Meaning | Default / rule |
+|---|---|---|
+| `max_forward_conns` | Concurrent connections across **all** `[[tcp_forward]]` listeners. | `6144` (3/4 of the 8192 relay cap, so SOCKS keeps ≥ 1/4); clamped 1..=8192 |
+| `max_forward_sessions` | Concurrent peer sessions across **all** `[[udp_forward]]` listeners. | 3/4 of the effective `max_udp_assocs` → **3024** at the shipped 4032 (so SOCKS keeps ≥ 1/4); clamped 1..=4032 |
+
+Setting either budget up to the full shared cap (8192 / 4032) deliberately removes the SOCKS reserve; the default is the largest value that still leaves the ≥ 1/4 reserve.
 
 Validation runs **before** any TLS, QUIC or socket work, and every listener is bound before it is spawned:
 
-- a bad `listen`/`target`, a port 0, an unknown field (serde `deny_unknown_fields`), or a bad `max_sessions` aborts startup with the entry index and field name;
-- listeners on the **same protocol** may not overlap: the same port with the same address, or with either side unspecified, is rejected (this includes the `[::]:1080` versus `127.0.0.1:1080` wildcard case, and IPv4-mapped forms of the same v4 address);
-- a `tcp_forward` may not overlap `socks_listen`; TCP and UDP may share a port number;
+- a bad `listen`/`target`, a port 0, an unknown field (serde `deny_unknown_fields`), a bad `max_sessions`/`max_conns` (`0` is an error), or more than **256 listeners per protocol** aborts startup with the entry index and field name;
+- `target = "0.0.0.0:53"`, `target = "[::]:53"` and the IPv4-mapped form `target = "[::ffff:0.0.0.0]:53"` are all rejected as unspecified (the mapped literal is the IPv4 any-address in a v6 wrapper);
+- listeners on the **same protocol** may not overlap: the same port with the same address, or with a wildcard that covers the other address, is rejected. `0.0.0.0:P` covers every IPv4 address on that port and the dual-stack `[::]:P` covers both families, so the `[::]:1080` versus `127.0.0.1:1080` pair and IPv4-mapped forms of the same v4 address are rejected too. The cross-family rule is asymmetric on purpose: `0.0.0.0:P` does **not** overlap a concrete IPv6 address, because an AF_INET socket cannot receive IPv6 traffic — only the dual-stack `[::]:P` covers both families;
+- a `tcp_forward` may not overlap `socks_listen` (same overlap rule); TCP and UDP may share a port number;
 - if a listener cannot bind (port already in use), client startup fails with the listener address in the error, and the info log line is emitted only after a successful bind.
 
 ### Lifecycle, limits and observability
@@ -889,12 +905,12 @@ Validation runs **before** any TLS, QUIC or socket work, and every listener is b
 stateDiagram-v2
     direction LR
     [*] --> Validated : parse + overlap checks
-    Validated --> Failed : bad entry · overlap · busy port
+    Validated --> Failed : bad entry · overlap · busy port · over 256 listeners
     Failed --> [*]
     Validated --> Bound : bind listener
     Bound --> Serving : spawn listener task
     Serving --> Serving : TCP accept · UDP datagram
-    Serving --> Reaped : TCP close · UDP idle 180 s
+    Serving --> Reaped : TCP close · UDP idle 180 s · UDP eviction after 5 s idle
     Reaped --> Serving : next connection · next datagram
     Serving --> Draining : SIGTERM / SIGINT
     Draining --> [*] : close listeners · SESS_CLOSE · release session slots
@@ -909,14 +925,15 @@ stateDiagram-v2
 
 | Resource | Bound | Shared with SOCKS? |
 |---|---|---|
-| TCP forwarded connections | 8192 process-wide relay admission | yes, same semaphore |
+| TCP forwarded connections | three levels: per-listener `max_conns` → process-wide `max_forward_conns` (6144 default) → shared 8192 relay admission | yes, at the last level (same semaphore); the forward budget reserves ≥ 1/4 for SOCKS |
 | One TCP forwarded stream | 300 s bidirectional idle; 5 s open/header budgets | same pump and budgets as CONNECT |
-| UDP forwarded sessions | `max_udp_assocs` (4032) process-wide, plus optional per-listener `max_sessions` | yes, same hub budget |
-| One UDP session | 180 s bidirectional idle, then `SESS_CLOSE` (best effort; server sweep is the backstop) | same idle window as an association |
+| UDP forwarded sessions | three levels: per-listener `max_sessions` (default = the forward-session budget) → process-wide `max_forward_sessions` (3024 default) → shared `max_udp_assocs` (4032) | yes, at the last level (same hub); the forward budget reserves ≥ 1/4 for SOCKS |
+| One UDP session | 180 s bidirectional idle, then `SESS_CLOSE` (best effort; server sweep is the backstop); a refused admission first evicts that listener's own peer idle ≥ 5 s and retries once | same idle window as an association |
+| One UDP peer, server side | one complete server session (dual-stack socket + reply-reader task) with a ~288 KiB Linux worst-case admission charge — the price the server's pool is sized at against `max_peer_memory_mb` — from the server's 8192-session pool with a per-connection fair share of `clamp(8192 / holders, 1024, 4096)` | yes — the same server session pool a SOCKS association draws from |
 | UDP payload | 8 KiB per datagram, fragmented above the live DATAGRAM budget | same MQP-3 rev2 limits |
-| Listener task | one task per configured listener; no per-peer task or socket | — |
+| Listener task | one task per configured listener; no per-peer client task or socket; at most 256 listeners per protocol | — |
 
-Observability is deliberately boring: one `info` line per bound listener, a non-loopback `warn`, rate-limited accept/relay/admission/refused warnings, and the existing `dgram_drops` classes (`TOO_LARGE`, `NO_EGRESS`, `EGRESS_DEAD`, `SESSION_FULL`, `REFUSED`, …) plus `udp_stats::session()` for UDP peers. A forwarded flow therefore shows up in the same 60 s report as a SOCKS flow — no separate dashboard.
+Observability is deliberately boring: one `info` line per bound listener that carries its effective caps (`max_conns=…` for TCP, `max_sessions=…` plus `forward_session_budget=…` for UDP), a non-loopback `warn`, and rate-limited accept/relay/admission/refused warnings with **separate** one-per-window slots for the per-listener cap, the process-wide forward budget and the shared relay/hub limit — one flood cannot silence the other two. Drop accounting uses the existing `dgram_drops` classes (`TOO_LARGE`, `NO_EGRESS`, `EGRESS_DEAD`, `SESSION_FULL`, `REFUSED`, …), where `REFUSED` covers a listener/feature budget refusal and `SESSION_FULL` the shared hub, plus `udp_stats::session()` for UDP peers. A forwarded flow therefore shows up in the same 60 s report as a SOCKS flow — no separate dashboard.
 
 ### SOCKS5 or forwarding?
 
@@ -927,14 +944,16 @@ Observability is deliberately boring: one `info` line per bound listener, a non-
 | TCP path | `CONNECT` | `tcp_forward` |
 | UDP path | `UDP ASSOCIATE` with SOCKS5 UDP request headers | `udp_forward`, raw datagrams |
 | Address families | whatever the app asks for | listener and target families are independent; IPv4, IPv6, dual-stack |
-| Admission / limits | shared process budgets | the same shared budgets |
+| Admission / limits | shared process budgets (8192 TCP / 4032 UDP) | same budgets behind dedicated forward budgets (`max_forward_conns` 6144 / `max_forward_sessions` 3024 by default) plus per-listener caps, so forwarding cannot take SOCKS's reserved ≥ 1/4 |
 | Best fit | browsers, `curl`, apps with proxy settings | appliances, databases/brokers/SSH, UDP services, fixed-destination deployments |
 
 ### Operational notes
 
 - **Server changes: none.** Forwarding uses the existing TCP target header and the existing rev2 `DATA OPEN`; the server binary, its config schema and the MQP-3 rev2 wire are untouched. A private/loopback/link-local/ULA target still requires the server's `allow_private = true`, and `auth_token` should stay set in that posture.
-- **Bind loopback unless you mean it.** A non-loopback listener lets any host that can reach it use that one fixed tunnel; bind `127.0.0.1` / `[::1]` for local applications, or bind a LAN address and firewall it deliberately.
-- **Plan session capacity.** Each UDP peer costs one client session out of the shared 4032 budget, and one server session out of the server's global pool; a listener with heavy peer churn should set `max_sessions` so it cannot consume the whole budget during a scan or flood.
+- **Bind loopback unless you mean it.** A non-loopback listener lets any host that can reach it use that one fixed tunnel; bind `127.0.0.1` / `[::1]` for local applications, or bind a LAN address and firewall it deliberately. For UDP, prefer a concrete address over a wildcard when peers validate the reply source (a wildcard listener's reply source is route-chosen, see the dual-stack section).
+- **Each UDP peer is a full server session.** Every forwarded peer owns one client session *and* one complete server-side session: a dual-stack socket, a reply-reader task, and a ~288 KiB Linux worst-case admission charge — the figure the server prices each session at when sizing its pool against `max_peer_memory_mb`. The server pool is 8192 sessions with a per-connection fair share of `clamp(8192 / session-holding connections, 1024, 4096)`, so a forward client on a shared server can be capped below its own 4032. Size `max_sessions` / `max_forward_sessions` against the **server** pool, not just the client's.
+- **Churn is rate-limited too, not just counted.** A peer session lives 180 s after its last activity in either direction, so sustained *new-source* churn above roughly `max_forward_sessions / 180` new peers per second (≈ 17/s at the default 3024) keeps the forward budget full even though each peer is short-lived. Forwarding evicts its own peers idle ≥ 5 s to absorb bursts; beyond that the excess is dropped (`REFUSED`) until churn stops. Lowering `max_sessions` protects SOCKS from forwarding but does **not** fix forwarding's own churn failure — lower it, reduce the peer-source rate, and raise `max_forward_sessions` only deliberately, since that eats the SOCKS reserve.
+- **One warn line per saturated level.** The three admission levels have separate rate-limited warnings — TCP: `listener connection limit`, `process-wide forward connection budget`, `relay connection limit`; UDP: `listener session limit`, `process-wide forward session budget exhausted`, `sessions exhausted (max_udp_assocs)` — so check which one fires before changing a knob.
 - **Same revision on both ends.** Forwarding is a client feature, but the client still needs a matching server revision (same MQP-3 wire rev2, same TLS pinned certificate).
 
 ## 📊 Performance
@@ -1033,14 +1052,14 @@ The client and server must run the **same revision**. Certificates are generated
 
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_egress_conns`, `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
-- **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
+- **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Per-listener caps (`max_conns` / `max_sessions`) sit under process-wide forward budgets (`max_forward_conns` / `max_forward_sessions`, both defaulting to 3/4 of the shared SOCKS limit) so forwarding cannot deny the SOCKS endpoint. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
 - **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
 The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **555 tests** on the macOS dev box (lib 269 + client 161 + server 119 + 6 process-level forwarding E2E).
+- **566 tests** on the macOS dev box (lib 273 + client 168 + server 119 + 6 process-level forwarding E2E).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, legacy MQP-2 receive paths, and the client forward listeners (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 6 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.

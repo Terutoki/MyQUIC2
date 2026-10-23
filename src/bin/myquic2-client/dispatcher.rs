@@ -747,6 +747,7 @@ pub(crate) fn flush_staged(
             .expect("a flush run head always carries the relay socket");
         let run_app = staged[i].app;
         let run_v6 = staged[i].reply_v6;
+        let run_raw = staged[i].raw;
         let run_dst = if run_v6 {
             map_for_dual(run_app)
         } else {
@@ -756,6 +757,7 @@ pub(crate) fn flush_staged(
         while j < staged.len()
             && staged[j].app == run_app
             && staged[j].reply_v6 == run_v6
+            && staged[j].raw == run_raw
             && staged[j]
                 .sock
                 .as_ref()
@@ -764,7 +766,11 @@ pub(crate) fn flush_staged(
             // A `None` item inherits this run; a `Some` item whose socket is
             // a different relay ends it. A `None` can only follow its own
             // frame's head (staging emits frames consecutively), so
-            // inheritance never crosses runs.
+            // inheritance never crosses runs. `raw` joins the run key even
+            // though one relay socket currently implies one reply mode: the
+            // empty-header vs SOCKS-header choice is per item, so a future
+            // second entry on one socket must split the run instead of
+            // mixing a framed and an unframed datagram into one sendmsg.
             j += 1;
         }
         let mut k = i;

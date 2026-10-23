@@ -1,0 +1,49 @@
+### rate=32000 arm=parent rep=1 2026-10-23T11:02:06Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 32000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=32000 sent=128000 recv=128000 send_errs=0 wall=4.601s sent_pps=32000 recv_pps=27818 loss=0.000%
+### rate=32000 arm=headA rep=1 2026-10-23T11:02:12Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 32000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=32000 sent=127999 recv=127959 send_errs=0 wall=4.602s sent_pps=32000 recv_pps=27802 loss=0.031%
+### rate=36000 arm=parent rep=1 2026-10-23T11:02:18Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 36000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=36000 sent=144003 recv=144003 send_errs=0 wall=4.603s sent_pps=36001 recv_pps=31287 loss=0.000%
+### rate=36000 arm=headA rep=1 2026-10-23T11:02:25Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 36000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=36000 sent=144003 recv=143710 send_errs=0 wall=4.604s sent_pps=36001 recv_pps=31212 loss=0.203%
+### rate=40000 arm=parent rep=1 2026-10-23T11:02:31Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 40000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=40000 sent=159999 recv=159999 send_errs=0 wall=4.603s sent_pps=40000 recv_pps=34761 loss=0.000%
+### rate=40000 arm=headA rep=1 2026-10-23T11:02:38Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 40000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=40000 sent=159999 recv=159999 send_errs=0 wall=4.603s sent_pps=40000 recv_pps=34762 loss=0.000%
+### rate=44000 arm=parent rep=1 2026-10-23T11:02:44Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 44000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=44000 sent=176000 recv=176000 send_errs=0 wall=4.605s sent_pps=44000 recv_pps=38221 loss=0.000%
+### rate=44000 arm=headA rep=1 2026-10-23T11:02:51Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 44000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=44000 sent=176001 recv=174638 send_errs=0 wall=4.603s sent_pps=44000 recv_pps=37943 loss=0.774%
+### rate=32000 arm=headA rep=2 2026-10-23T11:02:57Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 32000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=32000 sent=127999 recv=127999 send_errs=0 wall=4.602s sent_pps=32000 recv_pps=27813 loss=0.000%
+### rate=32000 arm=parent rep=2 2026-10-23T11:03:04Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 32000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=32000 sent=127999 recv=127791 send_errs=0 wall=4.603s sent_pps=32000 recv_pps=27764 loss=0.163%
+### rate=36000 arm=headA rep=2 2026-10-23T11:03:10Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 36000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=36000 sent=144003 recv=143996 send_errs=0 wall=4.602s sent_pps=36001 recv_pps=31288 loss=0.005%
+### rate=36000 arm=parent rep=2 2026-10-23T11:03:17Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 36000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=36000 sent=144003 recv=143913 send_errs=0 wall=4.603s sent_pps=36001 recv_pps=31263 loss=0.062%
+### rate=40000 arm=headA rep=2 2026-10-23T11:03:23Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 40000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=40000 sent=159999 recv=159688 send_errs=0 wall=4.608s sent_pps=40000 recv_pps=34655 loss=0.194%
+### rate=40000 arm=parent rep=2 2026-10-23T11:03:29Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 40000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=40000 sent=159999 recv=159795 send_errs=0 wall=4.603s sent_pps=40000 recv_pps=34716 loss=0.128%
+### rate=44000 arm=headA rep=2 2026-10-23T11:03:36Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 44000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=44000 sent=176001 recv=173008 send_errs=0 wall=4.605s sent_pps=44000 recv_pps=37566 loss=1.701%
+### rate=44000 arm=parent rep=2 2026-10-23T11:03:42Z
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 4 128 44000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=4 target_pps=44000 sent=176001 recv=175975 send_errs=0 wall=4.604s sent_pps=44000 recv_pps=38219 loss=0.015%
+KNEE DONE

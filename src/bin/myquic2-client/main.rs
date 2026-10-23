@@ -367,6 +367,25 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         (eps, Vec::new())
     };
 
+    // Parse the SOCKS listen address before any forward listener binds: a typo
+    // must not leave forward ports bound while startup rejects the config (and
+    // the forward overlap validation uses this address too).
+    let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
+
+    // Process-wide forwarding budgets, one semaphore per protocol, shared by
+    // every listener of that protocol. They exist so forwarding cannot consume
+    // the whole relay/session pool and deny the SOCKS endpoint: the default
+    // leaves 1/4 of each pool to SOCKS (see `ClientConf::forward_conn_budget` /
+    // `forward_session_budget`). They are lifetime permits: a forwarded TCP flow
+    // holds one until it closes, a UDP peer session holds one until it is
+    // reaped/closed.
+    let forward_conn_budget = Arc::new(tokio::sync::Semaphore::new(c.forward_conn_budget()));
+    let forward_session_budget = Arc::new(tokio::sync::Semaphore::new(c.forward_session_budget()));
+    // The shared process-wide TCP relay semaphore is passed explicitly (instead
+    // of each listener fetching the global) so the admission helper is testable
+    // with a small semaphore and the startup log can name the same number.
+    let relay_limiter = socks_conn_limiter().clone();
+
     // Config-driven forward listeners: bound and spawned before the SOCKS
     // accept loop so a bind failure aborts startup, and so their first
     // datagram/connection never waits behind SOCKS negotiation.
@@ -374,10 +393,13 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     for spec in tcp_forwards {
         // Spawn first (it binds): a log line must never claim a listener that
         // the following `?` then fails to create.
+        let max_conns = spec.max_conns;
         let line = format!(
-            "tcp_forward {} -> {} via QUIC (bound)",
+            "tcp_forward {} -> {} via QUIC (max_conns={max_conns}, \
+             forward_conn_budget={}, shared_relay_limit={MAX_SOCKS_CONNS}, bound)",
             spec.listen,
-            display_target(&spec.target)
+            display_target(&spec.target),
+            c.forward_conn_budget()
         );
         forward::spawn_tcp_forward(
             spec,
@@ -385,6 +407,8 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             egress_shared.clone(),
             timeout,
             shutdown_rx.clone(),
+            forward_conn_budget.clone(),
+            relay_limiter.clone(),
         )?;
         info!("{line}");
     }
@@ -398,14 +422,15 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             hub.clone(),
             egress_shared.clone(),
             shutdown_rx.clone(),
+            forward_session_budget.clone(),
         )?;
         info!(
             "udp_forward {listen} -> {target} (max_sessions={max_sessions}, \
-             per-peer sessions, 180s idle reap)"
+             forward_session_budget={}, per-peer sessions, 180s idle reap)",
+            c.forward_session_budget()
         );
     }
 
-    let listen: SocketAddr = c.socks_listen.parse().context("bad socks_listen")?;
     let li = tokio::net::TcpListener::from_std(tcp_listener_dual(&c.socks_listen)?)?;
     info!(
         "socks5 listening on {listen} -> QUIC {server_str_log} (dns=server-side, token={}, tls13-pinned, 0rtt)",

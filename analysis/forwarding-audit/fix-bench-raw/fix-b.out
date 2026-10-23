@@ -1,0 +1,85 @@
+### B1: tcp_forward max_conns=2, 5 concurrent raw TCP connections, hold 2, then close+new
+conn[0] connect=ok verdict=admitted
+conn[1] connect=ok verdict=admitted
+conn[2] connect=ok verdict=refused-RST detail=ConnectionResetError(54, 'Connection reset by peer')
+conn[3] connect=ok verdict=refused-RST detail=ConnectionResetError(54, 'Connection reset by peer')
+conn[4] connect=ok verdict=refused-RST detail=ConnectionResetError(54, 'Connection reset by peer')
+SUMMARY n=5 admitted=2 refused=3
+closed one admitted connection; waiting for capacity
+after_close_new=admitted attempt=0
+AFTER_CLOSE_RESULT PASS
+RESULT PASS
+-- client log refusal lines:
+2026-10-23T11:36:13.923996Z  WARN myquic2_client::forward: tcp_forward 127.0.0.1:18181 listener connection limit 2 reached; dropping 127.0.0.1:57480
+### B2: max_forward_conns=2 (listener max_conns=5), 5 concurrent, hold 2
+conn[0] connect=ok verdict=admitted
+conn[1] connect=ok verdict=admitted
+conn[2] connect=ok verdict=refused-RST detail=ConnectionResetError(54, 'Connection reset by peer')
+conn[3] connect=ok verdict=refused-RST detail=ConnectionResetError(54, 'Connection reset by peer')
+conn[4] connect=ok verdict=refused-RST detail=ConnectionResetError(54, 'Connection reset by peer')
+SUMMARY n=5 admitted=2 refused=3
+closed one admitted connection; waiting for capacity
+after_close_new=admitted attempt=0
+AFTER_CLOSE_RESULT PASS
+RESULT PASS
+-- client log refusal lines:
+2026-10-23T11:36:15.957815Z  WARN myquic2_client::forward: tcp_forward 127.0.0.1:18181 process-wide forward connection budget exhausted; dropping 127.0.0.1:57489 (raise max_forward_conns or lower max_conns)
+### B3: udp_forward max_sessions=2, 5 distinct source ports (1 datagram each), then age 5.2 s + new peer
+peer[0] verdict=admitted rtt_ms=1.92
+peer[1] verdict=admitted rtt_ms=1.64
+peer[2] verdict=refused-timeout
+peer[3] verdict=refused-timeout
+peer[4] verdict=refused-timeout
+SUMMARY n=5 admitted=2 refused=3
+aging: keeping 5 source sockets open and idle for 5.2s
+aged_new_peer=admitted after 27.50s (rtt_ms=0.81)
+AGING_RESULT PASS
+-- client log refusal lines:
+2026-10-23T11:36:17.963791Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:57874 (1 so far)
+2026-10-23T11:36:19.165979Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:53423 (3 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:24.972236Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:50370 (4 so far)
+2026-10-23T11:36:26.380698Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:50681 (6 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:27.793618Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:59822 (8 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:29.204041Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:56193 (10 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:30.616387Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:52490 (12 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:32.027273Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 2 reached; dropping datagram from 127.0.0.1:50457 (14 so far) (1 similar suppressed in the last second)
+### B4: eviction, max_sessions=1, peer A replies then idle, peer B retries (reply-activity path)
+peerA=admitted(reply received)
+peerB=admitted attempts=50 b_admit_latency=34.52s a_idle_at_admit=35.02s
+EVICT_RESULT PASS (admit latency must be << 180 s idle-reap)
+-- client log refusal lines:
+2026-10-23T11:36:54.879674Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (1 so far)
+2026-10-23T11:36:56.286795Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (3 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:57.696586Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (5 so far) (1 similar suppressed in the last second)
+2026-10-23T11:36:59.103451Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (7 so far) (1 similar suppressed in the last second)
+2026-10-23T11:37:00.510804Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (9 so far) (1 similar suppressed in the last second)
+2026-10-23T11:37:01.918821Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (11 so far) (1 similar suppressed in the last second)
+2026-10-23T11:37:03.326181Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (13 so far) (1 similar suppressed in the last second)
+2026-10-23T11:37:04.738012Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:49351 (15 so far) (1 similar suppressed in the last second)
+### B4b control: eviction with black-hole target (no reply activity), max_sessions=1
+peerA=sent (black-hole target, no reply expected)
+peerB=refused after 20s cap, attempts=29
+EVICT_NOREPLY_RESULT FAIL
+-- client log refusal lines:
+### B5: forwarding path regression sanity (default limits): udp_forward pps, 50 peers, SHA-256 TCP bulk
+-- udp_forward pps 1000B n=10000 batch=64 x5
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.334s recv_pps=29961 loss=0.000% OK
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.324s recv_pps=30874 loss=0.000% OK
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=9998 mismatched=0 wall=5.310s recv_pps=1883 loss=0.020% INCOMPLETE
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=9998 mismatched=0 wall=5.323s recv_pps=1878 loss=0.020% INCOMPLETE
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.327s recv_pps=30573 loss=0.000% OK
+-- udp_forward 50 peers x 2000 dgrams 128B batch 32 x2
+udp-multi listen=127.0.0.1:18282 peers=50 n_per_peer=2000 batch=32 payload=128 sent=100000 recv=100000 mismatched=0 wall=2.034s recv_pps=49167 loss=0.000% max_peer_wall=2.033s OK
+udp-multi listen=127.0.0.1:18282 peers=50 n_per_peer=2000 batch=32 payload=128 sent=100000 recv=100000 mismatched=0 wall=1.946s recv_pps=51391 loss=0.000% max_peer_wall=1.943s OK
+-- tcp_forward SHA-256 8MiB x10
+tcpverify fwd-1 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.294s 28.5 MB/s OK writer_err=None
+tcpverify fwd-2 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.420s 20.0 MB/s OK writer_err=None
+tcpverify fwd-3 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.133s 63.1 MB/s OK writer_err=None
+tcpverify fwd-4 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.096s 87.8 MB/s OK writer_err=None
+tcpverify fwd-5 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.094s 89.3 MB/s OK writer_err=None
+tcpverify fwd-6 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.307s 27.4 MB/s OK writer_err=None
+tcpverify fwd-7 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.092s 90.9 MB/s OK writer_err=None
+tcpverify fwd-8 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.088s 95.5 MB/s OK writer_err=None
+tcpverify fwd-9 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.091s 92.3 MB/s OK writer_err=None
+tcpverify fwd-10 endpoint=127.0.0.1:18181 bytes=8388608 echoed=8388608 sha256_match=True wall=0.091s 92.1 MB/s OK writer_err=None
+FIX_B_DONE 2026-10-23T11:38:18Z

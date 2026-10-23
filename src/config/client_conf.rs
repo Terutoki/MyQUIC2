@@ -4,8 +4,8 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use super::tuning::{
-    DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, MAX_POOL_CONNS, MAX_UDP_ASSOCS,
-    MAX_UDP_EGRESS_CONNS, d_5, d_bbr, d_keepalive, d_true,
+    DEFAULT_FORWARD_CONNS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, MAX_POOL_CONNS,
+    MAX_SOCKS_CONNS, MAX_UDP_ASSOCS, MAX_UDP_EGRESS_CONNS, d_5, d_bbr, d_keepalive, d_true,
 };
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
@@ -135,6 +135,25 @@ pub struct ClientConf {
     /// logged once per window, like the SOCKS admission cap.
     #[serde(default)]
     pub max_udp_assocs: Option<usize>,
+    /// Process-wide cap on concurrent sessions across **all** `[[udp_forward]]`
+    /// listeners. Unset = 3/4 of the effective [`Self::udp_assoc_count`]
+    /// (≈3024 at the shipped 4032), so at least 1/4 of the process UDP-session
+    /// budget always stays available to SOCKS5 `UDP ASSOCIATE`.
+    ///
+    /// This is the aggregate budget; one `[[udp_forward]]` entry's own
+    /// `max_sessions` bounds that listener inside it. Without the aggregate
+    /// budget a single busy forward listener (default `max_sessions` = the whole
+    /// process cap) could fill the hub and deny new SOCKS associations for up to
+    /// the 180 s idle reap, which is exactly the failure this knob prevents.
+    /// Clamped to `1..=MAX_UDP_ASSOCS`.
+    #[serde(default)]
+    pub max_forward_sessions: Option<usize>,
+    /// Process-wide cap on concurrent connections across **all**
+    /// `[[tcp_forward]]` listeners. Unset = [`DEFAULT_FORWARD_CONNS`] (3/4 of
+    /// the shared relay cap, i.e. 6144), leaving at least 1/4 of the relay
+    /// permits for SOCKS5 `CONNECT`. Clamped to `1..=MAX_SOCKS_CONNS`.
+    #[serde(default)]
+    pub max_forward_conns: Option<usize>,
     /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).
     /// Unset/empty = `h3` masquerade.
     #[serde(default)]
@@ -167,6 +186,12 @@ pub struct ForwardEntry {
     /// Destination after the QUIC hop, `IP:port` or `host:port`. A domain is
     /// resolved and policy-checked by the **server**, like every SOCKS target.
     pub target: String,
+    /// Concurrent connections this listener may relay. Unset = the process-wide
+    /// `max_forward_conns` budget (no extra per-listener constraint); clamped to
+    /// `1..=MAX_SOCKS_CONNS`. Ignored by `[[udp_forward]]` (it has
+    /// `max_sessions`).
+    #[serde(default)]
+    pub max_conns: Option<usize>,
 }
 
 /// UDP variant of [`ForwardEntry`] with the optional per-listener session cap.
@@ -176,7 +201,9 @@ pub struct UdpForwardEntry {
     pub listen: String,
     pub target: String,
     /// Concurrent per-peer sessions for this listener. Unset = the process-wide
-    /// `max_udp_assocs` (no extra constraint); clamped to `1..=MAX_UDP_ASSOCS`.
+    /// forward-session budget ([`ClientConf::forward_session_budget`]), which is
+    /// itself below `max_udp_assocs` so SOCKS keeps a reserved share; clamped to
+    /// `1..=MAX_UDP_ASSOCS`.
     #[serde(default)]
     pub max_sessions: Option<usize>,
 }
@@ -186,6 +213,8 @@ pub struct UdpForwardEntry {
 pub struct TcpForwardSpec {
     pub listen: SocketAddr,
     pub target: TargetAddr,
+    /// Effective per-listener connection cap (`1..=MAX_SOCKS_CONNS`).
+    pub max_conns: usize,
 }
 
 /// A validated UDP forward listener.
@@ -228,6 +257,33 @@ impl ClientConf {
             .clamp(1, MAX_UDP_ASSOCS)
     }
 
+    /// Process-wide cap on concurrent sessions across all `[[udp_forward]]`
+    /// listeners: `max_forward_sessions` when set, else 3/4 of the effective
+    /// [`Self::udp_assoc_count`] (never below 1). Clamped to
+    /// `1..=MAX_UDP_ASSOCS`.
+    ///
+    /// The default deliberately leaves a quarter of the process UDP-session
+    /// budget reserved for SOCKS5 `UDP ASSOCIATE`: forwarding is a shared
+    /// consumer of `UdpHub`, and without the reserve a churn-heavy listener can
+    /// fill it and deny SOCKS for up to the 180 s idle reap. An operator who
+    /// wants the whole budget for forwarding sets `max_forward_sessions`.
+    pub fn forward_session_budget(&self) -> usize {
+        let udp_cap = self.udp_assoc_count();
+        self.max_forward_sessions
+            .unwrap_or_else(|| default_forward_share(udp_cap))
+            .clamp(1, MAX_UDP_ASSOCS)
+    }
+
+    /// Process-wide cap on concurrent connections across all
+    /// `[[tcp_forward]]` listeners: `max_forward_conns` when set, else
+    /// [`DEFAULT_FORWARD_CONNS`] (3/4 of [`MAX_SOCKS_CONNS`]). Clamped to
+    /// `1..=MAX_SOCKS_CONNS`.
+    pub fn forward_conn_budget(&self) -> usize {
+        self.max_forward_conns
+            .unwrap_or(DEFAULT_FORWARD_CONNS)
+            .clamp(1, MAX_SOCKS_CONNS)
+    }
+
     pub fn interactive_port_list(&self) -> Vec<u16> {
         self.interactive_ports
             .clone()
@@ -267,6 +323,13 @@ impl ClientConf {
     /// listener that "just does not start" is indistinguishable from a typo,
     /// and the operator has no other signal (the process would look healthy).
     pub fn tcp_forwards(&self) -> anyhow::Result<Vec<TcpForwardSpec>> {
+        if self.tcp_forward.len() > MAX_FORWARD_LISTENERS {
+            bail!(
+                "{} [[tcp_forward]] entries configured: more than the {MAX_FORWARD_LISTENERS} \
+                 listener cap (each listener owns a socket, a task and a backlog queue)",
+                self.tcp_forward.len()
+            );
+        }
         let socks = self.socks_listen.parse::<SocketAddr>().ok();
         let mut seen: Vec<(usize, SocketAddr)> = Vec::with_capacity(self.tcp_forward.len());
         let mut out = Vec::with_capacity(self.tcp_forward.len());
@@ -291,8 +354,14 @@ impl ClientConf {
                 );
             }
             seen.push((i, listen));
+            let max_conns = match e.max_conns {
+                Some(0) => bail!("tcp_forward[{i}].max_conns 0: must be >= 1"),
+                Some(n) => n.clamp(1, MAX_SOCKS_CONNS),
+                None => self.forward_conn_budget(),
+            };
             out.push(TcpForwardSpec {
                 listen,
+                max_conns,
                 target: parse_forward_target("tcp_forward", i, &e.target)?,
             });
         }
@@ -302,6 +371,13 @@ impl ClientConf {
     /// Validate and lower the `[[udp_forward]]` tables (see
     /// [`ClientConf::tcp_forwards`] for the error-shape rationale).
     pub fn udp_forwards(&self) -> anyhow::Result<Vec<UdpForwardSpec>> {
+        if self.udp_forward.len() > MAX_FORWARD_LISTENERS {
+            bail!(
+                "{} [[udp_forward]] entries configured: more than the {MAX_FORWARD_LISTENERS} \
+                 listener cap (each listener owns a socket, a task and a 30 s timer)",
+                self.udp_forward.len()
+            );
+        }
         let mut seen: Vec<(usize, SocketAddr)> = Vec::with_capacity(self.udp_forward.len());
         let mut out = Vec::with_capacity(self.udp_forward.len());
         for (i, e) in self.udp_forward.iter().enumerate() {
@@ -319,7 +395,7 @@ impl ClientConf {
             let max_sessions = match e.max_sessions {
                 Some(0) => bail!("udp_forward[{i}].max_sessions 0: must be >= 1"),
                 Some(n) => n.clamp(1, MAX_UDP_ASSOCS),
-                None => self.udp_assoc_count(),
+                None => self.forward_session_budget(),
             };
             out.push(UdpForwardSpec {
                 listen,
@@ -329,6 +405,25 @@ impl ClientConf {
         }
         Ok(out)
     }
+}
+
+/// Upper bound on configured forward listeners per protocol (`[[tcp_forward]]`
+/// and `[[udp_forward]]` are capped independently).
+///
+/// Each listener owns a socket, a task and (TCP) a 1024-deep backlog queue;
+/// validation is also O(n²) in the listener count. A generated config with
+/// thousands of entries would stall startup and pin kernel queues, so the
+/// count is capped rather than silently accepted. The ceiling is far above any
+/// real port-forward deployment.
+pub const MAX_FORWARD_LISTENERS: usize = 256;
+
+/// Share of a process budget that forwarding may take by default: everything
+/// but a quarter, so the SOCKS endpoint always keeps a reserve. The quarter is
+/// floored at one slot and the result is floored at one, so even the tiniest
+/// caps (`max_udp_assocs` 2..=7) keep a genuine SOCKS reserve instead of
+/// silently granting forwarding the whole budget.
+fn default_forward_share(cap: usize) -> usize {
+    cap.saturating_sub((cap / 4).max(1)).max(1)
 }
 
 /// Fold an IPv4-mapped IPv6 address back to IPv4, so `[::ffff:127.0.0.1]` and
@@ -346,20 +441,34 @@ fn unmap_listen_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 /// Whether two configured listen addresses can accept the same traffic.
 ///
 /// Exact equality is not enough. Both sockets are local, on the same port, and
-/// `tcp_listener_dual` binds IPv6 listeners dual-stack; an unspecified address
-/// covers every address of its family and the v4/v6 wildcards overlap each
-/// other. With the shipped `socks_listen = "[::]:1080"`, a
-/// `[[tcp_forward]] listen = "127.0.0.1:1080"` must be rejected: the forward
-/// listener binds first, SOCKS still binds the dual-stack wildcard on some
-/// platforms, and loopback SOCKS clients would silently be relayed to the
-/// forward target.
+/// `tcp_listener_dual` / `udp_socket_dual` bind an IPv6 socket dual-stack; an
+/// unspecified address covers every address of its family and — for an IPv6
+/// wildcard, which is dual-stack — every IPv4 address too. With the shipped
+/// `socks_listen = "[::]:1080"`, a `[[tcp_forward]] listen = "127.0.0.1:1080"`
+/// must be rejected: the forward listener binds first, SOCKS still binds the
+/// dual-stack wildcard on some platforms, and loopback SOCKS clients would
+/// silently be relayed to the forward target.
+///
+/// The cross-family case is deliberately asymmetric: an IPv4 wildcard
+/// (`0.0.0.0:P`) does **not** overlap a concrete IPv6 address, because an
+/// AF_INET socket cannot receive IPv6 traffic; rejecting that pair would refuse
+/// a configuration that binds cleanly. Only the IPv6 wildcard (`[::]:P`) covers
+/// the other family, because it is bound with `V6ONLY=0`.
 fn listen_overlaps(a: SocketAddr, b: SocketAddr) -> bool {
+    use std::net::IpAddr;
     if a.port() != b.port() {
         return false;
     }
     let a_ip = unmap_listen_ip(a.ip());
     let b_ip = unmap_listen_ip(b.ip());
-    a_ip == b_ip || a_ip.is_unspecified() || b_ip.is_unspecified()
+    match (a_ip, b_ip) {
+        (IpAddr::V4(x), IpAddr::V4(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+        (IpAddr::V6(x), IpAddr::V6(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+        // A v4-mapped form was unmapped to V4 above, so a cross-family pair here
+        // is a genuine v4 address vs a genuine v6 address. Only the v6 wildcard
+        // (dual-stack) can receive the v4 traffic.
+        (IpAddr::V6(v6), IpAddr::V4(_)) | (IpAddr::V4(_), IpAddr::V6(v6)) => v6.is_unspecified(),
+    }
 }
 
 /// Parse one forward `listen` value: an `IP:port` literal with a non-zero port.
@@ -395,7 +504,12 @@ fn parse_forward_target(kind: &str, idx: usize, raw: &str) -> anyhow::Result<Tar
         if addr.port() == 0 {
             bail!("{kind}[{idx}].target {raw:?}: port 0 is not a valid target port");
         }
-        if addr.ip().is_unspecified() {
+        // Unmap before the unspecified test: `[::ffff:0.0.0.0]:80` is the
+        // IPv4-any address, not a concrete IPv6 address, and `Ipv6Addr::
+        // is_unspecified` is false for the mapped form. Without the unmap it
+        // slips past both this check and the shared wire encoder's
+        // "refuse unspecified" rule and the server may dial its own loopback.
+        if unmap_listen_ip(addr.ip()).is_unspecified() {
             bail!("{kind}[{idx}].target {raw:?}: unspecified address is not a valid target");
         }
         return Ok(TargetAddr::Ip(addr));
@@ -495,6 +609,7 @@ max_sessions = 7
         let tcp = c.tcp_forwards().unwrap();
         assert_eq!(tcp.len(), 2);
         assert_eq!(tcp[0].listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(tcp[0].max_conns, c.forward_conn_budget());
         assert_eq!(
             tcp[0].target,
             TargetAddr::Domain("example.com".to_string(), 80)
@@ -505,7 +620,7 @@ max_sessions = 7
         );
         let udp = c.udp_forwards().unwrap();
         assert_eq!(udp.len(), 2);
-        assert_eq!(udp[0].max_sessions, c.udp_assoc_count());
+        assert_eq!(udp[0].max_sessions, c.forward_session_budget());
         assert_eq!(udp[1].max_sessions, 7);
         assert_eq!(
             udp[1].target,
@@ -546,12 +661,26 @@ max_sessions = 7
                 "unspecified",
             ),
             (
+                // IPv4-mapped ANY is the v4 wildcard in a v6 literal; the
+                // unspecified test must unmap before deciding.
+                "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"[::ffff:0.0.0.0]:53\"",
+                "unspecified",
+            ),
+            (
+                "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"[::]:53\"",
+                "unspecified",
+            ),
+            (
                 "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"::1:80\"",
                 "bracketed",
             ),
             (
                 "[[udp_forward]]\nlisten = \"127.0.0.1:5353\"\ntarget = \"1.1.1.1:53\"\nmax_sessions = 0",
                 "max_sessions",
+            ),
+            (
+                "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"example.com:80\"\nmax_conns = 0",
+                "max_conns",
             ),
         ] {
             let err = validation_err(table);
@@ -671,5 +800,134 @@ max_sessions = 7
             c.udp_forwards().is_ok(),
             "TCP and UDP may share a port number"
         );
+    }
+
+    /// The aggregate forward budgets are the config half of "forwarding cannot
+    /// deny the SOCKS endpoint": 3/4 by default, leaving a quarter reserved.
+    #[test]
+    fn forward_budgets_reserve_a_socks_share_by_default() {
+        let c = parse_ok("");
+        assert_eq!(c.forward_conn_budget(), DEFAULT_FORWARD_CONNS);
+        assert_eq!(c.forward_session_budget(), 3024);
+        assert!(
+            c.forward_session_budget() < c.udp_assoc_count(),
+            "the forwarding default must leave a SOCKS reserve"
+        );
+        assert!(c.forward_session_budget() + c.udp_assoc_count() / 4 <= c.udp_assoc_count() + 1);
+
+        // Explicit knobs are honored, and clamped to the process caps.
+        let c: ClientConf = toml::from_str(&format!(
+            "{BASE}\nmax_forward_conns = 100\nmax_forward_sessions = 7"
+        ))
+        .unwrap();
+        assert_eq!(c.forward_conn_budget(), 100);
+        assert_eq!(c.forward_session_budget(), 7);
+
+        let c: ClientConf = toml::from_str(&format!(
+            "{BASE}\nmax_forward_conns = 999999\nmax_forward_sessions = 999999"
+        ))
+        .unwrap();
+        assert_eq!(c.forward_conn_budget(), MAX_SOCKS_CONNS);
+        assert_eq!(c.forward_session_budget(), MAX_UDP_ASSOCS);
+
+        // A lowered UDP budget shrinks the forwarding default with it, so the
+        // reserve follows the operator's `max_udp_assocs` rather than the
+        // process constant.
+        let c: ClientConf = toml::from_str(&format!("{BASE}\nmax_udp_assocs = 100")).unwrap();
+        assert_eq!(c.forward_session_budget(), 75);
+        let c: ClientConf = toml::from_str(&format!("{BASE}\nmax_udp_assocs = 1")).unwrap();
+        assert_eq!(c.forward_session_budget(), 1);
+
+        // Every cap keeps a nonzero SOCKS reserve; the integer-floor trap used
+        // to give forwarding the whole budget at caps 2 and 3.
+        for cap in 1usize..=8 {
+            let c: ClientConf = toml::from_str(&format!("{BASE}\nmax_udp_assocs = {cap}")).unwrap();
+            let forward = c.forward_session_budget();
+            assert!(forward <= cap, "forward budget {forward} exceeds cap {cap}");
+            if cap >= 2 {
+                assert!(
+                    forward < cap,
+                    "cap {cap} must reserve at least one slot for SOCKS, got forward={forward}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_forward_max_conns_parses_clamps_and_defaults() {
+        let c = parse_ok(
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"example.com:80\"\nmax_conns = 9",
+        );
+        assert_eq!(c.tcp_forwards().unwrap()[0].max_conns, 9);
+
+        let c = parse_ok(&format!(
+            "[[tcp_forward]]\nlisten = \"127.0.0.1:8080\"\ntarget = \"example.com:80\"\nmax_conns = {}",
+            MAX_SOCKS_CONNS + 10_000
+        ));
+        assert_eq!(
+            c.tcp_forwards().unwrap()[0].max_conns,
+            MAX_SOCKS_CONNS,
+            "max_conns clamps to the shared relay cap"
+        );
+    }
+
+    /// The cross-family overlap rule is asymmetric on purpose: an AF_INET
+    /// wildcard cannot receive IPv6, so `0.0.0.0:P` + `[::1]:P` is a legal pair
+    /// that binds cleanly; the dual-stack `[::]:P` covers both families and
+    /// must still be rejected against either.
+    #[test]
+    fn cross_family_listen_overlap_is_asymmetric() {
+        let c = parse_ok(
+            "[[tcp_forward]]\nlisten = \"0.0.0.0:8080\"\ntarget = \"a.example:80\"\n\
+             [[tcp_forward]]\nlisten = \"[::1]:8080\"\ntarget = \"b.example:80\"",
+        );
+        assert!(
+            c.tcp_forwards().is_ok(),
+            "v4 wildcard does not cover a concrete v6 address"
+        );
+
+        let c = parse_ok(
+            "[[tcp_forward]]\nlisten = \"[::]:8080\"\ntarget = \"a.example:80\"\n\
+             [[tcp_forward]]\nlisten = \"[::1]:8080\"\ntarget = \"b.example:80\"",
+        );
+        assert!(
+            c.tcp_forwards().is_err(),
+            "the dual-stack v6 wildcard covers a concrete v6 address"
+        );
+
+        // A concrete-v4 wildcard must also not overlap a v6 socks_listen.
+        let c = parse_with_socks(
+            "[::1]:1080",
+            "[[tcp_forward]]\nlisten = \"0.0.0.0:1080\"\ntarget = \"a.example:80\"",
+        );
+        assert!(
+            c.tcp_forwards().is_ok(),
+            "0.0.0.0 does not capture a v6-only SOCKS listener"
+        );
+    }
+
+    #[test]
+    fn forward_listener_count_is_capped() {
+        let mut tcp = String::new();
+        for i in 0..=MAX_FORWARD_LISTENERS {
+            tcp.push_str(&format!(
+                "[[tcp_forward]]\nlisten = \"127.0.0.1:{}\"\ntarget = \"example.com:80\"\n",
+                20_000 + i
+            ));
+        }
+        let c = parse_ok(&tcp);
+        let err = format!("{:#}", c.tcp_forwards().unwrap_err());
+        assert!(err.contains("listener cap"), "{err}");
+
+        let mut udp = String::new();
+        for i in 0..=MAX_FORWARD_LISTENERS {
+            udp.push_str(&format!(
+                "[[udp_forward]]\nlisten = \"127.0.0.1:{}\"\ntarget = \"1.1.1.1:53\"\n",
+                20_000 + i
+            ));
+        }
+        let c = parse_ok(&udp);
+        let err = format!("{:#}", c.udp_forwards().unwrap_err());
+        assert!(err.contains("listener cap"), "{err}");
     }
 }

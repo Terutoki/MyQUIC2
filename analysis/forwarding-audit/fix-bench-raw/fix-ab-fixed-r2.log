@@ -1,0 +1,60 @@
+### fix-ab arm=fixed rep=2 2026-10-23T11:32:07Z
+19:32  up  4:13, 1 user, load averages: 4.68 3.79 3.61
+--- warmup
+== udp 127.0.0.1:18080 127.0.0.1:19001 3000 64
+udp sent=3000 recv=3000 batch=64 wall=0.112s recv_pps=26900
+tcpecho bytes=2097152 echoed=2097152 mismatched=0 wall=0.043s 48.7 MB/s OK
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 2 128 20000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=2 target_pps=20000 sent=40000 recv=40000 send_errs=0 wall=2.602s sent_pps=20000 recv_pps=15372 loss=0.000%
+lat n=100 payload=64 samples=100 lost=0 stale=0 bad=0 wall=0.036s p50=318 p90=420 p99=1035 p999=2155 max=2155 mean=365 µs
+--- measured udp blast n=10000 x10
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.300s recv_pps=33309
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.286s recv_pps=34911
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.283s recv_pps=35303
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.297s recv_pps=33676
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.295s recv_pps=33884
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=9999 batch=64 wall=5.385s recv_pps=1857
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=9999 batch=64 wall=5.377s recv_pps=1860
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=9999 batch=64 wall=5.375s recv_pps=1860
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.337s recv_pps=29644
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.299s recv_pps=33408
+--- measured udppaced 30k x3
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 6 128 30000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=30000 sent=180001 recv=179570 send_errs=0 wall=6.603s sent_pps=30000 recv_pps=27196 loss=0.239%
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 6 128 30000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=30000 sent=180001 recv=179892 send_errs=0 wall=6.603s sent_pps=30000 recv_pps=27245 loss=0.061%
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 6 128 30000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=30000 sent=180002 recv=179563 send_errs=0 wall=6.602s sent_pps=30000 recv_pps=27197 loss=0.244%
+--- measured udpbidir 20k x2
+== udpbidir 127.0.0.1:18080 127.0.0.1:19001 6 128 20000
+udpbidir socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=20000 sent=120000 recv=120000 send_errs=0 wall=6.602s sent_pps=20000 recv_pps=18175 loss=0.000%
+== udpbidir 127.0.0.1:18080 127.0.0.1:19001 6 128 20000
+udpbidir socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=20000 sent=120000 recv=119777 send_errs=0 wall=6.602s sent_pps=20000 recv_pps=18142 loss=0.186%
+--- measured lat x5
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.077s p50=122 p90=218 p99=360 p999=1582 max=1582 mean=154 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.065s p50=117 p90=143 p99=335 p999=1700 max=1700 mean=129 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.062s p50=115 p90=140 p99=255 p999=1465 max=1465 mean=125 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.062s p50=116 p90=133 p99=279 p999=1427 max=1427 mean=124 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.063s p50=116 p90=130 p99=350 p999=1469 max=1469 mean=126 µs
+--- measured lattcp x3
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.055s | connect p50=110 p90=170 p99=274 p999=301 max=301 mean=122 µs | echo p50=134 p90=238 p99=414 p999=439 max=439 mean=153 µs
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.073s | connect p50=144 p90=225 p99=312 p999=385 max=385 mean=154 µs | echo p50=178 p90=326 p99=555 p999=723 max=723 mean=210 µs
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.077s | connect p50=142 p90=233 p99=425 p999=2357 max=2357 mean=169 µs | echo p50=173 p90=321 p99=452 p999=2107 max=2107 mean=215 µs
+--- measured tcpecho 8MiB x5
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.194s 43.2 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.349s 24.1 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.154s 54.5 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.293s 28.6 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.092s 90.8 MB/s OK
+--- load
+19:33  up  4:14, 1 user, load averages: 6.57 4.40 3.85

@@ -1,0 +1,39 @@
+### scenario C forward listeners 2026-10-23T11:04:29Z
+--- startup log lines
+2026-10-23T11:04:29.323521Z  INFO myquic2_client: tcp_forward 127.0.0.1:18181 -> 127.0.0.1:19000 via QUIC (bound)
+2026-10-23T11:04:29.323551Z  INFO myquic2_client: udp_forward 127.0.0.1:18282 -> 127.0.0.1:19001 (max_sessions=4032, per-peer sessions, 180s idle reap)
+--- udp forward: warmup + verify
+udp-pps listen=127.0.0.1:18282 n=100 batch=8 payload=1000 sent=100 recv=100 mismatched=0 wall=0.006s recv_pps=17550 loss=0.000% OK
+udp-lat listen=127.0.0.1:18282 n=50 payload=64 samples=50 lost=0 wall=0.012s p50=189 p90=243 p99=1888 max=1888 mean=236 us OK
+--- udp forward pps (1000B payload, n=10000, batch=64) x5
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.312s recv_pps=32088 loss=0.000% OK
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.310s recv_pps=32267 loss=0.000% OK
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.313s recv_pps=31950 loss=0.000% OK
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.298s recv_pps=33562 loss=0.000% OK
+udp-pps listen=127.0.0.1:18282 n=10000 batch=64 payload=1000 sent=10000 recv=10000 mismatched=0 wall=0.296s recv_pps=33791 loss=0.000% OK
+--- udp forward serial latency (payload 64) x5
+udp-lat listen=127.0.0.1:18282 n=500 payload=64 samples=500 lost=0 wall=0.062s p50=113 p90=127 p99=378 max=1638 mean=122 us OK
+udp-lat listen=127.0.0.1:18282 n=500 payload=64 samples=500 lost=0 wall=0.062s p50=112 p90=126 p99=383 max=1540 mean=122 us OK
+udp-lat listen=127.0.0.1:18282 n=500 payload=64 samples=500 lost=0 wall=0.070s p50=114 p90=150 p99=423 max=2992 mean=138 us OK
+udp-lat listen=127.0.0.1:18282 n=500 payload=64 samples=500 lost=0 wall=0.063s p50=113 p90=131 p99=339 max=1824 mean=123 us OK
+udp-lat listen=127.0.0.1:18282 n=500 payload=64 samples=500 lost=0 wall=0.062s p50=112 p90=126 p99=316 max=1485 mean=121 us OK
+--- udp forward multi-peer 50 peers x 2000 dgrams batch 32 payload 128
+udp-multi listen=127.0.0.1:18282 peers=50 n_per_peer=2000 batch=32 payload=128 sent=100000 recv=100000 mismatched=0 wall=1.965s recv_pps=50886 loss=0.000% max_peer_wall=1.963s OK
+udp-multi listen=127.0.0.1:18282 peers=50 n_per_peer=2000 batch=32 payload=128 sent=100000 recv=100000 mismatched=0 wall=1.968s recv_pps=50805 loss=0.000% max_peer_wall=1.966s OK
+--- tcp forward: warmup + verify
+tcp-lat listen=127.0.0.1:18181 n=50 payload=64 samples=50 lost=0 wall=0.004s p50=68 p90=81 p99=366 max=366 mean=77 us OK
+--- tcp forward bulk 8MiB x4
+tcp-bulk listen=127.0.0.1:18181 bytes=8388608 echoed=8388608 mismatched=1 wall=0.320s 26.2 MB/s FAIL
+tcp-bulk listen=127.0.0.1:18181 bytes=8388608 echoed=8388608 mismatched=0 wall=0.177s 47.3 MB/s OK
+tcp-bulk listen=127.0.0.1:18181 bytes=8388608 echoed=8388608 mismatched=0 wall=0.310s 27.0 MB/s OK
+tcp-bulk listen=127.0.0.1:18181 bytes=8388608 echoed=8388608 mismatched=4 wall=0.100s 84.1 MB/s FAIL
+--- tcp forward raw latency (payload 64) x5
+tcp-lat listen=127.0.0.1:18181 n=500 payload=64 samples=500 lost=0 wall=0.051s p50=95 p90=109 p99=289 max=371 mean=102 us OK
+tcp-lat listen=127.0.0.1:18181 n=500 payload=64 samples=500 lost=0 wall=0.053s p50=95 p90=115 p99=315 max=388 mean=105 us OK
+tcp-lat listen=127.0.0.1:18181 n=500 payload=64 samples=500 lost=0 wall=0.052s p50=96 p90=115 p99=285 max=376 mean=103 us OK
+tcp-lat listen=127.0.0.1:18181 n=500 payload=64 samples=500 lost=0 wall=0.052s p50=96 p90=113 p99=333 max=456 mean=104 us OK
+tcp-lat listen=127.0.0.1:18181 n=500 payload=64 samples=500 lost=0 wall=0.052s p50=96 p90=112 p99=313 max=490 mean=104 us OK
+--- client log tail
+2
+19:04  up  3:46, 1 user, load averages: 4.89 4.92 4.63
+FORWARD DONE

@@ -1,0 +1,20 @@
+### task-11 B4 follow-up (post-fold) 2026-10-23T11:42:26Z
+d700b48084aa0490cbff98f55f1ee41dcf30e038c353818d788f1c4d1a72ada3  /tmp/mq2-target-head/release/myquic2-client
+23b207c19d14101f16b3daf8433eee0d981c9073f2926381397d559b117d2a96  /tmp/mq2-target-head/release/myquic2-server
+19:42  up  4:23, 1 user, load averages: 4.69 4.62 4.28
+### B4 reply-active peer: udp_forward max_sessions=1, A sends+gets reply, A idle, B retries every 100ms
+peerA=admitted(reply received)
+peerB=admitted attempts=8 b_admit_latency=4.94s a_idle_at_admit=5.44s
+EVICT_RESULT PASS (admit latency must be << 180 s idle-reap)
+-- client log refusal lines:
+2026-10-23T11:42:28.075262Z  INFO myquic2_client: udp_forward 127.0.0.1:18282 -> 127.0.0.1:19001 (max_sessions=1, forward_session_budget=3024, per-peer sessions, 180s idle reap)
+2026-10-23T11:42:29.322782Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:64816 (1 so far)
+2026-10-23T11:42:30.731380Z  WARN myquic2_client::forward_udp: udp_forward 127.0.0.1:19001 listener session limit 1 reached; dropping datagram from 127.0.0.1:64816 (3 so far) (1 similar suppressed in the last second)
+-- client log eviction debug lines (if RUST_LOG=debug not set, expected empty):
+### B4c control: flaky target drops 1st datagram/source (no reply activity), max_sessions=1
+peerA=sent (black-hole target, no reply expected)
+peerB=admitted attempts=2 b_admit_latency=0.71s a_idle_at_admit=6.71s
+EVICT_NOREPLY_RESULT PASS
+-- client log refusal lines:
+2026-10-23T11:42:35.492302Z  INFO myquic2_client: udp_forward 127.0.0.1:18282 -> 127.0.0.1:19003 (max_sessions=1, forward_session_budget=3024, per-peer sessions, 180s idle reap)
+TASK11_DONE 2026-10-23T11:42:43Z

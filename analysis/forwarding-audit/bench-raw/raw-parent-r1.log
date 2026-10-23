@@ -1,0 +1,46 @@
+### arm=parent rep=1 cfg=client-parent.toml date=2026-10-23T10:52:43Z
+18:52  up  3:34, 1 user, load averages: 5.22 5.72 4.37
+--- warmup
+== udp 127.0.0.1:18080 127.0.0.1:19001 3000 64
+udp sent=3000 recv=3000 batch=64 wall=0.136s recv_pps=22104
+== tcpecho 127.0.0.1:18080 127.0.0.1:19000 2097152
+tcpecho bytes=2097152 echoed=2097152 mismatched=0 wall=0.046s 45.6 MB/s OK
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 2 128 20000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=2 target_pps=20000 sent=40000 recv=40000 send_errs=0 wall=2.602s sent_pps=20000 recv_pps=15371 loss=0.000%
+== lat 127.0.0.1:18080 127.0.0.1:19001 100 64
+lat n=100 payload=64 samples=100 lost=0 stale=0 bad=0 wall=0.024s p50=204 p90=271 p99=537 p999=1860 max=1860 mean=238 µs
+== lattcp 127.0.0.1:18080 127.0.0.1:19000 50 64
+lattcp n=50 bytes=64 connect_ok=50 connect_lost=0 echo_ok=50 echo_lost=0 bad=0 wall=0.017s | connect p50=127 p90=189 p99=416 p999=416 max=416 mean=146 µs | echo p50=172 p90=329 p99=506 p999=506 max=506 mean=200 µs
+--- measured
+# udp_clean pps (n=10000 batch=64) x5
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.361s recv_pps=27720
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.337s recv_pps=29639
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.267s recv_pps=37509
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.265s recv_pps=37766
+== udp 127.0.0.1:18080 127.0.0.1:19001 10000 64
+udp sent=10000 recv=10000 batch=64 wall=0.268s recv_pps=37376
+# udp_wall_fixed 5s stall counts as lossy run
+# lower_lat
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.059s p50=116 p90=123 p99=133 p999=1412 max=1412 mean=119 µs
+lat n=500 payload=64 samples=500 lost=0 stale=0 bad=0 wall=0.059s p50=116 p90=122 p99=132 p999=1438 max=1438 mean=118 µs
+# tcp_lat
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.045s | connect p50=93 p90=111 p99=139 p999=159 max=159 mean=96 µs | echo p50=126 p90=142 p99=164 p999=195 max=195 mean=128 µs
+lattcp n=200 bytes=64 connect_ok=200 connect_lost=0 echo_ok=200 echo_lost=0 bad=0 wall=0.044s | connect p50=93 p90=111 p99=133 p999=142 max=142 mean=96 µs | echo p50=124 p90=140 p99=155 p999=165 max=165 mean=126 µs
+# tcp_echo_8MiB
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.136s 61.8 MB/s OK
+tcpecho bytes=8388608 echoed=8388608 mismatched=0 wall=0.326s 25.8 MB/s OK
+# udp_paced_30k
+== udppaced 127.0.0.1:18080 127.0.0.1:19001 6 128 30000
+udppaced socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=30000 sent=180001 recv=179890 send_errs=0 wall=6.602s sent_pps=30000 recv_pps=27247 loss=0.062%
+# udp_bidir_20k
+== udpbidir 127.0.0.1:18080 127.0.0.1:19001 6 128 20000
+udpbidir socks=127.0.0.1:18080 target=127.0.0.1:19001 payload=128 secs=6 target_pps=20000 sent=120000 recv=120000 send_errs=0 wall=6.602s sent_pps=20000 recv_pps=18176 loss=0.000%
+# udp_multipaced_4x4000
+== udpmultipaced 127.0.0.1:18080 127.0.0.1:19001 4 6 128 4000
+udpmultipaced socks=127.0.0.1:18080 target=127.0.0.1:19001 assocs=4 failed_assocs=0 payload=128 secs=6 target_pps_per_assoc=4000 target_pps_agg=16000 sent=95992 recv=95992 send_errs=0 wall=6.602s sent_pps=15999 recv_pps=14539 loss=0.000% per_assoc_recv_min=23998 per_assoc_recv_max=23998
+--- load
+18:53  up  3:34, 1 user, load averages: 5.05 5.65 4.39
