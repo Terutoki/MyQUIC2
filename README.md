@@ -1,9 +1,6 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.svg">
-  <img src="assets/readme/hero-light.svg" alt="MyQUIC2 — the small-packet QUIC proxy. SOCKS5 and fixed-destination TCP/UDP forwarding in, QUIC/TLS 1.3 out, MQP-3 wire rev2 in between." width="100%">
-</picture>
+<h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.2-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
 [![Tests](https://img.shields.io/badge/Tests-567_passing-16a34a?style=flat-square)](#-verification)
@@ -59,13 +56,6 @@ The client is a pool of independent QUIC endpoints. The server is admission-firs
 
 ## 🧭 Architecture
 
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/architecture-dark.svg">
-  <img src="assets/readme/architecture-light.svg" alt="Architecture: SOCKS5 client pool, QUIC/TLS tunnel and MQP-3 rev2 data plane, admission-first server ingress" width="100%">
-</picture>
-</p>
-
 MyQUIC2 is split along the only boundary that matters for latency: **per-connection state lives with the connection, and the data plane never shares a receive path**. On the client, every pool slot owns its own QUIC endpoint, UDP socket and pinned runtime; TCP and UDP egress can be isolated by class, and the thread-local egress memo turns a steady flow into a handful of atomic loads. On the server, `SO_REUSEPORT` endpoints accept in parallel, the token gate and memory admission run before per-connection allocation, and each UDP association gets one 64 KiB session socket and one reader task.
 
 | Layer | Responsibility | Key design choice |
@@ -85,13 +75,6 @@ MyQUIC2 is split along the only boundary that matters for latency: **per-connect
 - **Admission-first server.** `SO_REUSEPORT` ingress endpoints, token auth, memory/connection admission, one 64 KiB session socket per association.
 
 ## 📡 MQP-3 rev2 wire
-
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/wire-dark.svg">
-  <img src="assets/readme/wire-light.svg" alt="MQP-3 rev2 frames: DATA 2 B, DATA OPEN/INLINE, TRAIN same/dict, FRAG 8 B, CTL" width="100%">
-</picture>
-</p>
 
 MQP-3 rev2 is a compact framing layer inside QUIC DATAGRAMs. It is deliberately **not** a reliable transport: QUIC supplies confidentiality, congestion control, loss detection and PMTU; MQP-3 supplies flow identity, first-frame addressing, aggregation and fragmentation. The revision is negotiated once, in `CTL HELLO/CAPS wire_ver = 2`; the protocol name stays MQP-3.
 
@@ -515,13 +498,6 @@ See [Verification](#-verification) for the exact commands and the CI matrix.
 
 ## 🔁 Full duplex
 
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/duplex-dark.svg">
-  <img src="assets/readme/duplex-light.svg" alt="Full-duplex MQP-3 rev2 lifecycle: client-owned and server-owned flows, domain rebind, SESS_CLOSE" width="100%">
-</picture>
-</p>
-
 Full duplex is not an afterthought in rev2: the id space is split by owner, both endpoints run the same open/ack/rebind/close state machine, and the connection-level tables hold client-owned and server-owned flows side by side. That matters for the traffic MyQUIC2 is built for. A game server or a DNS resolver replies from a source the client never explicitly dialed; an anycast target changes its reply address; a restricted NAT still needs a return path. Rev2 handles all three without a second protocol or a separate control channel.
 
 - **Both endpoints can open a flow.** Client-owned (`owner=0`) and server-owned (`owner=1`) ids share one registry. `FLOW_ACK` confirms; a compressed downlink is also an implicit ACK, so a lost ACK only delays compression.
@@ -531,13 +507,6 @@ Full duplex is not an afterthought in rev2: the id space is split by owner, both
 - **Close means close.** `SESS_CLOSE` / `FLOW_CLOSE` purge bindings, queued stager items and in-flight partials on both ends. A late frame finds no live binding and is dropped; it can never be misdelivered to a reused id.
 
 ## 🚀 Cross-session stager
-
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/stager-dark.svg">
-  <img src="assets/readme/stager-light.svg" alt="Cross-session stager packs payloads from several associations into one round-robin TRAIN dict" width="100%">
-</picture>
-</p>
 
 One stager per QUIC connection, not per association. This is the difference between compressing one app's burst and compressing the **aggregate** traffic of every SOCKS5 association that shares the tunnel. Small payloads from every app share a per-session FIFO with a round-robin cursor; a single `TRAIN dict` can carry items from several sessions, because each `wire_id` resolves to its own binding at the receiver.
 
@@ -559,8 +528,10 @@ The two ingress modes coexist in one client process and share everything below t
 ### Two ingress modes, one data plane
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
+    accTitle: Two ingress modes on one data plane
+    accDescr: SOCKS5 applications and raw TCP or UDP clients both enter through ConnPool and leave through the same QUIC tunnel to the admission-first server exit.
     subgraph APPS["🧩 Applications"]
         direction TB
         SOCKSAPP["🧦 SOCKS5-aware apps<br/>browser · curl · games"]
@@ -601,18 +572,18 @@ flowchart LR
     POOL ==> DGRAM
     STREAM ==> ING
     DGRAM ==> ING
-    style APPS fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    style APPS fill:#f8fafc,stroke:#cbd5e1,stroke-width:1.5px,color:#0f172a
     style CLIENT fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
     style TUNNEL fill:#eef2ff,stroke:#818cf8,stroke-width:2px,color:#1e1b4b
     style EXIT fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef appC fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
-    classDef edgeC fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef tunC fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef exitC fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    class SOCKSAPP,TCPAPP,UDPAPP appC
-    class SOCKS,TFL,UFL,POOL edgeC
-    class STREAM,DGRAM tunC
-    class ING,POLICY,IPV4T,IPV6T,DOMT exitC
+    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef tunnel fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class SOCKSAPP,TCPAPP,UDPAPP app
+    class SOCKS,TFL,UFL,POOL edge
+    class STREAM,DGRAM tunnel
+    class ING,POLICY,IPV4T,IPV6T,DOMT exit
 ```
 
 ### When to use it: the deployment shapes it was built for
@@ -628,8 +599,10 @@ Forwarding is the right tool whenever the **destination is known in advance** an
 | **Dual-stack and IPv6 transition** | A v4-only application needs a v6-only service; a v6-only appliance needs a v4-only peer; the two ends of the tunnel do not share an address family. | The listener family and the target family are **independent**: bind IPv4 locally, dial IPv6 at the exit — or bind dual-stack and reach either. The server exit decides the family. |
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
+    accTitle: Choosing an ingress mode
+    accDescr: Use SOCKS5 when the application can speak it; otherwise add a fixed-destination forward listener for a known address and port.
     Q{"Does the application<br/>speak SOCKS5?"}
     Q -->|"yes"| SOCKS["🧦 SOCKS5 ingress<br/>CONNECT · UDP ASSOCIATE<br/>any destination per request"]
     Q -->|"no"| FIXED{"Is the destination<br/>known and fixed?"}
@@ -640,15 +613,14 @@ flowchart TB
     FWD --> S3["📮 UDP services<br/>DNS · syslog · SNMP · TFTP · SIP/RTP"]
     FWD --> S4["🏢 Branch office / home lab<br/>one listener per LAN service"]
     FWD --> S5["🌉 Dual-stack bridge<br/>IPv4 app to IPv6 service and back"]
-    style Q fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
-    style FIXED fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
-    style SOCKS fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    style FWD fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    style S1 fill:#ffffff,stroke:#94a3b8,color:#0f172a
-    style S2 fill:#ffffff,stroke:#94a3b8,color:#0f172a
-    style S3 fill:#ffffff,stroke:#94a3b8,color:#0f172a
-    style S4 fill:#ffffff,stroke:#94a3b8,color:#0f172a
-    style S5 fill:#ffffff,stroke:#94a3b8,color:#0f172a
+    classDef decision fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef tunnel fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    class Q,FIXED decision
+    class SOCKS edge
+    class FWD,WRAP tunnel
+    class S1,S2,S3,S4,S5 app
 ```
 
 ### TCP forwarding: one accepted connection, one QUIC stream
@@ -656,46 +628,64 @@ flowchart TB
 A `[[tcp_forward]]` entry binds a local TCP listener. Every accepted connection becomes one QUIC bidirectional stream carrying the configured target as its MQP header, and the bytes are then relayed in both directions by the same pump the SOCKS5 `CONNECT` path uses. There is **no SOCKS5 negotiation and no SOCKS reply** — the application's first byte is not held for a round trip, and the server's dial ACK is consumed only as the failure signal.
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: TCP forwarding path
+    accDescr: One accepted TCP connection maps to one QUIC stream; the target header is written once and the pump carries bytes in both directions.
     autonumber
-    participant APP as 🧑‍💻 App
-    participant LIS as 🔌 tcp_forward listener
-    participant POOL as 🎰 ConnPool
-    participant Q as ⚡ QUIC stream
-    participant SRV as 🛰️ myquic2-server
-    participant DST as 🎯 Target
-    APP->>LIS: connect to the configured listen address
-    LIS->>LIS: accept · nodelay · TCP_NOTSENT_LOWAT
-    LIS->>POOL: pick a slot · wait for a live connection
-    POOL-->>LIS: connection + interactive priority
-    LIS->>Q: open_bi · 5 s budget
-    Q-->>LIS: send half + recv half
-    LIS->>Q: write MQP target header (own flush)
-    Q->>SRV: bidi stream · target header
-    SRV->>SRV: resolve · SSRF / allow_private
-    SRV->>DST: connect (happy eyeballs)
-    DST-->>SRV: accepted
-    SRV->>Q: MQP dial ACK
-    Q-->>LIS: ACK consumed by the pump
-    Note over LIS,Q: no SOCKS reply is sent · app bytes are not gated on the ACK
-    APP->>LIS: request bytes
-    LIS->>Q: vectored / zero-copy chunks
-    Q->>SRV: stream data
-    SRV->>DST: stream data
-    DST-->>SRV: response bytes
-    SRV-->>Q: stream data
-    Q-->>LIS: stream data
-    LIS-->>APP: response bytes
-    APP->>LIS: half-close (FIN)
-    LIS->>Q: finish send stream
-    Q->>SRV: FIN
-    SRV->>DST: shutdown write
-    DST-->>SRV: FIN
-    SRV-->>Q: finish
-    Q-->>LIS: FIN
-    LIS-->>APP: FIN
-    Note over LIS,DST: 300 s bidirectional idle deadline · failure before or during the pump ends in RST
+    box rgb(240, 253, 244) Client edge
+        participant APP as 🧑‍💻 App
+        participant LIS as 🔌 tcp_forward listener
+        participant POOL as 🎰 ConnPool
+        participant Q as ⚡ QUIC stream
+    end
+    box rgb(255, 247, 237) Exit side
+        participant SRV as 🛰️ myquic2-server
+        participant DST as 🎯 Target
+    end
+    rect rgb(240, 253, 244)
+        Note over APP,POOL: ① accept · pick a live slot
+        APP->>LIS: connect to the configured listen address
+        LIS->>LIS: accept · nodelay · TCP_NOTSENT_LOWAT
+        LIS->>POOL: pick a slot · wait for a live connection
+        POOL-->>LIS: connection + interactive priority
+    end
+    rect rgb(238, 242, 255)
+        Note over LIS,SRV: ② open stream · write the target header
+        LIS->>Q: open_bi · 5 s budget
+        Q-->>LIS: send half + recv half
+        LIS->>Q: write MQP target header (own flush)
+        Q->>SRV: bidi stream · target header
+        SRV->>SRV: resolve · SSRF / allow_private
+        SRV->>DST: connect (happy eyeballs)
+        DST-->>SRV: accepted
+        SRV->>Q: MQP dial ACK
+        Q-->>LIS: ACK consumed by the pump
+        Note over LIS,Q: no SOCKS reply is sent · app bytes are not gated on the ACK
+    end
+    rect rgb(255, 247, 237)
+        Note over APP,DST: ③ bidirectional pump
+        APP->>LIS: request bytes
+        LIS->>Q: vectored / zero-copy chunks
+        Q->>SRV: stream data
+        SRV->>DST: stream data
+        DST-->>SRV: response bytes
+        SRV-->>Q: stream data
+        Q-->>LIS: stream data
+        LIS-->>APP: response bytes
+    end
+    rect rgb(248, 250, 252)
+        Note over APP,DST: ④ half-close and teardown
+        APP->>LIS: half-close (FIN)
+        LIS->>Q: finish send stream
+        Q->>SRV: FIN
+        SRV->>DST: shutdown write
+        DST-->>SRV: FIN
+        SRV-->>Q: finish
+        Q-->>LIS: FIN
+        LIS-->>APP: FIN
+        Note over LIS,DST: 300 s bidirectional idle deadline · failure before or during the pump ends in RST
+    end
 ```
 
 - **Half-close is preserved in both directions.** An app FIN becomes a stream FIN and shuts down the target's write side; a target EOF becomes a FIN on the app socket.
@@ -709,46 +699,58 @@ sequenceDiagram
 A `[[udp_forward]]` entry binds a local UDP socket. Each distinct client source `IP:port` is mapped to **its own MQP-3 rev2 session**, created lazily on the first datagram and kept for the life of the flow. That is what makes the return path work: one server session owns one upstream socket, so replies from the target can only be demultiplexed back to the right peer by their session id. Replies are delivered as **bare payloads** from the configured listen port — never SOCKS5-framed — so an ordinary UDP application sees the same bytes it would see from a local port forward. (On a wildcard-bound listener the reply's source *address* is route-chosen rather than the address the peer sent to; bind a concrete address if peers validate it — see [IPv4 and IPv6](#ipv4-and-ipv6-on-both-sides-of-the-tunnel).)
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: UDP forwarding path
+    accDescr: Each peer address owns one session and one QUIC wire id; replies return as raw payloads from the listener port.
     autonumber
-    participant A as 🟢 Peer A · IPv4
-    participant B as 🔵 Peer B · IPv6
-    participant LIS as 📮 udp_forward listener
-    participant TBL as 🗂️ peer table
-    participant SA as 📦 session A
-    participant SB as 📦 session B
-    participant Q as 📡 MQP-3 rev2
-    participant SRV as 🛰️ server sessions
-    participant TA as 🎯 target A
-    participant TB as 🎯 target B
+    box rgb(240, 253, 244) Peers
+        participant A as 🟢 Peer A · IPv4
+        participant B as 🔵 Peer B · IPv6
+    end
+    box rgb(238, 242, 255) Client edge
+        participant LIS as 📮 udp_forward listener
+        participant TBL as 🗂️ peer table
+        participant SA as 📦 session A
+        participant SB as 📦 session B
+    end
+    box rgb(236, 254, 255) Tunnel
+        participant Q as 📡 MQP-3 rev2
+    end
+    box rgb(255, 247, 237) Exit side
+        participant SRV as 🛰️ server sessions
+        participant TA as 🎯 target A
+        participant TB as 🎯 target B
+    end
     rect rgb(240, 253, 244)
-    A->>LIS: datagram (source 192.0.2.10:5000)
-    LIS->>TBL: lookup source address
-    TBL-->>LIS: miss · allocate session A
-    LIS->>SA: publish session · raw reply mode
-    SA->>Q: DATA OPEN with the fixed target
-    Q->>SRV: OPEN · target
-    SRV->>TA: sendto from its own session socket
-    B->>LIS: datagram (source fd00::20:6000)
-    LIS->>TBL: lookup source address
-    TBL-->>LIS: miss · allocate session B
-    SB->>Q: DATA OPEN with the same fixed target
-    Q->>SRV: OPEN · target
-    SRV->>TB: sendto from a separate session socket
+        Note over A,SB: ① first datagram from each peer allocates a session
+        A->>LIS: datagram (source 192.0.2.10:5000)
+        LIS->>TBL: lookup source address
+        TBL-->>LIS: miss · allocate session A
+        LIS->>SA: publish session · raw reply mode
+        SA->>Q: DATA OPEN with the fixed target
+        Q->>SRV: OPEN · target
+        SRV->>TA: sendto from its own session socket
+        B->>LIS: datagram (source fd00::20:6000)
+        LIS->>TBL: lookup source address
+        TBL-->>LIS: miss · allocate session B
+        SB->>Q: DATA OPEN with the same fixed target
+        Q->>SRV: OPEN · target
+        SRV->>TB: sendto from a separate session socket
     end
     rect rgb(255, 247, 237)
-    TA-->>SRV: reply (source 192.0.2.10:53)
-    SRV-->>Q: DATA OPEN with source · then steady DATA
-    Q-->>LIS: dispatcher routes by session id
-    LIS-->>A: raw payload from the listen port
-    TB-->>SRV: reply (source fd00::30:53)
-    SRV-->>Q: steady DATA
-    Q-->>LIS: dispatcher routes by session id
-    LIS-->>B: raw payload from the listen port
+        Note over TA,B: ② replies return on the session id
+        TA-->>SRV: reply (source 192.0.2.10:53)
+        SRV-->>Q: DATA OPEN with source · then steady DATA
+        Q-->>LIS: dispatcher routes by session id
+        LIS-->>A: raw payload from the listen port
+        TB-->>SRV: reply (source fd00::30:53)
+        SRV-->>Q: steady DATA
+        Q-->>LIS: dispatcher routes by session id
+        LIS-->>B: raw payload from the listen port
+        Note over LIS,SRV: small payloads share a connection-level stager (cross-peer TRAIN) · payloads above one frame use FRAG
+        Note over A,B: 180 s bidirectional idle → SESS_CLOSE + hub slot release
     end
-    Note over LIS,SRV: small payloads share a connection-level stager (cross-peer TRAIN) · payloads above one frame use FRAG
-    Note over A,B: 180 s bidirectional idle → SESS_CLOSE + hub slot release
 ```
 
 - **Per-peer identity.** The session key is the full client source `IP:port`, so two peers on one listener never share an upstream socket or a reply stream. A peer that reopens from a new source port simply gets a new session; the old one is reaped after the idle window (or, when a new source is refused and it has already been idle ≥ 5 s, evicted early — see the admission bullet below).
@@ -764,8 +766,10 @@ sequenceDiagram
 Forwarding was designed dual-stack from day one. The **listener family and the target family are independent**: you can bind IPv4 locally and dial IPv6 at the exit, bind IPv6 locally and reach an IPv4 service, or bind the dual-stack wildcard and accept both client families on one port. The server exit resolves the target and applies the same SSRF / `allow_private` policy it applies to SOCKS.
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
+    accTitle: IPv4 and IPv6 on both sides of the tunnel
+    accDescr: Any client address family can reach any target address family, including domain targets resolved at the exit.
     subgraph CLIENTS["clients that connect"]
         direction TB
         C4["🟢 IPv4 clients"]
@@ -796,15 +800,15 @@ flowchart LR
     LW --> T4
     LW --> T6
     LW --> TD
-    style CLIENTS fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    style CLIENTS fill:#f8fafc,stroke:#cbd5e1,stroke-width:1.5px,color:#0f172a
     style LISTENERS fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
     style TARGETS fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef clientC fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
-    classDef listenC fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef targetC fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    class C4,C6 clientC
-    class L4,L6,LW listenC
-    class T4,T6,TD targetC
+    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class C4,C6 app
+    class L4,L6,LW edge
+    class T4,T6,TD exit
 ```
 
 | Listen form | Clients accepted | Notes |
@@ -901,8 +905,10 @@ Validation runs **before** any TLS, QUIC or socket work, and every listener is b
 ### Lifecycle, limits and observability
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a"}}}%%
 stateDiagram-v2
+    accTitle: Forward listener lifecycle
+    accDescr: Listener startup validates every entry, then serves TCP connections or UDP peers until shutdown drains the sessions.
     direction LR
     [*] --> Validated : parse + overlap checks
     Validated --> Failed : bad entry · overlap · busy port · over 256 listeners
@@ -921,6 +927,16 @@ stateDiagram-v2
     note right of Failed
         exit non-zero; no listener is left half-bound
     end note
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef ok fill:#bbf7d0,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef note fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
+    classDef warn fill:#ffe4e6,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef mute fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1.5px,color:#475569
+    class Validated edge
+    class Bound note
+    class Serving ok
+    class Reaped mute
+    class Failed,Draining warn
 ```
 
 | Resource | Bound | Shared with SOCKS? |
@@ -958,13 +974,6 @@ Observability is deliberately boring: one `info` line per bound listener that ca
 
 ## 📊 Performance
 
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/performance-dark.svg">
-  <img src="assets/readme/performance-light.svg" alt="Measured header sizes, DATAGRAM send reduction and loopback smoke results" width="100%">
-</picture>
-</p>
-
 Performance work is framed around the **small-packet path**, not bulk throughput. The benchmark is deliberately adversarial for framing: many associations, 128 B payloads, a mix of uplink and downlink, and a long enough run to expose queue growth or loss. It measures delivered payloads, frames per payload and DATAGRAM sends, not just throughput.
 
 | Path | Before rev2 | Rev2 steady | Saving |
@@ -983,13 +992,6 @@ The first frame of a flow is not the steady state: `OPEN` / `INLINE` carries the
 - **Where the numbers come from:** macOS loopback on release binaries. The Linux 2–4 core + `tc netem` matrix is the deployment gate: [`scripts/linux-bench-matrix.sh`](scripts/linux-bench-matrix.sh). These are not WAN predictions; they isolate framing and scheduling effects.
 
 ## 🛡️ Security
-
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/security-dark.svg">
-  <img src="assets/readme/security-light.svg" alt="Security model: TLS 1.3, token auth, per-packet authorization, opt-in full-cone" width="100%">
-</picture>
-</p>
 
 The security model assumes an untrusted peer and a hostile network. TLS 1.3 authenticates and encrypts the tunnel; MQP's job is narrower but critical: a compressed id must not become an authorization bypass, a rebind must not become an open relay, and a malformed frame must not become a memory or CPU primitive. The defaults are deliberately restrictive — full-cone off, private targets off, token required, and every peer-fillable structure bounded.
 
@@ -1076,9 +1078,10 @@ sudo scripts/linux-bench-matrix.sh
 
 ## 🧜 Mermaid atlas
 
-The original v0.2.0 README diagram set is preserved here — refreshed for the
-rev2 wire where the old labels described v3 — and extended with new sections.
-Every block below renders natively on GitHub.
+The README diagram set lives here — refreshed for the rev2 wire and redrawn
+with a shared, high-contrast palette — and is extended with new sections.
+Every block below renders natively on GitHub and carries an accessibility
+title and description.
 
 ### 🏗️ System & modules
 
@@ -1087,8 +1090,10 @@ Every block below renders natively on GitHub.
 _The original high-level map, kept as a fast orientation._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
+    accTitle: System overview
+    accDescr: Applications reach the client edge, cross an encrypted QUIC tunnel, and leave through an admission-first server to TCP or UDP targets.
     subgraph EDGE["💻  Client edge"]
         direction TB
         APPS["🧑‍💻 Apps<br/>curl · browser · games"]
@@ -1121,11 +1126,11 @@ flowchart LR
     style EXIT fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
     classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
     classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef tun fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef tunnel fill:#e0e7ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
     classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
     class APPS app
     class SOCKS,POOL edge
-    class TLS,MQP,CC tun
+    class TLS,MQP,CC tunnel
     class ING,AUTH,ROUTE,TARGETS exit
 ```
 
@@ -1134,8 +1139,10 @@ flowchart LR
 _Module boundaries: client, server, codec, transport and stats._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
+    accTitle: End-to-end module map
+    accDescr: Client modules are pool-first and server modules are admission-first, meeting at the shared QUIC and MQP-3 transport.
     subgraph CLI["🚀  myquic2-client · pool-first"]
         direction TB
         SOCKS["🧦 socks.rs<br/>CONNECT / ASSOCIATE"]
@@ -1169,12 +1176,12 @@ flowchart LR
     CLI ==>|"QUIC streams ⟷ DATAGRAMs<br/>TLS 1.3 · MQP-3"| SRV
     style CLI fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
     style SRV fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef cli fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef cli2 fill:#ecfeff,stroke:#0891b2,stroke-width:1.5px,color:#164e63
-    classDef srv fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    class SOCKS,POOL,AUTHC cli
-    class EGRESS,HUB,ASSOC,DISP cli2
-    class ACC,AUTHX,TABLE,FWD,TCPS,PIN srv
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:1.5px,color:#164e63
+    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    class SOCKS,POOL,AUTHC edge
+    class EGRESS,HUB,ASSOC,DISP wire
+    class ACC,AUTHX,TABLE,FWD,TCPS,PIN exit
 ```
 
 #### Shared library layers
@@ -1182,8 +1189,10 @@ flowchart LR
 _The `src/` layers from primitives up to the two binaries._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
+    accTitle: Shared library layers
+    accDescr: Both binaries are assembled from shared primitives, codecs, data-plane engines, and cross-cutting observability.
     subgraph L1["🪝  primitives · src/lib.rs facade"]
         direction LR
         S1["dual-stack UDP<br/>SO_REUSEPORT · SO_*BUFFORCE"]
@@ -1225,15 +1234,15 @@ flowchart TB
     style L3 fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
     style L4 fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
     style BIN fill:#0f172a,stroke:#334155,stroke-width:2px,color:#f8fafc
-    classDef prim fill:#dcfce7,stroke:#059669,stroke-width:1.5px,color:#064e3b
-    classDef codec fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
-    classDef data fill:#ffedd5,stroke:#ea580c,stroke-width:1.5px,color:#7c2d12
-    classDef cross fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    classDef edge fill:#dcfce7,stroke:#059669,stroke-width:1.5px,color:#064e3b
+    classDef tunnel fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
+    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:1.5px,color:#7c2d12
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
     classDef bin fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc
-    class S1,S2,S3 prim
-    class C1,C2,C3 codec
-    class D1,D2,D3 data
-    class O1,O2,O3 cross
+    class S1,S2,S3 edge
+    class C1,C2,C3 tunnel
+    class D1,D2,D3 exit
+    class O1,O2,O3 note
     class B1,B2 bin
 ```
 
@@ -1242,32 +1251,39 @@ flowchart TB
 _Where the two binaries sit: LAN / OpenWrt, internet, VPS, targets._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-subgraph LAN["🏠 LAN / OpenWrt"]
+    accTitle: Deployment topology
+    accDescr: A LAN or OpenWrt client dials the server over the public Internet; the server resolves and reaches TCP or UDP targets.
+    subgraph LAN["🏠  LAN / OpenWrt"]
+        direction TB
         APPS(["🧑‍💻 Apps"])
-        CLIENT["🧦 myquic2-client<br/>SOCKS5 :1080"]
+        CLIENT["🧦 myquic2-client<br/>SOCKS5 :1080 · forward listeners"]
         APPS -->|"TCP + UDP"| CLIENT
     end
-    CLIENT ==>|"QUIC · TLS 1.3"| NET["🌍 Internet"]
-    NET ==>|"QUIC · TLS 1.3"| SRV["🛰️ myquic2-server<br/>:8443"]
-    SRV --> RES(["🔎 resolver"])
-    SRV --> TCP(["🌐 TCP targets"])
-    SRV --> UDP(["📦 UDP targets"])
-    class APPS,CLIENT clientC
-    class NET wireC
-    class SRV coreC
-    class RES,TCP,UDP warmC
+    NET["🌍 Internet<br/>untrusted"]
+    subgraph EXIT["🛰️  Exit side"]
+        direction TB
+        SRV["🛰️ myquic2-server<br/>:8443"]
+        RES(["🔎 resolver"])
+        TCP(["🌐 TCP targets"])
+        UDP(["📦 UDP targets"])
+        SRV --> RES
+        SRV --> TCP
+        SRV --> UDP
+    end
+    CLIENT ==>|"QUIC · TLS 1.3"| NET
+    NET ==>|"QUIC · TLS 1.3"| SRV
     style LAN fill:#f0fdf4,stroke:#bbf7d0,stroke-width:1.5px,color:#14532d
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    style EXIT fill:#fff7ed,stroke:#fed7aa,stroke-width:1.5px,color:#7c2d12
+    classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef exit fill:#ffedd5,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    class APPS app
+    class CLIENT edge
+    class NET wire
+    class SRV,RES,TCP,UDP exit
 ```
 
 ### 🚀 Client paths
@@ -1277,8 +1293,10 @@ subgraph LAN["🏠 LAN / OpenWrt"]
 _Seven QUIC connections by default; each slot is its own endpoint and runtime._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
+    accTitle: Connection pool panorama
+    accDescr: Four TCP slots and three UDP slots separate interactive and bulk traffic, and every slot owns an endpoint, connection, dispatcher, and connection loop.
     subgraph APPS["🧑‍💻  application flows"]
         direction LR
         APP2["🎮 DNS · game<br/>interactive"]
@@ -1320,13 +1338,13 @@ flowchart TB
     style TCP fill:#eff6ff,stroke:#60a5fa,stroke-width:2px,color:#1e3a8a
     style UDPR fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
     style SLOT fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
-    classDef tcp fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
-    classDef udp fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    classDef infra fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    classDef wire fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef exit fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
     classDef app fill:#ffffff,stroke:#94a3b8,stroke-width:1.5px,color:#0f172a
-    class T0,T1,T2,T3 tcp
-    class U0,U1,U2 udp
-    class EP,CN,DL,LP infra
+    class T0,T1,T2,T3 wire
+    class U0,U1,U2 exit
+    class EP,CN,DL,LP note
     class APP1,APP2,APP3,APP4 app
 ```
 
@@ -1335,8 +1353,10 @@ flowchart TB
 _One SOCKS CONNECT, one QUIC stream, one exit-side dial._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: TCP echo path through SOCKS5
+    accDescr: SOCKS5 CONNECT is acknowledged optimistically, the exit dials the target, and the stream then carries a zero-copy bidirectional pump.
     autonumber
     box rgb(236, 253, 245) Client edge
         participant App as 🖥️ App
@@ -1386,37 +1406,39 @@ sequenceDiagram
 _The modern TCP dial: admission, happy-eyeballs racing, zero-copy pump._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: TCP relay path
+    accDescr: The server admits the connection, dials the target with happy eyeballs, and then pumps bytes with zero-copy chunks.
     autonumber
-        box rgb(236, 253, 245) Client edge
-            participant App as 🧑‍💻 App
-            participant Client as 🧦 MyQUIC2 client
-        end
-        box rgb(238, 242, 255) Tunnel
-            participant Server as 🛰️ MyQUIC2 server
-        end
-        box rgb(255, 247, 237) Exit side
-            participant Target as 🎯 Target TCP
-        end
-        rect rgb(248, 250, 252)
-            Note over App,Client: ① SOCKS5 CONNECT
-            App->>Client: atyp + addr + port
-            Client->>Server: open bi stream + stream head
-        end
-        rect rgb(238, 242, 255)
-            Note over Server: ② admission before work
-            Server->>Server: token gate + memory admission
-            Server->>Target: happy-eyeballs dial<br/>250 ms stagger · 4 s budget
-            Target-->>Server: connected
-            Server-->>Client: dial ACK
-            Client-->>App: SOCKS5 success
-        end
-        rect rgb(236, 253, 245)
-            Note over Server,Target: ③ zero-copy pump
-            Server->>Target: write_chunk / read_chunks
-            Note over Server,Target: failure → RST (SO_LINGER=0) + reset/stop 0x04
-        end
+    box rgb(236, 253, 245) Client edge
+        participant App as 🧑‍💻 App
+        participant Client as 🧦 MyQUIC2 client
+    end
+    box rgb(238, 242, 255) Tunnel
+        participant Server as 🛰️ MyQUIC2 server
+    end
+    box rgb(255, 247, 237) Exit side
+        participant Target as 🎯 Target TCP
+    end
+    rect rgb(248, 250, 252)
+        Note over App,Client: ① SOCKS5 CONNECT
+        App->>Client: atyp + addr + port
+        Client->>Server: open bi stream + stream head
+    end
+    rect rgb(238, 242, 255)
+        Note over Server: ② admission before work
+        Server->>Server: token gate + memory admission
+        Server->>Target: happy-eyeballs dial<br/>250 ms stagger · 4 s budget
+        Target-->>Server: connected
+        Server-->>Client: dial ACK
+        Client-->>App: SOCKS5 success
+    end
+    rect rgb(236, 253, 245)
+        Note over Server,Target: ③ zero-copy pump
+        Server->>Target: write_chunk / read_chunks
+        Note over Server,Target: failure → RST (SO_LINGER=0) + reset/stop 0x04
+    end
 ```
 
 #### Client egress selection
@@ -1424,9 +1446,11 @@ sequenceDiagram
 _Memo → acquire → own slot → sibling → fail-open or drop._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-D["📦 UDP datagram"] --> M{"memo<br/>fresh?"}
+    accTitle: Client egress selection
+    accDescr: A UDP datagram takes the memoized egress when fresh, otherwise it tries its own slot, a same-class sibling, and finally the fail-open or fail-closed policy.
+    D["📦 UDP datagram"] --> M{"memo<br/>fresh?"}
     M -->|"hit"| SEND["🚀 send_datagram"]
     M -->|"miss"| A["🧭 acquire egress"]
     A --> O{"own slot<br/>usable?"}
@@ -1436,19 +1460,14 @@ D["📦 UDP datagram"] --> M{"memo<br/>fresh?"}
     S -->|"no"| F{"udp_fail_closed?"}
     F -->|"false"| TCP["🔁 fail-open to TCP"]
     F -->|"true"| DROP["⛔ NO_EGRESS<br/>drop + count"]
-    class D,A,SEND clientC
-    class M,O,S,F decisionC
-    class TCP wireC
-    class DROP dangerC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef decision fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    class D,A,SEND edge
+    class M,O,S,F decision
+    class TCP wire
+    class DROP warn
 ```
 
 #### Reconnect & watchdog
@@ -1456,9 +1475,11 @@ D["📦 UDP datagram"] --> M{"memo<br/>fresh?"}
 _Two independent stall detectors, both below the QUIC idle timeout._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
-CONNECT(["🔌 Connecting"]) --> NEG["🤝 Negotiating<br/>HELLO · CAPS"]
+    accTitle: Reconnect and watchdog
+    accDescr: A connection negotiates CAPS or redials with bounded backoff; a watchdog reconnects when the path goes silent or acknowledgements stall.
+    CONNECT(["🔌 Connecting"]) --> NEG["🤝 Negotiating<br/>HELLO · CAPS"]
     NEG -->|"CAPS(2)"| READY(["✅ Ready"])
     NEG -->|"no CAPS · 2 s"| REDIAL["🔁 Reconnecting"]
     READY --> SILENT["🌑 Silent<br/>no inbound datagrams"]
@@ -1467,19 +1488,14 @@ CONNECT(["🔌 Connecting"]) --> NEG["🤝 Negotiating<br/>HELLO · CAPS"]
     ACKSTALL -->|"close"| REDIAL
     REDIAL -->|"200 ms … 5 s"| CONNECT
     READY -.-|"timeouts"| CLOCK["⏱️ watchdog = 2/3 × idle (default 40 s)<br/>QUIC idle = idle_timeout_secs (default 60 s)<br/>keepalive = 5 s (NAT only)"]
-    class CONNECT,NEG,REDIAL muteC
-    class READY clientC
-    class SILENT,ACKSTALL warmC
-    class CLOCK noteC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef mute fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1.5px,color:#475569
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef exit fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    class CONNECT,NEG,REDIAL mute
+    class READY edge
+    class SILENT,ACKSTALL exit
+    class CLOCK note
 ```
 
 ### 📡 Wire & flows
@@ -1489,8 +1505,10 @@ CONNECT(["🔌 Connecting"]) --> NEG["🤝 Negotiating<br/>HELLO · CAPS"]
 _Association setup, frame selection and the staged reply path._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: UDP echo path
+    accDescr: An association pins the app address, chooses DATA, TRAIN, or FRAG per payload, and routes replies back through the connection stager.
     autonumber
     box rgb(236, 253, 245) Client edge
         participant App as 🎮 App
@@ -1553,8 +1571,10 @@ sequenceDiagram
 _Payload shape → DATA / TRAIN / FRAG, with the send verdicts._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
+    accTitle: Frame shape decision
+    accDescr: A payload becomes steady DATA when confirmed, TRAIN when several small payloads can share a frame, and FRAG when it exceeds one datagram.
     P(["📦 payload +<br/>destination"]) --> Q{"does it fit<br/>one frame?"}
     Q -->|"yes · confirmed flow,<br/>within live budget"| S["rev2 DATA<br/>2 B steady · 1 lock"]
     Q -->|"no · several small payloads<br/>same or mixed flows"| B["rev2 TRAIN same/dict<br/>3 B header + 1 B/item"]
@@ -1566,15 +1586,16 @@ flowchart LR
     SEND -->|"Blocked"| DROP["🗑️ drop newest<br/>never drop-oldest"]
     SEND -->|"TooLarge"| RE["🔄 re-read live budget<br/>100 ms throttle"]
     RE -.-> Q
-    style P fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
-    classDef decision fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
-    classDef frame fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef send fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef app fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    classDef decision fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef tunnel fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
     classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
     classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    class P app
     class Q decision
-    class S,B,F frame
-    class SEND send
+    class S,B,F tunnel
+    class SEND wire
     class OK ok
     class DROP,RE warn
 ```
@@ -1584,26 +1605,23 @@ flowchart LR
 _Why rev2 coexistence with old decoders cannot misroute._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-BYTE(["🧵 first wire byte"]) --> N{"high nibble"}
+    accTitle: First-byte safety gate
+    accDescr: The high nibble of the first wire byte selects MQP-3 rev2, a legacy receive-only decoder, or a drop; unknown bytes never reach a parser.
+    BYTE(["🧵 first wire byte"]) --> N{"high nibble"}
     N -->|"0x0X"| R2["📡 MQP-3 rev2<br/>DATA · TRAIN · FRAG · CTL"]
     N -->|"0x02 / 0x05 / 0x06"| V2["📼 MQP-2 legacy<br/>receive + tests only"]
     N -->|"0x1X … 0x4X"| V3["📼 v0.2.0 v3 legacy<br/>receive + tests only"]
     N -->|"other"| DROP["⛔ drop"]
-    class BYTE clientC
-    class R2 wireC
-    class V2,V3 muteC
-    class DROP dangerC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef app fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,color:#0f172a
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef mute fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1.5px,color:#475569
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    class BYTE app
+    class R2 wire
+    class V2,V3 mute
+    class DROP warn
 ```
 
 #### Flow state machine
@@ -1611,28 +1629,26 @@ BYTE(["🧵 first wire byte"]) --> N{"high nibble"}
 _Inline → Opening → Open → Closed; ACK is an optimisation._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-INLINE(["⚪ INLINE"]) -->|"DATA OPEN"| OPENING(["🟣 OPENING"])
+    accTitle: Flow lifecycle
+    accDescr: A first frame creates an inline flow, acknowledgement or a compressed reply promotes it to open, and a close frame purges the binding.
+    INLINE(["⚪ INLINE"]) -->|"DATA OPEN"| OPENING(["🟣 OPENING"])
     OPENING -->|"FLOW_ACK<br/>or compressed reply"| OPEN(["🟢 OPEN"])
     OPENING -->|"FLOW_REJECT"| INLINE
     OPEN -->|"FLOW_CLOSE<br/>SESS_CLOSE"| CLOSED(["⚫ CLOSED"])
     INLINE -->|"session ends"| CLOSED
     OPEN -.->|"2 B steady"| HOT["📦 id + payload<br/>no session · no address"]
-    class INLINE muteC
-    class OPENING warmC
-    class OPEN clientC
-    class CLOSED dangerC
-    class HOT noteC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef mute fill:#f1f5f9,stroke:#cbd5e1,stroke-width:2px,color:#475569
+    classDef exit fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    class INLINE mute
+    class OPENING exit
+    class OPEN edge
+    class CLOSED warn
+    class HOT note
 ```
 
 #### Optimistic first packet
@@ -1640,31 +1656,33 @@ INLINE(["⚪ INLINE"]) -->|"DATA OPEN"| OPENING(["🟣 OPENING"])
 _The first UDP payload need not wait for CAPS; the server buffers pre-HELLO frames._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: Optimistic first packet
+    accDescr: The first UDP payload may leave before CAPS arrives; the server buffers up to eight pre-HELLO frames and releases them in order after a valid HELLO.
     autonumber
-        box rgb(236, 253, 245) Client
-            participant App as 🧑‍💻 App
-            participant Client as 🧦 MyQUIC2 client
-        end
-        box rgb(238, 242, 255) Server
-            participant Server as 🛰️ MyQUIC2 server
-        end
-        rect rgb(248, 250, 252)
-            Note over Client: QUIC established · rev2 state published
-            Client->>Server: CTL HELLO(wire_ver=2)
-            App->>Client: first UDP datagram
-        end
-        rect rgb(255, 247, 237)
-            Client->>Server: DATA OPEN (optimistic)
-            Server->>Server: buffer pre-HELLO frames<br/>8 frames / 16 KiB
-            Server-->>Client: CTL CAPS(2)
-            Server->>Server: flush buffer in arrival order
-            Server-->>Client: FLOW_ACK + reply
-        end
-        rect rgb(236, 253, 245)
-            Note over Client,Server: CAPS only updates caps · not a first-packet gate
-        end
+    box rgb(236, 253, 245) Client
+        participant App as 🧑‍💻 App
+        participant Client as 🧦 MyQUIC2 client
+    end
+    box rgb(238, 242, 255) Server
+        participant Server as 🛰️ MyQUIC2 server
+    end
+    rect rgb(248, 250, 252)
+        Note over Client: QUIC established · rev2 state published
+        Client->>Server: CTL HELLO(wire_ver=2)
+        App->>Client: first UDP datagram
+    end
+    rect rgb(255, 247, 237)
+        Client->>Server: DATA OPEN (optimistic)
+        Server->>Server: buffer pre-HELLO frames<br/>8 frames / 16 KiB
+        Server-->>Client: CTL CAPS(2)
+        Server->>Server: flush buffer in arrival order
+        Server-->>Client: FLOW_ACK + reply
+    end
+    rect rgb(236, 253, 245)
+        Note over Client,Server: CAPS only updates caps · not a first-packet gate
+    end
 ```
 
 #### Domain target + rebind
@@ -1672,38 +1690,40 @@ sequenceDiagram
 _Resolve once, learn the real source, then compress both directions._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: Domain target and reply-source rebind
+    accDescr: The first datagram names a domain; the server resolves it, learns the actual reply source, and binds that source to the same wire id.
     autonumber
-        box rgb(236, 253, 245) Client
-            participant App as 🧑‍💻 App
-            participant Client as 🧦 MyQUIC2 client
-        end
-        box rgb(238, 242, 255) Server
-            participant Server as 🛰️ MyQUIC2 server
-        end
-        box rgb(255, 247, 237) Exit side
-            participant Resolver as 🔎 Resolver
-            participant Target as 🎯 Target
-        end
-        rect rgb(248, 250, 252)
-            Note over App,Client: ① first datagram names the domain
-            App->>Client: UDP to example.com:53
-            Client->>Server: DATA OPEN(domain, payload)
-            Server->>Resolver: memo → moka → hickory
-            Resolver-->>Server: A / AAAA
-        end
-        rect rgb(255, 247, 237)
-            Note over Server,Target: ② learn the actual source
-            Server->>Target: payload
-            Target-->>Server: reply from actual source
-            Server-->>Client: DATA OPEN + SRC (actual source)
-            Client-->>App: SOCKS5 reply (learned source)
-        end
-        rect rgb(236, 253, 245)
-            Note over Client,Server: afterwards 2 B both ways · source changes rebind the id
-            Client->>Server: DATA 2 B steady
-        end
+    box rgb(236, 253, 245) Client
+        participant App as 🧑‍💻 App
+        participant Client as 🧦 MyQUIC2 client
+    end
+    box rgb(238, 242, 255) Server
+        participant Server as 🛰️ MyQUIC2 server
+    end
+    box rgb(255, 247, 237) Exit side
+        participant Resolver as 🔎 Resolver
+        participant Target as 🎯 Target
+    end
+    rect rgb(248, 250, 252)
+        Note over App,Client: ① first datagram names the domain
+        App->>Client: UDP to example.com:53
+        Client->>Server: DATA OPEN(domain, payload)
+        Server->>Resolver: memo → moka → hickory
+        Resolver-->>Server: A / AAAA
+    end
+    rect rgb(255, 247, 237)
+        Note over Server,Target: ② learn the actual source
+        Server->>Target: payload
+        Target-->>Server: reply from actual source
+        Server-->>Client: DATA OPEN + SRC (actual source)
+        Client-->>App: SOCKS5 reply (learned source)
+    end
+    rect rgb(236, 253, 245)
+        Note over Client,Server: afterwards 2 B both ways · source changes rebind the id
+        Client->>Server: DATA 2 B steady
+    end
 ```
 
 #### Pure-uplink flow
@@ -1711,30 +1731,32 @@ sequenceDiagram
 _FLOW_ACK unlocks compression even when no payload ever comes back._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: Pure-uplink flow acknowledgement
+    accDescr: A flow with no downlink is confirmed by FLOW_ACK, so compression unlocks without waiting for a reply payload.
     autonumber
-        box rgb(236, 253, 245) Client
-            participant App as 🧑‍💻 App
-            participant Client as 🧦 MyQUIC2 client
-        end
-        box rgb(238, 242, 255) Server
-            participant Server as 🛰️ MyQUIC2 server
-        end
-        box rgb(255, 247, 237) Exit side
-            participant Target as 🎯 Target
-        end
-        rect rgb(248, 250, 252)
-            Note over App,Client: telemetry · game upload · one-way flows
-            App->>Client: outbound datagram
-            Client->>Server: DATA OPEN(payload)
-            Server->>Target: payload
-        end
-        rect rgb(236, 253, 245)
-            Server-->>Client: FLOW_ACK (no payload)
-            Note over Client,Server: the ACK confirms the binding · compression unlocks without downlink
-            Client->>Server: DATA 2 B steady
-        end
+    box rgb(236, 253, 245) Client
+        participant App as 🧑‍💻 App
+        participant Client as 🧦 MyQUIC2 client
+    end
+    box rgb(238, 242, 255) Server
+        participant Server as 🛰️ MyQUIC2 server
+    end
+    box rgb(255, 247, 237) Exit side
+        participant Target as 🎯 Target
+    end
+    rect rgb(248, 250, 252)
+        Note over App,Client: telemetry · game upload · one-way flows
+        App->>Client: outbound datagram
+        Client->>Server: DATA OPEN(payload)
+        Server->>Target: payload
+    end
+    rect rgb(236, 253, 245)
+        Server-->>Client: FLOW_ACK (no payload)
+        Note over Client,Server: the ACK confirms the binding · compression unlocks without downlink
+        Client->>Server: DATA 2 B steady
+    end
 ```
 
 #### Server-owned full-cone flow
@@ -1742,32 +1764,34 @@ sequenceDiagram
 _The server can open a flow for an unsolicited source; the app replies on the same id._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#e0e7ff","noteBorderColor":"#6366f1","noteTextColor":"#1e1b4b","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","actorBkg":"#eef2ff","actorBorder":"#4f46e5","actorTextColor":"#1e1b4b","actorLineColor":"#94a3b8","signalColor":"#334155","signalTextColor":"#0f172a","labelBoxBkgColor":"#e0e7ff","labelBoxBorderColor":"#6366f1","labelTextColor":"#1e1b4b","loopTextColor":"#1e1b4b","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","activationBkgColor":"#c7d2fe","activationBorderColor":"#4f46e5","sequenceNumberBackgroundColor":"#4f46e5","sequenceNumberColor":"#ffffff"}}}%%
 sequenceDiagram
+    accTitle: Server-owned full-cone flow
+    accDescr: With full-cone enabled, an unsolicited datagram allocates a server-owned id, and the application can reply on the same id.
     autonumber
-        box rgb(255, 247, 237) Remote
-            participant Source as 🌐 Remote source
-        end
-        box rgb(238, 242, 255) Server
-            participant Server as 🛰️ MyQUIC2 server
-        end
-        box rgb(236, 253, 245) Client
-            participant Client as 🧦 MyQUIC2 client
-            participant App as 🧑‍💻 App
-        end
-        rect rgb(248, 250, 252)
-            Note over Source,Server: udp_full_cone = true · opt-in
-            Source->>Server: unsolicited datagram
-            Server->>Server: allocate owner=1 wire id
-            Server-->>Client: DATA OPEN + SRC (sess, source)
-            Client-->>App: deliver (learned source)
-        end
-        rect rgb(236, 253, 245)
-            Note over App,Source: app replies on the same id
-            App->>Client: app reply
-            Client->>Server: DATA 2 B steady (same id)
-            Server->>Source: app reply
-        end
+    box rgb(255, 247, 237) Remote
+        participant Source as 🌐 Remote source
+    end
+    box rgb(238, 242, 255) Server
+        participant Server as 🛰️ MyQUIC2 server
+    end
+    box rgb(236, 253, 245) Client
+        participant Client as 🧦 MyQUIC2 client
+        participant App as 🧑‍💻 App
+    end
+    rect rgb(248, 250, 252)
+        Note over Source,Server: udp_full_cone = true · opt-in
+        Source->>Server: unsolicited datagram
+        Server->>Server: allocate owner=1 wire id
+        Server-->>Client: DATA OPEN + SRC (sess, source)
+        Client-->>App: deliver (learned source)
+    end
+    rect rgb(236, 253, 245)
+        Note over App,Source: app replies on the same id
+        App->>Client: app reply
+        Client->>Server: DATA 2 B steady (same id)
+        Server->>Source: app reply
+    end
 ```
 
 #### Wire-version compatibility
@@ -1775,27 +1799,23 @@ sequenceDiagram
 _Matched deployment: a wrong peer fails at HELLO/CAPS, never silently downgrades._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
-A(["🆕 new client"]) --> B["📨 CTL HELLO(wire_ver=2)"]
+    accTitle: Version negotiation
+    accDescr: A new client requires CAPS with wire version 2; there is no downgrade, and a legacy first byte is dropped by the new server.
+    A(["🆕 new client"]) --> B["📨 CTL HELLO(wire_ver=2)"]
     B --> C{"peer answers<br/>CAPS(2)?"}
     C -->|"yes"| D(["✅ UDP enabled"])
     C -->|"no · 2 s"| E["🚫 close + redial"]
     E -.-> F(["no old-wire downgrade"])
     G(["📼 old v3 / MQP-2 peer"]) --> H["🔍 first byte is not 0x0X"]
     H --> I(["⛔ drop on new server"])
-    class A,B,C,D clientC
-    class E,F dangerC
-    class G,H,I muteC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef mute fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1.5px,color:#475569
+    class A,B,C,D edge
+    class E,F warn
+    class G,H,I mute
 ```
 
 ### 🚪 Server & admission
@@ -1805,8 +1825,10 @@ A(["🆕 new client"]) --> B["📨 CTL HELLO(wire_ver=2)"]
 _Admission before work: conn caps, token gate, sessions, replies._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
+    accTitle: Server ingress and session pipeline
+    accDescr: Admission happens before per-connection allocation; the session then resolves and gates the target before UDP egress allocates a session socket.
     subgraph G1["🚪  Ingress · admission before work"]
         direction LR
         L["[::]:8443<br/>SO_REUSEPORT<br/>1 endpoint / core · ≤ 8"]
@@ -1847,14 +1869,14 @@ flowchart TB
     style G1 fill:#eff6ff,stroke:#60a5fa,stroke-width:2px,color:#1e3a8a
     style G2 fill:#f5f3ff,stroke:#a78bfa,stroke-width:2px,color:#2e1065
     style G3 fill:#f0fdf4,stroke:#34d399,stroke-width:2px,color:#14532d
-    classDef gate fill:#fef2f2,stroke:#f87171,stroke-width:2px,color:#7f1d1d
-    classDef good fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
-    classDef infra fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
-    classDef deny fill:#fff1f2,stroke:#e11d48,stroke-width:1.5px,color:#881337
-    class G,T,F gate
-    class GS,SO,RP good
-    class L,A,H,HC,R,DN,SS infra
-    class RF,C1,BYE deny
+    classDef decision fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef ok fill:#dcfce7,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef tunnel fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:1.5px,color:#881337
+    class G,T,F decision
+    class GS,SO,RP ok
+    class L,A,H,HC,R,DN,SS tunnel
+    class RF,C1,BYE warn
 ```
 
 #### Admission decision tree
@@ -1862,25 +1884,21 @@ flowchart TB
 _Connection permit → token → memory budget → session fair-share._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-C["🔌 new QUIC connection"] --> G["🛡️ global conn cap"] --> A["🔑 token valid"] --> M["🧮 memory budget"] --> H["🛰️ handle_conn"] --> S["🔌 session fair-share"] --> SESS(["✅ admitted<br/>64 KiB socket"])
+    accTitle: Admission chain
+    accDescr: A connection passes the global cap, token check, and memory budget before handle_conn, and a session passes its fair-share check before allocation.
+    C["🔌 new QUIC connection"] --> G["🛡️ global conn cap"] --> A["🔑 token valid"] --> M["🧮 memory budget"] --> H["🛰️ handle_conn"] --> S["🔌 session fair-share"] --> SESS(["✅ admitted<br/>64 KiB socket"])
     G -.->|"full"| R["🚫 refuse<br/>1/s warn"]
     A -.->|"invalid"| CL["✂️ close 0x01"]
     M -.->|"deny"| R
     S -.->|"full"| D["📦 drop"]
-    class C,G,A,M,H,S coreC
-    class SESS clientC
-    class R,CL,D dangerC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef tunnel fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    class C,G,A,M,H,S tunnel
+    class SESS ok
+    class R,CL,D warn
 ```
 
 #### Reply-source authorization
@@ -1888,9 +1906,11 @@ C["🔌 new QUIC connection"] --> G["🛡️ global conn cap"] --> A["🔑 token
 _Restricted allowlist first; full-cone is an explicit opt-in._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-R(["📨 reply source"]) --> FC{"udp_full_cone?"}
+    accTitle: Reply-source policy
+    accDescr: Replies are accepted from the exact live flow, from full-cone mode, or from a bounded IP ring; everything else is dropped and counted.
+    R(["📨 reply source"]) --> FC{"udp_full_cone?"}
     FC -->|"true"| OK(["✅ forward any source"])
     FC -->|"false"| EX{"exact live<br/>flow source?"}
     EX -->|"yes"| OK
@@ -1898,19 +1918,14 @@ R(["📨 reply source"]) --> FC{"udp_full_cone?"}
     RING -->|"yes"| OK
     RING -->|"no"| DROP(["⛔ drop + count"])
     OK -.- NOTE["server-owned flow<br/>opt-in only"]
-    class R,FC,EX,RING coreC
-    class OK clientC
-    class DROP dangerC
-    class NOTE noteC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef tunnel fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef warn fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    class R,FC,EX,RING tunnel
+    class OK ok
+    class DROP warn
+    class NOTE note
 ```
 
 #### DNS resolution layers
@@ -1918,27 +1933,24 @@ R(["📨 reply source"]) --> FC{"udp_full_cone?"}
 _Thread memo → moka → hickory, then SSRF policy at the exit._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-Q(["🌐 host + port"]) --> TM["🔥 thread memo<br/>64 sets × 2 ways"]
+    accTitle: Resolver cache ladder
+    accDescr: Resolution falls from the thread-local memo to the shared moka cache and then to hickory, before the address passes the SSRF gate.
+    Q(["🌐 host + port"]) --> TM["🔥 thread memo<br/>64 sets × 2 ways"]
     TM -->|"miss"| MK["☁️ moka shared<br/>host key · 120 s / 10 s"]
     MK -->|"miss"| H["📡 hickory<br/>5 s · cancellable"]
     H --> C["🎯 A / AAAA"]
     C --> P["🛡️ SSRF / ipnet"]
     P --> O(["🔌 dial / sendmmsg"])
-    class Q,TM coreC
-    class MK,H wireC
-    class C,P warmC
-    class O clientC
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
+    classDef tunnel fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef exit fill:#ffedd5,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class Q,TM tunnel
+    class MK,H wire
+    class C,P exit
+    class O ok
 ```
 
 ### 🚀 Scheduling & transport
@@ -1948,14 +1960,18 @@ Q(["🌐 host + port"]) --> TM["🔥 thread memo<br/>64 sets × 2 ways"]
 _Per-session FIFO and a round-robin cursor feed one dict TRAIN._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-subgraph APPS["🧑‍💻 associations"]
+    accTitle: Cross-session stager
+    accDescr: Per-session FIFOs feed one round-robin drain, which packs payloads from several associations into a single TRAIN dictionary datagram.
+    subgraph APPS["🧑‍💻 associations"]
+        direction TB
         A["assoc A<br/>DNS"]
         B["assoc B<br/>game"]
         C["assoc C<br/>VPN"]
     end
     subgraph STAGE["⚙️ connection stager"]
+        direction TB
         Q["per-session FIFO<br/>round-robin cursor"]
         F["drain burst<br/>exact DATAGRAM budget"]
     end
@@ -1966,22 +1982,17 @@ subgraph APPS["🧑‍💻 associations"]
     F --> T["📦 TRAIN dict 0x04<br/>id list + idx + len + payload"]
     T --> D(["🚀 one QUIC DATAGRAM"])
     F -.-> NOTE["fair: a busy assoc cannot starve the rest"]
-    class A,B,C clientC
-    class Q,F coreC
-    class T wireC
-    class D clientC
-    class NOTE noteC
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef tunnel fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    class A,B,C edge
+    class Q,F tunnel
+    class T wire
+    class D edge
+    class NOTE note
     style APPS fill:#f0fdf4,stroke:#bbf7d0,stroke-width:1.5px,color:#14532d
     style STAGE fill:#eef2ff,stroke:#c7d2fe,stroke-width:1.5px,color:#312e81
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
 ```
 
 #### PMTU ramp
@@ -1989,9 +2000,12 @@ subgraph APPS["🧑‍💻 associations"]
 _Start at the QUIC floor, probe upward, and raise the start on known paths._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-subgraph RAMP["📈 PMTU discovery"]
+    accTitle: Path MTU discovery ladder
+    accDescr: The MTU climbs from 1200 to 1472 bytes; the DATAGRAM budget is MTU minus 38 bytes, and a 1472-byte path carries single frames up to 1434 bytes.
+    subgraph RAMP["📈 PMTU discovery"]
+        direction TB
         I["🎚️ initial_mtu<br/>default 1200"] --> P1["1336"]
         P1 --> P2["1404"]
         P2 --> P3["1438"]
@@ -2000,20 +2014,15 @@ subgraph RAMP["📈 PMTU discovery"]
     I --> B["📦 DATAGRAM budget<br/>mtu − 38 = 1162 B"]
     P4 --> W["✅ single frame<br/>up to 1434 B"]
     I -.-> R["💡 raise on known paths<br/>1360 / 1400 / 1472"]
-    class I,P1,P2,P3,P4 wireC
-    class B warmC
-    class W clientC
-    class R noteC
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef exit fill:#ffedd5,stroke:#fb923c,stroke-width:2px,color:#7c2d12
+    classDef ok fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef note fill:#ede9fe,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+    class I,P1,P2,P3,P4 wire
+    class B exit
+    class W ok
+    class R note
     style RAMP fill:#ecfeff,stroke:#a5f3fc,stroke-width:1.5px,color:#164e63
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
 ```
 
 ### ✅ Verification
@@ -2023,14 +2032,18 @@ subgraph RAMP["📈 PMTU discovery"]
 _Every push: format, lint, the full macOS/Linux test sets, musl and glibc builds._
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#64748b"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart LR
-subgraph CHECK["✅ checks"]
+    accTitle: Continuous integration and release pipeline
+    accDescr: Formatting, Clippy, and the full test suite gate two static builds, whose artifacts are hashed and published as release assets.
+    subgraph CHECK["✅ checks"]
+        direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>530 macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>567 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
+        direction TB
         M["musl static"]
         G["gnu 2.36"]
     end
@@ -2039,20 +2052,14 @@ subgraph CHECK["✅ checks"]
     M --> A["📜 SHA256SUMS"]
     G --> A
     A --> R(["🚀 release assets"])
-    class C,F,L,T coreC
-    class M,G wireC
-    class A,R clientC
+    classDef tunnel fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
+    classDef wire fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
+    classDef edge fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class C,F,L,T tunnel
+    class M,G wire
+    class A,R edge
     style CHECK fill:#f0fdf4,stroke:#bbf7d0,stroke-width:1.5px,color:#14532d
     style BUILD fill:#eef2ff,stroke:#c7d2fe,stroke-width:1.5px,color:#312e81
-
-    classDef clientC fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef coreC fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#1e1b4b
-    classDef wireC fill:#ecfeff,stroke:#0891b2,stroke-width:2px,color:#164e63
-    classDef warmC fill:#fff7ed,stroke:#fb923c,stroke-width:2px,color:#7c2d12
-    classDef dangerC fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#881337
-    classDef muteC fill:#f8fafc,stroke:#cbd5e1,color:#475569
-    classDef noteC fill:#e0e7ff,stroke:#8b5cf6,stroke-width:1.5px,color:#312e81
-    classDef decisionC fill:#fef9c3,stroke:#eab308,stroke-width:2px,color:#713f12
 ```
 
 ## 📚 Documentation
