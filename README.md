@@ -6,7 +6,7 @@
 </picture>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.2-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-566_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-567_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -501,7 +501,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **566 tests** on macOS (lib 273 + client 168 + server 119 + 6 process-level forwarding E2E); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **567 tests** on macOS (lib 274 + client 168 + server 119 + 6 process-level forwarding E2E); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1059,7 +1059,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **566 tests** on the macOS dev box (lib 273 + client 168 + server 119 + 6 process-level forwarding E2E).
+- **567 tests** on the macOS dev box (lib 274 + client 168 + server 119 + 6 process-level forwarding E2E).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, legacy MQP-2 receive paths, and the client forward listeners (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 6 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -1077,7 +1077,7 @@ sudo scripts/linux-bench-matrix.sh
 ## 🧜 Mermaid atlas
 
 The original v0.2.0 README diagram set is preserved here — refreshed for the
-rev2 wire where the old labels described v3 — and extended with new deep dives.
+rev2 wire where the old labels described v3 — and extended with new sections.
 Every block below renders natively on GitHub.
 
 ### 🏗️ System & modules
@@ -2060,10 +2060,9 @@ subgraph CHECK["✅ checks"]
 All project documents are maintained in **English**. The split is deliberate: the README is the operator-facing overview; the spec is the implementation contract; the analyses preserve the reasoning, measurements and fix history behind the current wire.
 
 - [MQP3_REV2_SPEC.md](MQP3_REV2_SPEC.md) — wire format, state machine, security contract and the implementation checklist.
-- [MQP3_REFACTOR_ANALYSIS.md](MQP3_REFACTOR_ANALYSIS.md) — design rationale, byte/CPU models, alternatives considered and roadmap.
+- [MQP3_REFACTOR_ANALYSIS.md](MQP3_REFACTOR_ANALYSIS.md) — self-contained synthesis of the design work: rationale, byte/CPU models, alternatives considered and roadmap.
 - [PROTOCOL_ANALYSIS.md](PROTOCOL_ANALYSIS.md) — end-to-end protocol/architecture analysis and the evidence behind the design.
 - [PERF_ANALYSIS.md](PERF_ANALYSIS.md) — performance work, benchmark results and the fix history that produced them.
-- [analysis/mqp3-refactor/](analysis/mqp3-refactor/) — five deep dives: [wire](analysis/mqp3-refactor/01-wire.md), [uplink](analysis/mqp3-refactor/02-uplink.md), [downlink](analysis/mqp3-refactor/03-downlink.md), [transport](analysis/mqp3-refactor/04-transport.md) and [evidence](analysis/mqp3-refactor/05-evidence.md).
 - [examples/hotpath_bench.rs](examples/hotpath_bench.rs) — TCP/UDP load, correctness, latency and full-duplex harness.
 - [scripts/linux-bench-matrix.sh](scripts/linux-bench-matrix.sh) — Linux deployment benchmark matrix.
 - [config-server.toml](config-server.toml) · [config-client.toml](config-client.toml) — documented configuration samples.

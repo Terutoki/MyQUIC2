@@ -1,7 +1,0 @@
-### B4c control: eviction idle floor with no reply activity (flaky target drops 1st datagram/source)
-peerA=sent (black-hole target, no reply expected)
-peerB=admitted attempts=2 b_admit_latency=0.70s a_idle_at_admit=6.71s
-EVICT_NOREPLY_RESULT PASS
--- client log refusal lines:
-2026-10-23T11:38:56.250809Z  INFO myquic2_client: udp_forward 127.0.0.1:18282 -> 127.0.0.1:19003 (max_sessions=1, forward_session_budget=3024, per-peer sessions, 180s idle reap)
-B4C_DONE

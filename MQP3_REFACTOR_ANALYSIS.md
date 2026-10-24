@@ -2,7 +2,7 @@
 
 > Analysis date: 2026-10-21 · Baseline: `d2f9658` (v0.2.0, clean worktree)
 > Scope: **MQP-3 UDP data plane** (QUIC DATAGRAM). TCP goes over QUIC stream, with no frame header at the protocol layer; this document discusses it only where "why TCP is not part of the refactor" is concerned.
-> Method: 5 parallel read-only deep reads + Lead synthesis (`analysis/mqp3-refactor/01-wire.md` … `05-evidence.md`),
+> Method: 5 parallel read-only deep reads + Lead synthesis (the per-topic notes are folded into this document and not shipped separately);
 > all benefit numbers are **model/source arithmetic**, not measurements on the target machine; evidence grading see §1.2.
 > Naming constraint: the refactored protocol **is still called MQP-3**; the wire version number exists only in the control plane `CAPS.wire_ver=2`, **the string "MQP-4" does not appear**.
 > Interaction protocol: the user has explicitly allowed wire incompatibility, the new protocol is still named MQP-3, both uplink and downlink must be optimized, and full duplex must be implemented.
@@ -405,8 +405,7 @@ association → reply cross-flow leakage. The benefit is only 2 B/frame, not wor
 - one QUIC packet carries one MQP frame, unless noted "quinn coalescing/connection-level stager";
 - no packet loss, no ACK-only packets, no PMTU jitter; no FEC;
 - "send calls/1000" = number of `try_send_datagram`; the TCP row is the number of `write_chunk`.
-- Detailed formulas and reproducible script: `analysis/mqp3-refactor/model.py`, `model-output.txt`;
-  cross-validation: `01-wire.md` §7, `02-uplink.md` §6, `03-downlink.md` §3.
+- Detailed formulas and assumptions: §6.1 (the reproducible model script and the per-topic cross-validation notes are not shipped separately).
 
 ### 6.2 Per-workload benefits
 
@@ -626,14 +625,7 @@ CTL SESS_CLOSE(sess=7, reason=0):
 
 ## Appendix B: Supporting reports and recomputation materials
 
-| File | Content |
-|---|---|
-| `analysis/mqp3-refactor/01-wire.md` | frame format/header overhead full matrix, candidates A/B/C, decoder DoS, golden bytes |
-| `analysis/mqp3-refactor/02-uplink.md` | client uplink per-segment cost, headroom table, implementation-layer benefits (F10/F3 etc.) |
-| `analysis/mqp3-refactor/03-downlink.md` | server downlink per-segment cost, per-session stager model, domain-name binding insight, P1–P7 ordering |
-| `analysis/mqp3-refactor/04-transport.md` | quinn facts, per-packet cost, D1–D6 full-duplex definition, leverage × workload, benchmark matrix |
-| `analysis/mqp3-refactor/05-evidence.md` | evidence grading, rejected designs, harness modes/gaps, document drift |
-| `analysis/mqp3-refactor/model.py` / `model-output.txt` | Lead-side wire model (reproducible; all assumptions written at the top of the script) |
+The five per-topic deep dives (`01-wire`, `02-uplink`, `03-downlink`, `04-transport`, `05-evidence`) and the wire-model script (`model.py` / `model-output.txt`) were the working materials behind this synthesis. They are not shipped in the repository; their conclusions are folded into the sections above, and the implementation contract is [`MQP3_REV2_SPEC.md`](MQP3_REV2_SPEC.md).
 
 ## Appendix C: List of invariants that must be preserved (for implementation review)
 
