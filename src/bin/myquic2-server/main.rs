@@ -123,7 +123,8 @@ async fn main() -> Result<()> {
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     let tuning = c.tuning();
     let congestion = Congestion::from_config(&c.congestion);
-    scfg.transport_config(build_transport_tuned(congestion, c.keep_alive_secs, tuning));
+    let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
+    scfg.transport_config(build_transport_tuned(congestion, keep_alive_secs, tuning));
     // QUIC ingress: `quic_endpoints` endpoints, each bound to `listen` with
     // its own receive loop — on Linux they share the port as a `SO_REUSEPORT`
     // group and the kernel spreads connections across it (the default there;
@@ -160,9 +161,11 @@ async fn main() -> Result<()> {
         );
     }
     info!(
-        "server listening on {listen} congestion={} gso_auto={} endpoints={ep_count} (quinn-udp probes UDP_SEGMENT/GRO)",
+        "server listening on {listen} congestion={} gso_auto={} endpoints={ep_count} \
+         keepalive={keep_alive_secs}s idle={}s (quinn-udp probes UDP_SEGMENT/GRO)",
         Congestion::from_config(&c.congestion),
-        c.gso
+        c.gso,
+        tuning.idle_timeout_secs
     );
     if !c.gso {
         warn!(

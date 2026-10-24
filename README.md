@@ -460,7 +460,7 @@ MQP-3 is a passenger, not a replacement. The transport choices that matter most:
 - **Runtime topology.** The client pins one current-thread runtime per pool slot (7 at the shipped defaults) and sizes the multi-threaded main runtime to the cores those pinned threads leave over, so saturation cannot put `cores + slots` runnable threads on `cores` CPUs. `MYQUIC2_SHARD_RUNTIME=0` restores the single shared runtime (full worker width).
 - **Session sockets.** Each UDP association gets one 64 KiB socket and one reader. `recvmmsg` and `sendmmsg` batch up to 32 datagrams; the per-session fair share prevents one association from monopolizing the exit.
 - **TCP path.** TCP rides a QUIC bidirectional stream: optimistic SOCKS5 success, borrowed QUIC halves, vectored writes, 300 s idle timeout, 250 ms happy-eyeballs delay, and `RST`/`STOP_SENDING` (`0x04`) on failure.
-- **Liveness.** The QUIC idle timeout is `max(3 × keepalive, 15 s)`; the client watchdog is `max(2 × keepalive, 8 s)`; reconnect backoff is 200 ms to 5 s. A dead path is detected below the QUIC idle timeout so the next request does not wait for it.
+- **Liveness.** Keepalive is only the NAT refresh cadence (5 s default); the QUIC idle timeout is decoupled (`idle_timeout_secs`, default 60 s, floor `max(3 × keepalive, 15 s)`), the client watchdog is `2/3 × idle` (40 s), and the selection-time stale gate is 22 s. Reconnect backoff is 200 ms to 5 s. A dead path is detected below the QUIC idle timeout so the next request does not wait for it; raise `idle_timeout_secs` (e.g. 90) to tolerate longer handovers, at the cost of slower true-failure detection.
 
 ### 15. Implementation map and observability
 
@@ -1466,7 +1466,7 @@ CONNECT(["🔌 Connecting"]) --> NEG["🤝 Negotiating<br/>HELLO · CAPS"]
     SILENT -->|"close"| REDIAL
     ACKSTALL -->|"close"| REDIAL
     REDIAL -->|"200 ms … 5 s"| CONNECT
-    READY -.-|"timeouts"| CLOCK["⏱️ watchdog = max(2×keepalive, 8 s)<br/>QUIC idle = max(3×keepalive, 15 s)"]
+    READY -.-|"timeouts"| CLOCK["⏱️ watchdog = 2/3 × idle (default 40 s)<br/>QUIC idle = idle_timeout_secs (default 60 s)<br/>keepalive = 5 s (NAT only)"]
     class CONNECT,NEG,REDIAL muteC
     class READY clientC
     class SILENT,ACKSTALL warmC

@@ -88,10 +88,12 @@ pub use tls::{
     parse_congestion, server_tls_config,
 };
 pub use transport::{
-    Congestion, DGRAM_MAX_WIRE, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW,
-    STREAM_RECEIVE_WINDOW, TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT,
-    build_client_transport_tuned, build_client_transport_tuned_class, build_transport,
-    build_transport_tuned, build_transport_tuned_class, idle_timeout_secs, watchdog_silence_secs,
+    Congestion, DEFAULT_IDLE_TIMEOUT_SECS, DGRAM_MAX_WIRE, IDLE_TIMEOUT_MAX_SECS,
+    IDLE_TIMEOUT_MIN_SECS, KEEP_ALIVE_MAX_SECS, RECEIVE_WINDOW, SEND_WINDOW, STREAM_RECEIVE_WINDOW,
+    TARGET_BDP_BYTES, TARGET_LINK_BYTES_PER_SEC, TARGET_LINK_RTT, build_client_transport_tuned,
+    build_client_transport_tuned_class, build_transport, build_transport_tuned,
+    build_transport_tuned_class, idle_timeout_secs, resolve_idle_timeout_secs,
+    watchdog_silence_secs,
 };
 // `incoming_stream_credits` is exercised by the lib tests below through
 // `use super::*`.
@@ -3662,15 +3664,13 @@ mod tests {
         assert!(err.to_string().contains("v4"), "{err}");
     }
 
-    /// The keepalive clamp bounds the derived detection window: the QUIC idle
-    /// timeout is `3x` and the client silence watchdog `2x`, so the old 3600
-    /// clamp put silent-path detection hours out. A sane value must pass
-    /// through untouched. The watchdog must stay strictly below the idle
-    /// timeout for every legal keepalive — that invariant is what makes the
-    /// watchdog an *independent* detector instead of dead code the idle timer
-    /// always beats.
+    /// The idle-timeout default/clamp bounds the detection window; the
+    /// keepalive clamp only bounds the NAT refresh cadence. The watchdog must
+    /// stay strictly below the idle timeout for every legal keepalive — that
+    /// invariant is what makes the watchdog an *independent* detector instead
+    /// of dead code the idle timer always beats.
     #[test]
-    fn keepalive_clamp_bounds_the_detection_window() {
+    fn keepalive_clamp_and_idle_window_bound_detection() {
         assert_eq!(clamp_keep_alive(3600), KEEP_ALIVE_MAX_SECS);
         assert_eq!(
             clamp_keep_alive(KEEP_ALIVE_MAX_SECS + 1),
@@ -3678,26 +3678,62 @@ mod tests {
         );
         assert_eq!(clamp_keep_alive(17), 17);
         assert_eq!(clamp_keep_alive(0), 1, "a zero keepalive cannot disable it");
-        assert!(
-            watchdog_silence_secs(KEEP_ALIVE_MAX_SECS) <= 1200,
-            "the watchdog must stay inside 20 minutes"
-        );
         // `watchdog < idle` over the whole accepted range, including the
         // clamp's low end: the client's detector has to fire before quinn's
         // idle timer (or the peer's CONNECTION_CLOSE) can.
         for k in 0..=KEEP_ALIVE_MAX_SECS {
-            let watchdog = watchdog_silence_secs(k);
-            let idle = idle_timeout_secs(k);
+            let idle = resolve_idle_timeout_secs(k, None);
+            let watchdog = watchdog_silence_secs(idle);
             assert!(
                 watchdog < idle,
                 "keepalive {k}s: watchdog {watchdog}s must fire before idle {idle}s"
             );
         }
-        // The shipped default detects path death at ~10 s (2 x 5 s), and the
-        // floors keep a 1 s keepalive from producing a hair-trigger detector.
-        assert_eq!(watchdog_silence_secs(5), 10);
-        assert_eq!(watchdog_silence_secs(1), 8);
-        assert_eq!(idle_timeout_secs(1), 15);
+        // Shipped defaults: 5 s keepalive -> 60 s idle -> 40 s watchdog, i.e.
+        // ~41 s true-failure detection instead of the old ~10 s.
+        assert_eq!(resolve_idle_timeout_secs(5, None), 60);
+        assert_eq!(watchdog_silence_secs(60), 40);
+        // A 1 s keepalive still gets the same 60 s liveness floor; the old
+        // fast behavior remains available through the explicit 15 s override.
+        assert_eq!(resolve_idle_timeout_secs(1, None), 60);
+        assert_eq!(resolve_idle_timeout_secs(5, Some(15)), 15);
+        assert_eq!(watchdog_silence_secs(15), 10);
+        // The idle window must stay above 3 x keepalive and inside the caps.
+        assert_eq!(resolve_idle_timeout_secs(20, Some(15)), 60);
+        assert_eq!(resolve_idle_timeout_secs(5, Some(10_000)), 900);
+        assert_eq!(resolve_idle_timeout_secs(5, Some(90)), 90);
+        // The longest legal keepalive still keeps the watchdog inside the old
+        // 20-minute bound.
+        assert!(
+            watchdog_silence_secs(resolve_idle_timeout_secs(KEEP_ALIVE_MAX_SECS, None)) <= 1200,
+            "the watchdog must stay inside 20 minutes"
+        );
+    }
+
+    /// The config path must resolve the same default/override the pure helpers
+    /// do: omitted `idle_timeout_secs` is 60 s (40 s watchdog), and an explicit
+    /// 15 s restores the old fast behavior on the shipped 5 s keepalive.
+    #[test]
+    fn config_path_resolves_the_liveness_window() {
+        let client = "socks_listen = '127.0.0.1:1080'\n\
+                      server_addr = '127.0.0.1:8443'\n\
+                      server_name = 's'\n\
+                      server_cert_file = 'c'\n";
+        let c: ClientConf = toml::from_str(client).unwrap();
+        assert_eq!(c.tuning().idle_timeout_secs, 60);
+        assert_eq!(watchdog_silence_secs(c.tuning().idle_timeout_secs), 40);
+        let c: ClientConf = toml::from_str(&format!("{client}idle_timeout_secs = 15\n")).unwrap();
+        assert_eq!(c.tuning().idle_timeout_secs, 15);
+        assert_eq!(watchdog_silence_secs(c.tuning().idle_timeout_secs), 10);
+
+        let server = "listen = '[::]:8443'\n\
+                      cert_file = 'c'\n\
+                      key_file = 'k'\n\
+                      server_name = 's'\n";
+        let s: ServerConf = toml::from_str(server).unwrap();
+        assert_eq!(s.tuning().idle_timeout_secs, 60);
+        let s: ServerConf = toml::from_str(&format!("{server}idle_timeout_secs = 90\n")).unwrap();
+        assert_eq!(s.tuning().idle_timeout_secs, 90);
     }
 
     /// The admission bound multiplies this figure by the admitted connection

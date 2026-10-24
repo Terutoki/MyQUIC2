@@ -14,7 +14,15 @@ key_file = "server-key.pem"
 server_name = "test.com"
 congestion = "bbr"
 gso = true
+# NAT/firewall refresh cadence. This is not the liveness window; keep it short
+# enough for the path's UDP mapping (5 s is safe on common 30-120 s NATs).
 keep_alive_secs = 5
+# Liveness window, decoupled from keepalive. Default 60 s: the client's silence
+# watchdog is 2/3 of it (40 s) and its stale gate is 22 s. 15 restores the old
+# fast behavior (~10 s watchdog); 90 widens the no-drop window to ~60 s. Values
+# below 3 × keep_alive_secs are raised to that floor. Both sides advertise an
+# idle timeout and QUIC uses the minimum, so keep this equal on both sides.
+idle_timeout_secs = 60
 allow_private = true
 # Full-cone NAT semantics for the UDP relay (default false). When true, every
 # UDP association's relay socket forwards replies from ANY source, not just the

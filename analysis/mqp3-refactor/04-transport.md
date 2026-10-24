@@ -91,7 +91,7 @@ Code locations: `src/transport/build.rs:144-281` (`build_transport_tuned_class`)
 | PMTU discovery | enabled, upper_bound 1472, min_mtu 1200, interval 600 s, black-hole cooldown 60 s | `build.rs:243-245`; quinn-proto `config/transport.rs:698-755` | **opportunistic**: probes are sent only in `poll_transmit` when `buf.is_empty() && established` (quinn-proto `connection/mod.rs:950`) → a saturated connection may stay at 1200 for a long time |
 | Flow control window | 4 / 8 / 4 MiB (stream_rwnd / conn_rwnd / send_window) | `build.rs:206-212`; `tuning.rs:229-232` | per connection, per direction (send_window is the local send budget); opt-in 8/16/8 |
 | Concurrent streams | bidi 8192 / uni 100 | `build.rs:197-198`; `tuning.rs:96` | covers the worst case of 8192 SOCKS connections landing on one connection |
-| keepalive / idle | 5 s / 15 s (=3×keepalive, floor 15) | `build.rs:264-275` | per-connection heartbeat; 7 connections = ~1.4 pkt/s/client |
+| keepalive / idle | 5 s / 60 s (decoupled; 40 s watchdog, 22 s stale) | `build.rs` | per-connection NAT heartbeat; 7 connections = ~1.4 pkt/s/client |
 | GSO/GRO | **quinn-udp auto-probes, no API switch**: Linux GSO=64 segments (quinn then clamps to 10 segments/sendmsg), GRO=64 segments; macOS without `fast-apple-datapath` → GSO=1, GRO=1, one recvmsg per packet | quinn-udp `unix.rs:189,237-252,806-855,978-996`; quinn `connection.rs:1020-1023,1334-1341`; `build.rs:175-178,276-279` | **the `gso` config is inert**: the server only prints it (`myquic2-server/main.rs:163-170`), the client parses it and never reads it (`config/client_conf.rs:20`) |
 | ECN | **enabled by default**: quinn-proto `PathData::sending_ecn = true`, sends ECT0, disables if the ACK lacks ECN counts/validation fails | quinn-proto `connection/paths.rs:73,122`, `connection/mod.rs:1006,1563-1600`; quinn-udp `unix.rs:119-140,614-632,719-799` | effective on Linux; the macOS dual-stack socket's `IP_RECVTOS` is unsupported (quinn-udp comment `unix.rs:119-121`) → IPv4 received packets have no TOS → ECN is most likely auto-disabled. **Not a tunable lever** |
 | Endpoint socket buffers | each endpoint requests 4 MiB SO_SNDBUF/SO_RCVBUF (Linux kernel records 2×); `SO_*BUFFORCE` best-effort | `src/lib.rs:137-144,336-402,592-603` | per client slot / server endpoint |
@@ -777,7 +777,7 @@ task-clock (pps/CPU-second is more stable than absolute pps). macOS only runs M1
 
 1. QUIC is already full duplex (independent PN/CC/loss/RTT/PTO in each direction); what "full duplex" lacks is MQP-3 state symmetry plus a control plane.
 2. Configuration: quinn 0.11.12/proto 0.11.19/udp 0.5.16; BBR (initial cwnd 234 KiB); DGRAM 1/2 MiB;
-   windows 4/8/4 MiB; initial_mtu 1200; ACK thr 2/5ms, bulk 8/10ms; keepalive 5s/idle 15s;
+   windows 4/8/4 MiB; initial_mtu 1200; ACK thr 2/5ms, bulk 8/10ms; keepalive 5s / idle 60s (watchdog 40s);
    ECN on by default (Linux); the server has only the interactive preset → bulk asymmetry; the gso config is ineffective (log only).
 3. GSO/GRO only on Linux (10 segments/sendmsg, GRO 64); this quinn-udp has no GSO/GRO on macOS, one syscall per packet,
    and the server defaults to 1 shard → macOS numbers cannot be extrapolated.

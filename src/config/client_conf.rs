@@ -29,6 +29,21 @@ pub struct ClientConf {
     pub dns_ip_preference: IpPreference,
     #[serde(default = "d_keepalive")]
     pub keep_alive_secs: u64,
+    /// QUIC idle timeout in seconds, decoupled from `keep_alive_secs` (which
+    /// stays the NAT/firewall refresh cadence).
+    ///
+    /// Unset means `max(3 x keep_alive_secs, 60)`. The client's silence
+    /// watchdog is `2/3 x idle` (40 s at the shipped defaults) and its
+    /// selection-time stale gate is the midpoint between keepalive and
+    /// watchdog (22 s). An explicit value is clamped to
+    /// `max(3 x keep_alive_secs, 15)..=900`; `15` restores the previous
+    /// fast-detection behavior with a 5 s keepalive, while values above 60
+    /// widen the no-drop window at the cost of slower true-failure detection.
+    ///
+    /// Both peers advertise an idle timeout and QUIC uses the minimum, so the
+    /// same value must be set on both sides for the intended window.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
     #[serde(default = "d_5")]
     pub reconnect_timeout_secs: u64,
     /// Must match the server's `auth_token` (both empty = no authentication).

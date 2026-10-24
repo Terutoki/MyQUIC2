@@ -29,13 +29,11 @@ fn reconnect_backoff() -> impl Iterator<Item = Duration> {
 
 /// How often the silence watchdog re-reads `ConnectionStats`.
 ///
-/// Detection granularity is this tick on top of the silence window, so the old
-/// hard-coded 5 s poll made a 10 s watchdog fire at ~15 s — i.e. at the QUIC
-/// idle timeout it is supposed to beat, quietly turning it back into the dead
-/// code the old `4x/20 s` window made it. One second keeps a 10 s window a
-/// ~11 s detector; the tick costs one `ConnectionStats` snapshot per second per
-/// connection (the same quinn state-lock acquisition the 5 s tick paid, just
-/// more often — still nowhere near the per-packet path).
+/// Detection granularity is this tick on top of the silence window: one second
+/// keeps the shipped 40 s window a ~41 s detector, while the tick costs one
+/// `ConnectionStats` snapshot per second per connection (the same quinn
+/// state-lock acquisition the old 5 s tick paid, just more often — still
+/// nowhere near the per-packet path).
 ///
 /// `pub(crate)` because the pool's selection-time path-health threshold
 /// ([`data_stale_threshold_ms`]) is derived from the worst-case age of an
@@ -109,14 +107,12 @@ pub(crate) fn spawn_conn_loop(
                     // advancing into a dead path, so an `rx || tx` reset
                     // blinds the detector exactly when the downlink dies.
                     //
-                    // `watchdog_silence` is derived from the same clamped
-                    // keepalive as the transport's idle timeout and is
-                    // `max(2x keepalive, 8 s)`, provably strictly below
-                    // `max(3x keepalive, 15 s)` (see its unit test). So these
+                    // `watchdog_silence` is `2/3` of the transport's resolved
+                    // idle timeout (40 s at the shipped defaults) and is
+                    // provably strictly below it (see its unit test). So these
                     // detectors really fire first and force the reconnect,
-                    // instead of the old `4x/20 s` window that the idle timer
-                    // always beat — which made them dead code and pinned path
-                    // death at ~15 s. `WATCHDOG_POLL` bounds the overshoot.
+                    // instead of being masked by quinn's idle timer.
+                    // `WATCHDOG_POLL` bounds the overshoot.
                     let watchdog = async {
                         let s0 = conn.stats();
                         // (a) Downlink / full blackhole: inbound datagrams

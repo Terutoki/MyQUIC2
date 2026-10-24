@@ -57,8 +57,9 @@ pub(crate) struct ConnSlot {
     /// SIGKILLed peer) freezes the counter and the stamp with it. That freeze
     /// is the signal `live` cannot express: a blackholed connection still has
     /// no `close_reason()` and keeps `live` true until the watchdog's
-    /// `max(2x keepalive, 8 s)` window expires. `0` means "no progress observed
-    /// yet" and is treated as *not* stale (see [`ConnSlot::is_data_stale`]):
+    /// `2/3 x idle` window (40 s at the shipped defaults) expires. `0` means
+    /// "no progress observed yet" and is treated as *not* stale (see
+    /// [`ConnSlot::is_data_stale`]):
     /// the clear path resets it on death, so a restored live hint can never
     /// pair a fresh generation with the previous one's stale stamp.
     pub(crate) last_rx_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -408,9 +409,8 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
 /// slot's inbound progress may be frozen before [`ConnPool::pick_tcp_index`]
 /// stops preferring it (see [`ConnSlot::is_data_stale`]).
 ///
-/// Derived from the same clamped keepalive the transport and the reconnect
-/// loop's silence watchdog use, as the midpoint between the two bounds that
-/// matter:
+/// Derived from the same keepalive/watchdog pair the transport and the
+/// reconnect loop use, as the midpoint between the two bounds that matter:
 ///
 /// - **Lower bound — a healthy idle connection must never be rejected.** The
 ///   shipped 5 s keepalive makes the peer's ACKs and keepalive PINGs arrive at
@@ -418,24 +418,25 @@ pub(crate) fn select_slot(pinned: bool, rr: usize, live: &[bool]) -> usize {
 ///   `udp_rx.datagrams` after at most one `WATCHDOG_POLL` tick, so the stamp's
 ///   age on a healthy idle connection stays below `keepalive + poll`.
 /// - **Upper bound — the gate must win while the slot is still live.** The
-///   watchdog force-closes at `max(2x keepalive, 8 s)` (and needs a poll tick
-///   to notice), so a threshold at or above that would never be reached while
-///   the blackholed slot was still selectable.
+///   watchdog force-closes at `2/3 x idle` (40 s at the shipped defaults) and
+///   needs a poll tick to notice, so a threshold at or above that would never
+///   be reached while the blackholed slot was still selectable.
 ///
 /// The midpoint is provably strictly between the bounds for every legal
-/// keepalive, 1..=300 s (locked by
-/// `data_stale_threshold_sits_between_healthy_idle_and_watchdog`): it keeps the
-/// healthy-idle case at least one poll tick of margin and still stops selecting
-/// a blackholed slot minutes before the watchdog on large keepalives. With the
-/// shipped 5 s keepalive (10 s watchdog window) it is 7 s, so a path that
-/// blackholes stops receiving *new* flows ~3 s before the watchdog would even
-/// notice, instead of accepting every CONNECT for the whole ~10 s window.
-pub(crate) fn data_stale_threshold_ms(keep_alive_secs: u64) -> u64 {
+/// keepalive/idle pair (locked by
+/// `data_stale_threshold_sits_between_healthy_idle_and_watchdog`). With the
+/// shipped 5 s keepalive and 40 s watchdog it is 22 s, so a path that
+/// blackholes stops receiving *new* flows 18 s before the watchdog would even
+/// notice, instead of accepting every CONNECT for the whole 40 s window.
+pub(crate) fn data_stale_threshold_ms(keep_alive_secs: u64, watchdog_secs: u64) -> u64 {
     // Same clamp the transport applies (`clamp_keep_alive`); no warning here —
     // `main` clamped and validated the configured value already, and this is
     // also called from the tests' default constructor.
     let keepalive = keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
-    let watchdog_secs = watchdog_silence_secs(keepalive);
+    debug_assert!(
+        watchdog_secs > keepalive,
+        "watchdog {watchdog_secs}s must exceed keepalive {keepalive}s"
+    );
     (keepalive + watchdog_secs) / 2 * 1_000
 }
 
@@ -567,8 +568,8 @@ pub(crate) struct ConnPool {
     /// [`data_stale_threshold_ms`]): a `live` TCP slot whose published
     /// inbound-progress stamp ([`ConnSlot::last_rx_ms`]) is older than this is
     /// re-picked away from in [`ConnPool::pick_tcp_index`]. Computed once at
-    /// startup from the clamped keepalive, so the routing path's check is two
-    /// relaxed loads and a cached-clock read.
+    /// startup from the resolved keepalive/watchdog pair, so the routing path's
+    /// check is two relaxed loads and a cached-clock read.
     pub(crate) data_stale_ms: u64,
 }
 
@@ -595,11 +596,12 @@ impl ConnPool {
             udp_fail_closed,
             udp_split,
             udp_bulk_shards,
-            // The shipped default keepalive (5 s) drives the selection-time
-            // path-health threshold, so the routing table the existing tests
-            // were written against keeps its shape. Tests that exercise the
-            // gate set `pool.data_stale_ms` (and the slots' stamps) directly.
-            data_stale_threshold_ms(5),
+            // The shipped defaults (5 s keepalive, 60 s idle -> 40 s watchdog)
+            // drive the selection-time path-health threshold, so the routing
+            // table the existing tests were written against keeps its shape.
+            // Tests that exercise the gate set `pool.data_stale_ms` (and the
+            // slots' stamps) directly.
+            data_stale_threshold_ms(5, 40),
         )
     }
 
@@ -614,8 +616,8 @@ impl ConnPool {
     /// payload size. It only affects classification, never the slot layout.
     ///
     /// `data_stale_ms` is the selection-time path-health threshold (see
-    /// [`data_stale_threshold_ms`]), derived by `main` from the same clamped
-    /// keepalive as the transport and the watchdog.
+    /// [`data_stale_threshold_ms`]), derived by `main` from the same resolved
+    /// idle timeout as the transport and the watchdog.
     pub(crate) fn new_with_bulk_ports(
         n: usize,
         interactive_ports: Vec<u16>,
@@ -784,10 +786,11 @@ impl ConnPool {
     /// 2. **Path health (L3)**: a *blackholed* connection has no close reason
     ///    and still reads live — NAT rebind, Wi-Fi handover, SIGKILLed peer —
     ///    so `close_reason()` cannot see it until the silence watchdog fires
-    ///    (`max(2x keepalive, 8 s)` later). Its published inbound-progress
-    ///    stamp goes stale first (see [`ConnSlot::is_data_stale`] and
-    ///    [`data_stale_threshold_ms`]), so a `live` preference whose progress
-    ///    is stale is re-picked over the live-and-fresh set. This changes
+    ///    (`2/3 x idle`, 40 s at the shipped defaults). Its published
+    ///    inbound-progress stamp goes stale first (see
+    ///    [`ConnSlot::is_data_stale`] and [`data_stale_threshold_ms`]), so a
+    ///    `live` preference whose progress is stale is re-picked over the
+    ///    live-and-fresh set. This changes
     ///    *selection only*: the slot stays live, the watchdog stays the
     ///    authority that force-closes and redials, and nothing here can trigger
     ///    a reconnect.

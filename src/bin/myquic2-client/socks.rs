@@ -282,14 +282,14 @@ pub(crate) async fn handle_socks(
             //
             // Selection-time path health: `pick_tcp_index` now re-picks a slot
             // away when the reconnect loop's published inbound-progress stamp
-            // is older than `data_stale_threshold_ms` (~7 s with the shipped
-            // 5 s keepalive, strictly below the `max(2x keepalive, 8 s)` ~10 s
-            // silence watchdog). A connection that blackholes *before* this
-            // flow's `pick_tcp` therefore stops receiving new flows at the
-            // first selection after its stamp goes stale, instead of swallowing
-            // every CONNECT for the whole ~10 s watchdog window. The selection
-            // gate changes routing only: the watchdog remains the authority
-            // that force-closes the dead connection and redials it.
+            // is older than `data_stale_threshold_ms` (~22 s with the shipped
+            // 5 s keepalive / 60 s idle, strictly below the 40 s silence
+            // watchdog). A connection that blackholes *before* this flow's
+            // `pick_tcp` therefore stops receiving new flows at the first
+            // selection after its stamp goes stale, instead of swallowing every
+            // CONNECT for the whole 40 s watchdog window. The selection gate
+            // changes routing only: the watchdog remains the authority that
+            // force-closes the dead connection and redials it.
             //
             // The residual limitation is the in-flight flow: once the
             // optimistic SOCKS success reply above has been sent, a flow that

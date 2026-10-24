@@ -153,49 +153,51 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     let quic_client = Arc::new(quic_client);
     let mut ccfg_interactive = quinn::ClientConfig::new(quic_client.clone());
     let congestion = Congestion::from_config(&c.congestion);
+    // Resolve the transport tuning once: the idle timeout it carries is the
+    // same value the silence watchdog and the pool's stale gate derive from,
+    // so the three can never disagree about the liveness window.
+    let tuning = c.tuning();
     // Client-side builders: same tuning, but they advertise zero incoming
     // stream credit (the server never opens a stream to us; see
     // `build_client_transport_tuned` for the peer-pinnable-memory reason).
     ccfg_interactive.transport_config(build_client_transport_tuned_class(
         congestion,
         c.keep_alive_secs,
-        c.tuning(),
+        tuning,
         false,
     ));
     let mut ccfg_bulk = quinn::ClientConfig::new(quic_client);
     ccfg_bulk.transport_config(build_client_transport_tuned_class(
         congestion,
         c.keep_alive_secs,
-        c.tuning(),
+        tuning,
         true,
     ));
     let server_str = c.server_addr.clone();
     let server_str_log = server_str.clone();
 
-    // Clamped once, because everything timing-related derives from it: the
-    // transport's keepalive/idle timeout (inside
-    // `build_client_transport_tuned_class`),
-    // the reconnect loop's silence watchdog, and the pool's selection-time
-    // path-health threshold. Clamping here keeps the three from disagreeing
-    // about what "keepalive" means.
+    // The keepalive is only the NAT/firewall refresh cadence; the liveness
+    // window is `tuning.idle_timeout_secs`, decoupled from it. The silence
+    // watchdog is 2/3 of that idle timeout (40 s at the shipped defaults) and
+    // is unit-proven strictly below it, so its two detectors (downlink silence
+    // and ACK stall) fire before quinn's idle timer instead of being masked by
+    // it.
     let keep_alive_secs = c.keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS);
-    // The silence watchdog window is derived from the same clamped keepalive
-    // the transport's idle timeout uses: `watchdog_silence_secs` is 2x
-    // keepalive with an 8 s floor and is unit-proven strictly below QUIC's 3x /
-    // 15 s idle timeout. The previous `4x keepalive, 20 s floor` was *always*
-    // above the idle timeout, so the watchdog in `spawn_conn_loop` could never
-    // fire first — dead code, with path death detected only when QUIC's idle
-    // timer expired (~15 s). Now detection is ~10 s with the shipped 5 s
-    // keepalive.
-    let watchdog_silence = Duration::from_secs(myquic2::watchdog_silence_secs(keep_alive_secs));
+    let idle_secs = tuning.idle_timeout_secs;
+    let watchdog_secs = myquic2::watchdog_silence_secs(idle_secs);
+    let watchdog_silence = Duration::from_secs(watchdog_secs);
     // Selection-time path health: how long a live slot's inbound progress may
     // be frozen before `pick_tcp_index` re-picks a new flow away from it. It is
     // strictly above a healthy idle connection's worst-case stamp age
     // (keepalive + one watchdog poll tick) and strictly below the silence
-    // watchdog, so a blackholed slot stops receiving *new* flows a few seconds
-    // before the watchdog force-closes it (7 s vs 10 s with the shipped 5 s
-    // keepalive; see `data_stale_threshold_ms`).
-    let data_stale_ms = data_stale_threshold_ms(keep_alive_secs);
+    // watchdog, so a blackholed slot stops receiving *new* flows well before
+    // the watchdog force-closes it (22 s vs 40 s at the shipped defaults; see
+    // `data_stale_threshold_ms`).
+    let data_stale_ms = data_stale_threshold_ms(keep_alive_secs, watchdog_secs);
+    info!(
+        "liveness: keepalive={keep_alive_secs}s idle={idle_secs}s \
+         watchdog={watchdog_secs}s stale={data_stale_ms}ms"
+    );
 
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();

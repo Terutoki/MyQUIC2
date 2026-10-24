@@ -641,8 +641,8 @@ fn stale_gate_keeps_healthy_idle_slot() {
     let mut pool = ConnPool::new(4, vec![53], true, true, 1);
     assert_eq!(
         pool.data_stale_ms,
-        data_stale_threshold_ms(5),
-        "the test constructor derives the threshold from the shipped 5 s keepalive"
+        data_stale_threshold_ms(5, 40),
+        "the test constructor derives the threshold from the shipped 5 s keepalive / 60 s idle"
     );
     for i in 0..pool.tcp_slots() {
         pool.slot(i)
@@ -819,8 +819,8 @@ fn stale_gate_overlays_liveness_without_changing_it() {
 }
 
 /// The gate reads the threshold the pool was built with, not a hard-coded
-/// window: the same 10 s-old stamp is stale under the shipped 7 s threshold and
-/// fresh under a 60 s one.
+/// window: the same 30 s-old stamp is stale under the shipped 22 s threshold
+/// and fresh under a 60 s one.
 #[test]
 fn stale_gate_uses_the_configured_threshold() {
     let mut pool = ConnPool::new(3, vec![], true, true, 1);
@@ -832,7 +832,7 @@ fn stale_gate_uses_the_configured_threshold() {
     let now = 1_000_000;
     pool.slot(1)
         .last_rx_ms
-        .store(now - 10_000, std::sync::atomic::Ordering::Relaxed);
+        .store(now - 30_000, std::sync::atomic::Ordering::Relaxed);
     for i in [0usize, 2] {
         pool.slot(i)
             .last_rx_ms
@@ -843,14 +843,14 @@ fn stale_gate_uses_the_configured_threshold() {
     assert_eq!(
         pool.pick_tcp_index_at(&bulk, now),
         2,
-        "10 s old is stale at the shipped 7 s threshold"
+        "30 s old is stale at the shipped 22 s threshold"
     );
     pool.data_stale_ms = 60_000;
     pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         pool.pick_tcp_index_at(&bulk, now),
         1,
-        "10 s old is fresh at a 60 s threshold, so the preference is kept"
+        "30 s old is fresh at a 60 s threshold, so the preference is kept"
     );
 }
 
@@ -898,10 +898,12 @@ fn slot_data_staleness_semantics() {
 /// rests on.
 #[test]
 fn data_stale_threshold_sits_between_healthy_idle_and_watchdog() {
-    // The shipped shape: 5 s keepalive -> 10 s watchdog window -> 7 s gate.
-    assert_eq!(data_stale_threshold_ms(5), 7_000);
+    // The shipped shape: 5 s keepalive / 60 s idle -> 40 s watchdog -> 22 s gate.
+    assert_eq!(data_stale_threshold_ms(5, 40), 22_000);
     for keepalive in 1..=KEEP_ALIVE_MAX_SECS {
-        let threshold = data_stale_threshold_ms(keepalive);
+        let idle = resolve_idle_timeout_secs(keepalive, None);
+        let watchdog = watchdog_silence_secs(idle);
+        let threshold = data_stale_threshold_ms(keepalive, watchdog);
         // Lower bound: a healthy idle connection's stamp ages by at most one
         // keepalive interval plus one watchdog poll tick before the next
         // sample; the gate must never fire inside that.
@@ -912,17 +914,22 @@ fn data_stale_threshold_sits_between_healthy_idle_and_watchdog() {
         );
         // Upper bound: strictly below the silence watchdog, so a blackholed
         // slot is rejected while it is still live and selectable.
-        let watchdog_ms = watchdog_silence_secs(keepalive) * 1_000;
+        let watchdog_ms = watchdog * 1_000;
         assert!(
             threshold < watchdog_ms,
             "keepalive={keepalive}: threshold {threshold} >= watchdog {watchdog_ms}"
         );
     }
     // Out-of-range inputs use the same clamp as the transport, without warning.
-    assert_eq!(data_stale_threshold_ms(0), data_stale_threshold_ms(1));
+    let watchdog_one = watchdog_silence_secs(resolve_idle_timeout_secs(1, None));
+    let watchdog_max = watchdog_silence_secs(resolve_idle_timeout_secs(KEEP_ALIVE_MAX_SECS, None));
     assert_eq!(
-        data_stale_threshold_ms(u64::MAX),
-        data_stale_threshold_ms(KEEP_ALIVE_MAX_SECS)
+        data_stale_threshold_ms(0, watchdog_one),
+        data_stale_threshold_ms(1, watchdog_one)
+    );
+    assert_eq!(
+        data_stale_threshold_ms(u64::MAX, watchdog_max),
+        data_stale_threshold_ms(KEEP_ALIVE_MAX_SECS, watchdog_max)
     );
 }
 
@@ -1143,7 +1150,7 @@ fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
         true,
         true,
         1,
-        data_stale_threshold_ms(5),
+        data_stale_threshold_ms(5, 40),
     );
     // WireGuard's 148 B handshake must not be mistaken for interactive.
     assert_eq!(pool.udp_class(&ip(51820), 148), EgressClass::Bulk);
@@ -1161,7 +1168,7 @@ fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
         true,
         true,
         1,
-        data_stale_threshold_ms(5),
+        data_stale_threshold_ms(5, 40),
     );
     assert_eq!(both.udp_class(&ip(443), 1200), EgressClass::Interactive);
     // A domain target classifies by its port the same way.

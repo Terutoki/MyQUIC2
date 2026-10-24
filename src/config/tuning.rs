@@ -12,6 +12,7 @@ use crate::FRAG_MAX_HELD_BYTES;
 use crate::dns::resolve::DNS_SLOW_PATH_PERMITS;
 use crate::mqp::r2_flow::{FlowBinding, R2_MAX_FLOWS_PER_CONN, SessionFlows};
 use crate::mqp::v3::MQP3_FLOW_TABLE_MAX_BYTES;
+use crate::transport::{DEFAULT_IDLE_TIMEOUT_SECS, resolve_idle_timeout_secs};
 use crate::udp::r2_stage::{R2_STAGE_MAX_BYTES, R2_STAGE_MAX_ITEMS, R2StageItem};
 use crate::udp::retry::{UDP_RETRY_DEPTH, UDP_RETRY_INFLIGHT, UDP_RETRY_SHARDS};
 use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
@@ -313,6 +314,13 @@ pub struct TransportTuning {
     /// the 1200-byte QUIC floor; see [`DEFAULT_INITIAL_MTU`] for what starting
     /// at the floor costs and how to raise it on a known path.
     pub initial_mtu: u16,
+    /// QUIC idle timeout in seconds, independent of the keepalive interval.
+    ///
+    /// The default is [`DEFAULT_IDLE_TIMEOUT_SECS`] (60 s) with the shipped
+    /// 5 s keepalive: the client derives a 40 s silence watchdog (`2/3 x
+    /// idle`) and a 22 s selection-time stale gate from it. `keep_alive_secs`
+    /// remains the NAT refresh cadence; it no longer sets the liveness window.
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for TransportTuning {
@@ -325,6 +333,7 @@ impl Default for TransportTuning {
             max_ack_delay: Duration::from_millis(5),
             initial_rtt: Duration::from_millis(DEFAULT_INITIAL_RTT_MS),
             initial_mtu: DEFAULT_INITIAL_MTU,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
         }
     }
 }
@@ -707,6 +716,10 @@ impl ServerConf {
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
             initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
             initial_mtu: initial_mtu_from(self.initial_mtu),
+            idle_timeout_secs: resolve_idle_timeout_secs(
+                self.keep_alive_secs,
+                self.idle_timeout_secs,
+            ),
         }
     }
 }
@@ -721,6 +734,10 @@ impl ClientConf {
             max_ack_delay: Duration::from_millis(self.max_ack_delay_ms.unwrap_or(5).clamp(1, 25)),
             initial_rtt: initial_rtt_from_ms(self.initial_rtt_ms),
             initial_mtu: initial_mtu_from(self.initial_mtu),
+            idle_timeout_secs: resolve_idle_timeout_secs(
+                self.keep_alive_secs,
+                self.idle_timeout_secs,
+            ),
         }
     }
 }

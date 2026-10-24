@@ -70,61 +70,116 @@ pub fn build_transport(
     congestion: Congestion,
     keep_alive_secs: u64,
 ) -> Arc<quinn::TransportConfig> {
-    build_transport_tuned(congestion, keep_alive_secs, TransportTuning::default())
+    let tuning = TransportTuning {
+        idle_timeout_secs: resolve_idle_timeout_secs(keep_alive_secs, None),
+        ..TransportTuning::default()
+    };
+    build_transport_tuned(congestion, keep_alive_secs, tuning)
 }
+
+/// Default QUIC idle timeout, in seconds, when `idle_timeout_secs` is unset.
+///
+/// The liveness window is deliberately **decoupled** from the keepalive
+/// interval: keepalive stays at its NAT-refresh value (5 s by default) while
+/// the idle timeout is long enough to survive a short packet-loss burst or a
+/// Wi-Fi/cellular handover. 60 s yields the shipped 40 s client watchdog
+/// (`2/3 x idle`) and 22 s selection-time stale gate on the default 5 s
+/// keepalive.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Lower clamp for a configured `idle_timeout_secs`: the old 3 x keepalive /
+/// 15 s floor. It keeps the idle timeout safely above the keepalive interval
+/// and preserves an escape hatch to the previous fast-detection behavior.
+pub const IDLE_TIMEOUT_MIN_SECS: u64 = 15;
+
+/// Upper clamp for a configured `idle_timeout_secs`: 3 x [`KEEP_ALIVE_MAX_SECS`].
+///
+/// This preserves the old maximum derived idle timeout (900 s at the 300 s
+/// keepalive cap) and bounds how long a peer can hold a silent connection.
+pub const IDLE_TIMEOUT_MAX_SECS: u64 = 900;
 
 /// Upper clamp for `keep_alive_secs`.
 ///
-/// The idle timeout is `3 x keepalive` and the client's silence watchdog
-/// `2 x keepalive`, so an unbounded value (the clamp used to be 3600) put
-/// silent-path detection 3-4 *hours* out — a black hole on a router, and a
-/// silent contradiction of the documented ~8-15 s detection. 300 s bounds the
-/// `2 x` watchdog at 10 minutes and the `3 x` idle timeout at 15 minutes while
-/// leaving every sane NAT keepalive alone; larger values are clamped **and
-/// warned about**, never obeyed silently.
+/// `keep_alive_secs` is the NAT/firewall refresh interval, not the liveness
+/// window: `idle_timeout_secs` is decoupled and clamped separately. The 300 s
+/// cap still leaves every sane NAT keepalive alone and bounds the maximum
+/// configurable idle timeout at [`IDLE_TIMEOUT_MAX_SECS`] (900 s); larger
+/// values are clamped **and warned about**, never obeyed silently.
 pub const KEEP_ALIVE_MAX_SECS: u64 = 300;
 
+// `resolve_idle_timeout_secs` clamps to a lower bound of 3 x keepalive and an
+// upper bound of `IDLE_TIMEOUT_MAX_SECS`; if the former ever exceeded the
+// latter, `clamp` would panic. Keep the caps ordered.
+const _: () = assert!(IDLE_TIMEOUT_MAX_SECS >= KEEP_ALIVE_MAX_SECS * 3);
+
 /// One definition of the keepalive bound, testable without a `TransportConfig`
-/// getter (quinn exposes setters only). Warns on the clamp: it changes how fast
-/// a silent path is noticed, which is what setting the field asks about.
+/// getter (quinn exposes setters only). Warns on the clamp: it changes the NAT
+/// refresh cadence, which is what setting the field asks about.
 pub(crate) fn clamp_keep_alive(keep_alive_secs: u64) -> u64 {
     if keep_alive_secs > KEEP_ALIVE_MAX_SECS {
         tracing::warn!(
             "keep_alive_secs {keep_alive_secs} exceeds the {KEEP_ALIVE_MAX_SECS} s cap; \
-             clamped (silent-path detection scales 2-3x with it)"
+             clamped (keepalive is the NAT refresh interval; liveness is set by \
+             idle_timeout_secs)"
         );
     }
     keep_alive_secs.clamp(1, KEEP_ALIVE_MAX_SECS)
 }
 
-/// QUIC idle timeout derived from the keepalive interval: `3 x keepalive`,
-/// floor 15 s (quinn requires the idle timeout to stay well above the
-/// keepalive interval, and a lower floor would let a few lost keepalives kill
-/// a healthy connection).
+/// Resolve the effective QUIC idle timeout, in seconds.
 ///
-/// Shared with the client binary so its silence watchdog can be derived from
-/// the *same* clamped keepalive value and proven to fire first — see
-/// [`watchdog_silence_secs`].
+/// `configured` is the optional `idle_timeout_secs` TOML knob. Unset means
+/// `max(3 x keepalive, [`DEFAULT_IDLE_TIMEOUT_SECS`])`; an explicit value is
+/// clamped to `max(3 x keepalive, [`IDLE_TIMEOUT_MIN_SECS`])..=`[`IDLE_TIMEOUT_MAX_SECS`]`.
+/// The 3 x keepalive floor keeps the idle timeout comfortably above the
+/// keepalive interval, so a few lost keepalives cannot kill a healthy
+/// connection; the explicit value is how an operator raises tolerance without
+/// touching the NAT refresh cadence.
+///
+/// Both peers advertise an idle timeout and QUIC uses the minimum, so the
+/// effective window is only as long as the shorter side's value.
 #[must_use]
-pub fn idle_timeout_secs(keep_alive_secs: u64) -> u64 {
-    clamp_keep_alive(keep_alive_secs).saturating_mul(3).max(15)
+pub fn resolve_idle_timeout_secs(keep_alive_secs: u64, configured: Option<u64>) -> u64 {
+    let keepalive = clamp_keep_alive(keep_alive_secs);
+    let floor = keepalive.saturating_mul(3).max(IDLE_TIMEOUT_MIN_SECS);
+    let default = keepalive.saturating_mul(3).max(DEFAULT_IDLE_TIMEOUT_SECS);
+    let value = configured.unwrap_or(default);
+    let clamped = value.clamp(floor, IDLE_TIMEOUT_MAX_SECS);
+    if configured.is_some() && value != clamped {
+        tracing::warn!(
+            "idle_timeout_secs {value} outside the {floor}..={IDLE_TIMEOUT_MAX_SECS} s range; \
+             clamped to {clamped}"
+        );
+    }
+    clamped
 }
 
-/// Client silence-watchdog budget derived from the keepalive interval:
-/// `2 x keepalive`, floor 8 s.
+/// Default QUIC idle timeout for `keep_alive_secs`, ignoring an explicit
+/// `idle_timeout_secs` override.
 ///
-/// It is deliberately **strictly below** [`idle_timeout_secs`] for every legal
-/// keepalive: the watchdog used to be `4 x keepalive` with a 20 s floor while
-/// the peer/QUIC idle timeout was `3 x keepalive` with a 15 s floor, so the
-/// watchdog could never fire first — it was dead code and path death was
-/// always detected by the idle timer instead (~15 s). With `2 x`/8 s the two
-/// independent detectors in the client's reconnect loop (downlink silence and
-/// ACK stall) actually bound failover, and the idle timeout can later be
-/// re-tuned upward without slowing recovery. A build-time/unit-test invariant
-/// proves `watchdog < idle` across the whole clamp range.
+/// Kept as the public convenience helper for callers that only have the
+/// keepalive value; the config path uses [`resolve_idle_timeout_secs`].
 #[must_use]
-pub fn watchdog_silence_secs(keep_alive_secs: u64) -> u64 {
-    clamp_keep_alive(keep_alive_secs).saturating_mul(2).max(8)
+pub fn idle_timeout_secs(keep_alive_secs: u64) -> u64 {
+    resolve_idle_timeout_secs(keep_alive_secs, None)
+}
+
+/// Client silence-watchdog budget derived from the idle timeout: `2/3 x idle`,
+/// floor 8 s.
+///
+/// It is deliberately **strictly below** the idle timeout (short idle values
+/// are clamped so `2/3 x idle` still leaves at least one second of margin), so
+/// the watchdog's two independent detectors (downlink silence and ACK stall)
+/// actually bound failover before quinn's idle timer fires. The previous
+/// `2 x keepalive` formula coupled the watchdog to the NAT refresh interval;
+/// decoupling it lets an operator extend the no-drop window without weakening
+/// NAT keepalive. A unit-test invariant proves `watchdog < idle` across the
+/// whole accepted range.
+#[must_use]
+pub fn watchdog_silence_secs(idle_timeout_secs: u64) -> u64 {
+    (idle_timeout_secs.saturating_mul(2) / 3)
+        .max(8)
+        .min(idle_timeout_secs.saturating_sub(1))
 }
 
 pub fn build_transport_tuned(
@@ -336,11 +391,15 @@ fn build_transport_inner(
     t.initial_mtu(tuning.initial_mtu);
     let keep_alive_secs = clamp_keep_alive(keep_alive_secs);
     t.keep_alive_interval(Some(Duration::from_secs(keep_alive_secs)));
-    // Idle timeout derives from keepalive so custom keep_alive_secs can never
-    // self-kill a healthy connection: idle must stay well above the keepalive
-    // interval (QUIC requires inbound traffic before idle fires). 15s floor
-    // preserves the old silent-blackhole bound; larger keepalives scale up.
-    let idle_secs = idle_timeout_secs(keep_alive_secs);
+    // The idle timeout is explicit (resolved from `idle_timeout_secs`), not
+    // derived from keepalive: keepalive is the NAT refresh cadence, idle is the
+    // liveness window. Clamp defensively for manually built `TransportTuning`
+    // values; the config path already went through
+    // `resolve_idle_timeout_secs`.
+    let idle_secs = tuning.idle_timeout_secs.clamp(
+        keep_alive_secs.saturating_mul(3).max(IDLE_TIMEOUT_MIN_SECS),
+        IDLE_TIMEOUT_MAX_SECS,
+    );
     t.max_idle_timeout(Some(
         Duration::from_secs(idle_secs)
             .try_into()
