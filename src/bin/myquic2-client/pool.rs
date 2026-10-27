@@ -22,6 +22,134 @@ pub(crate) fn bump_gen(tx: &watch::Sender<u64>) {
     tx.send_replace(next);
 }
 
+/// 0-RTT handshake phase of the connection a [`ConnSlot`] currently publishes.
+///
+/// The reconnect loop publishes a resumed connection as soon as quinn's
+/// `Connecting::into_0rtt()` succeeds, i.e. **before the handshake completes**,
+/// so that TCP flows and UDP payloads can ride the first flight. The peer may
+/// still discard that early data (`ZeroRttAccepted` then resolves `false`), and
+/// quinn reports such a discard only later, as `ZeroRttRejected` errors from the
+/// 0-RTT streams/datagrams. This state is how the rest of the client learns
+/// which of the three windows the published connection is in:
+///
+/// - [`Self::NONE`] — the dial was a full handshake that was awaited to
+///   completion; every stream is 1-RTT (the pre-0-RTT behaviour);
+/// - [`Self::PENDING`] — 0-RTT offered, handshake still in flight: streams
+///   opened now ride early data and may be discarded;
+/// - [`Self::ACCEPTED`] — the peer kept the early data: the early token and any
+///   first-flight TCP/UDP bytes were delivered;
+/// - [`Self::REJECTED`] — the peer discarded it: the early token is re-sent by
+///   the dial's monitor and TCP opens must retry on a 1-RTT stream.
+///
+/// It is per-generation state published with the connection (reset at the start
+/// of every dial), not a global: a reader that already holds an older
+/// `quinn::Connection` never consults a newer dial's phase in a way that could
+/// change behaviour, and the only consumer — the TCP open path's 0-RTT retry —
+/// re-validates through the connection it was handed.
+#[derive(Debug)]
+pub(crate) struct ZeroRttState {
+    phase: std::sync::atomic::AtomicU8,
+    /// Whether the early auth-token uni stream was written in the 0-RTT window.
+    /// When it was not, the dial's monitor re-sends the token on a 1-RTT stream
+    /// even if the early data was accepted.
+    token_early: std::sync::atomic::AtomicBool,
+}
+
+impl ZeroRttState {
+    /// No 0-RTT attempt on this generation (full handshake awaited).
+    pub(crate) const NONE: u8 = 0;
+    /// 0-RTT offered; the handshake (and with it acceptance) is still pending.
+    pub(crate) const PENDING: u8 = 1;
+    /// The peer kept the early data.
+    pub(crate) const ACCEPTED: u8 = 2;
+    /// The peer discarded the early data; only 1-RTT streams work now.
+    pub(crate) const REJECTED: u8 = 3;
+
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: std::sync::atomic::AtomicU8::new(Self::NONE),
+            token_early: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Current phase. One relaxed load; the value only gates an optimisation
+    /// (waiting/retrying on 0-RTT rejection), never a correctness decision:
+    /// the stream's own `ZeroRttRejected` error remains the authority.
+    pub(crate) fn phase(&self) -> u8 {
+        self.phase.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.phase() == Self::PENDING
+    }
+
+    pub(crate) fn is_rejected(&self) -> bool {
+        self.phase() == Self::REJECTED
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_accepted(&self) -> bool {
+        self.phase() == Self::ACCEPTED
+    }
+
+    /// The dial is a full handshake: no 0-RTT data was ever sent.
+    pub(crate) fn mark_none(&self) {
+        self.phase
+            .store(Self::NONE, std::sync::atomic::Ordering::Relaxed);
+        self.token_early
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A resumed dial published a 0.5-RTT connection.
+    pub(crate) fn mark_pending(&self) {
+        self.phase
+            .store(Self::PENDING, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The handshake completed: `accepted` is quinn's `ZeroRttAccepted` value.
+    pub(crate) fn mark_settled(&self, accepted: bool) {
+        self.phase.store(
+            if accepted {
+                Self::ACCEPTED
+            } else {
+                Self::REJECTED
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn set_token_early(&self, sent: bool) {
+        self.token_early
+            .store(sent, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_early(&self) -> bool {
+        self.token_early.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait (bounded by `deadline`) until the handshake phase is known.
+    ///
+    /// Polled at [`ZERO_RTT_SETTLE_POLL`]: the only caller is the TCP open
+    /// retry after a `ZeroRttRejected` error, i.e. the handshake is already
+    /// complete and the monitor task is about to publish the phase; a single
+    /// 10 ms tick covers the scheduling gap without a wakeup channel on the
+    /// per-flow path.
+    pub(crate) async fn wait_settled(&self, deadline: tokio::time::Instant) {
+        while self.is_pending() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            tokio::time::sleep(ZERO_RTT_SETTLE_POLL.min(deadline - now)).await;
+        }
+    }
+}
+
+/// Poll interval while waiting for the handshake phase to become known (see
+/// [`ZeroRttState::wait_settled`]).
+pub(crate) const ZERO_RTT_SETTLE_POLL: Duration = Duration::from_millis(10);
+
 /// One QUIC connection slot: the shared handle plus its generation channel.
 /// Bumped on every swap so waiters sleep without polling and dispatchers drop
 /// a stale connection without a per-packet timer.
@@ -30,6 +158,10 @@ pub(crate) struct ConnSlot {
     pub(crate) shared: SharedConn,
     pub(crate) gen_tx: watch::Sender<u64>,
     pub(crate) gen_rx: watch::Receiver<u64>,
+    /// 0-RTT phase of the connection in `shared` (see [`ZeroRttState`]):
+    /// published with the connection, reset on every dial. The TCP open path
+    /// reads it to retry an early stream after a rejection.
+    pub(crate) zero_rtt: Arc<ZeroRttState>,
     /// Routing hint, maintained by the connection loop: `shared` holds a
     /// connection with no close reason. One atomic load where `close_reason()`
     /// takes quinn's connection-state mutex and clones the error, which
@@ -72,10 +204,18 @@ impl ConnSlot {
             shared: Arc::new(ArcSwapOption::const_empty()),
             gen_tx,
             gen_rx,
+            zero_rtt: ZeroRttState::new(),
             live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rev2: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             last_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// This slot's 0-RTT phase handle (cheap `Arc` clone; see
+    /// [`ZeroRttState`]). The reconnect loop passes it to `dial_once`, which
+    /// resets and then advances it as the dial's handshake progresses.
+    pub(crate) fn zero_rtt_state(&self) -> Arc<ZeroRttState> {
+        self.zero_rtt.clone()
     }
 
     /// Publish the rev2 state for the connection this slot is about to carry.

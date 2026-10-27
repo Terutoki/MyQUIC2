@@ -145,6 +145,14 @@ impl std::fmt::Display for Suppressed {
 /// tunnel can only ever show ciphertext. `high-water payload` is the empirical
 /// check on `MQP_FRAG_MAX_PAYLOAD`: a deployment that never approaches it needs
 /// no larger cap, whatever its workload is.
+///
+/// The same cadence carries the rev2 data-plane counters (`r2_stats::Snapshot`,
+/// W9). Before this they were read only by unit tests, so every claim about the
+/// rev2 path — how many flows were opened/rejected, whether downlink
+/// compression works (`steady_sent` vs `open_src_sent`), how the domain/DNS
+/// paths behave, whether anything is being refused — was unobservable in the
+/// shipped binary. The line is delta-based (like the relay line) and silent
+/// when nothing moved.
 pub(crate) fn spawn_udp_reporter() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if ONCE.set(()).is_err() {
@@ -158,16 +166,15 @@ pub(crate) fn spawn_udp_reporter() {
         let mut prev_w = udp_write::snapshot();
         let mut prev_r = udp_stats::reassembly_drops();
         let mut prev_d = dgram_drops::snapshot();
+        // `snapshot()` flushes this thread's pending batched rev2 cells first
+        // (the same contract as `udp_stats::snapshot`): the reporter task is
+        // scheduled on a runtime worker, which may have counted replies for a
+        // session reader before the task migrated here, and a pending count
+        // would otherwise stay invisible until that thread's next 256-record or
+        // 1 s flush.
+        let mut prev_r2 = r2_stats::snapshot();
         loop {
             tick.tick().await;
-            // Flush this thread's pending batched rev2 reply-frame counts into
-            // the shared statics, the same way `udp_stats::snapshot` flushes its
-            // caller's cells: the reporter task runs on a runtime worker, and a
-            // pending count there would otherwise stay invisible until the
-            // 256-record threshold. The bounded-visibility model (a count on
-            // another worker becomes visible at its next flush) is the same one
-            // `udp_stats` documents.
-            r2_stats::flush_thread();
             let now = udp_stats::snapshot();
             let now_w = udp_write::snapshot();
             let d = now.since(&prev);
@@ -218,9 +225,24 @@ pub(crate) fn spawn_udp_reporter() {
                     now_d.refused
                 );
             }
+            let now_r2 = r2_stats::snapshot();
+            let dr2 = now_r2.since(&prev_r2);
+            if let Some(line) = r2_report_line(&dr2) {
+                info!("{line}");
+            }
             prev_d = now_d;
             prev = now;
             prev_w = now_w;
+            prev_r2 = now_r2;
         }
     });
+}
+
+/// The 60 s MQP-3 rev2 line for one interval, or `None` when nothing moved.
+///
+/// Pure so the "stay quiet when idle" contract and the line's prefix are
+/// unit-testable without a live reporter task (the counters themselves are
+/// process-global and other tests move them).
+pub(crate) fn r2_report_line(d: &r2_stats::Snapshot) -> Option<String> {
+    (!d.is_idle()).then(|| format!("mqp3 rev2 (60s): {d}"))
 }

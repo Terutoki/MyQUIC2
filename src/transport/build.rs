@@ -432,10 +432,16 @@ mod tests {
         assert_eq!(incoming_stream_credits(true), (0, 0));
     }
 
-    /// The server advertises the small pre-auth credit at handshake time and
+    /// The server advertises the bounded pre-auth credit at handshake time and
     /// raises it to `MAX_BIDI_STREAMS_PER_CONN` after authentication (see the
     /// server's accept loop). The old symmetric 8192/100 handshake credit let
     /// an unauthenticated peer park a receive assembler per advertised stream.
+    ///
+    /// The credit is *not* minimal: MAX_STREAMS is increase-only and a resumed
+    /// client opens 0-RTT TCP streams against the credit it remembers from the
+    /// previous handshake, so the pre-auth bidi credit is the per-connection
+    /// 0-RTT stream budget (see [`SERVER_PRE_AUTH_BIDI_CREDIT`]); the uni
+    /// credit covers the early token plus its 1-RTT re-send after a rejection.
     #[test]
     fn server_advertises_only_the_pre_auth_stream_credit() {
         assert_eq!(
@@ -443,8 +449,12 @@ mod tests {
             (SERVER_PRE_AUTH_BIDI_CREDIT, SERVER_UNI_STREAM_CREDIT)
         );
         assert_eq!(
-            SERVER_UNI_STREAM_CREDIT, 2,
-            "one auth uni stream plus one slot of margin; the server never opens one"
+            SERVER_PRE_AUTH_BIDI_CREDIT, 64,
+            "the remembered 0-RTT stream budget must cover a reconnect's early TCP flows"
+        );
+        assert_eq!(
+            SERVER_UNI_STREAM_CREDIT, 8,
+            "auth uni streams: early token + 1-RTT re-send, plus margin"
         );
     }
 }

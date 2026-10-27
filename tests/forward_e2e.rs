@@ -876,7 +876,19 @@ fn forwards_detect_server_loss_and_recover_after_restart() {
 
     // Restart the very same server config (port, cert, forwards). The client
     // was not restarted or reconfigured: recovery proves the redial path.
-    let restarted_at = fs::metadata(&client_log).map(|m| m.len()).unwrap_or(0);
+    //
+    // The "server accepted the client again" evidence is taken from the
+    // **restarted server's** log: `restart_server` appends to `server.log`, so a
+    // "new QUIC conn from" line written after this offset is provably from the
+    // new process, and only this client is talking to it. The client-side
+    // "QUIC connected to" marker is deliberately not used any more: under
+    // max-0-RTT optimistic publish the client logs that line when the
+    // connection *object* is created (0-RTT accepted locally), which can happen
+    // while the server is still down; the post-restart recovery is then that
+    // already-published connection's handshake settling, with no fresh dial to
+    // log.
+    let server_log = h.log_path("server.log", false);
+    let server_restart_at = fs::metadata(&server_log).map(|m| m.len()).unwrap_or(0);
     h.restart_server();
     let got = tcp_roundtrip(
         tcp_fwd,
@@ -895,17 +907,17 @@ fn forwards_detect_server_loss_and_recover_after_restart() {
         "the pre-restart UDP peer did not recover its forward\n{}",
         h.logs()
     );
-    // Echo recovery already implies a redial; the log pins that it was the
-    // same client process that reconnected to the restarted server.
+    // The echoes prove payload recovery; the restarted server's accept line
+    // proves it is the same client process that re-established the tunnel.
     if let Err(e) = wait_log_after(
-        &mut h.client,
-        &client_log,
-        restarted_at,
-        "QUIC connected to",
+        &mut h.server,
+        &server_log,
+        server_restart_at,
+        "new QUIC conn from",
         Duration::from_secs(10),
     ) {
         panic!(
-            "client never logged a post-restart connect: {e}\n{}",
+            "the restarted server never accepted the client's redial: {e}\n{}",
             h.logs()
         );
     }

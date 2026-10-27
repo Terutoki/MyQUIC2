@@ -2,6 +2,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
+use myquic2::mqp::wire::Wire;
 use myquic2::*;
 use quinn::Runtime;
 use std::{
@@ -30,6 +31,8 @@ mod table;
 mod tcp;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_0rtt;
 
 use crate::{
     accept::*, auth::*, forward::*, memo::*, pin::*, reader::*, reporter::*, table::*, tcp::*,
@@ -68,6 +71,11 @@ async fn main() -> Result<()> {
     let _ = coarse_millis();
     let a = Args::parse();
     let c: ServerConf = load_toml(&a.config)?;
+    // Wire revision: validate the `wire_rev`/ALPN pair before any socket or
+    // TLS work. The revision is carried by ALPN and never negotiated, so a bad
+    // value (or a rev2 ALPN label pinned together with rev3) must fail startup
+    // instead of silently selecting a wire the peer cannot speak.
+    c.validate_wire_rev()?;
     if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {
         anyhow::bail!(
             "auth_token is {} B, over the {AUTH_TOKEN_MAX_BYTES} B wire cap (server only reads the first {AUTH_TOKEN_MAX_BYTES} B, so a longer token can never authenticate)",
@@ -115,9 +123,19 @@ async fn main() -> Result<()> {
     }
     let cert = load_cert_der(&c.cert_file)?;
     let key = load_key_der(&c.key_file)?;
-    let tls = server_tls_config(cert, key, &c.alpn_bytes())?;
+    let alpn = c.alpn_bytes();
+    info!(
+        "application wire: rev{} (ALPN {})",
+        c.wire().rev(),
+        String::from_utf8_lossy(&alpn)
+    );
+    let tls = server_tls_config(cert, key, &alpn)?;
     if c.alpn.as_deref().is_some_and(|s| !s.is_empty()) {
-        info!("custom ALPN in use (masquerade: skew guard weakened, upgrade both sides together)");
+        info!(
+            "custom ALPN in use (both sides must match; ALPN does not encode the wire \
+             revision by default, so pin distinct labels across revisions for a \
+             handshake-level skew gate)"
+        );
     }
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
@@ -369,6 +387,7 @@ async fn main() -> Result<()> {
         auth_enabled,
         allow_private: c.allow_private,
         reply_filter: reply_filter(&c),
+        wire: c.wire(),
         cap,
     });
     // Orderly-shutdown flag shared with every accept loop: closing an endpoint
@@ -684,6 +703,12 @@ struct AcceptState {
     /// Reply-source policy for every session of every connection this process
     /// admits (`udp_full_cone`): snapshot per connection at accept time.
     reply_filter: ReplyFilter,
+    /// Application-layer wire revision every admitted connection speaks
+    /// (`wire_rev`, fixed for the process; ALPN defaults to the shared `h3`
+    /// label for both revisions and is not a wire gate). Threaded into
+    /// `handle_conn_with_wire`, which builds the matching connection state,
+    /// stager and reassembler — the revision is never sniffed per frame.
+    wire: Wire,
     /// Effective admission cap, for logs and `handle_conn`'s stream-pool share.
     cap: usize,
 }
@@ -769,6 +794,7 @@ async fn accept_loop(
         };
         let allow_private = st.allow_private;
         let reply_filter = st.reply_filter;
+        let wire = st.wire;
         let auth_token = st.auth_token.clone();
         // Read by `handle_conn` to size this connection's share of the
         // process-wide stream-task pool (a clone per accepted connection).
@@ -794,35 +820,66 @@ async fn accept_loop(
             // path; it is released below once the connection leaves the pending
             // window (or dropped with the task on any failure/timeout return).
             let mut ip_guard = Some(ip_guard);
-            // 0.5-RTT accept: streams usable before handshake completes on resumption.
-            let conn = match incoming.accept() {
+            // 0.5-RTT accept: `incoming.accept()` + `into_0rtt()` yields a
+            // usable Connection *before* the handshake completes. On a resumed
+            // connection the client's 0-RTT early data (auth token, HELLO, the
+            // first UDP datagrams / TCP stream bytes) is readable on it right
+            // away, so authentication starts here instead of after
+            // `ZeroRttAccepted`: the token is read and verified while the
+            // handshake is still in flight, and `handle_conn` then forwards the
+            // first-flight payloads. Waiting for the handshake first would put
+            // a full round trip back in front of every resumed connection,
+            // which is exactly what the 0-RTT work removes.
+            //
+            // The accepted future is not dropped: a detached monitor owns it so
+            // a handshake that stalls past `deadline` or dies is still
+            // logged/closed, and (tokenless mode) the per-IP pre-auth guard is
+            // released when the handshake settles.
+            let (conn, handshake_awaited) = match incoming.accept() {
                 Ok(connecting) => match connecting.into_0rtt() {
                     Ok((c, accepted_fut)) => {
-                        // Incoming conversion always succeeds and `accepted`
-                        // always resolves true, but an unfinished handshake
-                        // must not hold the connection permit: awaiting it
-                        // (bounded) gates the permit on handshake completion.
-                        // A dead client resolves false via the channel close,
-                        // and the timeout backstops a stall; either way the
-                        // close_reason check keeps a dead handle out.
-                        match tokio::time::timeout_at(deadline, accepted_fut).await {
-                            Ok(_) if c.close_reason().is_none() => c,
-                            Ok(_) => {
-                                if let Some(sup) = claim_server_log(ServerLog::HandshakeFailed) {
-                                    warn!("client handshake failed: {:?}{sup}", c.close_reason());
+                        // Tokenless mode has no token exchange to hold the
+                        // pre-auth window, so the monitor ends it at handshake
+                        // completion (same point the old await did). With a
+                        // token the slot is held until `authenticate` returns.
+                        let guard = if auth_enabled { None } else { ip_guard.take() };
+                        let monitor_conn = c.clone();
+                        tokio::spawn(async move {
+                            let _guard = guard;
+                            match tokio::time::timeout_at(deadline, accepted_fut).await {
+                                Ok(_accepted) => {
+                                    // The payload is meaningless on the server
+                                    // (quinn only tracks 0-RTT acceptance on the
+                                    // client); settling is the signal, and a
+                                    // handshake that died shows up as a close
+                                    // reason.
+                                    #[cfg(test)]
+                                    tests_0rtt::probe::handshake_settled();
+                                    if let Some(reason) = monitor_conn.close_reason()
+                                        && let Some(sup) =
+                                            claim_server_log(ServerLog::HandshakeFailed)
+                                    {
+                                        warn!("client handshake failed: {reason:?}{sup}");
+                                    }
                                 }
-                                return;
-                            }
-                            Err(_) => {
-                                if let Some(sup) = claim_server_log(ServerLog::HandshakeTimeout) {
-                                    warn!("handshake timed out after {handshake_budget:?}{sup}");
+                                Err(_) => {
+                                    // The auth deadline backstops this for a
+                                    // token connection; the close is the same
+                                    // terminal outcome the old await produced.
+                                    if let Some(sup) = claim_server_log(ServerLog::HandshakeTimeout)
+                                    {
+                                        warn!(
+                                            "handshake timed out after {handshake_budget:?}{sup}"
+                                        );
+                                    }
+                                    monitor_conn.close(0x01u32.into(), b"handshake timeout");
                                 }
-                                return;
                             }
-                        }
+                        });
+                        (c, false)
                     }
                     Err(connecting) => match tokio::time::timeout_at(deadline, connecting).await {
-                        Ok(Ok(c)) => c,
+                        Ok(Ok(c)) => (c, true),
                         Ok(Err(e)) => {
                             if let Some(sup) = claim_server_log(ServerLog::AcceptError) {
                                 warn!("accept err: {e:#}{sup}");
@@ -844,12 +901,18 @@ async fn accept_loop(
                     return;
                 }
             };
-            // The handshake is done; in tokenless mode the pending window ends
-            // here, so release the per-IP share immediately. With a token the
-            // share stays held through the bounded token read (AUTH_TIMEOUT).
-            if !auth_enabled {
+            // In tokenless mode the pre-auth window ended with the handshake:
+            // immediately for a fully awaited handshake, at settle time via the
+            // monitor for the 0.5-RTT path.
+            if handshake_awaited && !auth_enabled {
                 drop(ip_guard.take());
             }
+            // Authentication starts NOW, possibly before the handshake
+            // completes: the token may arrive as 0-RTT early data. The deadline
+            // is a fresh `AUTH_TIMEOUT` (the handshake is not consuming it any
+            // more) and the pre-auth permit/IP guard stay held until it returns.
+            // `authenticate` tolerates 0-RTT-rejected/reset/extra uni streams so
+            // the client's 1-RTT re-send after a rejection still authenticates.
             if let Err(e) = authenticate(
                 &conn,
                 &auth_token,
@@ -863,21 +926,39 @@ async fn accept_loop(
                 conn.close(0x01u32.into(), b"unauthorized");
                 return;
             }
+            #[cfg(test)]
+            tests_0rtt::probe::authenticated();
             // Authentication done: free the pre-auth slot so other new peers
             // can handshake while this connection lives on.
             drop(pending);
             drop(ip_guard.take());
-            // Raise the handshake's small pre-auth bidi credit to the full
+            // Raise the handshake's pre-auth bidi credit to the full
             // client-facing credit now that the peer has proven it holds the
             // token. MAX_STREAMS is increase-only, so this sequence is
             // protocol-legal; it is what keeps an unauthenticated peer from
             // parking a quinn receive assembler per advertised stream (see
-            // `SERVER_PRE_AUTH_BIDI_CREDIT`). Uni stays at the small credit: the
-            // protocol uses one client→server uni stream (the token) and the
-            // server never opens one.
+            // `SERVER_PRE_AUTH_BIDI_CREDIT`). The pre-auth credit is 64 rather
+            // than 4 because a resumed client opens 0-RTT TCP streams against
+            // the credit it remembers from its ticket; 64 covers a reconnect
+            // burst while the full 8192 stays post-auth only. Uni stays at the
+            // pre-auth credit: the client's auth token (early + 1-RTT re-send)
+            // needs at most two, and the server never opens one.
             conn.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(MAX_BIDI_STREAMS_PER_CONN));
-            if let Err(e) =
-                handle_conn(conn, allow_private, reply_filter, conn_limit_for_conn, cap).await
+            #[cfg(test)]
+            tests_0rtt::probe::handle_conn_start();
+            // The wire-aware entry point: one revision per process, its
+            // connection state/stager/reassembler and bidi-accept dispatch are
+            // built for that revision (rev2 CONTROL DATAGRAMs vs rev3 reliable
+            // control stream marker 0xFF vs TCP atyp).
+            if let Err(e) = handle_conn_with_wire(
+                conn,
+                allow_private,
+                reply_filter,
+                conn_limit_for_conn,
+                cap,
+                wire,
+            )
+            .await
             {
                 warn!("conn end: {e:#}");
             }

@@ -150,6 +150,9 @@ pub(crate) async fn handle_socks(
 
     let slot_idx = pool.pick_tcp_index(&target);
     let slot = pool.slot(slot_idx);
+    // The slot's 0-RTT phase: on a resumed dial the connection may still be
+    // handshaking here, so the open below can ride early data.
+    let zero_rtt = slot.zero_rtt_state();
     let mut gen_rx = slot.gen_rx.clone();
     let conn = match slot.wait_conn(&mut gen_rx, timeout).await {
         Ok(c) => c,
@@ -166,83 +169,70 @@ pub(crate) async fn handle_socks(
             return Err(e);
         }
     };
-    let (mut send, mut recv) =
-        match tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await {
-            Ok(Ok((s, r))) => {
-                let prio = if pool.is_interactive(&target) { 10 } else { 0 };
-                let _ = s.set_priority(prio);
-                (s, r)
-            }
-            _ => {
-                if conn.close_reason().is_some() {
-                    // Atomic read-then-clear with re-check: a reconnect may install
-                    // a fresh connection between a read and a later clear, and
-                    // clearing unconditionally would blackhole the new connection
-                    // until it dies. `clear_if_and_mark_dead` matches on
-                    // `stable_id` and folds the `live = false` into the same `rcu`
-                    // closure, so the decision, the store and the liveness bit
-                    // cannot be split by a concurrent publish.
-                    //
-                    // The SOCKS failure is a second writer on this slot, and it
-                    // shares the reconnect loop's one death commit: on top of the
-                    // clear, `retire_dead_slot` releases the dead generation's
-                    // egress-cache handles and its rev2 registry/staged payloads
-                    // and bumps the generation, exactly as the loop does when its
-                    // own future ends. Without it a connection death first noticed
-                    // here would leave the previous generation's state behind
-                    // until the loop's watchdog noticed, and a dead egress handle
-                    // could outlive the redial. Whichever writer wins the clear
-                    // owns the whole cleanup, so nothing is released twice.
-                    retire_dead_slot(&slot, slot_idx, &egress_shared, &conn);
-                    write_socks_reply(
-                        &mut s,
-                        fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,
-                        bnd,
-                    )
-                    .await
-                    .ok();
-                    anyhow::bail!("quic connection dead, retry");
-                }
-                write_socks_reply(
-                    &mut s,
-                    fast_socks5::consts::SOCKS5_REPLY_GENERAL_FAILURE,
-                    bnd,
-                )
-                .await
-                .ok();
-                anyhow::bail!("quic stream open failed (limit?), retry without killing conn");
-            }
-        };
     // The open header is deliberately its own write, flushed before any
     // application byte is read: a peer that waits for its first reply
     // (game login, banner protocols) must see the header within ~100ms
     // without the client ever sending payload. Never batch it behind the
     // first app chunk; `tcp_open_header_arrives_without_app_data` pins this.
+    // On a resumed connection it is written on a 0-RTT stream, i.e. in the
+    // first flight; `open_bi_and_write_header` re-opens on a 1-RTT stream if
+    // the peer rejects the early data, and nothing is consumed from `s` until
+    // it returns Ok.
     // Stack buffer: the header is at most 259 B, so the per-flow `Vec` this
     // used to allocate was one heap round trip for bytes that live one write.
     let mut hdr = [0u8; AddrHeader::MAX_LEN];
     let hdr_len = target.as_ref().header()?.encode_into(&mut hdr);
-    // Bounded: without a deadline a stalled connection parks this write until
-    // the QUIC idle timeout, pinning the app socket with no SOCKS answer and
-    // no idle watchdog (the watchdog lives inside the pump, which has not
-    // started yet). SOCKS success has not been sent at this point, so the
-    // failure still surfaces as a SOCKS error rather than a close.
-    let hdr_sent = tokio::time::timeout(Duration::from_secs(5), send.write_all(&hdr[..hdr_len]))
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false);
-    if !hdr_sent {
-        send.reset(0x04u32.into()).ok();
-        recv.stop(0x04u32.into()).ok();
-        write_socks_reply(
-            &mut s,
-            fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,
-            bnd,
-        )
-        .await
-        .ok();
-        anyhow::bail!("quic stream header write failed or timed out");
-    }
+    let prio = if pool.is_interactive(&target) { 10 } else { 0 };
+    let (mut send, mut recv) = match open_bi_and_write_header(
+        &conn,
+        &zero_rtt,
+        &hdr[..hdr_len],
+        prio,
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            if conn.close_reason().is_some() {
+                // Atomic read-then-clear with re-check: a reconnect may install
+                // a fresh connection between a read and a later clear, and
+                // clearing unconditionally would blackhole the new connection
+                // until it dies. `clear_if_and_mark_dead` matches on
+                // `stable_id` and folds the `live = false` into the same `rcu`
+                // closure, so the decision, the store and the liveness bit
+                // cannot be split by a concurrent publish.
+                //
+                // The SOCKS failure is a second writer on this slot, and it
+                // shares the reconnect loop's one death commit: on top of the
+                // clear, `retire_dead_slot` releases the dead generation's
+                // egress-cache handles and its rev2 registry/staged payloads
+                // and bumps the generation, exactly as the loop does when its
+                // own future ends. Without it a connection death first noticed
+                // here would leave the previous generation's state behind
+                // until the loop's watchdog noticed, and a dead egress handle
+                // could outlive the redial. Whichever writer wins the clear
+                // owns the whole cleanup, so nothing is released twice.
+                retire_dead_slot(&slot, slot_idx, &egress_shared, &conn);
+                write_socks_reply(
+                    &mut s,
+                    fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,
+                    bnd,
+                )
+                .await
+                .ok();
+                anyhow::bail!("quic connection dead, retry: {e:#}");
+            }
+            write_socks_reply(
+                &mut s,
+                fast_socks5::consts::SOCKS5_REPLY_GENERAL_FAILURE,
+                bnd,
+            )
+            .await
+            .ok();
+            anyhow::bail!("quic stream open failed (limit?), retry without killing conn: {e:#}");
+        }
+    };
     // Optimistic SOCKS success: the application's first bytes must not be
     // serialized behind the server-side dial. Waiting for the MQP-2 ACK here
     // costs one full client<->server RTT on every connection (Hysteria/

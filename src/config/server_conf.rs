@@ -5,6 +5,7 @@ use super::tuning::{
 };
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
+use crate::mqp::wire::{DEFAULT_REV, Wire};
 
 // ---------------- Config files ----------------
 /// Unknown keys are a hard error (both config structs). A misspelled
@@ -126,8 +127,27 @@ pub struct ServerConf {
     /// Ethernet path can set 1400 or 1472. See `ClientConf::initial_mtu`.
     #[serde(default)]
     pub initial_mtu: Option<u16>,
-    /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).
-    /// Unset/empty = `h3` masquerade.
+    /// Application-layer wire revision: `2` = shipped MQP-3 rev2, `3` = the
+    /// clean-slate rev3 wire. Unset = the build default ([`DEFAULT_REV`]).
+    ///
+    /// Both binaries of a deployment must agree. Both revisions default to the
+    /// shared `h3` ALPN masquerade, so ALPN is a deployment label rather than a
+    /// revision switch: a mixed pair with the same label completes the TLS
+    /// handshake and then fails silently at the data plane (nothing is
+    /// forwarded or misrouted). Pin distinct `alpn` labels across revisions to
+    /// get a TLS-level skew gate. There is no runtime negotiation and no
+    /// fallback by design.
+    #[serde(default)]
+    pub wire_rev: Option<u8>,
+    /// ALPN label override. Unset/empty = the historical `h3` masquerade,
+    /// which is the default for **both** wire revisions; a custom label is
+    /// used verbatim (e.g. `myquic2/r3` for rev3, `myquic2/3` for rev2).
+    ///
+    /// The label is a deployment choice, not a revision switch: both sides
+    /// must run the same value. Distinct labels across revisions give a
+    /// TLS-level fail-fast gate, while the default shared `h3` label means a
+    /// mismatched pair (rev2 vs rev3) completes the handshake and then fails
+    /// silently at the data plane — deploy matched binaries.
     #[serde(default)]
     pub alpn: Option<String>,
     /// Number of QUIC ingress endpoints (UDP sockets sharing `listen` through
@@ -157,7 +177,21 @@ pub struct ServerConf {
 }
 
 impl ServerConf {
+    /// Application-layer wire revision selected by this configuration.
+    pub fn wire(&self) -> Wire {
+        Wire::from_rev(self.wire_rev.unwrap_or(DEFAULT_REV)).unwrap_or(Wire::Rev2)
+    }
+
+    /// Whether the configuration pins a valid wire revision and an ALPN that
+    /// matches it. Called at startup by the server binary.
+    pub fn validate_wire_rev(&self) -> anyhow::Result<()> {
+        crate::mqp::wire::validate_config(self.wire_rev, self.alpn.as_deref())
+    }
+
     pub fn alpn_bytes(&self) -> Vec<u8> {
+        // Same resolution for both revisions: the default is the `h3`
+        // masquerade; a configured label is used verbatim. ALPN does not
+        // encode the wire revision by default.
         normalize_alpn(self.alpn.as_deref())
     }
 

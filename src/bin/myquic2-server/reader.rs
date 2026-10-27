@@ -2,10 +2,11 @@
 use super::*;
 use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{FlowBinding, FlowRegistry, FlowState, SessionFlows, SourceMatch};
+use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::r2_frag::R2FragFlow;
+use myquic2::udp::r2_stage::encode_standalone_item_for;
 use myquic2::udp::{
     R2Fragmenter, R2StageItem, R2StageKind, R2Stager, book_too_large, drain_staged,
-    encode_standalone_item,
 };
 
 /// Userspace receive buffer per session reader: one full-protocol-cap datagram
@@ -187,27 +188,253 @@ pub(crate) fn reply_stage_v3(
 // MQP-3 rev2 downlink: connection-level staging (Phase 2)
 // ---------------------------------------------------------------------------
 
+/// One-entry memo in front of [`SessionFlows::match_source`].
+///
+/// `match_source` is a linear scan of the session's ≤64 bindings (each domain
+/// binding also scanning its ≤16-address resolved set): 20 ns / 36 ns / 164 ns
+/// at 1 / 8 / 64 flows per the Lead's measurements, paid on **every** relayed
+/// reply. A steady request/response flow sends every reply from the same
+/// source, so the previous verdict is almost always still the answer — the
+/// legacy v3 path had exactly this memo, and rev2 dropped it.
+///
+/// # Correctness
+///
+/// The memo is trusted only while every input `match_source` reads is
+/// unchanged:
+/// - the reverse-table snapshot is **pointer-identical** — the table is
+///   copy-on-write and every insert/remove/reap publishes a whole new
+///   `Arc<SessionFlows>`, so a rebind, a `FLOW_CLOSE`, a `SESS_CLOSE` or a
+///   reaped entry can never be overridden;
+/// - the matched binding is not `Closed` (the same filter the scan applies);
+/// - the binding's two mutable classification fields still hold the values
+///   observed when the verdict was recorded: `reply_src` (re-armed by every
+///   `OPEN|SRC` send, so a rebind invalidates) and `reply_src_acked` (set by
+///   `CTL FLOW_ACK` from the datagram-reader task, so a late ACK invalidates
+///   and the flow becomes `Exact` on the next reply instead of re-sending
+///   binding frames forever).
+///
+/// `target`, `resolved` and `state` transitions after publication cannot change
+/// the classification: `target` is immutable, `resolved` is written only before
+/// the binding is published, and `mark_open`/`mark_closed` are covered by the
+/// snapshot-pointer and `Closed` checks. A miss falls through to the full scan,
+/// which re-records the memo, so the entry never outlives a stale verdict.
+struct ReplySourceMemo(Option<ReplySourceMemoEntry>);
+
+struct ReplySourceMemoEntry {
+    /// The reply source this verdict was recorded for (the memo key).
+    src: SocketAddr,
+    /// The reverse-table snapshot the verdict came from; keeps the allocation
+    /// alive so the pointer comparison cannot alias a later snapshot (ABA).
+    snapshot: Arc<SessionFlows>,
+    /// The binding the scan chose.
+    binding: Arc<FlowBinding>,
+    /// The scan's verdict: `true` = `Exact`, `false` = `Rebind`.
+    exact: bool,
+    /// `binding.reply_src()` when the verdict was recorded.
+    observed_reply_src: Option<SocketAddr>,
+    /// `binding.reply_src_acked()` when the verdict was recorded.
+    observed_acked: bool,
+}
+
+impl ReplySourceMemo {
+    const EMPTY: Self = Self(None);
+
+    /// The memoized verdict for `src`, or `None` when the memo is invalid for
+    /// the current snapshot/binding state (the caller then runs the scan).
+    fn lookup(&self, snapshot: &Arc<SessionFlows>, src: SocketAddr) -> Option<SourceMatch> {
+        let entry = self.0.as_ref()?;
+        if entry.src != src
+            || !Arc::ptr_eq(snapshot, &entry.snapshot)
+            || entry.binding.state() == FlowState::Closed
+            || entry.binding.reply_src() != entry.observed_reply_src
+            || entry.binding.reply_src_acked() != entry.observed_acked
+        {
+            return None;
+        }
+        Some(if entry.exact {
+            SourceMatch::Exact(Arc::clone(&entry.binding))
+        } else {
+            SourceMatch::Rebind(Arc::clone(&entry.binding))
+        })
+    }
+
+    /// Remember one scan verdict. The observed mutable fields are captured here,
+    /// after the scan, so a mutation that races the scan only costs one more
+    /// scan (never a wrong verdict).
+    fn record(&mut self, src: SocketAddr, snapshot: Arc<SessionFlows>, matched: &SourceMatch) {
+        let (binding, exact) = match matched {
+            SourceMatch::Exact(b) => (b, true),
+            SourceMatch::Rebind(b) => (b, false),
+        };
+        self.0 = Some(ReplySourceMemoEntry {
+            src,
+            snapshot,
+            binding: Arc::clone(binding),
+            exact,
+            observed_reply_src: binding.reply_src(),
+            observed_acked: binding.reply_src_acked(),
+        });
+    }
+}
+
 /// Per-session rev2 reply state: the reverse table used to classify a reply
-/// source.
+/// source, plus the one-entry memo in front of its scan.
 ///
 /// Phase 1 kept a per-session small-frame staging area here; Phase 2 moved all
 /// small-reply staging to the connection-scoped [`R2Stager`] so replies from
 /// different associations aggregate into one train. What remains is the
-/// read-only lookup handle.
+/// read-only lookup handle and the reply-source memo.
 pub(crate) struct R2ReplyState {
     pub(crate) flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
     /// The connection state when this reader belongs to a live connection: the
     /// full-cone path allocates a server-owned wire id from it and installs the
     /// binding in the connection registry. `None` only for fixtures.
     pub(crate) conn: Option<Arc<R2ConnState>>,
+    /// Wire revision of the connection this reader serves. Derived from the
+    /// connection state; fixtures without one are the rev2 default.
+    wire: Wire,
+    /// One-entry memo of the last `reply source -> binding` verdict (see
+    /// [`ReplySourceMemo`]). Task-local, so it dies with the reply reader.
+    memo: ReplySourceMemo,
+    /// rev3 only: per-flow count of context-carrying frames already sent, while
+    /// the flow is inside its K=2 no-ACK context window.
+    ///
+    /// rev2 waits for the client's `FLOW_ACK` before a learned reply source is
+    /// trusted (`reply_src_acked`); rev3 has no ACK, so this reader emits the
+    /// context form for the first [`R3_CONTEXT_K`] replies and then marks the
+    /// source confirmed locally. The map only ever holds flows *inside* their
+    /// window (entries are removed when the window closes), plus the bounded
+    /// `NEED_CONTEXT` repair set, so it cannot grow with the flow count.
+    ctx_sent: std::collections::HashMap<u32, u8>,
+    /// rev3 only: last observed connection repair epoch (see
+    /// [`R2ConnState::take_need_context`]).
+    ctx_epoch: u64,
+    /// Number of full `match_source` scans this reader paid (test probe: the
+    /// memo's whole effect is "repeated source, one scan").
+    #[cfg(test)]
+    pub(crate) match_scans: u64,
 }
+
+/// rev3 no-ACK context redundancy: how many consecutive downlink frames carry
+/// the binding context (`SRC`/`OPEN_SRC`) before the flow compresses. Two
+/// covers one lost datagram; the reliable control stream's `NEED_CONTEXT` is the
+/// repair path beyond that.
+pub(crate) const R3_CONTEXT_K: u8 = 2;
 
 impl R2ReplyState {
     pub(crate) fn new(
         flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
         conn: Option<Arc<R2ConnState>>,
     ) -> Self {
-        Self { flows, conn }
+        // The reply/output encoders follow the connection's revision; a fixture
+        // without a connection is the shipped rev2 default.
+        let wire = conn.as_ref().map_or(Wire::Rev2, |c| c.wire());
+        Self {
+            flows,
+            conn,
+            wire,
+            memo: ReplySourceMemo::EMPTY,
+            ctx_sent: std::collections::HashMap::new(),
+            ctx_epoch: 0,
+            #[cfg(test)]
+            match_scans: 0,
+        }
+    }
+
+    /// Wire revision of this reader's connection.
+    pub(crate) fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    /// Pick up client→server `NEED_CONTEXT` repairs (rev3).
+    ///
+    /// The control-stream task bumps the connection's repair epoch when the
+    /// peer says it missed a binding context; this reader rebuilds its forced
+    /// window from the bounded hint list before classifying the next reply. The
+    /// common case is one relaxed load (`None`) per reply.
+    fn sync_ctx_repairs(&mut self) {
+        if self.wire != Wire::Rev3 {
+            return;
+        }
+        let mut seen = self.ctx_epoch;
+        let repair = self
+            .conn
+            .as_ref()
+            .and_then(|state| state.take_need_context(&mut seen));
+        let Some(ids) = repair else {
+            return;
+        };
+        self.ctx_epoch = seen;
+        // A repair supersedes every in-flight K window: the peer's list is the
+        // authority for what it is missing, and a stale window can only cause
+        // redundant (harmless) context frames.
+        self.ctx_sent.clear();
+        for wire_id in ids {
+            self.ctx_sent.insert(wire_id, 0);
+        }
+    }
+
+    /// Whether this flow must send another context-carrying frame before
+    /// compressing (rev3 only).
+    fn context_due(&self, wire_id: u32) -> bool {
+        self.wire == Wire::Rev3
+            && self
+                .ctx_sent
+                .get(&wire_id)
+                .is_some_and(|sent| *sent < R3_CONTEXT_K)
+    }
+
+    /// Record one context-carrying downlink frame for `binding` (rev3 only).
+    ///
+    /// After [`R3_CONTEXT_K`] sends the learned source is locally confirmed
+    /// (`mark_reply_src_acked`), which is exactly what the client's `FLOW_ACK`
+    /// does on rev2; the no-ACK contract replaces the round trip with bounded
+    /// redundancy, and the `NEED_CONTEXT` stream message repairs a run of losses
+    /// beyond that.
+    fn note_ctx_sent(&mut self, binding: &Arc<FlowBinding>) {
+        if self.wire != Wire::Rev3 {
+            return;
+        }
+        let wire_id = binding.wire_id;
+        let sent = self.ctx_sent.entry(wire_id).or_insert(0);
+        *sent = sent.saturating_add(1);
+        if *sent >= R3_CONTEXT_K {
+            self.ctx_sent.remove(&wire_id);
+            // Local confirmation of the learned reply source. Harmless for
+            // flows whose target already names the source (it only affects the
+            // `match_source` acked gate, which those already satisfy).
+            binding.mark_reply_src_acked();
+        }
+    }
+
+    /// Classify one reply source: the memo first, the full reverse-table scan on
+    /// a miss.
+    ///
+    /// This is the per-reply entry point for the rev2 downlink direction; the
+    /// scan it usually avoids is the largest single CPU cost on the reply path
+    /// (see [`ReplySourceMemo`]).
+    fn classify_reply_source(&mut self, src: SocketAddr) -> Option<SourceMatch> {
+        // One snapshot load per reply either way: the memo compares against it
+        // and the scan iterates it. `load_full` (rather than `load`) is what
+        // lets the memo keep the snapshot alive, so the pointer comparison that
+        // validates it cannot alias a later allocation.
+        let snapshot = self.flows.load_full();
+        if let Some(matched) = self.memo.lookup(&snapshot, src) {
+            return Some(matched);
+        }
+        #[cfg(test)]
+        {
+            self.match_scans += 1;
+        }
+        let matched = snapshot.match_source(src).filter(|m| match m {
+            SourceMatch::Exact(binding) | SourceMatch::Rebind(binding) => {
+                binding.state() != FlowState::Closed
+            }
+        });
+        if let Some(matched) = matched.as_ref() {
+            self.memo.record(src, snapshot, matched);
+        }
+        matched
     }
 }
 
@@ -240,7 +467,10 @@ fn install_unsolicited(
     if conn.registry.len() >= conn.registry.cap() {
         return None;
     }
-    let wire_id = conn.ids.alloc()?;
+    // rev3: an id past the 14-bit fid space cannot be represented on the wire,
+    // so refuse the install *before* burning an id and let the caller keep the
+    // `DATA INLINE` fail-safe. rev2 accepts every allocator id.
+    let wire_id = wire::alloc_wire_id(&conn.ids, conn.wire())?;
     let binding = FlowBinding::new_shared(wire_id, sess, TargetAddr::Ip(src));
     binding.set_reply_src(src);
     binding.mark_open();
@@ -401,8 +631,11 @@ fn stage_open_src(
     item: R2StageItem,
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
+    wire: Wire,
 ) -> (StageDrain, bool) {
-    let body = match encode_standalone_item(&item, *limit) {
+    // Same revision-aware encoder a batched drain uses, so a directly-sent
+    // binding frame is byte-identical to a staged one on both wires.
+    let body = match encode_standalone_item_for(wire, &item, *limit) {
         Some(body) => body,
         None => {
             book_too_large(1);
@@ -520,25 +753,29 @@ fn r2_send_large_reply(
     src: SocketAddr,
     payload: &[u8],
     limit: usize,
+    now_ms: u64,
+    wire: Wire,
 ) -> R2LargeReply {
     let n = payload.len();
     let aref = r2::ip_ref(src);
-    let Ok(header) = aref.header() else {
+    if aref.header().is_err() {
         // The reader normalized and validated the source before this call, so
         // an unencodable address is unreachable; never panic on it.
         return R2LargeReply::TooLarge;
-    };
-    let addr_len = header.len();
+    }
     match r2_match {
         Some(SourceMatch::Exact(binding)) => {
-            if r2::data_steady_len(binding.wire_id, n) <= limit {
-                let sent = r2::encode_data_steady(binding.wire_id, payload, limit)
-                    .map(|body| try_send_datagram(c2, body))
-                    .unwrap_or(DatagramSend::TooLarge);
+            // The encoder refuses a frame over the live budget (and, on rev3, an
+            // id past the 14-bit fid space), which is the same verdict the
+            // explicit length check used to produce — no separate length
+            // helpers exist for both revisions.
+            let encoded = wire::encode_data_steady(wire, binding.wire_id, payload, limit);
+            if let Some(body) = encoded {
+                let sent = try_send_datagram(c2, body);
                 let out = R2LargeReply::from_send(sent);
                 if out == R2LargeReply::Sent {
                     udp_stats::payload(n);
-                    r2_stats::bump_steady_sent();
+                    r2_stats::bump_steady_sent(now_ms);
                 }
                 out
             } else {
@@ -551,21 +788,23 @@ fn r2_send_large_reply(
                     payload,
                 );
                 if sent.complete() {
-                    r2_stats::bump_steady_sent();
+                    r2_stats::bump_steady_sent(now_ms);
                 }
                 R2LargeReply::from_payload(&sent)
             }
         }
         Some(SourceMatch::Rebind(binding)) => {
-            if r2::data_open_len(binding.wire_id, addr_len, n) <= limit {
-                let sent = r2::encode_data_open(binding.wire_id, s, &aref, true, payload, limit)
-                    .map(|body| try_send_datagram(c2, body))
-                    .unwrap_or(DatagramSend::TooLarge);
+            // The adapter picks the revision's context form: rev2 `OPEN|SRC`,
+            // rev3 `SRC` (client-owned) / `OPEN_SRC` (server-owned).
+            let encoded =
+                wire::encode_data_open(wire, binding.wire_id, s, &aref, true, payload, limit);
+            if let Some(body) = encoded {
+                let sent = try_send_datagram(c2, body);
                 let out = R2LargeReply::from_send(sent);
                 if out == R2LargeReply::Sent {
                     binding.set_reply_src(src);
                     udp_stats::payload(n);
-                    r2_stats::bump_open_src_sent();
+                    r2_stats::bump_open_src_sent(now_ms);
                 }
                 out
             } else {
@@ -585,16 +824,15 @@ fn r2_send_large_reply(
                     // the actual source when it reassembles, so the next reply
                     // from it compresses.
                     binding.set_reply_src(src);
-                    r2_stats::bump_open_src_sent();
+                    r2_stats::bump_open_src_sent(now_ms);
                 }
                 R2LargeReply::from_payload(&sent)
             }
         }
         None => {
-            if r2::data_inline_len(addr_len, n) <= limit {
-                let sent = r2::encode_data_inline(s, &aref, true, payload, limit)
-                    .map(|body| try_send_datagram(c2, body))
-                    .unwrap_or(DatagramSend::TooLarge);
+            let encoded = wire::encode_data_inline(wire, s, &aref, true, payload, limit);
+            if let Some(body) = encoded {
+                let sent = try_send_datagram(c2, body);
                 let out = R2LargeReply::from_send(sent);
                 if out == R2LargeReply::Sent {
                     udp_stats::payload(n);
@@ -1041,11 +1279,13 @@ pub(crate) fn handle_session_reply(
     // compressed. Phase 1b uses the same match for every reply size: small ones
     // ride the steady/TRAIN staging below, large ones go out as one rev2 DATA
     // frame or rev2 FRAG (the legacy MQP-2 fragmenter is retired here).
-    let mut r2_match = r2.flows.load().match_source(src).filter(|m| match m {
-        SourceMatch::Exact(binding) | SourceMatch::Rebind(binding) => {
-            binding.state() != FlowState::Closed
-        }
-    });
+    //
+    // The one-entry memo in front of the scan is what makes a steady
+    // request/response flow pay O(1) here instead of scanning up to 64
+    // bindings; it invalidates itself on any snapshot replacement, close,
+    // rebind (`reply_src`) or `FLOW_ACK` (`reply_src_acked`) — see
+    // [`ReplySourceMemo`].
+    let mut r2_match = r2.classify_reply_source(src);
     let on_r2 = r2_match.is_some();
     if !on_allowlist && !on_flow && !on_r2 {
         if reply_filter == ReplyFilter::FullCone {
@@ -1069,6 +1309,25 @@ pub(crate) fn handle_session_reply(
         && let Some(binding) = install_unsolicited(conn, &r2.flows, s, src)
     {
         r2_match = Some(SourceMatch::Rebind(binding));
+    }
+    // rev3 no-ACK context policy. `match_source` classifies a learned reply
+    // source as `Exact` only once `reply_src_acked` is set; rev2 gets that from
+    // the client's `FLOW_ACK`, rev3 has no ACK at all. Instead:
+    // - pick up any client `NEED_CONTEXT` repairs first (bounded hint list);
+    // - while a flow is inside its K=2 context window, force the context form
+    //   even when the table says `Exact` — this is what carries the binding for
+    //   a server-owned flow whose target names the source (otherwise the table
+    //   short-circuits to `Exact` and the first reply would be steady);
+    // - [`R2ReplyState::note_ctx_sent`] confirms the source locally after the
+    //   K-th successful context frame, which is exactly the state the rev2 ACK
+    //   would have produced.
+    if r2.wire() == Wire::Rev3 {
+        r2.sync_ctx_repairs();
+        if let Some(SourceMatch::Exact(binding)) = r2_match.as_ref()
+            && r2.context_due(binding.wire_id)
+        {
+            r2_match = Some(SourceMatch::Rebind(Arc::clone(binding)));
+        }
     }
     // ------------------------------------------------------------------
     // Small replies: one connection-scoped staging queue (Phase 2).
@@ -1111,13 +1370,22 @@ pub(crate) fn handle_session_reply(
             payload: Bytes::copy_from_slice(payload),
         };
         let verdict = if is_rebind {
-            let (verdict, sent) =
-                stage_open_src(c2, stage, item, limit, &mut *last_too_large_probe_ms);
+            let (verdict, sent) = stage_open_src(
+                c2,
+                stage,
+                item,
+                limit,
+                &mut *last_too_large_probe_ms,
+                r2.wire(),
+            );
             if sent {
                 if let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref() {
                     binding.set_reply_src(src);
+                    // rev3: count this context frame and confirm the source
+                    // locally after K=2 (the no-ACK replacement for FLOW_ACK).
+                    r2.note_ctx_sent(binding);
                 }
-                r2_stats::bump_open_src_sent();
+                r2_stats::bump_open_src_sent(now);
             }
             verdict
         } else {
@@ -1141,9 +1409,29 @@ pub(crate) fn handle_session_reply(
     // Phase 1b/2: a reply above the small threshold is rev2 as well — one
     // DATA/OPEN|SRC/INLINE frame when it fits the live budget, otherwise rev2
     // FRAG. The legacy MQP-2 fragmenter is not a production reply sender.
-    let sent = r2_send_large_reply(c2, s, &mut *frag2, r2_match.as_ref(), src, payload, *limit);
+    // `now` is the reply handler's single coarse sample for this frame; the
+    // stats flush gate reuses it instead of reading the clock again (W8b).
+    let sent = r2_send_large_reply(
+        c2,
+        s,
+        &mut *frag2,
+        r2_match.as_ref(),
+        src,
+        payload,
+        *limit,
+        now,
+        r2.wire(),
+    );
     match large_reply_disposition(sent, c2, limit, last_too_large_probe_ms) {
-        ReplyDisposition::Continue => {}
+        ReplyDisposition::Continue => {
+            // rev3 no-ACK: a fully queued context frame counts toward the K=2
+            // window (the fragmenter already learned the source above).
+            if sent == R2LargeReply::Sent
+                && let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref()
+            {
+                r2.note_ctx_sent(binding);
+            }
+        }
         ReplyDisposition::BreakSession => return ReplyDisposition::BreakSession,
     }
     ReplyDisposition::Continue
@@ -1228,10 +1516,12 @@ pub(crate) async fn sess_reader_task(
     // drained burst replies are handled in place from the recvmmsg scratch and
     // never touch it.
     let mut buf = sess_recv_buf();
-    // MQP-3 rev2 sender for replies that do not fit one `DATA` frame. Small
-    // replies are staged on the connection-level `stage` instead (Phase 2), so
-    // this session no longer keeps a legacy `DgramFragmenter` at all.
-    let mut frag2 = R2Fragmenter::new();
+    // MQP-3 sender for replies that do not fit one `DATA` frame, for the
+    // connection's revision (rev2 = shipped wire; rev3 = `FRAG` with fids).
+    // Small replies are staged on the connection-level `stage` instead
+    // (Phase 2), so this session no longer keeps a legacy `DgramFragmenter`.
+    let wire = r2_conn.as_ref().map_or(Wire::Rev2, |c| c.wire());
+    let mut frag2 = R2Fragmenter::new_with_wire(wire);
     let mut limit = c2.max_datagram_size().unwrap_or(0);
     let mut last_touch = 0u64;
     let mut last_limit_refresh = coarse_millis();
@@ -1479,7 +1769,7 @@ pub(crate) async fn sess_reader_task(
     // idempotent, like every `SESS_CLOSE`; a connection that is already closed
     // needs no notification (the sends would only be dropped).
     if removed_own && c2.close_reason().is_none() {
-        r2_send_sess_close(&c2, s);
+        r2_send_sess_close(&c2, r2.conn.as_ref(), s);
     }
     // Mark this dead entry's bindings `Closed` from its own reverse-table
     // snapshot, so a reply reader still draining cannot match a torn-down
@@ -1678,7 +1968,7 @@ pub(crate) async fn get_or_create_sess_guarded(
             // next steady frames do not target a session the server no longer
             // has (they could only fail lookup). Best-effort and idempotent.
             let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
-            spawn_sess_close_notifications(cd.clone(), ids);
+            spawn_sess_close_notifications(cd.clone(), r2.cloned(), ids);
             abort_evicted(evicted);
             let now2 = mono_millis();
             let n2 = ss.len();
@@ -1728,7 +2018,7 @@ pub(crate) async fn get_or_create_sess_guarded(
             });
             r2_finish_reaped(r2, &evicted, purged);
             let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
-            spawn_sess_close_notifications(cd.clone(), ids);
+            spawn_sess_close_notifications(cd.clone(), r2.cloned(), ids);
             abort_evicted(evicted);
             match session_limiter().clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -1942,7 +2232,7 @@ pub(crate) async fn get_or_create_sess_guarded(
         r2_finish_reaped(r2, &stale_dead, purged_reaped);
         r2_finish_reaped(r2, &swept, 0);
         let ids: Vec<u32> = swept.iter().map(|e| e.sess).collect();
-        spawn_sess_close_notifications(cd.clone(), ids);
+        spawn_sess_close_notifications(cd.clone(), r2.cloned(), ids);
         abort_evicted(stale_dead);
         abort_evicted(swept);
         return None;
@@ -1978,7 +2268,7 @@ pub(crate) async fn get_or_create_sess_guarded(
     // `stale_dead` needs no notification — those readers had already exited, so
     // the client's own idle/exit path is what closed them.
     let ids: Vec<u32> = swept.iter().map(|e| e.sess).collect();
-    spawn_sess_close_notifications(cd.clone(), ids);
+    spawn_sess_close_notifications(cd.clone(), r2.cloned(), ids);
     abort_evicted(stale_dead);
     abort_evicted(swept);
     if inserted { Some(sock) } else { None }

@@ -3,6 +3,22 @@ socks_listen = "[::]:1080"
 server_addr = "127.0.0.1:8443"
 server_name = "test.com"
 server_cert_file = "server-cert.pem"
+# ---- Wire revision (both sides must match) ---------------------------------
+# Application-layer wire revision: 2 = MQP-3 rev2 (LEB128 ids, CTL/FLOW_ACK
+# datagrams, HELLO/CAPS version announcement), 3 = MQP-3 rev3 (fixed 2-byte
+# packed header, no varints, no per-flow ACK, reliable control stream). Unset =
+# the build default (rev3 in this release).
+#
+# Both revisions default to the shared `h3` ALPN masquerade, so ALPN is a
+# deployment label, not a revision switch: a mixed client/server pair with the
+# same label completes the TLS handshake and then fails silently at the data
+# plane. Set the SAME wire_rev on both binaries (matched deployment), or pin
+# distinct `alpn` labels on both sides to get a handshake-level skew gate.
+# There is no runtime negotiation or downgrade.
+#
+# Rollback: rev2 stays config-selectable for one release. Set `wire_rev = 2` on
+# both sides (and redeploy both together) to return to the rev2 wire.
+# wire_rev = 3
 congestion = "bbr"
 gso = true
 # NAT/firewall refresh cadence. This is not the liveness window; keep it short
@@ -83,9 +99,11 @@ quic_conns = 4
 # userspace reader buffer, so a RAM-tight router lowers this; past the cap a
 # UDP ASSOCIATE is refused with SOCKS REP=0x01.
 # max_udp_assocs = 4032
-# ALPN (optional; omit = h3 masquerade). Hides only the ALPN label
-# (cert+MQP framing stay fingerprintable). alpn="myquic2/3" restores the
-# versioned identifier; set the same value on both sides.
+# ALPN (optional; omit/empty = the default `h3` masquerade for BOTH wire
+# revisions). Hides only the ALPN label (cert+MQP framing stay fingerprintable).
+# A custom label is used verbatim and must match on both sides; distinct labels
+# are the opt-in way to get a TLS-level fail-fast gate across revisions
+# (e.g. alpn="myquic2/r3" on rev3 and "h3" on rev2).
 # alpn = "h3"
 # ---- TCP/UDP forward listeners (optional; omit both = SOCKS5 only) ----
 # Expose a local port that relays raw TCP/UDP through the same QUIC tunnel to a

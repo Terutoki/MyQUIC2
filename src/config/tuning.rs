@@ -153,19 +153,37 @@ pub const MAX_BIDI_STREAMS_PER_CONN: u32 = 8192;
 /// frames; each peer-opened stream keeps up to quinn's `MAX_CHUNKS = 1024` gap
 /// spans, so advertising the full credit in the handshake would let one
 /// unauthenticated connection pin hundreds of MiB before proving it holds the
-/// token. The handshake therefore advertises this small credit, and the server
+/// token. The handshake therefore advertises this bounded credit, and the server
 /// raises it to [`MAX_BIDI_STREAMS_PER_CONN`] with MAX_STREAMS as soon as
-/// authentication succeeds. Four concurrent pre-auth streams are far more than
-/// a real client needs: it opens only its auth uni stream before the token is
-/// verified.
-pub const SERVER_PRE_AUTH_BIDI_CREDIT: u32 = 4;
+/// authentication succeeds.
+///
+/// It is **64, not 4**, because MAX_STREAMS is increase-only *and* 0-RTT clients
+/// use the credit they remember from the previous handshake's ServerHello
+/// (quinn-proto `Connection::init_0rtt` restores the ticket's transport
+/// parameters). A resumed client can therefore open TCP relay streams in its
+/// very first flight, long before the post-auth MAX_STREAMS arrives: with a
+/// pre-auth credit of 4 only four concurrent TCP flows per connection could ride
+/// 0-RTT early data, which at the shipped 4-connection pool is 16 early flows on
+/// a redial — a thundering-herd sized cliff for exactly the reconnect burst the
+/// pool produces. 64 covers one connection's share of a realistic reconnect
+/// burst (`MAX_POOL_CONNS` x 64 = 1024 early flows process-wide) while still
+/// bounding an unauthenticated peer to 64 x 1024 x 96 B = 6 MiB of quinn receive
+/// assemblers for the 5 s pre-auth window; the much larger
+/// [`MAX_BIDI_STREAMS_PER_CONN`] credit stays post-auth only. The extra
+/// peer-pinnable memory is charged through [`pre_auth_stream_memory_bytes`].
+pub const SERVER_PRE_AUTH_BIDI_CREDIT: u32 = 64;
 
 /// Unidirectional-stream credit the server advertises (and keeps).
 ///
-/// The protocol uses exactly one client→server uni stream (the auth token); the
-/// client never sends another and the server never opens one, so the old
-/// 100-stream credit was pure peer-pinnable assembler memory.
-pub const SERVER_UNI_STREAM_CREDIT: u32 = 2;
+/// The protocol uses at most two client→server uni streams: the auth token sent
+/// in 0-RTT early data and, when that early data is rejected (or its stream
+/// write failed structurally), the same token re-sent on a fresh 1-RTT stream
+/// after the handshake completes. 8 leaves margin for that retry (a
+/// structurally failed early attempt can consume one stream slot per dial) and
+/// for a peer that opens a few extra streams, while keeping the peer-pinnable
+/// assembler charge bounded; the client never opens one for data and the server
+/// never opens one at all.
+pub const SERVER_UNI_STREAM_CREDIT: u32 = 8;
 
 /// Concurrent UDP associations one *client process* may admit.
 ///
@@ -936,6 +954,49 @@ mod tests {
         assert!(
             R2_INGRESS_FIXED_BYTES >= 16 * 1024 + slots * per_slot / 2,
             "term must cover the pre-HELLO buffer and the fast table"
+        );
+    }
+
+    /// W6: the handshake advertises the raised pre-auth bidi credit so a
+    /// resumed client can open TCP relay streams in its **first flight**
+    /// (quinn-proto restores the ticket's transport parameters at
+    /// `init_0rtt`, so the remembered credit is the 0-RTT stream budget), and
+    /// the uni credit leaves room for the early token plus its 1-RTT re-send.
+    /// The admission charge must follow the constants: the whole point of the
+    /// raise is that the extra peer-pinnable assembler memory is priced.
+    /// The two pre-auth credits, read through a function so the assertions
+    /// below are runtime checks (clippy rejects `assert!` on constants).
+    fn pre_auth_credits() -> (u32, u32) {
+        (SERVER_PRE_AUTH_BIDI_CREDIT, SERVER_UNI_STREAM_CREDIT)
+    }
+
+    #[test]
+    fn pre_auth_stream_credit_covers_early_0rtt_tcp_streams() {
+        assert_eq!(pre_auth_credits(), (64, 8));
+        // The last four auth uni streams are margin over the two the protocol
+        // can actually use (early token + 1-RTT resend), so the pre-auth memory
+        // charge cannot be raised without a deliberate decision here.
+        assert!(
+            pre_auth_credits().1 >= 2,
+            "the auth path needs the early token stream and its 1-RTT resend"
+        );
+        assert!(
+            pre_auth_credits().0 <= MAX_BIDI_STREAMS_PER_CONN,
+            "the pre-auth credit is raised to the post-auth one, never past it"
+        );
+        let per_stream = QUINN_ASSEMBLER_MAX_CHUNKS as u64 * QUINN_ASSEMBLER_SPAN_BYTES;
+        assert_eq!(pre_auth_stream_memory_bytes(), (64 + 8) * per_stream);
+        assert_eq!(pre_auth_stream_memory_bytes(), 72 * 1024 * 96);
+        assert!(
+            pre_auth_stream_memory_bytes() > 6 * 1024 * 1024,
+            "the raised pre-auth credit is a multi-MiB per-connection admission term (got {} B)",
+            pre_auth_stream_memory_bytes()
+        );
+        // And it is actually added into the per-connection admission figure.
+        let per_conn = per_connection_memory_bytes(&TransportTuning::default());
+        assert_eq!(
+            per_conn - pre_auth_stream_memory_bytes() + 72 * 1024 * 96,
+            per_conn
         );
     }
 

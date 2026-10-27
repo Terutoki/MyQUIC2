@@ -29,9 +29,18 @@ pub(crate) async fn handle_tcp_stream(
     admitted: usize,
     allow_private: bool,
     stat_conn: quinn::Connection,
+    // The stream's first byte, already consumed by the rev3 accept path's
+    // classifier: it is the MQP address `atyp` and must be fed to the header
+    // decoder instead of being read twice. `None` on rev2, whose accept loop
+    // does not sniff the first byte at all (the header read owns it).
+    first: Option<u8>,
+    // Absolute deadline for the whole header read. The rev3 accept path starts
+    // it before consuming the first byte, so a slow first byte and the rest of
+    // the header share the shipped 5 s budget instead of paying it twice.
+    header_deadline: tokio::time::Instant,
 ) {
     let target: TargetAddr =
-        match tokio::time::timeout(Duration::from_secs(5), read_mqp_target(&mut recv)).await {
+        match tokio::time::timeout_at(header_deadline, read_mqp_target(&mut recv, first)).await {
             Ok(Ok(t)) => t,
             _ => {
                 send.reset(0x01u32.into()).ok();
@@ -240,7 +249,12 @@ pub(crate) fn mqp_hdr_len(atyp: u8, domain_len: u8) -> Result<usize> {
     })
 }
 
-pub(crate) async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<TargetAddr> {
+/// Read one MQP TCP header. `first` is the already-consumed first byte (the
+/// rev3 accept path's address-type classifier), or `None` to read it here.
+pub(crate) async fn read_mqp_target(
+    recv: &mut quinn::RecvStream,
+    first: Option<u8>,
+) -> Result<TargetAddr> {
     // No per-read timeout here: the caller wraps the whole header read in a
     // single 5s budget, and an inner timeout just registered extra timers.
     //
@@ -250,7 +264,10 @@ pub(crate) async fn read_mqp_target(recv: &mut quinn::RecvStream) -> Result<Targ
     // the dial even started. Now only the final `TargetAddr` allocates.
     pub(crate) const HDR_MAX: usize = 1 + 1 + 255 + 2;
     let mut buf = [0u8; HDR_MAX];
-    recv.read_exact(&mut buf[..1]).await.context("hdr read")?;
+    match first {
+        Some(atyp) => buf[0] = atyp,
+        None => recv.read_exact(&mut buf[..1]).await.context("hdr read")?,
+    }
     let (len, rest_at) = match buf[0] {
         0x03 => {
             recv.read_exact(&mut buf[1..2])

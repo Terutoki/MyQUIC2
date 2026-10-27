@@ -51,6 +51,7 @@ use quinn::Connection;
 use crate::dgram_drops;
 use crate::mqp::addr::TargetAddr;
 use crate::mqp::r2;
+use crate::mqp::wire::{self, Wire};
 use crate::udp::send::{DatagramSend, try_send_datagram};
 use crate::udp_stats;
 
@@ -153,6 +154,14 @@ impl PackedFrames {
 /// Per-connection stager. One instance lives next to the connection's
 /// `FlowRegistry`/`CtlState`; associations and session readers share it.
 pub struct R2Stager {
+    /// Wire revision of the connection this stager belongs to.
+    ///
+    /// The encoder is the only thing that differs between revisions: the queue,
+    /// fairness and packing policy are revision-agnostic. [`Wire::Rev2`] is the
+    /// default so every existing construction site keeps byte-identical
+    /// behaviour; a rev3 connection calls [`Self::set_wire`] (or
+    /// [`Self::new_with_wire`]) when its state is created.
+    wire: Wire,
     /// Per-session FIFO queues. A session's items are always sent in push order.
     sessions: HashMap<u32, VecDeque<R2StageItem>, foldhash::fast::RandomState>,
     /// Round-robin cursor over session ids that currently have items.
@@ -193,7 +202,7 @@ pub struct R2Stager {
 
 impl Default for R2Stager {
     fn default() -> Self {
-        Self::with_capacity(R2_STAGE_MAX_ITEMS, R2_STAGE_MAX_BYTES)
+        Self::with_capacity_wire(R2_STAGE_MAX_ITEMS, R2_STAGE_MAX_BYTES, Wire::Rev2)
     }
 }
 
@@ -203,9 +212,23 @@ impl R2Stager {
         Self::default()
     }
 
+    /// A stager that encodes for `wire` (rev2 keeps the shipped behaviour,
+    /// which is also [`Self::new`]).
+    #[must_use]
+    pub fn new_with_wire(wire: Wire) -> Self {
+        Self::with_capacity_wire(R2_STAGE_MAX_ITEMS, R2_STAGE_MAX_BYTES, wire)
+    }
+
     #[must_use]
     pub fn with_capacity(max_items: usize, max_bytes: usize) -> Self {
+        Self::with_capacity_wire(max_items, max_bytes, Wire::Rev2)
+    }
+
+    /// Test/configuration seam: same queue bounds, explicit wire revision.
+    #[must_use]
+    pub fn with_capacity_wire(max_items: usize, max_bytes: usize, wire: Wire) -> Self {
         Self {
+            wire,
             sessions: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             order: VecDeque::new(),
             steady_order: VecDeque::new(),
@@ -234,6 +257,22 @@ impl R2Stager {
     #[must_use]
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
+    }
+
+    /// Set the wire revision this stager encodes for.
+    ///
+    /// Called by the connection state constructor (a stager is created before
+    /// its connection's wire is known in a few test seams); changing it with
+    /// items queued would re-encode them under another revision, so callers
+    /// only do this before the first push.
+    pub fn set_wire(&mut self, wire: Wire) {
+        self.wire = wire;
+    }
+
+    /// Wire revision this stager encodes for.
+    #[must_use]
+    pub fn wire(&self) -> Wire {
+        self.wire
     }
 
     /// Apply the negotiated `CAPS.max_train_items` (clamped to the codec bound;
@@ -502,7 +541,12 @@ impl R2Stager {
         let mut flow_idx = std::mem::take(&mut self.flow_idx_scratch);
         run.clear();
         unique.clear();
-        let mut cost = 4usize; // kind/form/count/nfl
+        // Frame-header bytes before any item: rev2 has one byte each for
+        // kind/form/count/nfl, rev3 folds the form into b0 (b0 + nfl + count).
+        let mut cost = match self.wire {
+            Wire::Rev2 => 4usize,
+            Wire::Rev3 => 3usize,
+        };
         let mut took_any = self.take_steady_head(session, limit, &mut run, &mut unique, &mut cost);
         while took_any && let Some(next) = self.next_steady_session() {
             took_any = self.take_steady_head(next, limit, &mut run, &mut unique, &mut cost);
@@ -529,9 +573,9 @@ impl R2Stager {
             let R2StageKind::Steady { wire_id } = run[0].kind else {
                 unreachable!("a steady run only holds steady items");
             };
-            r2::encode_data_steady(wire_id, &run[0].payload, limit)
+            wire::encode_data_steady(self.wire, wire_id, &run[0].payload, limit)
         } else {
-            Self::encode_train_run(unique.as_slice(), &mut flow_idx, &run, limit)
+            self.encode_train_run(unique.as_slice(), &mut flow_idx, &run, limit)
         };
         match encoded {
             Some(body) => {
@@ -561,9 +605,9 @@ impl R2Stager {
         book_too_large(n);
     }
 
-    /// Encode one standalone `Open`/`Inline` item.
+    /// Encode one standalone `Open`/`Inline` item for this stager's wire.
     fn encode_standalone(&self, item: &R2StageItem, limit: usize) -> Option<Bytes> {
-        encode_standalone_item(item, limit)
+        encode_standalone_item_for(self.wire, item, limit)
     }
 
     /// Pop heads round-robin while they are `Steady` and fit `limit`.
@@ -589,13 +633,25 @@ impl R2Stager {
             return false;
         }
         let payload_len = front.payload.len();
-        let mut add = 1 + r2::varint_len(payload_len as u32) + payload_len;
+        // Per-item and per-new-flow wire cost, revision-specific. The rev3
+        // figure is the DICT **upper bound** (idx byte + length field + the
+        // 2-byte fid on first use); the encoder may pick the smaller SAME /
+        // SAME_EQUAL form for a single-flow run, never a larger one, so the
+        // packing decision stays conservative.
+        let (item_cost, flow_cost) = match self.wire {
+            Wire::Rev2 => (
+                1 + r2::varint_len(payload_len as u32) + payload_len,
+                r2::varint_len(wire_id),
+            ),
+            Wire::Rev3 => (1 + r3_item_len_len(payload_len) + payload_len, 2),
+        };
+        let mut add = item_cost;
         let new_flow = !unique.contains(&wire_id);
         if new_flow {
             if unique.len() >= u8::MAX as usize {
                 return false;
             }
-            add += r2::varint_len(wire_id);
+            add += flow_cost;
         }
         if cost.saturating_add(add) > limit {
             return false;
@@ -629,6 +685,7 @@ impl R2Stager {
     /// from the reused [`Self::flow_idx_scratch`] map, so resolving an item's
     /// dict index is O(1) instead of the O(flows) `position` scan per item.
     fn encode_train_run(
+        &self,
         flows: &[u32],
         flow_idx: &mut HashMap<u32, u8, foldhash::fast::RandomState>,
         run: &[R2StageItem],
@@ -650,7 +707,32 @@ impl R2Stager {
                 .expect("every run flow was deduped into the flow list");
             *view = (idx, item.payload.as_ref());
         }
-        r2::encode_train_dict(flows, &items[..run.len()], limit)
+        // rev3 single-flow run: the SAME forms (equal-length first) are wire-
+        // smaller than a one-entry DICT, so they are preferred; both are still
+        // valid `TRAIN` frames for the receiver and the packing cost above
+        // already bounded the larger DICT size. rev2 has no such form and keeps
+        // the shipped DICT encoding byte-for-byte.
+        if self.wire == Wire::Rev3 && flows.len() == 1 {
+            let R2StageKind::Steady { wire_id } = run[0].kind else {
+                unreachable!("a steady run only holds steady items");
+            };
+            let mut refs: [&[u8]; r2::R2_MAX_TRAIN_ITEMS] = [&[]; r2::R2_MAX_TRAIN_ITEMS];
+            for (slot, item) in refs[..run.len()].iter_mut().zip(run) {
+                *slot = item.payload.as_ref();
+            }
+            let equal_lengths = run.iter().all(|i| i.payload.len() == run[0].payload.len());
+            let refs = &refs[..run.len()];
+            let encoded = if equal_lengths {
+                wire::encode_train_same_equal(self.wire, wire_id, refs, limit)
+                    .or_else(|| wire::encode_train_same(self.wire, wire_id, refs, limit))
+            } else {
+                wire::encode_train_same(self.wire, wire_id, refs, limit)
+            };
+            if let Some(body) = encoded {
+                return Some(body);
+            }
+        }
+        wire::encode_train_dict(self.wire, flows, &items[..run.len()], limit)
     }
 
     /// Pop the next session that has a non-empty queue, rotating the cursor.
@@ -894,18 +976,46 @@ pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOut
 /// `DATA OPEN|SRC` directly (outside the stager lock) and must use the exact
 /// same wire encoder as a batched drain.
 pub fn encode_standalone_item(item: &R2StageItem, limit: usize) -> Option<Bytes> {
+    encode_standalone_item_for(Wire::Rev2, item, limit)
+}
+
+/// [`encode_standalone_item`] for a connection's wire revision.
+///
+/// The rev3 integration uses this so a stager-owned standalone frame (rev3
+/// `DATA_EXT`/steady) is byte-identical to what a batched drain produces. The
+/// rev2 signature above stays for call sites that are rev2-only (the server's
+/// `stage_open_src` path); it is exactly the [`Wire::Rev2`] arm here.
+pub fn encode_standalone_item_for(wire: Wire, item: &R2StageItem, limit: usize) -> Option<Bytes> {
     match &item.kind {
         R2StageKind::Open {
             wire_id,
             sess,
             addr,
             src,
-        } => r2::encode_data_open(*wire_id, *sess, &addr.as_ref(), *src, &item.payload, limit),
+        } => wire::encode_data_open(
+            wire,
+            *wire_id,
+            *sess,
+            &addr.as_ref(),
+            *src,
+            &item.payload,
+            limit,
+        ),
         R2StageKind::Inline { sess, addr, src } => {
-            r2::encode_data_inline(*sess, &addr.as_ref(), *src, &item.payload, limit)
+            wire::encode_data_inline(wire, *sess, &addr.as_ref(), *src, &item.payload, limit)
         }
-        R2StageKind::Steady { wire_id } => r2::encode_data_steady(*wire_id, &item.payload, limit),
+        R2StageKind::Steady { wire_id } => {
+            wire::encode_data_steady(wire, *wire_id, &item.payload, limit)
+        }
     }
+}
+
+/// Wire length of a rev3 `TRAIN` item-length field (1 B below the `0xFF`
+/// escape, 3 B for the escape + `u16`); the stager's packing cost model uses
+/// it. Payloads above `u16::MAX` cannot be staged.
+fn r3_item_len_len(n: usize) -> usize {
+    debug_assert!(n <= u16::MAX as usize, "staged payload above u16");
+    if n < 0xFF { 1 } else { 3 }
 }
 
 /// Account `n` payloads dropped because the live path budget no longer fits
@@ -1002,6 +1112,7 @@ pub fn drain_staged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqp::r3;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn v4(port: u16) -> SocketAddr {
@@ -1582,5 +1693,93 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(received, expected);
         assert!(s.is_empty());
+    }
+    /// rev3 stager: a single-flow run of equal-length payloads uses the
+    /// `SAME_EQUAL` form (one shared item length, no per-item framing), and a
+    /// mixed-length single-flow run uses `SAME`; both decode back to the same
+    /// `(wire_id, payload)` sequence.
+    #[test]
+    fn rev3_single_flow_train_prefers_the_equal_length_form() {
+        let mut s = R2Stager::new_with_wire(Wire::Rev3);
+        assert_eq!(s.wire(), Wire::Rev3);
+        let wid = 2u32; // client-owned local 1
+        for _ in 0..3 {
+            s.push(steady(1, 1, b"abc")).unwrap();
+        }
+        let f = s.next_frame(1162).expect("a same-equal train");
+        let t = wire::decode_train(Wire::Rev3, &f.body).expect("rev3 train decodes");
+        assert_eq!(
+            t.form(),
+            r3::TRAIN_FORM_SAME_EQUAL,
+            "equal-length single-flow run must use SAME_EQUAL"
+        );
+        let got: Vec<(u32, &[u8])> = t.items().collect();
+        assert_eq!(
+            got,
+            vec![(wid, &b"abc"[..]), (wid, &b"abc"[..]), (wid, &b"abc"[..])]
+        );
+
+        let mut s = R2Stager::new_with_wire(Wire::Rev3);
+        for p in [&b"a"[..], b"bb", b"ccc"] {
+            s.push(steady(1, 1, p)).unwrap();
+        }
+        let f = s.next_frame(1162).expect("a same train");
+        let t = wire::decode_train(Wire::Rev3, &f.body).expect("rev3 train decodes");
+        assert_eq!(
+            t.form(),
+            r3::TRAIN_FORM_SAME,
+            "mixed lengths must use the per-item-length SAME form"
+        );
+        let got: Vec<(u32, &[u8])> = t.items().collect();
+        assert_eq!(
+            got,
+            vec![(wid, &b"a"[..]), (wid, &b"bb"[..]), (wid, &b"ccc"[..])]
+        );
+        assert!(s.is_empty());
+    }
+
+    /// rev2 stays byte-identical: the same single-flow run encodes the shipped
+    /// DICT form (never a rev3-only form).
+    #[test]
+    fn rev2_single_flow_train_stays_dict() {
+        let mut s = R2Stager::new();
+        for _ in 0..3 {
+            s.push(steady(1, 1, b"abc")).unwrap();
+        }
+        let f = s.next_frame(1162).expect("a dict train");
+        let t = r2::decode_train(&f.body).expect("rev2 train decodes");
+        assert_eq!(t.form, r2::R2_TRAIN_FORM_DICT);
+        assert_eq!(t.items().count(), 3);
+    }
+
+    /// rev3 standalone items are `DATA_EXT`/steady frames with the fixed
+    /// 2-byte header; the rev2 default helper still emits the rev2 frame.
+    #[test]
+    fn rev3_standalone_items_encode_for_rev3() {
+        let item = open(7, 2, b"hi");
+        let body = encode_standalone_item_for(Wire::Rev3, &item, 1162).expect("encodes");
+        let v = wire::decode_data(Wire::Rev3, &body).expect("rev3 data decodes");
+        assert_eq!(v.wire_id, Some(id(2)));
+        assert_eq!(v.sess, Some(7));
+        assert_eq!(v.payload, b"hi");
+        let rev2_body = encode_standalone_item(&item, 1162).expect("rev2 encodes");
+        assert_eq!(r2::kind(&rev2_body), Some(r2::R2Kind::Data));
+        assert_ne!(
+            &body[..],
+            &rev2_body[..],
+            "rev3 encodes the fixed-header form, not the rev2 varint one"
+        );
+        // rev3 steady DATA is exactly a 2-byte header + payload.
+        let steady = encode_standalone_item_for(
+            Wire::Rev3,
+            &R2StageItem {
+                session: 1,
+                kind: R2StageKind::Steady { wire_id: id(1) },
+                payload: Bytes::from_static(b"ab"),
+            },
+            1162,
+        )
+        .unwrap();
+        assert_eq!(steady.len(), 4);
     }
 }

@@ -10,6 +10,7 @@ use super::tuning::{
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
 use crate::mqp::addr::TargetAddr;
+use crate::mqp::wire::{DEFAULT_REV, Wire};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,8 +170,27 @@ pub struct ClientConf {
     /// permits for SOCKS5 `CONNECT`. Clamped to `1..=MAX_SOCKS_CONNS`.
     #[serde(default)]
     pub max_forward_conns: Option<usize>,
-    /// ALPN override (e.g. `myquic2/3` to restore the versioned identifier).
-    /// Unset/empty = `h3` masquerade.
+    /// Application-layer wire revision: `2` = shipped MQP-3 rev2, `3` = the
+    /// clean-slate rev3 wire. Unset = the build default ([`DEFAULT_REV`]).
+    ///
+    /// Both binaries of a deployment must agree. Both revisions default to the
+    /// shared `h3` ALPN masquerade, so ALPN is a deployment label rather than a
+    /// revision switch: a mixed pair with the same label completes the TLS
+    /// handshake and then fails silently at the data plane (nothing is
+    /// forwarded or misrouted). Pin distinct `alpn` labels across revisions to
+    /// get a TLS-level skew gate. There is no runtime negotiation and no
+    /// fallback by design.
+    #[serde(default)]
+    pub wire_rev: Option<u8>,
+    /// ALPN label override. Unset/empty = the historical `h3` masquerade,
+    /// which is the default for **both** wire revisions; a custom label is
+    /// used verbatim (e.g. `myquic2/r3` for rev3, `myquic2/3` for rev2).
+    ///
+    /// The label is a deployment choice, not a revision switch: both sides
+    /// must run the same value. Distinct labels across revisions give a
+    /// TLS-level fail-fast gate, while the default shared `h3` label means a
+    /// mismatched pair (rev2 vs rev3) completes the handshake and then fails
+    /// silently at the data plane — deploy matched binaries.
     #[serde(default)]
     pub alpn: Option<String>,
     // ---- Forward listeners (client-only; both arrays empty = disabled) ----
@@ -328,7 +348,28 @@ impl ClientConf {
         self.udp_split.unwrap_or(true)
     }
 
+    /// Application-layer wire revision selected by this configuration.
+    ///
+    /// An out-of-range `wire_rev` is rejected at startup by
+    /// [`Self::validate_wire_rev`]; this accessor falls back to the build
+    /// default so a partially-validated config can never change the wire
+    /// silently. The revision is not encoded in ALPN by default (both
+    /// revisions default to the `h3` masquerade), so only a matched deployment
+    /// is supported.
+    pub fn wire(&self) -> Wire {
+        Wire::from_rev(self.wire_rev.unwrap_or(DEFAULT_REV)).unwrap_or(Wire::Rev2)
+    }
+
+    /// Whether the configuration pins a valid wire revision and an ALPN that
+    /// matches it. Called at startup by the client binary.
+    pub fn validate_wire_rev(&self) -> anyhow::Result<()> {
+        crate::mqp::wire::validate_config(self.wire_rev, self.alpn.as_deref())
+    }
+
     pub fn alpn_bytes(&self) -> Vec<u8> {
+        // Same resolution for both revisions: the default is the `h3`
+        // masquerade; a configured label is used verbatim. ALPN does not
+        // encode the wire revision by default.
         normalize_alpn(self.alpn.as_deref())
     }
 
@@ -585,6 +626,51 @@ server_cert_file = "server-cert.pem"
              {extra}"
         ))
         .expect("the config with a custom socks_listen must parse")
+    }
+
+    #[test]
+    fn wire_rev_is_parsed_validated_and_alpn_defaults_to_h3() {
+        use crate::mqp::wire::Wire;
+
+        // Unset follows the build default, which is rev3 after the rollover,
+        // and both revisions default to the shared h3 masquerade label.
+        let c = parse_ok("");
+        assert_eq!(c.wire(), Wire::Rev3);
+        assert_eq!(c.alpn_bytes(), b"h3");
+        assert!(c.validate_wire_rev().is_ok());
+
+        let c = parse_ok("wire_rev = 3\n");
+        assert_eq!(c.wire(), Wire::Rev3);
+        assert_eq!(c.alpn_bytes(), b"h3");
+        assert!(c.validate_wire_rev().is_ok());
+
+        // Explicit rev2 is the one-release rollback wire; it also defaults to
+        // the h3 masquerade.
+        let c = parse_ok("wire_rev = 2\n");
+        assert_eq!(c.wire(), Wire::Rev2);
+        assert_eq!(c.alpn_bytes(), b"h3");
+        assert!(c.validate_wire_rev().is_ok());
+
+        // A custom label is a deployment choice, accepted for any revision (it
+        // is not a revision switch). Empty stays the h3 default.
+        let c = parse_ok("wire_rev = 3\nalpn = \"h3\"\n");
+        assert_eq!(c.wire(), Wire::Rev3);
+        assert_eq!(c.alpn_bytes(), b"h3");
+        assert!(c.validate_wire_rev().is_ok());
+        let c = parse_ok("wire_rev = 3\nalpn = \"myquic2/r3\"\n");
+        assert_eq!(c.wire(), Wire::Rev3);
+        assert_eq!(c.alpn_bytes(), b"myquic2/r3");
+        assert!(c.validate_wire_rev().is_ok());
+        let c = parse_ok("wire_rev = 2\nalpn = \"myquic2/2\"\n");
+        assert_eq!(c.wire(), Wire::Rev2);
+        assert_eq!(c.alpn_bytes(), b"myquic2/2");
+        assert!(c.validate_wire_rev().is_ok());
+        let c = parse_ok("alpn = \"\"\n");
+        assert_eq!(c.alpn_bytes(), b"h3");
+
+        // Only the revision number is validated.
+        assert!(parse_ok("wire_rev = 4\n").validate_wire_rev().is_err());
+        assert!(parse_ok("wire_rev = 0\n").validate_wire_rev().is_err());
     }
 
     fn validation_err(extra: &str) -> String {

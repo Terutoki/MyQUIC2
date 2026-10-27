@@ -30,6 +30,7 @@ use parking_lot::RwLock;
 
 use super::addr::{TargetAddr, TargetAddrRef};
 use super::r2::{self, Caps};
+use super::wire::{self, Wire};
 
 /// Per-session flow cap. Mirrors the v0.2.0 `MQP3_MAX_FLOWS`; a full table
 /// falls back to `INLINE` frames and never blocks the association.
@@ -51,6 +52,18 @@ pub const R2_MAX_RESOLVED_ADDRS: usize = 16;
 
 /// Highest sender-local id that still fits `wire_id = (local << 1) | owner`.
 const MAX_LOCAL_FLOW_ID: u32 = u32::MAX >> 1;
+
+/// Binding-context repeats for the rev3 no-ACK sender policy (K = 2).
+///
+/// rev2 gates compression on an explicit `FLOW_ACK`/implicit compressed-frame
+/// confirmation. rev3 has no per-flow ACK, so a sender repeats the
+/// binding-carrying frame (`DATA_EXT OPEN` / `FRAG open`) for the first
+/// [`R3_CONTEXT_REPEATS`] payloads of a not-yet-open binding and then marks it
+/// open locally; a receiver that still misses the binding repairs with
+/// `NEED_CONTEXT`, which calls [`FlowBinding::rearm_context`]. Two independent
+/// copies cover one lost DATAGRAM, which is the same loss budget the rev2
+/// `OPEN` repetition had while the binding was `Opening`.
+pub const R3_CONTEXT_REPEATS: u8 = 2;
 
 /// Confirmation state of a flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +102,15 @@ pub struct FlowBinding {
     /// Destination the flow is bound to (domain targets keep their name).
     pub target: TargetAddr,
     state: AtomicU8,
+    /// rev3 no-ACK sender policy: binding-carrying frames still owed to the
+    /// peer before steady frames are safe (see [`R3_CONTEXT_REPEATS`]).
+    ///
+    /// Inert on rev2, where `state` alone (the `FLOW_ACK`-gated `Opening`) is
+    /// the sender's gate. Kept per binding rather than per association because
+    /// the repair signal (`NEED_CONTEXT`) arrives on the connection's control
+    /// reader task, which has no handle to any association's sender state;
+    /// [`Self::rearm_context`] is the one cross-task re-arm point.
+    context_left: AtomicU8,
     /// Downlink: address to write into the SOCKS5 UDP reply header. Learned
     /// from the first inline reply / `OPEN|SRC` rebind, so it is the actual
     /// source address (same semantics as today's inline replies).
@@ -126,6 +148,7 @@ impl FlowBinding {
             session,
             target,
             state: AtomicU8::new(FlowState::Opening as u8),
+            context_left: AtomicU8::new(R3_CONTEXT_REPEATS),
             reply_src: ArcSwapOption::const_empty(),
             reply_src_acked: AtomicBool::new(false),
             resolved: ArcSwap::from_pointee(Vec::new()),
@@ -143,19 +166,104 @@ impl FlowBinding {
     }
 
     /// Mark the flow confirmed. Idempotent; never reopens a closed binding.
+    ///
+    /// **Load-then-CAS (W8a).** Both endpoints call this on the receive path —
+    /// a steady `DATA` frame, the first occurrence of every id in a `TRAIN`
+    /// item run, every completed `FRAG` payload — while virtually every call
+    /// hits a binding that is already `Open` (a compressed frame *is* the
+    /// implicit confirmation) or already `Closed`. An unconditional
+    /// `compare_exchange` is a locked RMW on that path even when it changes
+    /// nothing; a relaxed load first makes the steady state a plain load, and
+    /// only the real `Opening -> Open` transition pays the RMW. The CAS (not a
+    /// plain store) keeps the `Closed` state terminal: it loses to a concurrent
+    /// [`Self::mark_closed`] exactly as the unconditional form did.
     pub fn mark_open(&self) {
-        let _ = self.state.compare_exchange(
-            FlowState::Opening as u8,
-            FlowState::Open as u8,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if self.state.load(Ordering::Relaxed) == FlowState::Opening as u8 {
+            let _ = self.state.compare_exchange(
+                FlowState::Opening as u8,
+                FlowState::Open as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// Mark the flow closed. A closed id is never reused, so no transition out
     /// of this state exists.
     pub fn mark_closed(&self) {
         self.state.store(FlowState::Closed as u8, Ordering::Relaxed);
+    }
+
+    /// One rev3 context slot: whether this payload must carry the binding form.
+    ///
+    /// Returns `true` while the binding is `Opening` and has context frames
+    /// left (consuming one); the send that consumes the **last** slot also
+    /// marks the binding open locally, so the next payload uses a steady frame.
+    /// Returns `false` for an already-open/closed binding (steady frames are
+    /// safe / the id is gone).
+    ///
+    /// Only the rev3 send path calls this; rev2 keeps the ACK-gated state
+    /// machine untouched.
+    pub fn take_context_slot(&self) -> bool {
+        loop {
+            if self.state.load(Ordering::Relaxed) != FlowState::Opening as u8 {
+                return false;
+            }
+            let left = self.context_left.load(Ordering::Relaxed);
+            if left <= 1 {
+                // The last (or a raced-out) context frame: transition to open
+                // first, so no later payload can send a context frame after
+                // the window closes.
+                if self
+                    .state
+                    .compare_exchange(
+                        FlowState::Opening as u8,
+                        FlowState::Open as u8,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    self.context_left.store(0, Ordering::Relaxed);
+                    return true;
+                }
+                // Lost to a close (or another consumer): re-read the state.
+                continue;
+            }
+            if self
+                .context_left
+                .compare_exchange(left, left - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Re-arm the rev3 context window after a peer `NEED_CONTEXT` repair hint.
+    ///
+    /// Moves an open binding back to `Opening` (so the next payloads carry the
+    /// binding form again) and resets the counter. A closed binding cannot be
+    /// revived: its id is never reused. Idempotent, and safe against a
+    /// concurrent sender (the sender's CAS loop re-reads the state).
+    pub fn rearm_context(&self) {
+        if self.state.load(Ordering::Relaxed) == FlowState::Closed as u8 {
+            return;
+        }
+        self.context_left
+            .store(R3_CONTEXT_REPEATS, Ordering::Relaxed);
+        let _ = self.state.compare_exchange(
+            FlowState::Open as u8,
+            FlowState::Opening as u8,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Remaining rev3 context frames (test/observability probe).
+    #[must_use]
+    pub fn context_left(&self) -> u8 {
+        self.context_left.load(Ordering::Relaxed)
     }
 
     /// Record the actual reply source of a downlink flow and clear its
@@ -561,14 +669,40 @@ impl FlowRegistry {
         session: u32,
         target: TargetAddr,
     ) -> Result<Arc<FlowBinding>, RegistryError> {
+        self.insert_new_for(Wire::Rev2, ids, session, target)
+    }
+
+    /// [`Self::insert_new`] for a connection's wire revision.
+    ///
+    /// On rev3 an id that cannot be represented as a 14-bit `fid` must never be
+    /// installed: the rev3 encoders would refuse every frame for it, so the
+    /// binding would be a permanently dead entry (and the payload would be lost
+    /// anyway). The allocator is only run once the fid space is known to have
+    /// room, so an exhausted rev3 id space costs **no** id and falls straight
+    /// through to the caller's `INLINE` fail-safe, exactly like a full table.
+    /// rev2 accepts every id the allocator returns, byte-identically to before.
+    pub fn insert_new_for(
+        &self,
+        wire: Wire,
+        ids: &FlowIds,
+        session: u32,
+        target: TargetAddr,
+    ) -> Result<Arc<FlowBinding>, RegistryError> {
         let mut map = self.map.write();
         // Capacity before allocation: a refused insert must not consume an id
         // (see the doc above).
         if map.len() >= self.cap {
             return Err(RegistryError::Full);
         }
-        // No id left is the same INLINE fail-safe as a full table.
-        let Some(wire_id) = ids.alloc() else {
+        // rev3 fid-space exhaustion, checked before allocating so a dead id is
+        // never burned (the registry insert path is the only allocator for
+        // these ids, and the map lock serialises competing inserts).
+        if wire == Wire::Rev3 && ids.allocated() >= wire::MAX_R3_LOCAL_ID {
+            return Err(RegistryError::Full);
+        }
+        // No id left (or the fid space can no longer represent one) is the same
+        // INLINE fail-safe as a full table.
+        let Some(wire_id) = wire::alloc_wire_id(ids, wire) else {
             return Err(RegistryError::Full);
         };
         let binding = FlowBinding::new_shared(wire_id, session, target);
@@ -927,6 +1061,97 @@ mod tests {
         assert_eq!(b.state(), FlowState::Closed);
         b.mark_open();
         assert_eq!(b.state(), FlowState::Closed);
+    }
+
+    /// rev3 no-ACK sender policy: exactly [`R3_CONTEXT_REPEATS`] binding-
+    /// carrying payloads per new binding, then the binding is open locally
+    /// (steady frames); a repair hint re-arms the same window.
+    #[test]
+    fn rev3_context_window_opens_locally_and_rearms() {
+        let b = binding(1, 7, TargetAddr::Ip(v4(53)));
+        assert_eq!(b.context_left(), R3_CONTEXT_REPEATS);
+        for expected_left in (0..R3_CONTEXT_REPEATS).rev() {
+            assert!(b.take_context_slot(), "context frame is owed");
+            assert_eq!(b.context_left(), expected_left);
+            assert_eq!(
+                b.state(),
+                if expected_left == 0 {
+                    FlowState::Open
+                } else {
+                    FlowState::Opening
+                },
+                "the last context frame marks the binding open locally"
+            );
+        }
+        assert!(
+            !b.take_context_slot(),
+            "an open binding sends steady frames (no ACK was waited for)"
+        );
+        // Peer repair: re-open the context window.
+        b.rearm_context();
+        assert_eq!(b.state(), FlowState::Opening);
+        assert_eq!(b.context_left(), R3_CONTEXT_REPEATS);
+        assert!(b.take_context_slot());
+        assert_eq!(b.context_left(), R3_CONTEXT_REPEATS - 1);
+        // A closed binding cannot be revived: its id is never reused.
+        b.mark_closed();
+        b.rearm_context();
+        assert_eq!(b.state(), FlowState::Closed);
+        assert!(!b.take_context_slot());
+    }
+
+    /// rev3 id exhaustion is a no-id-cost fail-safe: an id that cannot be a
+    /// 14-bit fid is never allocated/installed, while rev2 keeps accepting ids
+    /// past the fid space.
+    #[test]
+    fn insert_new_for_rev3_respects_the_fid_space() {
+        let ids = FlowIds::new(false);
+        // Consume the whole rev3 fid space without a registry.
+        for _ in 0..wire::MAX_R3_LOCAL_ID {
+            assert!(wire::alloc_wire_id(&ids, Wire::Rev3).is_some());
+        }
+        let reg = FlowRegistry::new(8);
+        let allocated = ids.allocated();
+        assert_eq!(
+            reg.insert_new_for(Wire::Rev3, &ids, 7, TargetAddr::Ip(v4(53)))
+                .unwrap_err(),
+            RegistryError::Full,
+            "exhausted rev3 fid space is the INLINE fail-safe"
+        );
+        assert_eq!(ids.allocated(), allocated, "no id may be burned");
+        assert!(reg.is_empty());
+        // rev2 still installs: its varint id space is far larger.
+        let b = reg
+            .insert_new_for(Wire::Rev2, &ids, 7, TargetAddr::Ip(v4(54)))
+            .expect("rev2 installs past the rev3 fid space");
+        assert!(b.wire_id > 0);
+    }
+
+    /// W8a: `mark_open` short-circuits on a relaxed load in the steady state
+    /// (the per-frame downlink path calls it unconditionally), but the load
+    /// must not change the transition semantics: `Opening -> Open` still
+    /// transitions, a repeated call is idempotent, and a `Closed` binding is
+    /// never reopened.
+    #[test]
+    fn mark_open_load_first_keeps_idempotence() {
+        let b = binding(1, 7, TargetAddr::Ip(v4(53)));
+        assert_eq!(b.state(), FlowState::Opening);
+        // The fast path (already Open) repeatedly returns the same state.
+        b.mark_open();
+        for _ in 0..64 {
+            b.mark_open();
+            assert_eq!(b.state(), FlowState::Open);
+        }
+        // Closed is terminal on both the load and the CAS arm.
+        b.mark_closed();
+        for _ in 0..64 {
+            b.mark_open();
+            assert_eq!(b.state(), FlowState::Closed);
+        }
+        // A fresh binding still takes the one real transition.
+        let fresh = binding(2, 7, TargetAddr::Ip(v4(54)));
+        fresh.mark_open();
+        assert!(fresh.is_open());
     }
 
     #[test]

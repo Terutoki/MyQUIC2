@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use clap::Parser;
+use myquic2::mqp::wire::Wire;
 use myquic2::*;
 use quinn::Runtime;
 use std::{
@@ -36,6 +37,8 @@ mod rev2;
 mod socks;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_0rtt;
 mod util;
 
 use crate::{
@@ -128,6 +131,11 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             "auth_token is a placeholder from the sample config; set a private shared secret (or an empty token with firewall isolation)"
         );
     }
+    // Wire revision: validate the `wire_rev`/ALPN pair before any socket or TLS
+    // work. A bad revision (or a rev2 ALPN label pinned together with rev3)
+    // must fail startup loudly instead of silently selecting a wire the peer
+    // cannot speak; the revision is carried by ALPN and never negotiated.
+    c.validate_wire_rev()?;
     // Forward listeners: validate the whole table before any socket, TLS config
     // or QUIC endpoint is created. A bad entry must fail startup loudly — a
     // silently skipped listener is indistinguishable from a working tunnel until
@@ -148,7 +156,13 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         sendmmsg_available(),
         recvmmsg_available()
     );
-    let tls = client_tls_config(load_cert_der(&c.server_cert_file)?, &c.alpn_bytes())?;
+    let alpn = c.alpn_bytes();
+    info!(
+        "application wire: rev{} (ALPN {})",
+        c.wire().rev(),
+        String::from_utf8_lossy(&alpn)
+    );
+    let tls = client_tls_config(load_cert_der(&c.server_cert_file)?, &alpn)?;
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let quic_client = Arc::new(quic_client);
     let mut ccfg_interactive = quinn::ClientConfig::new(quic_client.clone());
@@ -304,6 +318,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
                 server_str.clone(),
                 c.server_name.clone(),
                 c.auth_token.clone(),
+                c.wire(),
                 pool.slot(i),
                 hub.clone(),
                 egress_shared.clone(),
@@ -360,6 +375,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
                 server_str.clone(),
                 c.server_name.clone(),
                 c.auth_token.clone(),
+                c.wire(),
                 pool.slot(i),
                 watchdog_silence,
                 i,
@@ -647,6 +663,7 @@ fn spawn_slot_shard(
     server: String,
     server_name: String,
     auth: String,
+    wire: Wire,
     slot: ConnSlot,
     hub: Arc<UdpHub>,
     egress: Arc<SharedEgress>,
@@ -701,6 +718,7 @@ fn spawn_slot_shard(
                     server,
                     server_name,
                     auth,
+                    wire,
                     slot,
                     watchdog_silence,
                     idx,

@@ -132,6 +132,12 @@ pub(crate) struct DnsGate {
     hot_key: std::sync::atomic::AtomicU64,
     hot_state: std::sync::atomic::AtomicU64,
     hot_deadline: std::sync::atomic::AtomicU64,
+    /// Test-only per-gate count of datagrams this gate refused (InFlight or a
+    /// cached Unusable verdict). The process-wide `dgram_drops` counters are
+    /// shared by every concurrently running test, so tests that assert exact
+    /// accounting of *their own* burst must count locally.
+    #[cfg(test)]
+    refusals: std::sync::atomic::AtomicU64,
 }
 
 impl DnsGate {
@@ -145,7 +151,23 @@ impl DnsGate {
             hot_key: std::sync::atomic::AtomicU64::new(0),
             hot_state: std::sync::atomic::AtomicU64::new(0),
             hot_deadline: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            refusals: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Record one gate refusal (test-only, local to this gate instance).
+    #[cfg(test)]
+    pub(crate) fn note_refusal(&self) {
+        self.refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of datagrams this gate refused so far (test-only; immune to the
+    /// process-global counters other concurrent tests bump).
+    #[cfg(test)]
+    pub(crate) fn refusals(&self) -> u64 {
+        self.refusals.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Publish the fast hint (see the field docs). The key is stored last with
@@ -500,6 +522,8 @@ pub(crate) async fn forward_server_dgram(
                 GateClaim::Proceed(generation) => generation,
                 GateClaim::InFlight | GateClaim::Unusable => {
                     dgram_drops::bump(&dgram_drops::REFUSED);
+                    #[cfg(test)]
+                    ss.dns_gate.note_refusal();
                     return None;
                 }
             };

@@ -35,6 +35,8 @@ use super::send::{DatagramSend, PayloadSend, note_send_buffer_full, try_send_dat
 use crate::mqp::addr::TargetAddrRef;
 use crate::mqp::fragment::{MQP_FRAG_MAX_PAYLOAD, MQP_FRAG_MAX_TOTAL};
 use crate::mqp::r2;
+use crate::mqp::r3;
+use crate::mqp::wire::{self, Wire};
 use crate::stats::{DatagramDropKind, warn_datagram_drop};
 use crate::{dgram_drops, udp_stats};
 
@@ -64,6 +66,32 @@ pub enum R2FragFlow<'a> {
         addr: TargetAddrRef<'a>,
         src: bool,
     },
+}
+
+/// Per-revision fragment framing for one payload: the flow id, the first and
+/// following header sizes, and the binding context the first frame carries.
+#[derive(Debug, Clone, Copy)]
+struct FragHeaders<'a> {
+    wire_id: Option<u32>,
+    first_hdr: usize,
+    rest_hdr: usize,
+    ctx: Option<(u32, TargetAddrRef<'a>, bool)>,
+}
+
+impl<'a> FragHeaders<'a> {
+    fn flow(
+        wire_id: Option<u32>,
+        first_hdr: usize,
+        rest_hdr: usize,
+        ctx: Option<(u32, TargetAddrRef<'a>, bool)>,
+    ) -> Self {
+        Self {
+            wire_id,
+            first_hdr,
+            rest_hdr,
+            ctx,
+        }
+    }
 }
 
 /// Pure split plan: frame count + per-fragment chunk sizes/headers.
@@ -132,12 +160,108 @@ pub struct R2Fragmenter {
     /// Drives the aggregate-space gate in [`Self::send`]; a healthy fragmenter
     /// only pays one `false` branch.
     last_blocked: bool,
+    /// Wire revision of the connection this fragmenter belongs to. Rev2 is the
+    /// `Default`; the connection setup selects rev3 explicitly.
+    wire: Wire,
 }
 
 impl R2Fragmenter {
+    /// Rev2-default fragmenter (unchanged behavior).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fragmenter for an explicit wire revision.
+    #[must_use]
+    pub fn new_with_wire(wire: Wire) -> Self {
+        Self {
+            wire,
+            ..Self::default()
+        }
+    }
+
+    /// Select the wire revision after construction (used by the connection
+    /// state constructors, which build the fragmenter before the revision is
+    /// known in every path).
+    pub fn set_wire(&mut self, wire: Wire) {
+        self.wire = wire;
+    }
+
+    /// Wire revision this fragmenter encodes for.
+    #[must_use]
+    pub fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    /// Header sizes of the first and following fragments plus the flow context,
+    /// for the fragmenter's configured revision.
+    ///
+    /// Pure: the split plan and the encoders both use it, so a frame-size
+    /// mismatch is a codec bug rather than a silently unreassemblable payload.
+    fn headers<'a>(&self, flow: &R2FragFlow<'a>) -> Option<FragHeaders<'a>> {
+        match self.wire {
+            Wire::Rev2 => match *flow {
+                R2FragFlow::Steady { wire_id } => {
+                    let hdr = r2::frag_steady_len(wire_id, 0);
+                    Some(FragHeaders::flow(Some(wire_id), hdr, hdr, None))
+                }
+                R2FragFlow::Opening {
+                    wire_id,
+                    sess,
+                    addr,
+                    src,
+                } => {
+                    let header = addr.header().ok()?;
+                    Some(FragHeaders::flow(
+                        Some(wire_id),
+                        r2::frag_open_len(wire_id, header.len(), 0),
+                        r2::frag_steady_len(wire_id, 0),
+                        Some((sess, addr, src)),
+                    ))
+                }
+                R2FragFlow::Inline { sess, addr, src } => {
+                    let header = addr.header().ok()?;
+                    let hdr = r2::frag_inline_len(header.len(), 0);
+                    Some(FragHeaders::flow(None, hdr, hdr, Some((sess, addr, src))))
+                }
+            },
+            Wire::Rev3 => match *flow {
+                R2FragFlow::Steady { wire_id } => {
+                    wire::fid_for(wire_id)?;
+                    let hdr = r3::frag_steady_len(0);
+                    Some(FragHeaders::flow(Some(wire_id), hdr, hdr, None))
+                }
+                R2FragFlow::Opening {
+                    wire_id,
+                    sess,
+                    addr,
+                    src,
+                } => {
+                    let fid = wire::fid_for(wire_id)?;
+                    let header = addr.header().ok()?;
+                    // The rev3 adapter splits the rebind case (client-owned +
+                    // src) into the session-less SRC form.
+                    let server_owned = fid >= r3::SERVER_FID_BASE;
+                    let first = if src && !server_owned {
+                        r3::frag_src_len(header.len(), 0)
+                    } else {
+                        r3::frag_open_len(header.len(), 0)
+                    };
+                    Some(FragHeaders::flow(
+                        Some(wire_id),
+                        first,
+                        r3::frag_steady_len(0),
+                        Some((sess, addr, src)),
+                    ))
+                }
+                R2FragFlow::Inline { sess, addr, src } => {
+                    let header = addr.header().ok()?;
+                    let hdr = r3::frag_inline_len(header.len(), 0);
+                    Some(FragHeaders::flow(None, hdr, hdr, Some((sess, addr, src))))
+                }
+            },
+        }
     }
 
     /// Send `payload` as rev2 `FRAG` frames. The caller has already established
@@ -150,41 +274,14 @@ impl R2Fragmenter {
         flow: &R2FragFlow<'_>,
         payload: &[u8],
     ) -> PayloadSend {
-        let (wire_id, first_hdr, rest_hdr, sess_ctx) = match *flow {
-            R2FragFlow::Steady { wire_id } => {
-                if wire_id == 0 {
-                    return self.too_large("rev2 fragment for id 0");
-                }
-                let hdr = r2::frag_steady_len(wire_id, 0);
-                (Some(wire_id), hdr, hdr, None)
-            }
-            R2FragFlow::Opening {
-                wire_id,
-                sess,
-                addr,
-                src,
-            } => {
-                if wire_id == 0 {
-                    return self.too_large("rev2 fragment open for id 0");
-                }
-                let Ok(header) = addr.header() else {
-                    return self.too_large("bad address header");
-                };
-                let first = r2::frag_open_len(wire_id, header.len(), 0);
-                (
-                    Some(wire_id),
-                    first,
-                    r2::frag_steady_len(wire_id, 0),
-                    Some((sess, addr, src)),
-                )
-            }
-            R2FragFlow::Inline { sess, addr, src } => {
-                let Ok(header) = addr.header() else {
-                    return self.too_large("bad address header");
-                };
-                let hdr = r2::frag_inline_len(header.len(), 0);
-                (None, hdr, hdr, Some((sess, addr, src)))
-            }
+        let Some(FragHeaders {
+            wire_id,
+            first_hdr,
+            rest_hdr,
+            ctx: sess_ctx,
+        }) = self.headers(flow)
+        else {
+            return self.too_large("unencodable fragment context for this wire revision");
         };
         let Some(plan) = FragPlan::new(limit, first_hdr, rest_hdr, payload.len()) else {
             return self.too_large("payload above the rev2 fragmentation limit");
@@ -223,14 +320,14 @@ impl R2Fragmenter {
             };
             let chunk = &remaining[..chunk_len];
             let encoded = match (idx, wire_id, sess_ctx) {
-                (0, Some(id), Some((sess, addr, src))) => r2::encode_frag_open(
-                    id, sess, &addr, src, frag_id, idx as u8, total, chunk, limit,
+                (0, Some(id), Some((sess, addr, src))) => wire::encode_frag_open(
+                    self.wire, id, sess, &addr, src, frag_id, idx as u8, total, chunk, limit,
                 ),
                 (_, Some(id), _) => {
-                    r2::encode_frag_steady(id, frag_id, idx as u8, total, chunk, limit)
+                    wire::encode_frag_steady(self.wire, id, frag_id, idx as u8, total, chunk, limit)
                 }
-                (_, None, Some((sess, addr, src))) => r2::encode_frag_inline(
-                    sess, &addr, src, frag_id, idx as u8, total, chunk, limit,
+                (_, None, Some((sess, addr, src))) => wire::encode_frag_inline(
+                    self.wire, sess, &addr, src, frag_id, idx as u8, total, chunk, limit,
                 ),
                 _ => None,
             };
@@ -362,6 +459,88 @@ mod tests {
         let f = R2Fragmenter::new();
         assert_eq!(f.next_id, 0);
         assert!(!f.last_blocked);
+        assert_eq!(f.wire(), Wire::Rev2);
+    }
+
+    #[test]
+    fn rev3_header_sizes_match_the_codec() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let addr = TargetAddrRef::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53));
+        let v4 = addr.header().unwrap().len();
+        let f = R2Fragmenter::new_with_wire(Wire::Rev3);
+        // Client-owned steady: 1 class + 2 fid + 4 frag + 1 idx + 1 total = 9 B.
+        let h = f
+            .headers(&R2FragFlow::Steady { wire_id: 2 })
+            .expect("rev3 steady header");
+        assert_eq!(h.wire_id, Some(2));
+        assert_eq!(
+            (h.first_hdr, h.rest_hdr),
+            (r3::frag_steady_len(0), r3::frag_steady_len(0))
+        );
+        assert_eq!(h.first_hdr, 9);
+        assert!(h.ctx.is_none());
+        // Client-owned OPEN (src=false): steady + sess(4) + addr.
+        let h = f
+            .headers(&R2FragFlow::Opening {
+                wire_id: 2,
+                sess: 7,
+                addr,
+                src: false,
+            })
+            .expect("rev3 open header");
+        assert_eq!(h.first_hdr, 9 + 4 + v4);
+        assert_eq!(h.rest_hdr, 9);
+        assert_eq!(h.first_hdr, r3::frag_open_len(v4, 0));
+        // Client-owned rebind (src=true): the session-less SRC form.
+        let h = f
+            .headers(&R2FragFlow::Opening {
+                wire_id: 2,
+                sess: 7,
+                addr,
+                src: true,
+            })
+            .expect("rev3 src header");
+        assert_eq!(h.first_hdr, 9 + v4);
+        assert_eq!(h.first_hdr, r3::frag_src_len(v4, 0));
+        // Server-owned new flow (src=true): OPEN_SRC keeps the session.
+        let h = f
+            .headers(&R2FragFlow::Opening {
+                wire_id: 3,
+                sess: 7,
+                addr,
+                src: true,
+            })
+            .expect("rev3 open_src header");
+        assert_eq!(h.first_hdr, 9 + 4 + v4);
+        assert_eq!(h.first_hdr, r3::frag_open_len(v4, 0));
+        // INLINE keeps session + address on every fragment:
+        // 1 class + 4 frag_id + 1 idx + 1 total + 4 sess + addr.
+        let h = f
+            .headers(&R2FragFlow::Inline {
+                sess: 7,
+                addr,
+                src: false,
+            })
+            .expect("rev3 inline header");
+        assert_eq!(h.wire_id, None);
+        assert_eq!(h.first_hdr, h.rest_hdr);
+        assert_eq!(h.first_hdr, 11 + v4);
+        assert_eq!(h.first_hdr, r3::frag_inline_len(v4, 0));
+        // Exhausted rev3 id space: the split refuses rather than emitting an
+        // unreassemblable frame (caller falls back to INLINE upstream).
+        assert!(
+            f.headers(&R2FragFlow::Steady {
+                wire_id: 0x2001 << 1
+            })
+            .is_none()
+        );
+        // Rev2 header sizing is unchanged by the wire field.
+        let f2 = R2Fragmenter::new();
+        let h = f2
+            .headers(&R2FragFlow::Steady { wire_id: 2 })
+            .expect("rev2 steady header");
+        assert_eq!(h.first_hdr, r2::frag_steady_len(2, 0));
+        assert_eq!(h.rest_hdr, h.first_hdr);
     }
 
     /// Every size refusal must be visible in `dgram_drops`: the rev2 path used

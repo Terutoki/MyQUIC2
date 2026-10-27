@@ -1,8 +1,11 @@
 //! Inbound DATAGRAM dispatcher.
 use super::*;
 use futures_util::future::FutureExt as _;
-use myquic2::mqp::r2::{self, R2Kind};
+use myquic2::mqp::ctl_stream::{self, CtlRate};
+use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{FlowBinding, RegistryError};
+use myquic2::mqp::r3::CtlMessage;
+use myquic2::mqp::wire::{self, FrameKind, Wire};
 use myquic2::udp::{R2Assembled, R2Reassembler};
 
 /// Direct-mapped dispatcher cache, one slot per session id modulo the table
@@ -883,19 +886,38 @@ fn send_flow_ack(conn: Option<&quinn::Connection>, id: u32) {
     }
 }
 
-/// Best-effort `CTL FLOW_REJECT` for a binding frame this side refuses.
+/// Best-effort rejection notice for a binding frame this side refuses.
 ///
 /// The peer answers a reject by closing the offending flow and sending
 /// `INLINE` for the target until its TTL expires, which is the only recovery
 /// a rejected `OPEN` has; staying silent leaves the peer re-sending frames for
 /// an id we will never install.
-fn send_flow_reject(conn: Option<&quinn::Connection>, id: u32, reason: u8) {
-    let Some(conn) = conn else {
-        return;
-    };
-    match r2_send_ctl(conn, &r2::Ctl::FlowReject { id, reason }) {
-        DatagramSend::Sent => counters::flow_reject_tx(),
-        _ => counters::ctl_tx_fail(),
+///
+/// rev2 sends `CTL FLOW_REJECT` on the DATAGRAM plane; rev3 has no control
+/// DATAGRAMs, so the same notice rides the reliable control stream as
+/// `REJECT{fid}` (14-bit id; an id that cannot be a fid is unencodable on rev3
+/// anyway, so there is nothing to reject).
+fn send_flow_reject(rev2: &ConnRev2, conn: Option<&quinn::Connection>, id: u32, reason: u8) {
+    match rev2.wire() {
+        Wire::Rev2 => {
+            let Some(conn) = conn else {
+                return;
+            };
+            match r2_send_ctl(conn, &r2::Ctl::FlowReject { id, reason }) {
+                DatagramSend::Sent => counters::flow_reject_tx(),
+                _ => counters::ctl_tx_fail(),
+            }
+        }
+        Wire::Rev3 => {
+            let Some(fid) = wire::fid_for(id) else {
+                return;
+            };
+            if rev2.send_ctl(CtlMessage::Reject { fid, reason }) {
+                counters::flow_reject_tx();
+            } else {
+                counters::ctl_tx_fail();
+            }
+        }
     }
 }
 
@@ -913,10 +935,11 @@ fn send_flow_reject(conn: Option<&quinn::Connection>, id: u32, reason: u8) {
 /// registry drops the frame instead of evicting a live flow, and an unknown
 /// *client-owned* id is never installable (only owner bit 1 is).
 ///
-/// Every failure is reported to the peer as `CTL FLOW_REJECT` so it can stop
-/// using this id and fall back to `INLINE` (`TABLE_FULL` when the per-connection
-/// registry is at its cap, `POLICY` for everything else); without it a lost or
-/// refused `OPEN` left the sender repeating frames this side can never resolve.
+/// Every failure is reported to the peer (rev2 `CTL FLOW_REJECT`, rev3
+/// `REJECT` on the control stream) so it can stop using this id and fall back
+/// to `INLINE` (`TABLE_FULL` when the per-connection registry is at its cap,
+/// `POLICY` for everything else); without it a lost or refused `OPEN` left the
+/// sender repeating frames this side can never resolve.
 fn install_server_flow(
     rev2: &ConnRev2,
     conn: Option<&quinn::Connection>,
@@ -925,15 +948,15 @@ fn install_server_flow(
     addr: Option<TargetAddrRef<'_>>,
 ) -> Option<Arc<FlowBinding>> {
     if !r2::wire_id_server_owned(id) {
-        send_flow_reject(conn, id, r2::R2_REJECT_POLICY);
+        send_flow_reject(rev2, conn, id, r2::R2_REJECT_POLICY);
         return None;
     }
     let (Some(sess), Some(addr)) = (sess, addr) else {
-        send_flow_reject(conn, id, r2::R2_REJECT_POLICY);
+        send_flow_reject(rev2, conn, id, r2::R2_REJECT_POLICY);
         return None;
     };
     let Some(src) = r2_addr_dst(addr) else {
-        send_flow_reject(conn, id, r2::R2_REJECT_POLICY);
+        send_flow_reject(rev2, conn, id, r2::R2_REJECT_POLICY);
         return None;
     };
     let binding = FlowBinding::new_shared(id, sess, TargetAddr::Ip(src));
@@ -951,7 +974,7 @@ fn install_server_flow(
                 RegistryError::Full => r2::R2_REJECT_TABLE_FULL,
                 RegistryError::Conflict => r2::R2_REJECT_POLICY,
             };
-            send_flow_reject(conn, id, reason);
+            send_flow_reject(rev2, conn, id, reason);
             None
         }
     }
@@ -960,14 +983,39 @@ fn install_server_flow(
 /// Handle one rev2 `CTL` frame.
 ///
 /// Every opcode is idempotent and loss-tolerant by construction: a lost `CAPS`
-/// only delays readiness (the `HELLO` retry covers it), a lost `FLOW_ACK` only
-/// delays compression (the uplink keeps sending `OPEN`), and a lost
-/// `FLOW_CLOSE`/`SESS_CLOSE` is backstopped by the server's idle sweep.
+/// only delays readiness (the `HELLO` retry covers it, and a missing `CAPS`
+/// never fails the connection — W2), a lost `FLOW_ACK` only delays compression
+/// (the uplink keeps sending `OPEN`), and a lost `FLOW_CLOSE`/`SESS_CLOSE` is
+/// backstopped by the server's idle sweep.
 ///
 /// `hub` is the process association table: a `SESS_CLOSE` is only recorded for
 /// a session whose association is still live (see the arm below), so the hub
 /// read is what keeps the bounded notification set free of stale ids.
+///
+/// Test entry point: reads the coarse clock itself. The production dispatcher
+/// calls [`handle_r2_ctl_at`] with the drain burst's single clock read.
+#[cfg(test)]
 pub(crate) fn handle_r2_ctl(rev2: &ConnRev2, hub: &UdpHub, r2_reasm: &mut R2Reassembler, d: &[u8]) {
+    handle_r2_ctl_at(rev2, hub, r2_reasm, d, coarse_millis());
+}
+
+/// [`handle_r2_ctl`] with the caller's coarse-clock read (W8a: one clock read
+/// per drain burst instead of one per control frame).
+pub(crate) fn handle_r2_ctl_at(
+    rev2: &ConnRev2,
+    hub: &UdpHub,
+    r2_reasm: &mut R2Reassembler,
+    d: &[u8],
+    now_ms: u64,
+) {
+    // rev3 has no CTL DATAGRAMs: its control plane is the reliable stream. A
+    // DATAGRAM that happens to carry a rev2 CTL first byte is not a control
+    // frame there, so it must never mutate state (the wire-aware classifier
+    // already routes rev3 DATAGRAMs elsewhere; this is the belt-and-braces).
+    if rev2.wire() != Wire::Rev2 {
+        counters::ctl_drop();
+        return;
+    }
     let Ok(ctl) = r2::decode_ctl(d) else {
         counters::ctl_drop();
         return;
@@ -983,7 +1031,7 @@ pub(crate) fn handle_r2_ctl(rev2: &ConnRev2, hub: &UdpHub, r2_reasm: &mut R2Reas
     if matches!(
         ctl,
         r2::Ctl::SessClose { .. } | r2::Ctl::FlowClose { .. } | r2::Ctl::FlowReject { .. }
-    ) && !rev2.ctl.ctl_allowed(coarse_millis())
+    ) && !rev2.ctl.ctl_allowed(now_ms)
     {
         counters::ctl_rate_limited();
         return;
@@ -1006,7 +1054,11 @@ pub(crate) fn handle_r2_ctl(rev2: &ConnRev2, hub: &UdpHub, r2_reasm: &mut R2Reas
                 // The uplink falls back to `INLINE` for this target for the
                 // reason's window (spec §3.4) instead of re-opening on every
                 // payload; the binding's target is the key the uplink looks up.
-                rev2.note_rejected(binding.target.clone(), reason, mono_millis());
+                // The window is stored on the coarse epoch: that is the clock
+                // `ensure_binding`/`is_rejected` probe with, so both sides of
+                // the TTL comparison share one epoch (and the drain burst's
+                // clock read is reused — W8a).
+                rev2.note_rejected(binding.target.clone(), reason, now_ms);
                 counters::flow_reject_rx();
             }
             // Duplicate/unknown reject: no queued state can exist for an id
@@ -1056,6 +1108,170 @@ pub(crate) fn handle_r2_ctl(rev2: &ConnRev2, hub: &UdpHub, r2_reasm: &mut R2Reas
     }
 }
 
+/// Recovery for a steady frame naming a flow this side never installed.
+///
+/// rev2 needs none: the sender keeps repeating `OPEN` while its binding is
+/// `Opening`, so an unknown steady id is just a stale frame (counted).
+/// rev3 has no ACK/OPEN gate at all — the *receiver* is the one that notices a
+/// lost context window, so it asks the peer to re-send binding context
+/// (`NEED_CONTEXT{id}`) on the control stream. Rate-limited per connection by
+/// [`ConnRev2::send_need_context`]; the frame itself is still dropped (UDP
+/// semantics: it was sent before the peer had the binding).
+fn repair_unknown_flow(rev2: &ConnRev2, wire_id: u32) {
+    if rev2.wire() == Wire::Rev3 {
+        rev2.send_need_context(wire_id);
+    }
+}
+
+/// Apply one rev3 control-stream message (`REJECT`/`SESS_CLOSE`/`FLOW_CLOSE`/
+/// `NEED_CONTEXT`/`GOAWAY`).
+///
+/// Mirrors the rev2 `CTL` handlers action for action, minus the DATAGRAM plane:
+/// the stream is reliable and ordered, so the client never repeats and no frame
+/// can be lost, but every action stays idempotent because the server may retry a
+/// reap notice and a `NEED_CONTEXT` can race a re-arm.
+///
+/// `hub` gates the `SESS_CLOSE` note exactly like the rev2 arm: only a session
+/// with a live association can consume it, so a peer cannot park stale ids in
+/// the bounded notification set.
+pub(crate) fn handle_r3_ctl(
+    rev2: &ConnRev2,
+    hub: &UdpHub,
+    r2_reasm: &mut R2Reassembler,
+    msg: CtlMessage,
+) {
+    counters::ctl_stream_rx();
+    match msg {
+        CtlMessage::Reject { fid, reason } => {
+            let Some(id) = wire::wire_id_for_fid(fid) else {
+                counters::rx_unknown_id();
+                return;
+            };
+            match rev2.registry.remove(id) {
+                Some(binding) => {
+                    // Known flow: the per-id cleanup is worth its scans.
+                    let _ = r2_reasm.drop_flow(id);
+                    let _ = rev2.stager.lock().drop_flow_scoped(binding.session, id);
+                    binding.mark_closed();
+                    // The uplink sends `INLINE` for the target for the reason's
+                    // window instead of re-opening on every payload.
+                    rev2.note_rejected(binding.target.clone(), reason, coarse_millis());
+                    counters::flow_reject_rx();
+                }
+                // Duplicate/unknown reject: no queued state can exist for an id
+                // this side never installed, so the scans are skipped.
+                None => counters::rx_unknown_id(),
+            }
+        }
+        CtlMessage::SessClose { sess, .. } => {
+            let _ = r2_reasm.drop_session(sess);
+            let _ = rev2.stager.lock().drop_session(sess);
+            // Both client-owned and accepted server-owned bindings of the
+            // reaped session must go (see the rev2 `SESS_CLOSE` arm).
+            let _ = rev2.registry.remove_session(sess);
+            let live = hub.entry(sess).is_some_and(|e| e.is_alive());
+            if live {
+                rev2.note_session_closed(sess);
+            }
+            counters::sess_close_rx();
+        }
+        CtlMessage::FlowClose { fid, .. } => {
+            let Some(id) = wire::wire_id_for_fid(fid) else {
+                counters::rx_unknown_id();
+                return;
+            };
+            match rev2.registry.remove(id) {
+                Some(binding) => {
+                    let _ = r2_reasm.drop_flow(id);
+                    let _ = rev2.stager.lock().drop_flow_scoped(binding.session, id);
+                    binding.mark_closed();
+                    counters::flow_close_rx();
+                }
+                None => counters::rx_unknown_id(),
+            }
+        }
+        CtlMessage::NeedContext { fid } => {
+            let Some(id) = wire::wire_id_for_fid(fid) else {
+                counters::ctl_stream_drop();
+                return;
+            };
+            match rev2.registry.get(id) {
+                // Re-arm the no-ACK context window: the receiver missed the
+                // first K copies, so the next payloads carry the binding form
+                // again (the sender self-confirms after K, see
+                // `FlowBinding::take_context_slot`).
+                Some(binding) => {
+                    binding.rearm_context();
+                    counters::need_context_rx();
+                }
+                // The peer asks for a flow this generation never installed:
+                // nothing to re-arm (its `REJECT`/re-`OPEN` path owns that).
+                None => counters::rx_unknown_id(),
+            }
+        }
+        // The server is shedding this connection on its side: the client's own
+        // egress/reconnect path is authoritative for its flows, so this only
+        // feeds observability.
+        CtlMessage::Goaway => counters::ctl_stream_drop(),
+        // Server→client is REJECT/SESS_CLOSE/NEED_CONTEXT/GOAWAY; the rest are
+        // client→server directions and are a protocol anomaly here.
+        CtlMessage::AssocClose { .. } => counters::ctl_stream_drop(),
+    }
+}
+
+/// Spawn the generation's rev3 control-stream task.
+///
+/// One task per published generation owns the client-opened bidi stream (marker
+/// `0xFF`): it opens it immediately after the generation is published — so on a
+/// resumed connection the marker and the first messages ride the 0-RTT flight —
+/// writes every message the packet path queues through [`ConnRev2::send_ctl`]
+/// in order, and forwards inbound messages to the dispatcher loop, which owns
+/// the flow/stager/reassembly state. QUIC supplies reliability and ordering, so
+/// this direction has no app-level retry and no rate budget.
+///
+/// The task ends when the stream fails (the connection died) or when the
+/// dispatcher stops consuming (generation replaced); the next generation opens
+/// its own stream.
+fn spawn_ctl_stream(
+    conn: quinn::Connection,
+    mut to_server: tokio::sync::mpsc::UnboundedReceiver<CtlMessage>,
+    to_dispatcher: tokio::sync::mpsc::UnboundedSender<CtlMessage>,
+) {
+    tokio::spawn(async move {
+        let Ok((mut sender, mut receiver)) = ctl_stream::open_client_stream(&conn).await else {
+            // No control plane on this generation (connection already dead).
+            return;
+        };
+        loop {
+            tokio::select! {
+                msg = to_server.recv() => match msg {
+                    Some(msg) => {
+                        if sender.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                    // The generation's connection state is gone: finish the
+                    // stream so the server sees a clean control-plane teardown.
+                    None => {
+                        let _ = sender.into_inner().finish();
+                        return;
+                    }
+                },
+                msg = receiver.recv() => match msg {
+                    Ok(Some(msg)) => {
+                        if to_dispatcher.send(msg).is_err() {
+                            return;
+                        }
+                    }
+                    // Clean EOF or a stream error: the connection path
+                    // (watchdog/reconnect) owns the outcome.
+                    _ => return,
+                },
+            }
+        }
+    });
+}
+
 /// One rev2 `DATA` frame: steady (`wire_id` only), `OPEN`/`OPEN|SRC`, or
 /// `INLINE` (session + address).
 fn dispatch_r2_data(
@@ -1066,11 +1282,12 @@ fn dispatch_r2_data(
     d: &Bytes,
     out: &mut Vec<StagedReply>,
 ) -> usize {
-    let Ok(f) = r2::decode_data(d) else {
+    let wire = rev2.wire();
+    let Ok(f) = wire::decode_data(wire, d) else {
         counters::rx_drop();
         return 0;
     };
-    let Some(id) = f.id else {
+    let Some(id) = f.wire_id else {
         // INLINE: no flow bound, self-describing session + address. The
         // sender's fail-safe when its table is full.
         let (Some(sess), Some(addr)) = (f.sess, f.addr) else {
@@ -1095,6 +1312,15 @@ fn dispatch_r2_data(
     let binding = match rev2.registry.get(id) {
         Some(binding) => binding,
         None => {
+            // rev3 no-ACK: a steady frame for an unknown server-owned id means
+            // our copy of that reply flow's binding context was lost (open or
+            // frame loss). Ask for the context instead of rejecting a flow the
+            // server still believes in; the frame itself is dropped.
+            if wire == Wire::Rev3 && f.addr.is_none() && r2::wire_id_server_owned(id) {
+                counters::rx_unknown_id();
+                repair_unknown_flow(rev2, id);
+                return 0;
+            }
             // Unknown id: only a server-owned standalone OPEN can install a
             // flow (full-cone / unsolicited reply). An unknown client-owned id
             // or an address-less steady frame is still a drop — never guess.
@@ -1116,22 +1342,22 @@ fn dispatch_r2_data(
     }
     // `OPEN|SRC` is how the server teaches the client the actual reply source
     // (domain flow binding, port change, anycast): record it for the SOCKS5
-    // reply header, exactly like the shipped inline path. This is a binding
-    // frame for **our** binding (client-owned rebind) **or** the install of a
-    // server-owned one, and either way it must be confirmed: until the peer
-    // sees `FLOW_ACK` it cannot know the frame arrived, and a lost DATAGRAM
-    // would leave it re-sending the source forever (or, with the shared
-    // confirmation semantics, never compressing the flow).
+    // reply header, exactly like the shipped inline path. On rev2 the frame is
+    // confirmed with `CTL FLOW_ACK` (the peer re-sends until it arrives); rev3
+    // has no ACK plane — the server repeats the context itself for the first
+    // K replies, so the client only records the source.
     if f.src
         && let Some(src) = f.addr
         && let Some(src) = r2_addr_dst(src)
     {
         binding.set_reply_src(src);
-        send_flow_ack(conn, binding.wire_id);
+        if wire == Wire::Rev2 {
+            send_flow_ack(conn, binding.wire_id);
+        }
     }
     // Any compressed downlink proves the server installed this id: that is the
-    // implicit ACK the uplink waits for (a pure-uplink flow otherwise relies on
-    // `CTL FLOW_ACK`).
+    // implicit ACK the rev2 uplink waits for (a pure-uplink flow otherwise
+    // relies on `CTL FLOW_ACK`); on rev3 it simply confirms the binding early.
     binding.mark_open();
     let Some(dst) = r2_reply_dst(&binding) else {
         dgram_drops::bump(&dgram_drops::REFUSED);
@@ -1188,7 +1414,7 @@ fn dispatch_r2_train(
     d: &Bytes,
     out: &mut Vec<StagedReply>,
 ) -> usize {
-    let Ok(t) = r2::decode_train(d) else {
+    let Ok(t) = wire::decode_train(rev2.wire(), d) else {
         counters::rx_drop();
         return 0;
     };
@@ -1228,7 +1454,13 @@ fn dispatch_r2_train(
     #[derive(Clone, Copy)]
     enum Resolved {
         Pending,
-        Hit { sess: u32, dst: SocketAddr },
+        Hit {
+            sess: u32,
+            dst: SocketAddr,
+        },
+        /// Uninstalled id: skipped (and counted) per item, but the rev3 repair
+        /// hint is sent at most once per frame for it.
+        Unknown,
     }
     let mut resolved: [Resolved; TRAIN_MAX] = std::array::from_fn(|_| Resolved::Pending);
 
@@ -1241,11 +1473,23 @@ fn dispatch_r2_train(
         let slot = usize::from(item_slot[i]);
         let (sess, dst) = match resolved[slot] {
             Resolved::Hit { sess, dst } => (sess, dst),
+            Resolved::Unknown => {
+                // Already reported for this frame; the counter stays per item
+                // (the rev2 drop accounting contract).
+                counters::rx_unknown_id();
+                continue;
+            }
             Resolved::Pending => match slots[slot].1.as_ref() {
                 None => {
                     // TRAIN items never install a flow: a run carries no
                     // address, so an uninstalled id is a stale frame
                     // (counted per item, as before), never a new binding.
+                    // rev3: a server-owned id we do not hold is a lost
+                    // reply-flow context — ask for it once per frame.
+                    if rev2.wire() == Wire::Rev3 && r2::wire_id_server_owned(slots[slot].0) {
+                        repair_unknown_flow(rev2, slots[slot].0);
+                    }
+                    resolved[slot] = Resolved::Unknown;
                     counters::rx_unknown_id();
                     continue;
                 }
@@ -1291,6 +1535,7 @@ fn dispatch_r2_train(
 /// The reassembler owns every bound (8 KiB payload, 256 partials, 256 KiB held,
 /// 2 s timeout), so a peer that sends one fragment and stops cannot pin memory
 /// here — the dispatcher's existing reassembly tick expires it.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_r2_frag(
     rev2: &ConnRev2,
     conn: Option<&quinn::Connection>,
@@ -1299,13 +1544,17 @@ fn dispatch_r2_frag(
     r2_reasm: &mut R2Reassembler,
     d: &Bytes,
     out: &mut Vec<StagedReply>,
+    now_ms: u64,
 ) -> usize {
-    let Ok(f) = r2::decode_frag(d) else {
+    let wire = rev2.wire();
+    let Ok(f) = wire::decode_frag(wire, d) else {
         counters::rx_drop();
         return 0;
     };
     counters::frag_rx();
-    let Some(a) = r2_reasm.push(d, &f, coarse_millis()) else {
+    // The reassembler is wire-configured too, but the view is already
+    // revision-neutral (internal wire ids), so the same keying/bounds apply.
+    let Some(a) = r2_reasm.push_view(d, &f, now_ms) else {
         // Partial (or a refused/duplicate fragment): nothing to deliver yet.
         return 0;
     };
@@ -1322,6 +1571,14 @@ fn dispatch_r2_frag(
             let binding = match rev2.registry.get(id) {
                 Some(binding) => binding,
                 None => {
+                    // rev3 no-ACK: a completed steady fragment set for an
+                    // unknown server-owned id is a lost reply-flow context —
+                    // ask for it (the reassembled payload is dropped).
+                    if wire == Wire::Rev3 && addr.is_none() && r2::wire_id_server_owned(id) {
+                        counters::rx_unknown_id();
+                        repair_unknown_flow(rev2, id);
+                        return 0;
+                    }
                     // A fragmented server-owned OPEN|SRC is self-describing
                     // through its first fragment, so it installs like the
                     // single-frame form; a steady fragment set (no address)
@@ -1355,11 +1612,14 @@ fn dispatch_r2_frag(
                 None
             };
             if let Some(src_addr) = src_dst {
-                // `OPEN|SRC` (or a rebind) teaches the actual reply source;
-                // confirm it so the peer can stop re-sending the binding frame
-                // (see `send_flow_ack` and the shared confirmation contract).
+                // `OPEN|SRC` (or a rebind) teaches the actual reply source.
+                // rev2 confirms it so the peer can stop re-sending the binding
+                // frame; rev3 has no ACK plane (the server repeats the context
+                // for the first K replies itself).
                 binding.set_reply_src(src_addr);
-                send_flow_ack(conn, binding.wire_id);
+                if wire == Wire::Rev2 {
+                    send_flow_ack(conn, binding.wire_id);
+                }
             }
             let Some(dst) = src_dst.or_else(|| r2_reply_dst(&binding)) else {
                 dgram_drops::bump(&dgram_drops::REFUSED);
@@ -1395,12 +1655,20 @@ fn dispatch_r2_frag(
     1
 }
 
-/// Decode and route one inbound MQP-3 rev2 datagram.
+/// Decode and route one inbound MQP-3 rev2 or rev3 datagram.
 ///
-/// Returns the number of replies staged. Rev2 is dispatched *before* the
-/// legacy v3/MQP-2 paths (which the caller selects by first byte): the two
-/// wire generations intentionally share a connection during staging, and the
-/// safe first-byte ranges (`0x0X` vs `0x1X..`) keep them disjoint.
+/// Returns the number of replies staged. rev2 is dispatched *before* the
+/// legacy v3/MQP-2 paths (which the caller selects by first byte): the two wire
+/// generations intentionally share a rev2 connection during staging, and the
+/// safe first-byte ranges (`0x0X` vs `0x1X..`) keep them disjoint. A **rev3**
+/// connection never runs the legacy fallbacks: its DATAGRAM plane carries only
+/// rev3 frames (the TCP plane is stream-native), so an unclassifiable byte is a
+/// malformed frame, not an old-generation one.
+///
+/// Test entry point: it classifies the first byte and reads the coarse clock
+/// itself. The production dispatcher classifies **once** per datagram and
+/// passes its drain-burst clock read through [`dispatch_inbound`] (W8a).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_r2(
     rev2: &ConnRev2,
@@ -1411,22 +1679,63 @@ pub(crate) fn dispatch_r2(
     d: Bytes,
     out: &mut Vec<StagedReply>,
 ) -> usize {
-    match r2::kind(&d) {
-        Some(R2Kind::Ctl) => {
-            handle_r2_ctl(rev2, hub, r2_reasm, &d);
+    let Some(kind) = wire::kind(rev2.wire(), &d) else {
+        return 0;
+    };
+    dispatch_frame_kind(
+        kind,
+        rev2,
+        cache,
+        hub,
+        r2_reasm,
+        conn,
+        d,
+        out,
+        coarse_millis(),
+    )
+}
+
+/// [`dispatch_r2`] on an already-classified first byte and an already-read
+/// coarse clock (W8a).
+///
+/// The [`FrameKind`] is the *only* thing the revision-aware first-byte
+/// classification yields, so classifying in [`dispatch_inbound`] and passing it
+/// here removes the second identical match; `now_ms` removes a
+/// `coarse_millis()` per `CTL`/`FRAG` frame in favour of one per drain burst.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_frame_kind(
+    kind: FrameKind,
+    rev2: &ConnRev2,
+    cache: &mut [DispatchSlot; DISPATCH_CACHE],
+    hub: &UdpHub,
+    r2_reasm: &mut R2Reassembler,
+    conn: Option<&quinn::Connection>,
+    d: Bytes,
+    out: &mut Vec<StagedReply>,
+    now_ms: u64,
+) -> usize {
+    match kind {
+        // Only rev2 classifies a DATAGRAM as control; rev3 control rides the
+        // reliable stream (the handler has its own rev2 guard as well).
+        FrameKind::Ctl => {
+            handle_r2_ctl_at(rev2, hub, r2_reasm, &d, now_ms);
             0
         }
-        Some(R2Kind::Data) => dispatch_r2_data(rev2, conn, cache, hub, &d, out),
-        Some(R2Kind::Train) => dispatch_r2_train(rev2, cache, hub, &d, out),
+        FrameKind::Data => dispatch_r2_data(rev2, conn, cache, hub, &d, out),
+        FrameKind::Train => dispatch_r2_train(rev2, cache, hub, &d, out),
         // Rev2 FRAG is reassembled here and never routed into the legacy
         // MQP-2 fragment path (the first-byte dispatch keeps them disjoint).
-        Some(R2Kind::Frag) => dispatch_r2_frag(rev2, conn, cache, hub, r2_reasm, &d, out),
-        None => 0,
+        FrameKind::Frag => dispatch_r2_frag(rev2, conn, cache, hub, r2_reasm, &d, out, now_ms),
     }
 }
 
-/// Route one inbound DATAGRAM: rev2 first (first byte `0x0X`), then the
-/// legacy MQP-3/MQP-2/BATCH paths keyed by session.
+/// Route one inbound DATAGRAM: the connection's wire frames first, then (rev2
+/// only) the legacy MQP-3/MQP-2/BATCH paths keyed by session.
+///
+/// `now_ms` is the caller's single coarse-clock read for the drain burst
+/// (W8a); `CTL`/`FRAG` handling uses it instead of taking its own, and the
+/// revision-aware classification below is the one the wire dispatcher consumes
+/// (`dispatch_frame_kind`), so no datagram is classified twice.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_inbound(
     cache: &mut [DispatchSlot; DISPATCH_CACHE],
@@ -1437,9 +1746,16 @@ pub(crate) fn dispatch_inbound(
     reasm: &mut DgramReassembler,
     r2_reasm: &mut R2Reassembler,
     out: &mut Vec<StagedReply>,
+    now_ms: u64,
 ) {
-    if r2::is_r2(&d) {
-        dispatch_r2(rev2, cache, hub, r2_reasm, conn, d, out);
+    if let Some(kind) = wire::kind(rev2.wire(), &d) {
+        dispatch_frame_kind(kind, rev2, cache, hub, r2_reasm, conn, d, out, now_ms);
+        return;
+    }
+    if rev2.wire() != Wire::Rev2 {
+        // rev3 carries no legacy frames; a byte that is not a rev3 frame is
+        // malformed, and falling into the MQP-2 decoder could only misparse it.
+        counters::rx_drop();
         return;
     }
     let sess_of = |d: &Bytes| {
@@ -1503,7 +1819,31 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             // its key is connection-scoped (`wire_id`/`INLINE`+session), so a
             // per-association copy would only duplicate state and the same
             // payload's frames all travel on this connection.
-            let mut r2_reasm = R2Reassembler::new();
+            let mut r2_reasm = R2Reassembler::new_with_wire(rev2.wire());
+            // rev3 control plane: one client-opened bidi stream per generation.
+            // The dispatcher loop owns the flow/stager/reassembly state, so the
+            // stream task only does I/O: it writes what `ConnRev2::send_ctl`
+            // queues and forwards inbound messages here. A rev2 generation keeps
+            // a channel whose sender lives in `_ctl_keepalive`, so the select arm
+            // below simply never becomes ready and no stream is opened.
+            let (dispatch_ctl_tx, mut dispatch_ctl_rx) =
+                tokio::sync::mpsc::unbounded_channel::<CtlMessage>();
+            let wire = rev2.wire();
+            let _ctl_keepalive = if wire == Wire::Rev3 {
+                let (to_server_tx, to_server_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<CtlMessage>();
+                // Install synchronously, before the first inbound datagram can
+                // be dispatched: a repair or a close queued from then on always
+                // has a writer.
+                rev2.install_ctl_writer(to_server_tx);
+                spawn_ctl_stream(conn.clone(), to_server_rx, dispatch_ctl_tx);
+                None
+            } else {
+                Some(dispatch_ctl_tx)
+            };
+            // Receiver-side control budget (a hostile/buggy peer can flood
+            // idempotent messages even on a reliable stream).
+            let mut ctl_rx_rate = CtlRate::default_budget();
             // `push` only runs when a fragment arrives, so a peer that sends
             // fragments and then goes quiet would pin its partials for the
             // connection's lifetime; this tick is what makes `FRAG_TIMEOUT_MS` a
@@ -1540,6 +1880,11 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         // waker drops with it). One wakeup moves up to 32
                         // replies; a drained connection error breaks out after
                         // flushing what was staged.
+                        //
+                        // W8a: one coarse-clock read per drain burst, shared by
+                        // the rev2 `CTL` rate budget and the FRAG reassembler
+                        // deadline, instead of one per frame.
+                        let now_ms = coarse_millis();
                         let mut drained = 1usize;
                         if staged.len() < LAST_HOP_DRAIN * 2 {
                             dispatch_inbound(
@@ -1551,6 +1896,7 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                                 &mut reasm,
                                 &mut r2_reasm,
                                 &mut staged,
+                                now_ms,
                             );
                         }
                         for _ in 1..LAST_HOP_DRAIN {
@@ -1569,6 +1915,7 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                                         &mut reasm,
                                         &mut r2_reasm,
                                         &mut staged,
+                                        now_ms,
                                     );
                                 }
                                 Some(Err(_)) => { reader_failed = true; break; }
@@ -1594,6 +1941,15 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                         }
                         if reader_failed {
                             break;
+                        }
+                    }
+                    msg = dispatch_ctl_rx.recv() => {
+                        if let Some(msg) = msg {
+                            if ctl_rx_rate.allow(coarse_millis()) {
+                                handle_r3_ctl(&rev2, &hub, &mut r2_reasm, msg);
+                            } else {
+                                counters::ctl_stream_drop();
+                            }
                         }
                     }
                     _ = gen_rx.changed() => break,

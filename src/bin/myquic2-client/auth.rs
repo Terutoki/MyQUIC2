@@ -1,6 +1,7 @@
 //! Dial, auth and reconnect loop.
 use super::*;
 use backon::{BackoffBuilder, ExponentialBuilder};
+use myquic2::mqp::wire::Wire;
 
 /// Reconnect backoff: 200 ms base, x2, capped at 5 s. Additive jitter is the
 /// caller's (`jitter_ms()`), not backon's.
@@ -47,12 +48,17 @@ pub(crate) fn spawn_conn_loop(
     server_str: String,
     sname: String,
     auth: String,
+    wire: Wire,
     slot: ConnSlot,
     watchdog_silence: Duration,
     idx: usize,
     egress: std::sync::Arc<super::egress::SharedEgress>,
 ) {
     tokio::spawn(async move {
+        // 0-RTT phase handle of this slot's current generation: `dial_once`
+        // resets and advances it, and the TCP open path reads it to retry an
+        // early stream after a 0-RTT rejection.
+        let zero_rtt = slot.zero_rtt_state();
         let mut backoff = reconnect_backoff();
         loop {
             let server: SocketAddr = match resolve_server_addr(&server_str).await {
@@ -65,14 +71,16 @@ pub(crate) fn spawn_conn_loop(
                     continue;
                 }
             };
-            match dial_once(&ep, &cfg, server, &sname, &auth).await {
+            match dial_once(&ep, &cfg, server, &sname, &auth, &zero_rtt).await {
                 Ok(conn) => {
                     info!("QUIC connected to {server}");
-                    // MQP-3 rev2 state is created per dial and published
-                    // *before* the connection: the dispatcher and the egress
-                    // cache resolve the state of the generation they are
-                    // handed, never a neighbouring generation's.
-                    let rev2 = ConnRev2::new();
+                    // MQP-3 connection state is created per dial for the
+                    // configured wire revision (`wire_rev` + ALPN, fixed for
+                    // the deployment) and published *before* the connection:
+                    // the dispatcher and the egress cache resolve the state of
+                    // the generation they are handed, never a neighbouring
+                    // generation's.
+                    let rev2 = ConnRev2::new_with_wire(wire);
                     slot.set_rev2(rev2.clone());
                     slot.publish(&conn);
                     // Establishment is inbound progress: seed the routing
@@ -86,18 +94,23 @@ pub(crate) fn spawn_conn_loop(
                     bump_gen(&slot.gen_tx);
                     let connected_at = std::time::Instant::now();
                     // MQP-3 rev2 negotiation: `CTL HELLO` immediately, retried
-                    // until `CAPS` or the ~2 s cap. The dispatcher task that
-                    // receives `CAPS` was started by the generation bump above
-                    // and stores it on this very `ConnRev2`; the egress cache
-                    // refuses to publish a connection until then, so no UDP
-                    // frame can leave before the peer acknowledged rev2.
+                    // until `CAPS` or the ~2 s cap. On a resumed dial this now
+                    // happens while the handshake is still in flight, so the
+                    // HELLO datagram goes in 0-RTT with the auth token.
                     //
-                    // No `CAPS`/wrong wire version is fatal for this dial: the
-                    // connection is closed here and the redial loop retries.
-                    // There is deliberately no fallback to the old wire.
+                    // A missing/late `CAPS` must NEVER tear this connection
+                    // down: it is already published and carrying UDP/TCP
+                    // payloads (a CAPS is not a data-path gate — Phase 0 removed
+                    // the pre-HELLO buffer, so the server dispatches rev2 frames
+                    // as they arrive and HELLO only triggers the CAPS answer).
+                    // `handshake` returns false only for a truly unusable
+                    // connection: an explicit wrong-wire-version `CAPS` (fail
+                    // fast, upgrade both sides) or ConnectionLost/Unsupported.
+                    // Everything else keeps the live connection and retries.
                     if !rev2::handshake(&conn, &rev2).await {
                         warn!(
-                            "MQP-3 rev2 handshake failed (no CAPS/wrong wire version) on {server}; closing and redialing"
+                            "MQP-3 rev2 negotiation failed fatally (wrong wire version or \
+                             connection lost) on {server}; closing and redialing"
                         );
                         conn.close(0u32.into(), b"rev2 handshake");
                     }
@@ -332,18 +345,85 @@ pub(crate) async fn ensure_dialed_alive(conn: &quinn::Connection) -> bool {
     conn.close_reason().is_none()
 }
 
+/// Extra budget for the 0-RTT auth-token write, on top of the dial's shared
+/// deadline.
+///
+/// The early uni stream is opened while the handshake is still in flight: quinn
+/// has the stream credit from the ticket's remembered transport parameters, so
+/// `open_uni` + the <=256 B write complete without a network round trip. A
+/// connection that cannot do that immediately must not delay *publishing* (the
+/// whole point of the early dial), so the early write gets this short budget and
+/// the monitor re-sends the token on a 1-RTT stream afterwards. Nothing is lost:
+/// the server tolerates the aborted early stream (see `authenticate`).
+pub(crate) const EARLY_AUTH_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Upper bound on the monitor's 1-RTT auth re-send attempts after a 0-RTT
+/// rejection / a failed early write. Each attempt is bounded by the dial
+/// attempt budget; the server's `AUTH_TIMEOUT` (5 s) backstops a client that
+/// never gets a token through.
+const MAX_AUTH_RESEND_ATTEMPTS: u32 = 5;
+
+/// Upper bound on TCP stream-open retries across a 0-RTT rejection. Each retry
+/// needs a fresh stream; more than a handful can only mean the handshake is
+/// making no progress, in which case the 5 s open budget expires anyway.
+const MAX_0RTT_OPEN_ATTEMPTS: u32 = 8;
+
+/// Detached 0-RTT monitors that saw the peer accept the early data.
+pub(crate) static ZERO_RTT_ACCEPTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Detached 0-RTT monitors that saw the peer reject the early data.
+pub(crate) static ZERO_RTT_REJECTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Auth tokens re-sent on a 1-RTT uni stream after a rejection or a failed
+/// early write.
+pub(crate) static ZERO_RTT_TOKEN_RESENDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Re-sends that never got through inside the bounded retry loop.
+pub(crate) static ZERO_RTT_RESEND_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(accepted, rejected, token_resends, resend_failures)` — test/report accessor.
+#[cfg(test)]
+pub(crate) fn zero_rtt_counters() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        ZERO_RTT_ACCEPTED.load(Relaxed),
+        ZERO_RTT_REJECTED.load(Relaxed),
+        ZERO_RTT_TOKEN_RESENDS.load(Relaxed),
+        ZERO_RTT_RESEND_FAILURES.load(Relaxed),
+    )
+}
+
 /// Dial one connection with the slot's own transport preset.
 ///
 /// `cfg` is per-slot, not the endpoint default: the two UDP egress classes
 /// need different ACK presets on the same endpoint (the bulk class trades
 /// feedback precision for reverse-path CPU; the interactive class must keep
 /// the tuned low-latency one), which `Endpoint::connect` cannot express.
+///
+/// ## 0-RTT (user priority: maximise early data)
+///
+/// On a resumed dial (`into_0rtt()` succeeds) this returns the 0.5-RTT
+/// `Connection` **without awaiting the handshake**: the pool publishes it at
+/// once, so the dispatcher/egress can send UDP datagrams and SOCKS/forward TCP
+/// flows can open streams in the very first flight, together with the auth
+/// token (written here, before the connection is returned) and the rev2 `HELLO`
+/// the connection loop sends next. Security is deliberately waived for the
+/// token: a bearer secret in replayable early data is the price of removing the
+/// one-RTT auth handshake from the reconnect path.
+///
+/// Rejection is learned asynchronously from the `ZeroRttAccepted` future, which
+/// a detached monitor holds (see [`spawn_zero_rtt_monitor`]); the monitor
+/// re-sends the token on a fresh 1-RTT stream when the early data was discarded.
+/// Fresh (non-resumed) dials keep the old behaviour: wait for the handshake,
+/// then send the token 1-RTT.
 pub(crate) async fn dial_once(
     ep: &quinn::Endpoint,
     cfg: &quinn::ClientConfig,
     server: SocketAddr,
     name: &str,
     auth_token: &str,
+    zero_rtt: &Arc<ZeroRttState>,
 ) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
     // One deadline for the whole attempt, the auth stages included. The stages
@@ -353,38 +433,52 @@ pub(crate) async fn dial_once(
     // and widening the window in which the pool still advertises the previous,
     // dead connection. Every stage below now shares this instant.
     let deadline = t0 + DIAL_ATTEMPT_TIMEOUT;
+    // Every dial resets the slot's phase: a publication is always paired with
+    // the phase of the handshake that produced it (the connection loop publishes
+    // after this returns).
+    zero_rtt.mark_none();
     let connecting = ep.connect_with(cfg.clone(), server, name)?;
-    // 0-RTT: the token is deliberately NOT sent in early data. A bearer
-    // secret in replayable early data lets anyone who observes one handshake
-    // open new authenticated connections by replaying it inside the ticket
-    // window (rustls single-use tickets narrow the window but cannot close
-    // it: a replay that arrives first wins). Application flows still benefit
-    // from resumption (one handshake instead of a full one); only the token
-    // waits for the 1-RTT keys, which are never replayable. This costs the
-    // resumed handshake one RTT before the server admits flows, in exchange
-    // for the token never appearing in replayable bytes.
-    //
-    // 0.11 API: `into_0rtt()` yields `(Connection, ZeroRttAccepted)`; the
-    // future resolves when the handshake completes with true = early data
-    // kept, false = rejected OR the connection died first. The timeout plus
-    // the `ensure_dialed_alive` gate below keep a dead dial from ever being
-    // published (0.11's `Connecting` resolves `Ok` even for dead dials).
+    // 0.11 API: `into_0rtt()` yields `(Connection, ZeroRttAccepted)`; the future
+    // resolves when the handshake completes with true = early data kept,
+    // false = rejected OR the connection died first. `Ok` means the local
+    // endpoint has the ticket's remembered 0-RTT keys and transport parameters,
+    // so early streams/datagrams can be queued immediately.
     let conn = match connecting.into_0rtt() {
         Ok((conn, accepted_fut)) => {
+            // The token goes out NOW, on a 0-RTT uni stream opened while the
+            // handshake is in flight. No later stage re-sends it synchronously:
+            // the monitor below is the 1-RTT fallback.
+            zero_rtt.mark_pending();
             let token = auth_token.to_owned();
-            let accepted = match tokio::time::timeout_at(deadline, accepted_fut).await {
-                Ok(a) => a,
-                Err(_) => anyhow::bail!("0-RTT offered but the handshake did not complete"),
+            let early_ok = if token.is_empty() {
+                true
+            } else {
+                match send_early_auth(&conn, &token, deadline).await {
+                    Ok(()) => {
+                        tracing::debug!("0-RTT auth token written in the first flight");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "0-RTT auth token write failed ({e:#}); the monitor will re-send 1-RTT"
+                        );
+                        false
+                    }
+                }
             };
-            tracing::debug!("QUIC resumption: 0-RTT accepted={accepted}");
+            zero_rtt.set_token_early(early_ok && !token.is_empty());
+            spawn_zero_rtt_monitor(
+                conn.clone(),
+                accepted_fut,
+                zero_rtt.clone(),
+                token,
+                early_ok,
+            );
+            // Cheap liveness only: never wait for the handshake here. Yielding
+            // once lets the driver deliver a terminal event so a dead dial is
+            // not published; the monitor owns everything handshake-related.
             if !ensure_dialed_alive(&conn).await {
-                anyhow::bail!("connection lost during handshake");
-            }
-            // 1-RTT only: the established connection's keys are fresh per
-            // handshake, so a captured token can never be replayed into a new
-            // connection the way captured early data could.
-            if !token.is_empty() {
-                send_auth(&conn, &token, deadline).await?;
+                anyhow::bail!("connection lost before it could be published");
             }
             conn
         }
@@ -409,12 +503,181 @@ pub(crate) async fn dial_once(
     Ok(conn)
 }
 
-/// Open a uni stream and write the auth token into it (1-RTT only).
+/// Write the auth token on a 0-RTT uni stream, before the handshake completes.
 ///
-/// Rejection is learned via the `ZeroRttAccepted` future, not from this handle.
-/// `deadline` is the dial attempt's shared deadline: both stages time out
-/// against it, so auth can never extend an attempt beyond
-/// [`DIAL_ATTEMPT_TIMEOUT`].
+/// Tighter than the dial deadline on purpose: [`EARLY_AUTH_TIMEOUT`] bounds the
+/// open+write so a connection whose remembered stream credit is missing cannot
+/// delay the publish; the monitor re-sends 1-RTT in that case.
+async fn send_early_auth(
+    conn: &quinn::Connection,
+    token: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let early_deadline = deadline.min(tokio::time::Instant::now() + EARLY_AUTH_TIMEOUT);
+    send_auth_stream(conn, token, early_deadline)
+        .await
+        .map(|_| ())
+}
+
+/// Detached `ZeroRttAccepted` monitor for one resumed dial.
+///
+/// Exactly one of these exists per 0-RTT dial (the future can be polled by
+/// nobody else). It publishes the handshake outcome into the slot's
+/// [`ZeroRttState`] — the TCP open path reads it to retry a discarded 0-RTT
+/// stream — and re-sends the auth token on a fresh 1-RTT uni stream whenever the
+/// early token cannot be trusted to have arrived:
+///
+/// - **0-RTT rejected** (`false`): every early stream/datagram was discarded,
+///   so the token must be re-sent (the server's `authenticate` loop is waiting
+///   for it);
+/// - **accepted but the early write failed** structurally: same re-send;
+/// - **accepted and the early write succeeded**: nothing to do.
+///
+/// `accepted_fut` resolving means the handshake (or the connection) is done, so
+/// every stream opened here is a 1-RTT stream with full protection.
+fn spawn_zero_rtt_monitor(
+    conn: quinn::Connection,
+    accepted_fut: quinn::ZeroRttAccepted,
+    zero_rtt: Arc<ZeroRttState>,
+    token: String,
+    early_ok: bool,
+) {
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let accepted = accepted_fut.await;
+        zero_rtt.mark_settled(accepted);
+        if accepted {
+            ZERO_RTT_ACCEPTED.fetch_add(1, Relaxed);
+            tracing::debug!("QUIC resumption: 0-RTT accepted");
+            if early_ok {
+                return;
+            }
+            tracing::debug!("0-RTT accepted without the early token; re-sending 1-RTT");
+        } else {
+            ZERO_RTT_REJECTED.fetch_add(1, Relaxed);
+            tracing::debug!("QUIC resumption: 0-RTT rejected; re-sending the auth token 1-RTT");
+        }
+        if token.is_empty() {
+            return;
+        }
+        // Bounded replay of the auth stage against a fresh deadline: the dial's
+        // own deadline may have expired while the handshake was in flight.
+        let deadline = tokio::time::Instant::now() + DIAL_ATTEMPT_TIMEOUT;
+        let mut backoff = Duration::from_millis(10);
+        for attempt in 0..MAX_AUTH_RESEND_ATTEMPTS {
+            match send_auth_stream(&conn, &token, deadline).await {
+                Ok(_) => {
+                    ZERO_RTT_TOKEN_RESENDS.fetch_add(1, Relaxed);
+                    tracing::debug!("auth token re-sent on a 1-RTT uni stream (attempt {attempt})");
+                    return;
+                }
+                Err(e) => {
+                    if conn.close_reason().is_some() {
+                        tracing::debug!("cannot re-send auth token: connection closed ({e:#})");
+                        break;
+                    }
+                    tracing::debug!("auth token re-send failed ({e:#}); retrying in {backoff:?}");
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(backoff.min(deadline - now)).await;
+            backoff = (backoff * 2).min(Duration::from_millis(250));
+        }
+        ZERO_RTT_RESEND_FAILURES.fetch_add(1, Relaxed);
+        tracing::debug!("auth token could not be re-sent within {DIAL_ATTEMPT_TIMEOUT:?}");
+    });
+}
+
+/// Open a bidi stream and write `hdr` on it, retrying across a 0-RTT rejection.
+///
+/// This is the SOCKS `CONNECT` / TCP-forward open sequence, which now runs on a
+/// possibly still-handshaking connection: `open_bi()` there returns a stream
+/// whose `RecvStream::is_0rtt()` is `true`, and its bytes ride the first flight.
+/// If the peer discards the early data, quinn reports `ZeroRttRejected` on the
+/// next write (or the write was buffered and silently discarded), so:
+///
+/// - a `ZeroRttRejected` write error waits for the handshake phase to settle
+///   ([`ZeroRttState::wait_settled`]) and retries open+header on a stream that
+///   is now guaranteed 1-RTT;
+/// - a write quinn accepted on a 0-RTT stream is retried when the monitor has
+///   already recorded a rejection (`is_0rtt()` + `is_rejected()`), since those
+///   bytes could only have been in discarded early data.
+///
+/// Nothing is consumed from the application's TCP socket before this returns
+/// `Ok`, so no application bytes are lost by a retry. The residual window — the
+/// peer rejects the early data *after* this returned an accepted 0-RTT header —
+/// surfaces as a `ZeroRttRejected` error on the pump's first write, i.e. the
+/// flow fails closed instead of silently truncating (the same fail-closed
+/// posture the rest of the stream path has).
+pub(crate) async fn open_bi_and_write_header(
+    conn: &quinn::Connection,
+    zero_rtt: &ZeroRttState,
+    hdr: &[u8],
+    prio: i32,
+    budget: Duration,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let (mut send, mut recv) = match tokio::time::timeout_at(deadline, conn.open_bi()).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(e).context("quic stream open failed"),
+            Err(_) => anyhow::bail!("quic stream open timed out"),
+        };
+        // Definite answer from quinn: a 0-RTT stream can be discarded, a 1-RTT
+        // one cannot. (The stream handed out here is the only place the client
+        // can observe which window the open landed in.)
+        let early = recv.is_0rtt();
+        let _ = send.set_priority(prio);
+        match tokio::time::timeout_at(deadline, send.write_all(hdr)).await {
+            Ok(Ok(())) => {
+                if early && zero_rtt.is_rejected() {
+                    // The monitor recorded the rejection while this write was in
+                    // flight: the header is in discarded early data, so re-open
+                    // on a 1-RTT stream.
+                    send.reset(0u32.into()).ok();
+                    recv.stop(0u32.into()).ok();
+                    if attempt >= MAX_0RTT_OPEN_ATTEMPTS {
+                        anyhow::bail!("0-RTT rejected; stream open retries exhausted");
+                    }
+                    zero_rtt.wait_settled(deadline).await;
+                    continue;
+                }
+                return Ok((send, recv));
+            }
+            Ok(Err(e)) => {
+                send.reset(0u32.into()).ok();
+                recv.stop(0u32.into()).ok();
+                if !matches!(e, quinn::WriteError::ZeroRttRejected) {
+                    return Err(e).context("quic stream header write failed");
+                }
+                // Early data was discarded: the handshake has completed by the
+                // time quinn reports this, so wait only for the monitor to
+                // publish the phase and retry the open on a 1-RTT stream.
+                if attempt >= MAX_0RTT_OPEN_ATTEMPTS {
+                    anyhow::bail!("0-RTT rejected; stream open retries exhausted");
+                }
+                zero_rtt.wait_settled(deadline).await;
+            }
+            Err(_) => {
+                send.reset(0u32.into()).ok();
+                recv.stop(0u32.into()).ok();
+                anyhow::bail!("quic stream header write timed out");
+            }
+        }
+    }
+}
+
+/// Open a uni stream and write the auth token into it.
+///
+/// Used twice: for the 0-RTT early token (called from `dial_once` before the
+/// handshake completes) and for the monitor's 1-RTT re-send after a rejection.
+/// `deadline` bounds both stages, so auth can never extend a dial attempt beyond
+/// [`DIAL_ATTEMPT_TIMEOUT`] unless the caller passes a later one.
 pub(crate) async fn send_auth_stream(
     conn: &quinn::Connection,
     token: &str,
@@ -423,14 +686,14 @@ pub(crate) async fn send_auth_stream(
     let mut uni = tokio::time::timeout_at(deadline, conn.open_uni())
         .await
         .context("auth stream open timed out")??;
-    // Bounded by the same attempt deadline: without one a stalled connection
-    // parks the dial attempt here until the QUIC idle timeout. On timeout the
-    // error propagates out of `dial_once`, so the attempt fails and nothing is
-    // published. The token is ≤ 256 B (one small write); `finish()` stays
-    // best-effort. A failed write must `reset` instead of merely dropping
-    // `uni`: dropping sends a graceful FIN bearing whatever prefix of the
-    // token got out, which the server reads as a credential mismatch, while
-    // `reset` aborts the stream so no partial token is ever framed as final.
+    // Bounded by the caller's deadline: without one a stalled connection parks
+    // the caller until the QUIC idle timeout. The token is <= 256 B (one small
+    // write); `finish()` stays best-effort. A failed write must `reset` instead
+    // of merely dropping `uni`: dropping sends a graceful FIN bearing whatever
+    // prefix of the token got out, which the server reads as a credential
+    // mismatch, while `reset` aborts the stream so no partial token is ever
+    // framed as final (the server's authenticate loop tolerates the reset and
+    // keeps waiting for the complete token, e.g. the 1-RTT re-send).
     match tokio::time::timeout_at(deadline, uni.write_all(token.as_bytes())).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {

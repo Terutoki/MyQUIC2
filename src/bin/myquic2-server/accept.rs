@@ -1,11 +1,14 @@
 //! Admission limits: connection/dial/stream caps and the per-connection handler.
 use super::*;
 use futures_util::future::FutureExt as _;
-use myquic2::mqp::r2::{self, Caps, Ctl, R2Kind};
+use myquic2::mqp::ctl_stream::{self, CtlRate, CtlReceiver, CtlSender, StreamClass};
+use myquic2::mqp::r2::{self, Caps, Ctl};
 use myquic2::mqp::r2_flow::{
     CtlState, FlowBinding, FlowIds, FlowRegistry, FlowState, R2_MAX_RESOLVED_ADDRS, RegistryError,
     SessionFlows,
 };
+use myquic2::mqp::r3::CtlMessage;
+use myquic2::mqp::wire::{self, FrameKind, Wire};
 use myquic2::udp::{R2Reassembler, R2Stager};
 
 /// Hard process-wide bounds: new QUIC connections are refused past this count
@@ -845,14 +848,12 @@ pub(crate) fn r2_caps_due(last_ms: u64, now_ms: u64) -> bool {
 /// 1 s check, and the 60 s report's accuracy is unaffected. The rest are read
 /// directly by tests, so those stay one shared RMW per frame (a per-frame cost
 /// next to a QUIC DATAGRAM send reads as noise).
+///
+/// [`snapshot`] is what the 60 s reporter reads (W9); it flushes the caller
+/// thread's batched cells first, exactly like `udp_stats::snapshot`.
 pub(crate) mod r2_stats {
-    use crate::coarse_millis;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Rev2 data/control frames accepted into the pre-HELLO buffer.
-    pub(crate) static PRE_HELLO_BUFFERED: AtomicU64 = AtomicU64::new(0);
-    /// Pre-HELLO frames dropped because the bounded buffer was full.
-    pub(crate) static PRE_HELLO_DROPPED: AtomicU64 = AtomicU64::new(0);
     /// `DATA OPEN` bindings installed (accepted + `FLOW_ACK`).
     pub(crate) static OPENS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static ACKS: AtomicU64 = AtomicU64::new(0);
@@ -867,6 +868,13 @@ pub(crate) mod r2_stats {
     /// Reassembled rev2 payloads routed to a target.
     pub(crate) static FRAG_COMPLETE: AtomicU64 = AtomicU64::new(0);
     pub(crate) static CAPS_SENT: AtomicU64 = AtomicU64::new(0);
+    /// Valid `CTL HELLO` frames for this wire version (the `CAPS` trigger).
+    ///
+    /// `HELLO` is no longer a gate in front of the data plane — frames are
+    /// dispatched as they arrive — so this count is pure observability: it says
+    /// whether the client's handshake announcement arrived, independent of the
+    /// data it may or may not have preceded.
+    pub(crate) static HELLOS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static BAD_HELLO: AtomicU64 = AtomicU64::new(0);
     pub(crate) static SESS_CLOSES: AtomicU64 = AtomicU64::new(0);
     pub(crate) static FLOW_CLOSES: AtomicU64 = AtomicU64::new(0);
@@ -892,12 +900,259 @@ pub(crate) mod r2_stats {
     /// pending-open cap was reached. Duplicates are expected under
     /// retransmission; the counter makes a name-resolution stall visible.
     pub(crate) static DNS_OPEN_DROPS: AtomicU64 = AtomicU64::new(0);
+    /// Domain `DATA OPEN`s served by the **synchronous warm-cache fast path**
+    /// (W5): the name was answered by this thread's DNS memo / the session's
+    /// destination memo, so the payload was forwarded, the binding installed
+    /// and `FLOW_ACK` sent inline in the datagram loop — no spawned lookup.
+    pub(crate) static DNS_SYNC_OPENS: AtomicU64 = AtomicU64::new(0);
+    /// A domain `DATA OPEN` whose lookup failed or timed out (including the
+    /// negative-cache verdict). The triggering payload has **no address to be
+    /// sent to**: it is inherently undeliverable and is dropped (UDP
+    /// semantics), never re-routed, and never retried (a failed
+    /// `resolve_all_cached` is negatively cached host-wide for 10 s before it
+    /// returns, so an in-budget retry can only re-read that verdict).
+    /// Split from [`DNS_OPEN_POLICY_DROP`]/[`DNS_OPEN_SESS_REFUSED`] so the
+    /// loss class is observable rather than folded into one `REFUSED` count.
+    pub(crate) static DNS_OPEN_DNS_FAIL: AtomicU64 = AtomicU64::new(0);
+    /// A domain `DATA OPEN` whose every resolved record the SSRF policy
+    /// rejected (or whose install found a conflicting `(session, target)`).
+    /// The payload is undeliverable **by policy**; the delivery path stays
+    /// fail-closed rather than re-routing around it.
+    pub(crate) static DNS_OPEN_POLICY_DROP: AtomicU64 = AtomicU64::new(0);
+    /// A domain `DATA OPEN` that resolved to a usable address but could not get
+    /// a session to carry it (fair share, global pool, no DATAGRAM support, or a
+    /// `SESS_CLOSE` cancelling the creation). The destination is valid but there
+    /// is no live per-association delivery path, and the payload is dropped:
+    /// inventing a different session path would violate the association's
+    /// socket/reader ownership and SSRF authorization.
+    pub(crate) static DNS_OPEN_SESS_REFUSED: AtomicU64 = AtomicU64::new(0);
     /// Staged small replies dropped because the connection stager was full
     /// (bounded queue) or could not be re-queued after a drain.
     pub(crate) static STAGE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
     /// Server-owned flows created for full-cone / unsolicited downlink sources
     /// (`DATA OPEN|SRC` with an id from the server's half).
     pub(crate) static FULL_CONE_FLOWS: AtomicU64 = AtomicU64::new(0);
+
+    // ---- rev3 reliable control stream (`mqp::ctl_stream`) ----
+
+    /// rev3 control streams accepted on this endpoint.
+    pub(crate) static CTL_STREAMS: AtomicU64 = AtomicU64::new(0);
+    /// rev3 streams refused because they were the *second* marker stream
+    /// (exactly one control stream per connection).
+    pub(crate) static CTL_STREAM_SECOND: AtomicU64 = AtomicU64::new(0);
+    /// rev3 streams reset because their first byte was neither the control
+    /// marker nor an MQP address type.
+    pub(crate) static CTL_STREAM_BAD_FIRST: AtomicU64 = AtomicU64::new(0);
+    /// rev3 control messages accepted from the peer (inside the rate budget).
+    pub(crate) static CTL_MSGS_RECV: AtomicU64 = AtomicU64::new(0);
+    /// rev3 control messages dropped: over the receiver rate budget, or queued
+    /// for a server→client send that has no live control stream / full queue.
+    pub(crate) static CTL_MSGS_DROPPED: AtomicU64 = AtomicU64::new(0);
+    /// rev3 control-stream read/write errors (the stream is torn down; the
+    /// datagram plane keeps running on its own loss-recovery).
+    pub(crate) static CTL_STREAM_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// Server→client `NEED_CONTEXT` frames queued because a compressed frame
+    /// named an unknown id on a rev3 connection (the no-ACK repair path).
+    pub(crate) static NEED_CONTEXT_SENT: AtomicU64 = AtomicU64::new(0);
+    /// Client→server `NEED_CONTEXT` frames accepted (downlink context re-arm).
+    pub(crate) static NEED_CONTEXT_RECV: AtomicU64 = AtomicU64::new(0);
+    /// NEED_CONTEXT repairs dropped: unknown/unrepresentable flow id, or the
+    /// repair rate budget/queue refused them. No state is ever allocated for a
+    /// repair hint.
+    pub(crate) static NEED_CONTEXT_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// Snapshot of every rev2 counter, for the 60 s report (W9) and tests.
+    ///
+    /// Field order follows the report line; `since`/`is_idle` mirror
+    /// `udp_stats::UdpSnapshot` so the reporter can print deltas and stay quiet
+    /// when nothing moved.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Snapshot {
+        pub(crate) opens: u64,
+        pub(crate) acks: u64,
+        pub(crate) rejects: u64,
+        pub(crate) inline: u64,
+        pub(crate) train_items: u64,
+        pub(crate) steady_sent: u64,
+        pub(crate) open_src_sent: u64,
+        pub(crate) flow_acks_recv: u64,
+        pub(crate) unknown_id: u64,
+        pub(crate) dns_sync_opens: u64,
+        pub(crate) dns_open_dns_fail: u64,
+        pub(crate) dns_open_policy_drop: u64,
+        pub(crate) dns_open_sess_refused: u64,
+        pub(crate) dns_open_drops: u64,
+        pub(crate) ctl_hellos: u64,
+        pub(crate) ctl_caps_sent: u64,
+        pub(crate) ctl_bad_hello: u64,
+        pub(crate) sess_closes: u64,
+        pub(crate) flow_closes: u64,
+        pub(crate) stale_closes: u64,
+        pub(crate) frag_refused: u64,
+        pub(crate) frag_frames: u64,
+        pub(crate) frag_complete: u64,
+        pub(crate) stage_full_drops: u64,
+        pub(crate) session_end_bindings: u64,
+        pub(crate) full_cone_flows: u64,
+        pub(crate) ctl_streams: u64,
+        pub(crate) ctl_stream_second: u64,
+        pub(crate) ctl_stream_bad_first: u64,
+        pub(crate) ctl_msgs_recv: u64,
+        pub(crate) ctl_msgs_dropped: u64,
+        pub(crate) ctl_stream_errors: u64,
+        pub(crate) need_context_sent: u64,
+        pub(crate) need_context_recv: u64,
+        pub(crate) need_context_dropped: u64,
+    }
+
+    impl Snapshot {
+        /// Counters accumulated since `prev`.
+        #[must_use]
+        pub(crate) fn since(&self, prev: &Self) -> Self {
+            fn d(now: u64, prev: u64) -> u64 {
+                now.saturating_sub(prev)
+            }
+            Self {
+                opens: d(self.opens, prev.opens),
+                acks: d(self.acks, prev.acks),
+                rejects: d(self.rejects, prev.rejects),
+                inline: d(self.inline, prev.inline),
+                train_items: d(self.train_items, prev.train_items),
+                steady_sent: d(self.steady_sent, prev.steady_sent),
+                open_src_sent: d(self.open_src_sent, prev.open_src_sent),
+                flow_acks_recv: d(self.flow_acks_recv, prev.flow_acks_recv),
+                unknown_id: d(self.unknown_id, prev.unknown_id),
+                dns_sync_opens: d(self.dns_sync_opens, prev.dns_sync_opens),
+                dns_open_dns_fail: d(self.dns_open_dns_fail, prev.dns_open_dns_fail),
+                dns_open_policy_drop: d(self.dns_open_policy_drop, prev.dns_open_policy_drop),
+                dns_open_sess_refused: d(self.dns_open_sess_refused, prev.dns_open_sess_refused),
+                dns_open_drops: d(self.dns_open_drops, prev.dns_open_drops),
+                ctl_hellos: d(self.ctl_hellos, prev.ctl_hellos),
+                ctl_caps_sent: d(self.ctl_caps_sent, prev.ctl_caps_sent),
+                ctl_bad_hello: d(self.ctl_bad_hello, prev.ctl_bad_hello),
+                sess_closes: d(self.sess_closes, prev.sess_closes),
+                flow_closes: d(self.flow_closes, prev.flow_closes),
+                stale_closes: d(self.stale_closes, prev.stale_closes),
+                frag_refused: d(self.frag_refused, prev.frag_refused),
+                frag_frames: d(self.frag_frames, prev.frag_frames),
+                frag_complete: d(self.frag_complete, prev.frag_complete),
+                stage_full_drops: d(self.stage_full_drops, prev.stage_full_drops),
+                session_end_bindings: d(self.session_end_bindings, prev.session_end_bindings),
+                full_cone_flows: d(self.full_cone_flows, prev.full_cone_flows),
+                ctl_streams: d(self.ctl_streams, prev.ctl_streams),
+                ctl_stream_second: d(self.ctl_stream_second, prev.ctl_stream_second),
+                ctl_stream_bad_first: d(self.ctl_stream_bad_first, prev.ctl_stream_bad_first),
+                ctl_msgs_recv: d(self.ctl_msgs_recv, prev.ctl_msgs_recv),
+                ctl_msgs_dropped: d(self.ctl_msgs_dropped, prev.ctl_msgs_dropped),
+                ctl_stream_errors: d(self.ctl_stream_errors, prev.ctl_stream_errors),
+                need_context_sent: d(self.need_context_sent, prev.need_context_sent),
+                need_context_recv: d(self.need_context_recv, prev.need_context_recv),
+                need_context_dropped: d(self.need_context_dropped, prev.need_context_dropped),
+            }
+        }
+
+        /// Nothing happened in this interval; the reporter stays quiet.
+        #[must_use]
+        pub(crate) fn is_idle(&self) -> bool {
+            *self == Self::default()
+        }
+    }
+
+    impl std::fmt::Display for Snapshot {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "opens={} acks={} rejects={} inline={} train_items={} steady_sent={} \
+                 open_src_sent={} flow_acks={} unknown_id={}; \
+                 dns: sync_open={} dns_fail={} policy_drop={} sess_refused={} open_drops={}; \
+                 ctl: hellos={} caps={} bad_hello={} sess_close={} flow_close={} stale_close={}; \
+                 frag: refused={} accepted={} complete={}; \
+                 stage_full={} session_end={} full_cone={}; \
+                 ctl-stream: streams={} second={} bad_first={} msgs={} dropped={} errors={} need_ctx(sent/recv/dropped)={}/{}/{}",
+                self.opens,
+                self.acks,
+                self.rejects,
+                self.inline,
+                self.train_items,
+                self.steady_sent,
+                self.open_src_sent,
+                self.flow_acks_recv,
+                self.unknown_id,
+                self.dns_sync_opens,
+                self.dns_open_dns_fail,
+                self.dns_open_policy_drop,
+                self.dns_open_sess_refused,
+                self.dns_open_drops,
+                self.ctl_hellos,
+                self.ctl_caps_sent,
+                self.ctl_bad_hello,
+                self.sess_closes,
+                self.flow_closes,
+                self.stale_closes,
+                self.frag_refused,
+                self.frag_frames,
+                self.frag_complete,
+                self.stage_full_drops,
+                self.session_end_bindings,
+                self.full_cone_flows,
+                self.ctl_streams,
+                self.ctl_stream_second,
+                self.ctl_stream_bad_first,
+                self.ctl_msgs_recv,
+                self.ctl_msgs_dropped,
+                self.ctl_stream_errors,
+                self.need_context_sent,
+                self.need_context_recv,
+                self.need_context_dropped,
+            )
+        }
+    }
+
+    /// Totals since process start, after flushing this thread's batched cells.
+    ///
+    /// The bounded-visibility model is `udp_stats::snapshot`'s: a count pending
+    /// on another worker becomes visible at that worker's next flush (256
+    /// records or 1 s), which is far inside the reporter's 60 s cadence.
+    pub(crate) fn snapshot() -> Snapshot {
+        flush_thread();
+        Snapshot {
+            opens: OPENS.load(Ordering::Relaxed),
+            acks: ACKS.load(Ordering::Relaxed),
+            rejects: REJECTS.load(Ordering::Relaxed),
+            inline: INLINE.load(Ordering::Relaxed),
+            train_items: TRAIN_ITEMS.load(Ordering::Relaxed),
+            steady_sent: STEADY_SENT.load(Ordering::Relaxed),
+            open_src_sent: OPEN_SRC_SENT.load(Ordering::Relaxed),
+            flow_acks_recv: FLOW_ACKS_RECV.load(Ordering::Relaxed),
+            unknown_id: UNKNOWN_ID.load(Ordering::Relaxed),
+            dns_sync_opens: DNS_SYNC_OPENS.load(Ordering::Relaxed),
+            dns_open_dns_fail: DNS_OPEN_DNS_FAIL.load(Ordering::Relaxed),
+            dns_open_policy_drop: DNS_OPEN_POLICY_DROP.load(Ordering::Relaxed),
+            dns_open_sess_refused: DNS_OPEN_SESS_REFUSED.load(Ordering::Relaxed),
+            dns_open_drops: DNS_OPEN_DROPS.load(Ordering::Relaxed),
+            ctl_hellos: HELLOS.load(Ordering::Relaxed),
+            ctl_caps_sent: CAPS_SENT.load(Ordering::Relaxed),
+            ctl_bad_hello: BAD_HELLO.load(Ordering::Relaxed),
+            sess_closes: SESS_CLOSES.load(Ordering::Relaxed),
+            flow_closes: FLOW_CLOSES.load(Ordering::Relaxed),
+            stale_closes: STALE_CLOSES.load(Ordering::Relaxed),
+            frag_refused: FRAGS.load(Ordering::Relaxed),
+            frag_frames: FRAG_FRAMES.load(Ordering::Relaxed),
+            frag_complete: FRAG_COMPLETE.load(Ordering::Relaxed),
+            stage_full_drops: STAGE_FULL_DROPS.load(Ordering::Relaxed),
+            session_end_bindings: SESSION_END_BINDINGS.load(Ordering::Relaxed),
+            full_cone_flows: FULL_CONE_FLOWS.load(Ordering::Relaxed),
+            ctl_streams: CTL_STREAMS.load(Ordering::Relaxed),
+            ctl_stream_second: CTL_STREAM_SECOND.load(Ordering::Relaxed),
+            ctl_stream_bad_first: CTL_STREAM_BAD_FIRST.load(Ordering::Relaxed),
+            ctl_msgs_recv: CTL_MSGS_RECV.load(Ordering::Relaxed),
+            ctl_msgs_dropped: CTL_MSGS_DROPPED.load(Ordering::Relaxed),
+            ctl_stream_errors: CTL_STREAM_ERRORS.load(Ordering::Relaxed),
+            need_context_sent: NEED_CONTEXT_SENT.load(Ordering::Relaxed),
+            need_context_recv: NEED_CONTEXT_RECV.load(Ordering::Relaxed),
+            need_context_dropped: NEED_CONTEXT_DROPPED.load(Ordering::Relaxed),
+        }
+    }
 
     #[inline]
     pub(crate) fn bump(counter: &AtomicU64) {
@@ -921,9 +1176,15 @@ pub(crate) mod r2_stats {
     /// this sits on the reply path and only whole seconds are at stake.
     const FLUSH_PER_FRAME_MS: u64 = 1_000;
 
-    /// Flush this thread's pending batched reply-frame counts into the shared
-    /// statics.
+    /// Flush this thread's pending batched counts into the shared statics.
     fn flush_locals() {
+        L_TRAIN_ITEMS.with(|c| {
+            let v = c.get();
+            if v != 0 {
+                TRAIN_ITEMS.fetch_add(v, Ordering::Relaxed);
+                c.set(0);
+            }
+        });
         L_STEADY_SENT.with(|c| {
             let v = c.get();
             if v != 0 {
@@ -942,10 +1203,16 @@ pub(crate) mod r2_stats {
 
     /// Batched `+= 1` for a per-thread reply-frame counter: count flush at
     /// [`FLUSH_PER_FRAME`], time flush at [`FLUSH_PER_FRAME_MS`].
+    ///
+    /// `now_ms` is the **frame's** coarse clock sample, passed by the reply
+    /// handler that already took one for its own interval gates. Reading the
+    /// clock here instead would be a second `coarse_millis()` per downlink
+    /// reply frame (W8b: one clock sample per frame).
     #[inline]
     fn bump_reply(
         local: &'static std::thread::LocalKey<std::cell::Cell<u64>>,
         global: &'static AtomicU64,
+        now_ms: u64,
     ) {
         local.with(|c| {
             let v = c.get().wrapping_add(1);
@@ -956,10 +1223,9 @@ pub(crate) mod r2_stats {
             }
         });
         let due = L_REPLY_LAST_FLUSH_MS.with(|c| {
-            let now = coarse_millis();
             let last = c.get();
-            if now.saturating_sub(last) >= FLUSH_PER_FRAME_MS {
-                c.set(now);
+            if now_ms.saturating_sub(last) >= FLUSH_PER_FRAME_MS {
+                c.set(now_ms);
                 true
             } else {
                 false
@@ -971,24 +1237,25 @@ pub(crate) mod r2_stats {
     }
 
     /// One downlink steady frame (or same-flow TRAIN) handed to quinn.
+    /// `now_ms` is the reply handler's per-frame coarse clock sample.
     #[inline]
-    pub(crate) fn bump_steady_sent() {
-        bump_reply(&L_STEADY_SENT, &STEADY_SENT);
+    pub(crate) fn bump_steady_sent(now_ms: u64) {
+        bump_reply(&L_STEADY_SENT, &STEADY_SENT, now_ms);
     }
 
     /// One downlink `OPEN|SRC` binding frame handed to quinn.
+    /// `now_ms` is the reply handler's per-frame coarse clock sample.
     #[inline]
-    pub(crate) fn bump_open_src_sent() {
-        bump_reply(&L_OPEN_SRC_SENT, &OPEN_SRC_SENT);
+    pub(crate) fn bump_open_src_sent(now_ms: u64) {
+        bump_reply(&L_OPEN_SRC_SENT, &OPEN_SRC_SENT, now_ms);
     }
 
-    /// Flush this thread's pending reply-frame counts into the shared statics.
+    /// Flush this thread's pending batched counts into the shared statics.
     ///
-    /// The batched counters are documented with the same bounded-visibility
-    /// model as `udp_stats`: a reporter or a test that reads them on the
-    /// counting thread calls this first to see its own records exactly. (A
-    /// pending count on another thread becomes visible at its next flush
-    /// threshold.)
+    /// [`snapshot`] calls this before loading the shared counters, and the unit
+    /// tests call it directly so a count made on the reading thread is visible
+    /// exactly (the same rule `udp_stats::snapshot` documents). A pending count
+    /// on another thread becomes visible at that thread's next flush threshold.
     pub(crate) fn flush_thread() {
         flush_locals();
     }
@@ -997,9 +1264,9 @@ pub(crate) mod r2_stats {
     ///
     /// Per item (not per frame): up to 64 per datagram, making this the one
     /// r2_stats line that sits on the packet path. Batched like
-    /// `udp_stats::payload` with a 256-cell flush; `TRAIN_ITEMS` has no
-    /// cross-thread reader (the 60 s report reads only the frames-sent family),
-    /// so the bounded visibility is invisible in practice.
+    /// `udp_stats::payload` with a 256-cell flush; the 60 s report reads it
+    /// (`snapshot`/`flush_locals` publish a pending cell), so the same
+    /// bounded-visibility model as the reply-frame counters applies.
     #[inline]
     pub(crate) fn bump_train_item() {
         L_TRAIN_ITEMS.with(|c| {
@@ -1023,10 +1290,32 @@ pub(crate) mod r2_stats {
 ///   resolves through;
 /// - [`FlowIds`] is the server owner's monotonic allocator (Phase 1b
 ///   server-initiated/full-cone flows; Phase 1a never allocates from it);
-/// - [`CtlState`] carries the `HELLO`/`CAPS` version gate: rev2 data frames
-///   that beat the HELLO are buffered (bounded) and flushed once a valid HELLO
-///   for this wire version opens the gate; overflow is counted and dropped.
+/// - [`CtlState`] carries the `CAPS` reply throttle and the `CTL` rate budget.
+///
+/// There is deliberately **no HELLO gate** here: rev2 frames are
+/// self-identifying by first byte, so the ingress dispatcher routes them the
+/// moment they arrive. `CTL HELLO` remains only the trigger that makes the
+/// server answer with `CTL CAPS` (and bump the hello/caps counters) — a lost
+/// HELLO can therefore no longer stall or drop data.
+///
+/// # Wire revisions
+///
+/// The same state model serves both wire revisions; [`Self::new`] is the
+/// shipped rev2 default and [`Self::new_with_wire`] selects the connection's
+/// revision (chosen from config + ALPN by the caller). rev3 differences are
+/// confined to the control plane and the no-ACK context policy:
+/// - no `CTL` DATAGRAMs and no `FLOW_ACK` (install is idempotent; bounded
+///   context redundancy K=2 replaces the ACK);
+/// - server→client `FLOW_REJECT`/`SESS_CLOSE`/`NEED_CONTEXT` are queued on the
+///   one reliable client-opened control stream ([`Self::queue_ctl`]);
+/// - an unknown compressed id is repaired with `NEED_CONTEXT` instead of only
+///   being counted ([`Self::send_need_context`]);
+/// - inbound `ASSOC_CLOSE`/`FLOW_CLOSE`/`NEED_CONTEXT` messages arrive on that
+///   stream (see `handle_control_message`).
 pub(crate) struct R2ConnState {
+    /// Wire revision of this connection. Rev2 is the default and keeps the
+    /// shipped byte-for-byte behaviour.
+    wire: Wire,
     pub(crate) registry: Arc<FlowRegistry>,
     /// Server-owned id allocator. Reserved for Phase 1b (server-initiated and
     /// full-cone downlink flows); keeping it on the connection state means that
@@ -1044,13 +1333,6 @@ pub(crate) struct R2ConnState {
     pub(crate) stage: Arc<parking_lot::Mutex<R2Stager>>,
     /// Last `CAPS` reply stamp (`coarse_millis` epoch; `0` = never).
     last_caps_ms: std::sync::atomic::AtomicU64,
-    /// Rev2 frames that arrived before a valid `HELLO` (data **and** control,
-    /// e.g. `SESS_CLOSE`). The client may send its first UDP payload
-    /// optimistically (no `CAPS` wait), so the server buffers those frames
-    /// until the version gate opens, then dispatches them in arrival order.
-    /// Bounded to keep a connection flood from pinning memory; overflow is
-    /// counted and dropped.
-    pre_hello: parking_lot::Mutex<(Vec<Bytes>, usize)>,
     /// Domain `DATA OPEN`s whose DNS lookup / first send is running on a
     /// spawned task, keyed by `(session, wire_id)`. Repeated OPENs for the same
     /// id are coalesced onto the in-flight lookup instead of spawning a second
@@ -1095,13 +1377,43 @@ pub(crate) struct R2ConnState {
     /// grow the map past the 1024 concurrent lookups the process admits.
     dns_waiters:
         parking_lot::Mutex<std::collections::HashMap<u32, Vec<Arc<std::sync::atomic::AtomicBool>>>>,
+    /// rev3 only: outbound queue into the connection's control-stream writer
+    /// task. `None` until the client's control stream is accepted (and after it
+    /// dies). Bounded: a peer that never opens the stream or stops reading must
+    /// not make the server buffer control messages without limit, so a full or
+    /// absent queue is a counted drop, never a datagram fallback (rev3 has no
+    /// control DATAGRAMs).
+    ctl_out: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<CtlMessage>>>,
+    /// Receive half of [`Self::ctl_out`], moved into the control-stream writer
+    /// task once the stream is accepted. Kept here (not threaded through the
+    /// accept loop) so the accept path only needs the connection state.
+    ctl_out_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<CtlMessage>>>,
+    /// rev3 only: whether the single control stream has been claimed. A second
+    /// marker stream is a protocol violation and is reset.
+    ctl_stream_taken: std::sync::atomic::AtomicBool,
+    /// rev3 only: receiver-side rate budget for inbound control messages
+    /// (idempotent, reliable, but a hostile peer can still stream duplicates).
+    ctl_rate: parking_lot::Mutex<CtlRate>,
+    /// rev3 only: sender-side budget for `NEED_CONTEXT` repairs, so a flood of
+    /// unknown compressed ids cannot turn into an unbounded control-stream
+    /// write amplifier.
+    need_ctx_rate: parking_lot::Mutex<CtlRate>,
+    /// rev3 only: client→server `NEED_CONTEXT` mailbox.
+    ///
+    /// Reply readers are per session/task, so the repair hint travels through
+    /// this connection-scoped slot: a bump of `ctx_need_epoch` tells every
+    /// reply reader to pick up the (bounded) id list before its next reply.
+    /// `None`/empty means no repair outstanding. Never allocates flow state —
+    /// an unknown id is a hint, not a binding.
+    ctx_need: parking_lot::Mutex<Vec<u32>>,
+    ctx_need_epoch: std::sync::atomic::AtomicU64,
 }
 
-/// Bounds for [`R2ConnState::pre_hello`]: only the first optimistic frames
-/// need to survive the HELLO round trip. A larger burst is dropped and counted
-/// rather than buffered (the handshake completes in one RTT on any live path).
-pub(crate) const PRE_HELLO_MAX_FRAMES: usize = 8;
-pub(crate) const PRE_HELLO_MAX_BYTES: usize = 16 * 1024;
+/// Upper bound on concurrent `NEED_CONTEXT` repairs a connection's mailbox
+/// carries between two reply-reader syncs. Exceeding it clears the set (the
+/// peer repeats a repair on its own retransmission/timeout); the point is only
+/// that a hint flood cannot grow memory.
+pub(crate) const CTX_NEED_CAP: usize = 64;
 
 /// Concurrent domain lookups one connection may have in flight. The global
 /// `dns_slow_path_limiter` bounds the actual resolver work; this is the
@@ -1220,20 +1532,184 @@ pub(crate) enum PendingOpen {
 }
 
 impl R2ConnState {
+    /// Shipped-revision (rev2) connection state. Byte-for-byte the behaviour
+    /// every existing call site had; the wiring task swaps the server's call
+    /// site to [`Self::new_with_wire`] with the configured revision.
+    ///
+    /// Production goes through [`Self::new_with_wire`] (the handler always
+    /// knows the connection's revision), so this is the fixture/test default —
+    /// kept as the documented rev2 constructor the contract requires.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Arc<Self> {
+        Self::new_with_wire(Wire::Rev2)
+    }
+
+    /// Connection state for `wire` (the revision selected by config + ALPN).
+    pub(crate) fn new_with_wire(wire: Wire) -> Arc<Self> {
         Arc::new(Self {
+            wire,
             registry: Arc::new(FlowRegistry::new(
                 myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_CONN,
             )),
             ids: FlowIds::new(true),
             ctl: Arc::new(CtlState::new()),
-            stage: Arc::new(parking_lot::Mutex::new(R2Stager::new())),
+            // The stager encodes with the connection's revision (rev2 default
+            // keeps the shipped byte stream).
+            stage: Arc::new(parking_lot::Mutex::new(R2Stager::new_with_wire(wire))),
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
-            pre_hello: parking_lot::Mutex::new((Vec::new(), 0)),
             pending_dns_opens: parking_lot::Mutex::new(std::collections::HashMap::new()),
             pending_dns_bytes: std::sync::atomic::AtomicUsize::new(0),
             dns_waiters: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ctl_out: parking_lot::Mutex::new(None),
+            ctl_out_rx: parking_lot::Mutex::new(None),
+            ctl_stream_taken: std::sync::atomic::AtomicBool::new(false),
+            ctl_rate: parking_lot::Mutex::new(CtlRate::default_budget()),
+            need_ctx_rate: parking_lot::Mutex::new(CtlRate::new(256)),
+            ctx_need: parking_lot::Mutex::new(Vec::new()),
+            ctx_need_epoch: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Wire revision of this connection.
+    #[must_use]
+    pub(crate) fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    /// Attach the outbound control-stream queue (rev3, once the client's
+    /// control stream has been accepted).
+    fn install_ctl_out(&self, tx: tokio::sync::mpsc::Sender<CtlMessage>) {
+        *self.ctl_out.lock() = Some(tx);
+    }
+
+    /// Attach the receive half of the outbound queue (called once by
+    /// [`handle_conn_inner`]); the control-stream task takes it when it starts.
+    fn install_ctl_out_rx(&self, rx: tokio::sync::mpsc::Receiver<CtlMessage>) {
+        *self.ctl_out_rx.lock() = Some(rx);
+    }
+
+    /// Take the writer queue for the control-stream task (single consumer).
+    fn take_ctl_out_rx(&self) -> Option<tokio::sync::mpsc::Receiver<CtlMessage>> {
+        self.ctl_out_rx.lock().take()
+    }
+
+    /// Detach the outbound queue when the control stream dies, so later
+    /// messages are counted as dropped instead of buffered forever.
+    fn clear_ctl_out(&self) {
+        *self.ctl_out.lock() = None;
+    }
+
+    /// Claim the connection's single rev3 control stream. `false` means one was
+    /// already claimed: a second marker stream is a protocol violation.
+    fn claim_ctl_stream(&self) -> bool {
+        self.ctl_stream_taken
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Consume one slot of the inbound control-message rate budget.
+    fn allow_ctl_message(&self, now_ms: u64) -> bool {
+        self.ctl_rate.lock().allow(now_ms)
+    }
+
+    /// Queue one server→client control-stream message.
+    ///
+    /// `false` means the control stream is absent (not opened yet / torn down)
+    /// or its bounded queue is full: the caller counts the drop. Never falls
+    /// back to a DATAGRAM — rev3 has no control DATAGRAMs.
+    fn queue_ctl(&self, msg: CtlMessage) -> bool {
+        match self.ctl_out.lock().as_ref() {
+            Some(tx) => tx.try_send(msg).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Ask the reply readers to re-send downlink context for `wire_id`
+    /// (client→server `NEED_CONTEXT`). Bounded mailbox + epoch bump; never
+    /// allocates flow state.
+    fn note_need_context(&self, wire_id: u32) {
+        {
+            let mut ids = self.ctx_need.lock();
+            if ids.len() >= CTX_NEED_CAP {
+                // Bounded hint set: drop the stale repairs instead of growing.
+                // A peer that still misses context repeats its hint (the control
+                // stream is reliable, so this is not a repair-loss path).
+                r2_stats::bump(&r2_stats::NEED_CONTEXT_DROPPED);
+                ids.clear();
+            }
+            if !ids.contains(&wire_id) {
+                ids.push(wire_id);
+            }
+        }
+        self.ctx_need_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The client's pending context repairs, when the epoch moved since `seen`.
+    ///
+    /// Called by every reply reader (per session) before classifying a reply;
+    /// the id list is small and bounded, and the common case is one relaxed
+    /// load returning `None`.
+    pub(crate) fn take_need_context(&self, seen: &mut u64) -> Option<Vec<u32>> {
+        let epoch = self
+            .ctx_need_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if epoch == *seen {
+            return None;
+        }
+        *seen = epoch;
+        Some(self.ctx_need.lock().clone())
+    }
+
+    /// Queue a `NEED_CONTEXT{fid}` repair for an unknown compressed id
+    /// (server→client, rev3). Rate-limited; `false` when the id cannot be
+    /// represented as a rev3 fid or the budget/queue refused the hint.
+    fn send_need_context(&self, wire_id: u32) -> bool {
+        let Some(fid) = wire::fid_for(wire_id) else {
+            r2_stats::bump(&r2_stats::NEED_CONTEXT_DROPPED);
+            return false;
+        };
+        if !self.need_ctx_rate.lock().allow(coarse_millis()) {
+            r2_stats::bump(&r2_stats::NEED_CONTEXT_DROPPED);
+            return false;
+        }
+        if self.queue_ctl(CtlMessage::NeedContext { fid }) {
+            r2_stats::bump(&r2_stats::NEED_CONTEXT_SENT);
+            true
+        } else {
+            r2_stats::bump(&r2_stats::NEED_CONTEXT_DROPPED);
+            false
+        }
+    }
+
+    /// Queue a `REJECT{fid}` for a refused install/OPEN (rev3).
+    fn send_reject(&self, wire_id: u32, reason: u8) -> bool {
+        let Some(fid) = wire::fid_for(wire_id) else {
+            r2_stats::bump(&r2_stats::CTL_MSGS_DROPPED);
+            return false;
+        };
+        if self.queue_ctl(CtlMessage::Reject { fid, reason }) {
+            true
+        } else {
+            r2_stats::bump(&r2_stats::CTL_MSGS_DROPPED);
+            false
+        }
+    }
+
+    /// Queue a `SESS_CLOSE` for a reaped association (rev3). The reliable
+    /// stream replaces the rev2 three-DATAGRAM repeat; one message is enough.
+    fn send_sess_close(&self, sess: u32) -> bool {
+        if self.queue_ctl(CtlMessage::SessClose { sess, reason: 0 }) {
+            true
+        } else {
+            r2_stats::bump(&r2_stats::CTL_MSGS_DROPPED);
+            false
+        }
     }
 
     /// Register one generic-slow-path DNS waiter for `sess`, returning the RAII
@@ -1444,30 +1920,6 @@ impl R2ConnState {
         self.last_caps_ms.store(now_ms.max(1), Ordering::Relaxed);
         true
     }
-
-    /// Buffer one pre-HELLO frame; `false` means the buffer is full and the
-    /// caller must count/drop it.
-    fn buffer_pre_hello(&self, d: Bytes) -> bool {
-        let mut q = self.pre_hello.lock();
-        let (frames, bytes) = &mut *q;
-        if frames.len() >= PRE_HELLO_MAX_FRAMES
-            || bytes.saturating_add(d.len()) > PRE_HELLO_MAX_BYTES
-        {
-            return false;
-        }
-        *bytes += d.len();
-        frames.push(d);
-        r2_stats::bump(&r2_stats::PRE_HELLO_BUFFERED);
-        true
-    }
-
-    /// Take the buffered pre-HELLO frames after a valid HELLO opened the gate.
-    fn take_pre_hello(&self) -> Vec<Bytes> {
-        let mut q = self.pre_hello.lock();
-        let frames = std::mem::take(&mut q.0);
-        q.1 = 0;
-        frames
-    }
 }
 
 /// RAII registration of one generic-slow-path DNS waiter (see
@@ -1530,11 +1982,33 @@ fn r2_send_ctl(cd: &quinn::Connection, ctl: &Ctl) {
 /// own idle path notices. A terminal/blocked verdict stops the repeats: a dead
 /// or backed-up DATAGRAM path cannot carry them and the receiver's idle sweep is
 /// the correctness backstop.
-pub(crate) fn r2_send_sess_close(cd: &quinn::Connection, sess: u32) {
-    let frame = r2::encode_ctl(&Ctl::SessClose { sess, reason: 0 });
-    for _ in 0..3 {
-        if try_send_datagram(cd, frame.clone()) != DatagramSend::Sent {
-            return;
+pub(crate) fn r2_send_sess_close(
+    cd: &quinn::Connection,
+    state: Option<&Arc<R2ConnState>>,
+    sess: u32,
+) {
+    match state.map(|s| s.wire()).unwrap_or(Wire::Rev2) {
+        Wire::Rev2 => {
+            let frame = r2::encode_ctl(&Ctl::SessClose { sess, reason: 0 });
+            for _ in 0..3 {
+                if try_send_datagram(cd, frame.clone()) != DatagramSend::Sent {
+                    return;
+                }
+            }
+        }
+        Wire::Rev3 => {
+            // The reliable stream replaces the rev2 three-DATAGRAM repeat: one
+            // ordered, retransmitted message is enough, and a lost close cannot
+            // blackhole the association anymore.
+            match state {
+                Some(state) => {
+                    let _ = state.send_sess_close(sess);
+                }
+                // No connection state (a unit fixture): count the undeliverable
+                // notification instead of falling back to a rev2 DATAGRAM a
+                // rev3 peer cannot read.
+                None => r2_stats::bump(&r2_stats::CTL_MSGS_DROPPED),
+            }
         }
     }
 }
@@ -1554,7 +2028,11 @@ pub(crate) fn r2_send_sess_close(cd: &quinn::Connection, sess: u32) {
 /// just stops early (`close_reason` check per chunk). The batch is bounded by
 /// the reap itself (the per-connection session cap); the `Vec<u32>` costs 16
 /// KiB only in the pathological full-reap case.
-pub(crate) fn spawn_sess_close_notifications(cd: quinn::Connection, sessions: Vec<u32>) {
+pub(crate) fn spawn_sess_close_notifications(
+    cd: quinn::Connection,
+    state: Option<Arc<R2ConnState>>,
+    sessions: Vec<u32>,
+) {
     if sessions.is_empty() {
         return;
     }
@@ -1568,7 +2046,7 @@ pub(crate) fn spawn_sess_close_notifications(cd: quinn::Connection, sessions: Ve
                 return;
             }
             for &sess in chunk {
-                r2_send_sess_close(&cd, sess);
+                r2_send_sess_close(&cd, state.as_ref(), sess);
             }
             tokio::task::yield_now().await;
         }
@@ -1583,9 +2061,37 @@ fn r2_refuse(counter: Option<&std::sync::atomic::AtomicU64>) {
     }
 }
 
-fn r2_reject(cd: &quinn::Connection, id: u32, reason: u8) {
+/// Refuse one client flow: the rev2 `FLOW_REJECT` DATAGRAM, or the equivalent
+/// rev3 reliable-stream `REJECT{fid}` message. The flow id cannot be represented
+/// as a rev3 fid only past the 14-bit exhaustion point, where the control
+/// message is counted as dropped (the peer's id space is the same bound).
+fn r2_reject(state: &Arc<R2ConnState>, cd: &quinn::Connection, id: u32, reason: u8) {
     r2_stats::bump(&r2_stats::REJECTS);
-    r2_send_ctl(cd, &Ctl::FlowReject { id, reason });
+    match state.wire() {
+        Wire::Rev2 => r2_send_ctl(cd, &Ctl::FlowReject { id, reason }),
+        Wire::Rev3 => {
+            let _ = state.send_reject(id, reason);
+        }
+    }
+}
+
+/// Acknowledge an accepted `DATA OPEN`.
+///
+/// rev2 sends the post-hoc `FLOW_ACK` that unlocks the client's compression.
+/// rev3 has **no ACK at all**: the install is idempotent and bounded context
+/// redundancy (K=2) is what makes the binding usable, so this is a no-op there
+/// (the `ACKS` counter then only tracks rev2 ACK datagrams).
+fn r2_ack_open(state: &Arc<R2ConnState>, cd: &quinn::Connection, id: u32) {
+    if state.wire() == Wire::Rev2 {
+        r2_send_ctl(
+            cd,
+            &Ctl::FlowAck {
+                id,
+                status: r2::R2_ACK_OPEN,
+            },
+        );
+        r2_stats::bump(&r2_stats::ACKS);
+    }
 }
 
 /// Install an accepted `DATA OPEN` in both tables: the connection-wide forward
@@ -1821,11 +2327,18 @@ pub(crate) fn r2_handle_ctl(
     }
     match ctl {
         Ctl::Hello { wire_ver, .. } => {
+            // HELLO is a capability announcement, never a gate: the data plane
+            // runs whether or not it arrived. It is what makes the server
+            // answer with CAPS (throttled) and what bumps the hello/caps
+            // counters, so a lost HELLO now costs one control frame, not a
+            // stalled or dropped data path.
             if wire_ver == r2::R2_WIRE_VER {
                 state.ctl.mark_hello();
+                r2_stats::bump(&r2_stats::HELLOS);
             } else {
                 // Version mismatch: answer with our own version so the peer can
-                // fail fast, but never open the gate for it.
+                // fail fast; the data plane is unaffected because a rev2 frame
+                // is self-identifying and can only come from a rev2 peer.
                 r2_stats::bump(&r2_stats::BAD_HELLO);
             }
             if state.caps_due(mono_millis()) {
@@ -1909,6 +2422,93 @@ pub(crate) fn r2_handle_ctl(
     }
 }
 
+/// Handle one rev3 control-stream message on the connection's datagram-reader
+/// task (which owns the reassembler and the session table the message acts on).
+///
+/// The message classes mirror the rev2 `CTL` opcodes, minus the ACK/HELLO
+/// machinery rev3 deletes:
+/// - `ASSOC_CLOSE`: the reliable replacement for `SESS_CLOSE` ×3. Cancels the
+///   in-flight DNS paths *before* removing the session (same ordering proof as
+///   the rev2 arm: the lookup tasks' guarded creation re-reads the flag inside
+///   the shard write lock), drops this connection's reassembly/stager state for
+///   the association, then reaps it.
+/// - `FLOW_CLOSE`: removes one binding from both tables and drops its queued
+///   downlink payloads / in-flight fragments.
+/// - `NEED_CONTEXT`: the peer missed the downlink binding context of a flow it
+///   still has on the wire — record a bounded repair hint that every reply
+///   reader of the connection re-reads before its next reply (see
+///   [`R2ConnState::take_need_context`]). Never allocates flow state.
+/// - `REJECT`/`SESS_CLOSE`/`GOAWAY` are server→client messages; a client
+///   sending them is a protocol violation and is counted, never acted on.
+pub(crate) fn handle_control_message(
+    ss: &SessTable,
+    state: &Arc<R2ConnState>,
+    r2_reasm: &mut R2Reassembler,
+    msg: CtlMessage,
+) {
+    match msg {
+        CtlMessage::AssocClose { sess, .. } => {
+            state.cancel_pending_opens_for_session(sess);
+            state.cancel_dns_waiters_for_session(sess);
+            let dropped = r2_reasm.drop_session(sess);
+            let _ = state.stage.lock().drop_session(sess);
+            if dropped > 0 {
+                r2_stats::SESSION_END_BINDINGS
+                    .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Same accounting as the rev2 `CTL SESS_CLOSE` arm: a closed
+            // session and a repeated close are different classes.
+            if r2_close_session(ss, state, sess) {
+                r2_stats::bump(&r2_stats::SESS_CLOSES);
+            } else {
+                r2_stats::bump(&r2_stats::STALE_CLOSES);
+            }
+        }
+        CtlMessage::FlowClose { fid, .. } => {
+            let Some(wire_id) = wire::wire_id_for_fid(fid) else {
+                r2_refuse(None);
+                return;
+            };
+            match r2_remove_flow(ss, state, wire_id) {
+                Some(binding) => {
+                    let dropped = r2_reasm.drop_flow(wire_id);
+                    let _ = state
+                        .stage
+                        .lock()
+                        .drop_flow_scoped(binding.session, wire_id);
+                    if dropped > 0 {
+                        r2_stats::SESSION_END_BINDINGS
+                            .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    r2_stats::bump(&r2_stats::FLOW_CLOSES);
+                }
+                None => r2_stats::bump(&r2_stats::STALE_CLOSES),
+            }
+        }
+        CtlMessage::NeedContext { fid } => {
+            let Some(wire_id) = wire::wire_id_for_fid(fid) else {
+                r2_stats::bump(&r2_stats::NEED_CONTEXT_DROPPED);
+                return;
+            };
+            // A repair hint is only meaningful for a flow this side actually
+            // has; an unknown id stays a counted no-op (never allocate state).
+            if state.registry.get(wire_id).is_none() {
+                r2_stats::bump(&r2_stats::NEED_CONTEXT_DROPPED);
+                return;
+            }
+            r2_stats::bump(&r2_stats::NEED_CONTEXT_RECV);
+            state.note_need_context(wire_id);
+        }
+        // Server→client message classes: never valid from a client.
+        CtlMessage::Reject { .. } | CtlMessage::SessClose { .. } => r2_refuse(None),
+        // The peer announces it will stop using the connection. There is
+        // nothing the server must repair (the datagram plane is loss-tolerant by
+        // contract and the peer closes the QUIC connection itself); the message
+        // is already counted by the control-stream task.
+        CtlMessage::Goaway => {}
+    }
+}
+
 /// Forward one payload for an already-installed rev2 flow.
 ///
 /// The target is the binding's IP address, or (domain flow) the first address
@@ -1941,6 +2541,7 @@ async fn r2_forward_flow_item(
         allow_private,
         staged,
         state,
+        wire_id,
         binding.as_ref(),
         payload,
     )
@@ -1967,13 +2568,24 @@ async fn r2_forward_flow_resolved(
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
     state: &Arc<R2ConnState>,
+    wire_id: u32,
     binding: Option<&Arc<FlowBinding>>,
     payload: Bytes,
 ) -> bool {
+    // rev3 no-ACK repair is only useful for an id this endpoint **never**
+    // installed: the peer missed the binding context (its steady output is the
+    // symptom). A closed id is never reused (so a repair could not help a late
+    // frame) and is the normal post-close retransmission shape. Ask for
+    // `NEED_CONTEXT{fid}` on the reliable control stream instead of only
+    // counting — rate-limited and never allocating state (a hint, not a binding).
+    let repair_unknown = state.wire() == Wire::Rev3 && binding.is_none();
     let Some(binding) = binding.filter(|b| b.state() != FlowState::Closed) else {
         // The id was closed (FLOW_CLOSE / session teardown) or never lived: a
         // late frame must fail lookup, never be re-routed.
         r2_refuse(Some(&r2_stats::UNKNOWN_ID));
+        if repair_unknown {
+            let _ = state.send_need_context(wire_id);
+        }
         return false;
     };
     let Some(dst) = binding.target_ip().or_else(|| binding.resolved_first()) else {
@@ -2029,11 +2641,14 @@ pub(crate) fn policy_resolved(addrs: &[SocketAddr], allow_private: bool) -> Vec<
 
 /// Resolve and forward a domain-target `DATA OPEN` **off the datagram loop**.
 ///
-/// DNS is the only potentially seconds-long await on the ingress path (up to
-/// `DNS_LOOKUP_TIMEOUT`), so the reader spawns this task with owned data and
-/// keeps routing other datagrams. The task owns everything it touches:
-/// resolution + SSRF filtering, session creation (which may await a session
-/// permit), the target send, and the idempotent install + `FLOW_ACK`.
+/// This is the **cold-cache slow path**: the caller already consulted the
+/// synchronous thread memo / session destination memo (W5) and fell through
+/// because the name is not cached on this thread. DNS is the only potentially
+/// seconds-long await on the ingress path (up to `DNS_LOOKUP_TIMEOUT`), so the
+/// reader spawns this task with owned data and keeps routing other datagrams.
+/// The task owns everything it touches: resolution + SSRF filtering, session
+/// creation (which may await a session permit), the target send, and the
+/// idempotent install + `FLOW_ACK`.
 ///
 /// `pending` removes the `(session, id)` coalescing entry on every exit path
 /// and carries the session's cancellation flag: if a `CTL SESS_CLOSE` for
@@ -2067,24 +2682,42 @@ async fn r2_forward_domain_open_bg(
     let _dns_permit = match dns_slow_path_limiter().clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            // Process-wide resolver budget refused: counted by the shared
+            // `DNS_BUDGET` class (the 60 s report's DNS line), not as a name
+            // failure — the name was never looked up.
             dgram_drops::bump(&dgram_drops::DNS_BUDGET);
-            r2_reject(&cd, id, r2::R2_REJECT_DNS);
+            r2_reject(&state, &cd, id, r2::R2_REJECT_DNS);
             return;
         }
     };
     let addrs = match resolve_all_cached(&host, port).await {
         Ok(v) => v,
         Err(_) => {
+            // W4: a resolver error/timeout is **inherently undeliverable** —
+            // there is no address to send this payload to, and inventing one
+            // would be exactly the SSRF hole the policy exists to close.
+            //
+            // No in-budget retry is possible: `resolve_all_cached` records the
+            // failure as a host-keyed negative cache entry (`DNS_NEG_TTL`,
+            // 10 s) *before* returning it, so a retry inside this 5 s budget can
+            // only re-read that verdict. It would add an await and a second
+            // wakeup on the ingress path and never succeed; the payload stays an
+            // ordinary UDP drop (the client's own retransmission is the retry).
+            // The distinct counter is what makes the loss observable instead of
+            // folded into the shared `REFUSED`.
+            r2_stats::bump(&r2_stats::DNS_OPEN_DNS_FAIL);
             r2_refuse(None);
-            r2_reject(&cd, id, r2::R2_REJECT_DNS);
+            r2_reject(&state, &cd, id, r2::R2_REJECT_DNS);
             return;
         }
     };
     let usable = policy_resolved(&addrs, allow_private);
     if usable.is_empty() {
-        // Every record was rejected by the SSRF policy.
+        // Every record was rejected by the SSRF policy: undeliverable by
+        // policy, never re-routed around the filter (`DNS_OPEN_POLICY_DROP`).
+        r2_stats::bump(&r2_stats::DNS_OPEN_POLICY_DROP);
         r2_refuse(None);
-        r2_reject(&cd, id, r2::R2_REJECT_POLICY);
+        r2_reject(&state, &cd, id, r2::R2_REJECT_POLICY);
         return;
     }
     if cd.close_reason().is_some() {
@@ -2123,8 +2756,17 @@ async fn r2_forward_domain_open_bg(
             // Session/share/permit refusal (or the cancelled-creation rollback):
             // no flow can be installed around it. A cancelled OPEN must not ACK
             // or bind a closed session either — the client already dropped the
-            // association.
-            r2_reject(&cd, id, r2::R2_REJECT_TABLE_FULL);
+            // association. W4: the destination is valid but there is no live
+            // per-association delivery path, and *deliberately* no alternative
+            // one is invented — a session owns its socket, its reader task and
+            // its SSRF authorization, so routing around a refusal would bypass
+            // the admission policy. `DNS_OPEN_SESS_REFUSED` makes that distinct
+            // from a name failure (`DNS_OPEN_DNS_FAIL`) and a policy drop
+            // (`DNS_OPEN_POLICY_DROP`). The specific resource class
+            // (`FAIR_SHARE`/`SESSION_FULL`/`SESS_CREATE_FAILED`) is already
+            // counted by `get_or_create_sess_guarded`.
+            r2_stats::bump(&r2_stats::DNS_OPEN_SESS_REFUSED);
+            r2_reject(&state, &cd, id, r2::R2_REJECT_TABLE_FULL);
             return;
         }
     };
@@ -2162,24 +2804,24 @@ async fn r2_forward_domain_open_bg(
     ) {
         Ok(_) => {
             r2_stats::bump(&r2_stats::OPENS);
-            r2_send_ctl(
-                &cd,
-                &Ctl::FlowAck {
-                    id,
-                    status: r2::R2_ACK_OPEN,
-                },
-            );
-            r2_stats::bump(&r2_stats::ACKS);
+            r2_ack_open(&state, &cd, id);
         }
-        Err(RegistryError::Full) => r2_reject(&cd, id, r2::R2_REJECT_TABLE_FULL),
+        Err(RegistryError::Full) => r2_reject(&state, &cd, id, r2::R2_REJECT_TABLE_FULL),
         Err(RegistryError::Conflict) => {
             r2_refuse(None);
-            r2_reject(&cd, id, r2::R2_REJECT_POLICY);
+            r2_reject(&state, &cd, id, r2::R2_REJECT_POLICY);
         }
     }
 }
 
 /// Handle one `DATA OPEN` (client-initiated flow: the address is the target).
+///
+/// Order is invariant: the target send happens **before** the install, so an
+/// install/table refusal can only mean "no compression", never "payload lost"
+/// (P2-7). IP targets forward inline through `forward_server_dgram`; domain
+/// targets first take the synchronous warm-cache fast path (W5), and only a
+/// name that is not cached on this thread is handed to the spawned resolver
+/// task.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn r2_ingress_open(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
@@ -2199,7 +2841,7 @@ pub(crate) async fn r2_ingress_open(
     // arrives in Phase 1b as the *server's* OPEN|SRC, never as a client OPEN.
     if sess == 0 || r2::wire_id_server_owned(id) {
         r2_refuse(None);
-        r2_reject(cd, id, r2::R2_REJECT_POLICY);
+        r2_reject(state, cd, id, r2::R2_REJECT_POLICY);
         return;
     }
     // An id is bound to one `(session, target)` for the connection's life: a
@@ -2214,7 +2856,7 @@ pub(crate) async fn r2_ingress_open(
         && (existing.session != sess || existing.target != target)
     {
         r2_refuse(None);
-        r2_reject(cd, id, r2::R2_REJECT_POLICY);
+        r2_reject(state, cd, id, r2::R2_REJECT_POLICY);
         return;
     }
     // Deliver first (or resolve+deliver): a flow is installed only after the
@@ -2224,7 +2866,7 @@ pub(crate) async fn r2_ingress_open(
         TargetAddrRef::Ip(dst) => {
             if !allow_private && !is_global_ip_cached(dst.ip()) {
                 r2_refuse(None);
-                r2_reject(cd, id, r2::R2_REJECT_POLICY);
+                r2_reject(state, cd, id, r2::R2_REJECT_POLICY);
                 return;
             }
             flush_staged_sends(staged);
@@ -2245,84 +2887,165 @@ pub(crate) async fn r2_ingress_open(
                     Some(Vec::new())
                 }
                 None => {
-                    r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL);
+                    r2_reject(state, cd, id, r2::R2_REJECT_TABLE_FULL);
                     return;
                 }
             }
         }
         TargetAddrRef::Domain(host, port) => {
             let host = host.to_owned();
-            match state.begin_pending_open(sess, id, &target) {
-                PendingOpen::Duplicate => {
-                    // The first OPEN for this id is already resolving. This
-                    // frame's payload is distinct application data, so buffer
-                    // it behind the lookup (bounded) instead of losing it; the
-                    // task forwards the queued payloads in order after the
-                    // resolution. A full/closed queue drops it as the old path
-                    // always did, and `NotPending` means the lookup just
-                    // finished: forward on the ordinary path. A duplicate that
-                    // names a different target is the registry's conflict case
-                    // moved into the DNS window: refuse it, never queue it for
-                    // the in-flight target's destination.
-                    match state.queue_pending_open_payload(sess, id, &target.as_ref(), &payload) {
-                        PendingPayload::Queued => {}
-                        PendingPayload::Full | PendingPayload::Cancelled => {
-                            r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
-                        }
-                        PendingPayload::Conflict => {
-                            r2_refuse(None);
-                            r2_reject(cd, id, r2::R2_REJECT_POLICY);
-                        }
-                        PendingPayload::NotPending => {
-                            let accepted = forward_v3_item(
-                                fast,
-                                ss,
-                                cd,
-                                conn_id,
-                                sess,
-                                target.as_ref(),
-                                payload,
-                                allow_private,
-                                staged,
-                                Some(state),
-                            )
-                            .await;
-                            if !accepted {
+            // Duplicate-OPEN pre-check (W5): if a lookup for this `(session,
+            // id)` is already in flight, this frame is the client's normal "no
+            // ACK yet" duplicate. Queue its payload behind that lookup — never
+            // forward it early, because the in-flight target is the authority
+            // for where it may go, and a duplicate naming a different target
+            // must still be refused as the protocol violation it is.
+            // `NotPending` means there is no in-flight lookup, so this OPEN can
+            // take the synchronous warm-cache path below.
+            match state.queue_pending_open_payload(sess, id, &target.as_ref(), &payload) {
+                PendingPayload::Queued => return,
+                PendingPayload::Full | PendingPayload::Cancelled => {
+                    r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                    return;
+                }
+                PendingPayload::Conflict => {
+                    r2_refuse(None);
+                    r2_reject(state, cd, id, r2::R2_REJECT_POLICY);
+                    return;
+                }
+                PendingPayload::NotPending => {}
+            }
+            // W5 — synchronous warm-cache fast path. Mirror
+            // `forward_server_dgram`'s resolution order (this thread's DNS memo,
+            // then the session's destination memo) *before* paying a task spawn:
+            // on a hit the payload is forwarded, the binding installed and
+            // `FLOW_ACK` sent inline in the datagram loop, so a warm domain flow
+            // starts compressing one task round trip earlier and never leaves
+            // the reader. The resolution runs exactly once per frame: its answer
+            // is reused for the forward and the install instead of resolving a
+            // second time inside `forward_server_dgram` (W8b: one resolution and
+            // one coarse clock sample per frame).
+            //
+            // The SSRF/`allow_private` decision is the *same* one the slow path
+            // makes: `resolve_forward_target` only returns `Addr` for an address
+            // that passes the policy, so a warm name that resolves to a filtered
+            // address stays on the cold path (which scans the whole record set
+            // for a usable one) and never skips the check.
+            if let ForwardResolution::Addr(dst, life) =
+                resolve_forward_target(ss, sess, &host, port, allow_private)
+            {
+                flush_staged_sends(staged);
+                let sock = match get_or_create_sess(
+                    ss,
+                    cd,
+                    conn_id,
+                    sess,
+                    Some((host.as_str(), port, dst, life)),
+                    Some(state),
+                )
+                .await
+                {
+                    Some(s) => s,
+                    None => {
+                        // Same class as the slow path's refusal: the destination
+                        // is valid but no per-association delivery path exists
+                        // (and none is invented — see `DNS_OPEN_SESS_REFUSED`).
+                        r2_stats::bump(&r2_stats::DNS_OPEN_SESS_REFUSED);
+                        r2_reject(state, cd, id, r2::R2_REJECT_TABLE_FULL);
+                        return;
+                    }
+                };
+                remember_dst(ss, sess, dst);
+                udp_try_send(&sock, map_for_dual(dst), payload);
+                // Arm the connection fast table from the answer just used, so
+                // this session's later steady frames hit the fast path. (The
+                // spawned slow path deliberately leaves arming to the datagram
+                // loop; here we *are* the datagram loop.)
+                arm_fast(fast, ss, conn_id, sess, target.as_ref(), dst, life);
+                r2_stats::bump(&r2_stats::DNS_SYNC_OPENS);
+                // The one address the synchronous probe knows (the memo's first
+                // record) is the flow's validated reply-source set here: it is
+                // the address this payload was sent to, so its replies are
+                // authorized without a second lookup. A reply from a *different*
+                // record of the same name is the cold path's case (its full
+                // resolved set is installed there).
+                Some(vec![dst])
+            } else {
+                match state.begin_pending_open(sess, id, &target) {
+                    PendingOpen::Duplicate => {
+                        // The first OPEN for this id is already resolving. This
+                        // frame's payload is distinct application data, so buffer
+                        // it behind the lookup (bounded) instead of losing it;
+                        // the task forwards the queued payloads in order after
+                        // the resolution. A full/closed queue drops it as the
+                        // old path always did, and `NotPending` means the lookup
+                        // just finished: forward on the ordinary path. A
+                        // duplicate that names a different target is the
+                        // registry's conflict case moved into the DNS window:
+                        // refuse it, never queue it for the in-flight target's
+                        // destination.
+                        match state.queue_pending_open_payload(sess, id, &target.as_ref(), &payload)
+                        {
+                            PendingPayload::Queued => {}
+                            PendingPayload::Full | PendingPayload::Cancelled => {
                                 r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
                             }
+                            PendingPayload::Conflict => {
+                                r2_refuse(None);
+                                r2_reject(state, cd, id, r2::R2_REJECT_POLICY);
+                            }
+                            PendingPayload::NotPending => {
+                                let accepted = forward_v3_item(
+                                    fast,
+                                    ss,
+                                    cd,
+                                    conn_id,
+                                    sess,
+                                    target.as_ref(),
+                                    payload,
+                                    allow_private,
+                                    staged,
+                                    Some(state),
+                                )
+                                .await;
+                                if !accepted {
+                                    r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                                }
+                            }
                         }
+                        return;
                     }
-                    return;
-                }
-                PendingOpen::Full => {
-                    // This is a *per-connection* resource refusal (16 in-flight
-                    // OPENs), never DNS-budget exhaustion: charging it to
-                    // `DNS_BUDGET` made the 60 s report claim the process-wide
-                    // resolver budget was drained while the share cap was the
-                    // actual gate. REFUSED is the correct policy-drop class,
-                    // plus the per-connection pending-open counter.
-                    r2_refuse(Some(&r2_stats::DNS_OPEN_DROPS));
-                    r2_reject(cd, id, r2::R2_REJECT_DNS);
-                    return;
-                }
-                PendingOpen::Started(pending) => {
-                    // Owned task: the datagram loop must not await DNS. The
-                    // task performs the same forward-then-install sequence and
-                    // sends its own ACK/reject.
-                    tokio::spawn(r2_forward_domain_open_bg(
-                        ss.clone(),
-                        cd.clone(),
-                        conn_id,
-                        allow_private,
-                        Arc::clone(state),
-                        id,
-                        sess,
-                        host,
-                        port,
-                        payload,
-                        pending,
-                    ));
-                    return;
+                    PendingOpen::Full => {
+                        // This is a *per-connection* resource refusal (16
+                        // in-flight OPENs), never DNS-budget exhaustion: charging
+                        // it to `DNS_BUDGET` made the 60 s report claim the
+                        // process-wide resolver budget was drained while the
+                        // share cap was the actual gate. REFUSED is the correct
+                        // policy-drop class, plus the per-connection
+                        // pending-open counter.
+                        r2_refuse(Some(&r2_stats::DNS_OPEN_DROPS));
+                        r2_reject(state, cd, id, r2::R2_REJECT_DNS);
+                        return;
+                    }
+                    PendingOpen::Started(pending) => {
+                        // Owned task: the datagram loop must not await DNS. The
+                        // task performs the same forward-then-install sequence
+                        // and sends its own ACK/reject.
+                        tokio::spawn(r2_forward_domain_open_bg(
+                            ss.clone(),
+                            cd.clone(),
+                            conn_id,
+                            allow_private,
+                            Arc::clone(state),
+                            id,
+                            sess,
+                            host,
+                            port,
+                            payload,
+                            pending,
+                        ));
+                        return;
+                    }
                 }
             }
         }
@@ -2333,24 +3056,17 @@ pub(crate) async fn r2_ingress_open(
     match r2_install(state, ss, sess, id, target, resolved) {
         Ok(_) => {
             r2_stats::bump(&r2_stats::OPENS);
-            r2_send_ctl(
-                cd,
-                &Ctl::FlowAck {
-                    id,
-                    status: r2::R2_ACK_OPEN,
-                },
-            );
-            r2_stats::bump(&r2_stats::ACKS);
+            r2_ack_open(state, cd, id);
         }
-        Err(RegistryError::Full) => r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL),
+        Err(RegistryError::Full) => r2_reject(state, cd, id, r2::R2_REJECT_TABLE_FULL),
         Err(RegistryError::Conflict) => {
             r2_refuse(None);
-            r2_reject(cd, id, r2::R2_REJECT_POLICY);
+            r2_reject(state, cd, id, r2::R2_REJECT_POLICY);
         }
     }
 }
 
-/// Route one decoded rev2 `DATA` frame (steady / open / inline).
+/// Route one decoded `DATA` frame (steady / open / inline) for `wire`.
 #[allow(clippy::too_many_arguments)]
 async fn r2_ingress_data(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
@@ -2360,9 +3076,12 @@ async fn r2_ingress_data(
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
     state: &Arc<R2ConnState>,
+    wire: Wire,
     d: Bytes,
 ) {
-    let Ok(data) = r2::decode_data(&d) else {
+    // The adapter maps rev3 `fid`s back to the internal `wire_id` the whole
+    // state model uses, so everything below is revision-agnostic.
+    let Ok(data) = wire::decode_data(wire, &d) else {
         r2_refuse(None);
         return;
     };
@@ -2376,7 +3095,7 @@ async fn r2_ingress_data(
     let target = data.addr.map(TargetAddrRef::into_owned);
     let payload = d.slice_ref(data.payload);
     udp_stats::payload(data.payload.len());
-    match (data.id, data.sess, target) {
+    match (data.wire_id, data.sess, target) {
         (Some(id), Some(sess), Some(target)) => {
             r2_ingress_open(
                 fast,
@@ -2433,9 +3152,10 @@ async fn r2_ingress_data(
     }
 }
 
-/// Route one rev2 `TRAIN`: every item resolves through the connection registry
-/// and is forwarded on its own; an item naming an unknown id is dropped and
-/// counted, never guessed, and the rest of the frame continues.
+/// Route one `TRAIN`: every item resolves through the connection registry and
+/// is forwarded on its own; an item naming an unknown id is dropped/counted
+/// (and, on rev3, repaired with `NEED_CONTEXT`), never guessed, and the rest of
+/// the frame continues.
 #[allow(clippy::too_many_arguments)]
 async fn r2_ingress_train(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
@@ -2445,9 +3165,12 @@ async fn r2_ingress_train(
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
     state: &Arc<R2ConnState>,
+    wire: Wire,
     d: Bytes,
 ) {
-    let Ok(train) = r2::decode_train(&d) else {
+    // The adapter's iterator yields `(internal wire_id, payload)` in wire order
+    // for both revisions (rev2 same/dict; rev3 same/same-equal/dict).
+    let Ok(train) = wire::decode_train(wire, &d) else {
         r2_refuse(None);
         return;
     };
@@ -2494,7 +3217,7 @@ async fn r2_ingress_train(
         item_slot[i] = slot;
     }
     state.registry.get_batch(&mut slots[..n_slots]);
-    for (slot_index, (_wire_id, item)) in train.items().enumerate() {
+    for (slot_index, (wire_id, item)) in train.items().enumerate() {
         r2_stats::bump_train_item();
         udp_stats::payload(item.len());
         let payload = d.slice_ref(item);
@@ -2507,6 +3230,7 @@ async fn r2_ingress_train(
             allow_private,
             staged,
             state,
+            wire_id,
             binding,
             payload,
         )
@@ -2537,15 +3261,19 @@ async fn r2_ingress_frag(
     staged: &mut Vec<StagedSend>,
     state: &Arc<R2ConnState>,
     r2_reasm: &mut R2Reassembler,
+    wire: Wire,
     d: Bytes,
 ) {
-    let Ok(frag) = r2::decode_frag(&d) else {
+    // Decode through the wire adapter; the decoded view carries the internal
+    // `wire_id` for both revisions, and the reassembler keeps the same keys,
+    // bounds and expiry.
+    let Ok(frag) = wire::decode_frag(wire, &d) else {
         r2_stats::bump(&r2_stats::FRAGS);
         r2_refuse(None);
         return;
     };
     r2_stats::bump(&r2_stats::FRAG_FRAMES);
-    let Some(done) = r2_reasm.push(&d, &frag, coarse_millis()) else {
+    let Some(done) = r2_reasm.push_view(&d, &frag, coarse_millis()) else {
         // Partial, duplicate, expired or refused fragment: the module already
         // bounds and validates everything; UDP semantics say drop.
         return;
@@ -2631,18 +3359,23 @@ async fn r2_ingress_frag(
     }
 }
 
-/// Dispatch one rev2 DATAGRAM body.
+/// Dispatch one MQP-3 DATAGRAM body for the connection's `wire` revision.
 ///
-/// Optimistic-first-packet contract: the client no longer waits for `CAPS`
-/// before sending its first UDP payload. The version gate remains authoritative
-/// — every rev2 frame except `HELLO` that arrives before a valid `HELLO` is
-/// stashed in a bounded per-connection buffer and dispatched only once
-/// `HELLO(wire_ver=2)` opens the gate; overflow is counted and dropped. This
-/// keeps order for optimistic data plus an early `SESS_CLOSE`. A wrong-version
-/// HELLO never opens the gate and therefore never releases the buffer. Legacy
-/// v2/v3 frames keep their own dispatch and are unaffected.
+/// Optimistic-first-packet contract: the client does not wait for `CAPS` before
+/// sending its first UDP payload, and (on rev2) the server does not wait for
+/// `HELLO` before dispatching data. The caller classified `kind` from the first
+/// byte through [`wire::kind`] — the only revision-specific dispatch decision —
+/// so this function only has to route by frame family and hand the decoder the
+/// same `wire`.
+///
+/// rev2: `CTL` frames are the lossy datagram control plane (HELLO/CAPS/ACK/
+/// REJECT/CLOSE) and are handled here; the data classes keep the shipped bytes
+/// and behaviour.
+/// rev3: there is no control DATAGRAM class at all (`wire::kind(Rev3, ..)`
+/// never returns [`FrameKind::Ctl`]); the reliable control stream is handled by
+/// the stream accept path.
 #[allow(clippy::too_many_arguments)]
-async fn handle_r2_ingress(
+async fn handle_ingress_frame(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
     ss: &SessTable,
     cd: &quinn::Connection,
@@ -2651,84 +3384,18 @@ async fn handle_r2_ingress(
     staged: &mut Vec<StagedSend>,
     state: &Arc<R2ConnState>,
     r2_reasm: &mut R2Reassembler,
+    wire: Wire,
+    kind: FrameKind,
     d: Bytes,
 ) {
-    let Some(kind) = r2::kind(&d) else {
-        return;
-    };
-    if kind == R2Kind::Ctl {
-        // HELLO is processed immediately; every other frame (data or control)
-        // waits for it in the bounded buffer so optimistic sends keep their
-        // order, including a fast SESS_CLOSE.
-        let is_hello = d.get(1).copied() == Some(r2::R2_CTL_HELLO);
-        if !is_hello && !state.ctl.hello_seen() {
-            if state.buffer_pre_hello(d) {
-                return;
-            }
-            r2_refuse(Some(&r2_stats::PRE_HELLO_DROPPED));
-            return;
+    match kind {
+        FrameKind::Data => {
+            r2_ingress_data(fast, ss, cd, conn_id, allow_private, staged, state, wire, d).await;
         }
-        r2_handle_ctl(ss, cd, state, r2_reasm, &d);
-        if state.ctl.hello_seen() {
-            for frame in state.take_pre_hello() {
-                r2_dispatch_frame(
-                    fast,
-                    ss,
-                    cd,
-                    conn_id,
-                    allow_private,
-                    staged,
-                    state,
-                    r2_reasm,
-                    frame,
-                )
-                .await;
-            }
+        FrameKind::Train => {
+            r2_ingress_train(fast, ss, cd, conn_id, allow_private, staged, state, wire, d).await;
         }
-        return;
-    }
-    if !state.ctl.hello_seen() {
-        if state.buffer_pre_hello(d) {
-            return;
-        }
-        r2_refuse(Some(&r2_stats::PRE_HELLO_DROPPED));
-        return;
-    }
-    r2_dispatch_frame(
-        fast,
-        ss,
-        cd,
-        conn_id,
-        allow_private,
-        staged,
-        state,
-        r2_reasm,
-        d,
-    )
-    .await;
-}
-
-/// Dispatch one already-version-gated rev2 data frame.
-#[allow(clippy::too_many_arguments)]
-async fn r2_dispatch_frame(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
-    ss: &SessTable,
-    cd: &quinn::Connection,
-    conn_id: usize,
-    allow_private: bool,
-    staged: &mut Vec<StagedSend>,
-    state: &Arc<R2ConnState>,
-    r2_reasm: &mut R2Reassembler,
-    d: Bytes,
-) {
-    match r2::kind(&d) {
-        Some(R2Kind::Data) => {
-            r2_ingress_data(fast, ss, cd, conn_id, allow_private, staged, state, d).await;
-        }
-        Some(R2Kind::Train) => {
-            r2_ingress_train(fast, ss, cd, conn_id, allow_private, staged, state, d).await;
-        }
-        Some(R2Kind::Frag) => {
+        FrameKind::Frag => {
             r2_ingress_frag(
                 fast,
                 ss,
@@ -2738,21 +3405,242 @@ async fn r2_dispatch_frame(
                 staged,
                 state,
                 r2_reasm,
+                wire,
                 d,
             )
             .await;
         }
-        Some(R2Kind::Ctl) => r2_handle_ctl(ss, cd, state, r2_reasm, &d),
-        None => r2_refuse(None),
+        FrameKind::Ctl => {
+            // Only rev2 can produce this family; rev3's control plane is the
+            // reliable stream (see the control-stream accept path).
+            debug_assert_eq!(wire, Wire::Rev2);
+            r2_handle_ctl(ss, cd, state, r2_reasm, &d);
+        }
     }
 }
 
+/// The connection's rev3 control-stream task: one reliable, ordered bidi stream
+/// carries every rare control message in both directions (see
+/// `mqp::ctl_stream`). It owns the stream halves and bridges them to the rest of
+/// the server:
+/// - inbound messages are rate-limited here and forwarded to the datagram-reader
+///   task ([`handle_control_message`]), which owns the reassembler/session table
+///   they act on;
+/// - outbound messages are written straight from the bounded queue in
+///   [`R2ConnState::queue_ctl`] (REJECT / SESS_CLOSE / NEED_CONTEXT).
+///
+/// The task ends when the stream or the connection goes away; the datagram
+/// plane keeps running (its loss recovery never depends on a control message).
+async fn r3_control_stream_task(
+    conn: quinn::Connection,
+    state: Arc<R2ConnState>,
+    mut tx: CtlSender,
+    mut rx: CtlReceiver,
+    mut out_rx: tokio::sync::mpsc::Receiver<CtlMessage>,
+    ctl_in: tokio::sync::mpsc::UnboundedSender<CtlMessage>,
+) {
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(Some(msg)) => {
+                    if !state.allow_ctl_message(coarse_millis()) {
+                        // Idempotent message classes are cheap but not free;
+                        // the reliable sender never repeats, so only a hostile
+                        // peer can hit this.
+                        r2_stats::bump(&r2_stats::CTL_MSGS_DROPPED);
+                        continue;
+                    }
+                    r2_stats::bump(&r2_stats::CTL_MSGS_RECV);
+                    if ctl_in.send(msg).is_err() {
+                        // The datagram reader is gone: nothing can act on the
+                        // message anymore.
+                        r2_stats::bump(&r2_stats::CTL_STREAM_ERRORS);
+                        break;
+                    }
+                }
+                // Clean FIN from the peer: it will not send more control
+                // messages. Tear the whole control plane down (the writer half
+                // only exists to answer those messages); the datagram plane is
+                // unaffected.
+                Ok(None) => break,
+                Err(_) => {
+                    r2_stats::bump(&r2_stats::CTL_STREAM_ERRORS);
+                    break;
+                }
+            },
+            out = out_rx.recv() => match out {
+                Some(msg) => {
+                    if tx.send(msg).await.is_err() {
+                        r2_stats::bump(&r2_stats::CTL_STREAM_ERRORS);
+                        break;
+                    }
+                }
+                // The connection state is being dropped: the handler is exiting.
+                None => break,
+            },
+            _ = conn.closed() => break,
+        }
+    }
+    // Later server→client messages are counted drops, never a DATAGRAM fallback
+    // (rev3 has no control DATAGRAMs).
+    state.clear_ctl_out();
+}
+
+/// Dispatch one client-opened bidi stream on a rev3 connection.
+///
+/// rev3 multiplexes the TCP relay and the reliable control plane on the same
+/// bidi-stream space, so the **first byte** decides (see
+/// [`ctl_stream::classify_first_byte`]): `0xFF` is the control marker,
+/// `0x01|0x03|0x04` are the MQP address `atyp` of a TCP relay stream, anything
+/// else is a protocol violation. The byte is consumed here and handed to the
+/// chosen path, so it is never read twice.
+///
+/// The 5 s header budget starts here (one deadline for the byte plus the rest of
+/// the TCP header), and the caller's header-stage credits are held across it
+/// exactly like the rev2 handler's header read; the control stream returns them
+/// immediately (it is not a parked header).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_rev3_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    header_credit: tokio::sync::OwnedSemaphorePermit,
+    header_share: tokio::sync::OwnedSemaphorePermit,
+    streams_held: Arc<std::sync::atomic::AtomicUsize>,
+    share: usize,
+    admitted: usize,
+    allow_private: bool,
+    conn: quinn::Connection,
+    state: Arc<R2ConnState>,
+    ctl_in: tokio::sync::mpsc::UnboundedSender<CtlMessage>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut first = [0u8; 1];
+    match tokio::time::timeout_at(deadline, recv.read_exact(&mut first)).await {
+        Ok(Ok(())) => {}
+        // A stream whose first byte never arrives is a parked header task; the
+        // credits bound it and the budget releases it.
+        _ => {
+            send.reset(0x01u32.into()).ok();
+            return;
+        }
+    }
+    match ctl_stream::classify_first_byte(first[0]) {
+        Some(StreamClass::Control) => {
+            // Not a header-stage task: return the credits now.
+            drop(header_credit);
+            drop(header_share);
+            if !state.claim_ctl_stream() {
+                // Exactly one control stream per connection; a second marker
+                // stream is a protocol violation.
+                r2_stats::bump(&r2_stats::CTL_STREAM_SECOND);
+                send.reset(0x05u32.into()).ok();
+                return;
+            }
+            r2_stats::bump(&r2_stats::CTL_STREAMS);
+            let Some((tx, rx)) = ctl_stream::accept_server_stream(send, recv, first[0]) else {
+                // Unreachable: the marker was just classified as control.
+                r2_stats::bump(&r2_stats::CTL_STREAM_ERRORS);
+                return;
+            };
+            let Some(out_rx) = state.take_ctl_out_rx() else {
+                // The state was not built with a writer queue (a fixture / a
+                // non-rev3 connection): without it server→client control is
+                // impossible, so tear the stream down instead of half-using it.
+                r2_stats::bump(&r2_stats::CTL_STREAM_ERRORS);
+                let mut send = tx.into_inner();
+                send.reset(0x05u32.into()).ok();
+                return;
+            };
+            r3_control_stream_task(conn, state, tx, rx, out_rx, ctl_in).await;
+        }
+        Some(StreamClass::Tcp { atyp }) => {
+            // Hand the already-consumed atyp into the shipped TCP handler; it
+            // reads only the rest of the MQP header inside the same deadline,
+            // so the 5 s header budget is not doubled.
+            handle_tcp_stream(
+                send,
+                recv,
+                header_credit,
+                header_share,
+                streams_held,
+                share,
+                admitted,
+                allow_private,
+                conn,
+                Some(atyp),
+                deadline,
+            )
+            .await;
+        }
+        None => {
+            // Neither a control marker nor an MQP address type: reset + count,
+            // never guess a route.
+            r2_stats::bump(&r2_stats::CTL_STREAM_BAD_FIRST);
+            drop(header_credit);
+            drop(header_share);
+            send.reset(0x01u32.into()).ok();
+        }
+    }
+}
+
+/// Entry point kept for call sites that do not (yet) know the connection's
+/// wire revision: the shipped rev2 behaviour.
+///
+/// The revision is a property of the connection (config + ALPN, validated at
+/// the TLS boundary), so the wiring task swaps the accept loop's call to
+/// [`handle_conn_with_wire`] with the configured [`Wire`]; this default wrapper
+/// keeps the existing signature as the documented rev2 default/rollback entry
+/// point (used by fixtures and tests).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn handle_conn(
     conn: quinn::Connection,
     allow_private: bool,
     reply_filter: ReplyFilter,
     conn_limit: Arc<tokio::sync::Semaphore>,
     conn_cap: usize,
+) -> Result<()> {
+    handle_conn_with_wire(
+        conn,
+        allow_private,
+        reply_filter,
+        conn_limit,
+        conn_cap,
+        Wire::Rev2,
+    )
+    .await
+}
+
+/// Connection entry point for an explicit wire revision.
+///
+/// The one line the later wiring task changes in `main.rs`:
+/// `handle_conn(...)` → `handle_conn_with_wire(..., wire)`.
+pub(crate) async fn handle_conn_with_wire(
+    conn: quinn::Connection,
+    allow_private: bool,
+    reply_filter: ReplyFilter,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    conn_cap: usize,
+    wire: Wire,
+) -> Result<()> {
+    handle_conn_inner(
+        conn,
+        allow_private,
+        reply_filter,
+        conn_limit,
+        conn_cap,
+        wire,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_conn_inner(
+    conn: quinn::Connection,
+    allow_private: bool,
+    reply_filter: ReplyFilter,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    conn_cap: usize,
+    wire: Wire,
 ) -> Result<()> {
     // Peer-driven rate: a line per admitted connection is the right operational
     // granularity, but a churn/handshake flood makes it one formatted line per
@@ -2773,9 +3661,20 @@ pub(crate) async fn handle_conn(
     // holds a session (`ShardedSessTable::note_empty_state`); an idle TCP-only
     // connection must not dilute anyone's session budget.
     let sess: SessTable = Arc::new(ShardedSessTable::new(reply_filter));
-    // MQP-3 rev2 connection state (flow registry + HELLO/CAPS gate). Shared by
-    // this handler, the datagram reader, the sweeper and every session reader.
-    let r2_state = R2ConnState::new();
+    // MQP-3 connection state (flow registry + control-plane bookkeeping) for
+    // this connection's wire revision. Shared by this handler, the datagram
+    // reader, the sweeper and every session reader.
+    let r2_state = R2ConnState::new_with_wire(wire);
+    // rev3 reliable control plane: one client-opened bidi stream. `ctl_out` is
+    // the server→client writer queue (installed when the stream is accepted);
+    // `ctl_in` carries the peer's messages to the datagram loop, which owns the
+    // reassembler/session table they act on. Both are unused on rev2 (controls
+    // ride DATAGRAMs there).
+    let (ctl_out_tx, ctl_out_rx) = tokio::sync::mpsc::channel::<CtlMessage>(64);
+    let (ctl_in_tx, mut ctl_in_rx) = tokio::sync::mpsc::unbounded_channel::<CtlMessage>();
+    r2_state.install_ctl_out(ctl_out_tx);
+    r2_state.install_ctl_out_rx(ctl_out_rx);
+    let mut ctl_in_open = true;
     {
         let sess = sess.clone();
         let conn = conn.clone();
@@ -2805,7 +3704,7 @@ pub(crate) async fn handle_conn(
                         // they must not block the shard runtime that also drives
                         // every connection's QUIC.
                         let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
-                        spawn_sess_close_notifications(conn.clone(), ids);
+                        spawn_sess_close_notifications(conn.clone(), Some(r2_sweep.clone()), ids);
                         abort_evicted(evicted);
                     }
                     _ = conn.closed() => {
@@ -2838,6 +3737,9 @@ pub(crate) async fn handle_conn(
     let cd = conn.clone();
     let ss = sess.clone();
     let r2 = r2_state.clone();
+    // Captured for the dispatch/decoders: the revision never changes for a live
+    // connection (it is fixed by config + ALPN at the handshake).
+    let wire = r2_state.wire();
     tokio::spawn(async move {
         // One receive future per connection instead of one per datagram:
         // `read_datagram` is cancel-safe (a buffered datagram is returned before
@@ -2853,7 +3755,10 @@ pub(crate) async fn handle_conn(
         // keys are connection-scoped (`wire_id`) or self-describing (`INLINE`),
         // so it sits next to the legacy MQP-2 reassembler rather than inside a
         // session. It shares the same expiry tick.
-        let mut r2_reasm = R2Reassembler::new();
+        // The reassembler is created for the connection's revision (the wire
+        // only affects which decoded view it accepts; keys/bounds/expiry are
+        // shared and `push_view` takes the adapter's view).
+        let mut r2_reasm = R2Reassembler::new_with_wire(wire);
         // The reassembler can only expire state it is asked about, and `push` is
         // reached only when a fragment arrives — so a peer that sends fragments
         // and then goes quiet (its connection stays alive on keepalives) would pin
@@ -2954,6 +3859,21 @@ pub(crate) async fn handle_conn(
                     Ok(d) => d,
                     Err(_) => break,
                 },
+                // rev3 reliable control plane: the control-stream task forwards
+                // the peer's rare messages here, because this task owns the
+                // reassembler and session table they act on. Disabled on rev2
+                // (its control plane is the CTL DATAGRAM, handled per frame).
+                msg = ctl_in_rx.recv(), if wire == Wire::Rev3 && ctl_in_open => match msg {
+                    Some(msg) => {
+                        handle_control_message(&ss, &r2, &mut r2_reasm, msg);
+                        continue;
+                    }
+                    None => {
+                        // Every control-stream task is gone (connection teardown).
+                        ctl_in_open = false;
+                        continue;
+                    }
+                },
                 _ = reasm_tick.tick(),
                     if reasm.held_bytes() > 0 || r2_reasm.held_bytes() > 0 =>
                 {
@@ -3006,6 +3926,36 @@ pub(crate) async fn handle_conn(
                 // `d` is already owned (from `read_datagram`), so payload slices borrow
                 // it directly: one refcount bump per slice, no extra clone per packet.
                 // (`decode_*_ref` borrows are shared, coexisting with `slice`.)
+                //
+                // rev3 connections dispatch **only** rev3 frames: the revision is
+                // fixed at the TLS/ALPN boundary, so a legacy MQP-2/3 frame here
+                // is a protocol violation, not a fallback. The first byte is
+                // classified exactly once and handed to the dispatcher.
+                if wire == Wire::Rev3 {
+                    match wire::kind(Wire::Rev3, &d) {
+                        Some(kind) => {
+                            handle_ingress_frame(
+                                &mut fast,
+                                &ss,
+                                &cd,
+                                conn_id,
+                                allow_private,
+                                &mut staged,
+                                &r2,
+                                &mut r2_reasm,
+                                Wire::Rev3,
+                                kind,
+                                d,
+                            )
+                            .await;
+                        }
+                        // Not an r3 frame class: counted refusal, never guessed.
+                        None => {
+                            dgram_drops::bump(&dgram_drops::REFUSED);
+                        }
+                    }
+                    continue;
+                }
                 if is_v3(&d) {
                     handle_v3_ingress(
                         &mut fast,
@@ -3020,12 +3970,14 @@ pub(crate) async fn handle_conn(
                     .await;
                     continue;
                 }
-                // MQP-3 rev2 frames are dispatched before the MQP-2 kinds: their
-                // first byte is `0x0X`, which no legacy decoder accepts (see
+                // rev2 frames are dispatched before the MQP-2 kinds: their first
+                // byte is `0x0X`, which no legacy decoder accepts (see
                 // `r2::is_r2`), so the two dispatch orders can never claim the
-                // same DATAGRAM. The gate inside buffers non-HELLO frames until HELLO.
-                if r2::is_r2(&d) {
-                    handle_r2_ingress(
+                // same DATAGRAM. `wire::kind` is the single classification; the
+                // legacy v2/v3 fallbacks above/below are rev2-connection-only and
+                // keep the shipped mixed-version behaviour byte-identical.
+                if let Some(kind) = wire::kind(Wire::Rev2, &d) {
+                    handle_ingress_frame(
                         &mut fast,
                         &ss,
                         &cd,
@@ -3034,6 +3986,8 @@ pub(crate) async fn handle_conn(
                         &mut staged,
                         &r2,
                         &mut r2_reasm,
+                        Wire::Rev2,
+                        kind,
                         d,
                     )
                     .await;
@@ -3329,17 +4283,39 @@ pub(crate) async fn handle_conn(
         // the header stage. Inside, the task trades the credit for the share
         // slot + process-wide stream permit before dialing (see
         // `handle_tcp_stream`).
-        tokio::spawn(handle_tcp_stream(
-            send,
-            recv,
-            header_credit,
-            header_share_permit,
-            streams_held.clone(),
-            share,
-            admitted,
-            allow_private,
-            stat_conn,
-        ));
+        if wire == Wire::Rev3 {
+            // rev3 multiplexes the reliable control stream and the TCP relay on
+            // the same bidi-stream space: the first byte decides. rev2 never
+            // sniffs it (its control plane is CTL DATAGRAMs), which keeps the
+            // shipped header read — and its bytes — unchanged.
+            tokio::spawn(dispatch_rev3_stream(
+                send,
+                recv,
+                header_credit,
+                header_share_permit,
+                streams_held.clone(),
+                share,
+                admitted,
+                allow_private,
+                stat_conn,
+                r2_state.clone(),
+                ctl_in_tx.clone(),
+            ));
+        } else {
+            tokio::spawn(handle_tcp_stream(
+                send,
+                recv,
+                header_credit,
+                header_share_permit,
+                streams_held.clone(),
+                share,
+                admitted,
+                allow_private,
+                stat_conn,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ));
+        }
     }
     Ok(())
 }

@@ -414,12 +414,11 @@ impl SharedEgress {
             match g.as_ref() {
                 // A rev2 generation is usable for UDP as soon as its state is
                 // published, **before** `CAPS`: the first payload is sent
-                // optimistically instead of waiting one HELLO/CAPS RTT. The
-                // server keeps the version gate authoritative by buffering
-                // these frames until a valid HELLO arrives, then flushing them;
-                // `CAPS` only updates the negotiated caps and the compression
-                // limits. `HELLO` itself is sent immediately by the reconnect
-                // loop, so the server-side buffer usually holds nothing.
+                // optimistically instead of waiting one HELLO/CAPS RTT. Phase 0
+                // removed the pre-HELLO buffer: the server dispatches rev2
+                // frames as they arrive (HELLO only triggers the CAPS answer),
+                // and `CAPS` only updates the negotiated caps and compression
+                // limits. On rev3 there is no HELLO/CAPS at all.
                 Some(c) if c.close_reason().is_none() => {
                     // Coherent pair: the rev2 state is re-checked against the
                     // still-published connection (see `ConnSlot::rev2_for`), so

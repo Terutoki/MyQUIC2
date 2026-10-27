@@ -32,10 +32,13 @@
 //!   associations' payloads into one cross-session `TRAIN dict`.
 use super::*;
 use bytes::Bytes;
+use myquic2::mqp::ctl_stream;
 use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{
     CtlState, FlowBinding, FlowIds, FlowRegistry, FlowState, R2_MAX_FLOWS_PER_CONN, SessionFlows,
 };
+use myquic2::mqp::r3::CtlMessage;
+use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::r2_frag::R2FragFlow;
 use myquic2::udp::{
     R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
@@ -44,10 +47,22 @@ use std::collections::VecDeque;
 
 /// Retry cadence for `CTL HELLO` until `CAPS` arrives.
 pub(crate) const HELLO_RETRY: Duration = Duration::from_millis(200);
-/// Hard cap on the `HELLO`/`CAPS` handshake. A server that never answers is not
-/// a rev2 peer: the caller closes the connection and the redial loop retries,
-/// which is the spec's fail-fast rule (no silent old-wire fallback).
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Slow `HELLO` retry cadence once the fast window below has elapsed.
+///
+/// The server re-sends `CAPS` for a repeated `HELLO` (rate-limited to one per
+/// 100 ms), so one more `HELLO` two seconds later recovers a lost `CAPS`
+/// without ever taking the connection down (W2).
+pub(crate) const HELLO_RETRY_SLOW: Duration = Duration::from_secs(2);
+/// Bounded window of the **fast** (`HELLO_RETRY`) `HELLO` cadence.
+///
+/// It bounds only how long the initial negotiation is retried eagerly; it is
+/// not a connection deadline. A missing or late `CAPS` after this window keeps
+/// the connection alive and the retry continues in the background at
+/// [`HELLO_RETRY_SLOW`] (W2): `CAPS` only tunes limits — the live frame limit
+/// falls back to the connection's DATAGRAM budget ([`ConnRev2::frame_limit`])
+/// and the stager keeps the codec's train bound — so there is no data-path
+/// state that needs it.
+pub(crate) const HELLO_FAST_WINDOW: Duration = Duration::from_secs(2);
 
 /// Bounded set of server-closed sessions recorded for an association to
 /// consume.
@@ -115,6 +130,13 @@ pub(crate) struct ConnRev2 {
     /// Unique per dial. An association resets its [`UplinkFlows`] when the
     /// epoch of the handle it is about to send on changes.
     pub(crate) epoch: u64,
+    /// Application-layer wire revision of this connection.
+    ///
+    /// Chosen by configuration + ALPN for the whole connection (never sniffed
+    /// from a frame). [`Wire::Rev2`] is the default so every existing
+    /// construction keeps the shipped behaviour; rev3 changes the codec, the
+    /// no-ACK sender policy and the control plane (see [`Self::new_with_wire`]).
+    wire: Wire,
     /// `wire_id -> Arc<FlowBinding>` for both directions on this connection.
     /// The uplink inserts newly opened flows; the dispatcher resolves
     /// compressed downlink frames through it. Ids are never reused while the
@@ -128,10 +150,11 @@ pub(crate) struct ConnRev2 {
     pub(crate) ctl: CtlState,
     /// `true` once a `CAPS` with the rev2 wire version was received. This is
     /// **not** a UDP usability gate: the first payload may be sent
-    /// optimistically before `CAPS` (the server buffers pre-HELLO frames until
-    /// the version gate opens). `CAPS` only replaces the boot limits with the
-    /// peer's negotiated caps and enables the peer-advertised compression
-    /// limits; the reconnect loop still treats a missing/wrong CAPS as fatal.
+    /// optimistically before `CAPS` (Phase 0 removed the pre-HELLO buffer; the
+    /// server dispatches frames as they arrive). `CAPS` only replaces the boot
+    /// limits with the peer's negotiated caps and enables the peer-advertised
+    /// compression limits; a missing/late CAPS is non-fatal, only an explicit
+    /// wrong-version CAPS (or a dead connection) closes the dial.
     ready: std::sync::atomic::AtomicBool,
     /// `CAPS.max_frame_bytes` (`0` = not negotiated), the peer's one-frame
     /// cap. The live limit for every rev2 send is `min(conn budget, this)`,
@@ -163,10 +186,25 @@ pub(crate) struct ConnRev2 {
     /// which is ordinary UDP loss. Updated with `Relaxed`: the caller treats
     /// `false` as "not closed on this datagram" and re-checks on the next sync.
     closed_len: std::sync::atomic::AtomicUsize,
-    /// Targets the server rejected with `CTL FLOW_REJECT`, with their window
-    /// start and reason-selected TTL (see [`REJECT_TTL_TRANSIENT_MS`] /
-    /// [`REJECT_TTL_POLICY_MS`]).
+    /// Targets the server rejected with `CTL FLOW_REJECT` / rev3 `REJECT`,
+    /// with their window start and reason-selected TTL (see
+    /// [`REJECT_TTL_TRANSIENT_MS`] / [`REJECT_TTL_POLICY_MS`]).
     rejected: parking_lot::RwLock<Vec<RejectedTarget>>,
+    /// rev3 outbound control messages: the generation's control-stream task
+    /// owns the stream and accepts messages here (see [`Self::send_ctl`]).
+    /// `None` on rev2 and until the dispatcher installs the writer.
+    ctl_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CtlMessage>>>,
+    /// Sender-side rate budget for `NEED_CONTEXT` repairs: one hostile/broken
+    /// peer can otherwise make an unknown-id frame storm turn into a control
+    /// stream storm (the receiver-side [`ctl_stream::CtlRate`] bounds the
+    /// opposite direction).
+    ctx_repair_rate: parking_lot::Mutex<ctl_stream::CtlRate>,
+    /// Memo of "this connection's handshake completed" (see
+    /// [`Self::is_handshake_done`]). Only rev3 consults it: a payload sent on a
+    /// not-yet-handshaked connection is 0-RTT early data whose DATAGRAMs QUIC
+    /// may discard wholesale on a rejected resumption, so it must not spend the
+    /// no-ACK binding-context budget.
+    handshake_done: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ConnRev2 {
@@ -175,6 +213,7 @@ impl std::fmt::Debug for ConnRev2 {
         // the whole primitive.
         f.debug_struct("ConnRev2")
             .field("epoch", &self.epoch)
+            .field("wire", &self.wire)
             .field("registry_len", &self.registry.len())
             .field("ids_allocated", &self.ids.allocated())
             .field("ready", &self.is_ready())
@@ -184,37 +223,173 @@ impl std::fmt::Debug for ConnRev2 {
 }
 
 impl ConnRev2 {
-    /// Fresh state for one dial.
+    /// Fresh state for one dial on the shipped rev2 wire.
+    ///
+    /// This constructor is the unchanged default: [`Wire::Rev2`],
+    /// `HELLO`/`CAPS` negotiation, `FLOW_ACK`-gated compression and the CTL
+    /// DATAGRAM control plane. The reconnect path selects the configured
+    /// revision explicitly through [`Self::new_with_wire`]; this is the
+    /// documented rev2 default/rollback entry point, kept for fixtures and the
+    /// rollback contract.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new() -> Arc<Self> {
-        Self::with_stager(R2Stager::new())
+        Self::with_stager(R2Stager::new(), Wire::Rev2)
+    }
+
+    /// Fresh state for one dial on `wire`.
+    ///
+    /// Rev3 has no `HELLO`/`CAPS`: the revision comes from configuration (ALPN
+    /// defaults to the shared `h3` label for both revisions, so it is not a
+    /// version gate by default) and the caps are the static [`Wire::caps`]
+    /// contract, so the state comes up **ready** with the
+    /// default frame limit and the codec's own train bound (the data path never
+    /// waited for `CAPS` on rev2 either — this merely skips the negotiation).
+    /// The stager is constructed for the same wire so every encoded frame matches
+    /// the connection.
+    // The wiring task (config/ALPN plumbing, client/auth.rs) flips the default
+    // constructor to this one; until then only tests exercise the rev3 path, so
+    // a non-test client build sees it as unused.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_wire(wire: Wire) -> Arc<Self> {
+        Self::with_stager(R2Stager::new_with_wire(wire), wire)
     }
 
     /// Test seam: the same state with an explicitly sized stager queue, so a
     /// unit test can provoke the queue-full policy without 1024 pushed items.
     #[cfg(test)]
     pub(crate) fn with_stager_capacity(items: usize, bytes: usize) -> Arc<Self> {
-        Self::with_stager(R2Stager::with_capacity(items, bytes))
+        Self::with_stager(R2Stager::with_capacity(items, bytes), Wire::Rev2)
     }
 
-    fn with_stager(stager: R2Stager) -> Arc<Self> {
+    fn with_stager(mut stager: R2Stager, wire: Wire) -> Arc<Self> {
+        stager.set_wire(wire);
+        // rev3's static contract: ready immediately, default frame limit. rev2
+        // stays not-ready until `CAPS` (behaviour unchanged).
+        let static_caps = wire == Wire::Rev3;
         Arc::new(Self {
             epoch: NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            wire,
             registry: FlowRegistry::new(R2_MAX_FLOWS_PER_CONN),
             ids: FlowIds::new(false),
             ctl: CtlState::new(),
-            ready: std::sync::atomic::AtomicBool::new(false),
-            max_frame_bytes: std::sync::atomic::AtomicU16::new(0),
+            ready: std::sync::atomic::AtomicBool::new(static_caps),
+            max_frame_bytes: std::sync::atomic::AtomicU16::new(if static_caps {
+                r2::R2_DEFAULT_MAX_FRAME_BYTES
+            } else {
+                0
+            }),
             stager: Arc::new(parking_lot::Mutex::new(stager)),
             closed_sessions: parking_lot::RwLock::new(VecDeque::new()),
             closed_len: std::sync::atomic::AtomicUsize::new(0),
             rejected: parking_lot::RwLock::new(Vec::new()),
+            ctl_tx: parking_lot::Mutex::new(None),
+            ctx_repair_rate: parking_lot::Mutex::new(ctl_stream::CtlRate::default_budget()),
+            handshake_done: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Application-layer wire revision of this connection.
+    #[must_use]
+    pub(crate) fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    /// Whether `conn`'s QUIC/TLS handshake has completed, memoized once seen.
+    ///
+    /// rev3 uses this to decide whether a payload may spend a binding's no-ACK
+    /// context budget. A payload sent before the handshake completes can ride
+    /// as 0-RTT early data, and QUIC **discards** early DATAGRAMs wholesale when
+    /// the server rejects early data (a restarted server rejects the
+    /// resumption): there is no app-level retransmission. Spending the 2-frame
+    /// context budget on such a payload would leave the sender self-confirmed
+    /// (`FlowBinding::take_context_slot` marks it open) on a binding the
+    /// receiver never installed, so every later payload would be an
+    /// unresolvable steady frame — exactly the "held datagram across a server
+    /// restart leaves a persistent peer blackholed" regression.
+    ///
+    /// Once the handshake is known complete this is one relaxed load. Before
+    /// that it costs one `quinn::Connection::handshake_data` probe per payload
+    /// on the early-data path only (a payload on an open binding never asks);
+    /// that path is at most the 0-RTT window of a dial, or a dead-egress
+    /// outage.
+    #[must_use]
+    pub(crate) fn is_handshake_done(&self, conn: &quinn::Connection) -> bool {
+        if self
+            .handshake_done
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        if conn.handshake_data().is_some() {
+            self.handshake_done
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Install the generation's rev3 control-stream writer.
+    ///
+    /// Called synchronously by the dispatcher when it spawns the generation's
+    /// control task, before any inbound datagram is handled — so a repair or a
+    /// close queued from then on always has a writer. Rev2 never installs one.
+    pub(crate) fn install_ctl_writer(&self, tx: tokio::sync::mpsc::UnboundedSender<CtlMessage>) {
+        *self.ctl_tx.lock() = Some(tx);
+    }
+
+    /// Queue one rev3 control message for the reliable control stream.
+    ///
+    /// Non-blocking by design: the packet path (dispatcher, association exit)
+    /// must never await an I/O write. The generation's control task owns the
+    /// stream and writes messages in queue order; QUIC supplies reliability, so
+    /// there is no app-level repeat. `false` means no writer is installed (rev2,
+    /// or the generation's dispatcher has not run) or the task is gone; callers
+    /// treat it as a dropped (idempotent) message.
+    pub(crate) fn send_ctl(&self, msg: CtlMessage) -> bool {
+        if self.wire != Wire::Rev3 {
+            return false;
+        }
+        self.ctl_tx
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| tx.send(msg).is_ok())
+    }
+
+    /// Ask the peer to re-send binding context for `wire_id` (rev3 no-ACK
+    /// repair), rate-limited per connection.
+    ///
+    /// A steady frame for an id the receiver never installed is the only
+    /// recovery signal under the no-ACK policy: the receiver drops the frame
+    /// and asks once (bounded by [`ctl_stream::CtlRate`]), instead of a control
+    /// frame storm for a peer that keeps sending unknown ids.
+    pub(crate) fn send_need_context(&self, wire_id: u32) -> bool {
+        if self.wire != Wire::Rev3 {
+            return false;
+        }
+        let Some(fid) = wire::fid_for(wire_id) else {
+            return false;
+        };
+        if !self.ctx_repair_rate.lock().allow(coarse_millis()) {
+            return false;
+        }
+        let sent = self.send_ctl(CtlMessage::NeedContext { fid });
+        if sent {
+            counters::need_context_tx();
+        }
+        sent
     }
 
     /// Record a decoded `CAPS`. Only `wire_ver == 2` makes the connection
     /// usable; any other version stays not-ready and the handshake loop closes
     /// the connection (fail-fast, no old-wire fallback).
+    ///
+    /// rev3 has no `CAPS` at all (a CTL DATAGRAM is never acted on there), so
+    /// this is a rev2-only entry point in practice.
     pub(crate) fn on_caps(&self, caps: r2::Caps) {
+        if self.wire != Wire::Rev2 {
+            return;
+        }
         self.ctl.set_caps(caps);
         counters::caps_rx();
         if caps.wire_ver != r2::R2_WIRE_VER {
@@ -463,25 +638,39 @@ impl ConnRev2 {
 
 /// `CTL HELLO`/`CAPS` handshake for one freshly published connection.
 ///
-/// Sends `HELLO` immediately, then once per [`HELLO_RETRY`] until the
-/// dispatcher stores a `CAPS` (see [`ConnRev2::on_caps`]) or
-/// [`HANDSHAKE_TIMEOUT`] expires. UDP payloads are not blocked on this
-/// function: the egress cache publishes the generation right after the state
-/// is set, and the server buffers pre-HELLO frames until the gate opens. A `CAPS` for a different wire version fails
-/// immediately: waiting out the timeout would only delay the mandated redial.
-/// `false` means the caller must close the connection.
-pub(crate) async fn handshake(conn: &quinn::Connection, rev2: &ConnRev2) -> bool {
-    handshake_with(conn, rev2, HANDSHAKE_TIMEOUT, HELLO_RETRY).await
+/// Sends `HELLO` immediately, then once per [`HELLO_RETRY`] for at most
+/// [`HELLO_FAST_WINDOW`]. UDP payloads are not blocked on this function: the
+/// egress cache publishes the generation right after the state is set, and the
+/// server buffers pre-HELLO frames until the gate opens.
+///
+/// **A missing/late `CAPS` is not a connection failure (W2).** When the fast
+/// window elapses without `CAPS`, a background task keeps advertising `HELLO`
+/// at [`HELLO_RETRY_SLOW`] for the connection's life and this function returns
+/// `true`: the connection is live and fully usable without negotiated caps (see
+/// [`HELLO_FAST_WINDOW`]). `false` therefore means only the two definitive
+/// failures: a `CAPS` that explicitly names another wire version (the mandated
+/// fail-fast, no silent old-wire fallback), or a connection that died while
+/// `HELLO` was being sent.
+pub(crate) async fn handshake(conn: &quinn::Connection, rev2: &Arc<ConnRev2>) -> bool {
+    handshake_with(conn, rev2, HELLO_FAST_WINDOW, HELLO_RETRY, HELLO_RETRY_SLOW).await
 }
 
-/// Testable form of [`handshake`] with explicit timing (keeps the 2 s
-/// production budget out of the unit tests).
+/// Testable form of [`handshake`] with explicit timing (keeps the 2 s/200 ms/
+/// 2 s production cadences out of the unit tests).
 pub(crate) async fn handshake_with(
     conn: &quinn::Connection,
-    rev2: &ConnRev2,
-    timeout: Duration,
+    rev2: &Arc<ConnRev2>,
+    fast_window: Duration,
     retry: Duration,
+    slow_retry: Duration,
 ) -> bool {
+    // rev3 has no `HELLO`/`CAPS`: ALPN selected the revision at the TLS
+    // handshake, the caps are the static `Wire::caps` contract and the state is
+    // ready as soon as it is published (0-RTT included). No HELLO byte is sent.
+    if rev2.wire() == Wire::Rev3 {
+        counters::handshake_ok();
+        return true;
+    }
     let start = tokio::time::Instant::now();
     loop {
         let hello = r2::encode_ctl(&r2::Ctl::Hello {
@@ -502,20 +691,75 @@ pub(crate) async fn handshake_with(
             counters::handshake_ok();
             return true;
         }
-        if rev2
-            .ctl
-            .caps()
-            .is_some_and(|c| c.wire_ver != r2::R2_WIRE_VER)
-        {
+        if caps_wrong_version(rev2) {
             counters::handshake_fail();
             return false;
         }
-        if start.elapsed() >= timeout {
-            counters::handshake_fail();
-            return false;
+        if start.elapsed() >= fast_window {
+            // W2: never tear down a live connection for a missing/late CAPS.
+            // Hand the (much slower) retry to a background task and report the
+            // connection as usable; the task keeps the negotiation alive and
+            // still fails fast on an explicit wrong-version answer.
+            counters::handshake_slow();
+            spawn_hello_retry(conn.clone(), rev2.clone(), slow_retry);
+            return true;
         }
         tokio::time::sleep(retry).await;
     }
+}
+
+/// Whether a decoded `CAPS` names a wire version other than this client's.
+///
+/// The only definitive mismatch: a server that explicitly answered another
+/// version can never be a rev2 peer, so it is the one case that still fails
+/// fast (W2 keeps a *missing* `CAPS` non-fatal).
+fn caps_wrong_version(rev2: &ConnRev2) -> bool {
+    rev2.ctl
+        .caps()
+        .is_some_and(|c| c.wire_ver != r2::R2_WIRE_VER)
+}
+
+/// Continue `HELLO` after the fast window without ever closing a live
+/// connection (W2).
+///
+/// Stops on `CAPS` (counted as a late handshake success), on connection death,
+/// or after closing a connection that answered another wire version. The task
+/// holds a `Connection` clone for at most one slow-retry interval past death;
+/// `close_reason` is checked before every send, so it cannot outlive the
+/// generation meaningfully.
+fn spawn_hello_retry(conn: quinn::Connection, rev2: Arc<ConnRev2>, slow_retry: Duration) {
+    tokio::spawn(async move {
+        let hello = r2::encode_ctl(&r2::Ctl::Hello {
+            wire_ver: r2::R2_WIRE_VER,
+            flags: 0,
+        });
+        loop {
+            if rev2.is_ready() {
+                counters::handshake_ok();
+                return;
+            }
+            if caps_wrong_version(&rev2) {
+                // Fail-fast is preserved for an explicit version answer, even
+                // after the fast window: closing here is the same verdict the
+                // foreground loop would have produced.
+                counters::handshake_fail();
+                conn.close(0u32.into(), b"rev2 wire version");
+                return;
+            }
+            if conn.close_reason().is_some() {
+                return;
+            }
+            match try_send_datagram(&conn, hello.clone()) {
+                DatagramSend::Sent | DatagramSend::Blocked | DatagramSend::TooLarge => {
+                    counters::hello_tx();
+                }
+                // No peer left to negotiate with; the reconnect loop owns the
+                // redial, so this only ends the retry.
+                DatagramSend::ConnectionLost | DatagramSend::Unsupported => return,
+            }
+            tokio::time::sleep(slow_retry).await;
+        }
+    });
 }
 
 /// Best-effort rev2 control frame on `conn`.
@@ -597,6 +841,22 @@ pub(crate) fn send_sess_close(
         }
     }
 
+    // rev3: the exit signal is one `ASSOC_CLOSE` on the reliable control
+    // stream (QUIC retransmits it, so the rev2 best-effort x3 repeat and its
+    // `is_ready` gate are gone), and no DATAGRAM is sent.
+    if reached
+        .as_ref()
+        .is_some_and(|rev2| rev2.wire() == Wire::Rev3)
+    {
+        if reached
+            .as_ref()
+            .is_some_and(|rev2| rev2.send_ctl(CtlMessage::AssocClose { sess, reason: 0 }))
+        {
+            counters::assoc_close_tx();
+        }
+        return;
+    }
+
     // The SESS_CLOSE itself: three datagrams on the association's current
     // egress connection, exactly as the spec's control plane asks.
     let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess, reason: 0 });
@@ -643,7 +903,8 @@ pub(crate) fn send_sess_close(
 /// The ready-to-send queue is **not** association-local any more: Phase 2 moved
 /// small-payload staging to the connection's [`ConnRev2::stager`], so one drain
 /// can pack payloads from several associations into one cross-session `TRAIN
-/// dict`. This struct keeps only the per-session routing state.
+/// dict`. This struct keeps only the per-session routing state plus the
+/// bounded queue-until-publish hold ([`UplinkPending`], W3).
 pub(crate) struct UplinkFlows {
     pub(crate) flows: SessionFlows,
     /// Connection epoch the current `flows` belong to.
@@ -661,6 +922,9 @@ pub(crate) struct UplinkFlows {
     /// became `Closed` fails the check here, so a later `FLOW_CLOSE`/session
     /// teardown is honoured even though the registry side already dropped it.
     pub(crate) last: Option<(TargetAddr, Arc<FlowBinding>)>,
+    /// Payloads held while no egress connection exists, bounded and flushed in
+    /// order once a fresh handle appears (W3: queue-until-publish).
+    pending: UplinkPending,
 }
 
 impl UplinkFlows {
@@ -669,6 +933,7 @@ impl UplinkFlows {
             flows: SessionFlows::new(),
             epoch: 0,
             last: None,
+            pending: UplinkPending::default(),
         }
     }
 
@@ -702,6 +967,345 @@ impl UplinkFlows {
             counters::session_reset();
         }
     }
+
+    /// Number of payloads currently held for a fresh egress handle (W3).
+    #[must_use]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether any payload is held for a fresh egress handle (W3). One branch
+    /// on the per-datagram path; the hold is empty in every steady state.
+    #[must_use]
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Hold `payload` until a fresh egress handle appears (W3).
+    ///
+    /// Returns `false` when the bounded hold is full (item or byte bound). The
+    /// caller then drops the payload and books it exactly as the pre-W3 path
+    /// did: drop **newest** past the bound, never the oldest, because the head
+    /// of a burst is what a request/response protocol (DNS/STUN/game
+    /// handshake) is waiting for.
+    pub(crate) fn hold_pending(&mut self, target: &TargetAddrRef<'_>, payload: &[u8]) -> bool {
+        self.push_pending(target, payload, mono_millis())
+    }
+
+    /// Test seam: [`Self::hold_pending`] with an explicit enqueue stamp, so the
+    /// bounded TTL can be exercised without sleeping for it.
+    #[cfg(test)]
+    pub(crate) fn hold_pending_at(
+        &mut self,
+        target: &TargetAddrRef<'_>,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> bool {
+        self.push_pending(target, payload, now_ms)
+    }
+
+    /// Shared body of [`Self::hold_pending`] / [`Self::hold_pending_at`].
+    fn push_pending(&mut self, target: &TargetAddrRef<'_>, payload: &[u8], now_ms: u64) -> bool {
+        if !self.pending.try_push(target, payload, now_ms) {
+            return false;
+        }
+        counters::egress_queued();
+        true
+    }
+
+    /// Age out held payloads past [`PENDING_TTL_MS`] (W3).
+    ///
+    /// Each dropped payload is booked as a `NO_EGRESS` loss: it was held
+    /// precisely because no egress connection existed, and once the bounded
+    /// window passes that loss is final — delivering a stale UDP datagram is
+    /// worse than losing it. Returns how many were dropped.
+    pub(crate) fn expire_pending(&mut self) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        self.expire_pending_stamped(mono_millis())
+    }
+
+    /// Test seam: [`Self::expire_pending`] against an explicit clock, so the
+    /// TTL can be exercised without a 500 ms sleep.
+    #[cfg(test)]
+    pub(crate) fn expire_pending_at(&mut self, now_ms: u64) -> usize {
+        self.expire_pending_stamped(now_ms)
+    }
+
+    fn expire_pending_stamped(&mut self, now_ms: u64) -> usize {
+        let n = self.pending.expire(now_ms);
+        if n != 0 {
+            book_hold_loss(n, "hold window elapsed");
+        }
+        n
+    }
+
+    /// Drop every held payload (association exit / peer-session teardown).
+    ///
+    /// Never silent: an exiting association's held payloads are as gone as a
+    /// dead connection's stager items, so they are booked the same way.
+    pub(crate) fn clear_pending(&mut self) -> usize {
+        let n = self.pending.clear();
+        if n != 0 {
+            book_hold_loss(n, "association exit");
+        }
+        n
+    }
+}
+
+/// Bound on payloads held per association while no egress connection exists
+/// (W3). Sixty-four is the codec's train bound: one hold's worth fits exactly
+/// one full cross-session `TRAIN dict` once it is flushed through the normal
+/// path.
+pub(crate) const PENDING_MAX_ITEMS: usize = 64;
+
+/// Byte bound on the W3 hold (payload bytes only; the target/`Bytes` headers
+/// add a few dozen bytes per item). Bounds the worst-case copy an outage can
+/// make: a high-rate app during a dead-egress window pays at most one hold's
+/// worth of `Bytes` allocations, after which new datagrams are dropped exactly
+/// as before.
+pub(crate) const PENDING_MAX_BYTES: usize = 64 * 1024;
+
+/// How long a held payload may wait for a fresh egress handle (W3).
+///
+/// UDP delivery is only useful while the datagram is fresh (DNS/STUN/gaming
+/// clients retransmit on their own timers, and a proxy-delivered stale datagram
+/// is worse than a drop: it can reorder against the client's retry). Half a
+/// second covers the cold-start publish window and the common
+/// death→backoff→re-dial→publish reconnect path; longer outages fall back to
+/// the pre-W3 fail-closed loss, which is the documented `udp_fail_closed`
+/// semantics.
+pub(crate) const PENDING_TTL_MS: u64 = 500;
+
+/// Poll cadence of the association's pending-flush timer (W3).
+///
+/// The timer branch is armed only while the hold is non-empty, so a healthy
+/// association pays nothing; during an outage it bounds how long a flushed
+/// generation can sit unnoticed to one tick (plus the expiry check).
+pub(crate) const PENDING_FLUSH_TICK: Duration = Duration::from_millis(100);
+
+/// One payload waiting for an egress handle (W3).
+struct HeldPayload {
+    target: TargetAddr,
+    payload: Bytes,
+    enqueued_ms: u64,
+}
+
+/// Book `n` held payloads that aged out without being sent: one `NO_EGRESS`
+/// loss each (the reason they were held), the stale-hold counter, and one
+/// rate-limited warning naming the hold. Only ever called on the no-egress
+/// path. The other drop reason — the hold was already at its bound — is booked
+/// where the payload is refused, in `send_payload_uplink`.
+fn book_hold_loss(n: usize, reason: &'static str) {
+    let mut total = 0;
+    for _ in 0..n {
+        total = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+        counters::egress_hold_stale();
+    }
+    dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, total, || {
+        format!("; {n} held datagram(s) dropped ({reason})")
+    });
+}
+
+/// Bounded per-association queue of payloads whose egress connection was not
+/// available (W3: queue-until-publish).
+///
+/// Before W3 every such payload was dropped (`NO_EGRESS`), which made a
+/// reconnect — and the cold-start window before the first egress publish — a
+/// total-loss window: a one-shot DNS query/STUN binding/game handshake waited
+/// for the app's own multi-second retransmission, and a burst lost every
+/// datagram after the first. This hold converts that into "delivered when a
+/// fresh handle appears", bounded three ways so UDP semantics are preserved:
+///
+/// * [`PENDING_MAX_ITEMS`] items / [`PENDING_MAX_BYTES`] payload bytes: past
+///   either bound the **newest** payload is refused (drop-newest, exactly
+///   quinn's DATAGRAM-buffer policy), because the oldest datagrams of a burst
+///   are the ones a request/response protocol is waiting for;
+/// * [`PENDING_TTL_MS`]: a payload is only delivered while it is fresh; an
+///   expired one is dropped and accounted as `NO_EGRESS` on the next flush
+///   attempt, never delivered late;
+/// * the flush is FIFO and re-enters the normal [`send_uplink`] path, so
+///   per-target ordering is preserved and no encoder/id state is duplicated
+///   here.
+///
+/// Payload bytes are copied on the hold path only (where the alternative is a
+/// drop) and only up to the byte bound. The hold is per association (not
+/// process-wide) so an exiting association takes its own payloads with it and
+/// no cross-session encoding state is involved.
+#[derive(Default)]
+struct UplinkPending {
+    items: VecDeque<HeldPayload>,
+    bytes: usize,
+}
+
+impl UplinkPending {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Push one payload, or refuse it (`false`) when at either bound.
+    fn try_push(&mut self, target: &TargetAddrRef<'_>, payload: &[u8], now_ms: u64) -> bool {
+        if self.items.len() >= PENDING_MAX_ITEMS
+            || self.bytes.saturating_add(payload.len()) > PENDING_MAX_BYTES
+        {
+            return false;
+        }
+        self.bytes += payload.len();
+        self.items.push_back(HeldPayload {
+            target: target.into_owned(),
+            payload: Bytes::copy_from_slice(payload),
+            enqueued_ms: now_ms,
+        });
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<HeldPayload> {
+        let item = self.items.pop_front()?;
+        self.bytes -= item.payload.len();
+        Some(item)
+    }
+
+    /// Return a payload that was not sent (dead handle) to the head of the
+    /// FIFO, so order survives a flush that aborted mid-way.
+    fn push_front(&mut self, item: HeldPayload) {
+        self.bytes += item.payload.len();
+        self.items.push_front(item);
+    }
+
+    /// Drop the payloads older than [`PENDING_TTL_MS`] and return how many.
+    /// FIFO insertion order means the head is always the oldest.
+    fn expire(&mut self, now_ms: u64) -> usize {
+        let mut n = 0;
+        while let Some(front) = self.items.front() {
+            if now_ms.saturating_sub(front.enqueued_ms) < PENDING_TTL_MS {
+                break;
+            }
+            let item = self.items.pop_front().expect("front was just observed");
+            self.bytes -= item.payload.len();
+            n += 1;
+        }
+        n
+    }
+
+    fn clear(&mut self) -> usize {
+        let n = self.items.len();
+        self.items.clear();
+        self.bytes = 0;
+        n
+    }
+}
+
+/// Flush held payloads onto an already-resolved egress handle (W3).
+///
+/// FIFO order through the normal [`send_uplink`] path, so a held payload
+/// re-enters exactly the encoding/id state machine a fresh datagram does (it is
+/// not replayed as a special frame, and a generation bump re-`OPEN`s flows the
+/// same way). The aggregate verdict is returned for the caller's shared
+/// recovery.
+///
+/// A `ConnectionLost`/`Unsupported` verdict means the in-flight payload never
+/// left: it goes back to the head of the hold and the flush stops, so it and
+/// everything behind it can still go out on the next generation within their
+/// TTL. `Blocked`/`TooLarge` were already booked where they were decided (the
+/// send path's own drop accounting) and only lose that one payload.
+fn flush_pending_on(
+    conn: &quinn::Connection,
+    limit: usize,
+    sess: u32,
+    bind: UdpBind,
+    rev2: &ConnRev2,
+    up: &mut UplinkFlows,
+    frag: &mut R2Fragmenter,
+) -> PayloadSend {
+    let mut aggregate = PayloadSend {
+        frames: 0,
+        failed: None,
+    };
+    while let Some(item) = up.pending.pop_front() {
+        let sent = send_uplink(
+            conn,
+            limit,
+            sess,
+            &item.target.as_ref(),
+            &item.payload,
+            bind,
+            rev2,
+            up,
+            frag,
+        );
+        aggregate = PayloadSend {
+            frames: aggregate.frames.saturating_add(sent.frames),
+            failed: prefer_severe(aggregate, sent).failed,
+        };
+        match sent.failed {
+            Some(DatagramSend::ConnectionLost | DatagramSend::Unsupported) => {
+                up.pending.push_front(item);
+                break;
+            }
+            _ => counters::egress_flushed(),
+        }
+    }
+    aggregate
+}
+
+/// Try to publish everything held for `bind` into the current egress handle
+/// (W3 flush trigger).
+///
+/// Called from the association's per-datagram send path *before* the current
+/// payload (so the hold keeps FIFO order across the boundary), from its
+/// pending-flush tick, and from the exit path. Returns `true` when the hold is
+/// empty afterwards (flushed or expired), `false` when no egress handle exists
+/// yet or the flush hit a dead one.
+///
+/// Resolution mirrors the send path's miss arm exactly (memo hit, then
+/// [`SharedEgress::acquire`] + memo store): a flush publishes on the same
+/// single-flight gate as a datagram and cannot bypass the class-isolation
+/// rules. It deliberately does **not** consult `CAPS`/`is_ready()` — an
+/// optimistic pre-`CAPS` (0-RTT) generation is publishable and usable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flush_pending_uplink(
+    egress: &SharedEgress,
+    pool: &ConnPool,
+    sess: u32,
+    bind: UdpBind,
+    up: &mut UplinkFlows,
+    frag: &mut R2Fragmenter,
+    now: u64,
+) -> bool {
+    if up.pending.is_empty() {
+        return true;
+    }
+    up.expire_pending();
+    if up.pending.is_empty() {
+        return true;
+    }
+    let sent = match egress.with_fresh(bind, now, |c, limit, rev2| {
+        let limit = rev2.frame_limit(limit);
+        flush_pending_on(c, limit, sess, bind, rev2, up, frag)
+    }) {
+        Some(sent) => sent,
+        None => {
+            // Generation read before the cached read, the contract the
+            // per-datagram miss path documents.
+            let generation =
+                egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+            match egress.acquire(pool, bind, now) {
+                Some(h) => {
+                    egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+                    let limit = h.rev2.frame_limit(h.limit);
+                    flush_pending_on(&h.conn, limit, sess, bind, &h.rev2, up, frag)
+                }
+                None => return false,
+            }
+        }
+    };
+    recover_send_outcome(egress, bind, sent);
+    up.pending.is_empty()
 }
 
 /// Uplink one SOCKS5 UDP payload of any size on the MQP-3 rev2 wire.
@@ -747,6 +1351,10 @@ pub(crate) fn send_uplink(
     // (spec §7.2/§2.3) key on it.
     let _ = bind;
     up.sync(rev2, sess);
+    // The fragmenter is per association but the wire is per connection: pin it
+    // on every send (cheap `Copy` field store) so a reconnect onto another
+    // revision re-encodes fragments correctly, and rev2 keeps identical bytes.
+    frag.set_wire(rev2.wire());
     let limit = rev2.frame_limit(limit);
     // An address that cannot be encoded can never be put on the wire. The
     // legacy fragmenter reported exactly this as a `TooLarge` drop and that is
@@ -761,7 +1369,17 @@ pub(crate) fn send_uplink(
             let drained = drain_conn_stage(rev2, conn, limit);
             return prefer_severe(
                 drained,
-                send_standalone(conn, limit, sess, addr, payload, None, frag),
+                send_standalone(
+                    conn,
+                    limit,
+                    sess,
+                    addr,
+                    payload,
+                    None,
+                    frag,
+                    rev2.wire(),
+                    false,
+                ),
             );
         }
         let item = R2StageItem {
@@ -775,17 +1393,22 @@ pub(crate) fn send_uplink(
         };
         return stage_or_count(rev2, conn, limit, item);
     };
+    // Binding form or steady frame for this payload. rev2: ACK-gated
+    // (`Opening` repeats OPEN). rev3: self-confirming, the first
+    // `R3_CONTEXT_REPEATS` payloads carry context and the last one marks the
+    // binding open locally (a `NEED_CONTEXT` repair re-arms it).
+    let context = uses_binding_context(rev2, &binding, rev2.is_handshake_done(conn));
     if payload.len() <= BATCH_SMALL_MAX {
-        let kind = if binding.is_open() {
-            R2StageKind::Steady {
-                wire_id: binding.wire_id,
-            }
-        } else {
+        let kind = if context {
             R2StageKind::Open {
                 wire_id: binding.wire_id,
                 sess,
                 addr: addr.into_owned(),
                 src: false,
+            }
+        } else {
+            R2StageKind::Steady {
+                wire_id: binding.wire_id,
             }
         };
         let item = R2StageItem {
@@ -800,8 +1423,51 @@ pub(crate) fn send_uplink(
     let drained = drain_conn_stage(rev2, conn, limit);
     prefer_severe(
         drained,
-        send_standalone(conn, limit, sess, addr, payload, Some(&binding), frag),
+        send_standalone(
+            conn,
+            limit,
+            sess,
+            addr,
+            payload,
+            Some(&binding),
+            frag,
+            rev2.wire(),
+            context,
+        ),
     )
+}
+
+/// Whether this payload must carry the binding form for `binding`.
+///
+/// * rev2 keeps the shipped ACK-gated rule: `Opening` sends `DATA OPEN` until a
+///   `FLOW_ACK` (or a compressed downlink) moves the binding to `Open`.
+/// * rev3 has no per-flow ACK: [`FlowBinding::take_context_slot`] hands out the
+///   first [`myquic2::mqp::r2_flow::R3_CONTEXT_REPEATS`] context frames and
+///   marks the binding open on the last one, so steady frames start on payload
+///   three of a fresh flow with no round trip and no ACK wait. The slot is
+///   consumed exactly once per payload, so a dropped payload only shortens the
+///   redundancy (a receiver that still misses the binding repairs with
+///   `NEED_CONTEXT`).
+/// * rev3 **early-data rule**: a payload sent before the connection's handshake
+///   completes is 0-RTT data and may be discarded without retransmission (a
+///   rejected resumption drops every early DATAGRAM). Such a payload therefore
+///   always carries the binding form and never spends the context budget — the
+///   same free redundancy rev2 gets from repeating `OPEN` until an ACK. Once
+///   `handshake_done` is true the normal K=2 window runs, so even if the whole
+///   early window was lost the receiver still gets its context window after the
+///   handshake.
+///
+/// `handshake_done` is passed in (instead of the connection) so the policy is a
+/// pure, unit-testable rule: early data never confirms a binding.
+pub(crate) fn uses_binding_context(
+    rev2: &ConnRev2,
+    binding: &FlowBinding,
+    handshake_done: bool,
+) -> bool {
+    match rev2.wire() {
+        Wire::Rev2 => !binding.is_open(),
+        Wire::Rev3 => !handshake_done || binding.take_context_slot(),
+    }
 }
 
 /// Push one staged item, draining once if the queue is full.
@@ -914,6 +1580,7 @@ fn warn_stage_full(total: u64) {
 /// fragments — the payload still has to be delivered and no legacy frame may be
 /// emitted — while `ConnectionLost`/`Unsupported` are returned for the caller's
 /// shared recovery.
+#[allow(clippy::too_many_arguments)]
 fn send_standalone(
     conn: &quinn::Connection,
     limit: usize,
@@ -922,8 +1589,10 @@ fn send_standalone(
     payload: &[u8],
     flow: Option<&Arc<FlowBinding>>,
     frag: &mut R2Fragmenter,
+    wire: Wire,
+    context: bool,
 ) -> PayloadSend {
-    if let Some(sent) = try_single_data(conn, limit, sess, addr, payload, flow)
+    if let Some(sent) = try_single_data(conn, limit, sess, addr, payload, flow, wire, context)
         && (sent.complete()
             || !matches!(
                 sent.failed,
@@ -933,7 +1602,7 @@ fn send_standalone(
         return sent;
     }
     let frag_flow = match flow {
-        Some(binding) if binding.is_open() => R2FragFlow::Steady {
+        Some(binding) if !context => R2FragFlow::Steady {
             wire_id: binding.wire_id,
         },
         Some(binding) => R2FragFlow::Opening {
@@ -961,6 +1630,7 @@ fn send_standalone(
 /// limit (the caller then fragments); `Some` carries the send verdict, which
 /// may itself be `Blocked`/`TooLarge` when the path budget shrank under the
 /// limit this encoding used.
+#[allow(clippy::too_many_arguments)]
 fn try_single_data(
     conn: &quinn::Connection,
     limit: usize,
@@ -968,20 +1638,23 @@ fn try_single_data(
     addr: &TargetAddrRef<'_>,
     payload: &[u8],
     flow: Option<&Arc<FlowBinding>>,
+    wire: Wire,
+    context: bool,
 ) -> Option<PayloadSend> {
-    let open = flow.is_some_and(|b| !b.is_open());
     let body = match flow {
-        Some(binding) if binding.is_open() => {
-            r2::encode_data_steady(binding.wire_id, payload, limit)?
+        Some(binding) if !context => {
+            wire::encode_data_steady(wire, binding.wire_id, payload, limit)?
         }
-        Some(binding) => r2::encode_data_open(binding.wire_id, sess, addr, false, payload, limit)?,
-        None => r2::encode_data_inline(sess, addr, false, payload, limit)?,
+        Some(binding) => {
+            wire::encode_data_open(wire, binding.wire_id, sess, addr, false, payload, limit)?
+        }
+        None => wire::encode_data_inline(wire, sess, addr, false, payload, limit)?,
     };
     Some(match try_send_datagram(conn, body) {
         DatagramSend::Sent => {
             udp_stats::payload(payload.len());
             match flow {
-                Some(_) if open => counters::open_tx(),
+                Some(_) if context => counters::open_tx(),
                 Some(_) => counters::steady_tx(),
                 None => counters::inline_tx(),
             }
@@ -1117,9 +1790,12 @@ fn ensure_binding(
     // One write-lock hold: capacity re-check, id allocation, insert. An id
     // allocated before a refused insert would be lost for the connection's
     // life (wire ids are never reused).
+    // rev3: an id that cannot be a 14-bit `fid` is refused *before* it is
+    // installed (and without burning it), so the caller falls back to `INLINE`
+    // instead of installing an unencodable binding.
     let binding = rev2
         .registry
-        .insert_new(&rev2.ids, sess, addr.into_owned())
+        .insert_new_for(rev2.wire(), &rev2.ids, sess, addr.into_owned())
         .ok()?;
     if !flows.insert(binding.clone()) {
         let _ = rev2.registry.remove(binding.wire_id);
@@ -1289,8 +1965,12 @@ pub(crate) mod counters {
         hello_tx,
         /// Handshakes that reached `CAPS(wire_ver=2)`.
         handshake_ok,
-        /// Handshakes that failed (no CAPS, wrong wire version, dead connection).
+        /// Handshakes that failed (wrong wire version or dead connection).
         handshake_fail,
+        /// Connections whose fast `HELLO` window elapsed without `CAPS` and
+        /// which moved to the slow background retry cadence (W2). Not a
+        /// failure: the connection is live and `CAPS` only tunes limits.
+        handshake_slow,
         /// `CTL CAPS` frames decoded.
         caps_rx,
         /// `CTL FLOW_ACK` frames that resolved an uplink binding.
@@ -1355,12 +2035,38 @@ pub(crate) mod counters {
         rx_unknown_id,
         /// Downlink frames dropped as malformed/refused.
         rx_drop,
+        /// Payloads held in the bounded queue-until-publish hold because no
+        /// egress connection existed (W3).
+        egress_queued,
+        /// Held payloads handed back to the normal uplink path when a fresh
+        /// egress handle appeared (W3).
+        egress_flushed,
+        /// Held payloads dropped because the hold was already at its item/byte
+        /// bound (W3: drop-newest past the bound).
+        egress_hold_full,
+        /// Held payloads dropped without being sent because the bounded window
+        /// elapsed (or the owner exited) before egress returned (W3).
+        egress_hold_stale,
         /// Flow tables reset because the connection generation changed.
         flow_table_reset,
         /// Flow tables reset because the server sent `SESS_CLOSE`.
         session_reset,
         /// `CTL` frames dropped as malformed/unknown.
         ctl_drop,
+        /// rev3: `ASSOC_CLOSE` messages queued on the control stream
+        /// (association exit; replaces the rev2 `SESS_CLOSE` x3 datagrams).
+        assoc_close_tx,
+        /// rev3: `NEED_CONTEXT` repair requests queued on the control stream.
+        need_context_tx,
+        /// rev3: `NEED_CONTEXT` repair requests received and applied (the peer
+        /// missed our binding context; the window was re-armed).
+        need_context_rx,
+        /// rev3: control-stream messages handled (Reject/SessClose/FlowClose/
+        /// NeedContext/Goaway).
+        ctl_stream_rx,
+        /// rev3: control-stream messages dropped without acting on them
+        /// (receiver rate budget, unimplemented direction, malformed).
+        ctl_stream_drop,
     }
 
     /// Thread-local flush threshold for the data-plane counters: the hot path
@@ -1394,6 +2100,8 @@ pub(crate) mod counters {
         frag_rx,
         frag_complete,
         rx_frame,
+        egress_queued,
+        egress_flushed,
     }
 
     // Control-plane / test-observable counters: direct shared increments, the
@@ -1402,6 +2110,7 @@ pub(crate) mod counters {
         hello_tx,
         handshake_ok,
         handshake_fail,
+        handshake_slow,
         caps_rx,
         flow_ack_rx,
         flow_reject_rx,
@@ -1424,22 +2133,31 @@ pub(crate) mod counters {
         inline_fallback,
         rx_unknown_id,
         rx_drop,
+        egress_hold_full,
+        egress_hold_stale,
         flow_table_reset,
         session_reset,
         ctl_drop,
+        assoc_close_tx,
+        need_context_tx,
+        need_context_rx,
+        ctl_stream_rx,
+        ctl_stream_drop,
     }
 
     impl std::fmt::Display for Rev2Snapshot {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(
                 f,
-                "hello={} handshake={}/{} caps={} frames_rx={} ack={}/{} reject={}/{} close={} \
-                 sess_close={}/{} flow_open={} srv={}/{} open={} steady={} inline={}/{} \
-                 stage={}p/{}d/{}f/{}i/{}x/{}full frag={}/{}/{} unknown_id={} drops={} \
-                 resets={}/{} ctl={}/{}/{}",
+                "hello={} handshake={}/{}/{} caps={} frames_rx={} ack={}/{} reject={}/{} \
+                 close={} sess_close={}/{} flow_open={} srv={}/{} open={} steady={} \
+                 inline={}/{} stage={}p/{}d/{}f/{}i/{}x/{}full hold={}q/{}f/{}full/{}stale \
+                 frag={}/{}/{} unknown_id={} drops={} resets={}/{} ctl={}/{}/{} \
+                 r3ctl={}/{} nctx={}/{} aclose={}",
                 self.hello_tx,
                 self.handshake_ok,
                 self.handshake_fail,
+                self.handshake_slow,
                 self.caps_rx,
                 self.rx_frame,
                 self.flow_ack_rx,
@@ -1462,6 +2180,10 @@ pub(crate) mod counters {
                 self.stage_items,
                 self.stage_drop,
                 self.stage_full,
+                self.egress_queued,
+                self.egress_flushed,
+                self.egress_hold_full,
+                self.egress_hold_stale,
                 self.frag_tx,
                 self.frag_rx,
                 self.frag_complete,
@@ -1472,6 +2194,11 @@ pub(crate) mod counters {
                 self.ctl_drop,
                 self.ctl_rate_limited,
                 self.ctl_tx_fail,
+                self.ctl_stream_rx,
+                self.ctl_stream_drop,
+                self.need_context_tx,
+                self.need_context_rx,
+                self.assoc_close_tx,
             )
         }
     }
@@ -2020,7 +2747,96 @@ mod tests {
     #[test]
     fn handshake_retry_constants_are_the_documented_budget() {
         assert_eq!(HELLO_RETRY, Duration::from_millis(200));
-        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(2));
-        assert!(HANDSHAKE_TIMEOUT.as_millis() / HELLO_RETRY.as_millis() >= 10);
+        assert_eq!(HELLO_RETRY_SLOW, Duration::from_secs(2));
+        assert_eq!(HELLO_FAST_WINDOW, Duration::from_secs(2));
+        assert!(HELLO_FAST_WINDOW.as_millis() / HELLO_RETRY.as_millis() >= 10);
+        assert!(
+            HELLO_RETRY_SLOW > HELLO_RETRY,
+            "the background cadence must be slower than the fast one"
+        );
+    }
+
+    /// W2: the fast window is a negotiation-retry bound, not a connection
+    /// deadline — a missing/late `CAPS` must never fail a live connection.
+    /// The only fatal control answer is an explicit different wire version.
+    #[test]
+    fn caps_version_check_is_the_only_fatal_answer() {
+        let r = ConnRev2::new();
+        assert!(!caps_wrong_version(&r), "no CAPS yet is not a mismatch");
+        r.on_caps(r2::Caps {
+            wire_ver: r2::R2_WIRE_VER,
+            ..r2::Caps::default()
+        });
+        assert!(!caps_wrong_version(&r));
+        let wrong = ConnRev2::new();
+        wrong.on_caps(r2::Caps {
+            wire_ver: r2::R2_WIRE_VER + 1,
+            ..r2::Caps::default()
+        });
+        assert!(caps_wrong_version(&wrong));
+        assert!(!wrong.is_ready());
+    }
+
+    /// W3: the hold is bounded by items, by bytes, and drops the newest past
+    /// either bound (never the oldest item of a burst).
+    #[test]
+    fn pending_hold_is_bounded_and_drops_the_newest() {
+        let mut up = UplinkFlows::new();
+        let addr: SocketAddr = "198.51.100.9:53".parse().unwrap();
+        for i in 0..PENDING_MAX_ITEMS {
+            let p = [i as u8];
+            assert!(up.hold_pending(&TargetAddrRef::Ip(addr), &p), "item {i}");
+        }
+        assert_eq!(up.pending_len(), PENDING_MAX_ITEMS);
+        assert!(up.has_pending());
+        // One past the item bound: refused, not evicting the oldest item.
+        assert!(!up.hold_pending(&TargetAddrRef::Ip(addr), b"newest"));
+        assert_eq!(up.pending_len(), PENDING_MAX_ITEMS);
+        assert_eq!(
+            up.pending.bytes, PENDING_MAX_ITEMS,
+            "one payload byte per held item"
+        );
+
+        // Byte bound: a second association with large payloads stops at the
+        // byte cap with fewer than the item cap.
+        let mut big = UplinkFlows::new();
+        let chunk = vec![0u8; PENDING_MAX_BYTES / 2];
+        assert!(big.hold_pending(&TargetAddrRef::Ip(addr), &chunk));
+        assert!(big.hold_pending(&TargetAddrRef::Ip(addr), &chunk));
+        assert_eq!(big.pending_len(), 2);
+        assert!(!big.hold_pending(&TargetAddrRef::Ip(addr), b"x"));
+        assert_eq!(big.pending_len(), 2);
+    }
+
+    /// W3: expiry is FIFO (the oldest payloads age out first) and exactly one
+    /// `NO_EGRESS` loss is booked per expired payload.
+    #[test]
+    fn pending_hold_expires_oldest_first_and_books_each_loss() {
+        let mut up = UplinkFlows::new();
+        let addr: SocketAddr = "198.51.100.9:53".parse().unwrap();
+        let t0 = mono_millis();
+        assert!(up.pending.try_push(&TargetAddrRef::Ip(addr), b"old", t0));
+        assert!(
+            up.pending
+                .try_push(&TargetAddrRef::Ip(addr), b"new", t0 + PENDING_TTL_MS / 2)
+        );
+        // Nothing is old enough yet.
+        assert_eq!(up.pending.expire(t0 + PENDING_TTL_MS / 2), 0);
+        assert_eq!(up.pending.len(), 2);
+        // At exactly the TTL the head expires; the younger one stays.
+        assert_eq!(up.pending.expire(t0 + PENDING_TTL_MS), 1);
+        assert_eq!(up.pending.len(), 1);
+        assert_eq!(up.pending.expire(t0 + 2 * PENDING_TTL_MS), 1);
+        assert!(up.pending.is_empty());
+        assert_eq!(up.pending.bytes, 0);
+        // Booking is one `NO_EGRESS` loss and one reason counter per payload.
+        // Both counters are process-wide while the test binary runs tests in
+        // parallel, so these are lower bounds (the inline `expire` calls above
+        // deliberately book nothing — that is `expire_pending`'s job).
+        let before_drops = dgram_drops::snapshot();
+        let before_counters = counters::snapshot();
+        book_hold_loss(2, "test");
+        assert!(dgram_drops::snapshot().since(&before_drops).no_egress >= 2);
+        assert!(counters::since(&before_counters).egress_hold_stale >= 2);
     }
 }

@@ -2,6 +2,23 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Client TLS: pin exact self-signed cert, no WebPKI roots (skip chain building => min RTT/CPU).
+///
+/// ## 0-RTT posture
+///
+/// Early data is explicitly enabled: with a resumption ticket from the previous
+/// connection, quinn's `Connecting::into_0rtt()` then succeeds and the caller
+/// sends the auth token, `HELLO` and application payloads in the first flight.
+///
+/// The resumption store is sized well above rustls' default of 256 server names
+/// because a ticket is **single-use** (rustls takes it out of the client store
+/// when it is offered, RFC 8446 anti-replay): every pool slot's dial burns one
+/// ticket and the next one only exists after that handshake's
+/// `NewSessionTicket`s land. A larger store keeps tickets for every pool slot
+/// (the client dials `MAX_POOL_CONNS` TCP + `MAX_UDP_EGRESS_CONNS` + 1 UDP
+/// connections, each to the same server name, but a ticket can be re-fetched
+/// only by a completed handshake) and for a rotated/standing set of
+/// pool configurations (e.g. an operator changing `quic_conns`), instead of
+/// thrashing the fixed-size default and silently degrading to full handshakes.
 pub fn client_tls_config(
     pinned: rustls::pki_types::CertificateDer<'static>,
     alpn: &[u8],
@@ -15,6 +32,8 @@ pub fn client_tls_config(
         .with_no_client_auth();
     cfg.alpn_protocols = vec![alpn.to_vec()];
     cfg.enable_early_data = true; // allow QUIC 0-RTT on resumption
+    const TLS_RESUMPTION_SESSIONS: usize = 1024;
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(TLS_RESUMPTION_SESSIONS);
     Ok(Arc::new(cfg))
 }
 

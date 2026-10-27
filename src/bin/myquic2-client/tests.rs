@@ -5,8 +5,11 @@
 //! exist to catch a framing regression in any future rewrite.
 use super::*;
 
+use myquic2::mqp::ctl_stream;
 use myquic2::mqp::r2;
-use myquic2::mqp::r2_flow::{FlowBinding, FlowState, R2_MAX_FLOWS_PER_CONN};
+use myquic2::mqp::r2_flow::{FlowBinding, FlowState, R2_MAX_FLOWS_PER_CONN, R3_CONTEXT_REPEATS};
+use myquic2::mqp::r3::CtlMessage;
+use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::{R2Assembled, R2Fragmenter, R2Reassembler, R2StageItem, R2StageKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -18,6 +21,17 @@ fn rev2_state() -> Arc<ConnRev2> {
     let r = ConnRev2::new();
     r.on_caps(r2::Caps::default());
     r
+}
+
+/// Ready-to-use rev3 connection state: statically ready (no HELLO/CAPS), empty
+/// flow registry, client-owned ids, rev3 stager/reassembler.
+fn rev3_state() -> Arc<ConnRev2> {
+    ConnRev2::new_with_wire(Wire::Rev3)
+}
+
+/// Fresh rev3 reassembler matching [`rev3_state`].
+fn rev3_reasm() -> R2Reassembler {
+    R2Reassembler::new_with_wire(Wire::Rev3)
 }
 
 /// Phase 2: small payloads queue in the connection-scoped stager and a drain
@@ -1773,11 +1787,33 @@ async fn rev2_handshake_negotiates_caps() {
 }
 
 /// A `CAPS` with another wire version is a definitive mismatch: fail fast
-/// instead of waiting out the timeout. There is no silent old-wire fallback.
+/// instead of waiting out the window. There is no silent old-wire fallback.
 #[tokio::test]
 async fn rev2_handshake_fails_fast_on_wire_version_mismatch() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let state = ConnRev2::new();
+    // The production dispatcher is what receives `CAPS`; drive the same
+    // `handle_r2_ctl` path from a reader task here (without it the answer never
+    // reaches the connection state and the test would be exercising the window
+    // instead of the version mismatch).
+    let client_for_reader = client_conn.clone();
+    let reader_state = state.clone();
+    let hub = UdpHub::new();
+    let reader = tokio::spawn(async move {
+        while !reader_state.is_ready() {
+            let Ok(d) = client_for_reader.read_datagram().await else {
+                return;
+            };
+            if r2::kind(&d) == Some(r2::R2Kind::Ctl) {
+                handle_r2_ctl(
+                    &reader_state,
+                    &hub,
+                    &mut myquic2::udp::R2Reassembler::new(),
+                    &d,
+                );
+            }
+        }
+    });
     let server = tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
             .await
@@ -1796,28 +1832,252 @@ async fn rev2_handshake_fails_fast_on_wire_version_mismatch() {
         "a version mismatch must fail the handshake"
     );
     assert!(!state.is_ready());
+    reader.abort();
     let server_conn = server.await.unwrap();
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
 }
 
-/// No `CAPS` at all (an old server silently drops HELLO) must also fail the
-/// handshake so the reconnect loop redials.
+/// Read the next downlink datagram that is not a rev2 `CTL` frame.
+///
+/// The W2 tests run a background `HELLO` retry, so HELLOs interleave with the
+/// DATA frames these tests assert on.
+async fn read_next_data(conn: &quinn::Connection) -> Bytes {
+    loop {
+        let d = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+            .await
+            .expect("a frame must arrive")
+            .unwrap();
+        if r2::kind(&d) != Some(r2::R2Kind::Ctl) {
+            return d;
+        }
+    }
+}
+
+/// W2: no `CAPS` at all must **never** fail a live connection.
+///
+/// The fast window is only a negotiation-retry bound: the handshake reports the
+/// connection usable, keeps advertising `HELLO` in the background at the slow
+/// cadence, and the data path keeps working on the boot limits
+/// (`frame_limit` falls back to the connection's DATAGRAM budget, the stager
+/// keeps the codec's train bound), so pre-`CAPS`/0-RTT datagrams are unaffected.
 #[tokio::test]
-async fn rev2_handshake_times_out_without_caps() {
-    let (client_conn, _server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+async fn rev2_handshake_without_caps_keeps_the_connection_usable() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let state = ConnRev2::new();
+    let before = counters::snapshot();
     assert!(
-        !rev2::handshake_with(
+        rev2::handshake_with(
             &client_conn,
             &state,
-            Duration::from_millis(60),
-            Duration::from_millis(10)
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await,
+        "a missing CAPS must not tear the connection down"
+    );
+    assert!(!state.is_ready(), "no CAPS has arrived");
+    assert!(
+        counters::since(&before).handshake_slow >= 1,
+        "the slow background retry is the non-fatal outcome"
+    );
+    // The background retry keeps the negotiation alive: the foreground loop is
+    // gone (we are past its return), so any further HELLO can only come from
+    // the spawned retry. `hello_tx` is a process-wide counter, hence `> 0`.
+    let before_hello = counters::snapshot();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        counters::since(&before_hello).hello_tx > 0,
+        "a lost CAPS must be recovered by another HELLO, not a redial"
+    );
+    // ... and the connection carries rev2 DATA with no negotiated caps at all.
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            b"no-caps-payload",
+            bind,
+            &state,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    drain_now(&state, &client_conn, limit);
+    let d = read_next_data(&server_conn).await;
+    let f = r2::decode_data(&d).expect("the payload must be rev2 DATA");
+    assert_eq!(f.payload, b"no-caps-payload");
+    assert!(
+        client_conn.close_reason().is_none(),
+        "the producer side must still consider the connection live"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// W2: a **late** `CAPS` (after the fast window) still completes the
+/// negotiation on the same connection — the background retry is what recovers
+/// it, with no redial and no flow loss.
+#[tokio::test]
+async fn late_caps_completes_the_negotiation_without_a_redial() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = ConnRev2::new();
+    let hub = UdpHub::new();
+    let client_for_reader = client_conn.clone();
+    let reader_state = state.clone();
+    let reader = tokio::spawn(async move {
+        while !reader_state.is_ready() {
+            let Ok(d) = client_for_reader.read_datagram().await else {
+                return;
+            };
+            if r2::kind(&d) == Some(r2::R2Kind::Ctl) {
+                handle_r2_ctl(
+                    &reader_state,
+                    &hub,
+                    &mut myquic2::udp::R2Reassembler::new(),
+                    &d,
+                );
+            }
+        }
+    });
+    let before = counters::snapshot();
+    assert!(
+        rev2::handshake_with(
+            &client_conn,
+            &state,
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
         )
         .await
     );
     assert!(!state.is_ready());
+    // The server's answer arrives after the fast window: this is exactly the
+    // lost-negotiation-packet case W2 exists for.
+    server_conn
+        .send_datagram(r2::encode_ctl(&r2::Ctl::Caps(r2::Caps {
+            max_train_items: 8,
+            ..r2::Caps::default()
+        })))
+        .unwrap();
+    for _ in 0..5_000 {
+        if state.is_ready() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(state.is_ready(), "a late CAPS must still be applied");
+    assert_eq!(
+        state.ctl.caps().map(|c| c.max_train_items),
+        Some(8),
+        "the late CAPS tunes the same limits as an early one"
+    );
+    // The background retry notices `ready` at its next tick (the slow cadence
+    // in this test is 20 ms), so poll for its success booking.
+    let mut booked = false;
+    for _ in 0..100 {
+        if counters::since(&before).handshake_ok >= 1 {
+            booked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        booked,
+        "the background retry books the late completion as a success"
+    );
+    assert!(
+        client_conn.close_reason().is_none(),
+        "the connection is never closed for a late CAPS"
+    );
+    // The retry stops once ready: after the in-flight HELLO(s), no more arrive.
+    for _ in 0..8 {
+        let _ = tokio::time::timeout(Duration::from_millis(20), server_conn.read_datagram()).await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "the background HELLO retry must stop once CAPS arrived"
+    );
+    reader.abort();
     client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// W2: the fail-fast for an explicit wrong wire version is preserved even when
+/// the answer arrives after the fast window — the background retry closes the
+/// connection itself, exactly the verdict the foreground loop would produce.
+#[tokio::test]
+async fn wrong_version_caps_after_the_fast_window_still_fails_fast() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = ConnRev2::new();
+    let hub = UdpHub::new();
+    let client_for_reader = client_conn.clone();
+    let reader_state = state.clone();
+    let reader = tokio::spawn(async move {
+        while client_for_reader.close_reason().is_none() {
+            let Ok(d) = client_for_reader.read_datagram().await else {
+                return;
+            };
+            if r2::kind(&d) == Some(r2::R2Kind::Ctl) {
+                handle_r2_ctl(
+                    &reader_state,
+                    &hub,
+                    &mut myquic2::udp::R2Reassembler::new(),
+                    &d,
+                );
+            }
+        }
+    });
+    let before = counters::snapshot();
+    assert!(
+        rev2::handshake_with(
+            &client_conn,
+            &state,
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await,
+        "the window expiry itself is not a failure"
+    );
+    server_conn
+        .send_datagram(r2::encode_ctl(&r2::Ctl::Caps(r2::Caps {
+            wire_ver: r2::R2_WIRE_VER + 7,
+            ..r2::Caps::default()
+        })))
+        .unwrap();
+    let mut closed = false;
+    for _ in 0..500 {
+        if client_conn.close_reason().is_some() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        closed,
+        "an explicit wrong-version CAPS must still close the connection"
+    );
+    assert!(
+        counters::since(&before).handshake_fail >= 1,
+        "a wrong-version answer is still a handshake failure"
+    );
+    reader.abort();
+    server_conn.close(0u32.into(), b"done");
 }
 
 /// byte-identical to what `encode_reply` produces in one buffer.
@@ -4158,9 +4418,9 @@ fn assoc_recv_buf_pool_is_bounded_and_exactly_sized() {
 /// final probe detects.
 #[tokio::test(start_paused = true)]
 async fn udp_associate_serves_its_first_datagram_without_a_startup_sleep() {
-    // The first datagram takes the counted NO_EGRESS path (no egress is
-    // published in this harness), so serialize with the tests that assert
-    // exact deltas on that process-wide counter.
+    // No egress is published in this harness: since W3 the first datagram is
+    // *held* (and its flush/expiry may bump the process-wide NO_EGRESS
+    // counter), so serialize with the tests that assert exact deltas on it.
     let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
     let spinner = tokio::spawn(async {
         loop {
@@ -4173,7 +4433,8 @@ async fn udp_associate_serves_its_first_datagram_without_a_startup_sleep() {
     let (control_server, _) = l.accept().await.unwrap();
 
     // No QUIC connection is ever published in this harness, so the datagram
-    // takes the synchronous counted NO_EGRESS path once it is read.
+    // takes the synchronous no-egress path once it is read (W3: held for the
+    // bounded grace, which is still consumed by the relay loop).
     let pool = ConnPool::new(1, vec![], true, true, 1);
     let hub = Arc::new(UdpHub::new());
     let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
@@ -5037,7 +5298,7 @@ async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
     assert_eq!(b.state(), FlowState::Closed);
     assert!(rev2.registry.get(b.wire_id).is_none());
     assert!(
-        rev2.is_rejected(&b.target_ref(), mono_millis()),
+        rev2.is_rejected(&b.target_ref(), coarse_millis()),
         "a rejected target is sent INLINE until the TTL expires"
     );
 
@@ -5127,8 +5388,8 @@ fn rev2_session_close_makes_the_uplink_reopen() {
 
 /// The egress cache publishes a rev2 generation as soon as its state exists,
 /// even before `CAPS`, so the first UDP payload can be sent optimistically.
-/// `CAPS` only upgrades the boot limits; the server buffers pre-HELLO frames
-/// until the version gate opens.
+/// `CAPS` only upgrades the boot limits; Phase 0 removed the pre-HELLO buffer,
+/// so the server dispatches rev2 frames as they arrive.
 #[tokio::test]
 async fn egress_publishes_before_caps_for_optimistic_first_packet() {
     let (conn, _client, _server) = real_connection().await;
@@ -5158,6 +5419,327 @@ async fn egress_publishes_before_caps_for_optimistic_first_packet() {
         .refresh_global(&pool, bind, now)
         .expect("a negotiated connection is publishable");
     assert!(h.rev2.is_ready());
+}
+
+/// W3: payloads produced while no egress connection exists are held, not
+/// dropped, and the hold is flushed **in order** through the normal uplink path
+/// once a fresh generation is published — the same path a live datagram takes
+/// (`DATA OPEN` for the first payload of the target, repeated while `Opening`).
+#[tokio::test]
+async fn queued_datagrams_flush_in_order_on_a_new_generation() {
+    // The no-egress assertions below hold exact deltas on process-wide
+    // counters, so serialize with the other egress-verdict tests.
+    let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress = SharedEgress::default();
+    let mut bind: Option<UdpBind> = None;
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+
+    // No egress published yet: the payloads are held, not dropped.
+    let before = dgram_drops::snapshot();
+    let before_counters = counters::snapshot();
+    for payload in [&b"one"[..], b"two", b"three"] {
+        send_payload_uplink(
+            &pool,
+            &egress,
+            7,
+            &target.as_ref(),
+            payload,
+            &mut bind,
+            &mut up,
+            &mut frag,
+            coarse_millis(),
+            SessionKind::Socks,
+        );
+    }
+    assert_eq!(
+        dgram_drops::snapshot().since(&before).no_egress,
+        0,
+        "a payload with no egress must be held, not dropped (W3)"
+    );
+    assert_eq!(up.pending_len(), 3);
+    assert!(
+        counters::since(&before_counters).egress_queued >= 3,
+        "each held payload is counted"
+    );
+
+    // A fresh generation is published (the redial the hold is waiting for).
+    let slot = pool.slot(pool.udp_global_slot(bind.unwrap().index));
+    let state = rev2_state();
+    slot.set_rev2(state.clone());
+    slot.publish(&client_conn);
+
+    // The next send attempt flushes the hold first (FIFO), then sends itself.
+    send_payload_uplink(
+        &pool,
+        &egress,
+        7,
+        &target.as_ref(),
+        b"four",
+        &mut bind,
+        &mut up,
+        &mut frag,
+        coarse_millis(),
+        SessionKind::Socks,
+    );
+    assert_eq!(up.pending_len(), 0, "the hold is empty after the flush");
+    assert_eq!(
+        up.epoch, state.epoch,
+        "flushed payloads ride the new generation's flow tables"
+    );
+    assert!(
+        counters::since(&before_counters).egress_flushed >= 3,
+        "each held payload handed back to the send path is counted"
+    );
+    drain_assoc_stage(&egress, &pool, bind.unwrap());
+
+    // Wire order is exactly the hold order followed by the new payload, and
+    // the frames are ordinary rev2 DATA: the flush reuses the normal encoder.
+    let mut ids = Vec::new();
+    for expected in [&b"one"[..], b"two", b"three", b"four"] {
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("the flushed payloads must reach the server")
+            .unwrap();
+        let f = r2::decode_data(&d).expect("a flushed payload is normal rev2 DATA");
+        assert_eq!(f.payload, expected, "the hold must preserve FIFO order");
+        assert_eq!(f.sess, Some(7));
+        assert_eq!(f.addr, Some(target.as_ref()));
+        ids.push(f.id.expect("the first payload of a new target opens a flow"));
+    }
+    assert!(
+        ids.windows(2).all(|w| w[0] == w[1]),
+        "the held payloads belong to one flow, opened by the first"
+    );
+    assert!(
+        state.registry.get(ids[0]).is_some(),
+        "the flow was installed on the new generation"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "four held payloads must produce four frames, not more"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// W3: the hold is bounded by items and by bytes and drops the **newest**
+/// payload past the bound, booking it exactly like the pre-W3 loss (one
+/// `NO_EGRESS` per payload) plus the reason counter.
+#[tokio::test]
+async fn queue_until_publish_is_bounded_and_books_the_newest_drop() {
+    // Process-wide no-egress counter: serialize with the other egress tests.
+    let _guard = EGRESS_VERDICT_COUNTER_LOCK.lock().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress = SharedEgress::default();
+    let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+
+    // Item bound: hold exactly PENDING_MAX_ITEMS one-byte payloads, then the
+    // next one is dropped (the oldest stay).
+    let mut bind: Option<UdpBind> = None;
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    for _ in 0..PENDING_MAX_ITEMS {
+        send_payload_uplink(
+            &pool,
+            &egress,
+            7,
+            &target.as_ref(),
+            b"x",
+            &mut bind,
+            &mut up,
+            &mut frag,
+            coarse_millis(),
+            SessionKind::Socks,
+        );
+    }
+    assert_eq!(up.pending_len(), PENDING_MAX_ITEMS);
+    let before = dgram_drops::snapshot();
+    let before_counters = counters::snapshot();
+    send_payload_uplink(
+        &pool,
+        &egress,
+        7,
+        &target.as_ref(),
+        b"newest",
+        &mut bind,
+        &mut up,
+        &mut frag,
+        coarse_millis(),
+        SessionKind::Socks,
+    );
+    assert_eq!(
+        up.pending_len(),
+        PENDING_MAX_ITEMS,
+        "drop-newest never evicts a held payload"
+    );
+    assert_eq!(
+        dgram_drops::snapshot().since(&before).no_egress,
+        1,
+        "exactly the refused payload is booked"
+    );
+    assert!(
+        counters::since(&before_counters).egress_hold_full >= 1,
+        "the full-bound drop has its own reason counter"
+    );
+
+    // Byte bound: 8 KiB payloads fill PENDING_MAX_BYTES with fewer items, and
+    // the ninth is refused although the item bound is far from reached.
+    let mut bind2: Option<UdpBind> = None;
+    let mut up2 = UplinkFlows::new();
+    let mut frag2 = R2Fragmenter::new();
+    let big = vec![0u8; PENDING_MAX_BYTES / 8];
+    for _ in 0..8 {
+        send_payload_uplink(
+            &pool,
+            &egress,
+            7,
+            &target.as_ref(),
+            &big,
+            &mut bind2,
+            &mut up2,
+            &mut frag2,
+            coarse_millis(),
+            SessionKind::Socks,
+        );
+    }
+    assert_eq!(up2.pending_len(), 8, "the byte bound, not the item bound");
+    let before = dgram_drops::snapshot();
+    send_payload_uplink(
+        &pool,
+        &egress,
+        7,
+        &target.as_ref(),
+        &big,
+        &mut bind2,
+        &mut up2,
+        &mut frag2,
+        coarse_millis(),
+        SessionKind::Socks,
+    );
+    assert_eq!(up2.pending_len(), 8);
+    assert_eq!(dgram_drops::snapshot().since(&before).no_egress, 1);
+}
+
+/// W3: a payload held past `PENDING_TTL_MS` is dropped and accounted, never
+/// delivered late: the bounded grace preserves UDP semantics (a stale datagram
+/// is worse than a lost one).
+#[test]
+fn expired_held_datagrams_are_dropped_and_accounted() {
+    let mut up = UplinkFlows::new();
+    let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let now = mono_millis();
+    assert!(up.hold_pending_at(&target.as_ref(), b"old", now));
+    assert!(up.hold_pending_at(&target.as_ref(), b"older", now));
+    assert_eq!(up.pending_len(), 2);
+    // Inside the window nothing is dropped (not even a millisecond short).
+    assert_eq!(up.expire_pending_at(now + PENDING_TTL_MS - 1), 0);
+    assert_eq!(up.pending_len(), 2);
+    let before = dgram_drops::snapshot();
+    let before_counters = counters::snapshot();
+    assert_eq!(up.expire_pending_at(now + PENDING_TTL_MS), 2);
+    assert!(
+        !up.has_pending(),
+        "the expired hold is empty, never delivered"
+    );
+    assert!(
+        dgram_drops::snapshot().since(&before).no_egress >= 2,
+        "each expired payload is a counted loss"
+    );
+    assert!(
+        counters::since(&before_counters).egress_hold_stale >= 2,
+        "the stale-hold reason counter is bumped"
+    );
+    // A payload enqueued at the same instant as the expiry is not stale.
+    assert!(up.hold_pending_at(&target.as_ref(), b"fresh", now + PENDING_TTL_MS));
+    assert_eq!(up.expire_pending_at(now + PENDING_TTL_MS), 0);
+    assert_eq!(up.pending_len(), 1);
+    assert_eq!(up.expire_pending_at(now + 2 * PENDING_TTL_MS), 1);
+    assert!(!up.has_pending());
+}
+
+/// W8a: `mark_open` is called per downlink frame (steady DATA, first occurrence
+/// of every TRAIN id, every completed FRAG payload). It must be a relaxed-load
+/// fast path in the steady state while keeping the exact transition semantics:
+/// `Opening -> Open` once, idempotent for `Open`, and `Closed` is terminal.
+#[test]
+fn mark_open_is_idempotent_for_downlink_frames() {
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr);
+    assert_eq!(binding.state(), FlowState::Opening);
+    for _ in 0..64 {
+        binding.mark_open();
+        assert!(binding.is_open(), "an OPEN confirmation is idempotent");
+    }
+    binding.mark_closed();
+    for _ in 0..64 {
+        binding.mark_open();
+        assert_eq!(
+            binding.state(),
+            FlowState::Closed,
+            "a compressed frame must never reopen a closed flow"
+        );
+    }
+}
+
+/// W8a: the dispatcher classifies the first byte **once** per inbound
+/// datagram and passes the drain burst's single coarse-clock read down; the
+/// legacy fallback (`MQP-3`/`MQP-2`/BATCH bytes) must still be routed to the
+/// old path after that refactor.
+#[tokio::test]
+async fn dispatch_inbound_classifies_the_first_byte_once() {
+    // The unroutable legacy frame below bumps the process-wide REFUSED counter,
+    // so serialize with the tests that assert exact deltas on it (the DNS
+    // slow-path suite) even though this test only checks a lower bound.
+    let _guard = DNS_SLOW_PATH_COUNTER_LOCK.lock().await;
+    let rev2 = ConnRev2::new();
+    let hub = UdpHub::new();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = DgramReassembler::new();
+    let mut r2_reasm = R2Reassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    // A rev2 CTL CAPS goes through the rev2 branch (the classification result
+    // is consumed there, not re-derived) and reaches the connection state.
+    let frame = r2::encode_ctl(&r2::Ctl::Caps(r2::Caps::default()));
+    assert_eq!(r2::kind(&frame), Some(r2::R2Kind::Ctl));
+    dispatch_inbound(
+        &mut cache,
+        &hub,
+        &rev2,
+        None,
+        frame,
+        &mut reasm,
+        &mut r2_reasm,
+        &mut out,
+        coarse_millis(),
+    );
+    assert!(rev2.is_ready(), "the rev2 CTL branch still handles CAPS");
+    assert_eq!(out.len(), 0, "a CTL contributes no staged reply");
+    // A non-rev2 first byte still falls through to the legacy path, which
+    // books REFUSED for an unroutable frame — the single classification must
+    // not swallow the fallback.
+    let before = dgram_drops::snapshot();
+    dispatch_inbound(
+        &mut cache,
+        &hub,
+        &rev2,
+        None,
+        Bytes::from_static(&[0x70]),
+        &mut reasm,
+        &mut r2_reasm,
+        &mut out,
+        coarse_millis(),
+    );
+    assert!(
+        dgram_drops::snapshot().since(&before).refused >= 1,
+        "an unroutable legacy frame is still refused on the old path"
+    );
 }
 
 /// Full-slice round trip: a real association task on a real QUIC connection
@@ -7796,4 +8378,797 @@ async fn raw_forward_slow_path_reply_sends_bare_payload() {
         pkt.is_empty(),
         "raw mode must not encode into the SOCKS5 scratch packet"
     );
+}
+
+// ================= MQP-3 rev3 client data plane =================
+//
+// The rev3 integration keeps the whole flow/stager/reassembly state model and
+// swaps only the codec, the sender confirmation policy (no per-flow ACK, K=2
+// binding context) and the control plane (one reliable client-opened bidi
+// stream instead of `CTL` DATAGRAMs). These tests construct
+// `ConnRev2::new_with_wire(Wire::Rev3)` and drive the same entry points the
+// production path uses.
+
+/// rev3 has no `HELLO`/`CAPS`: the state is ready from construction with the
+/// static caps, and `handshake()` is a no-op that sends **no** datagram bytes.
+#[tokio::test]
+async fn rev3_handshake_is_a_noop_and_never_sends_hello() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = rev3_state();
+    // Static contract: ready before any negotiation, default frame limit.
+    assert!(state.is_ready(), "rev3 caps are static: ready at publish");
+    assert_eq!(state.wire(), Wire::Rev3);
+    assert_eq!(
+        state.frame_limit(1400),
+        1400,
+        "the connection DATAGRAM budget is the live limit (static caps)"
+    );
+    assert!(state.ctl.caps().is_none(), "no CAPS frame was consumed");
+    // Both entry points report success and write nothing.
+    assert!(rev2::handshake(&client_conn, &state).await);
+    assert!(
+        rev2::handshake_with(
+            &client_conn,
+            &state,
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            Duration::from_millis(5)
+        )
+        .await
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "rev3 must not send HELLO/CAPS DATAGRAMs"
+    );
+    assert!(state.is_ready());
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// rev3 no-ACK policy: the first [`R3_CONTEXT_REPEATS`] payloads of a fresh flow
+/// carry the binding form (`DATA_EXT OPEN` with session + address), the last of
+/// them marks the binding open **locally**, and the third payload is a 2-byte
+/// steady header — with no `FLOW_ACK` (or any other downlink) ever needed.
+#[tokio::test]
+async fn rev3_context_frames_then_steady_without_any_ack() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = rev3_state();
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new_with_wire(Wire::Rev3);
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    let send = |body: &[u8], up: &mut UplinkFlows, frag: &mut R2Fragmenter| {
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            body,
+            bind,
+            &state,
+            up,
+            frag,
+        )
+    };
+    let mut id = None;
+    for payload in [&b"one"[..], b"two"] {
+        assert!(send(payload, &mut up, &mut frag).complete());
+        drain_now(&state, &client_conn, limit);
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("a context frame must arrive")
+            .unwrap();
+        let f = wire::decode_data(Wire::Rev3, &d).expect("rev3 DATA decodes");
+        let seen = f
+            .wire_id
+            .expect("a binding-context payload carries the flow id");
+        assert_eq!(f.sess, Some(7), "context frames carry session + address");
+        assert_eq!(f.addr, Some(addr.as_ref()));
+        assert!(!f.src, "an uplink context frame names the destination");
+        assert_eq!(f.payload, payload);
+        // Not steady: a steady rev3 frame is exactly 2 header bytes + payload.
+        assert!(
+            d.len() > 2 + payload.len(),
+            "payload {} must repeat the binding context",
+            String::from_utf8_lossy(payload)
+        );
+        id = Some(seen);
+    }
+    let id = id.expect("an id was allocated");
+    assert!(state.ids.allocated() >= 1);
+    assert!(
+        state.registry.get(id).unwrap().is_open(),
+        "the K-th context payload marks the binding open locally (no ACK)"
+    );
+    // Third payload: a steady frame with only the packed 2-byte header.
+    assert!(send(b"three", &mut up, &mut frag).complete());
+    drain_now(&state, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the steady frame must arrive")
+        .unwrap();
+    assert_eq!(
+        d.len(),
+        2 + b"three".len(),
+        "a confirmed rev3 flow costs only the 2-byte packed header"
+    );
+    let f = wire::decode_data(Wire::Rev3, &d).expect("rev3 steady DATA decodes");
+    assert_eq!(f.wire_id, Some(id));
+    assert_eq!(f.sess, None);
+    assert_eq!(f.addr, None);
+    assert_eq!(f.payload, b"three");
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// A `NEED_CONTEXT` repair hint re-arms the sender's K=2 window: the binding
+/// moves back to `Opening`, the counter resets, and the next payload carries the
+/// binding form again.
+#[test]
+fn rev3_need_context_message_rearms_the_sender_window() {
+    let state = rev3_state();
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let wire_id = r2::make_wire_id(1, false).unwrap();
+    let binding = FlowBinding::new_shared(wire_id, 7, addr);
+    assert!(state.registry.insert(binding.clone()).is_ok());
+    // Simulate the sender having spent the window (K context frames, self-open).
+    for _ in 0..R3_CONTEXT_REPEATS {
+        assert!(binding.take_context_slot());
+    }
+    assert!(binding.is_open());
+    let hub = UdpHub::new();
+    let mut reasm = rev3_reasm();
+    let before = counters::snapshot();
+    handle_r3_ctl(
+        &state,
+        &hub,
+        &mut reasm,
+        CtlMessage::NeedContext {
+            fid: wire::fid_for(wire_id).unwrap(),
+        },
+    );
+    assert_eq!(binding.state(), FlowState::Opening, "window re-armed");
+    assert_eq!(binding.context_left(), R3_CONTEXT_REPEATS);
+    assert!(
+        binding.take_context_slot(),
+        "the next payload carries the binding context again"
+    );
+    assert!(counters::since(&before).need_context_rx >= 1);
+    // An unknown fid is a no-op (counted), not a panic.
+    handle_r3_ctl(
+        &state,
+        &hub,
+        &mut reasm,
+        CtlMessage::NeedContext {
+            fid: wire::fid_for(r2::make_wire_id(2000, false).unwrap()).unwrap(),
+        },
+    );
+}
+
+/// rev3 id exhaustion: once the 14-bit `fid` space is spent, a new target is
+/// never installed — the payload falls back to the stateless `INLINE` form and
+/// the allocator burns **no** further ids (the documented rev3 fail-safe).
+#[tokio::test]
+async fn rev3_id_exhaustion_falls_back_to_inline_without_burning_ids() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = rev3_state();
+    // Spend the rev3 id space (the codec's 14-bit per-owner limit: 8192 ids).
+    for _ in 0..wire::MAX_R3_LOCAL_ID {
+        assert!(state.ids.alloc().is_some());
+    }
+    let allocated = state.ids.allocated();
+    assert_eq!(allocated, wire::MAX_R3_LOCAL_ID);
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new_with_wire(Wire::Rev3);
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            b"inline",
+            bind,
+            &state,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    assert!(
+        state.registry.is_empty(),
+        "no unencodable binding installed"
+    );
+    assert_eq!(
+        state.ids.allocated(),
+        allocated,
+        "exhaustion must not burn ids"
+    );
+    drain_now(&state, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the INLINE payload must arrive")
+        .unwrap();
+    let f = wire::decode_data(Wire::Rev3, &d).expect("rev3 INLINE decodes");
+    assert_eq!(f.wire_id, None, "INLINE carries no flow id");
+    assert_eq!(f.sess, Some(7));
+    assert_eq!(f.addr, Some(addr.as_ref()));
+    assert_eq!(f.payload, b"inline");
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// rev3 reuses an installed **server-owned** flow with a steady frame from the
+/// first payload (the server already owns/knows the id, so no client context is
+/// needed), while a fresh client-owned flow carries context — the OPEN/SRC vs
+/// steady split the adapter performs per owner bit.
+#[tokio::test]
+async fn rev3_server_owned_flow_reuses_steady_without_context() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let state = rev3_state();
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    // The dispatcher installs a server-owned reply flow (`OPEN|SRC` on the
+    // downlink); the app then sends to the same reply source.
+    let server_wid = r2::make_wire_id(1, true).unwrap();
+    let binding = FlowBinding::new_shared(server_wid, 7, addr.clone());
+    binding.set_reply_src(addr.socket_addr().unwrap());
+    binding.mark_open();
+    assert!(state.registry.insert(binding.clone()).is_ok());
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new_with_wire(Wire::Rev3);
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let limit = client_conn.max_datagram_size().unwrap();
+    assert!(
+        send_uplink(
+            &client_conn,
+            limit,
+            7,
+            &addr.as_ref(),
+            b"echo",
+            bind,
+            &state,
+            &mut up,
+            &mut frag,
+        )
+        .complete()
+    );
+    drain_now(&state, &client_conn, limit);
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the steady reuse frame must arrive")
+        .unwrap();
+    let f = wire::decode_data(Wire::Rev3, &d).expect("rev3 DATA decodes");
+    assert_eq!(f.wire_id, Some(server_wid));
+    assert_eq!(f.sess, None, "reused server-owned flow rides steady");
+    assert_eq!(f.addr, None);
+    assert_eq!(f.payload, b"echo");
+    assert!(state.ids.allocated() == 0, "no client id was allocated");
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// rev3 downlink: DATA/TRAIN/FRAG are decoded through the `wire` adapter and
+/// resolve the same flow registry / connection-scoped ids as rev2.
+#[tokio::test]
+async fn rev3_downlink_data_train_and_inline_decode_through_the_adapter() {
+    let state = rev3_state();
+    let hub = UdpHub::new();
+    let assoc = test_assoc().await;
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, assoc.entry.clone());
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = rev3_reasm();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let dst: SocketAddr = "198.51.100.1:53".parse().unwrap();
+    let wire_id = r2::make_wire_id(1, false).unwrap();
+    let binding = FlowBinding::new_shared(wire_id, sess, TargetAddr::Ip(dst));
+    binding.mark_open();
+    assert!(state.registry.insert(binding).is_ok());
+
+    // Steady DATA.
+    let frame = wire::encode_data_steady(Wire::Rev3, wire_id, b"one", 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&state, &mut cache, &hub, &mut reasm, None, frame, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, dst);
+    assert_eq!(out[0].payload, &b"one"[..]);
+    out.clear();
+
+    // TRAIN dict over the same flow (two items).
+    let items: [(u8, &[u8]); 2] = [(0, b"a"), (0, b"bb")];
+    let frame = wire::encode_train_dict(Wire::Rev3, &[wire_id], &items, 1400).unwrap();
+    assert_eq!(
+        dispatch_r2(&state, &mut cache, &hub, &mut reasm, None, frame, &mut out),
+        2
+    );
+    assert_eq!(out[0].payload, &b"a"[..]);
+    assert_eq!(out[1].payload, &b"bb"[..]);
+    out.clear();
+
+    // INLINE (no flow id) is self-describing: session + source address.
+    let frame = wire::encode_data_inline(
+        Wire::Rev3,
+        sess,
+        &TargetAddrRef::Ip(dst),
+        false,
+        b"inline",
+        1400,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_r2(&state, &mut cache, &hub, &mut reasm, None, frame, &mut out),
+        1
+    );
+    assert_eq!(out[0].dst, dst);
+    assert_eq!(out[0].payload, &b"inline"[..]);
+}
+
+/// rev3 unknown steady flow: the receiver cannot install a run/DATA frame with
+/// no address, so it asks the peer for the binding context (`NEED_CONTEXT`)
+/// instead of only counting the drop — the no-ACK repair path.
+#[tokio::test]
+async fn rev3_unknown_steady_flow_requests_context() {
+    let state = rev3_state();
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.install_ctl_writer(ctl_tx);
+    let hub = UdpHub::new();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = rev3_reasm();
+    let mut out: Vec<StagedReply> = Vec::new();
+    let server_wid = r2::make_wire_id(1, true).unwrap();
+    let frame = wire::encode_data_steady(Wire::Rev3, server_wid, b"reply", 1400).unwrap();
+    let before = counters::snapshot();
+    assert_eq!(
+        dispatch_r2(&state, &mut cache, &hub, &mut reasm, None, frame, &mut out),
+        0
+    );
+    assert!(counters::since(&before).rx_unknown_id >= 1);
+    assert!(counters::since(&before).need_context_tx >= 1);
+    match ctl_rx.try_recv() {
+        Ok(CtlMessage::NeedContext { fid }) => {
+            assert_eq!(fid, wire::fid_for(server_wid).unwrap())
+        }
+        other => panic!("expected NEED_CONTEXT on the control stream, got {other:?}"),
+    }
+}
+
+/// rev3 control-stream messages reproduce the rev2 `CTL` effects
+/// (`REJECT`/`SESS_CLOSE`/`FLOW_CLOSE`), with no DATAGRAM involved.
+#[tokio::test]
+async fn rev3_control_messages_match_the_rev2_actions() {
+    let state = rev3_state();
+    let hub = UdpHub::new();
+    let assoc = test_assoc().await;
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, assoc.entry.clone());
+    let mut reasm = rev3_reasm();
+
+    // REJECT: remove + close + arm the INLINE window for the target.
+    let target_a = TargetAddr::Ip("198.51.100.1:53".parse().unwrap());
+    let id_a = r2::make_wire_id(1, false).unwrap();
+    let a = FlowBinding::new_shared(id_a, sess, target_a.clone());
+    a.mark_open();
+    assert!(state.registry.insert(a.clone()).is_ok());
+    handle_r3_ctl(
+        &state,
+        &hub,
+        &mut reasm,
+        CtlMessage::Reject {
+            fid: wire::fid_for(id_a).unwrap(),
+            reason: r2::R2_REJECT_TABLE_FULL,
+        },
+    );
+    assert!(state.registry.get(id_a).is_none());
+    assert_eq!(a.state(), FlowState::Closed);
+    assert!(state.is_rejected(&target_a.as_ref(), coarse_millis()));
+    assert!(counters::snapshot().flow_reject_rx >= 1);
+
+    // SESS_CLOSE: purge the session's bindings and notify the live association.
+    let id_b = r2::make_wire_id(2, false).unwrap();
+    let b = FlowBinding::new_shared(id_b, sess, TargetAddr::Ip(target_a.socket_addr().unwrap()));
+    b.mark_open();
+    assert!(state.registry.insert(b.clone()).is_ok());
+    handle_r3_ctl(
+        &state,
+        &hub,
+        &mut reasm,
+        CtlMessage::SessClose { sess, reason: 0 },
+    );
+    assert!(state.registry.get(id_b).is_none());
+    assert_eq!(b.state(), FlowState::Closed);
+    assert!(state.take_session_closed(sess));
+
+    // FLOW_CLOSE: remove one flow.
+    let id_c = r2::make_wire_id(3, false).unwrap();
+    let c = FlowBinding::new_shared(
+        id_c,
+        sess,
+        TargetAddr::Ip("203.0.113.9:3478".parse().unwrap()),
+    );
+    c.mark_open();
+    assert!(state.registry.insert(c.clone()).is_ok());
+    handle_r3_ctl(
+        &state,
+        &hub,
+        &mut reasm,
+        CtlMessage::FlowClose {
+            fid: wire::fid_for(id_c).unwrap(),
+            reason: 0,
+        },
+    );
+    assert!(state.registry.get(id_c).is_none());
+    assert_eq!(c.state(), FlowState::Closed);
+
+    // Unknown fids are counted, never guessed.
+    let before = counters::snapshot();
+    handle_r3_ctl(
+        &state,
+        &hub,
+        &mut reasm,
+        CtlMessage::FlowClose {
+            fid: 0x3FFF,
+            reason: 0,
+        },
+    );
+    assert!(counters::since(&before).rx_unknown_id >= 1);
+}
+
+/// rev3 association exit sends **one** `ASSOC_CLOSE` on the reliable control
+/// stream and no `SESS_CLOSE` DATAGRAM (rev2's x3 repeat is gone).
+#[tokio::test]
+async fn rev3_assoc_close_replaces_sess_close_datagrams() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let egress = SharedEgress::default();
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    let state = rev3_state();
+    // Published generation, as the reconnect loop would.
+    let slot = pool.slot(pool.udp_global_slot(bind.index));
+    slot.set_rev2(state.clone());
+    slot.publish(&client_conn);
+    egress.cached[bind.index].store(Some(Arc::new(EgressCache {
+        conn: client_conn.clone(),
+        limit: 1200,
+        stamp_ms: coarse_millis(),
+        slot: pool.udp_global_slot(bind.index),
+        rev2: state.clone(),
+    })));
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.install_ctl_writer(ctl_tx);
+    let before = counters::snapshot();
+    send_sess_close(&egress, &pool, Some(bind), 7, state.epoch);
+    match ctl_rx.try_recv() {
+        Ok(CtlMessage::AssocClose { sess, .. }) => assert_eq!(sess, 7),
+        other => panic!("expected ASSOC_CLOSE on the control stream, got {other:?}"),
+    }
+    assert!(counters::since(&before).assoc_close_tx >= 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), server_conn.read_datagram())
+            .await
+            .is_err(),
+        "rev3 never sends SESS_CLOSE DATAGRAMs"
+    );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// rev3 never acts on `CTL` DATAGRAMs (its control plane is the stream), and an
+/// unclassifiable byte never reaches the legacy MQP-2/MQP-3 fallbacks.
+#[test]
+fn rev3_never_acts_on_ctl_datagrams_or_legacy_fallbacks() {
+    let state = rev3_state();
+    let hub = UdpHub::new();
+    let mut cache = empty_dispatch_cache();
+    let mut reasm = rev3_reasm();
+    let mut dgram_reasm = DgramReassembler::new();
+    let mut out: Vec<StagedReply> = Vec::new();
+    // A rev2 CAPS/HELLO-shaped DATAGRAM must not touch rev3 state.
+    let ctl = r2::encode_ctl(&r2::Ctl::Caps(r2::Caps::default()));
+    let caps_before = state.ctl.caps();
+    dispatch_inbound(
+        &mut cache,
+        &hub,
+        &state,
+        None,
+        ctl,
+        &mut dgram_reasm,
+        &mut reasm,
+        &mut out,
+        coarse_millis(),
+    );
+    assert_eq!(state.ctl.caps(), caps_before, "CTL datagrams are inert");
+    assert!(state.is_ready());
+    // An unclassifiable rev3 byte is a malformed frame (rx_drop), never the
+    // legacy MQP-2/MQP-3 dispatch paths.
+    let before = counters::snapshot();
+    dispatch_inbound(
+        &mut cache,
+        &hub,
+        &state,
+        None,
+        Bytes::from_static(&[0x70]),
+        &mut dgram_reasm,
+        &mut reasm,
+        &mut out,
+        coarse_millis(),
+    );
+    assert!(counters::since(&before).rx_drop >= 1);
+    assert_eq!(state.registry.len(), 0);
+}
+
+/// rev3 control sender plumbing is pure queueing (the stream task owns the
+/// I/O): no writer ⇒ `false`, installed writer ⇒ the message is queued, and a
+/// `NEED_CONTEXT` repair respects the per-connection rate budget.
+#[test]
+fn rev3_control_sender_queues_messages_and_rate_limits_repairs() {
+    let state = rev3_state();
+    assert!(
+        !state.send_ctl(CtlMessage::Goaway),
+        "no control-stream writer installed yet"
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    state.install_ctl_writer(tx);
+    assert!(state.send_ctl(CtlMessage::AssocClose { sess: 9, reason: 0 }));
+    assert_eq!(
+        rx.try_recv().expect("queued"),
+        CtlMessage::AssocClose { sess: 9, reason: 0 }
+    );
+    let wire_id = r2::make_wire_id(1, false).unwrap();
+    assert!(state.send_need_context(wire_id));
+    assert_eq!(
+        rx.try_recv().expect("repair queued"),
+        CtlMessage::NeedContext {
+            fid: wire::fid_for(wire_id).unwrap()
+        }
+    );
+    // Budget exhausted: a flood of idempotent hints is bounded per second, so
+    // most of a 5000-call burst is refused instead of reaching the stream.
+    let mut sent = 0usize;
+    for _ in 0..5000 {
+        if state.send_need_context(wire_id) {
+            sent += 1;
+        }
+    }
+    assert!(
+        sent < 5000,
+        "the NEED_CONTEXT budget must refuse part of an unknown-id frame storm"
+    );
+    assert_eq!(ctl_stream::MARKER, 0xFF, "control stream marker is stable");
+}
+
+/// rev3 full-slice round trip on a real connection: a published rev3
+/// generation (dispatcher + control-stream task started), first payload sent as
+/// `DATA_EXT OPEN` through the shared egress, and a server steady reply decoded
+/// through the rev3 adapter and delivered to the app's UDP socket.
+#[tokio::test]
+async fn rev3_full_duplex_round_trip_through_egress_and_dispatcher() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+    let hub = Arc::new(UdpHub::new());
+    let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
+    // A live association, so the dispatcher has a destination for the reply.
+    let assoc = test_assoc().await;
+    let sess = hub.alloc_sess().unwrap();
+    hub.publish(sess, assoc.entry.clone());
+    // Publish the rev3 generation exactly as the reconnect loop + wiring will.
+    let slot = pool.slot(pool.udp_global_slot(0));
+    let state = rev3_state();
+    slot.set_rev2(state.clone());
+    slot.publish(&client_conn);
+    slot.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    bump_gen(&slot.gen_tx);
+    spawn_dispatcher(slot.clone(), hub.clone());
+
+    // Uplink through the real egress path (single-flight acquire + memo store).
+    let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut bind: Option<UdpBind> = None;
+    let mut up = UplinkFlows::new();
+    let mut frag = R2Fragmenter::new();
+    send_payload_uplink(
+        &pool,
+        &egress,
+        sess,
+        &target.as_ref(),
+        b"ping",
+        &mut bind,
+        &mut up,
+        &mut frag,
+        coarse_millis(),
+        SessionKind::Socks,
+    );
+    let bind = bind.expect("the first payload binds the egress class");
+    drain_assoc_stage(&egress, &pool, bind);
+
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the rev3 context frame must arrive")
+        .unwrap();
+    let f = wire::decode_data(Wire::Rev3, &d).expect("rev3 DATA decodes");
+    let id = f.wire_id.expect("the first payload opens a flow");
+    assert_eq!(f.sess, Some(sess));
+    assert_eq!(f.addr, Some(target.as_ref()));
+    assert_eq!(f.payload, b"ping");
+
+    // Downlink: a steady rev3 frame for that flow reaches the app socket via
+    // the dispatcher's rev3 decode path.
+    server_conn
+        .send_datagram(wire::encode_data_steady(Wire::Rev3, id, b"pong", 1400).unwrap())
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), assoc.app.recv_from(&mut buf))
+        .await
+        .expect("the dispatcher must deliver the reply")
+        .unwrap()
+        .0;
+    // SOCKS5 UDP reply header (RSV/FRAG + IPv4 source + port) then the payload.
+    assert_eq!(&buf[..3], &[0, 0, 0]);
+    assert_eq!(buf[3], 0x01, "an IP-form reply source is encoded as IPv4");
+    assert_eq!(&buf[10..n], b"pong");
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Regression (task-12): rev3 **early-data payloads must never spend the
+/// binding's no-ACK context window**.
+///
+/// A DATAGRAM sent before the connection's handshake completes is 0-RTT early
+/// data; if the server rejects the resumption (e.g. it restarted), QUIC
+/// discards those DATAGRAMs wholesale and never retransmits them. If the sender
+/// had self-confirmed the binding on such a frame, every payload after the
+/// handshake would be a steady frame for an id the server never installed — the
+/// "held datagram across a server restart leaves a persistent forward peer
+/// blackholed" bug. Early data therefore always carries the binding form and
+/// leaves the K=2 window for the first post-handshake payloads.
+#[test]
+fn rev3_early_data_never_spends_the_binding_context_window() {
+    let state = rev3_state();
+    let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr);
+    // Pre-handshake (0-RTT) sends: binding form every time, budget untouched.
+    for _ in 0..8 {
+        assert!(
+            uses_binding_context(&state, &binding, false),
+            "an early-data payload must carry the binding context"
+        );
+    }
+    assert_eq!(
+        binding.state(),
+        FlowState::Opening,
+        "early data must not confirm the binding locally"
+    );
+    assert_eq!(
+        binding.context_left(),
+        R3_CONTEXT_REPEATS,
+        "a discarded 0-RTT frame must not consume the repair window"
+    );
+    // Established connection: the ordinary K=2 window, then steady frames.
+    assert!(uses_binding_context(&state, &binding, true));
+    assert!(uses_binding_context(&state, &binding, true));
+    assert!(
+        binding.is_open(),
+        "the last context payload self-confirms the binding"
+    );
+    assert!(!uses_binding_context(&state, &binding, true));
+
+    // rev2 is untouched: the ACK-gated rule ignores the handshake verdict.
+    let rev2 = rev2_state();
+    let b2 = FlowBinding::new_shared(
+        r2::make_wire_id(2, false).unwrap(),
+        7,
+        TargetAddr::Ip("198.51.100.10:53".parse().unwrap()),
+    );
+    assert!(uses_binding_context(&rev2, &b2, false));
+    assert!(uses_binding_context(&rev2, &b2, true));
+    b2.mark_open();
+    assert!(!uses_binding_context(&rev2, &b2, true));
+}
+
+/// Regression (task-12): a held payload that expires during an egress outage
+/// must leave the session on the ordinary `with_fresh`/`acquire` path, so the
+/// next payload of the SAME session (the persistent forward peer) is delivered
+/// on the fresh generation. Runs on both wire revisions: the hold/flush code is
+/// revision-independent.
+#[tokio::test]
+async fn held_datagram_expiry_then_fresh_generation_delivers_the_next_payload() {
+    for wire in [Wire::Rev2, Wire::Rev3] {
+        let (client_conn, server_conn, _client_ep, _server_ep) =
+            real_connection_with_server().await;
+        let pool = ConnPool::new(1, Vec::new(), true, true, 1);
+        let egress = SharedEgress::default();
+        let state = match wire {
+            Wire::Rev2 => rev2_state(),
+            Wire::Rev3 => rev3_state(),
+        };
+        let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+        let sess = 7u32;
+        // One persistent "peer": its uplink state and binding survive the
+        // generation change, exactly like a udp_forward peer session.
+        let mut bind: Option<UdpBind> = None;
+        let mut up = UplinkFlows::new();
+        let mut frag = R2Fragmenter::new_with_wire(wire);
+
+        // No egress published: the payload is held, not dropped.
+        send_payload_uplink(
+            &pool,
+            &egress,
+            sess,
+            &target.as_ref(),
+            b"during-outage",
+            &mut bind,
+            &mut up,
+            &mut frag,
+            coarse_millis(),
+            SessionKind::Socks,
+        );
+        assert_eq!(up.pending_len(), 1, "{wire:?}: payload held");
+        // The outage outlives the bounded window: the held payload expires and
+        // the hold empties (no stale state left behind).
+        assert_eq!(
+            up.expire_pending_at(mono_millis() + PENDING_TTL_MS),
+            1,
+            "{wire:?}: held payload expires"
+        );
+        assert!(up.pending_len() == 0, "{wire:?}: hold empty after expiry");
+
+        // A fresh generation is published (the restarted server's redial).
+        let bind = bind.expect("the first payload fixed the egress binding");
+        let slot = pool.slot(pool.udp_global_slot(bind.index));
+        slot.set_rev2(state.clone());
+        slot.publish(&client_conn);
+
+        // The same session's next payload takes the normal path and arrives.
+        send_payload_uplink(
+            &pool,
+            &egress,
+            sess,
+            &target.as_ref(),
+            b"after-outage",
+            &mut Some(bind),
+            &mut up,
+            &mut frag,
+            coarse_millis(),
+            SessionKind::Socks,
+        );
+        assert_eq!(
+            up.pending_len(),
+            0,
+            "{wire:?}: fresh generation sends, no hold"
+        );
+        drain_assoc_stage(&egress, &pool, bind);
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .unwrap_or_else(|_| panic!("{wire:?}: post-outage payload was not sent"))
+            .unwrap();
+        let f = wire::decode_data(wire, &d).expect("a DATA frame decodes");
+        assert_eq!(f.payload, b"after-outage", "{wire:?}");
+        assert_eq!(
+            f.sess,
+            Some(sess),
+            "{wire:?}: binding context on the new flow"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), server_conn.read_datagram())
+                .await
+                .is_err(),
+            "{wire:?}: the expired held payload must not be delivered late"
+        );
+        client_conn.close(0u32.into(), b"done");
+        server_conn.close(0u32.into(), b"done");
+    }
 }

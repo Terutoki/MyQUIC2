@@ -15,6 +15,15 @@
 //! fragment whose context disagrees — a peer cannot splice two sessions or
 //! targets into one payload.
 //!
+//! The reassembler is revision-agnostic internally: [`R2Reassembler::push`]
+//! keeps the shipped rev2 `FRAG` entry point, and
+//! [`R2Reassembler::push_view`] accepts the revision-independent decoded view
+//! from the [`crate::mqp::wire`] adapter (rev3 `FRAG` frames are decoded there
+//! and mapped back to the same internal `wire_id` keys). The wire revision is
+//! carried on the reassembler (`new_with_wire`/`set_wire`) so a connection's
+//! reassembler is created for the right revision; keys, bounds and expiry are
+//! identical for both.
+//!
 //! Bounds are the shipped ones: 8 KiB per payload, 256 partials, 256 KiB of
 //! retained assembly/pending bytes per connection (the stale `order` slots left
 //! by completed partials are charged to the same budget and kept bounded by
@@ -32,6 +41,7 @@ use crate::mqp::fragment::{
     MQP_FRAG_MAX_TOTAL,
 };
 use crate::mqp::r2;
+use crate::mqp::wire::{self, Wire};
 
 /// `(inline, id, frag_id)` map on `foldhash`, like every packet-adjacent table
 /// in this crate. The full key is compared, so a hash collision only costs a
@@ -307,9 +317,10 @@ pub struct R2Assembled {
     pub payload: Bytes,
 }
 
-/// Per-connection rev2 reassembly state.
-#[derive(Default)]
+/// Per-connection rev2/rev3 reassembly state.
 pub struct R2Reassembler {
+    /// Wire revision this reassembler serves (see [`Self::new_with_wire`]).
+    wire: Wire,
     parts: FragMap<Partial>,
     /// Insertion order of the live partials, oldest first. `parts` is the
     /// authority; completed/expired/evicted entries leave a stale slot that the
@@ -326,10 +337,87 @@ pub struct R2Reassembler {
     order_bytes: usize,
 }
 
+impl Default for R2Reassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One `FRAG` frame normalized from either wire revision, so the assembly logic
+/// below is written once.
+struct FragIn<'a> {
+    wire_id: Option<u32>,
+    sess: Option<u32>,
+    addr: Option<crate::mqp::addr::TargetAddrRef<'a>>,
+    src: bool,
+    frag_id: u32,
+    idx: u8,
+    total: u8,
+    chunk_off: usize,
+    chunk: &'a [u8],
+}
+
+impl<'a> FragIn<'a> {
+    fn from_rev2(f: &r2::FragRef<'a>) -> Self {
+        Self {
+            wire_id: f.id,
+            sess: f.sess,
+            addr: f.addr,
+            src: f.src,
+            frag_id: f.frag_id,
+            idx: f.idx,
+            total: f.total,
+            chunk_off: f.chunk_off,
+            chunk: f.chunk,
+        }
+    }
+
+    fn from_view(f: &wire::FragView<'a>) -> Self {
+        Self {
+            wire_id: f.wire_id,
+            sess: f.sess,
+            addr: f.addr,
+            src: f.src,
+            frag_id: f.frag_id,
+            idx: f.idx,
+            total: f.total,
+            chunk_off: f.chunk_off,
+            chunk: f.chunk,
+        }
+    }
+}
+
 impl R2Reassembler {
+    /// A reassembler for the shipped rev2 wire.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with_wire(Wire::Rev2)
+    }
+
+    /// A reassembler for `wire`. The wire only selects the accepted decoded view
+    /// (`push` is rev2-compatible, `push_view` is either revision); keys, bounds
+    /// and expiry are shared.
+    #[must_use]
+    pub fn new_with_wire(wire: Wire) -> Self {
+        Self {
+            wire,
+            parts: FragMap::default(),
+            order: VecDeque::new(),
+            held: 0,
+            order_bytes: 0,
+        }
+    }
+
+    /// The wire revision this reassembler was created for.
+    #[must_use]
+    pub fn wire(&self) -> Wire {
+        self.wire
+    }
+
+    /// Re-target the reassembler at another revision. Only meaningful before
+    /// any fragment is pushed (a live connection's revision never changes).
+    pub fn set_wire(&mut self, wire: Wire) {
+        self.wire = wire;
     }
 
     /// Retained chunk/slot bytes across all live partials **and** the stale
@@ -358,6 +446,25 @@ impl R2Reassembler {
     /// that is written into the assembly buffer when a later determinator
     /// unlocks it.
     pub fn push(&mut self, d: &Bytes, f: &r2::FragRef<'_>, now_ms: u64) -> Option<R2Assembled> {
+        self.push_frame(d, FragIn::from_rev2(f), now_ms)
+    }
+
+    /// Feed one decoded fragment from the revision-independent [`wire`] adapter
+    /// (rev2 and rev3 both arrive as a [`wire::FragView`]).
+    ///
+    /// Same contract and byte handling as [`Self::push`]; the view carries
+    /// internal `wire_id`s already mapped from the wire's 14-bit `fid`s, so the
+    /// keys, bounds and expiry are identical across revisions.
+    pub fn push_view(
+        &mut self,
+        d: &Bytes,
+        f: &wire::FragView<'_>,
+        now_ms: u64,
+    ) -> Option<R2Assembled> {
+        self.push_frame(d, FragIn::from_view(f), now_ms)
+    }
+
+    fn push_frame(&mut self, d: &Bytes, f: FragIn<'_>, now_ms: u64) -> Option<R2Assembled> {
         // Shape checks before anything copies. A malformed FRAG is a refused
         // datagram like any other validation failure.
         if f.total < 1 || f.total > MQP_FRAG_MAX_TOTAL || f.idx >= f.total || f.chunk.is_empty() {
@@ -376,7 +483,7 @@ impl R2Reassembler {
             book_drop(&dgram_drops::REFUSED);
             return None;
         }
-        let key = match (f.id, f.sess) {
+        let key = match (f.wire_id, f.sess) {
             (Some(id), _) if id != 0 => FragKey {
                 inline: false,
                 id,
@@ -416,7 +523,7 @@ impl R2Reassembler {
         // the only whole-payload copy on the single-fragment fast path).
         if f.total == 1 {
             return Some(R2Assembled {
-                wire_id: f.id,
+                wire_id: f.wire_id,
                 sess: incoming.as_ref().map(|c| c.sess),
                 addr: incoming.map(|c| c.addr),
                 src: f.src,
@@ -871,6 +978,52 @@ mod tests {
         assert_eq!(done.sess, Some(7));
         assert_eq!(done.addr, Some(TargetAddr::Ip(v4(53))));
         assert_eq!(done.payload, Bytes::from_static(b"abde"));
+    }
+
+    /// rev3: fragments decoded through the [`wire`] adapter
+    /// ([`wire::decode_frag`] → [`wire::FragView`]) reassemble with the same
+    /// keys/bounds/expiry and produce the same `R2Assembled` shape as rev2.
+    #[test]
+    fn rev3_fragments_reassemble_through_the_wire_adapter() {
+        use wire::Wire;
+
+        let mut r = R2Reassembler::new_with_wire(Wire::Rev3);
+        assert_eq!(r.wire(), Wire::Rev3);
+        // Client-owned internal id local 1 => wire_id 2 (fid 0).
+        let wire_id = 2u32;
+        let target = TargetAddrRef::Ip(v4(53));
+        // Build real rev3 frames: first fragment carries the OPEN context, the
+        // second is a steady fragment (out of order on purpose).
+        let f1 =
+            wire::encode_frag_open(Wire::Rev3, wire_id, 7, &target, false, 9, 1, 2, b"de", 1500)
+                .expect("r3 frag open encodes");
+        let f0 = wire::encode_frag_steady(Wire::Rev3, wire_id, 9, 0, 2, b"ab", 1500)
+            .expect("r3 frag steady encodes");
+        let d1 = f1;
+        let v1 = wire::decode_frag(Wire::Rev3, &d1).expect("r3 frag decodes");
+        assert!(r.push_view(&d1, &v1, 0).is_none());
+        let d0 = f0;
+        let v0 = wire::decode_frag(Wire::Rev3, &d0).expect("r3 frag decodes");
+        let done = r
+            .push_view(&d0, &v0, 0)
+            .expect("the payload completes when the last fragment lands");
+        assert_eq!(done.wire_id, Some(wire_id));
+        assert_eq!(done.sess, Some(7));
+        assert_eq!(done.addr, Some(TargetAddr::Ip(v4(53))));
+        assert_eq!(done.payload, Bytes::from_static(b"abde"));
+        assert_eq!(r.inflight(), 0);
+
+        // A one-fragment rev3 payload is a zero-copy view of the frame, exactly
+        // like the rev2 path.
+        let one = wire::encode_frag_steady(Wire::Rev3, wire_id, 10, 0, 1, b"whole", 1500).unwrap();
+        let v = wire::decode_frag(Wire::Rev3, &one).unwrap();
+        let done = r.push_view(&one, &v, 0).unwrap();
+        assert_eq!(done.payload, Bytes::from_static(b"whole"));
+        assert_eq!(
+            done.payload.as_ptr(),
+            v.chunk.as_ptr(),
+            "single-fragment payloads stay views of the arrived frame"
+        );
     }
 
     #[test]

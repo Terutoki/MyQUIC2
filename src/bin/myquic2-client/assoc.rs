@@ -369,7 +369,9 @@ impl AppDgramCtx<'_> {
         // and the single-flight winner still pays close_reason/
         // max_datagram_size at most once per refresh window. Stale handles are
         // reused optimistically behind one cheap `close_reason` gate: a dead
-        // one is invalidated and counted as NO_EGRESS instead of being sent.
+        // one is invalidated and its payload joins the bounded
+        // queue-until-publish hold (W3), which flushes it as soon as a fresh
+        // handle exists instead of losing it (see [`send_payload_uplink`]).
         //
         // The handle now also carries the connection's MQP-3 rev2 state: the
         // uplink stages/encodes against exactly the registry of the connection
@@ -433,6 +435,20 @@ impl SessionKind {
 /// accounting and `recover_send_outcome` are subtle and were all tuned
 /// together. The only difference between the two callers is the debug label.
 ///
+/// **W3 — queue-until-publish.** When the binding's dedicated egress
+/// connection is not available (cold start before the first publish, the whole
+/// reconnect/backoff window, or the refresh gate owned by another thread) the
+/// payload is no longer dropped on the spot: it is held in the association's
+/// bounded [`UplinkPending`] hold and flushed — in FIFO order, through this
+/// same normal path — as soon as a fresh handle appears (next send attempt, the
+/// association's pending-flush tick, or the generation bump a redial
+/// publishes). The hold is bounded by [`PENDING_MAX_ITEMS`] /
+/// [`PENDING_MAX_BYTES`] and by [`PENDING_TTL_MS`], so an outage still degrades
+/// to the documented fail-closed loss once the bounded grace is spent; only a
+/// refused payload is booked in `NO_EGRESS`. Held payloads of *this*
+/// association are older than the one being sent, so they are flushed before
+/// the current payload, preserving per-target order.
+///
 /// Synchronous (no `.await`), so callers may run it under a recvmmsg burst
 /// borrow.
 ///
@@ -466,6 +482,13 @@ pub(crate) fn send_payload_uplink(
         );
         b
     });
+    // W3: held payloads are older than this one. Flush them first so a burst
+    // that was held over an outage keeps its order when egress returns; the
+    // flush resolves its own handle (and is a no-op when the hold is empty, so
+    // the steady path pays one branch).
+    if uplink.has_pending() {
+        let _ = flush_pending_uplink(egress_shared, pool, sess, bind, uplink, frag, now);
+    }
     let sent = match egress_shared.with_fresh(bind, now, |c, limit, rev2| {
         send_uplink(c, limit, sess, target, payload, bind, rev2, uplink, frag)
     }) {
@@ -487,19 +510,35 @@ pub(crate) fn send_payload_uplink(
                 None => {
                     // No isolated egress connection right now: this binding's
                     // dedicated UDP slot(s) have not come up, are reconnecting,
-                    // or another thread owns the refresh gate. Counted *exactly*
-                    // (this counter is not batched) and warned once per
-                    // `DROP_WARN_INTERVAL_MS`, because "is `udp_fail_closed`
-                    // costing me anything" is only answerable if a short outage
-                    // is visible at all. The detail separates the three causes,
-                    // which is the difference between "the WAN is flapping" and
-                    // "another thread won the refresh race".
+                    // or another thread owns the refresh gate.
+                    //
+                    // W3: hold the payload (bounded) instead of dropping it.
+                    // The hold is the *grace*; only a payload refused by the
+                    // bound is a drop, and that drop is booked exactly like the
+                    // pre-W3 loss.
+                    if uplink.hold_pending(target, payload) {
+                        tracing::debug!(
+                            "udp {} {sess}: egress unavailable, {} datagram(s) held",
+                            kind.label(),
+                            uplink.pending_len()
+                        );
+                        return;
+                    }
+                    // Drop-newest past the bound: count exactly (this counter
+                    // is not batched) and warn once per `DROP_WARN_INTERVAL_MS`,
+                    // because "is `udp_fail_closed` costing me anything" is only
+                    // answerable if a short outage is visible at all. The detail
+                    // separates the causes, which is the difference between "the
+                    // WAN is flapping" and "another thread won the refresh
+                    // race".
                     let n = dgram_drops::bump(&dgram_drops::NO_EGRESS);
+                    counters::egress_hold_full();
                     dgram_drops::warn_egress_drop(dgram_drops::EgressDrop::NoConnection, n, || {
                         format!(
-                            "; class={} bind={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
+                            "; class={} bind={} hold_full={} udp_fail_closed={} udp_slot_live={} refresh_in_flight={}",
                             bind.class.name(),
                             bind.index,
+                            uplink.pending_len(),
                             pool.udp_fail_closed(),
                             pool.slot(pool.udp_global_slot(bind.index)).is_live(),
                             egress_shared.refreshing[bind.index]
@@ -622,6 +661,13 @@ pub(crate) async fn udp_associate_inner(
         Duration::from_secs(ASSOC_IDLE_TICK_SECS),
     );
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // W3 queue-until-publish flush timer. The branch is armed only while the
+    // association holds payloads (`uplink.has_pending()` guard), so a healthy
+    // association pays no wakeup; when the hold fills during an outage the
+    // interval's first (immediately-ready) tick fires as soon as the select is
+    // polled again, then once per `PENDING_FLUSH_TICK` until the hold drains.
+    let mut pending_flush = tokio::time::interval(PENDING_FLUSH_TICK);
+    pending_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Local copy of the last published app address: the value almost never
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
@@ -824,6 +870,27 @@ pub(crate) async fn udp_associate_inner(
                     break 'assoc;
                 }
             }
+            // W3: the bounded queue-until-publish hold is non-empty, so the
+            // egress connection may have returned since the last attempt. Flush
+            // in FIFO order, then write the flushed small payloads (they are
+            // staged on the connection; a burst end normally drains them, but an
+            // association whose app is waiting for a reply sends no next burst).
+            // Armed only while the hold is non-empty: the steady association
+            // never wakes for this branch.
+            _ = pending_flush.tick(), if uplink.has_pending() => {
+                if let Some(b) = bind {
+                    let _ = flush_pending_uplink(
+                        &egress_shared,
+                        &pool,
+                        sess,
+                        b,
+                        &mut uplink,
+                        &mut frag,
+                        coarse_millis(),
+                    );
+                    drain_assoc_stage(&egress_shared, &pool, b);
+                }
+            }
         }
     }
     // Final drain before the control-plane teardown: whatever this
@@ -835,6 +902,10 @@ pub(crate) async fn udp_associate_inner(
     if let Some(b) = bind {
         drain_assoc_stage(&egress_shared, &pool, b);
     }
+    // W3: whatever is still held for an egress handle that never returned is
+    // lost with the association. Book it (`NO_EGRESS`, one per payload) rather
+    // than dropping it silently.
+    uplink.clear_pending();
     // Session teardown runs even when no egress handle was ever acquired or the
     // generation is still in its handshake window: the local half (registry
     // bindings + staged payloads + the pending close notification) must not

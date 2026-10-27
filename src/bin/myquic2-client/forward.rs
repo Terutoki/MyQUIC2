@@ -274,36 +274,40 @@ async fn open_forward_stream(
 ) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
     let slot_idx = pool.pick_tcp_index(target);
     let slot = pool.slot(slot_idx);
+    let zero_rtt = slot.zero_rtt_state();
     let mut gen_rx = slot.gen_rx.clone();
     let conn = slot.wait_conn(&mut gen_rx, timeout).await?;
-    let (mut send, mut recv) =
-        match tokio::time::timeout(FORWARD_TCP_OPEN_TIMEOUT, conn.open_bi()).await {
-            Ok(Ok((s, r))) => (s, r),
-            _ => {
-                if conn.close_reason().is_some() {
-                    retire_dead_slot(&slot, slot_idx, egress, &conn);
-                }
-                anyhow::bail!("quic stream open failed (connection down or stream limit)");
-            }
-        };
-    let prio = if pool.is_interactive(target) { 10 } else { 0 };
-    let _ = send.set_priority(prio);
-    // The header is deliberately its own write, flushed before any app byte is
-    // read: a target that waits for its first reply (game login, banner
-    // protocols) must see the request within ~100 ms without the app having
-    // sent anything yet. Same contract as the SOCKS path's header write.
+    // The header is written as its own first stream write, flushed before any
+    // app byte is read: a target that waits for its first reply (game login,
+    // banner protocols) must see the request within ~100 ms without the app
+    // having sent anything yet. On a resumed connection the open lands on a
+    // 0-RTT stream (first flight); `open_bi_and_write_header` retries on a
+    // 1-RTT stream when the peer rejects the early data, and consumes no app
+    // bytes before it returns Ok.
     let mut hdr = [0u8; AddrHeader::MAX_LEN];
     let hdr_len = target.as_ref().header()?.encode_into(&mut hdr);
-    let sent = tokio::time::timeout(FORWARD_TCP_OPEN_TIMEOUT, send.write_all(&hdr[..hdr_len]))
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false);
-    if !sent {
-        send.reset(0x04u32.into()).ok();
-        recv.stop(0x04u32.into()).ok();
-        anyhow::bail!("quic stream header write failed or timed out");
+    let prio = if pool.is_interactive(target) { 10 } else { 0 };
+    match open_bi_and_write_header(
+        &conn,
+        &zero_rtt,
+        &hdr[..hdr_len],
+        prio,
+        FORWARD_TCP_OPEN_TIMEOUT,
+    )
+    .await
+    {
+        Ok(pair) => Ok(pair),
+        Err(e) => {
+            // The dead-slot self-heal: an open failure on a connection with a
+            // `close_reason` is the one path that can notice a death before the
+            // reconnect loop's watchdog, so it must retire the slot's
+            // generation exactly like the SOCKS path does.
+            if conn.close_reason().is_some() {
+                retire_dead_slot(&slot, slot_idx, egress, &conn);
+            }
+            Err(e)
+        }
     }
-    Ok((send, recv))
 }
 
 /// Arm a reset on the still-owned app socket.

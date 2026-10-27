@@ -3478,10 +3478,18 @@ mod tests {
     fn alpn_override_parses_and_defaults() {
         let base = "socks_listen = '[::]:1080'\nserver_addr = '127.0.0.1:8443'\n\
             server_name = 'test.com'\nserver_cert_file = 'x'\n";
+        // Both wire revisions default to the shared h3 masquerade; ALPN is a
+        // deployment label, not a revision switch.
         let c: ClientConf = toml::from_str(base).unwrap();
         assert_eq!(c.alpn_bytes(), b"h3");
-        let c2: ClientConf = toml::from_str(&format!("{base}alpn = 'myquic2/3'\n")).unwrap();
+        let rev2: ClientConf = toml::from_str(&format!("{base}wire_rev = 2\n")).unwrap();
+        assert_eq!(rev2.alpn_bytes(), b"h3");
+        // A configured label is used verbatim on either revision.
+        let c2: ClientConf =
+            toml::from_str(&format!("{base}wire_rev = 2\nalpn = 'myquic2/3'\n")).unwrap();
         assert_eq!(c2.alpn_bytes(), MQP_ALPN);
+        let c3: ClientConf = toml::from_str(&format!("{base}alpn = 'myquic2/r3'\n")).unwrap();
+        assert_eq!(c3.alpn_bytes(), b"myquic2/r3");
         assert_eq!(normalize_alpn(Some("")), b"h3");
         assert_eq!(normalize_alpn(None), b"h3");
         assert_eq!(normalize_alpn(Some("h3")), b"h3");
@@ -3779,14 +3787,18 @@ mod tests {
         };
         assert_eq!(per_connection_memory_bytes(&narrow_streams), d);
         // A full house of the shipped defaults: 4096 x (transport 14 MB +
-        // two reassembly budgets of 256 KiB + the rev2 data-plane ceilings).
-        // The UDP session pool is a *separate*, global term
-        // (`session_pool_memory_bytes`), charged once by the admission bound
-        // rather than per connection.
+        // two reassembly budgets of 256 KiB + the rev2 data-plane ceilings +
+        // the raised pre-auth stream-credit assemblers: 72 streams x
+        // 1,024 gap spans x 96 B = 6.1875 MiB, since W6 raised
+        // SERVER_PRE_AUTH_BIDI_CREDIT to 64 and SERVER_UNI_STREAM_CREDIT to 8
+        // so a resumed client can open 0-RTT TCP streams against the credit it
+        // remembers from the previous handshake). The UDP session pool is a
+        // *separate*, global term (`session_pool_memory_bytes`), charged once
+        // by the admission bound rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            80640,
-            "4096 x 19.6875 MiB is the 78.75 GiB worst case for the default windows"
+            105984,
+            "4096 x 25.875 MiB is the 103.5 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested
