@@ -71,7 +71,7 @@ clap = { version = "4", features = ["derive"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 arc-swap = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 # foldhash: the hasher for every in-process ad-hoc table whose keys are short
 # and peer-influenced (server session table, client hub, DNS caches/inflight,
 # the fragment reassembler's `(sess, id)` tables, the interactive-port set).

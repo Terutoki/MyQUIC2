@@ -1054,18 +1054,26 @@ pub(crate) struct R2ConnState {
     /// Domain `DATA OPEN`s whose DNS lookup / first send is running on a
     /// spawned task, keyed by `(session, wire_id)`. Repeated OPENs for the same
     /// id are coalesced onto the in-flight lookup instead of spawning a second
-    /// resolver; see [`R2ConnState::begin_pending_open`].
+    /// resolver; see [`R2ConnState::begin_pending_open`]. Payloads that arrive
+    /// on such a duplicate are queued (bounded) and forwarded once the lookup
+    /// resolves, because they are distinct data, not retransmissions of the
+    /// first payload.
     ///
-    /// The value is the entry's cancellation flag. A `CTL SESS_CLOSE` for the
-    /// session sets it (`cancel_pending_opens_for_session`), and the lookup task
-    /// checks it when it is about to create the session, so a DNS answer that
-    /// lands after the client closed the association cannot resurrect a
-    /// session (and a wire binding) the close already reaped. The map stays
-    /// bounded by [`MAX_PENDING_DNS_OPENS`]; a flag's lifetime is owned by the
-    /// task's RAII guard, exactly like the coalescing key.
-    pending_dns_opens: parking_lot::Mutex<
-        std::collections::HashMap<(u32, u32), Arc<std::sync::atomic::AtomicBool>>,
-    >,
+    /// The entry owns the cancellation flag and the duplicate payload queue. A
+    /// `CTL SESS_CLOSE` for the session sets the flag
+    /// (`cancel_pending_opens_for_session`), and the lookup task checks it when
+    /// it is about to create the session, so a DNS answer that lands after the
+    /// client closed the association cannot resurrect a session (and a wire
+    /// binding) the close already reaped. The map stays bounded by
+    /// [`MAX_PENDING_DNS_OPENS`]; an entry's lifetime is owned by the task's
+    /// RAII guard, exactly like the coalescing key.
+    pending_dns_opens:
+        parking_lot::Mutex<std::collections::HashMap<(u32, u32), Arc<PendingDnsLookup>>>,
+    /// Bytes currently queued across every [`PendingDnsLookup`] on this
+    /// connection (see [`MAX_PENDING_DNS_BYTES`]). Reserved before a duplicate
+    /// payload is pushed and released when it is drained or discarded, so a
+    /// malicious duplicate stream cannot grow the queues past a fixed bound.
+    pending_dns_bytes: std::sync::atomic::AtomicUsize,
     /// Domain datagrams resolved by the **generic slow path**
     /// ([`forward_server_dgram`]'s `Unresolved` arm), keyed by session.
     ///
@@ -1101,6 +1109,52 @@ pub(crate) const PRE_HELLO_MAX_BYTES: usize = 16 * 1024;
 /// tasks (each waits on the limiter while holding its socket/target copies).
 pub(crate) const MAX_PENDING_DNS_OPENS: usize = 16;
 
+/// Bounds for duplicate payloads queued behind an in-flight domain OPEN.
+///
+/// A duplicate OPEN is the client's normal "no ACK yet" behaviour and its
+/// payload is new data, so dropping it unconditionally loses application
+/// datagrams for the whole DNS window. The queue keeps those payloads until the
+/// first lookup resolves; the byte budget is per connection (shared across all
+/// [`MAX_PENDING_DNS_OPENS`] lookups) and the item cap is per lookup, so a
+/// zero-length-payload flood cannot grow a single deque without bound either.
+pub(crate) const MAX_PENDING_DNS_PAYLOADS: usize = 64;
+pub(crate) const MAX_PENDING_DNS_BYTES: usize = 256 * 1024;
+
+/// One in-flight domain OPEN: its target, cancellation flag and the duplicate
+/// payloads waiting for the lookup to resolve.
+///
+/// The target is what makes a queued duplicate safe: an id names one
+/// `(session, target)` for the connection's life, so a duplicate that names a
+/// different target must never be forwarded to the in-flight lookup's
+/// destination (that would deliver the payload to the wrong host).
+///
+/// The queue mutex is only taken while the state's pending map is held (push) or
+/// by the owning task/drop (drain), so there is no lock-order inversion with
+/// `cancel_pending_opens_for_session` (which never touches the queue).
+struct PendingDnsLookup {
+    target: TargetAddr,
+    cancelled: std::sync::atomic::AtomicBool,
+    queued: parking_lot::Mutex<std::collections::VecDeque<Bytes>>,
+}
+
+/// Result of offering a duplicate OPEN payload to its in-flight lookup.
+pub(crate) enum PendingPayload {
+    /// Buffered; the lookup task will forward it after resolution.
+    Queued,
+    /// The item/byte bound was reached: the payload is dropped (counted at the
+    /// caller), never a flow reject — the first lookup is still healthy.
+    Full,
+    /// The session was closed while the lookup was in flight.
+    Cancelled,
+    /// The duplicate names a different target than the in-flight lookup. That
+    /// is the same protocol violation the installed-registry conflict check
+    /// refuses, so the caller rejects the id instead of misrouting the payload.
+    Conflict,
+    /// The lookup finished between the duplicate check and the queue push; the
+    /// caller should forward the payload through the normal inline path.
+    NotPending,
+}
+
 /// RAII entry for one in-flight domain OPEN: removes the `(session, id)`
 /// coalescing key when the lookup task exits, on every path (success, refusal,
 /// timeout, cancellation).
@@ -1113,7 +1167,7 @@ pub(crate) const MAX_PENDING_DNS_OPENS: usize = 16;
 pub(crate) struct PendingDnsOpen {
     state: Arc<R2ConnState>,
     key: (u32, u32),
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    entry: Arc<PendingDnsLookup>,
 }
 
 impl PendingDnsOpen {
@@ -1124,19 +1178,34 @@ impl PendingDnsOpen {
     /// the ordering against `take_session` (see
     /// [`R2ConnState::cancel_pending_opens_for_session`]).
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+        self.entry
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The flag as a borrow, for the guarded session creation
     /// ([`get_or_create_sess_guarded`]).
     pub(crate) fn cancelled_flag(&self) -> &std::sync::atomic::AtomicBool {
-        &self.cancelled
+        &self.entry.cancelled
+    }
+
+    /// Take the duplicate payloads queued behind this lookup. The global byte
+    /// budget is released here; the task forwards the returned payloads to the
+    /// already-resolved destination.
+    pub(crate) fn take_queued(&self) -> Vec<Bytes> {
+        self.state.take_pending_payloads(&self.entry)
     }
 }
 
 impl Drop for PendingDnsOpen {
     fn drop(&mut self) {
         self.state.pending_dns_opens.lock().remove(&self.key);
+        // The key is gone, so no new duplicate can be queued. Whatever is left
+        // belongs to a lookup that failed/was refused/was cancelled: release
+        // its byte budget and account each payload as a DNS-window drop.
+        for _ in self.state.take_pending_payloads(&self.entry) {
+            r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+        }
     }
 }
 
@@ -1162,6 +1231,7 @@ impl R2ConnState {
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
             pre_hello: parking_lot::Mutex::new((Vec::new(), 0)),
             pending_dns_opens: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            pending_dns_bytes: std::sync::atomic::AtomicUsize::new(0),
             dns_waiters: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -1215,7 +1285,16 @@ impl R2ConnState {
     /// Begin (or coalesce) one domain OPEN. The returned guard owns the
     /// pending-entry lifetime; a duplicate or cap refusal leaves the set
     /// unchanged.
-    pub(crate) fn begin_pending_open(self: &Arc<Self>, sess: u32, id: u32) -> PendingOpen {
+    ///
+    /// `target` is stored only when a lookup actually starts (the duplicate
+    /// path returns before allocating), so the steady retransmission pays no
+    /// target clone.
+    pub(crate) fn begin_pending_open(
+        self: &Arc<Self>,
+        sess: u32,
+        id: u32,
+        target: &TargetAddr,
+    ) -> PendingOpen {
         let key = (sess, id);
         let mut set = self.pending_dns_opens.lock();
         if set.contains_key(&key) {
@@ -1224,13 +1303,94 @@ impl R2ConnState {
         if set.len() >= MAX_PENDING_DNS_OPENS {
             return PendingOpen::Full;
         }
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        set.insert(key, Arc::clone(&cancelled));
+        let entry = Arc::new(PendingDnsLookup {
+            target: target.clone(),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            queued: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        });
+        set.insert(key, Arc::clone(&entry));
         PendingOpen::Started(PendingDnsOpen {
             state: Arc::clone(self),
             key,
-            cancelled,
+            entry,
         })
+    }
+
+    /// Queue one duplicate OPEN payload behind its in-flight lookup.
+    ///
+    /// The pending-map lock is held across the queue push, so the RAII guard's
+    /// map removal cannot race a push into an entry that is already being
+    /// dropped: either the push is visible to the guard's final drain, or the
+    /// caller sees [`PendingPayload::NotPending`] and forwards the payload on
+    /// the ordinary path.
+    ///
+    /// A duplicate naming a different target is refused as
+    /// [`PendingPayload::Conflict`]: an id is bound to one `(session, target)`
+    /// for the connection's life, so queueing it here would forward it to the
+    /// in-flight lookup's destination instead of the one the frame named.
+    pub(crate) fn queue_pending_open_payload(
+        &self,
+        sess: u32,
+        id: u32,
+        target: &TargetAddrRef<'_>,
+        payload: &Bytes,
+    ) -> PendingPayload {
+        let set = self.pending_dns_opens.lock();
+        let Some(entry) = set.get(&(sess, id)) else {
+            return PendingPayload::NotPending;
+        };
+        if entry.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return PendingPayload::Cancelled;
+        }
+        if entry.target.as_ref() != *target {
+            return PendingPayload::Conflict;
+        }
+        let mut queued = entry.queued.lock();
+        if queued.len() >= MAX_PENDING_DNS_PAYLOADS || !self.reserve_pending_bytes(payload.len()) {
+            return PendingPayload::Full;
+        }
+        queued.push_back(payload.clone());
+        PendingPayload::Queued
+    }
+
+    /// Reserve `bytes` in the connection's duplicate-payload budget. A zero
+    /// length payload reserves nothing but still needs the item cap.
+    fn reserve_pending_bytes(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        self.pending_dns_bytes
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| {
+                    let next = current.checked_add(bytes)?;
+                    (next <= MAX_PENDING_DNS_BYTES).then_some(next)
+                },
+            )
+            .is_ok()
+    }
+
+    /// Drain an entry's queued duplicate payloads and release their budget.
+    fn take_pending_payloads(&self, entry: &PendingDnsLookup) -> Vec<Bytes> {
+        let drained: Vec<Bytes> = {
+            let mut queued = entry.queued.lock();
+            queued.drain(..).collect()
+        };
+        let bytes: usize = drained.iter().map(Bytes::len).sum();
+        if bytes != 0 {
+            self.pending_dns_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        drained
+    }
+
+    /// Bytes currently queued for duplicate domain-OPEN payloads (test probe
+    /// and the bound the queue must never exceed).
+    #[cfg(test)]
+    pub(crate) fn pending_dns_bytes(&self) -> usize {
+        self.pending_dns_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cancel every in-flight domain OPEN belonging to `sess` (`CTL
@@ -1256,9 +1416,11 @@ impl R2ConnState {
     /// cancel an unrelated future OPEN.
     pub(crate) fn cancel_pending_opens_for_session(&self, sess: u32) {
         let set = self.pending_dns_opens.lock();
-        for ((s, _), cancelled) in set.iter() {
+        for ((s, _), entry) in set.iter() {
             if *s == sess {
-                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                entry
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         // The guards remove their keys on task exit; this loop deliberately
@@ -1881,9 +2043,10 @@ pub(crate) fn policy_resolved(addrs: &[SocketAddr], allow_private: bool) -> Vec<
 /// close resurrected the session (socket, global permit and wire binding) after
 /// `SESS_CLOSE` had already reaped it.
 ///
-/// Repeated OPENs for the same id while this task is in flight are dropped by
-/// [`R2ConnState::begin_pending_open`]; the client repeats OPEN until ACK, so
-/// dropping a duplicate payload is ordinary UDP loss, never a stuck flow.
+/// Repeated OPENs for the same id while this task is in flight coalesce onto it
+/// ([`R2ConnState::begin_pending_open`]); their payloads are queued (bounded and
+/// target-checked) and forwarded here after the lookup resolves, so a client
+/// that opens a flow per payload does not lose the DNS window's datagrams.
 #[allow(clippy::too_many_arguments)]
 async fn r2_forward_domain_open_bg(
     ss: SessTable,
@@ -1979,6 +2142,16 @@ async fn r2_forward_domain_open_bg(
     // memo written above, and arms it there — one slow-path hit, never a
     // reason to keep the DNS wait on the reader.
     udp_try_send(&sock, map_for_dual(dst), payload);
+    // Duplicate OPENs that arrived while the lookup was in flight carried new
+    // payloads (the client repeats OPEN per payload, it does not retransmit the
+    // same one). Forward them now, in arrival order, before the install/ACK.
+    for queued in pending.take_queued() {
+        if pending.is_cancelled() {
+            r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+            continue;
+        }
+        udp_try_send(&sock, map_for_dual(dst), queued);
+    }
     match r2_install(
         &state,
         &ss,
@@ -2008,7 +2181,7 @@ async fn r2_forward_domain_open_bg(
 
 /// Handle one `DATA OPEN` (client-initiated flow: the address is the target).
 #[allow(clippy::too_many_arguments)]
-async fn r2_ingress_open(
+pub(crate) async fn r2_ingress_open(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
     ss: &SessTable,
     cd: &quinn::Connection,
@@ -2031,14 +2204,17 @@ async fn r2_ingress_open(
     }
     // An id is bound to one `(session, target)` for the connection's life: a
     // reopen with a different target is a protocol violation, never a reroute.
-    if let Some(existing) = state.registry.get(id) {
-        if existing.session != sess || existing.target != target {
-            r2_refuse(None);
-            r2_reject(cd, id, r2::R2_REJECT_POLICY);
-            return;
-        }
-    } else if state.registry.len() >= state.registry.cap() {
-        r2_reject(cd, id, r2::R2_REJECT_TABLE_FULL);
+    //
+    // A *full* registry is deliberately not checked here: the payload still has
+    // to be delivered before the install is refused (P2-7). `r2_install` runs
+    // after the forward and reports `TABLE_FULL`, which sends the reject then.
+    // Rejecting before the forward silently dropped the triggering datagram
+    // even though `INLINE` would have carried it.
+    if let Some(existing) = state.registry.get(id)
+        && (existing.session != sess || existing.target != target)
+    {
+        r2_refuse(None);
+        r2_reject(cd, id, r2::R2_REJECT_POLICY);
         return;
     }
     // Deliver first (or resolve+deliver): a flow is installed only after the
@@ -2076,12 +2252,46 @@ async fn r2_ingress_open(
         }
         TargetAddrRef::Domain(host, port) => {
             let host = host.to_owned();
-            match state.begin_pending_open(sess, id) {
+            match state.begin_pending_open(sess, id, &target) {
                 PendingOpen::Duplicate => {
-                    // The first OPEN for this id is already resolving; the
-                    // client repeats OPEN until its FLOW_ACK, so this payload
-                    // is ordinary UDP loss rather than a second resolver.
-                    r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                    // The first OPEN for this id is already resolving. This
+                    // frame's payload is distinct application data, so buffer
+                    // it behind the lookup (bounded) instead of losing it; the
+                    // task forwards the queued payloads in order after the
+                    // resolution. A full/closed queue drops it as the old path
+                    // always did, and `NotPending` means the lookup just
+                    // finished: forward on the ordinary path. A duplicate that
+                    // names a different target is the registry's conflict case
+                    // moved into the DNS window: refuse it, never queue it for
+                    // the in-flight target's destination.
+                    match state.queue_pending_open_payload(sess, id, &target.as_ref(), &payload) {
+                        PendingPayload::Queued => {}
+                        PendingPayload::Full | PendingPayload::Cancelled => {
+                            r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                        }
+                        PendingPayload::Conflict => {
+                            r2_refuse(None);
+                            r2_reject(cd, id, r2::R2_REJECT_POLICY);
+                        }
+                        PendingPayload::NotPending => {
+                            let accepted = forward_v3_item(
+                                fast,
+                                ss,
+                                cd,
+                                conn_id,
+                                sess,
+                                target.as_ref(),
+                                payload,
+                                allow_private,
+                                staged,
+                                Some(state),
+                            )
+                            .await;
+                            if !accepted {
+                                r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
+                            }
+                        }
+                    }
                     return;
                 }
                 PendingOpen::Full => {

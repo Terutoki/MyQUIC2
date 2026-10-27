@@ -66,14 +66,38 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// server's 180 s sweep.
 const MAX_CLOSED_SESSIONS: usize = 64;
 
-/// How long a target the server rejected (`CTL FLOW_REJECT`: policy / table
-/// full / DNS failure) is sent `INLINE` before the uplink retries an `OPEN`.
+/// How long a target the server rejected (`CTL FLOW_REJECT`) is sent `INLINE`
+/// before the uplink retries an `OPEN`.
 ///
 /// The spec asks for exactly this fallback: retrying the OPEN on every payload
 /// would be a rejected frame plus a lost payload each time, while `INLINE`
 /// keeps the association working (the server can still forward a
 /// self-describing frame) and re-tests the flow after the TTL.
-const REJECT_TTL_MS: u64 = 10_000;
+///
+/// The reason selects the window. `TABLE_FULL` and `DNS` are transient state
+/// that can clear on its own (a registry slot freed, a resolver recovered), so
+/// waiting the policy window would keep a healthy target on `INLINE` long
+/// after it could be compressed again. A policy rejection is a stable property
+/// of the destination (SSRF/owner/conflict), so retrying it often only burns a
+/// rejected frame per second.
+const REJECT_TTL_TRANSIENT_MS: u64 = 1_000;
+const REJECT_TTL_POLICY_MS: u64 = 30_000;
+
+/// Per-target rejection window for a `FLOW_REJECT` reason.
+fn reject_ttl_ms(reason: u8) -> u64 {
+    match reason {
+        r2::R2_REJECT_TABLE_FULL | r2::R2_REJECT_DNS => REJECT_TTL_TRANSIENT_MS,
+        _ => REJECT_TTL_POLICY_MS,
+    }
+}
+
+/// One target inside a `FLOW_REJECT` window.
+#[derive(Debug)]
+struct RejectedTarget {
+    target: TargetAddr,
+    rejected_at_ms: u64,
+    ttl_ms: u64,
+}
 
 /// Upper bound on the rejected-target cache. A peer controls rejections, so the
 /// set is bounded; past the cap the oldest entry is forgotten (the flow just
@@ -139,9 +163,10 @@ pub(crate) struct ConnRev2 {
     /// which is ordinary UDP loss. Updated with `Relaxed`: the caller treats
     /// `false` as "not closed on this datagram" and re-checks on the next sync.
     closed_len: std::sync::atomic::AtomicUsize,
-    /// `(target, rejected_at_ms)` for targets the server rejected with
-    /// `CTL FLOW_REJECT` (see [`REJECT_TTL_MS`]).
-    rejected: parking_lot::RwLock<Vec<(TargetAddr, u64)>>,
+    /// Targets the server rejected with `CTL FLOW_REJECT`, with their window
+    /// start and reason-selected TTL (see [`REJECT_TTL_TRANSIENT_MS`] /
+    /// [`REJECT_TTL_POLICY_MS`]).
+    rejected: parking_lot::RwLock<Vec<RejectedTarget>>,
 }
 
 impl std::fmt::Debug for ConnRev2 {
@@ -373,20 +398,26 @@ impl ConnRev2 {
         self.closed_sessions.read().iter().copied().collect()
     }
 
-    /// Record that the server rejected a flow for `target`. The uplink then
-    /// sends `INLINE` for it until [`REJECT_TTL_MS`] elapses, which is the
-    /// spec's fallback for FLOW_REJECT (policy / table full / DNS failure).
-    pub(crate) fn note_rejected(&self, target: TargetAddr, now_ms: u64) {
+    /// Record that the server rejected a flow for `target` with `reason`. The
+    /// uplink then sends `INLINE` for it until the reason's window elapses
+    /// (see [`REJECT_TTL_TRANSIENT_MS`] / [`REJECT_TTL_POLICY_MS`]).
+    pub(crate) fn note_rejected(&self, target: TargetAddr, reason: u8, now_ms: u64) {
+        let ttl_ms = reject_ttl_ms(reason);
         let mut rejected = self.rejected.write();
-        rejected.retain(|(_, at)| now_ms.saturating_sub(*at) < REJECT_TTL_MS);
-        if let Some(slot) = rejected.iter_mut().find(|(t, _)| *t == target) {
-            slot.1 = now_ms;
+        rejected.retain(|e| now_ms.saturating_sub(e.rejected_at_ms) < e.ttl_ms);
+        if let Some(slot) = rejected.iter_mut().find(|e| e.target == target) {
+            slot.rejected_at_ms = now_ms;
+            slot.ttl_ms = ttl_ms;
             return;
         }
         if rejected.len() >= MAX_REJECTED_TARGETS {
             rejected.remove(0);
         }
-        rejected.push((target, now_ms));
+        rejected.push(RejectedTarget {
+            target,
+            rejected_at_ms: now_ms,
+            ttl_ms,
+        });
     }
 
     /// Whether `addr` is inside an active rejection window.
@@ -397,17 +428,17 @@ impl ConnRev2 {
     /// target's window (and on every new-target payload in general). Only when
     /// the scan sees an expired entry, i.e. when the table actually needs
     /// pruning, does this upgrade to the write lock, prune and re-test under
-    /// it. The TTL predicate is unchanged: an entry is live while
-    /// `now_ms - at < REJECT_TTL_MS`, exactly what the prune retains and what
+    /// it. The TTL predicate is per entry: an entry is live while
+    /// `now_ms - rejected_at < ttl_ms`, exactly what the prune retains and what
     /// [`Self::note_rejected`] maintains.
     pub(crate) fn is_rejected(&self, addr: &TargetAddrRef<'_>, now_ms: u64) -> bool {
-        let expired = |at: &u64| now_ms.saturating_sub(*at) >= REJECT_TTL_MS;
+        let expired = |e: &RejectedTarget| now_ms.saturating_sub(e.rejected_at_ms) >= e.ttl_ms;
         let rejected = self.rejected.read();
         let mut hit = false;
         let mut stale = false;
-        for (t, at) in rejected.iter() {
-            stale |= expired(at);
-            hit |= t.as_ref() == *addr;
+        for e in rejected.iter() {
+            stale |= expired(e);
+            hit |= e.target.as_ref() == *addr;
         }
         if !stale {
             return hit;
@@ -418,8 +449,8 @@ impl ConnRev2 {
         // concurrent `note_rejected`.
         drop(rejected);
         let mut rejected = self.rejected.write();
-        rejected.retain(|(_, at)| !expired(at));
-        rejected.iter().any(|(t, _)| t.as_ref() == *addr)
+        rejected.retain(|e| !expired(e));
+        rejected.iter().any(|e| e.target.as_ref() == *addr)
     }
 
     /// Drop every binding (connection teardown). Bindings still referenced by
@@ -1038,13 +1069,13 @@ fn ensure_binding(
     if flows.is_full() {
         return None;
     }
-    // A rejected target stays `INLINE` for the TTL: re-opening it would cost
-    // one rejected frame plus one lost payload per payload (see
-    // [`REJECT_TTL_MS`]). Checked before any registry scan: the rejection is
-    // the expected outcome for every payload of the window, so nothing can be
-    // bound for it and the scans below could only waste work. `is_rejected` is
-    // itself read-mostly (it takes the write lock only to prune expired
-    // entries).
+    // A rejected target stays `INLINE` for its reason's window: re-opening it
+    // would cost one rejected frame plus one lost payload per payload (see
+    // [`REJECT_TTL_TRANSIENT_MS`] / [`REJECT_TTL_POLICY_MS`]). Checked before
+    // any registry scan: the rejection is the expected outcome for every
+    // payload of the window, so nothing can be bound for it and the scans below
+    // could only waste work. `is_rejected` is itself read-mostly (it takes the
+    // write lock only to prune expired entries).
     if rev2.is_rejected(addr, coarse_millis()) {
         return None;
     }
@@ -1449,6 +1480,7 @@ pub(crate) mod counters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_SESSION;
 
     #[test]
     fn fresh_state_is_not_ready_and_allocates_client_ids() {
@@ -1664,7 +1696,11 @@ mod tests {
     fn rejected_target_path_consumes_no_id() {
         let r = ConnRev2::new();
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
-        r.note_rejected(TargetAddr::Ip(addr), coarse_millis());
+        r.note_rejected(
+            TargetAddr::Ip(addr),
+            r2::R2_REJECT_TABLE_FULL,
+            coarse_millis(),
+        );
         let mut up = UplinkFlows::new();
         assert!(
             ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
@@ -1688,8 +1724,8 @@ mod tests {
         let r = ConnRev2::new();
         let a = TargetAddr::Ip("198.51.100.1:1".parse().unwrap());
         let b = TargetAddr::Ip("198.51.100.2:2".parse().unwrap());
-        r.note_rejected(a.clone(), 1_000);
-        r.note_rejected(b.clone(), 1_000);
+        r.note_rejected(a.clone(), r2::R2_REJECT_POLICY, 1_000);
+        r.note_rejected(b.clone(), r2::R2_REJECT_POLICY, 1_000);
         // Both windows are live: the probe answers from the shared lock and
         // leaves the table untouched.
         assert!(r.is_rejected(&a.as_ref(), 2_000));
@@ -1697,8 +1733,117 @@ mod tests {
         assert_eq!(r.rejected.read().len(), 2, "a live probe prunes nothing");
         // One TTL later both entries are expired: the probe upgrades to the
         // write lock, prunes them and answers `false`.
-        assert!(!r.is_rejected(&a.as_ref(), 1_000 + REJECT_TTL_MS));
+        assert!(!r.is_rejected(&a.as_ref(), 1_000 + REJECT_TTL_POLICY_MS));
         assert_eq!(r.rejected.read().len(), 0, "expired entries are pruned");
+    }
+
+    /// P2-6: a capacity/DNS rejection is transient and must be retried soon; a
+    /// policy rejection is stable and must not cost a rejected frame every
+    /// second.
+    #[test]
+    fn reject_ttl_is_reason_aware() {
+        let r = ConnRev2::new();
+        let table_full = TargetAddr::Ip("198.51.100.10:1".parse().unwrap());
+        let dns = TargetAddr::Ip("198.51.100.11:2".parse().unwrap());
+        let policy = TargetAddr::Ip("198.51.100.12:3".parse().unwrap());
+        r.note_rejected(table_full.clone(), r2::R2_REJECT_TABLE_FULL, 0);
+        r.note_rejected(dns.clone(), r2::R2_REJECT_DNS, 0);
+        r.note_rejected(policy.clone(), r2::R2_REJECT_POLICY, 0);
+
+        assert!(r.is_rejected(&table_full.as_ref(), REJECT_TTL_TRANSIENT_MS - 1));
+        assert!(r.is_rejected(&dns.as_ref(), REJECT_TTL_TRANSIENT_MS - 1));
+        assert!(
+            !r.is_rejected(&table_full.as_ref(), REJECT_TTL_TRANSIENT_MS),
+            "TABLE_FULL must retry on the short window"
+        );
+        assert!(
+            !r.is_rejected(&dns.as_ref(), REJECT_TTL_TRANSIENT_MS),
+            "DNS must retry on the short window"
+        );
+        assert!(
+            r.is_rejected(&policy.as_ref(), REJECT_TTL_TRANSIENT_MS),
+            "POLICY must stay INLINE past the transient window"
+        );
+        assert!(r.is_rejected(&policy.as_ref(), REJECT_TTL_POLICY_MS - 1));
+        assert!(
+            !r.is_rejected(&policy.as_ref(), REJECT_TTL_POLICY_MS),
+            "POLICY expires on its long window"
+        );
+    }
+
+    /// P1-1: 64 distinct rejected targets must not pin the association's 64
+    /// reverse-table slots. The 65th new target has to open a flow (the
+    /// registry is nearly empty), not fall back to `INLINE` forever.
+    #[test]
+    fn rejected_targets_reclaim_session_slots_for_new_targets() {
+        let r = ConnRev2::new();
+        let mut up = UplinkFlows::new();
+        let now = coarse_millis();
+        // Open 64 distinct targets first: that is the state a burst of
+        // FLOW_REJECTs lands on.
+        let mut opened = Vec::new();
+        for i in 0..R2_MAX_FLOWS_PER_SESSION as u16 {
+            let addr = SocketAddr::from(([198, 51, 100, 9], 4000 + i));
+            let binding = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr))
+                .expect("the first 64 targets fit the session table");
+            binding.mark_open();
+            opened.push(binding);
+        }
+        assert_eq!(up.flows.len(), R2_MAX_FLOWS_PER_SESSION);
+        assert!(up.flows.is_full());
+        for binding in opened {
+            // The production `FLOW_REJECT` close path: registry removal, the
+            // binding marked closed, and the reason window armed.
+            assert!(r.registry.remove(binding.wire_id).is_some());
+            binding.mark_closed();
+            assert_eq!(binding.state(), FlowState::Closed);
+            r.note_rejected(binding.target.clone(), r2::R2_REJECT_TABLE_FULL, now);
+        }
+        assert_eq!(up.flows.len(), R2_MAX_FLOWS_PER_SESSION);
+        assert!(
+            !up.flows.is_full(),
+            "closed bindings must not keep the session table full"
+        );
+
+        let fresh_addr = SocketAddr::from(([198, 51, 100, 10], 5000));
+        let fresh = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(fresh_addr))
+            .expect("the 65th target must reuse a closed slot");
+        assert_eq!(fresh.state(), FlowState::Opening);
+        assert_eq!(
+            up.flows.len(),
+            R2_MAX_FLOWS_PER_SESSION,
+            "the reclaimed slot was replaced, not appended"
+        );
+        assert!(r.registry.get(fresh.wire_id).is_some());
+    }
+
+    /// N-1: a server-side purge can arrive without a consumable `SESS_CLOSE`
+    /// note (the client's bounded set may have evicted it). The shared binding
+    /// is marked closed by the purge, so the next uplink must re-open instead
+    /// of sending steady frames for an id the server no longer holds.
+    #[test]
+    fn registry_purge_without_a_close_note_is_recovered() {
+        let r = ConnRev2::new();
+        let mut up = UplinkFlows::new();
+        up.sync(&r, 1);
+        let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        first.mark_open();
+        // The server reaped the session and the note was never recorded (or was
+        // evicted at MAX_CLOSED_SESSIONS): `sync` sees nothing.
+        assert_eq!(r.registry.remove_session(1), 1);
+        assert_eq!(first.state(), FlowState::Closed);
+        up.sync(&r, 1);
+        assert!(
+            up.last.is_some(),
+            "premise: the memo still holds the dead flow"
+        );
+
+        let reopened = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr))
+            .expect("the closed binding must not be reused");
+        assert_ne!(reopened.wire_id, first.wire_id, "an id is never reused");
+        assert_eq!(up.flows.len(), 1, "the dead slot was reclaimed");
+        assert!(r.registry.get(reopened.wire_id).is_some());
     }
 
     #[test]
@@ -1830,7 +1975,7 @@ mod tests {
         // A reject closes the flow and arms the target's INLINE window.
         first.mark_closed();
         let _ = r.registry.remove(first.wire_id);
-        r.note_rejected(TargetAddr::Ip(addr), now);
+        r.note_rejected(TargetAddr::Ip(addr), r2::R2_REJECT_POLICY, now);
         assert!(r.is_rejected(&TargetAddrRef::Ip(addr), now));
         assert!(
             ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
@@ -1838,9 +1983,9 @@ mod tests {
         );
         // The window is TTL-wide; a probe at the TTL boundary expires it (that
         // probe uses the wall clock in production, so pruning is exact).
-        assert!(r.is_rejected(&TargetAddrRef::Ip(addr), now + REJECT_TTL_MS - 1));
+        assert!(r.is_rejected(&TargetAddrRef::Ip(addr), now + REJECT_TTL_POLICY_MS - 1));
         assert!(
-            !r.is_rejected(&TargetAddrRef::Ip(addr), now + REJECT_TTL_MS),
+            !r.is_rejected(&TargetAddrRef::Ip(addr), now + REJECT_TTL_POLICY_MS),
             "the rejection expires after the TTL"
         );
         // Expire the entry as the wall clock would, then the next payload
@@ -1861,14 +2006,14 @@ mod tests {
         let r = ConnRev2::new();
         for i in 0..(MAX_REJECTED_TARGETS as u16 * 2) {
             let a = SocketAddr::from(([203, 0, 113, 9], 4000 + i));
-            r.note_rejected(TargetAddr::Ip(a), 0);
+            r.note_rejected(TargetAddr::Ip(a), r2::R2_REJECT_TABLE_FULL, 0);
         }
         let live = r.rejected.read().len();
         assert_eq!(live, MAX_REJECTED_TARGETS, "the set stays bounded");
         // Re-rejecting a present target moves its stamp, it does not grow.
         let a = TargetAddr::Ip(SocketAddr::from(([203, 0, 113, 9], 4000)));
-        r.note_rejected(a.clone(), 0);
-        r.note_rejected(a, 0);
+        r.note_rejected(a.clone(), r2::R2_REJECT_TABLE_FULL, 0);
+        r.note_rejected(a, r2::R2_REJECT_TABLE_FULL, 0);
         assert_eq!(r.rejected.read().len(), MAX_REJECTED_TARGETS);
     }
 

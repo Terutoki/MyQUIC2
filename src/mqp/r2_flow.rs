@@ -255,7 +255,9 @@ impl SessionFlows {
         Self::default()
     }
 
-    /// Number of live bindings.
+    /// Number of occupied slots. A binding that was marked `Closed` still
+    /// occupies its slot until a later insert reclaims it (see
+    /// [`Self::is_full`]).
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.iter().filter(|e| e.is_some()).count()
@@ -266,9 +268,22 @@ impl SessionFlows {
         self.entries.iter().all(Option::is_none)
     }
 
+    /// Whether every slot is occupied by a **live** binding.
+    ///
+    /// A `Closed` binding is a dead entry whose wire id can never be used again
+    /// (see [`FlowBinding::mark_closed`]): the close paths remove it from the
+    /// registry and mark the shared `Arc` closed, but this reverse table is
+    /// association-local and only `ensure_binding`'s same-target probe used to
+    /// forget it. Counting it as occupied pinned one of the 64 slots forever,
+    /// so 64 distinct rejected/closed targets made every later target fall back
+    /// to `INLINE` for the rest of the association. Such a slot is reclaimable
+    /// exactly like an empty one.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.entries.iter().all(Option::is_some)
+        !self.entries.iter().any(|e| match e {
+            None => true,
+            Some(b) => b.state() == FlowState::Closed,
+        })
     }
 
     /// Find a binding whose target equals `addr` (uplink send path).
@@ -350,13 +365,23 @@ impl SessionFlows {
         rebind.map(|b| SourceMatch::Rebind(b.clone()))
     }
 
-    /// Insert a binding; returns `false` when the table is full or the id is
-    /// already present (duplicate open is handled by the registry).
+    /// Insert a binding; returns `false` only when every slot holds a live
+    /// binding. A binding whose id is already present counts as inserted
+    /// (duplicate open is handled by the registry).
+    ///
+    /// A slot whose binding is `Closed` is reclaimed before an empty slot is
+    /// used: closed ids are never reusable, and keeping their `Arc` only pins a
+    /// slot (see [`Self::is_full`]). The registry entry behind the old binding
+    /// was already removed by whatever closed it (reject/close/session purge),
+    /// so dropping the table's reference here is safe.
     pub fn insert(&mut self, binding: Arc<FlowBinding>) -> bool {
         if self.find_id(binding.wire_id).is_some() {
             return true;
         }
-        let Some(slot) = self.entries.iter_mut().find(|e| e.is_none()) else {
+        let Some(slot) = self.entries.iter_mut().find(|e| match e {
+            None => true,
+            Some(b) => b.state() == FlowState::Closed,
+        }) else {
             return false;
         };
         *slot = Some(binding);
@@ -372,7 +397,9 @@ impl SessionFlows {
         entry.take()
     }
 
-    /// Iterate live bindings.
+    /// Iterate occupied slots. A binding that was marked `Closed` is still
+    /// yielded until a later insert reclaims its slot (see [`Self::insert`]);
+    /// callers that need live flows must check [`FlowBinding::state`].
     pub fn iter(&self) -> impl Iterator<Item = &Arc<FlowBinding>> {
         self.entries.iter().flatten()
     }
@@ -629,6 +656,14 @@ impl FlowRegistry {
     /// dropped. Used by `SESS_CLOSE` teardown so a closed association cannot
     /// leave receive-only bindings behind until the connection dies.
     ///
+    /// Every removed binding is marked [`FlowState::Closed`] before it is
+    /// dropped from the map. The sender-side association keeps its own `Arc`
+    /// in [`SessionFlows`], and the `SESS_CLOSE` notification that would make
+    /// it reset is bounded/lossy (the client keeps a cap of 64 pending notes):
+    /// marking the shared binding closed is what lets `UplinkFlows::sync` /
+    /// `ensure_binding` notice the purge even when the note was evicted,
+    /// instead of reusing an id the server no longer holds.
+    ///
     /// O(bindings of this session): the per-session index means a duplicate or
     /// forged `SESS_CLOSE` for an unknown session costs one hash probe, not a
     /// walk over the whole per-connection table.
@@ -641,6 +676,7 @@ impl FlowRegistry {
         let mut removed = 0usize;
         for wire_id in ids {
             if let Some(binding) = map.remove(&wire_id) {
+                binding.mark_closed();
                 if r2::wire_id_server_owned(binding.wire_id) {
                     self.server_flow_count
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -657,7 +693,9 @@ impl FlowRegistry {
     /// The server reap paths (idle/fair-share/session-pool sweeps, reader exit)
     /// remove a batch of sessions at once; doing so through
     /// [`Self::remove_session`] per entry paid one write lock and one map walk
-    /// per session. This pays one lock for the whole batch.
+    /// per session. This pays one lock for the whole batch. Like
+    /// [`Self::remove_session`], every removed binding is marked closed so the
+    /// sender side can recover even if its close notification was lost.
     pub fn remove_sessions(&self, sessions: &[u32]) -> usize {
         if sessions.is_empty() {
             return 0;
@@ -674,6 +712,7 @@ impl FlowRegistry {
         for ids in indexed {
             for wire_id in ids {
                 if let Some(binding) = map.remove(&wire_id) {
+                    binding.mark_closed();
                     if r2::wire_id_server_owned(binding.wire_id) {
                         self.server_flow_count
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -928,6 +967,45 @@ mod tests {
         assert!(!flows.insert(extra));
     }
 
+    /// P1-1: a `Closed` binding must not pin its reverse-table slot. Sixty-four
+    /// distinct rejected targets used to leave the table permanently "full",
+    /// forcing every later target to `INLINE` even though no live flow was
+    /// bound and the registry had room.
+    #[test]
+    fn session_flows_reclaim_closed_slots() {
+        let mut flows = SessionFlows::new();
+        let mut bindings = Vec::new();
+        for i in 1..=R2_MAX_FLOWS_PER_SESSION as u32 {
+            let b = binding(i, 7, TargetAddr::Ip(v4(1000 + i as u16)));
+            assert!(flows.insert(b.clone()));
+            bindings.push(b);
+        }
+        assert!(flows.is_full());
+        for b in &bindings {
+            b.mark_closed();
+        }
+        assert!(!flows.is_full(), "closed bindings cannot pin the table");
+        let fresh = binding(999, 7, TargetAddr::Ip(v4(9999)));
+        assert!(
+            flows.insert(fresh.clone()),
+            "a new target reuses a closed slot"
+        );
+        assert_eq!(
+            flows.len(),
+            R2_MAX_FLOWS_PER_SESSION,
+            "the reclaim replaces a dead slot instead of growing the table"
+        );
+        assert!(flows.find_id(fresh.wire_id).is_some());
+        assert_eq!(
+            flows
+                .iter()
+                .filter(|b| b.state() != FlowState::Closed)
+                .count(),
+            1,
+            "only the reclaimed slot was replaced; the rest are still dead"
+        );
+    }
+
     #[test]
     fn source_matching_exact_rebind_and_domain() {
         let mut flows = SessionFlows::new();
@@ -1114,11 +1192,16 @@ mod tests {
         let a = binding(1, 7, TargetAddr::Ip(v4(53)));
         let b = binding(2, 7, TargetAddr::Ip(v4(54)));
         let c = binding(3, 8, TargetAddr::Ip(v4(55)));
-        assert!(reg.insert(a).is_ok());
-        assert!(reg.insert(b).is_ok());
+        assert!(reg.insert(a.clone()).is_ok());
+        assert!(reg.insert(b.clone()).is_ok());
         assert!(reg.insert(c).is_ok());
         assert_eq!(reg.remove_session(7), 2);
         assert_eq!(reg.len(), 1);
+        // N-1: the sender-side association still holds these Arcs. Purging the
+        // registry must close them so `sync`/`ensure_binding` recovers even when
+        // the bounded `SESS_CLOSE` note was lost.
+        assert_eq!(a.state(), FlowState::Closed);
+        assert_eq!(b.state(), FlowState::Closed);
         // A duplicate/forged close for an unknown session costs one probe and
         // must not touch the remaining binding.
         assert_eq!(reg.remove_session(7), 0);
@@ -1132,6 +1215,31 @@ mod tests {
         assert_eq!(reg.remove_sessions(&[8]), 1);
         assert_eq!(reg.len(), 0);
         assert_eq!(reg.clear(), 0);
+    }
+
+    /// N-1 at the bound that matters: the client keeps at most 64 pending
+    /// `SESS_CLOSE` notes, so a mass purge of more than 64 associations must
+    /// still close every removed binding. The shared `Arc` is the only signal
+    /// those associations can see when their note was evicted.
+    #[test]
+    fn registry_remove_sessions_marks_every_binding_closed_past_the_note_cap() {
+        let reg = FlowRegistry::new(200);
+        let sessions: Vec<u32> = (1..=65).collect();
+        let mut bindings = Vec::new();
+        for &session in &sessions {
+            let b = binding(session, session, TargetAddr::Ip(v4(1000 + session as u16)));
+            assert!(reg.insert(b.clone()).is_ok());
+            bindings.push(b);
+        }
+        assert_eq!(reg.remove_sessions(&sessions), sessions.len());
+        assert!(reg.is_empty());
+        for b in bindings {
+            assert_eq!(
+                b.state(),
+                FlowState::Closed,
+                "every purged binding must be closed for the sender side"
+            );
+        }
     }
 
     #[test]

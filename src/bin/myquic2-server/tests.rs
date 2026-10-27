@@ -3351,51 +3351,167 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
     assert_eq!(d.refused, 0, "budget loss is not policy refusal");
 }
 
+/// Target the pending-domain-OPEN tests use for their coalesced lookups.
+fn pending_target() -> TargetAddr {
+    TargetAddr::Ip("203.0.113.7:53".parse().unwrap())
+}
+
+/// [`R2ConnState::begin_pending_open`] with the shared test target.
+fn begin_test_pending_open(state: &Arc<R2ConnState>, sess: u32, id: u32) -> PendingOpen {
+    state.begin_pending_open(sess, id, &pending_target())
+}
+
+/// [`R2ConnState::queue_pending_open_payload`] with the shared test target.
+fn queue_test_pending(state: &R2ConnState, sess: u32, id: u32, payload: &Bytes) -> PendingPayload {
+    let target = pending_target();
+    state.queue_pending_open_payload(sess, id, &target.as_ref(), payload)
+}
+
 /// The per-connection domain-OPEN coalescer: one in-flight lookup per
 /// `(session, id)`, a hard cap of `MAX_PENDING_DNS_OPENS`, and RAII release on
 /// every task exit path (ACK, reject, timeout, cancellation).
 #[test]
 fn pending_domain_opens_coalesce_cap_and_release() {
     let state = R2ConnState::new();
-    let first = match state.begin_pending_open(7, 9) {
+    let first = match begin_test_pending_open(&state, 7, 9) {
         PendingOpen::Started(g) => g,
         _ => panic!("the first OPEN must start a lookup"),
     };
     assert!(
-        matches!(state.begin_pending_open(7, 9), PendingOpen::Duplicate),
+        matches!(
+            begin_test_pending_open(&state, 7, 9),
+            PendingOpen::Duplicate
+        ),
         "a retransmitted OPEN coalesces onto the in-flight lookup"
     );
     // A different session (or a different id) is a different flow.
     assert!(matches!(
-        state.begin_pending_open(8, 9),
+        begin_test_pending_open(&state, 8, 9),
         PendingOpen::Started(_)
     ));
     assert!(matches!(
-        state.begin_pending_open(7, 10),
+        begin_test_pending_open(&state, 7, 10),
         PendingOpen::Started(_)
     ));
     drop(first);
     assert!(
-        matches!(state.begin_pending_open(7, 9), PendingOpen::Started(_)),
+        matches!(
+            begin_test_pending_open(&state, 7, 9),
+            PendingOpen::Started(_)
+        ),
         "dropping the guard must release the coalescing key"
     );
 
     // Fill the per-connection cap with held guards.
     let mut held = Vec::new();
     for id in 100..(100 + MAX_PENDING_DNS_OPENS as u32) {
-        match state.begin_pending_open(1, id) {
+        match begin_test_pending_open(&state, 1, id) {
             PendingOpen::Started(g) => held.push(g),
             _ => panic!("the cap must admit exactly MAX_PENDING_DNS_OPENS"),
         }
     }
     assert!(
-        matches!(state.begin_pending_open(1, 9999), PendingOpen::Full),
+        matches!(begin_test_pending_open(&state, 1, 9999), PendingOpen::Full),
         "past the cap the OPEN is refused instead of spawning another task"
     );
     drop(held);
     assert!(
-        matches!(state.begin_pending_open(1, 9999), PendingOpen::Started(_)),
+        matches!(
+            begin_test_pending_open(&state, 1, 9999),
+            PendingOpen::Started(_)
+        ),
         "releasing the in-flight guards must make room again"
+    );
+}
+
+/// P2-2: duplicate domain-OPEN payloads are distinct data, not retransmissions
+/// of the first frame. They are queued behind the in-flight lookup within a
+/// per-lookup item cap and a per-connection byte budget, and the task's
+/// `take_queued`/RAII drop releases the budget on every exit path.
+#[test]
+fn duplicate_domain_open_payloads_are_bounded_and_released() {
+    let state = R2ConnState::new();
+    let pending = match begin_test_pending_open(&state, 7, 9) {
+        PendingOpen::Started(g) => g,
+        _ => panic!("the first OPEN must start a lookup"),
+    };
+    let first = Bytes::from_static(b"first-duplicate");
+    assert!(matches!(
+        queue_test_pending(&state, 7, 9, &first),
+        PendingPayload::Queued
+    ));
+    assert_eq!(state.pending_dns_bytes(), first.len());
+    assert!(
+        matches!(
+            queue_test_pending(&state, 8, 9, &first),
+            PendingPayload::NotPending
+        ),
+        "a payload for a different lookup is not queued here"
+    );
+    // An id names one target for the connection's life. A duplicate naming a
+    // different target must be refused, never queued for the in-flight
+    // lookup's destination (that would deliver it to the wrong host).
+    let other_target = TargetAddr::Ip("203.0.113.8:53".parse().unwrap());
+    assert!(matches!(
+        state.queue_pending_open_payload(7, 9, &other_target.as_ref(), &first),
+        PendingPayload::Conflict
+    ));
+    assert_eq!(
+        state.pending_dns_bytes(),
+        first.len(),
+        "a refused conflict reserves nothing"
+    );
+
+    // Per-lookup item cap: the first payload plus the fill reaches the cap and
+    // the next one is refused, not queued without bound.
+    let one = Bytes::from_static(b"x");
+    for _ in 1..MAX_PENDING_DNS_PAYLOADS {
+        assert!(matches!(
+            queue_test_pending(&state, 7, 9, &one),
+            PendingPayload::Queued
+        ));
+    }
+    assert!(matches!(
+        queue_test_pending(&state, 7, 9, &one),
+        PendingPayload::Full
+    ));
+
+    // A close flags the entry: a later duplicate is not buffered for a session
+    // that is going away.
+    state.cancel_pending_opens_for_session(7);
+    assert!(matches!(
+        queue_test_pending(&state, 7, 9, &one),
+        PendingPayload::Cancelled
+    ));
+    let drained = pending.take_queued();
+    assert_eq!(drained.len(), MAX_PENDING_DNS_PAYLOADS);
+    assert_eq!(
+        state.pending_dns_bytes(),
+        0,
+        "the drained budget is released"
+    );
+
+    // Byte budget: one maximal payload fills the connection budget and the next
+    // byte is refused; dropping the guard releases it even without a drain.
+    let big = match begin_test_pending_open(&state, 7, 10) {
+        PendingOpen::Started(g) => g,
+        _ => panic!("a fresh key must start a lookup"),
+    };
+    let max = Bytes::from(vec![0u8; MAX_PENDING_DNS_BYTES]);
+    assert!(matches!(
+        queue_test_pending(&state, 7, 10, &max),
+        PendingPayload::Queued
+    ));
+    assert_eq!(state.pending_dns_bytes(), MAX_PENDING_DNS_BYTES);
+    assert!(matches!(
+        queue_test_pending(&state, 7, 10, &one),
+        PendingPayload::Full
+    ));
+    drop(big);
+    assert_eq!(
+        state.pending_dns_bytes(),
+        0,
+        "the RAII drop releases every queued payload's budget"
     );
 }
 
@@ -3406,11 +3522,11 @@ fn pending_domain_opens_coalesce_cap_and_release() {
 #[test]
 fn sess_close_cancels_only_its_sessions_in_flight_opens() {
     let state = R2ConnState::new();
-    let ours = match state.begin_pending_open(7, 9) {
+    let ours = match begin_test_pending_open(&state, 7, 9) {
         PendingOpen::Started(g) => g,
         _ => panic!("the first OPEN must start a lookup"),
     };
-    let other = match state.begin_pending_open(8, 9) {
+    let other = match begin_test_pending_open(&state, 8, 9) {
         PendingOpen::Started(g) => g,
         _ => panic!("a different session is a different lookup"),
     };
@@ -3427,13 +3543,19 @@ fn sess_close_cancels_only_its_sessions_in_flight_opens() {
         "another session's in-flight OPEN must be left alone"
     );
     assert!(
-        matches!(state.begin_pending_open(7, 9), PendingOpen::Duplicate),
+        matches!(
+            begin_test_pending_open(&state, 7, 9),
+            PendingOpen::Duplicate
+        ),
         "a flagged entry still coalesces (it is removed by its RAII guard)"
     );
 
     drop(ours);
     assert!(
-        matches!(state.begin_pending_open(7, 9), PendingOpen::Started(_)),
+        matches!(
+            begin_test_pending_open(&state, 7, 9),
+            PendingOpen::Started(_)
+        ),
         "the guard's drop releases the key again"
     );
     drop(other);
@@ -5479,6 +5601,81 @@ async fn rev2_open_ack_steady_inline_and_drops() {
     }
 
     rev2_teardown(client, task, holders_before).await;
+}
+
+/// P2-7: a full connection registry refuses the *install*, never the payload.
+/// The triggering OPEN's datagram must reach the target, then `FLOW_REJECT`
+/// tells the client to fall back to `INLINE` for later payloads.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rev2_open_on_full_registry_forwards_payload_then_rejects() {
+    let _holder_guard = holder_test_guard();
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = target.local_addr().unwrap();
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let state = R2ConnState::new();
+    // Pre-fill the connection registry to its cap as unrelated installed flows.
+    for local in 1..=state.registry.cap() as u32 {
+        let filler = FlowBinding::new_shared(
+            r2::make_wire_id(local, false).unwrap(),
+            999,
+            TargetAddr::Ip(SocketAddr::from(([203, 0, 113, 9], local as u16))),
+        );
+        assert!(state.registry.insert(filler).is_ok());
+    }
+    assert!(
+        !state.registry.has_capacity(),
+        "premise: the registry is full"
+    );
+    let id = r2::make_wire_id(state.registry.cap() as u32 + 1, false).unwrap();
+    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut staged = Vec::new();
+    r2_ingress_open(
+        &mut fast,
+        &ss,
+        &server_conn,
+        next_conn_id(),
+        true,
+        &mut staged,
+        &state,
+        id,
+        1,
+        TargetAddr::Ip(dst),
+        Bytes::from_static(b"must-arrive"),
+    )
+    .await;
+
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
+        .await
+        .expect("a full registry must still deliver the triggering payload")
+        .unwrap();
+    assert_eq!(&buf[..n], b"must-arrive");
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), client_conn.read_datagram())
+        .await
+        .expect("the refused install must answer FLOW_REJECT")
+        .unwrap();
+    match r2::decode_ctl(&frame).expect("FLOW_REJECT must decode") {
+        r2::Ctl::FlowReject {
+            id: rejected,
+            reason,
+        } => {
+            assert_eq!(rejected, id);
+            assert_eq!(reason, r2::R2_REJECT_TABLE_FULL);
+        }
+        other => panic!("expected FLOW_REJECT, got {other:?}"),
+    }
+    assert!(
+        state.registry.get(id).is_none(),
+        "a refused install must not leave a binding behind"
+    );
+    assert_eq!(state.registry.len(), state.registry.cap());
+
+    assert!(r2_close_session(&ss, &state, 1));
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
 }
 
 /// SSRF policy failure on an OPEN answers `FLOW_REJECT(policy)` and installs

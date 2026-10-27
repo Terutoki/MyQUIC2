@@ -61,8 +61,29 @@ fn free_udp_port_excluding(exclude: &[u16]) -> u16 {
 }
 
 fn spawn_bin(bin: &str, cfg: &Path, log: &Path) -> Child {
-    let stdout = fs::File::create(log).expect("create child stdout log");
-    let stderr = fs::File::create(log.with_extension("err")).expect("create child stderr log");
+    spawn_bin_logged(bin, cfg, log, false)
+}
+
+/// Restart variant: append to the log so the pre-restart server output (and
+/// the offset a caller took before respawning) stays readable.
+fn spawn_bin_append(bin: &str, cfg: &Path, log: &Path) -> Child {
+    spawn_bin_logged(bin, cfg, log, true)
+}
+
+fn spawn_bin_logged(bin: &str, cfg: &Path, log: &Path, append: bool) -> Child {
+    let open = |p: &Path| {
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true);
+        if append {
+            opts.append(true);
+        } else {
+            opts.write(true).truncate(true);
+        }
+        opts.open(p)
+            .unwrap_or_else(|e| panic!("open {}: {e}", p.display()))
+    };
+    let stdout = open(log);
+    let stderr = open(&log.with_extension("err"));
     Command::new(bin)
         .arg("--config")
         .arg(cfg)
@@ -77,11 +98,24 @@ fn spawn_bin(bin: &str, cfg: &Path, log: &Path) -> Child {
         .unwrap_or_else(|e| panic!("spawn {bin}: {e}"))
 }
 
+/// Liveness overrides for tests that must observe a dead path quickly.
+///
+/// `idle_timeout_secs` is floored at 15 by the transport, so the client's
+/// silence watchdog (2/3 of idle) can fire no earlier than ~10 s. A shorter
+/// value here would be silently clamped and only make the intent unclear.
+#[derive(Clone, Copy)]
+struct Liveness {
+    keep_alive_secs: u64,
+    idle_timeout_secs: u64,
+    reconnect_timeout_secs: u64,
+}
+
 /// One server + client pair with the tunnel's config written to a temp dir.
 struct Harness {
     dir: tempfile::TempDir,
     server: Child,
     client: Child,
+    server_cfg: PathBuf,
 }
 
 impl Harness {
@@ -94,6 +128,17 @@ impl Harness {
     /// trips the client's duplicate-listener validator or makes the forward
     /// bind fail.
     fn start(allow_private: bool, forwards: &str, reserved: &[u16]) -> Harness {
+        Self::start_opts(allow_private, forwards, reserved, None)
+    }
+
+    /// [`Self::start`] with explicit keepalive/idle/reconnect values, for the
+    /// restart test that has to watch the liveness watchdog fire.
+    fn start_opts(
+        allow_private: bool,
+        forwards: &str,
+        reserved: &[u16],
+        liveness: Option<Liveness>,
+    ) -> Harness {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let cert = dir.path().join("server-cert.pem");
         let key = dir.path().join("server-key.pem");
@@ -120,6 +165,7 @@ impl Harness {
                 socks_port,
                 allow_private,
                 forwards,
+                liveness,
             );
             let mut server = spawn_bin(
                 env!("CARGO_BIN_EXE_myquic2-server"),
@@ -142,6 +188,7 @@ impl Harness {
                         dir,
                         server,
                         client,
+                        server_cfg: server_cfg.clone(),
                     };
                 }
                 Err(e) => {
@@ -211,6 +258,31 @@ impl Harness {
             panic!("harness did not start: {e}\n{}", self.logs());
         }
     }
+
+    /// SIGKILL the server. No CONNECTION_CLOSE reaches the client, so this is
+    /// the "silent path death" case the watchdog exists for.
+    fn kill_server(&mut self) {
+        let _ = self.server.kill();
+        let _ = self.server.wait();
+    }
+
+    /// Start the server again from the same config (same listen port, cert and
+    /// forwards), appending to its log, and wait for the listener line.
+    fn restart_server(&mut self) {
+        let log = self.log_path("server.log", false);
+        let offset = fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+        self.server =
+            spawn_bin_append(env!("CARGO_BIN_EXE_myquic2-server"), &self.server_cfg, &log);
+        if let Err(e) = wait_log_after(
+            &mut self.server,
+            &log,
+            offset,
+            "server listening on",
+            Duration::from_secs(15),
+        ) {
+            panic!("server did not restart: {e}\n{}", self.logs());
+        }
+    }
 }
 
 /// Write both config files for one startup attempt.
@@ -224,7 +296,22 @@ fn write_configs(
     socks_port: u16,
     allow_private: bool,
     forwards: &str,
+    liveness: Option<Liveness>,
 ) {
+    let (server_liveness, client_liveness) = match liveness {
+        None => (String::new(), String::new()),
+        Some(l) => (
+            format!(
+                "keep_alive_secs = {}\nidle_timeout_secs = {}\n",
+                l.keep_alive_secs, l.idle_timeout_secs
+            ),
+            format!(
+                "keep_alive_secs = {}\nidle_timeout_secs = {}\n\
+                 reconnect_timeout_secs = {}\n",
+                l.keep_alive_secs, l.idle_timeout_secs, l.reconnect_timeout_secs
+            ),
+        ),
+    };
     fs::write(
         server_cfg,
         format!(
@@ -233,7 +320,8 @@ fn write_configs(
              key_file = {:?}\n\
              server_name = \"test.com\"\n\
              allow_private = {allow_private}\n\
-             auth_token = {AUTH:?}\n",
+             auth_token = {AUTH:?}\n\
+             {server_liveness}",
             cert.display().to_string(),
             key.display().to_string(),
         ),
@@ -247,6 +335,7 @@ fn write_configs(
              server_name = \"test.com\"\n\
              server_cert_file = {:?}\n\
              auth_token = {AUTH:?}\n\
+             {client_liveness}\
              {forwards}\n",
             cert.display().to_string(),
         ),
@@ -280,6 +369,37 @@ fn wait_started_short(
         if Instant::now() >= deadline {
             return Err(format!(
                 "client did not complete startup within {timeout:?}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait for `needle` to appear in `log` after byte `offset` (the file's length
+/// when the wait began). Fails early if the child exits.
+fn wait_log_after(
+    child: &mut Child,
+    log: &Path,
+    offset: u64,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!(
+                "child exited with {status} while waiting for {needle:?}"
+            ));
+        }
+        let bytes = fs::read(log).unwrap_or_default();
+        let start = usize::try_from(offset).unwrap_or(0).min(bytes.len());
+        if String::from_utf8_lossy(&bytes[start..]).contains(needle) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{needle:?} did not appear in {} within {timeout:?}",
+                log.display()
             ));
         }
         thread::sleep(Duration::from_millis(50));
@@ -486,6 +606,13 @@ fn udp_roundtrip(fwd: SocketAddr, payload: &[u8], deadline: Instant) -> bool {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
     sock.set_read_timeout(Some(Duration::from_millis(300)))
         .expect("read timeout");
+    udp_roundtrip_on(&sock, fwd, payload, deadline)
+}
+
+/// [`udp_roundtrip`] on an existing peer socket, so a caller can prove the
+/// *same* source address keeps working across a reconnect (the forward
+/// listener's peer table and the QUIC session are independent lifetimes).
+fn udp_roundtrip_on(sock: &UdpSocket, fwd: SocketAddr, payload: &[u8], deadline: Instant) -> bool {
     let mut buf = vec![0u8; payload.len().max(1024) + 64];
     while Instant::now() < deadline {
         if sock.send_to(payload, fwd).is_err() {
@@ -645,4 +772,141 @@ fn udp_forward_listener_survives_peer_churn() {
         "peer churn stopped the UDP forward listener\n{}",
         h.logs()
     );
+}
+
+/// Server restart: the client must notice the tunnel is gone on its own, keep
+/// both forward listeners alive while the server is down, redial the same
+/// address, and carry TCP and UDP echo again — including on the UDP peer
+/// socket that existed before the restart.
+///
+/// The server is SIGKILLed, so no CONNECTION_CLOSE is sent: detection depends
+/// on the client's silence watchdog (`2/3` of the idle timeout). With the
+/// transport's 15 s idle floor that is ~10 s, so this is intentionally the
+/// slowest e2e case; the assertions, not a shorter timeout, are what pin the
+/// reconnect path.
+#[test]
+fn forwards_detect_server_loss_and_recover_after_restart() {
+    let tcp_echo = spawn_tcp_echo();
+    let udp_echo = spawn_udp_echo();
+    let tcp_fwd_port = free_tcp_port();
+    let udp_fwd_port = free_udp_port();
+    let forwards = format!(
+        "[[tcp_forward]]\nlisten = \"127.0.0.1:{tcp_fwd_port}\"\ntarget = \"{tcp_echo}\"\n\
+         [[udp_forward]]\nlisten = \"127.0.0.1:{udp_fwd_port}\"\ntarget = \"{udp_echo}\"\n"
+    );
+    let mut h = Harness::start_opts(
+        true,
+        &forwards,
+        &[tcp_fwd_port, udp_fwd_port],
+        Some(Liveness {
+            keep_alive_secs: 1,
+            idle_timeout_secs: 15,
+            reconnect_timeout_secs: 2,
+        }),
+    );
+    h.wait_started();
+    let tcp_fwd: SocketAddr = format!("127.0.0.1:{tcp_fwd_port}").parse().unwrap();
+    let udp_fwd: SocketAddr = format!("127.0.0.1:{udp_fwd_port}").parse().unwrap();
+
+    // Both forward paths are live before the restart.
+    let got = tcp_roundtrip(
+        tcp_fwd,
+        b"before-restart",
+        Instant::now() + Duration::from_secs(20),
+    )
+    .unwrap_or_else(|| panic!("TCP forward never came up\n{}", h.logs()));
+    assert_eq!(got, b"before-restart");
+    let udp_peer = UdpSocket::bind("127.0.0.1:0").expect("bind persistent UDP peer");
+    udp_peer
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("read timeout");
+    assert!(
+        udp_roundtrip_on(
+            &udp_peer,
+            udp_fwd,
+            b"before-restart",
+            Instant::now() + Duration::from_secs(20)
+        ),
+        "UDP forward never came up\n{}",
+        h.logs()
+    );
+
+    let client_log = h.log_path("client.log", false);
+    let killed_at = fs::metadata(&client_log).map(|m| m.len()).unwrap_or(0);
+    h.kill_server();
+
+    // SIGKILL leaves the QUIC connection half-open: only the client's own
+    // liveness detection can turn this into a redial.
+    if let Err(e) = wait_log_after(
+        &mut h.client,
+        &client_log,
+        killed_at,
+        "QUIC connection lost, reconnecting",
+        Duration::from_secs(30),
+    ) {
+        panic!("client did not detect the server loss: {e}\n{}", h.logs());
+    }
+
+    // While the server is down, neither listener may deliver a stale echo.
+    assert!(
+        !udp_roundtrip_on(
+            &udp_peer,
+            udp_fwd,
+            b"while-down",
+            Instant::now() + Duration::from_millis(1200)
+        ),
+        "UDP forward echoed while the server was down\n{}",
+        h.logs()
+    );
+    let mut down = connect_retry(tcp_fwd, Instant::now() + Duration::from_secs(2))
+        .unwrap_or_else(|| panic!("TCP forward listener died with the server\n{}", h.logs()));
+    down.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let _ = down.write_all(b"while-down");
+    let mut buf = [0u8; 32];
+    match down.read(&mut buf) {
+        Ok(0) | Err(_) => {}
+        Ok(n) => panic!(
+            "TCP forward echoed {n} bytes while the server was down\n{}",
+            h.logs()
+        ),
+    }
+    // Release the relay permit before the restart; this stream belongs to the
+    // dead generation and can never carry the post-restart echo.
+    drop(down);
+
+    // Restart the very same server config (port, cert, forwards). The client
+    // was not restarted or reconfigured: recovery proves the redial path.
+    let restarted_at = fs::metadata(&client_log).map(|m| m.len()).unwrap_or(0);
+    h.restart_server();
+    let got = tcp_roundtrip(
+        tcp_fwd,
+        b"after-restart",
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap_or_else(|| panic!("TCP forward did not recover after restart\n{}", h.logs()));
+    assert_eq!(got, b"after-restart");
+    assert!(
+        udp_roundtrip_on(
+            &udp_peer,
+            udp_fwd,
+            b"after-restart",
+            Instant::now() + Duration::from_secs(30)
+        ),
+        "the pre-restart UDP peer did not recover its forward\n{}",
+        h.logs()
+    );
+    // Echo recovery already implies a redial; the log pins that it was the
+    // same client process that reconnected to the restarted server.
+    if let Err(e) = wait_log_after(
+        &mut h.client,
+        &client_log,
+        restarted_at,
+        "QUIC connected to",
+        Duration::from_secs(10),
+    ) {
+        panic!(
+            "client never logged a post-restart connect: {e}\n{}",
+            h.logs()
+        );
+    }
 }
