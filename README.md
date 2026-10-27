@@ -2,12 +2,12 @@
 
 <h1>MyQUIC2</h1>
 
-[![Release](https://img.shields.io/badge/Release-v0.2.2-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-567_passing-16a34a?style=flat-square)](#-verification)
+[![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
+[![Tests](https://img.shields.io/badge/Tests-705_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
-[![Protocol](https://img.shields.io/badge/Protocol-MQP--3-f59e0b?style=flat-square)](#-mqp-3-rev2-wire)
+[![Protocol](https://img.shields.io/badge/Protocol-MQP--3_rev3-f59e0b?style=flat-square)](#-mqp-3-rev3-wire-default)
 [![Platform](https://img.shields.io/badge/Platform-Linux_%7C_macOS_%7C_OpenWrt-6366f1?style=flat-square)](#-install)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](https://github.com/Terutoki/MyQUIC2/blob/main/LICENSE)
 
@@ -615,7 +615,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **567 tests** on macOS (lib 274 + client 168 + server 119 + 6 process-level forwarding E2E); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **705 tests** on macOS (lib 350 + client 198 + server 142 + 15 process-level E2E: 7 forwarding + 8 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1134,12 +1134,12 @@ The security model assumes an untrusted peer and a hostile network. TLS 1.3 auth
 
 ## 📦 Install
 
-**Latest published release: [v0.2.2](https://github.com/Terutoki/MyQUIC2/releases/latest).** Assets are profile-guided (PGO) builds made from the tag by the release workflow.
+**Latest published release: [v0.2.3](https://github.com/Terutoki/MyQUIC2/releases/latest).** Assets are profile-guided (PGO) builds made from the tag by the release workflow.
 
-- `myquic2-v0.2.2-x86_64-unknown-linux-musl.tar.gz` — static musl build, runs on any x86-64 Linux.
-- `myquic2-v0.2.2-x86_64-unknown-linux-gnu.tar.gz` — glibc ≥ 2.36 (Debian 12+, Ubuntu 23.04+).
-- `myquic2-v0.2.2-openwrt-x86_64-v1.tar.gz` — OpenWrt safe default for every x86-64 CPU.
-- `myquic2-v0.2.2-openwrt-x86_64-v2..v4.tar.gz` — SSE4.2 / AVX2 / AVX512 tuned (a mismatch dies with `Illegal instruction`).
+- `myquic2-v0.2.3-x86_64-unknown-linux-musl.tar.gz` — static musl build, runs on any x86-64 Linux.
+- `myquic2-v0.2.3-x86_64-unknown-linux-gnu.tar.gz` — glibc ≥ 2.36 (Debian 12+, Ubuntu 23.04+).
+- `myquic2-v0.2.3-openwrt-x86_64-v1.tar.gz` — OpenWrt safe default for every x86-64 CPU.
+- `myquic2-v0.2.3-openwrt-x86_64-v2..v4.tar.gz` — SSE4.2 / AVX2 / AVX512 tuned (a mismatch dies with `Illegal instruction`).
 - `SHA256SUMS` — checksums for every asset.
 
 ```sh
@@ -1155,7 +1155,7 @@ cargo build --release --bins
 ```
 
 > [!NOTE]
-> `v0.2.2` is the latest published release. It adds fixed-destination **TCP/UDP forward listeners** (IPv4, IPv6 and dual-stack) on top of the v0.2.1 MQP-3 rev2 data plane and audit hardening; the wire is unchanged. macOS and non-x86-64 targets build from source.
+> `v0.2.3` is the latest published release. It ships the **MQP-3 rev3 wire** (fixed 2-byte header, no per-flow ACK, one reliable control stream), **maximum 0-RTT** (token and payloads in the first flight; the server authenticates and forwards before its handshake completes), and the Phase-0 latency/CPU fixes (no HELLO gate, CAPS tolerance, queue-until-publish, warm-DNS fast path, reply memo), with rev2 config-selectable for one release as rollback. **The wire is incompatible with v0.2.2: upgrade both sides together** (`wire_rev = 3` is the default; `wire_rev = 2` restores rev2 for one release). macOS and non-x86-64 targets build from source.
 
 ## ⚡ Quick start
 
@@ -1193,9 +1193,9 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **567 tests** on the macOS dev box (lib 274 + client 168 + server 119 + 6 process-level forwarding E2E).
+- **705 tests** on the macOS dev box (lib 350 + client 198 + server 142 + 15 process-level E2E: 7 forwarding + 8 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
-- **Coverage of the contract:** codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent open/ack/reject/close, same-flow and dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, admission math, SSRF and reply-source policy, full-duplex ownership, legacy MQP-2 receive paths, and the client forward listeners (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 6 process-level E2E tests.
+- **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 15 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
 - **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
 
@@ -2174,7 +2174,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>567 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>705 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB
