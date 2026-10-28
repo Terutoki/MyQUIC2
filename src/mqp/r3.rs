@@ -875,10 +875,21 @@ pub fn encode_train_same(fid: u16, payloads: &[&[u8]], limit: usize) -> Option<B
     put_u16(&mut v, fid);
     v.push(payloads.len() as u8);
     for p in payloads {
-        debug_assert!(put_item_len(&mut v, p.len()));
+        // `put_item_len` writes the length field: it must never sit inside a
+        // `debug_assert!`, which compiles the whole expression away in release
+        // and would emit a frame every peer rejects.
+        let wrote = put_item_len(&mut v, p.len());
+        debug_assert!(wrote, "the length was already bounded by train_same_len");
         v.extend_from_slice(p);
     }
     debug_assert_eq!(v.len(), total);
+    // The length the encoder budgeted and the bytes it produced must agree in
+    // every profile: a mismatch means a header writer was skipped (the bug that
+    // shipped a length-less DICT train), and emitting that frame would make
+    // every receiver drop it. Refusing the frame keeps the failure countable.
+    if v.len() != total {
+        return None;
+    }
     Some(Bytes::from(v))
 }
 
@@ -894,11 +905,21 @@ pub fn encode_train_same_equal(fid: u16, payloads: &[&[u8]], limit: usize) -> Op
     v.push(CLASS_TRAIN | (TRAIN_FORM_SAME_EQUAL << TRAIN_FORM_SHIFT));
     put_u16(&mut v, fid);
     v.push(payloads.len() as u8);
-    debug_assert!(put_item_len(&mut v, item_len));
+    // See `encode_train_same`: the writer must run in every profile.
+    let wrote = put_item_len(&mut v, item_len);
+    debug_assert!(
+        wrote,
+        "the item length was already bounded by train_same_equal_len"
+    );
     for p in payloads {
         v.extend_from_slice(p);
     }
     debug_assert_eq!(v.len(), total);
+    // See `encode_train_same`: never emit a frame whose bytes disagree with its
+    // computed length.
+    if v.len() != total {
+        return None;
+    }
     Some(Bytes::from(v))
 }
 
@@ -917,10 +938,20 @@ pub fn encode_train_dict(flows: &[u16], items: &[(u8, &[u8])], limit: usize) -> 
     }
     for (idx, p) in items {
         v.push(*idx);
-        debug_assert!(put_item_len(&mut v, p.len()));
+        // See `encode_train_same`: the writer must run in every profile.
+        let wrote = put_item_len(&mut v, p.len());
+        debug_assert!(
+            wrote,
+            "the item length was already bounded by train_dict_len"
+        );
         v.extend_from_slice(p);
     }
     debug_assert_eq!(v.len(), total);
+    // See `encode_train_same`: never emit a frame whose bytes disagree with its
+    // computed length.
+    if v.len() != total {
+        return None;
+    }
     Some(Bytes::from(v))
 }
 
@@ -2278,6 +2309,45 @@ mod tests {
 
         // Minimal dictionary: one flow, one empty item.
         assert!(decode_train(&[0xA0, 0x01, 0x01, 0x05, 0x00, 0x00, 0x00]).is_ok());
+    }
+
+    /// The length fields are written by a stateful helper, and a version of
+    /// this encoder put that call inside `debug_assert!`: every multi-item
+    /// `TRAIN` then shipped without its per-item length and the peer rejected
+    /// it, silently dropping ~14% of a batched uplink in release builds. These
+    /// shapes are the ones that regressed, checked byte-for-byte so the profile
+    /// the test runs in cannot hide it.
+    #[test]
+    fn train_encoders_emit_every_length_field() {
+        let big = [0x5Au8; 128];
+
+        // DICT: `[idx][len][payload]` per item, len = 0x80 for 128 bytes.
+        let flows = [3u16, 2];
+        let items: [(u8, &[u8]); 2] = [(0, &big), (1, &big)];
+        let d = encode_train_dict(&flows, &items, 4096).expect("dict train fits");
+        assert_eq!(d.len(), train_dict_len(&flows, &items).unwrap());
+        assert_eq!(d.len(), 3 + 4 + 2 * (1 + 1 + 128));
+        assert_eq!(
+            &d[..9],
+            &[0xA0, 0x02, 0x02, 0x03, 0x00, 0x02, 0x00, 0x00, 0x80]
+        );
+        assert_eq!(decode_train(&d).unwrap().items().count(), 2);
+
+        // SAME: one shared flow, one length per item.
+        let refs: [&[u8]; 2] = [&big, &big];
+        let d = encode_train_same(7, &refs, 4096).expect("same train fits");
+        assert_eq!(d.len(), train_same_len(7, &refs).unwrap());
+        assert_eq!(
+            &d[..10],
+            &[0x80, 0x07, 0x00, 0x02, 0x80, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A]
+        );
+        assert_eq!(decode_train(&d).unwrap().items().count(), 2);
+
+        // SAME_EQUAL: the length lives once in the header.
+        let d = encode_train_same_equal(7, &refs, 4096).expect("same-equal train fits");
+        assert_eq!(d.len(), train_same_equal_len(7, &refs).unwrap());
+        assert_eq!(&d[..6], &[0x90, 0x07, 0x00, 0x02, 0x80, 0x5A]);
+        assert_eq!(decode_train(&d).unwrap().items().count(), 2);
     }
 
     #[test]

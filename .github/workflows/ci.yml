@@ -58,6 +58,23 @@ jobs:
           key: test
       - run: cargo test --all-targets
 
+  # `debug_assert!` compiles its whole expression away in release, so a
+  # side-effecting encoder call can pass every debug test and still ship broken
+  # frames (that is exactly how a length-less `TRAIN` reached a release build).
+  # The wire codecs are the part where that class of bug is silent and
+  # expensive, so they run in the profile the binaries ship in.
+  test-release-wire:
+    name: Test (release, wire codecs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: test-release
+      - run: cargo test --release --lib mqp::
+
   build-musl:
     name: Build x86_64-unknown-linux-musl (static)
     needs: [fmt, clippy, test]

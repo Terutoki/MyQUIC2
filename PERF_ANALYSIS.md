@@ -828,3 +828,81 @@ session (`a_full_table_evicts_the_quietest_session`), and sparse ids hit while a
 and leaves `len()` unchanged). B10 is pinned by `a_memo_eviction_keeps_the_fast_slot_serving`, which arms a
 session, evicts its memo row with an id exactly `SESS_MEMO_SLOTS` away, and asserts the slot still serves; run
 against the old `Stale | Miss` arm it fails with "a memo miss must not drop the slot".
+
+## 12. Seventh Batch: the batched uplink that never decoded (2026-10-29, post-57c9d13)
+
+Everything above came from reading the code. This batch came from running it: the
+repository's own benchmark (`examples/hotpath_bench`, the shape README §12 quotes)
+reported **13–17 % loss** on loopback at every rate, including 80 pps aggregate,
+where no queue in the system can be full.
+
+### 12.1 What the counters said
+
+Instrumenting both ends split the loss exactly:
+
+| Point | Value | Meaning |
+| --- | --- | --- |
+| bench `sent` | 1600 | payloads the app offered |
+| client `app` | 1600/1600 | read and handed to the uplink — no ingest loss |
+| client `stage` | 1600p / 1489f / 1600i / 0 drops | 1600 payloads packed into 1489 DATAGRAMs, none dropped |
+| server `diag_rx` | 1489 | **every packed DATAGRAM arrived** (quinn is not the loss) |
+| server decoded payloads | 1380 | **220 payloads vanished inside the frames** |
+| bench `recv` | 1380 | what came back |
+
+1488 datagrams, 1380 decoded as single-payload `DATA`, and **108 as `TRAIN`
+— every one of which the decoder rejected**. 108 trains carrying the remaining
+~220 payloads is exactly the 13.75 % loss.
+
+### 12.2 Root cause
+
+`src/mqp/r3.rs` wrote the train item-length field through a helper with side
+effects, invoked from inside a `debug_assert!`:
+
+```rust
+for (idx, p) in items {
+    v.push(*idx);
+    debug_assert!(put_item_len(&mut v, p.len()));   // never runs in release
+    v.extend_from_slice(p);
+}
+```
+
+`debug_assert!` compiles its **whole expression** away when
+`debug_assertions` is off, so `put_item_len` never appended the length byte in
+any release build. Every multi-item `TRAIN` therefore went out as
+`[flags][nfl][count][fids][idx][payload]...` instead of
+`[flags][nfl][count][fids][idx][len][payload]...`, and the peer rejected the
+frame (`Malformed("bad r3 train item fid")`) and dropped **all** of its
+payloads. Single-payload frames use `encode_data_steady`, which has no such
+field, so they were unaffected — which is why the loss only appeared once the
+stager had two items to batch, i.e. at higher association counts.
+
+The same pattern existed in `encode_train_same` and `encode_train_same_equal`.
+All three are fixed; the tests could never catch it because `cargo test` runs
+with debug assertions on, where the call *does* run.
+
+### 12.3 The fix
+
+1. The three writers are unconditional (`let wrote = put_item_len(..)`, with a
+   `debug_assert!` on the returned flag, which is already bounded by the
+   matching `train_*_len` helpers).
+2. Each encoder now refuses a frame whose produced length disagrees with its
+   budgeted length (`if v.len() != total { return None; }`). A future header
+   regression degrades to a counted too-large drop instead of a silent,
+   peer-rejected frame.
+3. `train_encoders_emit_every_length_field` pins the byte layout of all three
+   forms — the tests that existed only round-tripped, and round-tripping is
+   exactly what a debug build still does. CI gained a
+   `cargo test --release --lib mqp::` job so this class of bug is exercised in
+   the profile the binaries ship in.
+
+### 12.4 Verification
+
+Same machine, same command, after the fix:
+
+| Shape | Before | After |
+| --- | --- | --- |
+| 8 × 1000 pps × 128 B × 20 s | 13.7 % loss | **0.000 %** (160000/160000) |
+| 8 × 10 pps × 128 B × 20 s | 17.6 % loss | **0.000 %** (1600/1600) |
+
+`per_assoc_recv_min == per_assoc_recv_max` in both runs: delivery is now exact
+per association, not merely right in aggregate.
