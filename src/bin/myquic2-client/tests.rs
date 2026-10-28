@@ -7711,33 +7711,33 @@ fn app_ip_pin_is_family_tolerant() {
 
 /// PERF-3: the main runtime only loses workers to the sharded slot runtimes
 /// where those slots are really pinned (Linux), and even there it never drops
-/// below half the machine — the shipped 7 slots on an 8-core host must not leave
+/// below half the machine — the shipped 8 slots on an 8-core host must not leave
 /// every SOCKS/TCP/UDP task on one worker.
 #[test]
 fn main_runtime_worker_count_only_subtracts_real_pinning() {
-    // Linux: 7 pinned slots on 8 cores may claim at most half the machine, so
+    // Linux: 8 pinned slots on 8 cores may claim at most half the machine, so
     // the app-side pool keeps the other half (the old rule left exactly one).
-    assert_eq!(main_runtime_workers_for(8, true, 7, true), 4);
-    // A wide machine keeps the one-core-per-slot shape: 16 - 7 = 9.
-    assert_eq!(main_runtime_workers_for(16, true, 7, true), 9);
-    // 4 cores: 7 slots may only claim 2, leaving 2 workers.
-    assert_eq!(main_runtime_workers_for(4, true, 7, true), 2);
+    assert_eq!(main_runtime_workers_for(8, true, 8, true), 4);
+    // A wide machine keeps the one-core-per-slot shape: 16 - 8 = 8.
+    assert_eq!(main_runtime_workers_for(16, true, 8, true), 8);
+    // 4 cores: 8 slots may only claim 2, leaving 2 workers.
+    assert_eq!(main_runtime_workers_for(4, true, 8, true), 2);
     // Degenerate core counts still yield a usable runtime.
-    assert_eq!(main_runtime_workers_for(1, true, 7, true), 1);
-    assert_eq!(main_runtime_workers_for(2, true, 7, true), 1);
-    assert_eq!(main_runtime_workers_for(0, true, 7, true), 1);
+    assert_eq!(main_runtime_workers_for(1, true, 8, true), 1);
+    assert_eq!(main_runtime_workers_for(2, true, 8, true), 1);
+    assert_eq!(main_runtime_workers_for(0, true, 8, true), 1);
     // Off Linux pinning is a no-op: the slot threads reserve no core, so the
     // full default width is kept (this was the one-worker regression).
-    assert_eq!(main_runtime_workers_for(8, true, 7, false), 8);
-    assert_eq!(main_runtime_workers_for(4, true, 7, false), 4);
+    assert_eq!(main_runtime_workers_for(8, true, 8, false), 8);
+    assert_eq!(main_runtime_workers_for(4, true, 8, false), 4);
     // Shared-runtime topology: no pinned slot threads at all.
-    assert_eq!(main_runtime_workers_for(8, false, 7, true), 8);
-    assert_eq!(main_runtime_workers_for(0, false, 7, false), 1);
+    assert_eq!(main_runtime_workers_for(8, false, 8, true), 8);
+    assert_eq!(main_runtime_workers_for(0, false, 8, false), 1);
     // Invariant over the whole matrix: pinned slots never take more than half
     // the machine, so the pool that moves payload keeps at least the other
     // half (rounded up) whatever the pool width is.
     for cores in 1..=64usize {
-        for slots in [1, 4, 7, 9, 16] {
+        for slots in [1, 4, 8, 9, 16] {
             let workers = main_runtime_workers_for(cores, true, slots, true);
             assert!(workers >= 1, "cores={cores} slots={slots}");
             assert_eq!(

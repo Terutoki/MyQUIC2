@@ -456,8 +456,8 @@ impl FastTable {
     /// Publish `entry` at `idx`, stamped with the session's current liveness
     /// value, dropping whatever used to be there.
     ///
-    /// Dropping the previous entry is load-bearing: it is what releases a
-    /// reaped session's flow-table handle (see [`FastSess::flows`]).
+    /// Dropping the previous entry releases its `Weak<UdpSocket>` handle, so a
+    /// slot reclaimed from a reaped session holds nothing that outlives it.
     pub(crate) fn insert(&mut self, idx: usize, entry: FastSess) {
         self.ages[idx] = entry.last.load(std::sync::atomic::Ordering::Relaxed);
         self.tags[idx] = entry.sess;
@@ -594,9 +594,13 @@ pub(crate) fn try_stage(
 ///
 /// The slot is chosen by [`FastTable::arm_index`] (the session's own slot, else
 /// the first free one, else the quietest), so a probe always finds it. A
-/// `Stale`/`Miss` memo probe clears the session's slot instead: the session is
-/// gone or invisible, and leaving the old entry in place would keep sending
-/// into it.
+/// `Stale` memo probe clears the session's slot: the row named this session and
+/// its reader is gone, so the slot can only describe a session that no longer
+/// exists. A `Miss` leaves the slot alone — the memo is a 256-entry
+/// direct-mapped cache, the shipped client keeps more live sessions than that
+/// per QUIC connection, and the slot checks its own liveness
+/// (`is_live_for` + `sock.upgrade`) before it is used, so dropping it on a memo
+/// eviction only threw away a correct fast-path entry.
 ///
 /// Re-arming a session that already holds its slot only refreshes the pin and
 /// the liveness stamp: this runs on the *slow* path of every datagram while the
@@ -650,9 +654,20 @@ pub(crate) fn arm_fast(
             };
             fast.touch(idx, stamp);
         }
-        SessHit::Stale | SessHit::Miss => {
+        // The row named this session and its reader is finished: the slot can
+        // only describe a session that is gone, so drop it now instead of
+        // waiting for its frozen age to make it the eviction victim.
+        SessHit::Stale => {
             fast.clear(s);
         }
+        // A miss means this thread's memo lost `(conn_id, s)`, not that the
+        // session died: the memo is 256 direct-mapped entries and the shipped
+        // client keeps more live sessions than that per connection, so rows are
+        // evicted by their hash neighbours all the time. Keep the slot — it
+        // carries its own liveness check, and clearing it here made every memo
+        // eviction a fast-path miss (the table looked useless above ~256
+        // sessions per connection).
+        SessHit::Miss => {}
     }
 }
 

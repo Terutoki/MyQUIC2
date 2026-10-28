@@ -127,14 +127,14 @@ fn main() -> Result<()> {
 ///
 /// The reservation is therefore capped at **half the machine**:
 /// `workers >= ceil(cores / 2)` everywhere, and a wide machine keeps the old
-/// one-core-per-slot shape (16 cores: 7 slots pinned, 9 workers). The floor of
+/// one-core-per-slot shape (16 cores: 8 slots pinned, 8 workers). The floor of
 /// one worker is kept because the runtime must exist. [`priority_pin_cores`]
 /// pins only the cores this rule leaves unpinned, so the split is real rather
 /// than arithmetic: a pinned slot never shares a core with the app-side pool.
 ///
 /// Off Linux `pin_to_core` is a no-op, so the slot threads are ordinary threads
 /// the scheduler timeshares with everything else and the full default width is
-/// kept — at the shipped 7 slots an 8-core macOS host ran every SOCKS/TCP/UDP
+/// kept — at the shipped 8 slots an 8-core macOS host ran every SOCKS/TCP/UDP
 /// task on a single worker when the subtraction was applied there
 /// (LOGIC/PERF-3 regression). `main_runtime_workers_for` is the pure rule so
 /// both platform behaviours stay testable on one host.

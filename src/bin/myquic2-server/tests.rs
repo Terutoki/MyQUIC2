@@ -1000,6 +1000,93 @@ async fn a_full_table_evicts_the_quietest_session() {
     );
 }
 
+/// A memo eviction must not drop a live session's fast slot.
+///
+/// The session memo is a 256-entry direct-mapped cache, so ids a multiple of
+/// `SESS_MEMO_SLOTS` apart always share a row (the index mixes the id with an
+/// odd multiplier). The shipped client pools thousands of associations onto a
+/// handful of QUIC connections, so arm-time memo misses are the normal case
+/// there, not an edge case. `arm_fast` used to clear the slot on a miss, which
+/// turned every eviction into a fast-path miss for a session that was still
+/// live — the table could not hold the working set at all.
+#[tokio::test]
+async fn a_memo_eviction_keeps_the_fast_slot_serving() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let conn_id = next_conn_id();
+    let mut fast = FastTable::new();
+    let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
+    let dst: SocketAddr = "198.51.100.13:53".parse().unwrap();
+    let mut socks = Vec::new();
+
+    let s = 41u32;
+    let entry = capped_session(s, 0);
+    let sock = entry.sock.clone();
+    let last = entry.last.clone();
+    let epoch = entry.recent_epoch.clone();
+    let abort = entry.reader.abort_handle();
+    ss.shard(s).write().insert(s, entry);
+    ss.note_live_insert();
+    sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
+    socks.push(sock);
+    arm_fast(
+        &mut fast,
+        conn_id,
+        s,
+        TargetAddrRef::Ip(dst),
+        dst,
+        DNS_CACHE_TTL_MS,
+    );
+    assert!(fast.probe(s).is_some(), "premise: the session is armed");
+
+    // One memo table apart: the hash is a bijection mod a power of two, so this
+    // id lands on the same row and evicts the session's entry.
+    let rival = s + SESS_MEMO_SLOTS as u32;
+    {
+        let entry = capped_session(rival, 0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(rival).write().insert(rival, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, rival, sock.clone(), last, abort, epoch);
+        socks.push(sock);
+    }
+    assert!(
+        matches!(sess_memo_lookup(conn_id, s), SessHit::Miss),
+        "premise: the rival evicted the session's memo row"
+    );
+
+    // Re-arming on a miss must keep the slot: the session never died, only its
+    // memo row was reused.
+    arm_fast(
+        &mut fast,
+        conn_id,
+        s,
+        TargetAddrRef::Ip(dst),
+        dst,
+        DNS_CACHE_TTL_MS,
+    );
+    assert!(
+        fast.probe(s).is_some(),
+        "a memo miss must not drop the slot"
+    );
+    assert!(
+        try_stage(
+            &mut fast,
+            &ss,
+            conn_id,
+            s,
+            dst,
+            Bytes::from_static(b"fast"),
+            true,
+            &mut staged
+        )
+        .is_ok(),
+        "the session keeps its fast-path hit"
+    );
+}
+
 /// Sparse session ids must all hit, and a table over capacity must evict rather
 /// than grow.
 ///

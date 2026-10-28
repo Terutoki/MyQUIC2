@@ -709,6 +709,7 @@ previous batch's table growth.
 | B7 | Chained probing + "recycle the first dead slot" left entries unreachable and allowed a duplicate for the same session | Medium | ✅ Fixed: probe scans tags, no chaining, no holes |
 | B8 | Re-arming a live session rewrote the whole 440 B entry and both `Weak`s | Low | ✅ Fixed: only the pin and the liveness stamp are touched |
 | B9 | `arm_fast` took a third shard read lock per miss to cache a v3 flow table no shipped peer reads | Medium | ✅ Fixed: field removed, one lock per v3 train instead |
+| B10 | `arm_fast` cleared the slot on every session-memo miss, so the 256-entry memo's evictions discarded live slots | High | ✅ Fixed: only a `Stale` memo clears |
 
 ### 11.1 B6 — the miss path paid for the table's size
 
@@ -787,10 +788,43 @@ a slot the sweeper cannot reach) is now impossible by construction rather than
 by discipline. Everything else in the table is either a `Weak` (the socket), an
 `AbortHandle` (no ownership) or a shared 8 B stamp.
 
-### 11.5 Verification
+### 11.5 B10 — the memo miss that threw away live slots (found in the post-hoc review)
 
-`cargo test --bin myquic2-server` — 144 passed. The fast-table tests were rewritten for the new type:
+Reviewing the batch turned up a worse defect than any of the numbers above:
+`arm_fast` handled `SessHit::Stale` and `SessHit::Miss` in one arm,
+`fast.clear(s)`. Clearing on a *miss* is a leftover from the single-slot design,
+where a miss meant "this register now describes someone else". The table is
+keyed by session id, so it no longer holds that meaning: a miss says only that
+this thread's memo dropped `(conn_id, s)`.
+
+That mattered because the memo is a **256-entry direct-mapped cache** and the
+index mixes the id with an odd multiplier, i.e. it is a bijection mod 2^8: ids a
+multiple of `SESS_MEMO_SLOTS` apart always collide. The shipped client pools
+~4032 associations onto 4 UDP connections, so a server connection fronts ~1000
+live sessions — roughly four per memo row, which means most re-arms see a miss.
+Each of those misses cleared a slot that was still perfectly valid, so the
+effective hit rate was gated by the *memo*, not by the table: a session armed on
+a fresh hit lost its slot the next time a hash neighbour was armed.
+
+The fix is to clear only on `Stale` (the row still names this session and its
+reader is finished, so the slot can only describe a dead session). A `Miss`
+leaves the slot alone, and the slot checks its own liveness anyway
+(`is_live_for` + `sock.upgrade` before anything is staged). Leaving a dead entry
+behind is safe by construction: recreating a reaped id re-puts the memo inside
+`get_or_create_sess`, immediately before the arm, so the new session always arms
+through the `Fresh` path and replaces the dead entry; if that never happens the
+frozen age makes the entry the next eviction victim.
+
+`SESS_MEMO_SLOTS` itself is not the lever. With the clear gone, a miss costs one
+slow path and no state; the table still admits ~`FAST_SESS_SLOTS` arms no matter
+how large the memo is.
+
+### 11.6 Verification
+
+`cargo test --bin myquic2-server` — 145 passed. The fast-table tests were rewritten for the new type:
 both sessions hit (`two_sessions_on_one_connection_both_hit_the_fast_table`), a full table evicts the quietest
 session (`a_full_table_evicts_the_quietest_session`), and sparse ids hit while a full table never grows
 (`sparse_session_ids_both_hit_and_a_full_table_never_grows`, which also pins that re-arming returns the same slot
-and leaves `len()` unchanged).
+and leaves `len()` unchanged). B10 is pinned by `a_memo_eviction_keeps_the_fast_slot_serving`, which arms a
+session, evicts its memo row with an id exactly `SESS_MEMO_SLOTS` away, and asserts the slot still serves; run
+against the old `Stale | Miss` arm it fails with "a memo miss must not drop the slot".
