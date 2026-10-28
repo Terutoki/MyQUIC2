@@ -522,6 +522,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | `TRAIN` | 64 items | packer and decoder |
 | Stager | 1,024 items / 256 KiB per connection | enqueue admission |
 | Pack batch | 4 frames / 64 items | stager drain |
+| Control-plane queues | 64 messages per direction (`CTL_QUEUE` client, `CTL_IN_QUEUE` server) | bounded on both ends of the reliable stream: an outbound overflow drops the message and counts `ctl_queue_full`, an inbound overflow applies QUIC flow control to the peer instead of buffering it |
 | Reassembly | 2 s / 256 partials / 256 KiB per connection | reassembler sweep (both MQP-2 and the rev2/rev3 plane; the ordering index is pruned, not just the partials) |
 | QUIC stream reassembly | 1,024 gap spans per peer-opened stream (quinn-proto) | charged process-wide via the parked-header-stream credit |
 | Header-stage parked streams | 4,096 process-wide / 256 per connection | `HEADER_TASK_CREDIT` / `HEADER_CREDIT_PER_CONN` fail-fast reset |

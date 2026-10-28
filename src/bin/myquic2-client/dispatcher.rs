@@ -1234,8 +1234,8 @@ pub(crate) fn handle_r3_ctl(
 /// its own stream.
 fn spawn_ctl_stream(
     conn: quinn::Connection,
-    mut to_server: tokio::sync::mpsc::UnboundedReceiver<CtlMessage>,
-    to_dispatcher: tokio::sync::mpsc::UnboundedSender<CtlMessage>,
+    mut to_server: tokio::sync::mpsc::Receiver<CtlMessage>,
+    to_dispatcher: tokio::sync::mpsc::Sender<CtlMessage>,
 ) {
     tokio::spawn(async move {
         let Ok((mut sender, mut receiver)) = ctl_stream::open_client_stream(&conn).await else {
@@ -1259,7 +1259,11 @@ fn spawn_ctl_stream(
                 },
                 msg = receiver.recv() => match msg {
                     Ok(Some(msg)) => {
-                        if to_dispatcher.send(msg).is_err() {
+                        // Bounded, and awaited: a peer that outruns the
+                        // dispatcher stalls its own reliable stream instead of
+                        // growing this queue (the same backpressure the server
+                        // applies to its inbound handoff).
+                        if to_dispatcher.send(msg).await.is_err() {
                             return;
                         }
                     }
@@ -1826,12 +1830,19 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
             // queues and forwards inbound messages here. A rev2 generation keeps
             // a channel whose sender lives in `_ctl_keepalive`, so the select arm
             // below simply never becomes ready and no stream is opened.
+            //
+            // Both directions are **bounded** at `CTL_QUEUE`: the outbound one
+            // because its producer is the packet path at the peer's frame rate
+            // (`send_ctl` drops and counts instead of growing), the inbound one
+            // because a peer that floods the control stream would otherwise
+            // outrun this loop — the stream task awaits its `send`, so the
+            // backlog becomes QUIC flow control on the peer's own stream.
             let (dispatch_ctl_tx, mut dispatch_ctl_rx) =
-                tokio::sync::mpsc::unbounded_channel::<CtlMessage>();
+                tokio::sync::mpsc::channel::<CtlMessage>(rev2::CTL_QUEUE);
             let wire = rev2.wire();
             let _ctl_keepalive = if wire == Wire::Rev3 {
                 let (to_server_tx, to_server_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<CtlMessage>();
+                    tokio::sync::mpsc::channel::<CtlMessage>(rev2::CTL_QUEUE);
                 // Install synchronously, before the first inbound datagram can
                 // be dispatched: a repair or a close queued from then on always
                 // has a writer.

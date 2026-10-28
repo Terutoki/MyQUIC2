@@ -81,6 +81,19 @@ pub(crate) const HELLO_FAST_WINDOW: Duration = Duration::from_secs(2);
 /// server's 180 s sweep.
 const MAX_CLOSED_SESSIONS: usize = 64;
 
+/// Depth of the rev3 outbound control queue (see
+/// [`ConnRev2::send_ctl`]).
+///
+/// The queue only ever holds messages the peer has not been sent yet, and the
+/// producer is the packet path — one `REJECT` per binding frame this side
+/// refuses, i.e. at the peer's rate — while the consumer is a reliable stream
+/// serialized by the peer's flow control. Bounding it turns a peer that floods
+/// refused frames and stops reading into dropped idempotent notices instead of
+/// process memory growth; the counter (`ctl_queue_full`) is what makes that
+/// visible. The same number the server uses for its inbound handoff
+/// (`CTL_IN_QUEUE`), so both ends of the control plane are sized alike.
+pub(crate) const CTL_QUEUE: usize = 64;
+
 /// How long a target the server rejected (`CTL FLOW_REJECT`) is sent `INLINE`
 /// before the uplink retries an `OPEN`.
 ///
@@ -193,7 +206,15 @@ pub(crate) struct ConnRev2 {
     /// rev3 outbound control messages: the generation's control-stream task
     /// owns the stream and accepts messages here (see [`Self::send_ctl`]).
     /// `None` on rev2 and until the dispatcher installs the writer.
-    ctl_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CtlMessage>>>,
+    ///
+    /// **Bounded** ([`CTL_QUEUE`]): the queue is filled from the packet path,
+    /// one message per refused binding frame, i.e. at the peer's send rate,
+    /// while it drains at the rate the peer reads the reliable stream. An
+    /// unbounded channel let a peer that keeps sending frames this side refuses
+    /// and never reads the control stream grow it for the connection's
+    /// lifetime. `try_send` + a drop counter is the same policy the server's
+    /// `R2ConnState::queue_ctl` applies to its side of the same plane.
+    ctl_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<CtlMessage>>>,
     /// Sender-side rate budget for `NEED_CONTEXT` repairs: one hostile/broken
     /// peer can otherwise make an unknown-id frame storm turn into a control
     /// stream storm (the receiver-side [`ctl_stream::CtlRate`] bounds the
@@ -334,7 +355,7 @@ impl ConnRev2 {
     /// Called synchronously by the dispatcher when it spawns the generation's
     /// control task, before any inbound datagram is handled — so a repair or a
     /// close queued from then on always has a writer. Rev2 never installs one.
-    pub(crate) fn install_ctl_writer(&self, tx: tokio::sync::mpsc::UnboundedSender<CtlMessage>) {
+    pub(crate) fn install_ctl_writer(&self, tx: tokio::sync::mpsc::Sender<CtlMessage>) {
         *self.ctl_tx.lock() = Some(tx);
     }
 
@@ -343,17 +364,32 @@ impl ConnRev2 {
     /// Non-blocking by design: the packet path (dispatcher, association exit)
     /// must never await an I/O write. The generation's control task owns the
     /// stream and writes messages in queue order; QUIC supplies reliability, so
-    /// there is no app-level repeat. `false` means no writer is installed (rev2,
-    /// or the generation's dispatcher has not run) or the task is gone; callers
-    /// treat it as a dropped (idempotent) message.
+    /// there is no app-level repeat.
+    ///
+    /// The queue is bounded at [`CTL_QUEUE`], so a full one drops the message
+    /// and counts `ctl_queue_full` rather than growing without bound. Only
+    /// `REJECT`/`NEED_CONTEXT` notices can reach the full queue in practice
+    /// (they are produced at the peer's frame rate and are re-derivable from
+    /// the frames that follow), and dropping one costs the peer a retry —
+    /// `ASSOC_CLOSE` would fall back to the server's idle sweep. `false` means
+    /// no writer is installed (rev2, or the generation's dispatcher has not
+    /// run), the task is gone, or the queue was full; callers treat it as a
+    /// dropped (idempotent) message.
     pub(crate) fn send_ctl(&self, msg: CtlMessage) -> bool {
         if self.wire != Wire::Rev3 {
             return false;
         }
-        self.ctl_tx
-            .lock()
-            .as_ref()
-            .is_some_and(|tx| tx.send(msg).is_ok())
+        match self.ctl_tx.lock().as_ref() {
+            Some(tx) => match tx.try_send(msg) {
+                Ok(()) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    counters::ctl_queue_full();
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            },
+            None => false,
+        }
     }
 
     /// Ask the peer to re-send binding context for `wire_id` (rev3 no-ACK
@@ -2067,6 +2103,10 @@ pub(crate) mod counters {
         /// rev3: control-stream messages dropped without acting on them
         /// (receiver rate budget, unimplemented direction, malformed).
         ctl_stream_drop,
+        /// rev3: control-stream messages dropped because the outbound queue was
+        /// full (`CTL_QUEUE`). A peer that floods frames this side refuses
+        /// while not reading the control stream shows up here.
+        ctl_queue_full,
     }
 
     /// Thread-local flush threshold for the data-plane counters: the hot path
@@ -2143,6 +2183,7 @@ pub(crate) mod counters {
         need_context_rx,
         ctl_stream_rx,
         ctl_stream_drop,
+        ctl_queue_full,
     }
 
     impl std::fmt::Display for Rev2Snapshot {
@@ -2153,7 +2194,7 @@ pub(crate) mod counters {
                  close={} sess_close={}/{} flow_open={} srv={}/{} open={} steady={} \
                  inline={}/{} stage={}p/{}d/{}f/{}i/{}x/{}full hold={}q/{}f/{}full/{}stale \
                  frag={}/{}/{} unknown_id={} drops={} resets={}/{} ctl={}/{}/{} \
-                 r3ctl={}/{} nctx={}/{} aclose={}",
+                 r3ctl={}/{} nctx={}/{} aclose={} qfull={}",
                 self.hello_tx,
                 self.handshake_ok,
                 self.handshake_fail,
@@ -2199,6 +2240,7 @@ pub(crate) mod counters {
                 self.need_context_tx,
                 self.need_context_rx,
                 self.assoc_close_tx,
+                self.ctl_queue_full,
             )
         }
     }

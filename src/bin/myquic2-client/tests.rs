@@ -8891,7 +8891,7 @@ async fn rev3_downlink_data_train_and_inline_decode_through_the_adapter() {
 #[tokio::test]
 async fn rev3_unknown_steady_flow_requests_context() {
     let state = rev3_state();
-    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel(rev2::CTL_QUEUE);
     state.install_ctl_writer(ctl_tx);
     let hub = UdpHub::new();
     let mut cache = empty_dispatch_cache();
@@ -9015,7 +9015,7 @@ async fn rev3_assoc_close_replaces_sess_close_datagrams() {
         slot: pool.udp_global_slot(bind.index),
         rev2: state.clone(),
     })));
-    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel(rev2::CTL_QUEUE);
     state.install_ctl_writer(ctl_tx);
     let before = counters::snapshot();
     send_sess_close(&egress, &pool, Some(bind), 7, state.epoch);
@@ -9088,7 +9088,7 @@ fn rev3_control_sender_queues_messages_and_rate_limits_repairs() {
         !state.send_ctl(CtlMessage::Goaway),
         "no control-stream writer installed yet"
     );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(rev2::CTL_QUEUE);
     state.install_ctl_writer(tx);
     assert!(state.send_ctl(CtlMessage::AssocClose { sess: 9, reason: 0 }));
     assert_eq!(
@@ -9116,6 +9116,53 @@ fn rev3_control_sender_queues_messages_and_rate_limits_repairs() {
         "the NEED_CONTEXT budget must refuse part of an unknown-id frame storm"
     );
     assert_eq!(ctl_stream::MARKER, 0xFF, "control stream marker is stable");
+}
+
+/// A peer that floods frames this side refuses must not grow the outbound
+/// control queue without bound: past `CTL_QUEUE` the message is dropped and
+/// counted, and the queue drains normally once the writer makes progress.
+#[test]
+fn rev3_control_queue_drops_instead_of_growing() {
+    let state = rev3_state();
+    // Capacity 1, so the bound is reached deterministically.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    state.install_ctl_writer(tx);
+    let before = counters::snapshot();
+    assert!(state.send_ctl(CtlMessage::Goaway), "first message fits");
+    assert!(
+        !state.send_ctl(CtlMessage::AssocClose { sess: 1, reason: 0 }),
+        "a full queue refuses the message instead of buffering it"
+    );
+    assert_eq!(counters::since(&before).ctl_queue_full, 1);
+    // The same refusal at the real depth, shaped like a peer-driven reject
+    // storm: exactly the overflow is dropped, the queue keeps its first
+    // `CTL_QUEUE` messages.
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel(rev2::CTL_QUEUE);
+    state.install_ctl_writer(tx2);
+    let before = counters::snapshot();
+    let mut refused = 0usize;
+    for fid in 0..(rev2::CTL_QUEUE as u16 + 8) {
+        if !state.send_ctl(CtlMessage::Reject {
+            fid,
+            reason: r2::R2_REJECT_POLICY,
+        }) {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 8, "only the ring overflow is dropped");
+    assert_eq!(counters::since(&before).ctl_queue_full, 8);
+    // Draining one slot lets the next message through: dropping is pressure
+    // relief, not a latched failure.
+    assert!(rx2.try_recv().is_ok());
+    assert!(state.send_ctl(CtlMessage::Reject {
+        fid: 0,
+        reason: r2::R2_REJECT_POLICY,
+    }));
+    assert_eq!(
+        rx.try_recv()
+            .expect("the capacity-1 queue kept its message"),
+        CtlMessage::Goaway
+    );
 }
 
 /// rev3 full-slice round trip on a real connection: a published rev3

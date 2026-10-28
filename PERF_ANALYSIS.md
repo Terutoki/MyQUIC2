@@ -663,3 +663,36 @@ callers are tests plus `flush_reply_single` / `flush_reply_batch` in `reader.rs`
 matches a frame from a shipped peer. Context-lost asymmetry between the v3 encoder and its ingress is real but
 unreachable; `src/mqp/v3.rs` (3.2k lines) and its ingress paths are exercised by tests only, with no config switch to
 enable them. Recorded here so the next audit does not report it again without checking reachability.
+
+## 10. Fifth Batch: Third Audit Round (2026-10-28, post-62fe2b3)
+
+A third pass over the datapath after the second batch, focused on handoff queues and on whether the first batch's
+server-side fix had a client-side counterpart. One item was found.
+
+| # | Item | Severity | Status |
+|---|------|----------|--------|
+| B5 | Client rev3 **outbound** control queue is unbounded while its producer is the peer's frame rate | Medium | ✅ Fixed: `CTL_QUEUE` = 64, `try_send` + `ctl_queue_full`, inbound side bounded and awaited |
+
+### 10.1 B5 — client rev3 control queue
+
+Batch 3 bounded the server's inbound control handoff (`CTL_IN_QUEUE` = 64, `try_send`, drop + count). The client's
+outbound side had no bound at all: `ConnRev2::send_ctl` pushed into a `tokio::sync::mpsc::unbounded_channel` installed by
+`dispatcher::spawn_ctl_stream`, and the consumer writes the messages in order onto the reliable control stream, where
+progress is gated by the peer's flow control.
+
+Only one of the three producers was rate-limited (`send_need_context`, via `CtlRate`). The other peer-driven one is
+`send_flow_reject`: `install_server_flow` refuses a binding frame for four reasons (`wire_id_server_owned` violation, a
+missing session or address, an unencodable address, and a full/conflicting registry) and queues one `REJECT` per refused
+frame. A peer that keeps sending frames this side refuses *and* stops reading the control stream therefore queued them at
+its own packet rate for the connection's lifetime — ~72 B per queued message, i.e. megabytes per second at a few tens of
+thousands of packets per second, with no cap.
+
+The fix mirrors the server: both directions are now `channel(CTL_QUEUE)` with `CTL_QUEUE = 64`. `send_ctl` uses
+`try_send` and counts `ctl_queue_full` on `Full` (the counter is in the 60 s report line as `qfull=`); the stream task
+awaits its handoff to the dispatcher, so a peer that floods the inbound direction stalls its own stream through QUIC flow
+control instead of growing the queue. Dropping is safe for the messages that can actually fill the queue — `REJECT` and
+`NEED_CONTEXT` are re-derivable from the frames that follow — while a dropped `ASSOC_CLOSE` degrades to the server's 180 s
+idle reap. Regression coverage: `rev3_control_queue_drops_instead_of_growing` (capacity-1 and `CTL_QUEUE` cases, exact
+drop count, and that draining one slot restores admission).
+
+**Not changed:** `send_flow_ack` on the rev2 plane, which is a DATAGRAM send and already drops on `Blocked`.
