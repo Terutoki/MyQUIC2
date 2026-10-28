@@ -513,7 +513,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 
 | Resource | Bound | Enforcement |
 |---|---|---|
-| Fast session table | 64 slots | server ingress |
+| Fast session table | 128 slots | server ingress |
 | Flow registry | 4096 live flows per connection | send: `INLINE` fallback; receive: `FLOW_REJECT(table_full)` |
 | Flows per session | 64 | same fallback/reject path |
 | Resolved addresses | 16 per flow | DNS result truncation |
@@ -533,7 +533,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | File descriptors | 24,840 server / 12,496 client (designed capacity + 256 guard) | startup check against `RLIMIT_NOFILE`, rate-limited `EMFILE` warn at runtime |
 | Per-connection admission | 25,875 KiB (27,131,904 B) | checked before state allocation |
 
-The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 96 KiB of fixed ingress state (the 64-slot fast session table with inline destination pins + maps; the charge conservatively keeps the 16 KiB pre-HELLO allowance after Phase 0 removed the buffer), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (72 streams × 1,024 gap spans × 96 B = 6.75 MiB; the server advertises 64 bidi + 8 uni streams until the token is verified, then raises bidi to 8,192). The total is 25.875 MiB. At the full 4,096 connections that is **103.5 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
+The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 96 KiB of fixed ingress state (the 128-slot fast session table with inline destination pins + maps; the charge conservatively keeps the 16 KiB pre-HELLO allowance after Phase 0 removed the buffer), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (72 streams × 1,024 gap spans × 96 B = 6.75 MiB; the server advertises 64 bidi + 8 uni streams until the token is verified, then raises bidi to 8,192). The total is 25.875 MiB. At the full 4,096 connections that is **103.5 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
 
 A second, **process-wide fixed term** is subtracted from the budget once before the remainder is divided into connections. It covers state a peer can drive regardless of the connection count:
 

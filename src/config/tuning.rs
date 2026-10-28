@@ -23,14 +23,15 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 /// small fixed maps next to them. A conservative single term keeps the
 /// admission bound from depending on binary-private types.
 ///
-/// The fast session table is now 64 slots (`FAST_SESS_SLOTS` in
-/// `myquic2-server/accept.rs`, up from 16): each `FastSess` carries an inline
-/// `ConnPin` (255-byte name + address + deadline, ~304 B), a weak socket
-/// handle, the abort handle and a weak flow-table handle (a `Weak` costs the
-/// same 8 B as the `Arc` it replaced) — ~350 B per slot, so the
-/// table is ~22 KiB. With the 16 KiB pre-HELLO buffer (~38 KiB), the per-slot
-/// pins and the surrounding maps, 96 KiB is a round, conservative charge; the
-/// server's unit tests pin `FAST_SESS_SLOTS` against this constant's comment.
+/// The fast session table is now 128 slots (`FAST_SESS_SLOTS` in
+/// `myquic2-server/accept.rs`, up from 64 and originally 16): each `FastSess`
+/// carries an inline `ConnPin` (255-byte name + address + deadline, ~304 B), a
+/// weak socket handle, the abort handle and a weak flow-table handle (a `Weak`
+/// costs the same 8 B as the `Arc` it replaced) — ~420 B per slot, so the
+/// table is ~52.5 KiB. With the 16 KiB pre-HELLO buffer (~68.5 KiB), the
+/// per-slot pins and the surrounding maps, 96 KiB is still a round,
+/// conservative charge; the server's unit tests pin `FAST_SESS_SLOTS` against
+/// this constant's comment.
 pub const R2_INGRESS_FIXED_BYTES: u64 = 96 * 1024;
 
 /// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`
@@ -127,7 +128,8 @@ pub const DEFAULT_UDP_INTERACTIVE_CONNS: usize = 2;
 
 /// Hard cap on the interactive UDP egress shards: the same full-connection cost
 /// as [`MAX_UDP_EGRESS_CONNS`], and the two together bound the UDP egress range
-/// at `MAX_UDP_SLOTS` (`2 * MAX_UDP_EGRESS_CONNS`) scratch slots.
+/// at `MAX_UDP_SLOTS` (`MAX_UDP_INTERACTIVE_CONNS + MAX_UDP_EGRESS_CONNS`, 16)
+/// scratch slots in `myquic2-client::egress`.
 pub const MAX_UDP_INTERACTIVE_CONNS: usize = 8;
 
 /// Hard cap on the bulk UDP egress shards. Each shard is a full QUIC

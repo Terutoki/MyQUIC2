@@ -608,3 +608,58 @@ the client chooses its connection count, the server mirrors it.
   instead of 7, so a server sees one extra QUIC connection per client; (3) `nofile` is raised best-effort at startup and a
   short hard limit prints a warning instead of failing; (4) the rev3 control plane applies backpressure to a fast peer.
   No wire change, no on-disk format change.
+
+## 9. Fourth Batch: Second Audit Round (2026-10-28, post-3ab72b9)
+
+An independent sweep of the same datapath after the first batch of fixes, this time looking for defects *introduced or
+left* by it as well as for what the first pass skipped. Four items were found; one was withdrawn after verification.
+
+| # | Item | Severity | Status |
+|---|------|----------|--------|
+| B1 | Fast session table (64 slots) vs `LOCAL_SESS_MAX` = 4096, i.e. up to ~2000 live sessions per QUIC connection after the client pools its associations | High | ✅ Fixed: 128 slots, inline pins kept, memo raised to 256 |
+| B2 | Per-connection reply stager shared by every session (1,024 items / 256 KiB) | Medium-high | ⏸ Documented, structural |
+| B3 | rev3 uplink has no context-lost recovery | — | ❌ Withdrawn: MQP-3 codec is test-only (see below) |
+| B4 | Two doc comments drifted after batch 3 | Low | ✅ Fixed |
+
+### 9.1 B1 — fast table working set
+
+`FAST_SESS_SLOTS` was 64 while `LOCAL_SESS_MAX` is 4096, and the shipped client concentrates up to ~2000 live sessions on
+one connection (2 interactive + 2 bulk UDP shards for up to 4,032 associations). Past 64 live sessions *every* arm evicts:
+`fast_arm_index` falls through to the least-recently-active slot, so the table becomes a churn buffer and each datagram
+pays a full probe plus the slow path — `remember_dst`'s shard read lock, an unbatched `sendto` that bypasses
+`flush_staged_sends`' `sendmmsg`, and two memo probes.
+
+The fix doubles the table to 128 slots instead of sizing it to `LOCAL_SESS_MAX`, which would cost ~1.7 MiB per connection
+at ~420 B per slot (the inline `ConnPin` dominates). **Memory account:** 128 × ~420 B = 52.5 KiB per connection, up from
+26.25 KiB; with the 16 KiB pre-HELLO buffer that is ~68.5 KiB, still inside the 96 KiB `R2_INGRESS_FIXED_BYTES` charge
+(4,096 connections: 210 MiB worst case, in the same order as the documented quinn reassembler and TCP pump ceilings).
+
+`SESS_MEMO_SLOTS` had to grow with it: the memo index mixes the session id with the odd multiplier `0x9e3779b9`, so two
+ids exactly one fast-table step apart collide in a memo of the *same* size — precisely the pair a probed table exists to
+keep. A memo miss clears the session's fast slot, so 128/128 would have made the two tables fight. 256 restores the 2×
+headroom and costs ~5 KiB per worker thread.
+
+**Not fixed (structural):** a fixed-size table cannot cover 4096 sessions per connection. The remaining fix is to make a
+miss cheap — stage the slow path's target send into the same `flush_staged_sends` batch instead of one `sendto` per
+datagram — and to keep spreading the client's associations over more egress connections.
+
+### 9.2 B2 — shared reply stager
+
+`R2ConnState.stage` is one `R2Stager` per connection (1,024 items / 256 KiB) and the client packs ~2000 sessions onto a
+connection, i.e. ~0.5 frame / 128 B of headroom per session when the stager is full. Under overload `stage_push` drops
+with `BUFFER_FULL`; it does not queue.
+
+Sharing is the design: a per-session quota would multiply the per-connection bound by the session count and make the
+admission charge meaningless. The queueing discipline that matters here is upstream — the connection's DATAGRAM send
+buffer and the target socket's send buffer — and both are drop-newest already. Fairness is a scheduling problem (which
+session drains first), not a capacity one; the current drain is FIFO over one stager, which at least keeps a single
+session's frames in order.
+
+### 9.3 B3 — withdrawn: MQP-3 is not on the wire
+
+The finding assumed `handle_v3_ingress` (`accept.rs`) served live traffic. It does not: `encode_single` / `encode_train`
+callers are tests plus `flush_reply_single` / `flush_reply_batch` in `reader.rs`, and both of those functions are
+`#[cfg(test)]`. The rev3 wire is `src/mqp/r3.rs` (`wire::kind(Wire::Rev3, ..)` → `r3::kind`), and `is_v3` therefore never
+matches a frame from a shipped peer. Context-lost asymmetry between the v3 encoder and its ingress is real but
+unreachable; `src/mqp/v3.rs` (3.2k lines) and its ingress paths are exercised by tests only, with no config switch to
+enable them. Recorded here so the next audit does not report it again without checking reachability.

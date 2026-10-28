@@ -110,8 +110,8 @@ fn main() -> Result<()> {
 /// Worker count for the process's multi-threaded main runtime.
 ///
 /// The sharded topology (`MYQUIC2_SHARD_RUNTIME`, on by default) runs one
-/// current-thread runtime — and therefore one OS thread — per pool slot: 7 at
-/// the shipped defaults (4 TCP + 1 interactive UDP + 2 bulk shards). The main
+/// current-thread runtime — and therefore one OS thread — per pool slot: 8 at
+/// the shipped defaults (4 TCP + 2 interactive UDP + 2 bulk shards). The main
 /// runtime is where every SOCKS accept, TCP relay pump and UDP association
 /// task runs.
 ///
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
 /// "one core per slot" is not a reservation the app-side pool can afford to
 /// honour in full: it is the pool that moves user payload (accepts, relay
 /// pumps, every association), while a slot thread mostly parks on its endpoint
-/// and wakes for QUIC crypto. At the shipped 7 slots an 8-core host kept 7
+/// and wakes for QUIC crypto. At the shipped 8 slots an 8-core host kept 8
 /// cores for those parked threads and ran every SOCKS/TCP/UDP task on a single
 /// worker; a 4-core host did the same while pinning more slots than it has
 /// cores — the worst shape exactly where capacity is scarce.

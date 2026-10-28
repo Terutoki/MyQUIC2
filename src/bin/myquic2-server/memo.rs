@@ -51,10 +51,16 @@ pub(crate) struct SessMemo {
 
 /// 128 direct-mapped slots: session ids hash uniformly (odd multiplier is a
 /// bijection mod power-of-two), so 32 interleaved sessions already thrashed the
-/// old 32-slot table back to the table lock on every packet. 128 covers
-/// multi-association concurrency; past it entries still just miss through to the
-/// table — a miss is never a mis-serve, the key compare guarantees that.
-pub(crate) const SESS_MEMO_SLOTS: usize = 128;
+/// old 32-slot table back to the table lock on every packet. 256 covers
+/// multi-association concurrency and stays a power of two above the fast
+/// session table's `FAST_SESS_SLOTS` in `accept.rs`: the index mixes the id
+/// with `0x9e3779b9` (odd), so two ids one fast-table step apart always share a
+/// memo row when the two tables are the same size — exactly the pair a probed
+/// fast table is built to keep, and the newer arm would silently evict the
+/// older session's memo entry (a miss there clears its fast slot). Past 256
+/// entries still just miss through to the table — a miss is never a mis-serve,
+/// the key compare guarantees that.
+pub(crate) const SESS_MEMO_SLOTS: usize = 256;
 
 thread_local! {
     static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =

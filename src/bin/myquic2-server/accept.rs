@@ -292,10 +292,18 @@ pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
 ///
 /// See the note at the declaration site in [`handle_conn`] for why this is a
 /// table and not the single `(session, dst)` pair it used to be; the sizing
-/// argument is there too. 64 is the documented "hundreds of associations per
-/// connection" shape rounded to the probing table's power of two, and is
-/// charged to admission by `R2_INGRESS_FIXED_BYTES`.
-pub(crate) const FAST_SESS_SLOTS: usize = 64;
+/// argument is there too. 128 covers the steady working set of a connection
+/// that fronts a client pooling its associations onto a handful of QUIC
+/// connections (the shipped client packs up to ~2000 live sessions per
+/// connection), is the probing table's power of two, and is charged to
+/// admission by `R2_INGRESS_FIXED_BYTES`.
+///
+/// It is deliberately *not* sized to `LOCAL_SESS_MAX`: at ~420 B a slot that
+/// would be ~1.7 MiB per connection, so the table is the working set and a
+/// miss still resolves through the shard map. What it must avoid is the
+/// self-inflicted case where a full table evicts on *every* arm and turns the
+/// fast path back into a probed miss plus a slow path for each datagram.
+pub(crate) const FAST_SESS_SLOTS: usize = 128;
 // `fast_slot` masks instead of taking a modulo, and every probe step is a mask.
 const _: () = assert!(FAST_SESS_SLOTS.is_power_of_two());
 
@@ -356,10 +364,10 @@ pub(crate) struct FastSess {
     /// task, and the slot is only rewritten when *another* datagram happens to
     /// evict it (ids are monotonic, so a dead session's id never arrives
     /// again). A strong handle therefore pinned up to `MQP3_FLOW_TABLE_MAX_BYTES`
-    /// (22 KiB) per slot, up to 64 slots per connection, for the life of the
-    /// connection, outside the session budget the sweeper enforces. Upgrading
-    /// costs one refcount round-trip on the v3 frame that needs a flow id, and
-    /// a failed upgrade is exactly the "session is gone" signal the caller
+    /// (22 KiB) per slot, up to `FAST_SESS_SLOTS` slots per connection, for the
+    /// life of the connection, outside the session budget the sweeper enforces.
+    /// Upgrading costs one refcount round-trip on the v3 frame that needs a flow
+    /// id, and a failed upgrade is exactly the "session is gone" signal the caller
     /// already handles by falling through to [`session_flows`].
     flows: std::sync::Weak<arc_swap::ArcSwap<FlowTable>>,
 }
@@ -3883,14 +3891,19 @@ async fn handle_conn_inner(
         // syscall amplification of one `sendto` per datagram against one
         // `sendmmsg` per 32.
         //
-        // Sizing: 64 slots (~420 B each, on this task's heap future — the pin
+        // Sizing: 128 slots (~420 B each, on this task's heap future — the pin
         // buffer dominates). The multi-association shape this comment documents
-        // ("hundreds of sessions") is beyond one heap array, but 64 covers the
-        // DNS + game + handful-of-flows case with headroom and, unlike the old
-        // 16, keeps a realistic number of simultaneous associations on the fast
-        // path. Admission charges the array through `R2_INGRESS_FIXED_BYTES`;
-        // the delivered figure is `FAST_SESS_SLOTS * 420 B ~= 26.25 KiB` per
-        // connection.
+        // ("hundreds of sessions") is beyond one heap array, but 64 covered only
+        // the DNS + game + handful-of-flows case, and the shipped client packs
+        // up to ~2000 live sessions onto one connection, i.e. once a table is
+        // full *every* arm evicts and the "fast" path degrades to a full probe
+        // plus a slow path per datagram. 128 doubles the working set for
+        // ~52.5 KiB per connection and admission still charges it through
+        // `R2_INGRESS_FIXED_BYTES`; the delivered figure is
+        // `FAST_SESS_SLOTS * 420 B ~= 52.5 KiB` per connection. The remaining
+        // gap to `LOCAL_SESS_MAX` is structural: covering it with slots would
+        // cost ~1.7 MiB per connection, so a miss must stay cheap (batched
+        // target sends) rather than be made impossible by table size.
         //
         // **Probed, not direct-mapped.** Session ids come from the client's
         // monotonic counter and are never reused, so the live ids on a
