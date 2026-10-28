@@ -105,8 +105,11 @@ pub(crate) enum ReplyFilter {
 }
 
 /// The live session's MQP-3 flow table, if the entry exists and its reader has
-/// not exited. One shard read lock; used by the slow/arming paths, not by a
-/// steady v3 frame (which reads its fast slot's cached `Arc` instead).
+/// not exited. One shard read lock, taken once per v3 TRAIN (the caller keeps
+/// the handle for every item of that train) and never on the rev2 datagram
+/// path: caching this `Arc` in the connection's fast slot was tried and
+/// dropped, because filling it cost *every* rev2 miss a shard read lock to
+/// serve a field only a rev3 connection reads.
 pub(crate) fn session_flows(ss: &SessTable, s: u32) -> Option<Arc<arc_swap::ArcSwap<FlowTable>>> {
     let sh = ss.shard(s);
     let r = sh.read();

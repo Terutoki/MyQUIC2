@@ -779,25 +779,18 @@ fn allowlist_contains(ss: &SessTable, s: u32, dst: SocketAddr) -> bool {
 /// `flush_staged_sends`'s `sendmmsg`, and two extra memo probes with a `Weak`
 /// upgrade plus three `Arc` clones each.
 ///
-/// Pinned at the level the defect lived: arm two sessions that map to different
-/// home slots, then require a hit (and the allowlist record the fast path owes)
-/// from each, and a miss for a session that was never armed — the table is a
-/// cache, never a router. The sparse-id sibling below pins the *probing* half
-/// (ids whose low bits collide must still both hit).
+/// Pinned at the level the defect lived: arm two sessions, then require a hit
+/// (and the allowlist record the fast path owes) from each, and a miss for a
+/// session that was never armed — the table is a cache, never a router.
 #[tokio::test]
 async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let conn_id = next_conn_id();
-    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut fast = FastTable::new();
     let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
     let dst: SocketAddr = "198.51.100.7:53".parse().unwrap();
 
     let (s1, s2) = (1u32, 2u32);
-    assert_ne!(
-        fast_slot(s1),
-        fast_slot(s2),
-        "the fixture must exercise two distinct slots"
-    );
     // Held for the test's life: the fast path's socket liveness is a `Weak`
     // upgrade, so the table entry must be the socket's live owner.
     let mut socks = Vec::new();
@@ -817,18 +810,15 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     for s in [s1, s2] {
         arm_fast(
             &mut fast,
-            &ss,
             conn_id,
             s,
             TargetAddrRef::Ip(dst),
             dst,
             DNS_CACHE_TTL_MS,
         );
-        assert!(
-            fast_probe(&fast, s).is_some(),
-            "arm must publish session {s}"
-        );
+        assert!(fast.probe(s).is_some(), "arm must publish session {s}");
     }
+    assert_eq!(fast.len(), 2, "two sessions, two entries");
 
     // Both sessions must stage. The single-slot version could only ever serve
     // the most recently armed one.
@@ -849,20 +839,15 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         );
     }
 
-    // Never armed, and mapped to a slot that is EMPTY: must miss (this is the
-    // cheap case, and on its own it would still pass if `is_live_for` stopped
-    // checking the session id).
-    let empty_slot = 99u32;
-    assert!(
-        fast[fast_slot(empty_slot)].is_none(),
-        "premise: slot is empty"
-    );
+    // Never armed: must miss.
+    let never = 99u32;
+    assert!(fast.probe(never).is_none(), "premise: not armed");
     assert!(
         try_stage(
             &mut fast,
             &ss,
             conn_id,
-            empty_slot,
+            never,
             dst,
             Bytes::from_static(b"x"),
             true,
@@ -872,29 +857,21 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
         "an unarmed session must fall through to the slow path"
     );
 
-    // The case that actually pins "a cache, never a router": a session whose
-    // home slot is occupied by a *different* armed session, with a live reader
-    // and an upgradable socket of its own, but which was never armed itself.
-    // Probing reads past the other session's slot and stops at the empty slot
-    // after it, so this is a miss; dropping the exact `sess == s` compare would
-    // stage the datagram onto session 1's socket, and only this shape can catch
-    // that. (A session that *has* been armed at a probed position hits — see
-    // the sparse-id test below.)
-    let colliding = s1 + FAST_SESS_SLOTS as u32;
-    assert_eq!(
-        fast_slot(colliding),
-        fast_slot(s1),
-        "the fixture must share a home slot"
-    );
+    // The case that actually pins "a cache, never a router": a live session
+    // with a published session-table entry and an upgradable socket of its own,
+    // whose datagram arrives before anything armed it. Staging it could only
+    // come from another session's slot, and that would send this session's
+    // payload to the wrong target.
+    let live = s1 + FAST_SESS_SLOTS as u32;
     {
-        let entry = capped_session(colliding, 0);
+        let entry = capped_session(live, 0);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
-        ss.shard(colliding).write().insert(colliding, entry);
+        ss.shard(live).write().insert(live, entry);
         ss.note_live_insert();
-        sess_memo_put(conn_id, colliding, sock.clone(), last, abort, epoch);
+        sess_memo_put(conn_id, live, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
     assert!(
@@ -902,185 +879,146 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
             &mut fast,
             &ss,
             conn_id,
-            colliding,
+            live,
             dst,
             Bytes::from_static(b"x"),
             true,
             &mut staged
         )
         .is_err(),
-        "a colliding session must miss its way to the slow path, never borrow \
-         the slot owner's socket"
+        "an unarmed live session must miss its way to the slow path, never \
+         borrow another session's slot"
     );
     assert!(staged.is_empty(), "a miss must not stage anything");
 }
 
-/// A dead session's slot must be **recycled**, not left in the probe chain.
+/// A full table must evict the **quietest** session: never grow, never
+/// mis-route.
 ///
-/// Session ids come from a monotonic counter and are never reused, so once a
-/// session is reaped nothing ever names it again and the only way out of the
-/// table is another datagram's arm evicting the entry. `fast_arm_index` used to
-/// take a free slot, or the quietest live one once the table was full, and
-/// never a dead entry: 64 slots fill with tombstones on a long-lived connection
-/// and every arm pays a full-table scan from its home.
+/// Session ids are monotonic and never reused, so nothing else reclaims a slot:
+/// without an eviction order the table would simply stop admitting new
+/// sessions once full. The order is the session's own liveness stamp, advanced
+/// on a hit — a reaped or idle session stops advancing it and ages out, which
+/// is also why the arm scan no longer has to look for dead entries (two
+/// atomics per slot) and now only reads the tag and stamp arrays.
 #[tokio::test]
-async fn arm_recycles_a_dead_slot_instead_of_growing_the_chain() {
+async fn a_full_table_evicts_the_quietest_session() {
     let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let conn_id = next_conn_id();
-    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut fast = FastTable::new();
+    let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
     let dst: SocketAddr = "198.51.100.11:53".parse().unwrap();
 
-    // `s_new` shares `s_dead`'s home slot, so arming it must probe through the
-    // dead entry first.
-    let s_dead = 5u32;
-    let s_new = s_dead + FAST_SESS_SLOTS as u32;
-    let home = fast_slot(s_dead);
-    assert_eq!(fast_slot(s_new), home, "the fixture must share a home slot");
-
     let mut socks = Vec::new();
-    let abort = {
-        let entry = capped_session(s_dead, 0);
-        let sock = entry.sock.clone();
-        let last = entry.last.clone();
-        let epoch = entry.recent_epoch.clone();
-        let abort = entry.reader.abort_handle();
-        ss.shard(s_dead).write().insert(s_dead, entry);
-        ss.note_live_insert();
-        sess_memo_put(conn_id, s_dead, sock.clone(), last, abort.clone(), epoch);
-        socks.push(sock);
-        abort
-    };
-    // Arm while the session is still alive: `sess_memo_lookup` answers `Stale`
-    // for a finished reader, and a stale arm clears the slot instead of
-    // publishing it.
-    arm_fast(
-        &mut fast,
-        &ss,
-        conn_id,
-        s_dead,
-        TargetAddrRef::Ip(dst),
-        dst,
-        DNS_CACHE_TTL_MS,
-    );
-    assert_eq!(
-        fast_probe(&fast, s_dead),
-        Some(home),
-        "premise: armed at home"
-    );
-
-    // Reap it: the reply reader exits and the sweeper drops the table entry
-    // under the shard lock. Those two are exactly what `slot_is_dead` keys on.
-    abort.abort();
-    for _ in 0..10_000 {
-        if abort.is_finished() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(abort.is_finished(), "premise: the reader task is gone");
-    let removed = ss.shard(s_dead).write().remove(&s_dead);
-    assert!(removed.is_some(), "premise: the entry was published");
-    drop(removed);
-
-    assert_eq!(
-        fast_arm_index(&fast, s_new),
-        home,
-        "arming must recycle the dead slot instead of consuming the free slot \
-         after it"
-    );
-    // Until that arm writes the slot the dead entry is still the head of
-    // `s_new`'s chain, and it must never answer for `s_new`.
-    assert!(fast_probe(&fast, s_new).is_none());
-}
-
-/// Reaping a session must free its MQP-3 flow table even though the
-/// connection's fast slot still names it.
-///
-/// The slot array is a local of the connection's DATAGRAM task, which no
-/// sweeper can reach, and monotonic ids mean nothing ever evicts a dead entry.
-/// A strong `Arc` there made the fast table the flow table's *second owner*, so
-/// a reaped session's flow state (up to `MQP3_FLOW_TABLE_MAX_BYTES` per slot,
-/// 64 slots per connection) stayed pinned outside every session budget until
-/// the connection itself ended. The slot holds a `Weak` and only borrows the
-/// table through the session's own `Arc`.
-#[tokio::test]
-async fn reaped_session_releases_its_flow_table_from_the_fast_slot() {
-    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
-    let conn_id = next_conn_id();
-    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
-    let dst: SocketAddr = "198.51.100.12:53".parse().unwrap();
-    let s = 3u32;
-
-    let mut socks = Vec::new();
-    let abort = {
-        let entry = capped_session(s, 0);
+    // The quiet session is stamped a minute ago; every other session is fresh.
+    let quiet = 5u32;
+    let fresh: Vec<u32> = (0..FAST_SESS_SLOTS as u32 - 1).map(|i| 1_000 + i).collect();
+    for (s, idle) in std::iter::once((quiet, 60_000u64)).chain(fresh.iter().map(|&s| (s, 0u64))) {
+        let entry = capped_session(s, idle);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
         ss.shard(s).write().insert(s, entry);
         ss.note_live_insert();
-        sess_memo_put(conn_id, s, sock.clone(), last, abort.clone(), epoch);
+        sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
         socks.push(sock);
-        abort
-    };
+        arm_fast(
+            &mut fast,
+            conn_id,
+            s,
+            TargetAddrRef::Ip(dst),
+            dst,
+            DNS_CACHE_TTL_MS,
+        );
+    }
+    assert_eq!(fast.len(), FAST_SESS_SLOTS, "premise: the table is full");
+    assert!(
+        fast.probe(quiet).is_some(),
+        "premise: the quiet session is armed"
+    );
+
+    // One more session: the table has no free slot, so this arm can only evict.
+    let newcomer = 9_000u32;
+    {
+        let entry = capped_session(newcomer, 0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(newcomer).write().insert(newcomer, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, newcomer, sock.clone(), last, abort, epoch);
+        socks.push(sock);
+    }
     arm_fast(
         &mut fast,
-        &ss,
         conn_id,
-        s,
+        newcomer,
         TargetAddrRef::Ip(dst),
         dst,
         DNS_CACHE_TTL_MS,
     );
-    let flows = session_flows(&ss, s).expect("the armed session is live");
-    let weak = Arc::downgrade(&flows);
-    drop(flows);
-    assert!(
-        weak.upgrade().is_some(),
-        "premise: the session entry owns the table"
-    );
 
-    // Reap: the sweeper removes the entry, then the reader task exits.
-    let removed = ss.shard(s).write().remove(&s).expect("published");
-    abort.abort();
-    drop(removed);
+    assert_eq!(fast.len(), FAST_SESS_SLOTS, "a full table never grows");
     assert!(
-        weak.upgrade().is_none(),
-        "the fast slot must not keep a reaped session's flow table alive"
+        fast.probe(quiet).is_none(),
+        "the quietest session must lose its slot"
+    );
+    assert!(
+        fast.probe(newcomer).is_some(),
+        "the session that just armed must be present"
+    );
+    assert!(
+        try_stage(
+            &mut fast,
+            &ss,
+            conn_id,
+            newcomer,
+            dst,
+            Bytes::from_static(b"fast"),
+            true,
+            &mut staged
+        )
+        .is_ok(),
+        "the newly armed session must hit"
+    );
+    staged.clear();
+    assert!(
+        try_stage(
+            &mut fast,
+            &ss,
+            conn_id,
+            quiet,
+            dst,
+            Bytes::from_static(b"fast"),
+            true,
+            &mut staged
+        )
+        .is_err(),
+        "the evicted session must take the slow path, not a stale slot"
     );
 }
 
-/// Sparse session ids must both hit the probed table.
+/// Sparse session ids must all hit, and a table over capacity must evict rather
+/// than grow.
 ///
 /// The client allocates session ids from a monotonic counter and never reuses
 /// them, so on a long-lived connection the live ids are a *sparse* subset of the
-/// id space rather than a dense `1..=N` interval. `S1 + k * FAST_SESS_SLOTS`
-/// share the home slot (`s & (FAST_SESS_SLOTS - 1) == constant`) but are a full
-/// table apart, which is exactly the shape the old direct map could only ever
-/// treat as a permanent collision: after a few hundred associations a real
-/// client's live ids land on the same low bits at random. Both must arm and both
-/// must hit — the second is published in the first free slot after its home —
-/// and a table that is genuinely over `FAST_SESS_SLOTS` live sessions must evict
-/// the quietest rather than grow or mis-route.
+/// id space rather than a dense `1..=N` interval. A sparse-id fixture is also
+/// the only shape that catches a probe keyed on anything but the exact id.
 #[tokio::test]
-async fn sparse_session_ids_both_hit_the_probed_fast_table() {
+async fn sparse_session_ids_both_hit_and_a_full_table_never_grows() {
     let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let conn_id = next_conn_id();
-    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut fast = FastTable::new();
     let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
     let dst: SocketAddr = "198.51.100.7:53".parse().unwrap();
 
-    // Sparse ids from a counter that has run for a while: `s2`/`s3` land on the
-    // same home slot as each other (linear probing publishes the second one in
-    // the next free slot), `s1` on a different home. The spacing is derived from
-    // `FAST_SESS_SLOTS` so a future table resize cannot silently invalidate the
-    // fixture.
+    // Ids from a counter that has run for a while, a full table apart.
     let base = 1_001u32;
     let step = FAST_SESS_SLOTS as u32;
     let (s1, s2, s3) = (base + 1, base + step, base + 2 * step);
-    assert_eq!(fast_slot(s2), fast_slot(s3), "fixture: same home slot");
-    assert_ne!(fast_slot(s1), fast_slot(s2));
 
     let mut socks = Vec::new();
     for s in [s1, s2, s3] {
@@ -1097,7 +1035,6 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     for s in [s1, s2, s3] {
         arm_fast(
             &mut fast,
-            &ss,
             conn_id,
             s,
             TargetAddrRef::Ip(dst),
@@ -1105,30 +1042,23 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
             DNS_CACHE_TTL_MS,
         );
     }
-    // Re-arming a session whose home was occupied must update the probed slot
-    // in place, not append a second copy at some later free slot.
+    // Re-arming an already armed session must update its own slot in place,
+    // never append a second copy.
+    let i3 = fast.probe(s3).expect("s3 must be armed");
     arm_fast(
         &mut fast,
-        &ss,
         conn_id,
         s3,
         TargetAddrRef::Ip(dst),
         dst,
         DNS_CACHE_TTL_MS,
     );
-    let i2 = fast_probe(&fast, s2).expect("s2 must be armed");
-    let i3 = fast_probe(&fast, s3).expect("s3 must be armed");
-    assert_ne!(
-        i2, i3,
-        "a shared home must probe to a free slot instead of evicting the other session"
-    );
     assert_eq!(
-        fast.iter()
-            .filter(|slot| slot.as_ref().is_some_and(|x| x.sess == s3))
-            .count(),
-        1,
-        "re-arming must update the existing slot, never duplicate it"
+        fast.probe(s3),
+        Some(i3),
+        "a re-arm must keep the session's own slot"
     );
+    assert_eq!(fast.len(), 3, "a re-arm must not duplicate the entry");
     for s in [s1, s2, s3] {
         assert!(
             try_stage(
@@ -1142,15 +1072,14 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
                 &mut staged
             )
             .is_ok(),
-            "sparse session {s} must hit its probed slot"
+            "sparse session {s} must hit its slot"
         );
         staged.clear();
     }
 
     // Over capacity: `FAST_SESS_SLOTS + 1` new live sessions. The table is a
-    // fixed array, so the last arm must evict the quietest entry; the session
-    // it just armed is still present (nothing runs after it) and hits, and the
-    // table never exceeds its slot count.
+    // fixed array, so the last arm must evict rather than grow; the session it
+    // just armed is still present (nothing runs after it) and hits.
     let mut overflow = Vec::new();
     for i in 0..(FAST_SESS_SLOTS as u32 + 1) {
         let s = 5000 + i;
@@ -1167,7 +1096,6 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
     for (s, _) in &overflow {
         arm_fast(
             &mut fast,
-            &ss,
             conn_id,
             *s,
             TargetAddrRef::Ip(dst),
@@ -1175,11 +1103,7 @@ async fn sparse_session_ids_both_hit_the_probed_fast_table() {
             DNS_CACHE_TTL_MS,
         );
     }
-    assert_eq!(
-        fast.iter().filter(|slot| slot.is_some()).count(),
-        FAST_SESS_SLOTS,
-        "the table is fixed-size: arming beyond it evicts, never grows"
-    );
+    assert_eq!(fast.len(), FAST_SESS_SLOTS, "the table is fixed-size");
     let (last_s, _) = overflow.last().expect("overflow fixture is non-empty");
     assert!(
         try_stage(
@@ -5901,7 +5825,7 @@ async fn rev2_open_on_full_registry_forwards_payload_then_rejects() {
         "premise: the registry is full"
     );
     let id = r2::make_wire_id(state.registry.cap() as u32 + 1, false).unwrap();
-    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let mut fast = FastTable::new();
     let mut staged = Vec::new();
     r2_ingress_open(
         &mut fast,

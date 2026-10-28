@@ -696,3 +696,101 @@ idle reap. Regression coverage: `rev3_control_queue_drops_instead_of_growing` (c
 drop count, and that draining one slot restores admission).
 
 **Not changed:** `send_flow_ack` on the rev2 plane, which is a DATAGRAM send and already drops on `Blocked`.
+
+## 11. Sixth Batch: Fourth Audit Round (2026-10-29, post-09f609a)
+
+A fourth pass, this time looking for *per-datagram fixed cost* rather than missing bounds: cache footprint,
+lock count, atomic read-modify-write, syscalls. One severe item was found, and it was self-inflicted by the
+previous batch's table growth.
+
+| # | Item | Severity | Status |
+|---|------|----------|--------|
+| B6 | `fast_arm_index` turned every fast-table miss into a scan of 128 scattered ~440 B entries (~1.3 µs) | High | ✅ Fixed: split-array table, tag-only probe, in-place re-arm |
+| B7 | Chained probing + "recycle the first dead slot" left entries unreachable and allowed a duplicate for the same session | Medium | ✅ Fixed: probe scans tags, no chaining, no holes |
+| B8 | Re-arming a live session rewrote the whole 440 B entry and both `Weak`s | Low | ✅ Fixed: only the pin and the liveness stamp are touched |
+| B9 | `arm_fast` took a third shard read lock per miss to cache a v3 flow table no shipped peer reads | Medium | ✅ Fixed: field removed, one lock per v3 train instead |
+
+### 11.1 B6 — the miss path paid for the table's size
+
+The steady shape of a server datagram is: `resolve_fast` (hit → `try_stage` → the frame joins the burst, flushed
+as `sendmmsg` runs of ~32) or, on a miss, memo probe → shard read lock (`get_or_create_sess`) → a second shard read
+lock (`remember_dst`) → one `udp_try_send` → `arm_fast`.
+
+`arm_fast` picked its slot with `fast_arm_index`, which scanned the whole table — and each step of that scan
+dereferenced a 440-byte `FastSess` to call `slot_is_dead` (two cross-object atomic loads: `abort.is_finished()`
+and `sock.strong_count()`) plus `last.load(Relaxed)`. The payload array was 128 × 440 B = 52.5 KiB, i.e. far past
+L1, so one arm touched ~384 scattered cache lines: ~5.4k cycles, **~1.3 µs**, before even writing the entry back
+(440 B memcpy plus two `Arc::downgrade` refcount round-trips).
+
+The trigger is the shipped shape: the client pools ~4032 associations onto 4 UDP connections, so a server
+connection fronts ~1000 live sessions against 128 slots. At ~12 % hit rate, **88 % of datagrams take the slow path
+and arm**, i.e. ~1.3 µs of pure cache traffic each — around 17 % of one core at 150 kpps, on top of the ~2-3 µs
+the slow path already cost against ~0.2-0.3 µs for a hit. The previous batch raised the table from 64 to 128 to
+lift the hit rate from ~6 % to ~12 % and doubled the cost of every miss doing it: the eviction *churn* was priced
+in, the probe *scan* was not.
+
+### 11.2 The fix — split arrays, tag-only probe, in-place re-arm
+
+`FastTable` is now three parallel arrays over `FAST_SESS_SLOTS`:
+
+```rust
+pub(crate) struct FastTable {
+    tags:  [u32; FAST_SESS_SLOTS],              // 0 = free (session 0 is refused)
+    ages:  [u64; FAST_SESS_SLOTS],              // liveness stamp for eviction
+    slots: [Option<FastSess>; FAST_SESS_SLOTS], // the entry itself
+}
+```
+
+- `probe` reads `tags` only: 128 × 4 B = 512 B, eight cache lines, no dereference, no atomics. The chain and the
+  `None`-stops-the-probe rule are gone with it, so an entry can never hide behind a hole (B7), and `arm_index`
+  prefers the session's own slot before the first free tag before the minimum `ages` entry — the last one being
+  the only case that reads `ages` (1 KiB).
+- `insert` copies the entry once and stamps `ages` from it; `clear` removes tag, age and payload together, which
+  is also what releases a reaped session's flow-table `Weak`.
+- `touch(idx, stamp)` writes `ages` only when the stamp actually advanced (it advances about once per second), so
+  the steady hit path does not dirty the array every datagram.
+- Re-arming a session that already holds its slot now only refreshes `pin` (the one field that can change: a new
+  DNS generation) and the stamp. B8.
+- `size_of::<FastSess>() <= 448` is a compile-time assert next to the type: `R2_INGRESS_FIXED_BYTES` is derived
+  from that number, so a field may not grow it silently.
+
+Cost after the change: a miss scans 1.5 KiB instead of 52.5 KiB of scattered payloads, ~50 ns against ~1.3 µs.
+
+### 11.3 Not changed — staging the slow path's target sends (B-suggestion 2)
+
+Staging the slow path's `udp_try_send` into the burst was the other candidate. It buys nothing on the wire:
+`flush_staged_sends` merges only *consecutive* frames that share `(sock, dst)`, and a slow-path datagram is a run
+of length one by construction — the burst spans many sessions, so the neighbours differ. `udp_try_send_grouped`
+routes a single header-less frame to the per-frame path anyway, so the syscall count is identical and the send is
+merely deferred to the end of the burst. Recorded here so it is not re-proposed without measuring the run shape.
+
+### 11.4 B9 — the arm path's third shard lock (found while sizing B6's follow-up)
+
+`arm_fast` opened with `session_flows(ss, s)`, a shard read lock plus an `Arc`
+clone, purely to fill `FastSess::flows` — a field only `handle_v3_ingress` reads.
+That function serves MQP-3 rev3 TRAIN frames, which no shipped peer sends (§9.3), so the
+lock was paid by **every rev2 miss** to serve dead code: a third shard
+acquisition on a path that already takes two (`get_or_create_sess`,
+`remember_dst`). At the miss rates that matter (tens of thousands per second)
+that is ~0.2-0.3 us per datagram, and it is precisely the cost a bigger table
+would otherwise be spent to avoid.
+
+The field, the `fast_flows` accessor and the per-arm probe are gone;
+`handle_v3_ingress` takes `session_flows` once per train and keeps the handle
+for every item in it (a train carries up to `MQP3_MAX_TRAIN_ITEMS`), so the v3
+path pays one lock per train instead of one per frame. `FastSess` drops 8 B to
+432 B, which the compile-time assert now pins exactly.
+
+`reaped_session_releases_its_flow_table_from_the_fast_slot` was deleted with
+the field: the leak it guarded (a reaped session's 22 KiB flow table pinned by
+a slot the sweeper cannot reach) is now impossible by construction rather than
+by discipline. Everything else in the table is either a `Weak` (the socket), an
+`AbortHandle` (no ownership) or a shared 8 B stamp.
+
+### 11.5 Verification
+
+`cargo test --bin myquic2-server` — 144 passed. The fast-table tests were rewritten for the new type:
+both sessions hit (`two_sessions_on_one_connection_both_hit_the_fast_table`), a full table evicts the quietest
+session (`a_full_table_evicts_the_quietest_session`), and sparse ids hit while a full table never grows
+(`sparse_session_ids_both_hit_and_a_full_table_never_grows`, which also pins that re-arming returns the same slot
+and leaves `len()` unchanged).

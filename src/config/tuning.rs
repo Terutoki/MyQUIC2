@@ -23,15 +23,15 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 /// small fixed maps next to them. A conservative single term keeps the
 /// admission bound from depending on binary-private types.
 ///
-/// The fast session table is now 128 slots (`FAST_SESS_SLOTS` in
-/// `myquic2-server/accept.rs`, up from 64 and originally 16): each `FastSess`
-/// carries an inline `ConnPin` (255-byte name + address + deadline, ~304 B), a
-/// weak socket handle, the abort handle and a weak flow-table handle (a `Weak`
-/// costs the same 8 B as the `Arc` it replaced) — ~420 B per slot, so the
-/// table is ~52.5 KiB. With the 16 KiB pre-HELLO buffer (~68.5 KiB), the
-/// per-slot pins and the surrounding maps, 96 KiB is still a round,
-/// conservative charge; the server's unit tests pin `FAST_SESS_SLOTS` against
-/// this constant's comment.
+/// The fast session table is 128 slots (`FAST_SESS_SLOTS` in
+/// `myquic2-server/accept.rs`, up from 64 and originally 16): each slot is a
+/// 432 B `FastSess` (an inline `ConnPin` — 255-byte name + address + deadline,
+/// ~304 B — plus the weak socket handle, the abort handle, and the
+/// liveness/epoch stamps) next to a 4 B tag and an 8 B stamp in the separate
+/// probe arrays, so the table is ~55.5 KiB. With the 16 KiB pre-HELLO
+/// buffer (~72.5 KiB), the per-slot pins and the surrounding maps, 96 KiB is
+/// still a round, conservative charge; `size_of::<FastSess>()` is pinned by a
+/// compile-time assert in `accept.rs` so the arithmetic cannot drift silently.
 pub const R2_INGRESS_FIXED_BYTES: u64 = 96 * 1024;
 
 /// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`
@@ -961,20 +961,20 @@ mod tests {
         );
     }
 
-    /// PERF-4: the rev2 ingress term grew for the 64-slot fast session table
-    /// (each slot carries an inline `ConnPin`); it must stay a round,
-    /// conservative 96 KiB rather than drifting back to the 32 KiB figure that
-    /// covered 16 slots.
+    /// PERF-4: the rev2 ingress term grew for the fast session table (each slot
+    /// carries an inline `ConnPin`); it must stay a round, conservative 96 KiB
+    /// rather than drifting back to the 32 KiB figure that covered 16 slots.
     #[test]
-    fn r2_ingress_term_covers_the_64_slot_fast_table() {
+    fn r2_ingress_term_covers_the_fast_table() {
         assert_eq!(R2_INGRESS_FIXED_BYTES, 96 * 1024);
-        // 64 slots x (inline ConnPin ~304 B + handles) ~= 22 KiB, plus the
-        // 16 KiB pre-HELLO buffer and the surrounding maps: 96 KiB is
-        // conservative with headroom for the per-slot fields.
-        let slots = 64u64;
-        let per_slot = std::mem::size_of::<std::net::SocketAddr>() as u64 + 255 + 8 + 8 + 8 + 16;
+        // 128 slots. The payload entry is 440 B today (an inline `ConnPin` is
+        // 304 B of it) and the probe arrays add a 4 B tag plus an 8 B stamp per
+        // slot, so charge the whole slot; the 16 KiB pre-HELLO buffer and the
+        // surrounding maps ride along inside the same term.
+        let slots = 128u64;
+        let per_slot = 452;
         assert!(
-            R2_INGRESS_FIXED_BYTES >= 16 * 1024 + slots * per_slot / 2,
+            R2_INGRESS_FIXED_BYTES >= 16 * 1024 + slots * per_slot,
             "term must cover the pre-HELLO buffer and the fast table"
         );
     }

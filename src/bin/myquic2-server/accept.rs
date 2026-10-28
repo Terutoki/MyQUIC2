@@ -288,24 +288,21 @@ pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
     staged.clear();
 }
 
-/// Per-connection fast-path slots, linearly probed on the session id.
+/// Per-connection fast-path slots.
 ///
 /// See the note at the declaration site in [`handle_conn`] for why this is a
 /// table and not the single `(session, dst)` pair it used to be; the sizing
 /// argument is there too. 128 covers the steady working set of a connection
 /// that fronts a client pooling its associations onto a handful of QUIC
 /// connections (the shipped client packs up to ~2000 live sessions per
-/// connection), is the probing table's power of two, and is charged to
-/// admission by `R2_INGRESS_FIXED_BYTES`.
+/// connection), and is charged to admission by `R2_INGRESS_FIXED_BYTES`.
 ///
-/// It is deliberately *not* sized to `LOCAL_SESS_MAX`: at ~420 B a slot that
+/// It is deliberately *not* sized to `LOCAL_SESS_MAX`: at ~440 B a slot that
 /// would be ~1.7 MiB per connection, so the table is the working set and a
-/// miss still resolves through the shard map. What it must avoid is the
-/// self-inflicted case where a full table evicts on *every* arm and turns the
-/// fast path back into a probed miss plus a slow path for each datagram.
+/// miss still resolves through the shard map. A full table evicts on every
+/// arm, which is affordable only because an arm now costs a scan of the tag
+/// and stamp arrays instead of the payload array — see [`FastTable`].
 pub(crate) const FAST_SESS_SLOTS: usize = 128;
-// `fast_slot` masks instead of taking a modulo, and every probe step is a mask.
-const _: () = assert!(FAST_SESS_SLOTS.is_power_of_two());
 
 /// One session's steady-state entry in a connection's fast table.
 ///
@@ -351,25 +348,6 @@ pub(crate) struct FastSess {
     /// `fast_allow_cached`): steady single-target flows skip the re-derivation
     /// after the first datagram. Validated by the same epoch mechanism.
     allow: Option<(u32, SocketAddr, bool)>,
-    /// The session's MQP-3 flow table handle. Cached here so a steady v3 frame
-    /// resolves a compressed flow id without taking the session-table shard
-    /// lock; the snapshot itself is clone-on-write, so the handle stays valid
-    /// across flow opens.
-    ///
-    /// **Weak**, for the same reason as [`FastSess::sock`]: a strong handle
-    /// makes this slot a second owner of the session's flow table, and it
-    /// outlives the session. Reaping a session (the 180 s sweeper, an explicit
-    /// close, a reader exit) drops the `SessEntry`'s handle but cannot reach
-    /// into this table — `fast` is a local array of the connection's datagram
-    /// task, and the slot is only rewritten when *another* datagram happens to
-    /// evict it (ids are monotonic, so a dead session's id never arrives
-    /// again). A strong handle therefore pinned up to `MQP3_FLOW_TABLE_MAX_BYTES`
-    /// (22 KiB) per slot, up to `FAST_SESS_SLOTS` slots per connection, for the
-    /// life of the connection, outside the session budget the sweeper enforces.
-    /// Upgrading costs one refcount round-trip on the v3 frame that needs a flow
-    /// id, and a failed upgrade is exactly the "session is gone" signal the caller
-    /// already handles by falling through to [`session_flows`].
-    flows: std::sync::Weak<arc_swap::ArcSwap<FlowTable>>,
 }
 
 impl FastSess {
@@ -384,105 +362,141 @@ impl FastSess {
     }
 }
 
-/// Home probe position for `s` — the first slot its entry may occupy.
+// The per-connection admission charge for the table is derived from this size
+// (see `R2_INGRESS_FIXED_BYTES` in `config::tuning`): a field that grows an
+// entry by a few bytes grows every connection's reservation by kilobytes, so
+// this is pinned at the measured size rather than rounded up to a comfortable
+// ceiling.
+const _: () = assert!(std::mem::size_of::<FastSess>() <= 432);
+
+/// The connection's fast-path table: session id to steady-state entry.
 ///
-/// The table is a small linearly probed map whose hash is the session id's low
-/// bits. Session ids are allocated from a **monotonic, never-reused** client
-/// counter (`hub.rs::alloc_sess`), so on a long-lived connection the live ids
-/// are a *sparse* subset of the 32-bit space, not a dense `1..=N` interval: two
-/// live sessions land on the same home slot at random (with A live ids the
-/// chance all homes are distinct is `∏(N-i)/N`; at N=64 it stays above 60 %
-/// through A=8 (16 slots were already down to ~12 % there), which is why the
-/// table was widened.
-/// Probing past the home slot is what keeps every such collision from parking
-/// both sessions on the slow path forever — see [`fast_probe`].
-pub(crate) fn fast_slot(s: u32) -> usize {
-    (s as usize) & (FAST_SESS_SLOTS - 1)
+/// Three parallel arrays rather than one array of payload structs. Finding a
+/// session and choosing a victim only ever needed the ids and the liveness
+/// stamps; with the payloads inline, a scan had to touch up to 128 scattered
+/// ~440-byte structs (`ConnPin` alone carries a 255-byte name), which is ~384
+/// cache lines — measured at ~1.3 µs per arm in exactly the shape the shipped
+/// client produces (1000+ live sessions per connection against 128 slots, so
+/// ~88 % of datagrams take the slow path and arm). Split out, the same scan
+/// reads 512 B of tags and 1 KiB of stamps and dereferences nothing.
+pub(crate) struct FastTable {
+    /// Session id per slot, or [`EMPTY_TAG`] while the slot is free.
+    ///
+    /// One 512-byte array — the entire probe is eight cache lines. Session ids
+    /// come from a monotonic, never-reused counter (`hub.rs::alloc_sess`) and
+    /// `get_or_create_sess` refuses id 0, so 0 is a free sentinel.
+    tags: [u32; FAST_SESS_SLOTS],
+    /// Liveness stamp per slot: the session's `last` when it was armed,
+    /// advanced on a hit. The eviction order once the table is full. A reaped
+    /// session stops advancing, so its entry ages out on its own instead of
+    /// needing a liveness probe of its own.
+    ages: [u64; FAST_SESS_SLOTS],
+    /// The entries. Only ever reached through `tags`, by index.
+    slots: [Option<FastSess>; FAST_SESS_SLOTS],
 }
 
-/// The slot describing `s`, found by linear probing from its home position.
-///
-/// Probing stops at the first empty slot: [`arm_fast`] installs an entry at the
-/// first empty position from the session's home — or recycles a dead entry seen
-/// before that hole ([`fast_arm_index`]) — so an entry is reachable while the
-/// chain from home up to it has no hole. A hole (left by an eviction or a
-/// stale-slot clear) can therefore only turn a hit into a **miss** — which is
-/// safe, because a miss means "run the slow path", which re-arms the slot —
-/// and can never mis-route a datagram onto another session's socket.
-pub(crate) fn fast_probe(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> Option<usize> {
-    let home = fast_slot(s);
-    for step in 0..FAST_SESS_SLOTS {
-        let idx = (home + step) & (FAST_SESS_SLOTS - 1);
-        match &fast[idx] {
-            None => return None,
-            Some(slot) if slot.sess == s => return Some(idx),
-            Some(_) => {}
+/// The tag of a free slot. Session 0 is never allocated.
+const EMPTY_TAG: u32 = 0;
+
+impl FastTable {
+    pub(crate) const fn new() -> Self {
+        Self {
+            tags: [EMPTY_TAG; FAST_SESS_SLOTS],
+            ages: [0; FAST_SESS_SLOTS],
+            slots: [const { None }; FAST_SESS_SLOTS],
         }
     }
-    None
-}
 
-/// Whether a slot's session is provably gone: its reader exited, or nothing
-/// owns its socket any more.
-///
-/// Two atomic loads and no refcount RMW (`strong_count` is a plain load, unlike
-/// `upgrade`), so this is cheap enough to run over the whole probe chain in
-/// [`fast_arm_index`]. [`try_stage`] still treats a failed `upgrade` as a miss
-/// rather than trusting this: liveness can change between the two.
-#[inline]
-fn slot_is_dead(slot: &FastSess) -> bool {
-    slot.abort.is_finished() || slot.sock.strong_count() == 0
-}
+    /// The slot describing `s`, or `None`.
+    ///
+    /// A full scan of the tag array with **no chains**. The previous
+    /// linear-probing version stopped at the first hole, which made an entry
+    /// unreachable after an eviction — a miss, so safe — but also *unevictable*:
+    /// its stamp is shared with the live session and keeps advancing, so it
+    /// never looked like the quietest entry; and an arm that landed in a hole
+    /// could install a second entry for a session that already had one.
+    /// Scanning 128 tags is a handful of nanoseconds and removes both.
+    #[inline]
+    pub(crate) fn probe(&self, s: u32) -> Option<usize> {
+        if s == EMPTY_TAG {
+            return None;
+        }
+        self.tags.iter().position(|&tag| tag == s)
+    }
 
-/// Where [`fast_arm`] publishes a session: its existing slot, else the first
-/// **dead** slot from home (recycling a slot whose session is gone), else the
-/// first empty slot, else the least-recently-active slot when all
-/// [`FAST_SESS_SLOTS`] are taken.
-///
-/// Recycling matters because dead entries are invisible to the probe: session
-/// ids are monotonic and never reused, so no later datagram can evict a dead
-/// session's slot, and [`fast_arm_index`] would keep consuming empty slots
-/// (or evicting live ones) while dead entries lengthen every probe chain for
-/// the rest of the connection's life. Installing into the dead position keeps
-/// the linear-probing invariant: no empty slot lies between `home` and it (we
-/// return at the first empty, and a dead slot is not a hole).
-///
-/// The eviction order is the session's own liveness stamp (`last`, refreshed at
-/// most once a second per session), so a table that is genuinely over
-/// `FAST_SESS_SLOTS` live sessions keeps the recently active ones and lets the
-/// quiet ones fall back to the slow path — the same disposition the old
-/// direct-mapped table gave a colliding pair, but only once the table is full,
-/// not on a random low-bit collision below it.
-pub(crate) fn fast_arm_index(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> usize {
-    let home = fast_slot(s);
-    let mut dead: Option<usize> = None;
-    let mut oldest: Option<(u64, usize)> = None;
-    for step in 0..FAST_SESS_SLOTS {
-        let idx = (home + step) & (FAST_SESS_SLOTS - 1);
-        match &fast[idx] {
-            // The first hole ends the chain: a dead slot seen before it is
-            // still reachable from `home`, so recycle that instead of growing
-            // the chain into the hole.
-            None => return dead.unwrap_or(idx),
-            Some(slot) if slot.sess == s => return idx,
-            Some(slot) => {
-                if dead.is_none() && slot_is_dead(slot) {
-                    dead = Some(idx);
-                }
-                let last = slot.last.load(std::sync::atomic::Ordering::Relaxed);
-                if oldest.is_none_or(|(oldest_last, _)| last < oldest_last) {
-                    oldest = Some((last, idx));
-                }
+    /// Where to publish `s`: its own slot, else the first free slot, else the
+    /// quietest one.
+    ///
+    /// The table is a working set, not a router, so once it overflows the least
+    /// recently active session loses its slot and simply takes the slow path
+    /// on its next datagram.
+    pub(crate) fn arm_index(&self, s: u32) -> usize {
+        if let Some(idx) = self.probe(s) {
+            return idx;
+        }
+        if let Some(idx) = self.tags.iter().position(|&tag| tag == EMPTY_TAG) {
+            return idx;
+        }
+        let mut victim = 0;
+        let mut oldest = self.ages[0];
+        for (idx, &age) in self.ages.iter().enumerate().skip(1) {
+            if age < oldest {
+                oldest = age;
+                victim = idx;
             }
         }
+        victim
     }
-    // Every slot is taken and none is this session: recycle a dead one if the
-    // scan saw one, else evict the quietest.
-    dead.or(oldest.map(|(_, idx)| idx)).unwrap_or(home)
-}
 
-/// Empty slot value for `[Option<FastSess>; _]` initialization.
-pub(crate) const NO_FAST_SESS: Option<FastSess> = None;
+    #[inline]
+    pub(crate) fn get_mut(&mut self, idx: usize) -> Option<&mut FastSess> {
+        self.slots[idx].as_mut()
+    }
+
+    /// Publish `entry` at `idx`, stamped with the session's current liveness
+    /// value, dropping whatever used to be there.
+    ///
+    /// Dropping the previous entry is load-bearing: it is what releases a
+    /// reaped session's flow-table handle (see [`FastSess::flows`]).
+    pub(crate) fn insert(&mut self, idx: usize, entry: FastSess) {
+        self.ages[idx] = entry.last.load(std::sync::atomic::Ordering::Relaxed);
+        self.tags[idx] = entry.sess;
+        self.slots[idx] = Some(entry);
+    }
+
+    /// Drop `s`'s entry. Returns whether there was one.
+    pub(crate) fn clear(&mut self, s: u32) -> bool {
+        match self.probe(s) {
+            Some(idx) => {
+                self.tags[idx] = EMPTY_TAG;
+                self.ages[idx] = 0;
+                self.slots[idx] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Number of occupied slots. The datagram loop never needs it; the table's
+    /// own tests use it to pin "a re-arm updates in place, and a full table
+    /// evicts instead of growing".
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.tags.iter().filter(|&&tag| tag != EMPTY_TAG).count()
+    }
+
+    /// Advance `idx`'s liveness stamp to `stamp` when it moved.
+    ///
+    /// The stamp advances about once a second (see `touch_session_throttled`),
+    /// so this store — and the dirty cache line it costs — happens on roughly
+    /// one datagram in a thousand.
+    #[inline]
+    pub(crate) fn touch(&mut self, idx: usize, stamp: u64) {
+        if stamp > self.ages[idx] {
+            self.ages[idx] = stamp;
+        }
+    }
+}
 
 /// Resolve one datagram's target: the session's own pin first (free), then the
 /// session's destination memo, then the DNS cache.
@@ -493,7 +507,7 @@ pub(crate) const NO_FAST_SESS: Option<FastSess> = None;
 /// memo/DNS answer is still used for this datagram; the slow path then installs
 /// the slot (and its own pin) for the session that asked.
 pub(crate) fn resolve_fast(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     s: u32,
     a: TargetAddrRef<'_>,
@@ -503,15 +517,11 @@ pub(crate) fn resolve_fast(
         TargetAddrRef::Ip(dst) => return Some(dst),
         TargetAddrRef::Domain(h, p) => (h, p),
     };
-    // Scratch is only reached when this session has no reachable slot; nothing
+    // Scratch is only reached when this session has no slot of its own; nothing
     // is ever armed into it.
     let mut scratch: Option<ConnPin> = None;
-    let pin = match fast_probe(fast, s) {
-        Some(idx) => match fast[idx].as_mut() {
-            Some(slot) => &mut slot.pin,
-            // Unreachable: `fast_probe` only returns populated slots.
-            None => &mut scratch,
-        },
+    let pin = match fast.probe(s).and_then(|idx| fast.get_mut(idx)) {
+        Some(slot) => &mut slot.pin,
         None => &mut scratch,
     };
     // `pinned_sess` is `s` in both arms: `resolve_pin` only trusts a pin whose
@@ -528,7 +538,7 @@ pub(crate) fn resolve_fast(
 /// way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_stage(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     conn_id: usize,
     s: u32,
@@ -537,12 +547,12 @@ pub(crate) fn try_stage(
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
 ) -> Result<(), Bytes> {
-    let Some(idx) = fast_probe(fast, s) else {
+    let Some(idx) = fast.probe(s) else {
         return Err(payload);
     };
-    // `fast_probe` only returns populated slots; keep the fallback a miss rather
+    // `probe` only returns populated slots; keep the fallback a miss rather
     // than a panic (release builds are panic=abort).
-    let Some(slot) = fast[idx].as_mut() else {
+    let Some(slot) = fast.get_mut(idx) else {
         return Err(payload);
     };
     if !slot.is_live_for(s) || !fast_allow_cached(&mut slot.allow, allow_private, s, dst) {
@@ -566,25 +576,39 @@ pub(crate) fn try_stage(
     // including one made by a spawned resolver task this reader cannot see — so
     // a stale mirror can never suppress a record it should have made.
     mirror_record(ss, &mut slot.last_dst, s, dst, Some(&slot.epoch));
+    // The slot was just used, so it must not look like the quietest entry:
+    // refresh its eviction stamp. `touch` writes only when the stamp moved (it
+    // is shared with the session table and advances about once a second).
+    let stamp = slot.last.load(std::sync::atomic::Ordering::Relaxed);
     staged.push(StagedSend {
         sock,
         dst: map_for_dual(dst),
         payload,
     });
+    fast.touch(idx, stamp);
     Ok(())
 }
 
 /// Publish `(session, dst)` into this connection's fast table after the slow
 /// path created or found the session, so the next datagram for it is a hit.
 ///
-/// The slot is chosen by [`fast_arm_index`] (existing slot, else a dead slot,
-/// else first empty from the session's home, else the quietest), so probing
-/// lookups always find it. A `Stale`/`Miss` memo probe clears the session's
-/// slot instead: the session is gone or invisible, and leaving the old entry in
-/// place would keep sending into it.
+/// The slot is chosen by [`FastTable::arm_index`] (the session's own slot, else
+/// the first free one, else the quietest), so a probe always finds it. A
+/// `Stale`/`Miss` memo probe clears the session's slot instead: the session is
+/// gone or invisible, and leaving the old entry in place would keep sending
+/// into it.
+///
+/// Re-arming a session that already holds its slot only refreshes the pin and
+/// the liveness stamp: this runs on the *slow* path of every datagram while the
+/// table is too small for the live set, and rewriting the 432-byte entry (an
+/// `Arc::downgrade` refcount round-trip plus the name copy) bought nothing
+/// there — the socket, abort and epoch are the same values by construction.
+///
+/// Deliberately lock-free: it reads only the connection's thread-local session
+/// memo, so a miss costs the slow path no session-table acquisition of its own
+/// (the two it already takes are in `get_or_create_sess` and `remember_dst`).
 pub(crate) fn arm_fast(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
-    ss: &SessTable,
+    fast: &mut FastTable,
     conn_id: usize,
     s: u32,
     a: TargetAddrRef<'_>,
@@ -593,50 +617,43 @@ pub(crate) fn arm_fast(
 ) {
     match sess_memo_lookup(conn_id, s) {
         SessHit::Fresh(sock, last, abort, epoch) => {
-            let Some(flows) = session_flows(ss, s) else {
-                if let Some(idx) = fast_probe(fast, s) {
-                    fast[idx] = None;
-                }
-                return;
-            };
-            let mut pin = None;
             let (ph, pp) = target_name(a);
-            pin_arm(&mut pin, s, ph, pp, dst, life);
-            let idx = fast_arm_index(fast, s);
-            fast[idx] = Some(FastSess {
-                sess: s,
-                sock: Arc::downgrade(&sock),
-                last,
-                abort,
-                epoch,
-                pin,
-                last_dst: None,
-                allow: None,
-                flows: Arc::downgrade(&flows),
-            });
+            let idx = fast.arm_index(s);
+            // Already armed and still live: the pin is the only field that can
+            // have changed (a new DNS generation), so update it in place. A
+            // finished abort falls through: that entry describes a session this
+            // arm just replaced, and its handles must be rewritten.
+            let stamp = match fast.get_mut(idx) {
+                Some(slot) if slot.sess == s && !slot.abort.is_finished() => {
+                    pin_arm(&mut slot.pin, s, ph, pp, dst, life);
+                    slot.last.load(std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => {
+                    let mut pin = None;
+                    pin_arm(&mut pin, s, ph, pp, dst, life);
+                    fast.insert(
+                        idx,
+                        FastSess {
+                            sess: s,
+                            sock: Arc::downgrade(&sock),
+                            last,
+                            abort,
+                            epoch,
+                            pin,
+                            last_dst: None,
+                            allow: None,
+                        },
+                    );
+                    // `insert` stamped the slot from the entry's own `last`.
+                    return;
+                }
+            };
+            fast.touch(idx, stamp);
         }
         SessHit::Stale | SessHit::Miss => {
-            if let Some(idx) = fast_probe(fast, s) {
-                fast[idx] = None;
-            }
+            fast.clear(s);
         }
     }
-}
-
-/// The session's flow table from its fast slot, without taking the session-table
-/// lock. A stale/dead slot — including one whose session was reaped and whose
-/// table therefore no longer upgrades — falls through to the caller's
-/// [`session_flows`] probe, which answers `None` for a truly dead session.
-fn fast_flows(
-    fast: &[Option<FastSess>; FAST_SESS_SLOTS],
-    s: u32,
-) -> Option<Arc<arc_swap::ArcSwap<FlowTable>>> {
-    let idx = fast_probe(fast, s)?;
-    let slot = fast[idx].as_ref()?;
-    if !slot.is_live_for(s) {
-        return None;
-    }
-    slot.flows.upgrade()
 }
 
 /// Owned form used to unify an inline address borrowed from the DATAGRAM with a
@@ -660,7 +677,7 @@ impl V3Addr<'_> {
 /// installing a new flow mapping.
 #[allow(clippy::too_many_arguments)]
 async fn forward_v3_item(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -686,7 +703,7 @@ async fn forward_v3_item(
     flush_staged_sends(staged);
     let used = forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private, r2).await;
     if let Some((dst, life)) = used {
-        arm_fast(fast, ss, conn_id, sess, a, dst, life);
+        arm_fast(fast, conn_id, sess, a, dst, life);
         true
     } else {
         false
@@ -702,7 +719,7 @@ async fn forward_v3_item(
 /// compressed item with no mapping is dropped and counted, never guessed.
 #[allow(clippy::too_many_arguments)]
 async fn handle_v3_ingress(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -715,7 +732,12 @@ async fn handle_v3_ingress(
         dgram_drops::bump(&dgram_drops::REFUSED);
         return;
     };
-    let mut flows = fast_flows(fast, sess).or_else(|| session_flows(ss, sess));
+    // One shard read lock per v3 train, not per datagram: a train carries up to
+    // `MQP3_MAX_TRAIN_ITEMS` items, and the disarm below keeps the handle for
+    // all of them. Caching this `Arc` in the fast slot was measured against
+    // paying the probe here and lost: it cost every *rev2* miss a shard read
+    // lock to fill a field only a rev3 connection ever reads.
+    let mut flows = session_flows(ss, sess);
     let mut table = flows.as_ref().map(|f| f.load_full());
     let kind = d[0] & MQP3_KIND_MASK;
     match kind {
@@ -2579,7 +2601,7 @@ pub(crate) fn handle_control_message(
 /// registry lock for the whole frame.
 #[allow(clippy::too_many_arguments)]
 async fn r2_forward_flow_item(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -2618,7 +2640,7 @@ async fn r2_forward_flow_item(
 /// binding that was already `Closed`).
 #[allow(clippy::too_many_arguments)]
 async fn r2_forward_flow_resolved(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -2667,7 +2689,7 @@ async fn r2_forward_flow_resolved(
             )
             .await;
             if let Some((used_dst, life)) = used {
-                arm_fast(fast, ss, conn_id, sess, aref, used_dst, life);
+                arm_fast(fast, conn_id, sess, aref, used_dst, life);
             }
             used.is_some()
         }
@@ -2881,7 +2903,7 @@ async fn r2_forward_domain_open_bg(
 /// task.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn r2_ingress_open(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -2940,7 +2962,7 @@ pub(crate) async fn r2_ingress_open(
             .await;
             match used {
                 Some((used_dst, life)) => {
-                    arm_fast(fast, ss, conn_id, sess, r2::ip_ref(dst), used_dst, life);
+                    arm_fast(fast, conn_id, sess, r2::ip_ref(dst), used_dst, life);
                     Some(Vec::new())
                 }
                 None => {
@@ -3018,7 +3040,7 @@ pub(crate) async fn r2_ingress_open(
                 // this session's later steady frames hit the fast path. (The
                 // spawned slow path deliberately leaves arming to the datagram
                 // loop; here we *are* the datagram loop.)
-                arm_fast(fast, ss, conn_id, sess, target.as_ref(), dst, life);
+                arm_fast(fast, conn_id, sess, target.as_ref(), dst, life);
                 r2_stats::bump(&r2_stats::DNS_SYNC_OPENS);
                 // The one address the synchronous probe knows (the memo's first
                 // record) is the flow's validated reply-source set here: it is
@@ -3126,7 +3148,7 @@ pub(crate) async fn r2_ingress_open(
 /// Route one decoded `DATA` frame (steady / open / inline) for `wire`.
 #[allow(clippy::too_many_arguments)]
 async fn r2_ingress_data(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -3215,7 +3237,7 @@ async fn r2_ingress_data(
 /// the frame continues.
 #[allow(clippy::too_many_arguments)]
 async fn r2_ingress_train(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -3310,7 +3332,7 @@ async fn r2_ingress_train(
 /// connection fault and never a guess.
 #[allow(clippy::too_many_arguments)]
 async fn r2_ingress_frag(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -3433,7 +3455,7 @@ async fn r2_ingress_frag(
 /// the stream accept path.
 #[allow(clippy::too_many_arguments)]
 async fn handle_ingress_frame(
-    fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
+    fast: &mut FastTable,
     ss: &SessTable,
     cd: &quinn::Connection,
     conn_id: usize,
@@ -3891,19 +3913,18 @@ async fn handle_conn_inner(
         // syscall amplification of one `sendto` per datagram against one
         // `sendmmsg` per 32.
         //
-        // Sizing: 128 slots (~420 B each, on this task's heap future — the pin
-        // buffer dominates). The multi-association shape this comment documents
-        // ("hundreds of sessions") is beyond one heap array, but 64 covered only
-        // the DNS + game + handful-of-flows case, and the shipped client packs
-        // up to ~2000 live sessions onto one connection, i.e. once a table is
-        // full *every* arm evicts and the "fast" path degrades to a full probe
-        // plus a slow path per datagram. 128 doubles the working set for
-        // ~52.5 KiB per connection and admission still charges it through
-        // `R2_INGRESS_FIXED_BYTES`; the delivered figure is
-        // `FAST_SESS_SLOTS * 420 B ~= 52.5 KiB` per connection. The remaining
-        // gap to `LOCAL_SESS_MAX` is structural: covering it with slots would
-        // cost ~1.7 MiB per connection, so a miss must stay cheap (batched
-        // target sends) rather than be made impossible by table size.
+        // Sizing: 128 slots (a 440 B payload entry, pinned by the
+        // `size_of::<FastSess>()` assert above, next to a 4 B tag and an 8 B
+        // stamp in the probe arrays). The multi-association shape this comment
+        // documents ("hundreds of sessions") is beyond one heap array, but 64
+        // covered only the DNS + game + handful-of-flows case, and the shipped
+        // client packs up to ~2000 live sessions onto one connection, i.e. once
+        // a table is full *every* arm evicts. 128 doubles the working set for
+        // ~56.5 KiB per connection and admission still charges it through
+        // `R2_INGRESS_FIXED_BYTES`. The remaining gap to `LOCAL_SESS_MAX` is
+        // structural: covering it with slots would cost ~1.8 MiB per
+        // connection, so a miss must stay cheap (an arm now scans only the tag
+        // and stamp arrays) rather than be made impossible by table size.
         //
         // **Probed, not direct-mapped.** Session ids come from the client's
         // monotonic counter and are never reused, so the live ids on a
@@ -3929,7 +3950,7 @@ async fn handle_conn_inner(
         // connections would be ~105 MiB at this size — the reason the admission
         // charge was raised alongside the slot count, see
         // `R2_INGRESS_FIXED_BYTES` in `config::tuning`).
-        let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+        let mut fast = FastTable::new();
         // Target sends staged for the current drain burst, flushed grouped per
         // `(sock, dst)` run by `flush_staged_sends` (one `sendmmsg` per 32 on
         // Linux, one `try_send_to` per frame elsewhere). Bounded by
@@ -4123,7 +4144,7 @@ async fn handle_conn_inner(
                     )
                     .await;
                     if let Some((dst, life)) = used {
-                        arm_fast(&mut fast, &ss, conn_id, s, a.as_ref(), dst, life);
+                        arm_fast(&mut fast, conn_id, s, a.as_ref(), dst, life);
                     }
                 } else {
                     if is_batch(&d) {
@@ -4169,9 +4190,7 @@ async fn handle_conn_inner(
                                         // *next* frame for this session hits the
                                         // fast table (see the table comment).
                                         if let Some((dst2, life)) = used {
-                                            arm_fast(
-                                                &mut fast, &ss, conn_id, s, b.addr, dst2, life,
-                                            );
+                                            arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
                                             #[cfg(test)]
                                             BATCH_FAST_ARMS
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4205,7 +4224,7 @@ async fn handle_conn_inner(
                                     // kept every payload of every BATCH frame on
                                     // the slow path.
                                     if let Some((dst2, life)) = used {
-                                        arm_fast(&mut fast, &ss, conn_id, s, b.addr, dst2, life);
+                                        arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
                                         #[cfg(test)]
                                         BATCH_FAST_ARMS
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4260,7 +4279,7 @@ async fn handle_conn_inner(
                     )
                     .await;
                     if let Some((dst, life)) = used {
-                        arm_fast(&mut fast, &ss, conn_id, s, a, dst, life);
+                        arm_fast(&mut fast, conn_id, s, a, dst, life);
                     }
                 }
             }
