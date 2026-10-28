@@ -398,6 +398,10 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # A re-tagged release (same tag, newer commit) republishes the same
+          # asset names; without this the upload step fails with
+          # `already_exists` and leaves the previous build's binaries in place.
+          overwrite_files: true
           files: |
             release-assets/*.tar.gz
             release-assets/SHA256SUMS
