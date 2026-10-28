@@ -570,6 +570,7 @@ and at target under a resumed connection, with and without early data).
 | `analysis/rev3/rtt-server.md` | server RTT/latency audit: step table, S1–S20, L1–L13, byte arithmetic, measurement cells |
 | `analysis/rev3/parse-cost.md` | exact wire layouts, id-width math, op-count tables, P1–P16, C1–C15 vs W1–W7, clean-slate proposal |
 | `analysis/rev3/design-options.md` | lower bounds, candidates A/B/C, 14-lever verdicts, target wire layout, invariants, phase plan, 12 decisions |
+| `analysis/rev3/framing-rev2-vs-rev3.md` | shared stager evidence, exact rev2/rev3 frame sizes, single-flow capacity after the admission fix, multi-flow `DICT` edge |
 | `analysis/rev3/wire_model.py` | reproducible byte/interaction model for current vs rev3 (tables in §4.3) |
 | `examples/rev3_bench.rs` | new micro-benchmark (decode/encode/TRAIN/registry/session tables + wire tables); run with `cargo run --release --example rev3_bench` |
 

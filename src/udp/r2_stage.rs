@@ -51,6 +51,7 @@ use quinn::Connection;
 use crate::dgram_drops;
 use crate::mqp::addr::TargetAddr;
 use crate::mqp::r2;
+use crate::mqp::r3;
 use crate::mqp::wire::{self, Wire};
 use crate::udp::send::{DatagramSend, try_send_datagram};
 use crate::udp_stats;
@@ -500,9 +501,11 @@ impl R2Stager {
 
     /// Pack exactly one DATAGRAM (returns `false` when the queue is empty).
     ///
-    /// A run of confirmed flows from any sessions becomes one `TRAIN dict`; a
-    /// single confirmed item becomes a 2 B steady `DATA`; `Open`/`Inline`
-    /// items become standalone self-describing frames.
+    /// A run of confirmed flows from any sessions becomes one `TRAIN` in the
+    /// smallest form the wire supports (`SAME_EQUAL`/`SAME` for a rev3
+    /// single-flow run, `DICT` otherwise); a single confirmed item becomes a
+    /// steady `DATA`; `Open`/`Inline` items become standalone self-describing
+    /// frames.
     fn pack_one_frame(&mut self, limit: usize, q: &mut PackedFrames) -> bool {
         let Some(session) = self.next_session() else {
             return false;
@@ -541,15 +544,9 @@ impl R2Stager {
         let mut flow_idx = std::mem::take(&mut self.flow_idx_scratch);
         run.clear();
         unique.clear();
-        // Frame-header bytes before any item: rev2 has one byte each for
-        // kind/form/count/nfl, rev3 folds the form into b0 (b0 + nfl + count).
-        let mut cost = match self.wire {
-            Wire::Rev2 => 4usize,
-            Wire::Rev3 => 3usize,
-        };
-        let mut took_any = self.take_steady_head(session, limit, &mut run, &mut unique, &mut cost);
+        let mut took_any = self.take_steady_head(session, limit, &mut run, &mut unique);
         while took_any && let Some(next) = self.next_steady_session() {
-            took_any = self.take_steady_head(next, limit, &mut run, &mut unique, &mut cost);
+            took_any = self.take_steady_head(next, limit, &mut run, &mut unique);
         }
         let run_len = run.len();
         if run_len == 0 {
@@ -610,7 +607,8 @@ impl R2Stager {
         encode_standalone_item_for(self.wire, item, limit)
     }
 
-    /// Pop heads round-robin while they are `Steady` and fit `limit`.
+    /// Pop heads round-robin while they are `Steady` and the exact frame the
+    /// encoder would emit for the run plus the head fits `limit`.
     ///
     /// `first` is the session already selected by [`Self::pack_one_frame`], so
     /// the run starts with that session's head and only then rotates.
@@ -621,7 +619,6 @@ impl R2Stager {
         limit: usize,
         run: &mut Vec<R2StageItem>,
         unique: &mut Vec<u32>,
-        cost: &mut usize,
     ) -> bool {
         let Some(front) = self.sessions.get(&session).and_then(|q| q.front()) else {
             return false;
@@ -632,28 +629,17 @@ impl R2Stager {
         if run.len() >= self.max_train_items {
             return false;
         }
-        let payload_len = front.payload.len();
-        // Per-item and per-new-flow wire cost, revision-specific. The rev3
-        // figure is the DICT **upper bound** (idx byte + length field + the
-        // 2-byte fid on first use); the encoder may pick the smaller SAME /
-        // SAME_EQUAL form for a single-flow run, never a larger one, so the
-        // packing decision stays conservative.
-        let (item_cost, flow_cost) = match self.wire {
-            Wire::Rev2 => (
-                1 + r2::varint_len(payload_len as u32) + payload_len,
-                r2::varint_len(wire_id),
-            ),
-            Wire::Rev3 => (1 + r3_item_len_len(payload_len) + payload_len, 2),
-        };
-        let mut add = item_cost;
         let new_flow = !unique.contains(&wire_id);
-        if new_flow {
-            if unique.len() >= u8::MAX as usize {
-                return false;
-            }
-            add += flow_cost;
+        if new_flow && unique.len() >= u8::MAX as usize {
+            return false;
         }
-        if cost.saturating_add(add) > limit {
+        // Cost the exact frame the encoder will emit, not a conservative
+        // per-item bound: a rev3 single-flow run of equal lengths becomes a
+        // `SAME_EQUAL` train with no per-item index or length bytes, so the
+        // old DICT upper bound stopped such runs one to seven items early.
+        // Run lengths are at most `max_train_items` (64), so re-costing the
+        // whole frame per candidate is a handful of additions.
+        if Self::packed_steady_len(self.wire, run, front, unique, new_flow) > limit {
             return false;
         }
         let item = self.pop_one(session).expect("peeked item exists");
@@ -669,16 +655,79 @@ impl R2Stager {
         if new_flow {
             unique.push(wire_id);
         }
-        *cost += add;
         run.push(item);
         true
+    }
+
+    /// Exact wire length of the frame [`Self::encode_train_run`] emits for
+    /// `run` plus `candidate`.
+    ///
+    /// Mirrors the encoder's form choice: one item is a steady `DATA`; a rev3
+    /// single-flow run uses `SAME_EQUAL` when every payload has the same
+    /// length and `SAME` otherwise; every other run (rev2 always) uses
+    /// `DICT`. `flows` is the run's deduped flow list *before* `candidate`;
+    /// `new_flow` says whether the candidate adds one.
+    fn packed_steady_len(
+        wire: Wire,
+        run: &[R2StageItem],
+        candidate: &R2StageItem,
+        flows: &[u32],
+        new_flow: bool,
+    ) -> usize {
+        let R2StageKind::Steady { wire_id } = candidate.kind else {
+            unreachable!("only steady items join a train run");
+        };
+        let cand_len = candidate.payload.len();
+        if run.is_empty() {
+            return match wire {
+                Wire::Rev2 => 1 + r2::varint_len(wire_id) + cand_len,
+                Wire::Rev3 => r3::data_steady_len(cand_len),
+            };
+        }
+        let nfl = flows.len() + usize::from(new_flow);
+        if wire == Wire::Rev3 && nfl == 1 {
+            let item_len = run[0].payload.len();
+            if cand_len == item_len && run.iter().all(|i| i.payload.len() == item_len) {
+                return 4 + r3_item_len_len(item_len) + (run.len() + 1) * item_len;
+            }
+            let mut total = 4 + r3_item_len_len(cand_len) + cand_len;
+            for item in run {
+                total += r3_item_len_len(item.payload.len()) + item.payload.len();
+            }
+            return total;
+        }
+        let mut total = match wire {
+            Wire::Rev2 => 4, // kind + form + count + nfl
+            Wire::Rev3 => 3, // b0 (form inside) + nfl + count
+        };
+        for flow in flows {
+            total += match wire {
+                Wire::Rev2 => r2::varint_len(*flow),
+                Wire::Rev3 => 2,
+            };
+        }
+        if new_flow {
+            total += match wire {
+                Wire::Rev2 => r2::varint_len(wire_id),
+                Wire::Rev3 => 2,
+            };
+        }
+        for item in run.iter().chain(std::iter::once(candidate)) {
+            let len = item.payload.len();
+            total += 1 + len;
+            total += match wire {
+                Wire::Rev2 => r2::varint_len(len as u32),
+                Wire::Rev3 => r3_item_len_len(len),
+            };
+        }
+        total
     }
 
     /// Build the dict-form `TRAIN` for a multi-item steady run.
     ///
     /// `flows` is the run's deduped flow list in first-appearance order — the
-    /// same list [`Self::take_steady_head`] already maintains for its cost
-    /// bound, so no second scan of `run` rebuilds it. The item views are built
+    /// same list [`Self::take_steady_head`] already maintains for admission, so
+    /// no second scan of `run` rebuilds it. The item views are built
     /// into a fixed stack array (at most [`r2::R2_MAX_TRAIN_ITEMS`] entries, a
     /// few KiB) instead of a fresh per-frame `Vec`: their payload borrows are
     /// local to this call and cannot live in a stager field. Flow indices come
@@ -709,9 +758,10 @@ impl R2Stager {
         }
         // rev3 single-flow run: the SAME forms (equal-length first) are wire-
         // smaller than a one-entry DICT, so they are preferred; both are still
-        // valid `TRAIN` frames for the receiver and the packing cost above
-        // already bounded the larger DICT size. rev2 has no such form and keeps
-        // the shipped DICT encoding byte-for-byte.
+        // valid `TRAIN` frames for the receiver. `packed_steady_len` costs the
+        // form chosen here exactly, so a run admitted above always fits the
+        // live budget. rev2 has no such form and keeps the shipped DICT
+        // encoding byte-for-byte.
         if self.wire == Wire::Rev3 && flows.len() == 1 {
             let R2StageKind::Steady { wire_id } = run[0].kind else {
                 unreachable!("a steady run only holds steady items");
@@ -1128,6 +1178,14 @@ mod tests {
             session,
             kind: R2StageKind::Steady { wire_id: id(local) },
             payload: Bytes::from_static(payload),
+        }
+    }
+
+    fn steady_owned(session: u32, local: u32, payload: Vec<u8>) -> R2StageItem {
+        R2StageItem {
+            session,
+            kind: R2StageKind::Steady { wire_id: id(local) },
+            payload: Bytes::from(payload),
         }
     }
 
@@ -1781,5 +1839,114 @@ mod tests {
         )
         .unwrap();
         assert_eq!(steady.len(), 4);
+    }
+
+    /// P0 regression: a rev3 single-flow equal-length run used to be admitted
+    /// by the DICT upper bound (index + length + 2 B fid per item), which is
+    /// ~2 B/item larger than the `SAME_EQUAL` frame the encoder emits. These
+    /// runs now fill one DATAGRAM exactly.
+    #[test]
+    fn rev3_equal_length_runs_fill_one_datagram() {
+        for (len, count) in [(128usize, 9usize), (60, 19), (18, 64)] {
+            let mut s = R2Stager::new_with_wire(Wire::Rev3);
+            for _ in 0..count {
+                s.push(steady_owned(1, 1, vec![0xA5; len])).unwrap();
+            }
+            let f = s.next_frame(1162).expect("the equal-length run fits");
+            assert_eq!(
+                f.items as usize, count,
+                "len {len}: one frame holds the run"
+            );
+            assert!(f.body.len() <= 1162);
+            let t = wire::decode_train(Wire::Rev3, &f.body).expect("rev3 train decodes");
+            assert_eq!(t.form(), r3::TRAIN_FORM_SAME_EQUAL);
+            assert_eq!(t.items().count(), count);
+            assert!(s.is_empty(), "len {len}: no payload was left behind");
+            assert!(s.next_frame(1162).is_none());
+        }
+    }
+
+    /// One more equal-length item than the exact `SAME_EQUAL` size allows must
+    /// stop the run instead of overfilling the DATAGRAM.
+    #[test]
+    fn rev3_equal_length_run_stops_at_the_exact_size() {
+        let mut s = R2Stager::new_with_wire(Wire::Rev3);
+        for _ in 0..10 {
+            s.push(steady_owned(1, 1, vec![3; 128])).unwrap();
+        }
+        let first = s.next_frame(1162).expect("nine 128 B items fit");
+        assert_eq!(first.items, 9);
+        assert_eq!(first.body.len(), 4 + 1 + 9 * 128);
+        let second = s.next_frame(1162).expect("the tenth item follows");
+        assert_eq!(second.items, 1);
+        assert_eq!(second.body.len(), 2 + 128, "a lone item is steady DATA");
+        assert!(s.is_empty());
+    }
+
+    /// A length change ends the equal-length run but must not drop its tail:
+    /// the 9 x 128 B prefix is one `SAME_EQUAL` frame and the 60 B tail is
+    /// sent as steady `DATA` on the next frame.
+    #[test]
+    fn rev3_length_change_sends_the_tail_steadily() {
+        let mut s = R2Stager::new_with_wire(Wire::Rev3);
+        for _ in 0..9 {
+            s.push(steady_owned(1, 1, vec![7; 128])).unwrap();
+        }
+        s.push(steady_owned(1, 1, vec![7; 60])).unwrap();
+
+        let first = s.next_frame(1162).expect("the equal-length prefix fits");
+        assert_eq!(first.items, 9);
+        let t = wire::decode_train(Wire::Rev3, &first.body).expect("rev3 train decodes");
+        assert_eq!(t.form(), r3::TRAIN_FORM_SAME_EQUAL);
+
+        let second = s.next_frame(1162).expect("the 60 B tail still sends");
+        assert_eq!(second.items, 1);
+        let v = wire::decode_data(Wire::Rev3, &second.body).expect("steady DATA decodes");
+        assert_eq!(v.payload.len(), 60);
+        assert!(s.is_empty(), "the length change must not drop the tail");
+    }
+
+    /// The run-admission cost must equal the bytes of the frame the encoder
+    /// emits for the same run, in every form the stager can choose.
+    #[test]
+    fn packed_steady_len_matches_the_encoded_frame() {
+        let cases: &[(Wire, &[(u32, usize)])] = &[
+            (Wire::Rev2, &[(1, 60)]),
+            (Wire::Rev2, &[(1, 60), (1, 60), (1, 60)]),
+            (Wire::Rev2, &[(1, 128), (2, 60), (1, 128)]),
+            (Wire::Rev2, &[(1, 255), (1, 255)]),
+            (Wire::Rev3, &[(1, 60)]),
+            (Wire::Rev3, &[(1, 60), (1, 60), (1, 60)]),
+            (Wire::Rev3, &[(1, 60), (1, 61), (1, 60)]),
+            (Wire::Rev3, &[(1, 128), (2, 60), (1, 128)]),
+            (Wire::Rev3, &[(1, 254), (1, 255)]),
+        ];
+        for &(wire, shape) in cases {
+            let items: Vec<R2StageItem> = shape
+                .iter()
+                .map(|&(flow, len)| steady_owned(1, flow, vec![0; len]))
+                .collect();
+            let mut run: Vec<R2StageItem> = Vec::new();
+            let mut flows: Vec<u32> = Vec::new();
+            let mut cost = 0;
+            for item in &items {
+                let R2StageKind::Steady { wire_id } = item.kind else {
+                    unreachable!()
+                };
+                let new_flow = !flows.contains(&wire_id);
+                cost = R2Stager::packed_steady_len(wire, &run, item, &flows, new_flow);
+                if new_flow {
+                    flows.push(wire_id);
+                }
+                run.push(item.clone());
+            }
+            let mut s = R2Stager::new_with_wire(wire);
+            for item in &items {
+                s.push(item.clone()).unwrap();
+            }
+            let f = s.next_frame(1162).expect("the case fits one frame");
+            assert_eq!(f.items as usize, items.len(), "{shape:?}");
+            assert_eq!(cost, f.body.len(), "{wire:?} {shape:?}");
+        }
     }
 }
