@@ -53,6 +53,34 @@ use crate::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Slack above the derived fd figure: the config file, stdio, the DNS
+/// resolver's request sockets, the tokio drivers' epoll/eventfd/pipes and the
+/// log writer.
+const FD_GUARD: usize = 256;
+
+/// Fds the documented caps can need at once: one accepted socket per SOCKS
+/// relay ([`MAX_SOCKS_CONNS`], shared with `[[tcp_forward]]`), one socket per
+/// UDP association ([`MAX_UDP_ASSOCS`], shared with `[[udp_forward]]` peers) and
+/// one QUIC endpoint per pool slot ([`MAX_POOL_CONNS`]).
+fn designed_fds() -> u64 {
+    (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + MAX_POOL_CONNS + FD_GUARD) as u64
+}
+
+/// Raise the soft `RLIMIT_NOFILE` toward [`designed_fds`] and report what is in
+/// force. See `myquic2::fdlimit` for why this is a startup step rather than a
+/// per-accept error path.
+fn report_fd_budget() {
+    let want = designed_fds();
+    match myquic2::fdlimit::raise_nofile_limit(want) {
+        Ok(lim) if lim.shortfall(want) == 0 => info!("{}", lim.describe(want)),
+        Ok(lim) => warn!("{}", lim.describe(want)),
+        Err(e) => warn!(
+            "nofile limit unavailable ({e}); relays and associations past the process default \
+             fail with EMFILE"
+        ),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -65,6 +93,11 @@ fn main() -> Result<()> {
     let _ = coarse_millis();
     let a = Args::parse();
     let c: ClientConf = load_toml(&a.config)?;
+    // File-descriptor budget before the first socket: the SOCKS relay and UDP
+    // association caps are one fd each, far above a stock unix soft limit, and
+    // the accept loop treats `EMFILE` as transient — so without this line the
+    // client silently serves a fraction of its documented capacity.
+    report_fd_budget();
     let main_workers = main_runtime_workers(&c);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(main_workers)
@@ -82,25 +115,40 @@ fn main() -> Result<()> {
 /// runtime is where every SOCKS accept, TCP relay pump and UDP association
 /// task runs.
 ///
-/// The subtraction of the slot count is only justified where those slot threads
-/// are actually **pinned**: `linux::pin_to_core` is implemented only on Linux.
-/// There, `pinned_slots + workers <= cores` keeps the app-side pool from
-/// oversubscribing the machine (each pinned receive/dispatch thread owns its
-/// core, so a work-stealing worker landing there would timeshare it). The
-/// subtraction has a floor of one worker: the runtime must exist.
+/// Only **pinned** slot threads own a core (`linux::pin_to_core` is implemented
+/// only on Linux), so only there may the app-side pool give anything up. But
+/// "one core per slot" is not a reservation the app-side pool can afford to
+/// honour in full: it is the pool that moves user payload (accepts, relay
+/// pumps, every association), while a slot thread mostly parks on its endpoint
+/// and wakes for QUIC crypto. At the shipped 7 slots an 8-core host kept 7
+/// cores for those parked threads and ran every SOCKS/TCP/UDP task on a single
+/// worker; a 4-core host did the same while pinning more slots than it has
+/// cores — the worst shape exactly where capacity is scarce.
+///
+/// The reservation is therefore capped at **half the machine**:
+/// `workers >= ceil(cores / 2)` everywhere, and a wide machine keeps the old
+/// one-core-per-slot shape (16 cores: 7 slots pinned, 9 workers). The floor of
+/// one worker is kept because the runtime must exist. [`priority_pin_cores`]
+/// pins only the cores this rule leaves unpinned, so the split is real rather
+/// than arithmetic: a pinned slot never shares a core with the app-side pool.
 ///
 /// Off Linux `pin_to_core` is a no-op, so the slot threads are ordinary threads
-/// the scheduler timeshares with everything else; subtracting them would only
-/// shrink the app-side pool — at the shipped 7 slots an 8-core macOS host ran
-/// every SOCKS/TCP/UDP task on a single worker (LOGIC/PERF-3 regression). There
-/// the full default width is kept. `main_runtime_workers_for` is the pure rule
-/// so both platform behaviours stay testable on one host.
+/// the scheduler timeshares with everything else and the full default width is
+/// kept — at the shipped 7 slots an 8-core macOS host ran every SOCKS/TCP/UDP
+/// task on a single worker when the subtraction was applied there
+/// (LOGIC/PERF-3 regression). `main_runtime_workers_for` is the pure rule so
+/// both platform behaviours stay testable on one host.
 fn main_runtime_workers(c: &ClientConf) -> usize {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     main_runtime_workers_for(
         cores,
         shard_runtime_enabled(),
-        planned_slot_count(c.conn_count(), c.udp_split(), c.udp_egress_cnt()),
+        planned_slot_count(
+            c.conn_count(),
+            c.udp_split(),
+            c.udp_interactive_cnt(),
+            c.udp_egress_cnt(),
+        ),
         cfg!(target_os = "linux"),
     )
 }
@@ -116,7 +164,10 @@ fn main_runtime_workers_for(cores: usize, sharded: bool, slots: usize, pins_slot
     if !sharded || !pins_slots {
         return cores;
     }
-    cores.saturating_sub(slots.min(cores)).max(1)
+    // A pinned slot may claim a core, but never more than half the machine:
+    // the app-side workers are the side that moves payload, so they keep at
+    // least `ceil(cores / 2)` of it (see the doc above).
+    cores.saturating_sub(slots.min(cores / 2)).max(1)
 }
 
 async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
@@ -216,6 +267,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     let conns = c.conn_count();
     let udp_fail_closed = c.udp_fail_closed();
     let udp_split = c.udp_split();
+    let udp_interactive = c.udp_interactive_cnt();
     let udp_egress = c.udp_egress_cnt();
     let pool = ConnPool::new_with_bulk_ports(
         conns,
@@ -223,6 +275,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         c.udp_bulk_port_list(),
         udp_fail_closed,
         udp_split,
+        udp_interactive,
         udp_egress,
         data_stale_ms,
     );
@@ -241,18 +294,23 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     info!(
         "quic pool: {conns} TCP connection(s){} + {} dedicated UDP connection(s) ({}){} (endpoints: one UDP socket per slot)",
         if conns > 1 {
-            " (bulk round-robin + interactive pin)"
+            " (bulk round-robin + interactive round-robin)"
         } else {
             " (single connection: interactive and bulk share slot 0)"
         },
-        if udp_split { 1 + udp_egress } else { 1 },
         if udp_split {
-            let first_shard = pool.udp_global_slot(1);
+            udp_interactive + udp_egress
+        } else {
+            1
+        },
+        if udp_split {
+            let first_bulk = pool.udp_global_slot(pool.interactive_shards());
             format!(
-                "interactive slot {}, bulk shards {}..{}",
+                "interactive shards {}..{}, bulk shards {}..{}",
                 pool.udp_global_slot(0),
-                first_shard,
-                first_shard + udp_egress - 1
+                pool.udp_global_slot(0) + pool.interactive_shards() - 1,
+                first_bulk,
+                first_bulk + udp_egress - 1
             )
         } else {
             format!("shared slot {}", pool.udp_global_slot(0))
@@ -297,8 +355,9 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         // Core assignment by priority, not by slot index: see
         // `priority_pin_cores`. Computed before spawning so the interactive
         // pair claims the low cores even on a host with fewer cores than pool
-        // slots.
-        let pin_cores = priority_pin_cores(&pool);
+        // slots, and so only the cores `main_workers` did not claim are
+        // pinned.
+        let pin_cores = priority_pin_cores(&pool, main_workers);
         for (i, &pin_core) in pin_cores.iter().enumerate() {
             let sock = udp_socket_dual("[::]:0")?;
             // Per-slot transport preset (see `slot_uses_bulk_preset`): only
@@ -610,27 +669,46 @@ fn warn_socks_end(peer: SocketAddr, err: &anyhow::Error) {
 const SLOT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Core assignment for the sharded topology: rank every pool slot by how much
-/// its latency matters, then pin rank `r < usable_cores` to core `r`.
+/// its latency matters, then pin rank `r < usable` to core `r`, where
+/// `usable = cores - app_workers` is what [`main_runtime_workers`] left over.
 ///
 /// The old shape pinned by slot index (`idx < cores`), so on a host with fewer
-/// cores than `tcp_slots + 1` the interactive **UDP** slot (index `tcp_slots`,
-/// which carries every small-datagram and interactive-port association) was
+/// cores than `tcp_slots` plus the UDP range the interactive **UDP** slots
+/// (which carry every small-datagram and interactive-port association) were
 /// left unpinned and floated between cores while a bulk TCP slot kept a core.
-/// Priority order: TCP slot 0 (interactive) first, then the interactive UDP
-/// slot, then the remaining TCP slots, then the remaining UDP (bulk) shards.
-/// Slots past the core count get `None` and float, so a pool wider than the
-/// machine is still balanced by the scheduler.
-fn priority_pin_cores(pool: &ConnPool) -> Vec<Option<usize>> {
+/// Priority order: TCP slot 0 (interactive) first, then every interactive UDP
+/// shard, then the remaining TCP slots, then the remaining UDP (bulk) shards.
+///
+/// `app_workers` is the main runtime's worker count, so the cores that pool was
+/// sized for are never handed to a pinned slot: the split that
+/// [`main_runtime_workers_for`] promises is only real if a pinned slot thread
+/// and a work-stealing worker do not share a core. Slots past `usable` get
+/// `None` and float, so a pool wider than the machine is still balanced by the
+/// scheduler. On hosts where workers == cores nothing is pinned (`usable`
+/// floors at one), which matches the no-op `pin_to_core` there.
+fn priority_pin_cores(pool: &ConnPool, app_workers: usize) -> Vec<Option<usize>> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let usable = cores.saturating_sub(app_workers).max(1);
     let mut order: Vec<usize> = Vec::with_capacity(pool.slots_total());
     order.push(0);
-    order.push(pool.udp_global_slot(0));
-    order.extend(1..pool.tcp_slots());
-    order.extend((1..pool.udp_slot_count()).map(|i| pool.udp_global_slot(i)));
+    if pool.udp_split {
+        order.extend(
+            pool.udp_class_slots(EgressClass::Interactive)
+                .map(|i| pool.udp_global_slot(i)),
+        );
+        order.extend(1..pool.tcp_slots());
+        order.extend(
+            pool.udp_class_slots(EgressClass::Bulk)
+                .map(|i| pool.udp_global_slot(i)),
+        );
+    } else {
+        order.extend(1..pool.tcp_slots());
+        order.push(pool.udp_global_slot(0));
+    }
     debug_assert_eq!(order.len(), pool.slots_total());
     let mut pin_cores = vec![None; pool.slots_total()];
     for (rank, &slot) in order.iter().enumerate() {
-        if rank < cores {
+        if rank < usable {
             pin_cores[slot] = Some(rank);
         }
     }

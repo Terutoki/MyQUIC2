@@ -60,7 +60,7 @@ MyQUIC2 is split along the only boundary that matters for latency: **per-connect
 
 | Layer | Responsibility | Key design choice |
 |---|---|---|
-| **Client pool** | 4 TCP + 3 UDP slots by default; interactive and bulk sharding | One endpoint, socket and runtime per slot; selection-time path health; reconnect watchdog below the QUIC idle timeout |
+| **Client pool** | 4 TCP + 4 UDP slots by default (2 interactive + 2 bulk); interactive and bulk sharding | One endpoint, socket and runtime per slot; selection-time path health; reconnect watchdog below the QUIC idle timeout |
 | **Associations** | SOCKS5 `CONNECT` and `UDP ASSOCIATE`; app address pinning | The first valid UDP packet locks the app address; one association maps to one `session` |
 | **Forward listeners** | Raw TCP/UDP to configured fixed destinations (`[[tcp_forward]]` / `[[udp_forward]]`) | Same pool, tunnel and server; one session per UDP peer; IPv4, IPv6 and dual-stack listeners; fail-fast startup validation |
 | **Shared codec** | MQP-3 rev3 + rev2 frames (config-selected), flow tables, fragmentation, stager, reassembly | One implementation used by both binaries and by the tests; the revision is a connection property, never sniffed per frame |
@@ -530,6 +530,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | Client associations | 4,032 per process | UDP hub |
 | Global sessions | 8,192 | server session pool |
 | Connections | 4,096 | admission / listener |
+| File descriptors | 24,840 server / 12,496 client (designed capacity + 256 guard) | startup check against `RLIMIT_NOFILE`, rate-limited `EMFILE` warn at runtime |
 | Per-connection admission | 25,875 KiB (27,131,904 B) | checked before state allocation |
 
 The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 96 KiB of fixed ingress state (the 64-slot fast session table with inline destination pins + maps; the charge conservatively keeps the 16 KiB pre-HELLO allowance after Phase 0 removed the buffer), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (72 streams × 1,024 gap spans × 96 B = 6.75 MiB; the server advertises 64 bidi + 8 uni streams until the token is verified, then raises bidi to 8,192). The total is 25.875 MiB. At the full 4,096 connections that is **103.5 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
@@ -542,6 +543,7 @@ A second, **process-wide fixed term** is subtracted from the budget once before 
 - **UDP retry pool** — 16 shards × (256 queued + 16 in flight) × an 8 KiB payload (**34 MiB**); peer-driven, because a black-holed target or a full `SO_SNDBUF` makes `WouldBlock` the steady state.
 - **DNS slow-path waiters** — 1,024 permits × (payload + host + task structure) (**8.75 MiB**); each unique unresolvable domain parks one waiter until the lookup times out.
 - **Datagram-worker scratch** — the `recvmmsg` burst buffer plus the session read-buffer pool held per worker thread (hundreds of KiB × the shard-thread count).
+- **File descriptors** — the server's designed capacity is 8,192 session sockets + 16,384 relay stream slots + 8 QUIC endpoints (+256 guard) ≈ **24,840 fds**; the client's is 8,192 relay connections + 4,032 UDP associations + 16 pool connections (+256) ≈ **12,496**. That is far above a stock Linux soft `nofile` (often 1024) or macOS (256), and a host that runs out does not fail loudly: socket creation returns `EMFILE`, the session is refused with a rate-limited `warn`, and the capacity silently settles at the limit. Both binaries therefore report their `RLIMIT_NOFILE` at startup — raising the soft limit to the hard ceiling when they can, and printing the `ulimit -n` / `LimitNOFILE=` / `--ulimit nofile=` remedy when the hard limit is short. Set the limit explicitly in production; the check only warns.
 - **quinn stream-reassembly metadata** — every peer-opened stream can park up to **1,024 gap spans** in quinn's receive assembler, and QUIC flow control counts payload bytes rather than span metadata. The header-read stage caps how many such streams can be parked at once (4,096 process-wide, 256 per connection), so admission charges 4,096 × 1,024 × 96 B ≈ **384 MiB** as a fixed term; previously none of it was charged and one connection could pin hundreds of MiB against a 19 MiB charge.
 
 The per-connection charge covers state that a single connection can pin; the fixed term covers state many connections can pin together. Both are checked before allocation, so a flood of half-open associations cannot consume the budget of established traffic. The client is not exposed to the stream-assembly term at all: it advertises **zero** incoming stream credit (it opens every stream it uses and the server never opens one), so a peer cannot create a receive assembler on it.
@@ -674,7 +676,7 @@ flowchart LR
         SOCKS["🧦 SOCKS5 ingress<br/>CONNECT · UDP ASSOCIATE"]
         TFL["🔌 tcp_forward listeners<br/>one accepted connection<br/>= one QUIC stream"]
         UFL["📮 udp_forward listeners<br/>one session per peer IP:port"]
-        POOL["🎰 ConnPool<br/>4 TCP + 3 UDP connections<br/>interactive / bulk isolation"]
+        POOL["🎰 ConnPool<br/>4 TCP + 4 UDP connections<br/>interactive / bulk isolation"]
         SOCKS --> POOL
         TFL --> POOL
         UFL --> POOL
@@ -1185,7 +1187,7 @@ The client and server must run the **same revision**. Certificates are generated
 
 - **Wire:** `wire_rev` (`2` = rev2 rollback, `3` = rev3 default; unset = build default) — both binaries must agree. Both revisions default to the same `h3` ALPN label, so a mismatched pair is not rejected at the handshake; deploy matched binaries, or pin distinct `alpn` labels on both sides for a TLS-level skew gate. See [MQP-3 rev3](#-mqp-3-rev3-wire-default).
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
-- **UDP scheduling:** `udp_split`, `udp_egress_conns`, `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
+- **UDP scheduling:** `udp_split`, `udp_interactive_conns` (interactive shards, default 2), `udp_egress_conns` (bulk shards, default 2), `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
 - **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Per-listener caps (`max_conns` / `max_sessions`) sit under process-wide forward budgets (`max_forward_conns` / `max_forward_sessions`, both defaulting to 3/4 of the shared SOCKS limit) so forwarding cannot deny the SOCKS endpoint. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
 - **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
@@ -1193,7 +1195,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **705 tests** on the macOS dev box (lib 350 + client 198 + server 142 + 15 process-level E2E: 7 forwarding + 8 wire-revision).
+- **718 tests** on the macOS dev box (lib 358 + client 200 + server 145 + 15 process-level E2E: 7 forwarding + 8 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 15 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -1430,7 +1432,7 @@ _Seven QUIC connections by default; each slot is its own endpoint and runtime._
 %%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%
 flowchart TB
     accTitle: Connection pool panorama
-    accDescr: Four TCP slots and three UDP slots separate interactive and bulk traffic, and every slot owns an endpoint, connection, dispatcher, and connection loop.
+    accDescr: Four TCP slots and four UDP slots separate interactive and bulk traffic, and every slot owns an endpoint, connection, dispatcher, and connection loop.
     subgraph APPS["🧑‍💻  application flows"]
         direction LR
         APP2["🎮 DNS · game<br/>interactive"]
@@ -1439,14 +1441,15 @@ flowchart TB
         APP3["📞 bulk UDP assoc<br/>VPN · media"]
         APP2 ~~~ APP1 ~~~ APP4 ~~~ APP3
     end
-    subgraph POOL["🎰  ConnPool · 7 connections by default"]
+    subgraph POOL["🎰  ConnPool · 8 connections by default"]
         direction TB
         subgraph UDPR["🟠 UDP range · udp_split on"]
             direction LR
-            U0["slot 4<br/>⚡ interactive UDP<br/>small flows"]
-            U1["slot 5<br/>📦 bulk shard 0"]
-            U2["slot 6<br/>📦 bulk shard 1"]
-            U0 ~~~ U1 ~~~ U2
+            U0["slot 4<br/>⚡ interactive UDP 0<br/>small flows"]
+            U1["slot 5<br/>⚡ interactive UDP 1<br/>small flows"]
+            U2["slot 6<br/>📦 bulk shard 0"]
+            U3["slot 7<br/>📦 bulk shard 1"]
+            U0 ~~~ U1 ~~~ U2 ~~~ U3
         end
         subgraph TCP["🔵 TCP pool · quic_conns = 4"]
             direction LR

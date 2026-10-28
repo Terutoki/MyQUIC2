@@ -50,7 +50,7 @@ as per `git diff`. Implementation results:
 |---|---|---|
 | F1 | ✅ Fixed | `server/forward.rs` adds a per-connection `DnsGate` (in-flight coalescing + Unusable 5s negative cache) + `resolve_forward_target` (when the thread memo is filtered by SSRF, fall back to the session DestMemo; on hit, inline and return `Some` so `arm_fast` takes effect); fully filtered no longer spawns per packet |
 | F2 | ✅ Fixed | `server/accept.rs` 16 slots changed to bounded linear probing (`fast_probe` / `fast_arm_index`), shared by resolve/try_stage/arm; only when >16 live sessions does it evict the least active by `last` |
-| F3 | ⏸ Pending measurement | Thread topology changes need Linux 2~4 core benchmark confirmation before proceeding (report §5 second batch) |
+| F3 | ✅ Fixed (2026-10-28, third batch §8 A1) | `client/main.rs` `main_runtime_workers_for` no longer subtracts every pinned slot from the app runtime: pinned slots may claim at most half the cores, so the app side always keeps `>= ceil(cores/2)` workers (the old rule collapsed an 8-core Linux box to **1** worker). `priority_pin_cores` now takes the app worker count and never pins a slot onto a core the app runtime occupies |
 | F4 | ✅ Fixed | `udp/reassembler.rs` each of the two maps gets an insertion-order `VecDeque` + lazy invalidation + prune/over-limit rebuild on `expire`; eviction amortized O(1), `held` accounting unchanged |
 | F5 | ✅ Fixed | `udp/retry.rs` Linux n==1+header changed to a two-iovec `sendmmsg` (zero copy); `server/reader.rs` single staged reply sends a single 0x02 frame, no longer BATCH-of-1 |
 | F6 | ✅ Fixed | `src/udp/batch.rs` adds `with_burst_msg` (borrowed); the recvmmsg drain paths in client `assoc.rs` and server `reader.rs` process in place; non-Linux keeps the `burst_msg_copy` fallback |
@@ -558,3 +558,53 @@ The following, after line-by-line verification + existing in-code measurements, 
 
 F3 (thread topology), F8 (client N-pack), F10 (cross-runtime), F13 (reassembler probe fusion),
 P3-1/P3-7/P3-8/P3-9 — all need a Linux benchmark or have a gain/risk ratio unsuitable for this batch; design proposals were retained in the report.
+
+## 8. Third Batch: Independent Audit of v0.2.3 (2026-10-28)
+
+Scope: a fresh audit of the shipped tree (`HEAD 8ac314e`, v0.2.3) for the largest remaining performance limits and memory
+leaks, this time reading the code rather than re-measuring the 2026-10-19/21 batches. Result: **no unbounded growth
+remains** — every peer-fillable structure is bounded (buffer pools, stager, reassemblers, flow registry, DNS cache, retry
+pool, dispatch cache, forward hubs), and no task/owner cycle survived review. The severe findings were instead scheduling
+and architecture limits plus one lifecycle leak in the v3 ingress fast table. All but A4 are fixed in this batch.
+
+| ID | Severity | Status | Landing points |
+|---|---|---|---|
+| A1 | P1 | ✅ Fixed | `client/main.rs`: `main_runtime_workers_for` clamps the *pinned* share to half the machine (`cores.saturating_sub(slots.min(cores / 2)).max(1)`) instead of subtracting every pinned slot; `priority_pin_cores(pool, app_workers)` takes the worker count and installs at most `cores - app_workers` pins, so a pin can never displace the app runtime on its own core. On an 8-core Linux host the default 7-slot pool used to leave the app runtime (every SOCKS accept, TCP relay pump and UDP association task) **one** worker; it now gets 4, and slot threads get the other 4. |
+| A2 | P1 (QoS) | ✅ Fixed | `config/tuning.rs` adds `DEFAULT_UDP_INTERACTIVE_CONNS = 2` / `MAX_UDP_INTERACTIVE_CONNS = 8`; `config/client_conf.rs` adds `udp_interactive_conns` (`udp_interactive_cnt()`); `client/pool.rs` gives the interactive class its own shard range `0..interactive_shards` (bulk is `interactive_shards..`), a second round-robin cursor (`udp_irr`) so bulk bursts cannot move an interactive association, `MAX_UDP_SLOTS` = interactive + bulk (16), and `planned_slot_count` takes both counts. `client/main.rs` logs both ranges and prioritizes every interactive shard in the pin order. Default pool: 4 TCP + 2 interactive UDP + 2 bulk UDP = 8 connections. |
+| A3 | P1 (ops) | ✅ Fixed | `src/fdlimit.rs` (`nofile_limit`, `raise_nofile_limit`, `NoFileLimit::{shortfall, describe}`) raises the soft limit to `min(hard, wanted)` best-effort and reports the `ulimit -n` / `LimitNOFILE=` / `--ulimit nofile=` remedy; both binaries call `report_fd_budget()` at startup against their designed capacity (server 24,840 = 8,192 sessions + 16,384 relay slots + 8 endpoints + 256 guard, client 12,496 = 8,192 + 4,032 + 16 + 256). `nix` gains the `resource` feature. Previously **nothing** in the tree touched `RLIMIT_NOFILE`, so a stock `nofile=1024` silenced the 8,192-session design at ~1,000 sessions with a rate-limited `EMFILE` warn. |
+| A5 | P2 (leak) | ✅ Fixed | `server/accept.rs`: `FastSess.flows` is now `Weak<ArcSwap<FlowTable>>` instead of `Arc<...>`; `arm_fast` stores `Arc::downgrade(&flows)`; `fast_flows` upgrades and falls back to `session_flows` when the session is gone; `fast_arm_index` recycles dead slots (`slot_is_dead` = `abort.is_finished() \|\| sock.strong_count() == 0`) before growing the probe chain. A strong handle made the per-connection slot array a second owner of a dead session's flow table; session ids are monotonic, so nothing ever replaced the entry and up to 64 x 22 KiB per connection stayed pinned until the connection ended, outside the admission charge. `R2_INGRESS_FIXED_BYTES`'s doc was updated to the weak-handle wording. |
+| A6 | P3 | ✅ Fixed | `mqp/v3.rs` `decode_fragment_v3` now rejects `total > MQP_FRAG_MAX_TOTAL` (64) and `chunk > MQP_FRAG_MAX_PAYLOAD` (8,192) as `Malformed`, matching the v2 decoder's contract. Latent only (the v3 stage uses the encoder, the tests used the decoder), but a hostile or buggy peer would have been able to index beyond the reassembler's 64-fragment bound if the decoder ever became a receive path. |
+| A7 | P3 | ✅ Fixed | `server/accept.rs`: the rev3 control-plane handoff `ctl_in` is now `mpsc::channel(CTL_IN_QUEUE = 64)` instead of unbounded, and `r3_control_stream_task` awaits `send`, so a peer that outruns the datagram loop applies QUIC flow control to its own reliable stream. Messages are never dropped (`OPEN`/`CLOSE` are not idempotent), and the datagram loop only touches this queue through `queue_ctl`'s `try_send`, so the wait cannot deadlock. The token bucket (4,096 msg/s) had already bounded the growth rate to ~100 KB/s, so this is defence in depth, not an observed incident. |
+| A4 | P2 (structural) | ⏸ Won't fix — rationale below | The server keeps one DATAGRAM reader task per connection (`server/accept.rs` `handle_conn_inner`), so one client connection is one core at most. |
+
+### A4: why the per-connection server pipeline is not fanned out
+
+The obvious fix — spawn N reader tasks per connection — is wrong for two reasons, both verified in the tree:
+
+1. **Quinn serializes a connection by design.** One connection owns one UDP socket, one crypto/ACK state and one DATAGRAM
+   queue; every outbound datagram takes the connection lock (`udp/send.rs` notes that `send_datagram_wait` takes one mutex
+   per poll). Concurrent readers cannot exceed that ceiling, they only add contention.
+2. **The stager's contract is per-session FIFO.** `udp/r2_stage.rs` pins "each session's steady items keep their FIFO
+   order" (`mixed_heads_deliver_every_payload_exactly_once`), and `wire_id`s are client-assigned and monotonic. Two tasks
+   pushing for the same session race on both the sequence and the frame order, so a fan-out would trade a throughput
+   ceiling for a correctness regression.
+
+The supported way to raise per-client parallelism is therefore **more connections**, which A2 already does (3 -> 4 UDP
+connections by default, 2 of them interactive rather than 1), and which is bounded by `MAX_POOL_CONNS`,
+`MAX_UDP_INTERACTIVE_CONNS` and `MAX_UDP_EGRESS_CONNS`. The remaining serialization is a protocol property, not a bug:
+the client chooses its connection count, the server mirrors it.
+
+### 8.1 Verification
+
+- `cargo test` — **718 passed, 0 failed** (lib 358, client 200, server 145, E2E 15: 7 forwarding + 8 wire-revision).
+- New regression tests: `arm_recycles_a_dead_slot_instead_of_growing_the_chain`,
+  `reaped_session_releases_its_flow_table_from_the_fast_slot`, `fd_budget_covers_the_session_and_relay_pools`,
+  `fd_budget_covers_the_relay_and_association_pools`, `decode_fragment_v3_rejects_impossible_totals_and_oversized_chunks`,
+  `interactive_associations_rotate_over_their_own_shards`, plus the widened
+  `main_runtime_worker_count_only_subtracts_real_pinning`, `slot_pinning_prioritizes_the_interactive_pair`,
+  `udp_bulk_ports_force_bulk_regardless_of_first_payload` and the config matrix for `udp_interactive_cnt`.
+- Behavior changes to review: (1) the app runtime now keeps half the cores on a pinned topology — on an 8-core Linux box
+  the client runs 4 app workers + 4 pinned slot threads instead of 1 + 7; (2) the default client pool is 8 connections
+  instead of 7, so a server sees one extra QUIC connection per client; (3) `nofile` is raised best-effort at startup and a
+  short hard limit prints a warning instead of failing; (4) the rev3 control plane applies backpressure to a fast peer.
+  No wire change, no on-disk format change.

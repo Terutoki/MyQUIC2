@@ -27,6 +27,7 @@ macro_rules! stats_only {
 
 pub mod config;
 pub mod dns;
+pub mod fdlimit;
 pub mod linux;
 pub mod mqp;
 pub mod stats;
@@ -42,15 +43,15 @@ pub use config::{
     server_conf::ServerConf,
     tuning::{
         DEFAULT_FORWARD_CONNS, DEFAULT_INITIAL_MTU, DEFAULT_INITIAL_RTT_MS, DEFAULT_QUIC_CONNS,
-        DEFAULT_UDP_EGRESS_CONNS, INITIAL_MTU_MAX, INITIAL_MTU_MIN, INITIAL_RTT_MS_MAX,
-        INITIAL_RTT_MS_MIN, MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS, MAX_QUIC_ENDPOINTS,
-        MAX_SOCKS_CONNS, MAX_UDP_ASSOCS, MAX_UDP_EGRESS_CONNS, R2_SESSION_TABLES_BYTES,
-        SERVER_PRE_AUTH_BIDI_CREDIT, SERVER_UNI_STREAM_CREDIT, TransportTuning,
-        default_quic_endpoints, dns_inflight_memory_bytes, endpoint_memory_bytes,
-        endpoint_recv_buffer_bytes, load_toml, per_connection_memory_bytes,
-        per_session_memory_bytes, pre_auth_stream_memory_bytes, retry_pool_memory_bytes,
-        session_pool_memory_bytes, stream_assembler_memory_bytes, stream_pump_memory_bytes,
-        worker_scratch_bytes,
+        DEFAULT_UDP_EGRESS_CONNS, DEFAULT_UDP_INTERACTIVE_CONNS, INITIAL_MTU_MAX, INITIAL_MTU_MIN,
+        INITIAL_RTT_MS_MAX, INITIAL_RTT_MS_MIN, MAX_BIDI_STREAMS_PER_CONN, MAX_POOL_CONNS,
+        MAX_QUIC_ENDPOINTS, MAX_SOCKS_CONNS, MAX_UDP_ASSOCS, MAX_UDP_EGRESS_CONNS,
+        MAX_UDP_INTERACTIVE_CONNS, R2_SESSION_TABLES_BYTES, SERVER_PRE_AUTH_BIDI_CREDIT,
+        SERVER_UNI_STREAM_CREDIT, TransportTuning, default_quic_endpoints,
+        dns_inflight_memory_bytes, endpoint_memory_bytes, endpoint_recv_buffer_bytes, load_toml,
+        per_connection_memory_bytes, per_session_memory_bytes, pre_auth_stream_memory_bytes,
+        retry_pool_memory_bytes, session_pool_memory_bytes, stream_assembler_memory_bytes,
+        stream_pump_memory_bytes, worker_scratch_bytes,
     },
 };
 pub use time::{coarse::coarse_millis, mono::mono_millis};
@@ -3982,6 +3983,19 @@ mod tests {
             conf("udp_egress_conns = 999\n").udp_egress_cnt(),
             MAX_UDP_EGRESS_CONNS,
             "a config typo cannot dial an unbounded shard fan-out"
+        );
+        // Interactive UDP sharding: same clamp contract, separate knob.
+        assert_eq!(c.udp_interactive_cnt(), DEFAULT_UDP_INTERACTIVE_CONNS);
+        assert_eq!(conf("udp_interactive_conns = 1\n").udp_interactive_cnt(), 1);
+        assert_eq!(
+            conf("udp_interactive_conns = 0\n").udp_interactive_cnt(),
+            1,
+            "the interactive class always owns at least one dedicated connection"
+        );
+        assert_eq!(
+            conf("udp_interactive_conns = 999\n").udp_interactive_cnt(),
+            MAX_UDP_INTERACTIVE_CONNS,
+            "a config typo cannot dial an unbounded interactive fan-out"
         );
         // Unknown keys stay a hard error: the new field must not open a hole.
         assert!(toml::from_str::<ClientConf>(&format!("{base}udp_egress_conn = 2\n")).is_err());

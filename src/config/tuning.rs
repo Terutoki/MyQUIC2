@@ -26,7 +26,8 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 /// The fast session table is now 64 slots (`FAST_SESS_SLOTS` in
 /// `myquic2-server/accept.rs`, up from 16): each `FastSess` carries an inline
 /// `ConnPin` (255-byte name + address + deadline, ~304 B), a weak socket
-/// handle, the abort handle and the flow-table `Arc` — ~350 B per slot, so the
+/// handle, the abort handle and a weak flow-table handle (a `Weak` costs the
+/// same 8 B as the `Arc` it replaced) — ~350 B per slot, so the
 /// table is ~22 KiB. With the 16 KiB pre-HELLO buffer (~38 KiB), the per-slot
 /// pins and the surrounding maps, 96 KiB is a round, conservative charge; the
 /// server's unit tests pin `FAST_SESS_SLOTS` against this constant's comment.
@@ -83,7 +84,8 @@ pub const DEFAULT_QUIC_CONNS: usize = 4;
 /// connection (dial loop, DATAGRAM dispatcher, keepalives, its own 0-RTT ticket
 /// state), so this cap — not the config parser — is what bounds the per-client
 /// cost a `quic_conns` typo can request. The UDP egress slots are beyond this:
-/// a client's worst case is `MAX_POOL_CONNS + 1 + MAX_UDP_EGRESS_CONNS` with
+/// a client's worst case is
+/// `MAX_POOL_CONNS + MAX_UDP_INTERACTIVE_CONNS + MAX_UDP_EGRESS_CONNS` with
 /// `udp_split` (the default) and `MAX_POOL_CONNS + 1` without it.
 ///
 /// 16 rather than 8: separate congestion windows are the only per-flow
@@ -109,6 +111,24 @@ pub const MAX_POOL_CONNS: usize = 16;
 /// extra dial, and many-core hosts should raise it toward cores/2 up to
 /// [`MAX_UDP_EGRESS_CONNS`]. 1 restores the single bulk connection.
 pub const DEFAULT_UDP_EGRESS_CONNS: usize = 2;
+
+/// Default number of dedicated **interactive** UDP egress connections.
+///
+/// The interactive class is the latency-sensitive population (STUN/DTLS media,
+/// games, DNS, anything whose first datagram is ≤ 512 B), and every association
+/// in it shares its connection's 1 MiB DATAGRAM send buffer, 256 KiB stager and
+/// one congestion window. One connection therefore makes the class a single
+/// shared queue: an association that bursts can push every other one into a
+/// `Blocked` drop, and one loss event shrinks the window for all of them. Two
+/// halves that contention for one extra dial; raise it toward
+/// [`MAX_UDP_INTERACTIVE_CONNS`] on hosts that front many small-flow
+/// associations, and set 1 to keep the single stable connection.
+pub const DEFAULT_UDP_INTERACTIVE_CONNS: usize = 2;
+
+/// Hard cap on the interactive UDP egress shards: the same full-connection cost
+/// as [`MAX_UDP_EGRESS_CONNS`], and the two together bound the UDP egress range
+/// at `MAX_UDP_SLOTS` (`2 * MAX_UDP_EGRESS_CONNS`) scratch slots.
+pub const MAX_UDP_INTERACTIVE_CONNS: usize = 8;
 
 /// Hard cap on the bulk UDP egress shards. Each shard is a full QUIC
 /// connection in both directions (its own congestion window, DATAGRAM buffers,

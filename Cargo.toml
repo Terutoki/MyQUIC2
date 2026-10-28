@@ -197,10 +197,12 @@ fast-socks5 = "1.0.0"
 # mirrors what the Linux-only call sites actually touch: `socket` (module),
 # `uio` (`recvmmsg`/`MultiHeaders` live behind it in nix 0.31), `net` (the
 # `SockaddrStorage::as_sockaddr_in{6}` downcast accessors), `time` (the
-# `TimeSpec` timeout parameter) and `sched` (the affinity call; the module is
-# Linux-only, the feature is inert elsewhere). Only *called* on Linux,
-# portable fallback elsewhere.
-nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net", "time", "sched"] }
+# `TimeSpec` timeout parameter), `sched` (the affinity call; the module is
+# Linux-only, the feature is inert elsewhere) and `resource` (`getrlimit`/
+# `setrlimit` for the startup `RLIMIT_NOFILE` raise in `src/fdlimit.rs`; the
+# call sites are unix-portable and the feature is inert elsewhere). Only
+# *called* on Linux, portable fallback elsewhere.
+nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net", "time", "sched", "resource"] }
 # NOTE (frame pooling experiment): crossbeam-queue was trialled here as the
 # shard store of a reusable frame-buffer pool fed by `Bytes::from_owner`. It
 # measured *slower* than the plain per-frame `Vec` + `Bytes::from` shape

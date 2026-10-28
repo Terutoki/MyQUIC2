@@ -2,8 +2,9 @@
 use super::*;
 
 /// Width of the UDP egress range the egress cache and the pool's scratch
-/// arrays must cover: the interactive slot plus the largest shard set.
-pub(crate) const MAX_UDP_SLOTS: usize = 1 + MAX_UDP_EGRESS_CONNS;
+/// arrays must cover: the largest interactive shard set plus the largest bulk
+/// one.
+pub(crate) const MAX_UDP_SLOTS: usize = MAX_UDP_INTERACTIVE_CONNS + MAX_UDP_EGRESS_CONNS;
 
 /// The pool slot's published connection.
 ///
@@ -662,11 +663,15 @@ pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 /// class is the only isolation QUIC gives without stream priorities.
 ///
 /// With `udp_split` (the default) the UDP range starts with the **interactive**
-/// class's single slot (index 0) followed by `udp_egress_conns` **bulk** shards
-/// (indices 1..), so a bulk UDP flow's congestion window and DATAGRAM buffer
-/// cannot starve a latency-sensitive flow, and the bulk association population
-/// spreads across several connections instead of funneling every bulk flow into
-/// one connection's driver, dispatcher and server-side reader. A bulk
+/// class's `udp_interactive_conns` shards (indices `0..`) followed by
+/// `udp_egress_conns` **bulk** shards, so a bulk UDP flow's congestion window
+/// and DATAGRAM buffer cannot starve a latency-sensitive flow, and each
+/// association population spreads across several connections instead of
+/// funneling into one connection's driver, dispatcher and server-side reader.
+/// The interactive class is sharded too: every association in it shares its
+/// connection's 1 MiB DATAGRAM buffer, 256 KiB stager and congestion window, so
+/// a single slot turns the whole latency-sensitive population into one queue
+/// that any bursting association can drain into `Blocked` drops. Every
 /// association is assigned its shard once, from its first datagram
 /// ([`ConnPool::udp_bind`]); `udp_split = false` restores the single shared UDP
 /// slot (index 0) and disables sharding.
@@ -681,11 +686,15 @@ pub(crate) struct ConnPool {
     pub(crate) rr: Arc<std::sync::atomic::AtomicUsize>,
     /// Round-robin cursor for bulk shard assignment (see [`ConnPool::udp_bind`]).
     pub(crate) udp_rr: Arc<std::sync::atomic::AtomicUsize>,
+    /// Round-robin cursor for interactive shard assignment. Separate from
+    /// [`Self::udp_rr`] so a burst of bulk associations cannot shift the
+    /// shard a latency-sensitive association lands on.
+    pub(crate) udp_irr: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) interactive_ports: Arc<std::collections::HashSet<u16, foldhash::fast::RandomState>>,
     /// Destination ports forced to the **bulk** class whatever their first
     /// payload size (see [`ConnPool::udp_class`]). A VPN tunnel's first packet
     /// is small — WireGuard's handshake is 148 B — so the size heuristic alone
-    /// would keep the whole tunnel on the single interactive connection next to
+    /// would keep the whole tunnel on the interactive connections next to
     /// DNS/STUN/games, where it can never use the bulk shards. Empty from the
     /// size-only test constructor, i.e. the pure size heuristic.
     pub(crate) bulk_ports: Arc<std::collections::HashSet<u16, foldhash::fast::RandomState>>,
@@ -696,8 +705,12 @@ pub(crate) struct ConnPool {
     /// interactive class plus `bulk_shards` for the bulk class (the default)
     /// or shares a single one.
     pub(crate) udp_split: bool,
-    /// Bulk UDP shards (indices `1..1 + bulk_shards` of the UDP range). 1 when
-    /// `udp_split` is off, in which case the single shared slot is index 0.
+    /// Interactive UDP shards (UDP-range indices `0..interactive_shards`). 1
+    /// when `udp_split` is off, in which case every class shares index 0.
+    pub(crate) interactive_shards: usize,
+    /// Bulk UDP shards (UDP-range indices
+    /// `interactive_shards..interactive_shards + bulk_shards`). 1 when
+    /// `udp_split` is off.
     pub(crate) bulk_shards: usize,
     /// When set, UDP only ever uses dedicated UDP slots *of its own class*: if
     /// every one of them is down the datagram is dropped (counted in
@@ -735,6 +748,10 @@ impl ConnPool {
             Vec::new(),
             udp_fail_closed,
             udp_split,
+            // The legacy shape the size-heuristic tests were written against:
+            // one interactive slot. Tests that exercise interactive sharding
+            // go through `new_with_bulk_ports` directly.
+            1,
             udp_bulk_shards,
             // The shipped defaults (5 s keepalive, 60 s idle -> 40 s watchdog)
             // drive the selection-time path-health threshold, so the routing
@@ -746,10 +763,11 @@ impl ConnPool {
     }
 
     /// Build the process pool: `tcp` TCP slots indexed `0..tcp`, then the UDP
-    /// range — with `udp_split` on, the interactive class's slot at UDP index
-    /// 0 plus `udp_bulk_shards` bulk shards at `1..`, clamped here so no
-    /// caller can build a pool wider than the scratch arrays the routing and
-    /// egress paths size from [`MAX_POOL_CONNS`] / [`MAX_UDP_SLOTS`].
+    /// range — with `udp_split` on, `udp_interactive_shards` interactive slots
+    /// at UDP indices `0..` followed by `udp_bulk_shards` bulk shards, clamped
+    /// here so no caller can build a pool wider than the scratch arrays the
+    /// routing and egress paths size from [`MAX_POOL_CONNS`] /
+    /// [`MAX_UDP_SLOTS`].
     ///
     /// `bulk_ports` is the destination-port override list (see
     /// [`ConnPool::udp_class`]): ports classified as bulk whatever their first
@@ -758,31 +776,46 @@ impl ConnPool {
     /// `data_stale_ms` is the selection-time path-health threshold (see
     /// [`data_stale_threshold_ms`]), derived by `main` from the same resolved
     /// idle timeout as the transport and the watchdog.
+    // One argument per tuning knob it mirrors — folding them into a struct
+    // would hide the call sites' intent behind field names.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_bulk_ports(
         n: usize,
         interactive_ports: Vec<u16>,
         bulk_ports: Vec<u16>,
         udp_fail_closed: bool,
         udp_split: bool,
+        udp_interactive_shards: usize,
         udp_bulk_shards: usize,
         data_stale_ms: u64,
     ) -> Self {
         let tcp = n.clamp(1, MAX_POOL_CONNS);
+        let interactive_shards = if udp_split {
+            udp_interactive_shards.clamp(1, MAX_UDP_INTERACTIVE_CONNS)
+        } else {
+            1
+        };
         let bulk_shards = if udp_split {
             udp_bulk_shards.clamp(1, MAX_UDP_EGRESS_CONNS)
         } else {
             1
         };
-        let udp_slots = if udp_split { 1 + bulk_shards } else { 1 };
+        let udp_slots = if udp_split {
+            interactive_shards + bulk_shards
+        } else {
+            1
+        };
         let slots: Vec<ConnSlot> = (0..tcp + udp_slots).map(|_| ConnSlot::fresh()).collect();
         Self {
             slots: Arc::new(slots),
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             udp_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            udp_irr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
             bulk_ports: Arc::new(bulk_ports.into_iter().collect()),
             tcp_slots: tcp,
             udp_split,
+            interactive_shards,
             bulk_shards,
             udp_fail_closed,
             data_stale_ms,
@@ -794,14 +827,19 @@ impl ConnPool {
         self.tcp_slots
     }
 
-    /// UDP-range width: the interactive slot plus the bulk shards with the
+    /// UDP-range width: the interactive shards plus the bulk ones with the
     /// split on, a single shared slot with it off.
     pub(crate) fn udp_slot_count(&self) -> usize {
         if self.udp_split {
-            1 + self.bulk_shards
+            self.interactive_shards + self.bulk_shards
         } else {
             1
         }
+    }
+
+    /// Interactive UDP shards (the class's UDP-range width).
+    pub(crate) fn interactive_shards(&self) -> usize {
+        self.interactive_shards
     }
 
     /// Pool slot holding UDP-range index `index`.
@@ -809,15 +847,16 @@ impl ConnPool {
         self.tcp_slots + index
     }
 
-    /// UDP-range indices carrying `class`. The interactive class is always the
-    /// single index 0; the bulk class is `1..` with the split on and the
-    /// shared index 0 with it off. This is the fail-closed boundary: a
-    /// datagram may fail over inside its own class's set but never leaves it.
+    /// UDP-range indices carrying `class`. With the split on, the interactive
+    /// class is `0..interactive_shards` and the bulk class is everything after
+    /// it; with it off both classes share index 0. This is the fail-closed
+    /// boundary: a datagram may fail over inside its own class's set but never
+    /// leaves it.
     pub(crate) fn udp_class_slots(&self, class: EgressClass) -> std::ops::Range<usize> {
         match class {
-            EgressClass::Interactive => 0..1,
-            EgressClass::Bulk if self.udp_split => 1..self.udp_slot_count(),
-            EgressClass::Bulk => 0..1,
+            EgressClass::Interactive if self.udp_split => 0..self.interactive_shards,
+            EgressClass::Bulk if self.udp_split => self.interactive_shards..self.udp_slot_count(),
+            _ => 0..1,
         }
     }
 
@@ -827,33 +866,38 @@ impl ConnPool {
         self.tcp_slots + self.udp_slot_count()
     }
 
-    /// Bind `class` to a UDP-range index: the interactive class is always
-    /// index 0; bulk associations rotate over the shards. Called once per
-    /// association, from its first datagram — see [`UdpBind`].
+    /// Bind `class` to a UDP-range index: associations rotate over their own
+    /// class's shards, with the interactive class on its own cursor. Called
+    /// once per association, from its first datagram — see [`UdpBind`].
     ///
     /// Rotation (not hashing): associations arrive in an arbitrary order and
     /// live for a long time, so a cursor spreads them as evenly as a hash
-    /// would while staying one relaxed fetch_add and trivially testable.
+    /// would while staying one relaxed fetch_add and trivially testable. Two
+    /// cursors keep a burst of bulk associations from shifting which
+    /// interactive connection a latency-sensitive one lands on.
     pub(crate) fn udp_bind(&self, class: EgressClass) -> UdpBind {
         let shard = match class {
-            EgressClass::Interactive => 0,
+            EgressClass::Interactive if self.udp_split => self
+                .udp_irr
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             EgressClass::Bulk if self.udp_split => self
                 .udp_rr
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            EgressClass::Bulk => 0,
+            _ => 0,
         };
         self.udp_bind_shard(class, shard)
     }
 
     /// The explicit-shard form of [`ConnPool::udp_bind`]: `shard` is reduced
     /// modulo the class's shard count, so callers that carry their own stable
-    /// association key (and tests) never need the cursor. Interactive
-    /// bindings always resolve to index 0 — the class is never sharded.
+    /// association key (and tests) never need the cursor.
     pub(crate) fn udp_bind_shard(&self, class: EgressClass, shard: usize) -> UdpBind {
         let index = match class {
-            EgressClass::Interactive => 0,
-            EgressClass::Bulk if self.udp_split => 1 + shard % self.bulk_shards,
-            EgressClass::Bulk => 0,
+            EgressClass::Interactive if self.udp_split => shard % self.interactive_shards,
+            EgressClass::Bulk if self.udp_split => {
+                self.interactive_shards + shard % self.bulk_shards
+            }
+            _ => 0,
         };
         UdpBind { class, index }
     }
@@ -1053,14 +1097,28 @@ pub(crate) fn slot_uses_bulk_preset(pool: &ConnPool, i: usize) -> bool {
 /// computed from a stale slot layout silently reintroduces the oversubscription
 /// the split exists to avoid.
 #[must_use]
-pub(crate) fn planned_slot_count(conns: usize, udp_split: bool, udp_egress: usize) -> usize {
+pub(crate) fn planned_slot_count(
+    conns: usize,
+    udp_split: bool,
+    udp_interactive: usize,
+    udp_egress: usize,
+) -> usize {
     let tcp = conns.clamp(1, MAX_POOL_CONNS);
+    let interactive_shards = if udp_split {
+        udp_interactive.clamp(1, MAX_UDP_INTERACTIVE_CONNS)
+    } else {
+        1
+    };
     let bulk_shards = if udp_split {
         udp_egress.clamp(1, MAX_UDP_EGRESS_CONNS)
     } else {
         1
     };
-    let udp_slots = if udp_split { 1 + bulk_shards } else { 1 };
+    let udp_slots = if udp_split {
+        interactive_shards + bulk_shards
+    } else {
+        1
+    };
     tcp + udp_slots
 }
 
@@ -1070,15 +1128,16 @@ mod planned_slot_count_tests {
 
     #[test]
     fn planned_slots_match_the_built_pool() {
-        for (conns, split, egress) in [
-            (None, true, None),
-            (Some(1), true, Some(1)),
-            (Some(16), true, Some(8)),
-            (Some(3), false, Some(8)),
-            (Some(0), true, Some(0)),
-            (Some(99), true, Some(99)),
+        for (conns, split, interactive, egress) in [
+            (None, true, None, None),
+            (Some(1), true, Some(1), Some(1)),
+            (Some(16), true, Some(8), Some(8)),
+            (Some(3), false, Some(8), Some(8)),
+            (Some(0), true, Some(0), Some(0)),
+            (Some(99), true, Some(99), Some(99)),
         ] {
             let conns = conns.unwrap_or(crate::DEFAULT_QUIC_CONNS);
+            let interactive = interactive.unwrap_or(crate::DEFAULT_UDP_INTERACTIVE_CONNS);
             let egress = egress.unwrap_or(crate::DEFAULT_UDP_EGRESS_CONNS);
             let pool = ConnPool::new_with_bulk_ports(
                 conns,
@@ -1086,28 +1145,31 @@ mod planned_slot_count_tests {
                 Vec::new(),
                 true,
                 split,
+                interactive,
                 egress,
                 1,
             );
             assert_eq!(
-                planned_slot_count(conns, split, egress),
+                planned_slot_count(conns, split, interactive, egress),
                 pool.slots_total(),
-                "config ({conns:?}, split={split}, egress={egress:?})"
+                "config ({conns:?}, split={split}, interactive={interactive:?}, egress={egress:?})"
             );
         }
     }
 
     #[test]
-    fn shipped_defaults_build_seven_slots() {
-        // 4 TCP + interactive UDP + 2 bulk shards = 7 pinned runtimes at the
-        // shipped defaults; the main runtime is sized against this number.
+    fn shipped_defaults_build_eight_slots() {
+        // 4 TCP + 2 interactive UDP shards + 2 bulk shards = 8 pinned runtimes
+        // at the shipped defaults; the main runtime is sized against this
+        // number.
         assert_eq!(
             planned_slot_count(
                 crate::DEFAULT_QUIC_CONNS,
                 true,
+                crate::DEFAULT_UDP_INTERACTIVE_CONNS,
                 crate::DEFAULT_UDP_EGRESS_CONNS,
             ),
-            7
+            8
         );
     }
 }

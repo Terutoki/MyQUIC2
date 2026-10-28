@@ -343,11 +343,25 @@ pub(crate) struct FastSess {
     /// `fast_allow_cached`): steady single-target flows skip the re-derivation
     /// after the first datagram. Validated by the same epoch mechanism.
     allow: Option<(u32, SocketAddr, bool)>,
-    /// The session's MQP-3 flow table snapshot handle. Cached here so a steady
-    /// v3 frame resolves a compressed flow id without taking the session-table
-    /// shard lock; the snapshot itself is clone-on-write, so this handle stays
-    /// valid across flow opens.
-    flows: Arc<arc_swap::ArcSwap<FlowTable>>,
+    /// The session's MQP-3 flow table handle. Cached here so a steady v3 frame
+    /// resolves a compressed flow id without taking the session-table shard
+    /// lock; the snapshot itself is clone-on-write, so the handle stays valid
+    /// across flow opens.
+    ///
+    /// **Weak**, for the same reason as [`FastSess::sock`]: a strong handle
+    /// makes this slot a second owner of the session's flow table, and it
+    /// outlives the session. Reaping a session (the 180 s sweeper, an explicit
+    /// close, a reader exit) drops the `SessEntry`'s handle but cannot reach
+    /// into this table — `fast` is a local array of the connection's datagram
+    /// task, and the slot is only rewritten when *another* datagram happens to
+    /// evict it (ids are monotonic, so a dead session's id never arrives
+    /// again). A strong handle therefore pinned up to `MQP3_FLOW_TABLE_MAX_BYTES`
+    /// (22 KiB) per slot, up to 64 slots per connection, for the life of the
+    /// connection, outside the session budget the sweeper enforces. Upgrading
+    /// costs one refcount round-trip on the v3 frame that needs a flow id, and
+    /// a failed upgrade is exactly the "session is gone" signal the caller
+    /// already handles by falling through to [`session_flows`].
+    flows: std::sync::Weak<arc_swap::ArcSwap<FlowTable>>,
 }
 
 impl FastSess {
@@ -380,11 +394,12 @@ pub(crate) fn fast_slot(s: u32) -> usize {
 
 /// The slot describing `s`, found by linear probing from its home position.
 ///
-/// Probing stops at the first empty slot: [`arm_fast`] always installs an entry
-/// at the first empty position from the session's home, so an entry is reachable
-/// while the chain from home up to it has no hole. A hole (left by an eviction
-/// or a stale-slot clear) can therefore only turn a hit into a **miss** — which
-/// is safe, because a miss means "run the slow path", which re-arms the slot —
+/// Probing stops at the first empty slot: [`arm_fast`] installs an entry at the
+/// first empty position from the session's home — or recycles a dead entry seen
+/// before that hole ([`fast_arm_index`]) — so an entry is reachable while the
+/// chain from home up to it has no hole. A hole (left by an eviction or a
+/// stale-slot clear) can therefore only turn a hit into a **miss** — which is
+/// safe, because a miss means "run the slow path", which re-arms the slot —
 /// and can never mis-route a datagram onto another session's socket.
 pub(crate) fn fast_probe(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> Option<usize> {
     let home = fast_slot(s);
@@ -399,9 +414,30 @@ pub(crate) fn fast_probe(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> 
     None
 }
 
-/// Where [`arm_fast`] publishes a session: its existing slot, else the first
-/// empty slot from home, else the least-recently-active slot when all
+/// Whether a slot's session is provably gone: its reader exited, or nothing
+/// owns its socket any more.
+///
+/// Two atomic loads and no refcount RMW (`strong_count` is a plain load, unlike
+/// `upgrade`), so this is cheap enough to run over the whole probe chain in
+/// [`fast_arm_index`]. [`try_stage`] still treats a failed `upgrade` as a miss
+/// rather than trusting this: liveness can change between the two.
+#[inline]
+fn slot_is_dead(slot: &FastSess) -> bool {
+    slot.abort.is_finished() || slot.sock.strong_count() == 0
+}
+
+/// Where [`fast_arm`] publishes a session: its existing slot, else the first
+/// **dead** slot from home (recycling a slot whose session is gone), else the
+/// first empty slot, else the least-recently-active slot when all
 /// [`FAST_SESS_SLOTS`] are taken.
+///
+/// Recycling matters because dead entries are invisible to the probe: session
+/// ids are monotonic and never reused, so no later datagram can evict a dead
+/// session's slot, and [`fast_arm_index`] would keep consuming empty slots
+/// (or evicting live ones) while dead entries lengthen every probe chain for
+/// the rest of the connection's life. Installing into the dead position keeps
+/// the linear-probing invariant: no empty slot lies between `home` and it (we
+/// return at the first empty, and a dead slot is not a hole).
 ///
 /// The eviction order is the session's own liveness stamp (`last`, refreshed at
 /// most once a second per session), so a table that is genuinely over
@@ -409,15 +445,22 @@ pub(crate) fn fast_probe(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> 
 /// quiet ones fall back to the slow path — the same disposition the old
 /// direct-mapped table gave a colliding pair, but only once the table is full,
 /// not on a random low-bit collision below it.
-fn fast_arm_index(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> usize {
+pub(crate) fn fast_arm_index(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> usize {
     let home = fast_slot(s);
+    let mut dead: Option<usize> = None;
     let mut oldest: Option<(u64, usize)> = None;
     for step in 0..FAST_SESS_SLOTS {
         let idx = (home + step) & (FAST_SESS_SLOTS - 1);
         match &fast[idx] {
-            None => return idx,
+            // The first hole ends the chain: a dead slot seen before it is
+            // still reachable from `home`, so recycle that instead of growing
+            // the chain into the hole.
+            None => return dead.unwrap_or(idx),
             Some(slot) if slot.sess == s => return idx,
             Some(slot) => {
+                if dead.is_none() && slot_is_dead(slot) {
+                    dead = Some(idx);
+                }
                 let last = slot.last.load(std::sync::atomic::Ordering::Relaxed);
                 if oldest.is_none_or(|(oldest_last, _)| last < oldest_last) {
                     oldest = Some((last, idx));
@@ -425,8 +468,9 @@ fn fast_arm_index(fast: &[Option<FastSess>; FAST_SESS_SLOTS], s: u32) -> usize {
             }
         }
     }
-    // Every slot is live and none is this session: evict the quietest.
-    oldest.map_or(home, |(_, idx)| idx)
+    // Every slot is taken and none is this session: recycle a dead one if the
+    // scan saw one, else evict the quietest.
+    dead.or(oldest.map(|(_, idx)| idx)).unwrap_or(home)
 }
 
 /// Empty slot value for `[Option<FastSess>; _]` initialization.
@@ -525,11 +569,11 @@ pub(crate) fn try_stage(
 /// Publish `(session, dst)` into this connection's fast table after the slow
 /// path created or found the session, so the next datagram for it is a hit.
 ///
-/// The slot is chosen by [`fast_arm_index`] (existing slot, else first empty
-/// from the session's home, else the quietest), so probing lookups always find
-/// it. A `Stale`/`Miss` memo probe clears the session's slot instead: the
-/// session is gone or invisible, and leaving the old entry in place would keep
-/// sending into it.
+/// The slot is chosen by [`fast_arm_index`] (existing slot, else a dead slot,
+/// else first empty from the session's home, else the quietest), so probing
+/// lookups always find it. A `Stale`/`Miss` memo probe clears the session's
+/// slot instead: the session is gone or invisible, and leaving the old entry in
+/// place would keep sending into it.
 pub(crate) fn arm_fast(
     fast: &mut [Option<FastSess>; FAST_SESS_SLOTS],
     ss: &SessTable,
@@ -560,7 +604,7 @@ pub(crate) fn arm_fast(
                 pin,
                 last_dst: None,
                 allow: None,
-                flows,
+                flows: Arc::downgrade(&flows),
             });
         }
         SessHit::Stale | SessHit::Miss => {
@@ -572,14 +616,19 @@ pub(crate) fn arm_fast(
 }
 
 /// The session's flow table from its fast slot, without taking the session-table
-/// lock. A stale/dead slot falls through to the caller's `session_flows` probe.
+/// lock. A stale/dead slot — including one whose session was reaped and whose
+/// table therefore no longer upgrades — falls through to the caller's
+/// [`session_flows`] probe, which answers `None` for a truly dead session.
 fn fast_flows(
     fast: &[Option<FastSess>; FAST_SESS_SLOTS],
     s: u32,
 ) -> Option<Arc<arc_swap::ArcSwap<FlowTable>>> {
     let idx = fast_probe(fast, s)?;
     let slot = fast[idx].as_ref()?;
-    slot.is_live_for(s).then(|| slot.flows.clone())
+    if !slot.is_live_for(s) {
+        return None;
+    }
+    slot.flows.upgrade()
 }
 
 /// Owned form used to unify an inline address borrowed from the DATAGRAM with a
@@ -3419,6 +3468,13 @@ async fn handle_ingress_frame(
     }
 }
 
+/// Capacity of the control-stream → datagram-loop handoff queue
+/// ([`r3_control_stream_task`]). Same order as the server→client writer queue
+/// in [`R2ConnState::queue_ctl`]: the datagram loop drains this between packets,
+/// so a full queue means the peer outpaced its own receive path, not that
+/// messages are being lost.
+const CTL_IN_QUEUE: usize = 64;
+
 /// The connection's rev3 control-stream task: one reliable, ordered bidi stream
 /// carries every rare control message in both directions (see
 /// `mqp::ctl_stream`). It owns the stream halves and bridges them to the rest of
@@ -3429,6 +3485,14 @@ async fn handle_ingress_frame(
 /// - outbound messages are written straight from the bounded queue in
 ///   [`R2ConnState::queue_ctl`] (REJECT / SESS_CLOSE / NEED_CONTEXT).
 ///
+/// The inbound handoff is **bounded** ([`CTL_IN_QUEUE`]) and applies
+/// backpressure: a peer that outruns the datagram loop makes this task wait,
+/// which its reliable stream turns into QUIC flow control on the peer, instead
+/// of growing a per-connection queue. Dropping the message instead would break
+/// the reliable-plane contract (`OPEN`/`CLOSE` are not idempotent), and waiting
+/// cannot deadlock: the datagram loop only ever touches this side through
+/// `queue_ctl`'s `try_send`.
+///
 /// The task ends when the stream or the connection goes away; the datagram
 /// plane keeps running (its loss recovery never depends on a control message).
 async fn r3_control_stream_task(
@@ -3437,7 +3501,7 @@ async fn r3_control_stream_task(
     mut tx: CtlSender,
     mut rx: CtlReceiver,
     mut out_rx: tokio::sync::mpsc::Receiver<CtlMessage>,
-    ctl_in: tokio::sync::mpsc::UnboundedSender<CtlMessage>,
+    ctl_in: tokio::sync::mpsc::Sender<CtlMessage>,
 ) {
     loop {
         tokio::select! {
@@ -3451,7 +3515,10 @@ async fn r3_control_stream_task(
                         continue;
                     }
                     r2_stats::bump(&r2_stats::CTL_MSGS_RECV);
-                    if ctl_in.send(msg).is_err() {
+                    // Bounded handoff: waiting here applies the peer's own QUIC
+                    // stream flow control, which is the only correct answer to
+                    // "the datagram loop is a queue behind" — see the fn doc.
+                    if ctl_in.send(msg).await.is_err() {
                         // The datagram reader is gone: nothing can act on the
                         // message anymore.
                         r2_stats::bump(&r2_stats::CTL_STREAM_ERRORS);
@@ -3511,7 +3578,7 @@ async fn dispatch_rev3_stream(
     allow_private: bool,
     conn: quinn::Connection,
     state: Arc<R2ConnState>,
-    ctl_in: tokio::sync::mpsc::UnboundedSender<CtlMessage>,
+    ctl_in: tokio::sync::mpsc::Sender<CtlMessage>,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut first = [0u8; 1];
@@ -3668,10 +3735,12 @@ async fn handle_conn_inner(
     // rev3 reliable control plane: one client-opened bidi stream. `ctl_out` is
     // the server→client writer queue (installed when the stream is accepted);
     // `ctl_in` carries the peer's messages to the datagram loop, which owns the
-    // reassembler/session table they act on. Both are unused on rev2 (controls
-    // ride DATAGRAMs there).
+    // reassembler/session table they act on. Both are **bounded** (this one at
+    // `CTL_IN_QUEUE`, and it applies backpressure — see
+    // `r3_control_stream_task`) and both are unused on rev2 (controls ride
+    // DATAGRAMs there).
     let (ctl_out_tx, ctl_out_rx) = tokio::sync::mpsc::channel::<CtlMessage>(64);
-    let (ctl_in_tx, mut ctl_in_rx) = tokio::sync::mpsc::unbounded_channel::<CtlMessage>();
+    let (ctl_in_tx, mut ctl_in_rx) = tokio::sync::mpsc::channel::<CtlMessage>(CTL_IN_QUEUE);
     r2_state.install_ctl_out(ctl_out_tx);
     r2_state.install_ctl_out_rx(ctl_out_rx);
     let mut ctl_in_open = true;

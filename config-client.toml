@@ -74,10 +74,20 @@ quic_conns = 4
 # udp_fail_closed = true
 # Split UDP egress into dedicated connections by class (default true):
 # interactive_ports destinations and flows whose first datagram is <= 512 B
-# (STUN/DTLS/RTP-sized media, DNS, games) ride the interactive connection,
-# everything else the bulk one, so a bulk flow cannot starve a
+# (STUN/DTLS/RTP-sized media, DNS, games) ride the interactive connections,
+# everything else the bulk ones, so a bulk flow cannot starve a
 # latency-sensitive flow. false = one shared UDP connection (one fewer dial).
 # udp_split = true
+# Number of dedicated **interactive** UDP connections (default 2, clamped
+# 1..=8). The class is the latency-sensitive population and every association
+# in it shares its connection's 1 MiB DATAGRAM send buffer, 256 KiB stager and
+# one congestion window, so a single connection makes the class one shared
+# queue: a burst by one association can push the others into a Blocked drop.
+# Every interactive association is bound to one shard for life; raise this on
+# hosts fronting many small-flow associations (a game/media gateway), lower it
+# to 1 to keep one stable interactive connection. Ignored with
+# udp_split = false.
+# udp_interactive_conns = 2
 # Number of dedicated **bulk** UDP connections (default 2, clamped 1..=8).
 # Every bulk association is bound to one shard for life, so N associations
 # spread over min(N, k) connections on both ends — k client send/encrypt
@@ -90,7 +100,7 @@ quic_conns = 4
 # packet size (default [51820, 1194] = WireGuard, OpenVPN). Needed because the
 # egress class is fixed by the association's first datagram and a tunnel's
 # first packet is small (WireGuard handshake 148 B), which the size heuristic
-# alone would otherwise put on the single interactive connection next to
+# alone would otherwise put on an interactive connection next to
 # DNS/STUN/games. Ports in interactive_ports keep their interactive class.
 # udp_bulk_ports = [51820, 1194]
 # Max concurrent UDP associations (default 4032, clamped 1..=4032). Each

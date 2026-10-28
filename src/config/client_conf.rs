@@ -4,8 +4,9 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use super::tuning::{
-    DEFAULT_FORWARD_CONNS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS, MAX_POOL_CONNS,
-    MAX_SOCKS_CONNS, MAX_UDP_ASSOCS, MAX_UDP_EGRESS_CONNS, d_5, d_bbr, d_keepalive, d_true,
+    DEFAULT_FORWARD_CONNS, DEFAULT_QUIC_CONNS, DEFAULT_UDP_EGRESS_CONNS,
+    DEFAULT_UDP_INTERACTIVE_CONNS, MAX_POOL_CONNS, MAX_SOCKS_CONNS, MAX_UDP_ASSOCS,
+    MAX_UDP_EGRESS_CONNS, MAX_UDP_INTERACTIVE_CONNS, d_5, d_bbr, d_keepalive, d_true,
 };
 use crate::dns::IpPreference;
 use crate::mqp::ack::normalize_alpn;
@@ -101,7 +102,7 @@ pub struct ClientConf {
     /// The egress class is fixed by the association's first datagram, and a
     /// tunnel's first packet is small (WireGuard handshake initiation is
     /// 148 B, OpenVPN control packets 14-60 B), so the size heuristic alone
-    /// would bind a whole VPN tunnel to the single interactive connection —
+    /// would bind a whole VPN tunnel to the interactive connections —
     /// sharing one congestion window and DATAGRAM buffer with DNS/STUN/games,
     /// exactly the starvation the split exists to prevent. Unset = the
     /// shipped VPN list `[51820, 1194]` (WireGuard, OpenVPN). Set it to `[]`
@@ -116,17 +117,29 @@ pub struct ClientConf {
     /// cwnd with TCP traffic.
     #[serde(default)]
     pub udp_fail_closed: Option<bool>,
-    /// Whether UDP egress is split into one dedicated connection per egress
+    /// Whether UDP egress is split into dedicated connections per egress
     /// class (default `true`). Destinations in `interactive_ports`, and
     /// associations whose first datagram is no larger than 512 B
     /// (STUN/DTLS/RTP-sized media, DNS, games), ride the **interactive** UDP
-    /// connection; everything else rides one of the **bulk** shards — so a
+    /// connections; everything else rides one of the **bulk** shards — so a
     /// bulk flow's congestion window and 1 MB DATAGRAM send buffer cannot
     /// starve a latency-sensitive flow. A client with the split dials
-    /// `quic_conns + 1 + udp_egress_conns` connections; `false` restores the
-    /// single shared UDP connection (`quic_conns + 1`) and disables sharding.
+    /// `quic_conns + udp_interactive_conns + udp_egress_conns` connections;
+    /// `false` restores the single shared UDP connection (`quic_conns + 1`) and
+    /// disables sharding in both classes.
     #[serde(default)]
     pub udp_split: Option<bool>,
+    /// Number of dedicated **interactive** UDP egress connections ("shards").
+    ///
+    /// Every interactive association is assigned one shard from its first
+    /// datagram and keeps it for life (see `ConnPool::udp_bind`), so N such
+    /// associations spread over min(N, k) connections instead of queueing on
+    /// one shared 1 MiB DATAGRAM buffer, 256 KiB stager and congestion window.
+    /// Unset = [`DEFAULT_UDP_INTERACTIVE_CONNS`] (2); 1 restores the single
+    /// stable interactive connection, and `udp_split = false` ignores this
+    /// value.
+    #[serde(default)]
+    pub udp_interactive_conns: Option<usize>,
     /// Number of dedicated **bulk** UDP egress connections ("shards").
     ///
     /// Every bulk association is assigned one shard from its first datagram
@@ -136,7 +149,7 @@ pub struct ClientConf {
     /// the server k per-connection DATAGRAM readers. On a many-core host
     /// raise it toward half the cores (up to 8); 1 restores the single bulk
     /// connection. Unset = `DEFAULT_UDP_EGRESS_CONNS` (2). The interactive
-    /// class is never sharded (it must stay one stable connection), and
+    /// class has its own shard count ([`Self::udp_interactive_conns`]), and
     /// `udp_split = false` ignores this value.
     #[serde(default)]
     pub udp_egress_conns: Option<usize>,
@@ -273,13 +286,23 @@ impl ClientConf {
 
     /// Bulk UDP egress shard count: [`DEFAULT_UDP_EGRESS_CONNS`] (2) when
     /// `udp_egress_conns` is unset, clamped to
-    /// `1..=`[`MAX_UDP_EGRESS_CONNS`]. The interactive class always keeps its
-    /// single dedicated connection; this number multiplies the bulk class
+    /// `1..=`[`MAX_UDP_EGRESS_CONNS`]. The interactive class has its own count
+    /// ([`Self::udp_interactive_cnt`]); this number multiplies the bulk class
     /// only, and only while `udp_split` is on.
     pub fn udp_egress_cnt(&self) -> usize {
         self.udp_egress_conns
             .unwrap_or(DEFAULT_UDP_EGRESS_CONNS)
             .clamp(1, MAX_UDP_EGRESS_CONNS)
+    }
+
+    /// Interactive UDP egress shard count:
+    /// [`DEFAULT_UDP_INTERACTIVE_CONNS`] (2) when `udp_interactive_conns` is
+    /// unset, clamped to `1..=`[`MAX_UDP_INTERACTIVE_CONNS`]. 1 is the legacy
+    /// shape — every small-first-datagram association on one connection.
+    pub fn udp_interactive_cnt(&self) -> usize {
+        self.udp_interactive_conns
+            .unwrap_or(DEFAULT_UDP_INTERACTIVE_CONNS)
+            .clamp(1, MAX_UDP_INTERACTIVE_CONNS)
     }
 
     /// Concurrent UDP-association cap: [`MAX_UDP_ASSOCS`] (4032) when

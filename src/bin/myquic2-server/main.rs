@@ -58,6 +58,33 @@ fn reply_filter(c: &ServerConf) -> ReplyFilter {
     }
 }
 
+/// Slack above the derived fd figure: the config file, stdio, the DNS
+/// resolver's request sockets, the tokio drivers' epoll/eventfd/pipes and the
+/// log writer.
+const FD_GUARD: usize = 256;
+
+/// Fds the documented caps can need at once: one UDP socket per session
+/// ([`MAX_SESSIONS_GLOBAL`]), one TCP socket per live relay flow
+/// ([`MAX_STREAM_TASKS`]) and one per QUIC ingress endpoint.
+fn designed_fds() -> u64 {
+    (MAX_SESSIONS_GLOBAL + MAX_STREAM_TASKS + MAX_QUIC_ENDPOINTS + FD_GUARD) as u64
+}
+
+/// Raise the soft `RLIMIT_NOFILE` toward [`designed_fds`] and report what is in
+/// force. See `myquic2::fdlimit` for why this is a startup step rather than a
+/// per-create error path.
+fn report_fd_budget() {
+    let want = designed_fds();
+    match myquic2::fdlimit::raise_nofile_limit(want) {
+        Ok(lim) if lim.shortfall(want) == 0 => info!("{}", lim.describe(want)),
+        Ok(lim) => warn!("{}", lim.describe(want)),
+        Err(e) => warn!(
+            "nofile limit unavailable ({e}); sessions and relays past the process default fail \
+             with EMFILE"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -97,6 +124,12 @@ async fn main() -> Result<()> {
         recvmmsg_available()
     );
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
+    // File-descriptor budget before the first socket: the designed caps need
+    // one fd per session socket plus one per relayed TCP flow, which is an
+    // order of magnitude above a stock unix soft limit. `EMFILE` at session
+    // create is logged and dropped like any transient failure, so without this
+    // line a host silently serves a fraction of its documented capacity.
+    report_fd_budget();
 
     if is_placeholder_token(&c.auth_token) {
         warn!(

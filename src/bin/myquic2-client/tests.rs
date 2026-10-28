@@ -1076,8 +1076,8 @@ fn udp_egress_is_confined_to_the_dedicated_slots() {
             "fail-closed egress crossed into the interactive class"
         );
     }
-    // The interactive class is never sharded: with fail-closed on it has no
-    // sibling to fail over to and stays on its single slot.
+    // One interactive shard in this pool: with fail-closed on the class has
+    // no sibling to fail over to and stays on its own slot.
     let (order, k) = egress.egress_order(
         &sharded,
         sharded.udp_bind_shard(EgressClass::Interactive, 0),
@@ -1164,6 +1164,7 @@ fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
         true,
         true,
         1,
+        1,
         data_stale_threshold_ms(5, 40),
     );
     // WireGuard's 148 B handshake must not be mistaken for interactive.
@@ -1181,6 +1182,7 @@ fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
         vec![443],
         true,
         true,
+        1,
         1,
         data_stale_threshold_ms(5, 40),
     );
@@ -1200,8 +1202,9 @@ fn udp_bulk_ports_force_bulk_regardless_of_first_payload() {
 
 /// Bulk associations rotate over the shard set and never onto another
 /// class's slot; a zero shard count clamps up (the bulk class always owns at
-/// least one dedicated connection with the split on) and the interactive
-/// class is never sharded whatever the cursor says.
+/// least one dedicated connection with the split on). This pool has one
+/// interactive shard, so the interactive cursor stays on index 0 — the
+/// multi-shard case is `interactive_associations_rotate_over_their_own_shards`.
 #[test]
 fn bulk_associations_rotate_over_the_shard_set() {
     let pool = ConnPool::new(3, vec![], true, true, 3);
@@ -1210,7 +1213,7 @@ fn bulk_associations_rotate_over_the_shard_set() {
         .map(|_| pool.udp_bind(EgressClass::Bulk).index)
         .collect();
     assert_eq!(idx, vec![1, 2, 3, 1, 2, 3, 1], "rotation, not hashing");
-    // The interactive class is never sharded: the cursor does not matter.
+    // A single interactive shard: the cursor does not matter.
     for _ in 0..4 {
         assert_eq!(pool.udp_bind(EgressClass::Interactive).index, 0);
     }
@@ -1237,6 +1240,85 @@ fn bulk_associations_rotate_over_the_shard_set() {
     assert_eq!(shared.udp_bind(EgressClass::Bulk).index, 0);
     assert_eq!(shared.udp_bind(EgressClass::Interactive).index, 0);
     assert_eq!(shared.udp_bind_shard(EgressClass::Bulk, 3).index, 0);
+}
+
+/// The interactive class is sharded too: every interactive slot is a separate
+/// QUIC connection with its own 1 MiB DATAGRAM buffer, 256 KiB stager and
+/// congestion window, so N small-packet associations spread over min(N, k)
+/// connections instead of queueing behind one another on a single one.
+#[test]
+fn interactive_associations_rotate_over_their_own_shards() {
+    // 3 TCP + 2 interactive + 2 bulk.
+    let pool = ConnPool::new_with_bulk_ports(
+        3,
+        vec![],
+        vec![],
+        true,
+        true,
+        2,
+        2,
+        data_stale_threshold_ms(5, 40),
+    );
+    assert_eq!(pool.udp_slot_count(), 4);
+    assert_eq!(pool.interactive_shards(), 2);
+    assert_eq!(pool.slots_total(), 7);
+
+    // Interactive: indices 0..2, rotating on its own cursor.
+    let interactive: Vec<usize> = (0..5)
+        .map(|_| pool.udp_bind(EgressClass::Interactive).index)
+        .collect();
+    assert_eq!(interactive, vec![0, 1, 0, 1, 0]);
+    // Bulk: indices 2..4. Its cursor is independent, so the bulk burst above
+    // cannot shift an interactive binding.
+    let bulk: Vec<usize> = (0..5)
+        .map(|_| pool.udp_bind(EgressClass::Bulk).index)
+        .collect();
+    assert_eq!(bulk, vec![2, 3, 2, 3, 2]);
+    assert_eq!(pool.udp_bind(EgressClass::Interactive).index, 1);
+
+    // The class ranges are the fail-closed boundary.
+    assert_eq!(pool.udp_class_slots(EgressClass::Interactive), 0..2);
+    assert_eq!(pool.udp_class_slots(EgressClass::Bulk), 2..4);
+    // Explicit shard keys reduce modulo the class's own count.
+    assert_eq!(pool.udp_bind_shard(EgressClass::Interactive, 5).index, 1);
+    assert_eq!(pool.udp_bind_shard(EgressClass::Bulk, 5).index, 3);
+
+    // Every interactive slot is its own pool slot past the TCP range.
+    for i in 0..2 {
+        assert_eq!(pool.udp_global_slot(i), 3 + i);
+    }
+
+    // One interactive shard restores the legacy single stable connection, and
+    // the class then rotates on index 0 only.
+    let single = ConnPool::new_with_bulk_ports(
+        3,
+        vec![],
+        vec![],
+        true,
+        true,
+        1,
+        2,
+        data_stale_threshold_ms(5, 40),
+    );
+    assert_eq!(single.udp_slot_count(), 3);
+    for _ in 0..4 {
+        assert_eq!(single.udp_bind(EgressClass::Interactive).index, 0);
+    }
+
+    // `udp_split = false` collapses both classes onto the shared slot.
+    let shared = ConnPool::new_with_bulk_ports(
+        3,
+        vec![],
+        vec![],
+        true,
+        false,
+        4,
+        4,
+        data_stale_threshold_ms(5, 40),
+    );
+    assert_eq!(shared.udp_slot_count(), 1);
+    assert_eq!(shared.udp_bind(EgressClass::Interactive).index, 0);
+    assert_eq!(shared.udp_class_slots(EgressClass::Bulk), 0..1);
 }
 
 /// Two egress bindings never share a cached handle: a handle published for
@@ -4784,7 +4866,11 @@ async fn deferred_batch_flush_recovers_a_dead_egress_verdict() {
 fn slot_pinning_prioritizes_the_interactive_pair() {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let pool = ConnPool::new(4, vec![], true, true, 2);
-    let pin_cores = priority_pin_cores(&pool);
+    // The shipped split: the main runtime keeps half the machine, so the pinned
+    // slots may claim `usable = ceil(cores / 2)` cores at most.
+    let app_workers = cores / 2;
+    let usable = cores.saturating_sub(app_workers).max(1);
+    let pin_cores = priority_pin_cores(&pool, app_workers);
     assert_eq!(pin_cores.len(), pool.slots_total());
     // Rank 0 is always pinned (there is at least one core).
     assert_eq!(
@@ -4792,35 +4878,78 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
         Some(0),
         "the interactive TCP slot is the top priority"
     );
-    if cores >= 2 {
+    if usable >= 2 {
         assert_eq!(
             pin_cores[pool.udp_global_slot(0)],
             Some(1),
             "the interactive UDP slot is the second priority"
         );
     }
-    if cores >= 3 {
+    if usable >= 3 {
         assert_eq!(
             pin_cores[1],
             Some(2),
             "the remaining TCP slots follow the interactive pair"
         );
     }
-    // Every pinned rank is a real core, and past the core count slots float.
+    // Every pinned rank is a real core, and past the usable count slots float.
     let mut ranks: Vec<usize> = pin_cores.iter().flatten().copied().collect();
     ranks.sort_unstable();
     assert_eq!(
         ranks,
-        (0..cores.min(pool.slots_total())).collect::<Vec<_>>(),
-        "pins are a bijection onto the first `min(cores, slots)` ranks"
+        (0..usable.min(pool.slots_total())).collect::<Vec<_>>(),
+        "pins are a bijection onto the first `min(usable, slots)` ranks"
     );
-    // A pool wider than the machine leaves the lowest-priority tail floating:
-    // the number of pinned slots is exactly the usable core count.
+    // A pool wider than the usable cores leaves the lowest-priority tail
+    // floating: the number of pinned slots is exactly the usable core count.
     assert_eq!(
         pin_cores.iter().flatten().count(),
-        cores.min(pool.slots_total()),
-        "exactly `min(cores, slots)` slots are pinned"
+        usable.min(pool.slots_total()),
+        "exactly `min(usable, slots)` slots are pinned"
     );
+    // And pinning never eats a core the app-side pool was sized for.
+    assert!(
+        cores.saturating_sub(pin_cores.iter().flatten().count()) >= app_workers,
+        "pinned slots must leave the {app_workers} app-side workers their cores"
+    );
+
+    // Every interactive shard outranks every bulk slot: the class carries the
+    // latency-sensitive population, so widening it must not push its later
+    // shards behind bulk TCP/UDP slots.
+    let wide = ConnPool::new_with_bulk_ports(
+        4,
+        vec![],
+        vec![],
+        true,
+        true,
+        2,
+        2,
+        data_stale_threshold_ms(5, 40),
+    );
+    let wide_pins = priority_pin_cores(&wide, app_workers);
+    assert_eq!(wide_pins.len(), wide.slots_total());
+    assert_eq!(wide_pins[0], Some(0), "interactive TCP slot first");
+    if usable >= 2 {
+        assert_eq!(
+            wide_pins[wide.udp_global_slot(0)],
+            Some(1),
+            "first interactive UDP shard is rank 1"
+        );
+    }
+    if usable >= 3 {
+        assert_eq!(
+            wide_pins[wide.udp_global_slot(1)],
+            Some(2),
+            "second interactive UDP shard outranks every bulk slot"
+        );
+    }
+    if usable >= 4 {
+        assert_eq!(
+            wide_pins[1],
+            Some(3),
+            "the remaining TCP slots follow the whole interactive class"
+        );
+    }
 }
 
 // ---- Memory-retention fixes: egress dead-handle release, UDP-assoc cap ----
@@ -7581,29 +7710,67 @@ fn app_ip_pin_is_family_tolerant() {
 }
 
 /// PERF-3: the main runtime only loses workers to the sharded slot runtimes
-/// where those slots are really pinned (Linux). Elsewhere the subtraction had no
-/// basis and collapsed the app-side pool to one worker at the shipped defaults.
+/// where those slots are really pinned (Linux), and even there it never drops
+/// below half the machine — the shipped 7 slots on an 8-core host must not leave
+/// every SOCKS/TCP/UDP task on one worker.
 #[test]
 fn main_runtime_worker_count_only_subtracts_real_pinning() {
-    // Linux: 7 pinned slots on 8 cores leave one worker (floor), and the
-    // subtraction scales with the core count.
-    assert_eq!(main_runtime_workers_for(8, true, 7, true), 1);
+    // Linux: 7 pinned slots on 8 cores may claim at most half the machine, so
+    // the app-side pool keeps the other half (the old rule left exactly one).
+    assert_eq!(main_runtime_workers_for(8, true, 7, true), 4);
+    // A wide machine keeps the one-core-per-slot shape: 16 - 7 = 9.
     assert_eq!(main_runtime_workers_for(16, true, 7, true), 9);
-    assert_eq!(
-        main_runtime_workers_for(4, true, 7, true),
-        1,
-        "floor of one"
-    );
+    // 4 cores: 7 slots may only claim 2, leaving 2 workers.
+    assert_eq!(main_runtime_workers_for(4, true, 7, true), 2);
+    // Degenerate core counts still yield a usable runtime.
     assert_eq!(main_runtime_workers_for(1, true, 7, true), 1);
+    assert_eq!(main_runtime_workers_for(2, true, 7, true), 1);
+    assert_eq!(main_runtime_workers_for(0, true, 7, true), 1);
     // Off Linux pinning is a no-op: the slot threads reserve no core, so the
     // full default width is kept (this was the one-worker regression).
     assert_eq!(main_runtime_workers_for(8, true, 7, false), 8);
     assert_eq!(main_runtime_workers_for(4, true, 7, false), 4);
     // Shared-runtime topology: no pinned slot threads at all.
     assert_eq!(main_runtime_workers_for(8, false, 7, true), 8);
-    // A degenerate core count still yields a usable runtime.
-    assert_eq!(main_runtime_workers_for(0, true, 7, true), 1);
     assert_eq!(main_runtime_workers_for(0, false, 7, false), 1);
+    // Invariant over the whole matrix: pinned slots never take more than half
+    // the machine, so the pool that moves payload keeps at least the other
+    // half (rounded up) whatever the pool width is.
+    for cores in 1..=64usize {
+        for slots in [1, 4, 7, 9, 16] {
+            let workers = main_runtime_workers_for(cores, true, slots, true);
+            assert!(workers >= 1, "cores={cores} slots={slots}");
+            assert_eq!(
+                workers,
+                cores.saturating_sub(slots.min(cores / 2)).max(1),
+                "cores={cores} slots={slots}"
+            );
+            assert!(
+                workers >= cores.div_ceil(2),
+                "cores={cores} slots={slots} left only {workers} workers"
+            );
+        }
+    }
+}
+
+/// The startup fd raise must be sized off the pools that actually spend fds:
+/// one accepted socket per SOCKS/`tcp_forward` relay, one socket per UDP
+/// association/forward peer, one QUIC endpoint per pool slot. A cap change that
+/// leaves this derivation behind makes the raise (and the log line that reports
+/// it) understate what the process needs.
+#[test]
+fn fd_budget_covers_the_relay_and_association_pools() {
+    let floor = (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS) as u64;
+    assert!(
+        designed_fds() >= floor,
+        "designed_fds() {} < relay+association floor {floor}",
+        designed_fds()
+    );
+    assert_eq!(
+        designed_fds(),
+        (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + MAX_POOL_CONNS + FD_GUARD) as u64,
+        "the endpoint term and guard band stay part of the derivation"
+    );
 }
 
 /// PERF-9: a `TRAIN dict` resolves every distinct id through one `get_batch`

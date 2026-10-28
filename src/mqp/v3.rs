@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use super::addr::{AddrHeader, TargetAddr, TargetAddrRef};
 use super::error::MqpError;
-use super::fragment::MQP_FRAG_MAX_PAYLOAD;
+use super::fragment::{MQP_FRAG_MAX_PAYLOAD, MQP_FRAG_MAX_TOTAL};
 
 /// High nibble of the first byte: frame kind. The low nibble is flags.
 pub const MQP3_SINGLE: u8 = 0x10;
@@ -674,7 +674,7 @@ pub fn decode_fragment_v3(b: &[u8]) -> Result<FragmentV3Ref<'_>, MqpError> {
         .get(off)
         .ok_or(MqpError::Malformed("truncated v3 frag total"))?;
     off += 1;
-    if total == 0 || idx >= total {
+    if total == 0 || total > MQP_FRAG_MAX_TOTAL || idx >= total {
         return Err(MqpError::Malformed("bad v3 frag index"));
     }
     let inline = if flags & MQP3_FLAG_INLINE != 0 {
@@ -696,6 +696,16 @@ pub fn decode_fragment_v3(b: &[u8]) -> Result<FragmentV3Ref<'_>, MqpError> {
     if off >= b.len() {
         return Err(MqpError::Malformed("empty v3 frag chunk"));
     }
+    // The reassembler refuses a partial past `MQP_FRAG_MAX_PAYLOAD`, so a chunk
+    // that alone exceeds it can never complete: reject it here, where the frame
+    // is still one slice, instead of letting it into a bounded pool to be
+    // dropped there. `total` is checked against `MQP_FRAG_MAX_TOTAL` above for
+    // the same reason (`MQP3_FLOW_TABLE_MAX_BYTES` sizes the per-flow pool off
+    // those two constants).
+    if b.len() - off > MQP_FRAG_MAX_PAYLOAD {
+        return Err(MqpError::Malformed("oversized v3 frag chunk"));
+    }
+    let chunk = &b[off..];
     Ok(FragmentV3Ref {
         sess,
         flow,
@@ -704,7 +714,7 @@ pub fn decode_fragment_v3(b: &[u8]) -> Result<FragmentV3Ref<'_>, MqpError> {
         id,
         idx,
         total,
-        chunk: &b[off..],
+        chunk,
     })
 }
 
@@ -1045,6 +1055,55 @@ mod tests {
         let d = encode_fragment_v3(7, 0, None, false, 1, 0, 1, b"x", 1500).unwrap();
         assert_eq!(d.len(), MQP3_FRAG_PREFIX_LEN + 1);
         assert!(decode_fragment_v3(&[0x30, 7, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    /// Hostile-input hardening: `total` and the chunk length are promises to a
+    /// bounded pool, so the decoder must refuse a set that can never complete
+    /// instead of handing it to the reassembler to drop. Both bounds are the
+    /// reassembler's own constants (`MQP_FRAG_MAX_TOTAL`,
+    /// `MQP_FRAG_MAX_PAYLOAD`), and both boundary values stay legal.
+    #[test]
+    fn decode_fragment_v3_rejects_impossible_totals_and_oversized_chunks() {
+        // Layout for a no-flow frame: flags(1) sess(4) id(4) idx(1) total(1).
+        const IDX_AT: usize = 9;
+        const TOTAL_AT: usize = 10;
+        let mut d = encode_fragment_v3(7, 0, None, false, 1, 0, 2, b"x", 1500)
+            .unwrap()
+            .to_vec();
+        assert_eq!(d[TOTAL_AT], 2, "premise: total is where the test writes it");
+
+        d[TOTAL_AT] = MQP_FRAG_MAX_TOTAL + 1;
+        assert!(
+            matches!(
+                decode_fragment_v3(&d),
+                Err(MqpError::Malformed("bad v3 frag index"))
+            ),
+            "a total past MQP_FRAG_MAX_TOTAL can never assemble"
+        );
+        // The largest supported width still decodes.
+        d[TOTAL_AT] = MQP_FRAG_MAX_TOTAL;
+        d[IDX_AT] = MQP_FRAG_MAX_TOTAL - 1;
+        assert_eq!(decode_fragment_v3(&d).unwrap().total, MQP_FRAG_MAX_TOTAL);
+
+        // One chunk over the whole per-flow payload budget can never complete
+        // either; the encoder is unbounded on purpose (`limit` only caps the
+        // datagram), so the decoder is the gate.
+        let over = vec![0u8; MQP_FRAG_MAX_PAYLOAD + 1];
+        let d = encode_fragment_v3(7, 0, None, false, 1, 0, 2, &over, usize::MAX).unwrap();
+        assert!(
+            matches!(
+                decode_fragment_v3(&d),
+                Err(MqpError::Malformed("oversized v3 frag chunk"))
+            ),
+            "a chunk past MQP_FRAG_MAX_PAYLOAD can never assemble"
+        );
+        let full = vec![0u8; MQP_FRAG_MAX_PAYLOAD];
+        let d = encode_fragment_v3(7, 0, None, false, 1, 0, 2, &full, usize::MAX).unwrap();
+        assert_eq!(
+            decode_fragment_v3(&d).unwrap().chunk.len(),
+            MQP_FRAG_MAX_PAYLOAD,
+            "the boundary itself stays legal"
+        );
     }
 
     #[test]

@@ -915,6 +915,142 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     assert!(staged.is_empty(), "a miss must not stage anything");
 }
 
+/// A dead session's slot must be **recycled**, not left in the probe chain.
+///
+/// Session ids come from a monotonic counter and are never reused, so once a
+/// session is reaped nothing ever names it again and the only way out of the
+/// table is another datagram's arm evicting the entry. `fast_arm_index` used to
+/// take a free slot, or the quietest live one once the table was full, and
+/// never a dead entry: 64 slots fill with tombstones on a long-lived connection
+/// and every arm pays a full-table scan from its home.
+#[tokio::test]
+async fn arm_recycles_a_dead_slot_instead_of_growing_the_chain() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let conn_id = next_conn_id();
+    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let dst: SocketAddr = "198.51.100.11:53".parse().unwrap();
+
+    // `s_new` shares `s_dead`'s home slot, so arming it must probe through the
+    // dead entry first.
+    let s_dead = 5u32;
+    let s_new = s_dead + FAST_SESS_SLOTS as u32;
+    let home = fast_slot(s_dead);
+    assert_eq!(fast_slot(s_new), home, "the fixture must share a home slot");
+
+    let mut socks = Vec::new();
+    let abort = {
+        let entry = capped_session(s_dead, 0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(s_dead).write().insert(s_dead, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, s_dead, sock.clone(), last, abort.clone(), epoch);
+        socks.push(sock);
+        abort
+    };
+    // Arm while the session is still alive: `sess_memo_lookup` answers `Stale`
+    // for a finished reader, and a stale arm clears the slot instead of
+    // publishing it.
+    arm_fast(
+        &mut fast,
+        &ss,
+        conn_id,
+        s_dead,
+        TargetAddrRef::Ip(dst),
+        dst,
+        DNS_CACHE_TTL_MS,
+    );
+    assert_eq!(
+        fast_probe(&fast, s_dead),
+        Some(home),
+        "premise: armed at home"
+    );
+
+    // Reap it: the reply reader exits and the sweeper drops the table entry
+    // under the shard lock. Those two are exactly what `slot_is_dead` keys on.
+    abort.abort();
+    for _ in 0..10_000 {
+        if abort.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(abort.is_finished(), "premise: the reader task is gone");
+    let removed = ss.shard(s_dead).write().remove(&s_dead);
+    assert!(removed.is_some(), "premise: the entry was published");
+    drop(removed);
+
+    assert_eq!(
+        fast_arm_index(&fast, s_new),
+        home,
+        "arming must recycle the dead slot instead of consuming the free slot \
+         after it"
+    );
+    // Until that arm writes the slot the dead entry is still the head of
+    // `s_new`'s chain, and it must never answer for `s_new`.
+    assert!(fast_probe(&fast, s_new).is_none());
+}
+
+/// Reaping a session must free its MQP-3 flow table even though the
+/// connection's fast slot still names it.
+///
+/// The slot array is a local of the connection's DATAGRAM task, which no
+/// sweeper can reach, and monotonic ids mean nothing ever evicts a dead entry.
+/// A strong `Arc` there made the fast table the flow table's *second owner*, so
+/// a reaped session's flow state (up to `MQP3_FLOW_TABLE_MAX_BYTES` per slot,
+/// 64 slots per connection) stayed pinned outside every session budget until
+/// the connection itself ended. The slot holds a `Weak` and only borrows the
+/// table through the session's own `Arc`.
+#[tokio::test]
+async fn reaped_session_releases_its_flow_table_from_the_fast_slot() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let conn_id = next_conn_id();
+    let mut fast: [Option<FastSess>; FAST_SESS_SLOTS] = [NO_FAST_SESS; FAST_SESS_SLOTS];
+    let dst: SocketAddr = "198.51.100.12:53".parse().unwrap();
+    let s = 3u32;
+
+    let mut socks = Vec::new();
+    let abort = {
+        let entry = capped_session(s, 0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(s).write().insert(s, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, s, sock.clone(), last, abort.clone(), epoch);
+        socks.push(sock);
+        abort
+    };
+    arm_fast(
+        &mut fast,
+        &ss,
+        conn_id,
+        s,
+        TargetAddrRef::Ip(dst),
+        dst,
+        DNS_CACHE_TTL_MS,
+    );
+    let flows = session_flows(&ss, s).expect("the armed session is live");
+    let weak = Arc::downgrade(&flows);
+    drop(flows);
+    assert!(
+        weak.upgrade().is_some(),
+        "premise: the session entry owns the table"
+    );
+
+    // Reap: the sweeper removes the entry, then the reader task exits.
+    let removed = ss.shard(s).write().remove(&s).expect("published");
+    abort.abort();
+    drop(removed);
+    assert!(
+        weak.upgrade().is_none(),
+        "the fast slot must not keep a reaped session's flow table alive"
+    );
+}
+
 /// Sparse session ids must both hit the probed table.
 ///
 /// The client allocates session ids from a monotonic counter and never reuses
@@ -4898,6 +5034,25 @@ fn udp_full_cone_config_selects_the_reply_filter() {
         reply_filter(&conf("udp_full_cone = true\n")),
         ReplyFilter::FullCone,
         "an explicit true must reach the accept path"
+    );
+}
+
+/// The startup fd raise must be sized off the pools that actually spend fds:
+/// one UDP socket per session, one TCP socket per relayed flow. A cap change
+/// that leaves this derivation behind makes the raise (and the log line that
+/// reports it) understate what the process needs.
+#[test]
+fn fd_budget_covers_the_session_and_relay_pools() {
+    let floor = (MAX_SESSIONS_GLOBAL + MAX_STREAM_TASKS) as u64;
+    assert!(
+        designed_fds() >= floor,
+        "designed_fds() {} < session+relay floor {floor}",
+        designed_fds()
+    );
+    assert_eq!(
+        designed_fds(),
+        (MAX_SESSIONS_GLOBAL + MAX_STREAM_TASKS + MAX_QUIC_ENDPOINTS + FD_GUARD) as u64,
+        "the guard band and endpoint term stay part of the derivation"
     );
 }
 
