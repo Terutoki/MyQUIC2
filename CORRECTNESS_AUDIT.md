@@ -61,6 +61,10 @@ raises it), so on macOS the fix is a no-op unless the sysctl is raised. The
 backlog is a queue depth only; the accept loop and the admission semaphores
 still bound how many connections are served.
 
+The Linux side is reasoned from `listen(2)` semantics, not re-measured: the
+3,000-association burst that produced the 272/948/2,647 failures above was run
+on macOS. A Linux run is worth doing before quoting a recovery percentage.
+
 ### P3 — anonymous stage-full drops (fixed)
 
 A payload dropped because the connection stager stayed full after a drain was
@@ -68,9 +72,13 @@ counted (`dgram_drops::BUFFER_FULL`, the `stage=…full` reporter field) but the
 warning named neither the association nor the flow, so an operator could not
 tell which app socket was losing datagrams.
 
-Fix: the warning now carries both ids (`src/bin/myquic2-client/rev2.rs:1571`,
-`:1611`). The drop verdict and counters are unchanged, so throughput is not
-affected.
+Fix: the warning now carries both ids (`src/bin/myquic2-client/rev2.rs:1567`,
+`:1609`). Both full-queue paths report them: the push path through
+`R2StageItem::ids`, and the requeue-overflow path through `requeue_unsent`,
+which now returns the identity of the first item it could not take back.
+INLINE items print `inline` rather than a fabricated `flow 0`. The drop verdict
+and counters are unchanged, so throughput is not affected; the id extraction
+runs only on the drop path, not on every staged payload.
 
 ### P4 — panic on the datagram path (fixed)
 
@@ -93,8 +101,10 @@ Clippy's `significant_drop_in_scrutinee` fired at two sites:
 * `src/bin/myquic2-server/reader.rs:655` — `match stage.lock().push(item)`
   held the stager mutex until the end of the match;
 * `src/mqp/r2_flow.rs:805` — `match self.by_session.write().remove(&session)`
-  held the per-session index lock until the end of the match, then took the
-  map write lock (a lock-order inversion if the guard had still been alive).
+  held the per-session index lock until the end of the match. The map write
+  lock was taken *after* the match, so the two guards never actually overlapped;
+  an arm that later learned to take it would have inverted the order
+  (`insert`/`clear` take map first).
 
 Both now bind the result before the `match`, so the guard is released at the
 end of the statement. No behaviour change; the lints are clean.

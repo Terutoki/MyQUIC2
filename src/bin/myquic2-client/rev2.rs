@@ -490,10 +490,10 @@ impl ConnRev2 {
     /// self-describing and FRAG reassembly is keyed by index — and it is the
     /// price of keeping quinn sends outside the stager lock.
     pub(crate) fn drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainOutcome {
-        drain_staged(conn, &self.stager, limit, || {
+        drain_staged(conn, &self.stager, limit, |at| {
             counters::stage_full();
             let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-            warn_stage_full(n, None);
+            warn_stage_full(n, at);
         })
     }
 
@@ -1519,14 +1519,6 @@ fn stage_or_count(
     item: R2StageItem,
 ) -> PayloadSend {
     let mut item = item;
-    // Identify the association/flow before the item is consumed: a stage-full
-    // drop is otherwise anonymous, and "which app socket lost datagrams" is
-    // the first question an operator asks of the counter.
-    let dropped_sess = item.session;
-    let dropped_flow = match &item.kind {
-        R2StageKind::Steady { wire_id } | R2StageKind::Open { wire_id, .. } => *wire_id,
-        R2StageKind::Inline { .. } => 0,
-    };
     let mut drained = PayloadSend {
         frames: 0,
         failed: None,
@@ -1567,8 +1559,13 @@ fn stage_or_count(
     // same verdict a full DATAGRAM send buffer produces — unless the drain saw
     // a more severe verdict (a dead connection), which the caller must still
     // act on.
+    //
+    // The item is still owned here, so the drop can name the association/flow
+    // that lost it: "which app socket?" is the first question an operator asks
+    // of the counter. Doing this after the loop keeps the success path free of
+    // the id extraction.
     let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-    warn_stage_full(n, Some((dropped_sess, dropped_flow)));
+    warn_stage_full(n, Some(item.ids()));
     PayloadSend {
         frames: drained.frames,
         failed: drained.failed.or(Some(DatagramSend::Blocked)),
@@ -1608,16 +1605,22 @@ fn map_drain_outcome(out: R2DrainOutcome) -> PayloadSend {
 /// queue stayed full after a drain (the app controls the rate). Reports the
 /// session and flow id so the losing association is identifiable from the log
 /// alone; the same drop is also visible in the 60 s `stage=…full` counter.
-fn warn_stage_full(total: u64, at: Option<(u32, u32)>) {
+/// `None` means the drop happened on the requeue-overflow path, where the id
+/// was not captured.
+fn warn_stage_full(total: u64, at: Option<(u32, Option<u32>)>) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NEVER_LOGGED);
     static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()).is_none() {
         return;
     }
     match at {
-        Some((sess, flow)) => tracing::warn!(
+        Some((sess, Some(flow))) => tracing::warn!(
             "udp datagram dropped: connection stage queue full after a drain \
              ({total} so far; session {sess}, flow {flow})"
+        ),
+        Some((sess, None)) => tracing::warn!(
+            "udp datagram dropped: connection stage queue full after a drain \
+             ({total} so far; session {sess}, inline)"
         ),
         None => tracing::warn!(
             "udp datagram dropped: connection stage queue full after a drain ({total} so far)"

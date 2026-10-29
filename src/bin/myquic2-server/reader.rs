@@ -546,7 +546,7 @@ pub(crate) fn drain_stage(
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
 ) -> StageDrain {
-    let outcome = drain_staged(c2, stage, *limit, || {
+    let outcome = drain_staged(c2, stage, *limit, |_at| {
         dgram_drops::bump(&dgram_drops::BUFFER_FULL);
         r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
     });
@@ -654,13 +654,14 @@ fn stage_open_src(
             // no learned `reply_src`; the next reply re-sends the OPEN.
             //
             // Bind the push result *before* the `match`: a temporary in the
-            // scrutinee lives until the end of the match (clippy
-            // `significant_drop_in_scrutinee`), and an arm that later takes
-            // another lock would self-deadlock against parking_lot's
-            // non-reentrant mutex.
+            // scrutinee lives to the end of the match (clippy
+            // `significant_drop_in_scrutinee`), so an arm that later took a
+            // second stager lock would nest two `parking_lot` guards. No arm
+            // does today; keeping the guard's scope to one statement makes
+            // that impossible to introduce by accident.
             let pushed = {
-                let mut stage = stage.lock();
-                stage.push(item)
+                let mut queue = stage.lock();
+                queue.push(item)
             };
             match pushed {
                 Ok(_) => (StageDrain::Ok, false),

@@ -64,7 +64,7 @@ jobs:
   # The wire codecs are the part where that class of bug is silent and
   # expensive, so they run in the profile the binaries ship in.
   test-release-wire:
-    name: Test (release, wire codecs)
+    name: Test (release, wire + datagram paths)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -74,6 +74,10 @@ jobs:
         with:
           key: test-release
       - run: "cargo test --release --lib mqp::"
+      # The debug `test` job is the only place the stager/udp tests run by
+      # default; a debug-only assertion there once hid a broken release-mode
+      # encoder (PERF_ANALYSIS.md §12). Pin the shipped profile too.
+      - run: "cargo test --release --lib udp::"
 
   build-musl:
     name: Build x86_64-unknown-linux-musl (static)

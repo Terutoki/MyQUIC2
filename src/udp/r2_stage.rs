@@ -99,6 +99,20 @@ pub struct R2StageItem {
     pub payload: Bytes,
 }
 
+impl R2StageItem {
+    /// `(session, flow)` identity for drop reporting.
+    ///
+    /// `Inline` items have no flow id, so the flow stays `None` instead of a
+    /// fabricated 0 that an operator would read as a real association.
+    pub fn ids(&self) -> (u32, Option<u32>) {
+        let flow = match &self.kind {
+            R2StageKind::Steady { wire_id } | R2StageKind::Open { wire_id, .. } => Some(*wire_id),
+            R2StageKind::Inline { .. } => None,
+        };
+        (self.session, flow)
+    }
+}
+
 /// Result of one [`R2Stager::drain`] call.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct R2DrainOutcome {
@@ -741,7 +755,7 @@ impl R2Stager {
         limit: usize,
     ) -> Option<Bytes> {
         debug_assert!(run.len() <= r2::R2_MAX_TRAIN_ITEMS);
-        debug_assert!(flows.len() <= u8::MAX as usize);
+        debug_assert!(flows.len() <= r2::R2_MAX_TRAIN_ITEMS);
         flow_idx.clear();
         for (i, wire_id) in flows.iter().enumerate() {
             flow_idx.insert(*wire_id, i as u8);
@@ -907,29 +921,38 @@ impl R2Stager {
     /// not a fault). The caller accounts each of those with its full-queue
     /// drop policy; this function books nothing (the item payloads are
     /// released here, the counter bump is the caller's business).
-    pub fn requeue_unsent(&mut self, q: &mut PackedFrames, failed_frame: usize) -> usize {
+    /// Returns the number of items the queue could not take back and, when at
+    /// least one was dropped, the identity of the first one so the caller can
+    /// name the losing association in its full-queue warning.
+    pub fn requeue_unsent(
+        &mut self,
+        q: &mut PackedFrames,
+        failed_frame: usize,
+    ) -> (usize, Option<(u32, Option<u32>)>) {
         let start = match q.frames.get(failed_frame + 1) {
             Some(first_unsent) => first_unsent.item_off as usize,
             None => {
                 // The failed frame was the last one packed: nothing unsent.
                 q.frames.clear();
-                return 0;
+                return (0, None);
             }
         };
         if start > q.items.len() {
             q.frames.clear();
-            return 0;
+            return (0, None);
         }
         let mut overflow = 0usize;
+        let mut first = None;
         for item in q.items.drain(start..) {
-            if self.push(item).is_err() {
+            if let Err(back) = self.push(item) {
                 overflow += 1;
+                first.get_or_insert_with(|| back.ids());
             }
         }
         // The frames list is dead weight after the requeue; a later reuse of
         // `q` must never re-send stale bodies.
         q.frames.clear();
-        overflow
+        (overflow, first)
     }
 
     /// Pack exactly one frame for the shape tests: same selection as
@@ -1108,7 +1131,9 @@ pub fn book_too_large(n: usize) {
 /// accounted by [`send_packed_frames`], and the unsent tail is requeued for the
 /// next drain. `on_requeue_overflow` is invoked once per item the bounded queue
 /// could not take back (a concurrent pusher refilled it during the unlocked
-/// send window); the caller supplies its usual full-queue accounting.
+/// send window); the caller supplies its usual full-queue accounting, and the
+/// argument names the first lost item's `(session, flow)` so that accounting
+/// can say which association lost it.
 ///
 /// The `datagram_send_buffer_space` check is the cheap backpressure gate: when
 /// quinn's DATAGRAM buffer is already full, no amount of packing can get a
@@ -1119,7 +1144,7 @@ pub fn drain_staged(
     conn: &Connection,
     stage: &parking_lot::Mutex<R2Stager>,
     limit: usize,
-    mut on_requeue_overflow: impl FnMut(),
+    mut on_requeue_overflow: impl FnMut(Option<(u32, Option<u32>)>),
 ) -> R2DrainOutcome {
     let mut total = R2DrainOutcome::default();
     let mut q = PackedFrames::default();
@@ -1158,9 +1183,9 @@ pub fn drain_staged(
         total.items_sent = total.items_sent.saturating_add(outcome.items_sent);
         total.items_dropped = total.items_dropped.saturating_add(outcome.items_dropped);
         if outcome.failed.is_some() {
-            let overflow = stage.lock().requeue_unsent(&mut q, outcome.frames as usize);
+            let (overflow, first) = stage.lock().requeue_unsent(&mut q, outcome.frames as usize);
             for _ in 0..overflow {
-                on_requeue_overflow();
+                on_requeue_overflow(first);
             }
             total.failed = outcome.failed;
             break;
@@ -1453,7 +1478,7 @@ mod tests {
         assert_eq!(q.frames[2].item_len, 1);
         // Simulate: frame 1 failed (its item stays dead), so
         // `outcome.frames == 1` requeues only what is beyond the failure.
-        let overflow = s.requeue_unsent(&mut q, 1);
+        let (overflow, _) = s.requeue_unsent(&mut q, 1);
         assert_eq!(overflow, 0);
         assert!(q.frames.is_empty(), "stale bodies must not survive");
         // The head items (the sent train's and the failed frame's) stay in
@@ -1488,8 +1513,13 @@ mod tests {
         s.push(steady(3, 5, b"r3")).unwrap();
         s.push(steady(4, 6, b"r4")).unwrap();
         assert_eq!(s.len(), 4);
-        let overflow = s.requeue_unsent(&mut q, 0);
+        let (overflow, at) = s.requeue_unsent(&mut q, 0);
         assert_eq!(overflow, 1, "the unsent tail item did not fit back");
+        assert_eq!(
+            at,
+            Some((2, Some(id(9)))),
+            "the overflow names the session/flow that lost the item"
+        );
         assert_eq!(s.len(), 4, "the queue is exactly full again");
         assert!(q.frames.is_empty());
     }

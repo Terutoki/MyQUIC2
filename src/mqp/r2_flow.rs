@@ -802,11 +802,12 @@ impl FlowRegistry {
     /// forged `SESS_CLOSE` for an unknown session costs one hash probe, not a
     /// walk over the whole per-connection table.
     pub fn remove_session(&self, session: u32) -> usize {
-        // Drop the index write guard before taking the map write guard: the
-        // temporary in a `match` scrutinee lives to the end of the match
-        // (clippy `significant_drop_in_scrutinee`), which would nest two
-        // different locks of the registry and make the lock order
-        // by_session → map, the reverse of `insert`/`clear`.
+        // Drop the index write guard before the `match` that consumes the
+        // result: a temporary in a scrutinee lives to the end of the match
+        // (clippy `significant_drop_in_scrutinee`), so an arm that later took
+        // the map lock would nest by_session → map, the reverse of
+        // `insert`/`clear`. No arm does today; one statement per guard keeps
+        // the order uniform and the lint quiet.
         let indexed = self.by_session.write().remove(&session);
         let ids = match indexed {
             Some(ids) => ids,
