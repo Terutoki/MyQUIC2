@@ -81,7 +81,9 @@ builds the flow list from the run itself), but a future edit breaking it would
 panic the task that drains **every** association of the connection.
 
 Fix: the lookup returns `None` on a miss (the caller already books that case as
-too-large and drops the frame), guarded by `debug_assert!`. Regression test:
+too-large and drops the frame) and reports the broken invariant once through
+`tracing::error!`, so a future logic bug degrades to a counted drop and a single
+log line instead of a panic. Regression test:
 `encode_train_run_drops_a_run_whose_flow_is_not_in_the_list`.
 
 ### P5 — guards held across a match (fixed)

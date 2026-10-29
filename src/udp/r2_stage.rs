@@ -752,12 +752,20 @@ impl R2Stager {
                 unreachable!("a steady run only holds steady items");
             };
             // `take_steady_head` derives `flows` from `run` itself, so this
-            // lookup cannot miss. If a future edit ever breaks that invariant,
-            // drop the frame (the caller books its items as too-large) instead
-            // of panicking the datagram loop that this connection shares
-            // across every association.
+            // lookup cannot miss. If a future edit ever breaks that
+            // invariant, drop the frame (the caller books its items as
+            // too-large) instead of panicking the datagram loop that this
+            // connection shares across every association. Reported once: the
+            // branch is unreachable today, and a logic bug that reaches it
+            // must not turn into one log line per frame.
             let Some(&idx) = flow_idx.get(&wire_id) else {
-                debug_assert!(false, "every run flow was deduped into the flow list");
+                static REPORTED: std::sync::Once = std::sync::Once::new();
+                REPORTED.call_once(|| {
+                    tracing::error!(
+                        "train run item has no flow-list entry; dropping the frame \
+                         (encoder invariant broken)"
+                    );
+                });
                 return None;
             };
             *view = (idx, item.payload.as_ref());
