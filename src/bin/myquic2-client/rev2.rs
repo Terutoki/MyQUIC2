@@ -1605,8 +1605,10 @@ fn map_drain_outcome(out: R2DrainOutcome) -> PayloadSend {
 /// queue stayed full after a drain (the app controls the rate). Reports the
 /// session and flow id so the losing association is identifiable from the log
 /// alone; the same drop is also visible in the 60 s `stage=…full` counter.
-/// `None` means the drop happened on the requeue-overflow path, where the id
-/// was not captured.
+///
+/// `None` is a defensive fallback for a caller that could not obtain an id:
+/// both live call sites pass `Some`, including the requeue path, which reports
+/// the first item it could not take back.
 fn warn_stage_full(total: u64, at: Option<(u32, Option<u32>)>) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NEVER_LOGGED);
     static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -72,8 +72,9 @@ counted (`dgram_drops::BUFFER_FULL`, the `stage=…full` reporter field) but the
 warning named neither the association nor the flow, so an operator could not
 tell which app socket was losing datagrams.
 
-Fix: the warning now carries both ids (`src/bin/myquic2-client/rev2.rs:1567`,
-`:1609`). Both full-queue paths report them: the push path through
+Fix: the warning now carries both ids (`stage_or_count` and `warn_stage_full`
+in `src/bin/myquic2-client/rev2.rs`). Both full-queue paths report them: the
+push path through
 `R2StageItem::ids`, and the requeue-overflow path through `requeue_unsent`,
 which now returns the identity of the first item it could not take back.
 INLINE items print `inline` rather than a fabricated `flow 0`. The drop verdict
@@ -98,10 +99,11 @@ log line instead of a panic. Regression test:
 
 Clippy's `significant_drop_in_scrutinee` fired at two sites:
 
-* `src/bin/myquic2-server/reader.rs:655` — `match stage.lock().push(item)`
-  held the stager mutex until the end of the match;
-* `src/mqp/r2_flow.rs:805` — `match self.by_session.write().remove(&session)`
-  held the per-session index lock until the end of the match. The map write
+* `stage_open_src` (`src/bin/myquic2-server/reader.rs`) — `match
+  stage.lock().push(item)` held the stager mutex until the end of the match;
+* `FlowRegistry::remove_session` (`src/mqp/r2_flow.rs`) — `match
+  self.by_session.write().remove(&session)` held the per-session index lock
+  until the end of the match. The map write
   lock was taken *after* the match, so the two guards never actually overlapped;
   an arm that later learned to take it would have inverted the order
   (`insert`/`clear` take map first).
