@@ -25,12 +25,13 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 ///
 /// The fast session table (`FAST_SESS_SLOTS` in `myquic2-server/accept.rs`) is
 /// sized from the same array budget the old 128 × 432 B table used. Each
-/// `FastSess` is now 128 B — the inline `ConnPin` was removed after its only
-/// reader turned out to be the INLINE/legacy path — so the same ~56 KiB
-/// carries ~405 slots. With the 16 KiB pre-HELLO buffer and the
-/// surrounding maps, 96 KiB remains a round, conservative charge; the slot
-/// count is derived from `size_of::<FastSess>()` in `accept.rs`, so the
-/// arithmetic cannot drift silently.
+/// `FastSess` is now 128 B — the inline `ConnPin` moved to the bounded
+/// `DOMAIN_PIN_SLOTS` side cache because its only reader is the INLINE/legacy
+/// path — so the same ~55.4 KiB carries ~405 slots. The side cache adds
+/// 48 × ~304 B ≈ 14 KiB. With the 16 KiB pre-HELLO buffer and the surrounding
+/// maps, 96 KiB remains a round, conservative charge; the slot count is
+/// derived from `size_of::<FastSess>()` in `accept.rs`, so the arithmetic
+/// cannot drift silently.
 pub const R2_INGRESS_FIXED_BYTES: u64 = 96 * 1024;
 
 /// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`

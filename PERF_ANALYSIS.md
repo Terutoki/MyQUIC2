@@ -623,9 +623,11 @@ left* by it as well as for what the first pass skipped. Four items were found; o
 
 ### 9.1 B1 — fast table working set
 
-> **Follow-up (2026-10-30):** the inline pin was removed and `FAST_SESS_SLOTS` is now
-> computed from the same array budget (~405 slots, 128 B `FastSess`). The
-> 128-slot numbers below are the historical record of B1, not the current table.
+> **Follow-up (2026-10-30):** the inline pin moved out of the hot slot and
+> `FAST_SESS_SLOTS` is now computed from the same array budget (~405 slots,
+> 128 B `FastSess`); a bounded 48-entry domain-pin side cache restores the
+> INLINE/legacy lock-free hit. The 128-slot numbers below are the historical
+> record of B1, not the current table.
 
 `FAST_SESS_SLOTS` was 64 while `LOCAL_SESS_MAX` is 4096, and the shipped client concentrates up to ~2000 live sessions on
 one connection (2 interactive + 2 bulk UDP shards for up to 4,032 associations). Past 64 live sessions *every* arm evicts:
@@ -646,6 +648,15 @@ headroom and costs ~5 KiB per worker thread.
 **Not fixed (structural):** a fixed-size table cannot cover 4096 sessions per connection. The remaining fix is to make a
 miss cheap — stage the slow path's target send into the same `flush_staged_sends` batch instead of one `sendto` per
 datagram — and to keep spreading the client's associations over more egress connections.
+
+**Measurement follow-up (2026-10-30):** the current code uses ~405 slots plus a
+bounded 48-entry domain-pin side cache. `hotpath_bench udpmulti` at the shipped
+8 associations (≈2 sessions per connection) does not exceed the old 128-slot
+working set, so it cannot show the overflow win. A meaningful A/B needs a
+512+ association client or a synthetic 1000-session ingress test; record pps,
+CPU, syscalls/payload and fast-table hit rate, with a 10–100 session control run
+to measure the longer probe's low-fan-in cost. Until then, treat the table-size
+change as a structural improvement, not a measured throughput claim.
 
 ### 9.2 B2 — shared reply stager
 

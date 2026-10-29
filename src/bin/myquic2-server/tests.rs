@@ -885,6 +885,64 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
     assert!(staged.is_empty(), "a miss must not stage anything");
 }
 
+/// The domain-pin side cache is the lock-free shortcut the hot slot no longer
+/// carries. It is keyed by `(session, name, port)` and cleared with the slot.
+#[test]
+fn domain_pin_side_cache_is_keyed_and_cleared_with_the_slot() {
+    let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let mut fast = FastTable::new();
+    let dst: SocketAddr = "198.51.100.44:443".parse().unwrap();
+    fast.pin_cache(7, "pin-side.invalid", 443, dst, DNS_CACHE_TTL_MS);
+
+    assert_eq!(
+        resolve_fast(
+            &mut fast,
+            &ss,
+            7,
+            TargetAddrRef::Domain("pin-side.invalid", 443),
+            true
+        ),
+        Some(dst),
+        "a live side pin must answer without a session-table lookup"
+    );
+    assert_eq!(
+        resolve_fast(
+            &mut fast,
+            &ss,
+            7,
+            TargetAddrRef::Domain("pin-side.invalid", 80),
+            true
+        ),
+        None,
+        "a different port must not reuse the pin"
+    );
+    assert_eq!(
+        resolve_fast(
+            &mut fast,
+            &ss,
+            8,
+            TargetAddrRef::Domain("pin-side.invalid", 443),
+            true
+        ),
+        None,
+        "a different session must not reuse the pin"
+    );
+
+    // `clear` runs the pin purge even when no hot slot was armed.
+    assert!(!fast.clear(7), "premise: no hot slot was armed");
+    assert_eq!(
+        resolve_fast(
+            &mut fast,
+            &ss,
+            7,
+            TargetAddrRef::Domain("pin-side.invalid", 443),
+            true
+        ),
+        None,
+        "clearing the session must clear its domain pin too"
+    );
+}
+
 /// A full table must evict the **quietest** session: never grow, never
 /// mis-route.
 ///
@@ -3006,9 +3064,19 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
     let gate_before = ss.dns_gate.refusals();
     let mut inline = 0usize;
     for _ in 0..33 {
-        if forward_server_dgram(&ss, &server_conn, 0, 11, addr, payload.clone(), true, None)
-            .await
-            .is_some()
+        if forward_server_dgram(
+            &ss,
+            &server_conn,
+            0,
+            11,
+            addr,
+            payload.clone(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .is_some()
         {
             inline += 1;
         }
@@ -3058,9 +3126,19 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
     let gate_before2 = ss.dns_gate.refusals();
     let mut inline2 = 0usize;
     for _ in 0..40 {
-        if forward_server_dgram(&ss, &server_conn, 0, 12, addr, payload.clone(), true, None)
-            .await
-            .is_some()
+        if forward_server_dgram(
+            &ss,
+            &server_conn,
+            0,
+            12,
+            addr,
+            payload.clone(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .is_some()
         {
             inline2 += 1;
         }
@@ -3136,9 +3214,19 @@ async fn filtered_domain_burst_is_refused_inline_after_one_waiter() {
     let spawns_before = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
     for _ in 0..33 {
         assert!(
-            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false, None)
-                .await
-                .is_none(),
+            forward_server_dgram(
+                &ss,
+                &server_conn,
+                0,
+                21,
+                addr,
+                payload.clone(),
+                false,
+                None,
+                None
+            )
+            .await
+            .is_none(),
             "a filtered target never relays a datagram"
         );
     }
@@ -3175,9 +3263,19 @@ async fn filtered_domain_burst_is_refused_inline_after_one_waiter() {
     let spawns_before2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
     for _ in 0..40 {
         assert!(
-            forward_server_dgram(&ss, &server_conn, 0, 21, addr, payload.clone(), false, None)
-                .await
-                .is_none(),
+            forward_server_dgram(
+                &ss,
+                &server_conn,
+                0,
+                21,
+                addr,
+                payload.clone(),
+                false,
+                None,
+                None
+            )
+            .await
+            .is_none(),
             "a cached unusable verdict never relays"
         );
     }
@@ -3452,6 +3550,7 @@ async fn forward_limiter_exhaustion_counts_dns_budget_exactly_once() {
         addr,
         Bytes::from_static(b"q"),
         true,
+        None,
         None,
     )
     .await;
@@ -3916,6 +4015,7 @@ async fn a_session_dest_memo_answers_a_domain_target_inline() {
         Bytes::from_static(b"first"),
         true,
         None,
+        None,
     )
     .await;
     let (resolved, life) = used.expect(
@@ -3946,6 +4046,7 @@ async fn a_session_dest_memo_answers_a_domain_target_inline() {
         TargetAddrRef::Domain(host, port),
         Bytes::from_static(b"second"),
         true,
+        None,
         None,
     )
     .await;

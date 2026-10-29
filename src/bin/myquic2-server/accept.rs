@@ -362,22 +362,39 @@ pub(crate) const FAST_SESS_SLOTS: usize =
     FAST_TABLE_ARRAY_BYTES / (std::mem::size_of::<FastSess>() + 12);
 const _: () = assert!(FAST_SESS_SLOTS >= 128);
 
+/// Full-name domain pins kept beside the fast slots.
+///
+/// The hot slot no longer carries a 255-byte pin, but the INLINE/legacy
+/// `resolve_fast` path still needs a lock-free hit for repeated domain
+/// frames. This side cache keeps the old pin shape for a bounded working set:
+/// 48 entries × ~304 B ≈ 14 KiB, which fits the 96 KiB admission charge
+/// together with the ~55.4 KiB slot arrays and the 16 KiB pre-HELLO reserve.
+/// IP targets never enter it.
+pub(crate) const DOMAIN_PIN_SLOTS: usize = 48;
+const _: () = assert!(
+    FAST_SESS_SLOTS * (std::mem::size_of::<FastSess>() + 12)
+        + DOMAIN_PIN_SLOTS * (std::mem::size_of::<ConnPin>() + 4)
+        <= 80 * 1024
+);
+
 /// The connection's fast-path table: session id to steady-state entry.
 ///
-/// Three parallel arrays rather than one array of payload structs. Finding a
-/// session and choosing a victim only ever needed the ids and the liveness
-/// stamps; with the payloads inline, a scan had to touch up to 128 scattered
-/// ~440-byte structs (`ConnPin` alone carried a 255-byte name), which is ~384
-/// cache lines — measured at ~1.3 µs per arm in the old layout in exactly the
-/// shape the shipped client produces (1000+ live sessions per connection, so
-/// ~88 % of datagrams took the slow path and armed). Split out, the same scan
-/// reads only the tag and stamp arrays and dereferences nothing.
+/// The hot lookup is three parallel arrays rather than one array of payload
+/// structs. Finding a session and choosing a victim only ever needed the ids
+/// and the liveness stamps; with the payloads inline, a scan had to touch up to
+/// 128 scattered ~440-byte structs (`ConnPin` alone carried a 255-byte name),
+/// which is ~384 cache lines — measured at ~1.3 µs per arm in the old layout in
+/// exactly the shape the shipped client produces (1000+ live sessions per
+/// connection, so ~88 % of datagrams took the slow path and armed). Split out,
+/// the same scan reads only the tag and stamp arrays and dereferences nothing.
+/// The bounded `pin_tags`/`pins` side cache below adds the INLINE/legacy domain
+/// shortcut back without putting a 255-byte name in every hot slot.
 pub(crate) struct FastTable {
     /// Session id per slot, or [`EMPTY_TAG`] while the slot is free.
     ///
-    /// One 512-byte array — the entire probe is eight cache lines. Session ids
-    /// come from a monotonic, never-reused counter (`hub.rs::alloc_sess`) and
-    /// `get_or_create_sess` refuses id 0, so 0 is a free sentinel.
+    /// Session ids come from a monotonic, never-reused counter
+    /// (`hub.rs::alloc_sess`) and `get_or_create_sess` refuses id 0, so 0 is a
+    /// free sentinel.
     tags: [u32; FAST_SESS_SLOTS],
     /// Liveness stamp per slot: the session's `last` when it was armed,
     /// advanced on a hit. The eviction order once the table is full. A reaped
@@ -386,6 +403,11 @@ pub(crate) struct FastTable {
     ages: [u64; FAST_SESS_SLOTS],
     /// The entries. Only ever reached through `tags`, by index.
     slots: [Option<FastSess>; FAST_SESS_SLOTS],
+    /// Session id per domain-pin slot, or [`EMPTY_TAG`] while free.
+    pin_tags: [u32; DOMAIN_PIN_SLOTS],
+    /// Full-name domain pins for the INLINE/legacy `resolve_fast` path.
+    /// Bounded and separate from the hot slots so IP targets never grow it.
+    pins: [Option<ConnPin>; DOMAIN_PIN_SLOTS],
 }
 
 /// The tag of a free slot. Session 0 is never allocated.
@@ -397,6 +419,8 @@ impl FastTable {
             tags: [EMPTY_TAG; FAST_SESS_SLOTS],
             ages: [0; FAST_SESS_SLOTS],
             slots: [const { None }; FAST_SESS_SLOTS],
+            pin_tags: [EMPTY_TAG; DOMAIN_PIN_SLOTS],
+            pins: [const { None }; DOMAIN_PIN_SLOTS],
         }
     }
 
@@ -465,6 +489,7 @@ impl FastTable {
 
     /// Drop `s`'s entry. Returns whether there was one.
     pub(crate) fn clear(&mut self, s: u32) -> bool {
+        self.pin_clear(s);
         match self.probe(s) {
             Some(idx) => {
                 self.tags[idx] = EMPTY_TAG;
@@ -473,6 +498,57 @@ impl FastTable {
                 true
             }
             None => false,
+        }
+    }
+
+    /// The live domain pin for `(s, host, port)`, if one is cached.
+    ///
+    /// This is the lock-free shortcut the hot `FastSess` slot used to carry.
+    /// It is a cache, not a router: the session id, name, port and deadline
+    /// are all re-checked here.
+    pub(crate) fn pin_get(&self, s: u32, host: &str, port: u16) -> Option<SocketAddr> {
+        let idx = self.pin_tags.iter().position(|&tag| tag == s)?;
+        let pin = self.pins[idx].as_ref()?;
+        (pin.sess == s && pin_is_for(pin, host, port) && pin.expires > coarse_millis())
+            .then_some(pin.addr)
+    }
+
+    /// Insert or refresh a full-name domain pin.
+    fn pin_store(&mut self, pin: ConnPin) {
+        let s = pin.sess;
+        let idx = if let Some(i) = self.pin_tags.iter().position(|&tag| tag == s) {
+            i
+        } else if let Some(i) = self.pin_tags.iter().position(|&tag| tag == EMPTY_TAG) {
+            i
+        } else {
+            let mut victim = 0;
+            let mut earliest = u64::MAX;
+            for (i, p) in self.pins.iter().enumerate() {
+                let expires = p.as_ref().map_or(0, |p| p.expires);
+                if expires < earliest {
+                    earliest = expires;
+                    victim = i;
+                }
+            }
+            victim
+        };
+        self.pin_tags[idx] = s;
+        self.pins[idx] = Some(pin);
+    }
+
+    /// Arm a domain pin from a resolved `(host, port, addr)` and cache it.
+    pub(crate) fn pin_cache(&mut self, s: u32, host: &str, port: u16, addr: SocketAddr, life: u64) {
+        let mut pin = None;
+        pin_arm(&mut pin, s, host, port, addr, life);
+        if let Some(pin) = pin {
+            self.pin_store(pin);
+        }
+    }
+
+    fn pin_clear(&mut self, s: u32) {
+        if let Some(idx) = self.pin_tags.iter().position(|&tag| tag == s) {
+            self.pin_tags[idx] = EMPTY_TAG;
+            self.pins[idx] = None;
         }
     }
 
@@ -500,14 +576,16 @@ impl FastTable {
 /// Resolve one datagram's target through the session's destination memo, then
 /// the DNS cache. IP targets are already resolved and return immediately.
 ///
-/// This used to consult a `ConnPin` stored in the session's fast-table slot.
-/// The pin was only ever read on this INLINE/legacy path, while it made every
-/// `FastSess` 304 B larger and was rewritten on every slow-path arm — including
-/// every IP arm, where no reader can exist. The steady/TRAIN path resolves from
-/// the flow binding and never calls this function, so the pin was removed and
-/// the freed space now buys a larger fast table. This path keeps a stack-local
-/// scratch pin: a memo hit may still arm it, but no per-connection state grows.
+/// This used to consult a `ConnPin` stored in every `FastSess`, which made the
+/// hot slot 304 B larger and was rewritten on every slow-path arm — including
+/// every IP arm, where no reader can exist. The pin now lives in the bounded
+/// [`DOMAIN_PIN_SLOTS`] side cache instead: the steady/TRAIN path resolves from
+/// the flow binding and never calls this function, while INLINE/legacy domain
+/// frames and the `r2_ingress_open` pending-payload race keep a lock-free hit
+/// for the hot working set. A miss resolves through the session memo/DNS and
+/// stores the resulting scratch pin in that cache.
 pub(crate) fn resolve_fast(
+    fast: &mut FastTable,
     ss: &SessTable,
     s: u32,
     a: TargetAddrRef<'_>,
@@ -517,8 +595,15 @@ pub(crate) fn resolve_fast(
         TargetAddrRef::Ip(dst) => return Some(dst),
         TargetAddrRef::Domain(h, p) => (h, p),
     };
+    if let Some(dst) = fast.pin_get(s, h, p) {
+        return Some(dst);
+    }
     let mut scratch: Option<ConnPin> = None;
-    resolve_pin(ss, &mut scratch, s, s, h, p, allow_private)
+    let dst = resolve_pin(ss, &mut scratch, s, s, h, p, allow_private)?;
+    if let Some(pin) = scratch {
+        fast.pin_store(pin);
+    }
+    Some(dst)
 }
 
 /// Try the fast path for one datagram: validate the slot, mirror the allowlist
@@ -650,6 +735,28 @@ pub(crate) fn arm_fast(fast: &mut FastTable, conn_id: usize, s: u32) {
     }
 }
 
+/// Arm the fast slot and, for a domain target, the bounded domain-pin cache.
+///
+/// IP targets never enter the pin cache: `resolve_fast` returns their address
+/// directly and no reader exists. This keeps the old arm site's useful half
+/// (the domain shortcut) without the per-IP 255-byte dead write.
+fn arm_fast_with_target(
+    fast: &mut FastTable,
+    conn_id: usize,
+    s: u32,
+    a: TargetAddrRef<'_>,
+    used: Option<(SocketAddr, u64)>,
+) -> bool {
+    let Some((dst, life)) = used else {
+        return false;
+    };
+    arm_fast(fast, conn_id, s);
+    if let TargetAddrRef::Domain(h, p) = a {
+        fast.pin_cache(s, h, p, dst, life);
+    }
+    true
+}
+
 /// Owned form used to unify an inline address borrowed from the DATAGRAM with a
 /// flow address borrowed from the session's clone-on-write table.
 enum V3Addr<'a> {
@@ -682,7 +789,7 @@ async fn forward_v3_item(
     staged: &mut Vec<StagedSend>,
     r2: Option<&Arc<R2ConnState>>,
 ) -> bool {
-    let want = resolve_fast(ss, sess, a, allow_private);
+    let want = resolve_fast(fast, ss, sess, a, allow_private);
     let payload = match want {
         Some(dst) => {
             match try_stage(fast, ss, conn_id, sess, dst, payload, allow_private, staged) {
@@ -695,13 +802,11 @@ async fn forward_v3_item(
     // Keep the per-flow wire order: staged fast-path sends go out before the
     // slow path's immediate send.
     flush_staged_sends(staged);
-    let used = forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private, r2).await;
-    if used.is_some() {
-        arm_fast(fast, conn_id, sess);
-        true
-    } else {
-        false
-    }
+    let used =
+        forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private, r2, None).await;
+    let accepted = used.is_some();
+    arm_fast_with_target(fast, conn_id, sess, a, used);
+    accepted
 }
 
 /// Decode and route one MQP-3 SINGLE/TRAIN.
@@ -2669,29 +2774,29 @@ async fn r2_forward_flow_resolved(
     match try_stage(fast, ss, conn_id, sess, dst, payload, allow_private, staged) {
         Ok(()) => true,
         Err(payload) => {
-            // The steady/TRAIN slow path already has an IP. Stage it with the
-            // fast-path sends instead of an immediate `udp_try_send`: the old
-            // shape flushed and sent before every miss, so a train of
-            // interleaved hits and misses paid a flush + syscall per item and
-            // could never group a flow's consecutive payloads. The burst-end
-            // flush now sees the whole train in encounter order. The SSRF check
-            // and `remember_dst` mirror `forward_server_dgram`'s IP arm.
-            if !allow_private && !is_global_ip_cached(dst.ip()) {
-                dgram_drops::bump(&dgram_drops::REFUSED);
-                return false;
-            }
-            let Some(sock) = get_or_create_sess(ss, cd, conn_id, sess, None, Some(state)).await
-            else {
-                return false;
-            };
-            remember_dst(ss, sess, dst);
-            staged.push(StagedSend {
-                sock,
-                dst: map_for_dual(dst),
+            // The steady/TRAIN slow path already has an IP. `staged: Some`
+            // makes the shared forwarder push it into this burst instead of an
+            // immediate `udp_try_send`: the old shape flushed and sent before
+            // every miss, so a train of interleaved hits and misses paid a
+            // flush + syscall per item and could never group a flow's
+            // consecutive payloads. The SSRF check and `remember_dst` stay in
+            // the one IP arm.
+            let used = forward_server_dgram(
+                ss,
+                cd,
+                conn_id,
+                sess,
+                r2::ip_ref(dst),
                 payload,
-            });
-            arm_fast(fast, conn_id, sess);
-            true
+                allow_private,
+                Some(state),
+                Some(staged),
+            )
+            .await;
+            if used.is_some() {
+                arm_fast(fast, conn_id, sess);
+            }
+            used.is_some()
         }
     }
 }
@@ -2958,6 +3063,7 @@ pub(crate) async fn r2_ingress_open(
                 payload,
                 allow_private,
                 Some(state),
+                None,
             )
             .await;
             match used {
@@ -3041,6 +3147,7 @@ pub(crate) async fn r2_ingress_open(
                 // spawned slow path deliberately leaves arming to the datagram
                 // loop; here we *are* the datagram loop.)
                 arm_fast(fast, conn_id, sess);
+                fast.pin_cache(sess, &host, port, dst, life);
                 r2_stats::bump(&r2_stats::DNS_SYNC_OPENS);
                 // The one address the synchronous probe knows (the memo's first
                 // record) is the flow's validated reply-source set here: it is
@@ -3913,7 +4020,7 @@ async fn handle_conn_inner(
         // syscall amplification of one `sendto` per datagram against one
         // `sendmmsg` per 32.
         //
-        // Sizing: `FAST_SESS_SLOTS` is computed to fit the same ~56.5 KiB
+        // Sizing: `FAST_SESS_SLOTS` is computed to fit the same ~55.4 KiB
         // array budget the old 128 × 432 B table used, next to a 4 B tag and an
         // 8 B stamp in the probe arrays. Removing the inline pin shrank
         // `FastSess` to 128 B, so the budget now carries ~405 slots (3.1×). The
@@ -3951,9 +4058,11 @@ async fn handle_conn_inner(
         let mut fast = FastTable::new();
         // Target sends staged for the current drain burst, flushed grouped per
         // `(sock, dst)` run by `flush_staged_sends` (one `sendmmsg` per 32 on
-        // Linux, one `try_send_to` per frame elsewhere). Bounded by
-        // `LAST_HOP_DRAIN`, cleared per burst.
-        let mut staged: Vec<StagedSend> = Vec::with_capacity(LAST_HOP_DRAIN);
+        // Linux, one `try_send_to` per frame elsewhere). The Vec is cleared
+        // after every burst flush. Its capacity hint covers one full TRAIN;
+        // a burst can stage up to `LAST_HOP_DRAIN * R2_MAX_TRAIN_ITEMS`
+        // items, so it may grow on a multi-TRAIN burst.
+        let mut staged: Vec<StagedSend> = Vec::with_capacity(r2::R2_MAX_TRAIN_ITEMS);
         loop {
             let head: Bytes = tokio::select! {
                 r = reader.as_mut() => match r {
@@ -4106,7 +4215,7 @@ async fn handle_conn_inner(
                     // One resolution for this datagram: the session's destination
                     // memo, else the DNS cache. A domain target already memoized
                     // never reaches `forward_server_dgram` at all.
-                    let want = resolve_fast(&ss, s, a.as_ref(), allow_private);
+                    let want = resolve_fast(&mut fast, &ss, s, a.as_ref(), allow_private);
                     // Stage on the fast path; only the slow path keeps the payload,
                     // and `try_stage` hands it back on a miss so the steady path
                     // pays no `Bytes` clone.
@@ -4139,11 +4248,10 @@ async fn handle_conn_inner(
                         whole,
                         allow_private,
                         Some(&r2),
+                        None,
                     )
                     .await;
-                    if used.is_some() {
-                        arm_fast(&mut fast, conn_id, s);
-                    }
+                    arm_fast_with_target(&mut fast, conn_id, s, a.as_ref(), used);
                 } else {
                     if is_batch(&d) {
                         let Ok(b) = decode_batch(&d) else {
@@ -4151,7 +4259,7 @@ async fn handle_conn_inner(
                             continue;
                         };
                         let s = b.sess;
-                        let want = resolve_fast(&ss, s, b.addr, allow_private);
+                        let want = resolve_fast(&mut fast, &ss, s, b.addr, allow_private);
                         match want {
                             Some(dst) => {
                                 for p in b.payloads() {
@@ -4182,14 +4290,20 @@ async fn handle_conn_inner(
                                             payload,
                                             allow_private,
                                             Some(&r2),
+                                            None,
                                         )
                                         .await;
                                         // Arm from the slow path's answer, so the
                                         // *next* frame for this session hits the
                                         // fast table (see the table comment).
-                                        if used.is_some() {
-                                            arm_fast(&mut fast, conn_id, s);
-                                            #[cfg(test)]
+                                        #[cfg(test)]
+                                        let armed = arm_fast_with_target(
+                                            &mut fast, conn_id, s, b.addr, used,
+                                        );
+                                        #[cfg(not(test))]
+                                        arm_fast_with_target(&mut fast, conn_id, s, b.addr, used);
+                                        #[cfg(test)]
+                                        if armed {
                                             BATCH_FAST_ARMS
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
@@ -4236,10 +4350,11 @@ async fn handle_conn_inner(
                                         payload,
                                         allow_private,
                                         Some(&r2),
+                                        None,
                                     )
                                     .await;
                                     if let Some((dst2, _)) = used {
-                                        arm_fast(&mut fast, conn_id, s);
+                                        arm_fast_with_target(&mut fast, conn_id, s, b.addr, used);
                                         want = Some(dst2);
                                         #[cfg(test)]
                                         BATCH_FAST_ARMS
@@ -4254,7 +4369,7 @@ async fn handle_conn_inner(
                         dgram_drops::bump(&dgram_drops::REFUSED);
                         continue;
                     };
-                    let want = resolve_fast(&ss, s, a, allow_private);
+                    let want = resolve_fast(&mut fast, &ss, s, a, allow_private);
                     // `d` is already owned (from `read_datagram`), so the slice
                     // borrows it directly: one refcount bump, no payload copy.
                     let off = d.len() - p.len();
@@ -4292,11 +4407,10 @@ async fn handle_conn_inner(
                         payload,
                         allow_private,
                         Some(&r2),
+                        None,
                     )
                     .await;
-                    if used.is_some() {
-                        arm_fast(&mut fast, conn_id, s);
-                    }
+                    arm_fast_with_target(&mut fast, conn_id, s, a, used);
                 }
             }
             flush_staged_sends(&mut staged);

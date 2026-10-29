@@ -453,6 +453,11 @@ pub(crate) fn resolve_forward_target(
 /// caller's own pin cannot outlive it (see [`pin_life_ms`]); `None` means the
 /// datagram was dropped (SSRF filter, negative cache, DNS overload, no session
 /// slot, or the per-connection [`DnsGate`] coalescing an in-flight lookup).
+///
+/// `staged` is `Some` only on the steady/TRAIN fast-path drain: the resolved
+/// send is pushed into the caller's burst buffer instead of an immediate
+/// `udp_try_send`, so the burst-end `flush_staged_sends` can group same-flow
+/// runs. The unresolved DNS arm always spawns/returns None and never stages.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_server_dgram(
     ss: &SessTable,
@@ -463,6 +468,7 @@ pub(crate) async fn forward_server_dgram(
     payload: Bytes,
     allow_private: bool,
     r2: Option<&Arc<R2ConnState>>,
+    staged: Option<&mut Vec<StagedSend>>,
 ) -> Option<(SocketAddr, u64)> {
     match addr {
         TargetAddrRef::Ip(dst) => {
@@ -482,7 +488,15 @@ pub(crate) async fn forward_server_dgram(
             // write per datagram that nothing could read back.
             let sock = get_or_create_sess(ss, cd, conn_id, s, None, r2).await?;
             remember_dst(ss, s, dst);
-            udp_try_send(&sock, map_for_dual(dst), payload);
+            let mapped = map_for_dual(dst);
+            match staged {
+                Some(staged) => staged.push(StagedSend {
+                    sock,
+                    dst: mapped,
+                    payload,
+                }),
+                None => udp_try_send(&sock, mapped, payload),
+            }
             // An IP target has no DNS entry behind it: the pin's own TTL is the
             // only bound there is.
             Some((dst, DNS_CACHE_TTL_MS))
@@ -497,7 +511,15 @@ pub(crate) async fn forward_server_dgram(
                     let sock =
                         get_or_create_sess(ss, cd, conn_id, s, Some((h, p, dst, life)), r2).await?;
                     remember_dst(ss, s, dst);
-                    udp_try_send(&sock, map_for_dual(dst), payload);
+                    let mapped = map_for_dual(dst);
+                    match staged {
+                        Some(staged) => staged.push(StagedSend {
+                            sock,
+                            dst: mapped,
+                            payload,
+                        }),
+                        None => udp_try_send(&sock, mapped, payload),
+                    }
                     return Some((dst, life));
                 }
                 ForwardResolution::Unresolved => {}
