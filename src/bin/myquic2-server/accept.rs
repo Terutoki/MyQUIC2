@@ -288,27 +288,13 @@ pub(crate) fn flush_staged_sends(staged: &mut Vec<StagedSend>) {
     staged.clear();
 }
 
-/// Per-connection fast-path slots.
-///
-/// See the note at the declaration site in [`handle_conn`] for why this is a
-/// table and not the single `(session, dst)` pair it used to be; the sizing
-/// argument is there too. 128 covers the steady working set of a connection
-/// that fronts a client pooling its associations onto a handful of QUIC
-/// connections (the shipped client packs up to ~2000 live sessions per
-/// connection), and is charged to admission by `R2_INGRESS_FIXED_BYTES`.
-///
-/// It is deliberately *not* sized to `LOCAL_SESS_MAX`: at ~440 B a slot that
-/// would be ~1.7 MiB per connection, so the table is the working set and a
-/// miss still resolves through the shard map. A full table evicts on every
-/// arm, which is affordable only because an arm now costs a scan of the tag
-/// and stamp arrays instead of the payload array — see [`FastTable`].
-pub(crate) const FAST_SESS_SLOTS: usize = 128;
-
 /// One session's steady-state entry in a connection's fast table.
 ///
-/// Every field is exactly what the single-slot version kept, minus the ambiguity
-/// of "which session is this about": the slot names its session, so a datagram
-/// for any other session simply does not match and falls through.
+/// The fields the single-slot version kept, minus the ambiguity of "which
+/// session is this about" (the slot names its session, so a datagram for any
+/// other session simply does not match and falls through) and minus the inline
+/// pin, whose only reader was the INLINE/legacy `resolve_fast`; the steady and
+/// TRAIN paths resolve from the flow binding and never read it.
 pub(crate) struct FastSess {
     /// The session this slot describes; the probe compares it exactly.
     pub(crate) sess: u32,
@@ -332,12 +318,6 @@ pub(crate) struct FastSess {
     /// The session's allowlist epoch, so a re-record happens whenever a push
     /// this reader did not make (a spawned resolver task's) moved the allowlist.
     epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// The address this session's domain target resolves to, so a domain
-    /// datagram skips the DNS lookup entirely instead of paying a hash, a key
-    /// build and a key compare on every packet. Only ever consulted for the
-    /// session it was armed for (see [`resolve_fast`]); it expires on its own —
-    /// see [`ConnPin`].
-    pin: Option<ConnPin>,
     /// Last destination recorded into this session's reply allowlist here. The
     /// allowlist update takes the table read lock, so it runs only when the
     /// destination actually changed (steady single-target flows pay nothing
@@ -362,23 +342,36 @@ impl FastSess {
     }
 }
 
-// The per-connection admission charge for the table is derived from this size
-// (see `R2_INGRESS_FIXED_BYTES` in `config::tuning`): a field that grows an
-// entry by a few bytes grows every connection's reservation by kilobytes, so
-// this is pinned at the measured size rather than rounded up to a comfortable
-// ceiling.
-const _: () = assert!(std::mem::size_of::<FastSess>() <= 432);
+/// Per-connection fast-path slots.
+///
+/// See the note at the declaration site in [`handle_conn`] for why this is a
+/// table and not the single `(session, dst)` pair it used to be; the sizing
+/// argument is there too. The shipped client packs up to ~2000 live sessions
+/// per connection, so the table is a working set charged to admission by
+/// `R2_INGRESS_FIXED_BYTES`, not a router.
+///
+/// The slot count is computed from the same array budget the previous
+/// `128 × 432 B` table used. Removing the inline `ConnPin` (its only reader was
+/// the INLINE/legacy `resolve_fast`, never the steady/TRAIN path) shrank
+/// `FastSess`, and spending that saving on more slots attacks the measured
+/// ~88% slow-path rate directly without increasing the per-connection
+/// admission charge. The `+ 12` is the split table's per-slot tag (4 B) and
+/// age (8 B).
+const FAST_TABLE_ARRAY_BYTES: usize = 128 * (432 + 12);
+pub(crate) const FAST_SESS_SLOTS: usize =
+    FAST_TABLE_ARRAY_BYTES / (std::mem::size_of::<FastSess>() + 12);
+const _: () = assert!(FAST_SESS_SLOTS >= 128);
 
 /// The connection's fast-path table: session id to steady-state entry.
 ///
 /// Three parallel arrays rather than one array of payload structs. Finding a
 /// session and choosing a victim only ever needed the ids and the liveness
 /// stamps; with the payloads inline, a scan had to touch up to 128 scattered
-/// ~440-byte structs (`ConnPin` alone carries a 255-byte name), which is ~384
-/// cache lines — measured at ~1.3 µs per arm in exactly the shape the shipped
-/// client produces (1000+ live sessions per connection against 128 slots, so
-/// ~88 % of datagrams take the slow path and arm). Split out, the same scan
-/// reads 512 B of tags and 1 KiB of stamps and dereferences nothing.
+/// ~440-byte structs (`ConnPin` alone carried a 255-byte name), which is ~384
+/// cache lines — measured at ~1.3 µs per arm in the old layout in exactly the
+/// shape the shipped client produces (1000+ live sessions per connection, so
+/// ~88 % of datagrams took the slow path and armed). Split out, the same scan
+/// reads only the tag and stamp arrays and dereferences nothing.
 pub(crate) struct FastTable {
     /// Session id per slot, or [`EMPTY_TAG`] while the slot is free.
     ///
@@ -415,7 +408,7 @@ impl FastTable {
     /// its stamp is shared with the live session and keeps advancing, so it
     /// never looked like the quietest entry; and an arm that landed in a hole
     /// could install a second entry for a session that already had one.
-    /// Scanning 128 tags is a handful of nanoseconds and removes both.
+    /// Scanning the tag array is a handful of nanoseconds and removes both.
     #[inline]
     pub(crate) fn probe(&self, s: u32) -> Option<usize> {
         if s == EMPTY_TAG {
@@ -431,21 +424,27 @@ impl FastTable {
     /// recently active session loses its slot and simply takes the slow path
     /// on its next datagram.
     pub(crate) fn arm_index(&self, s: u32) -> usize {
-        if let Some(idx) = self.probe(s) {
-            return idx;
-        }
-        if let Some(idx) = self.tags.iter().position(|&tag| tag == EMPTY_TAG) {
-            return idx;
-        }
+        // One pass over tags+ages, not `probe` + first-free + oldest: the table
+        // is now large enough (~405 slots) that three separate scans would
+        // dominate an arm. The pass still returns the session's own slot first,
+        // then the first free slot, then the quietest occupied one.
+        let mut free = None;
         let mut victim = 0;
-        let mut oldest = self.ages[0];
-        for (idx, &age) in self.ages.iter().enumerate().skip(1) {
-            if age < oldest {
-                oldest = age;
+        let mut oldest = u64::MAX;
+        for (idx, &tag) in self.tags.iter().enumerate() {
+            if s != EMPTY_TAG && tag == s {
+                return idx;
+            }
+            if tag == EMPTY_TAG {
+                if free.is_none() {
+                    free = Some(idx);
+                }
+            } else if self.ages[idx] < oldest {
+                oldest = self.ages[idx];
                 victim = idx;
             }
         }
-        victim
+        free.unwrap_or(victim)
     }
 
     #[inline]
@@ -498,16 +497,17 @@ impl FastTable {
     }
 }
 
-/// Resolve one datagram's target: the session's own pin first (free), then the
-/// session's destination memo, then the DNS cache.
+/// Resolve one datagram's target through the session's destination memo, then
+/// the DNS cache. IP targets are already resolved and return immediately.
 ///
-/// Only this session's own slot is ever consulted — the pin is keyed on
-/// `(session, name, port)` and answering another session's datagram from it
-/// would be a silent mis-route. A miss resolves with a scratch slot, so the
-/// memo/DNS answer is still used for this datagram; the slow path then installs
-/// the slot (and its own pin) for the session that asked.
+/// This used to consult a `ConnPin` stored in the session's fast-table slot.
+/// The pin was only ever read on this INLINE/legacy path, while it made every
+/// `FastSess` 304 B larger and was rewritten on every slow-path arm — including
+/// every IP arm, where no reader can exist. The steady/TRAIN path resolves from
+/// the flow binding and never calls this function, so the pin was removed and
+/// the freed space now buys a larger fast table. This path keeps a stack-local
+/// scratch pin: a memo hit may still arm it, but no per-connection state grows.
 pub(crate) fn resolve_fast(
-    fast: &mut FastTable,
     ss: &SessTable,
     s: u32,
     a: TargetAddrRef<'_>,
@@ -517,16 +517,8 @@ pub(crate) fn resolve_fast(
         TargetAddrRef::Ip(dst) => return Some(dst),
         TargetAddrRef::Domain(h, p) => (h, p),
     };
-    // Scratch is only reached when this session has no slot of its own; nothing
-    // is ever armed into it.
     let mut scratch: Option<ConnPin> = None;
-    let pin = match fast.probe(s).and_then(|idx| fast.get_mut(idx)) {
-        Some(slot) => &mut slot.pin,
-        None => &mut scratch,
-    };
-    // `pinned_sess` is `s` in both arms: `resolve_pin` only trusts a pin whose
-    // own `sess` matches, so a scratch (always `None`) can never arm anything.
-    resolve_pin(ss, pin, s, s, h, p, allow_private)
+    resolve_pin(ss, &mut scratch, s, s, h, p, allow_private)
 }
 
 /// Try the fast path for one datagram: validate the slot, mirror the allowlist
@@ -602,39 +594,27 @@ pub(crate) fn try_stage(
 /// (`is_live_for` + `sock.upgrade`) before it is used, so dropping it on a memo
 /// eviction only threw away a correct fast-path entry.
 ///
-/// Re-arming a session that already holds its slot only refreshes the pin and
-/// the liveness stamp: this runs on the *slow* path of every datagram while the
-/// table is too small for the live set, and rewriting the 432-byte entry (an
-/// `Arc::downgrade` refcount round-trip plus the name copy) bought nothing
-/// there — the socket, abort and epoch are the same values by construction.
+/// Re-arming a session that already holds its slot only refreshes the liveness
+/// stamp: this runs on the *slow* path of every datagram while the table is
+/// too small for the live set, and rewriting the entry (an `Arc::downgrade`
+/// refcount round-trip) bought nothing there — the socket, abort and epoch are
+/// the same values by construction.
 ///
 /// Deliberately lock-free: it reads only the connection's thread-local session
 /// memo, so a miss costs the slow path no session-table acquisition of its own
 /// (the two it already takes are in `get_or_create_sess` and `remember_dst`).
-pub(crate) fn arm_fast(
-    fast: &mut FastTable,
-    conn_id: usize,
-    s: u32,
-    a: TargetAddrRef<'_>,
-    dst: SocketAddr,
-    life: u64,
-) {
+pub(crate) fn arm_fast(fast: &mut FastTable, conn_id: usize, s: u32) {
     match sess_memo_lookup(conn_id, s) {
         SessHit::Fresh(sock, last, abort, epoch) => {
-            let (ph, pp) = target_name(a);
             let idx = fast.arm_index(s);
-            // Already armed and still live: the pin is the only field that can
-            // have changed (a new DNS generation), so update it in place. A
+            // Already armed and still live: the handles cannot have changed. A
             // finished abort falls through: that entry describes a session this
             // arm just replaced, and its handles must be rewritten.
             let stamp = match fast.get_mut(idx) {
                 Some(slot) if slot.sess == s && !slot.abort.is_finished() => {
-                    pin_arm(&mut slot.pin, s, ph, pp, dst, life);
                     slot.last.load(std::sync::atomic::Ordering::Relaxed)
                 }
                 _ => {
-                    let mut pin = None;
-                    pin_arm(&mut pin, s, ph, pp, dst, life);
                     fast.insert(
                         idx,
                         FastSess {
@@ -643,7 +623,6 @@ pub(crate) fn arm_fast(
                             last,
                             abort,
                             epoch,
-                            pin,
                             last_dst: None,
                             allow: None,
                         },
@@ -703,7 +682,7 @@ async fn forward_v3_item(
     staged: &mut Vec<StagedSend>,
     r2: Option<&Arc<R2ConnState>>,
 ) -> bool {
-    let want = resolve_fast(fast, ss, sess, a, allow_private);
+    let want = resolve_fast(ss, sess, a, allow_private);
     let payload = match want {
         Some(dst) => {
             match try_stage(fast, ss, conn_id, sess, dst, payload, allow_private, staged) {
@@ -717,8 +696,8 @@ async fn forward_v3_item(
     // slow path's immediate send.
     flush_staged_sends(staged);
     let used = forward_server_dgram(ss, cd, conn_id, sess, a, payload, allow_private, r2).await;
-    if let Some((dst, life)) = used {
-        arm_fast(fast, conn_id, sess, a, dst, life);
+    if used.is_some() {
+        arm_fast(fast, conn_id, sess);
         true
     } else {
         false
@@ -2687,26 +2666,32 @@ async fn r2_forward_flow_resolved(
         return false;
     };
     let sess = binding.session;
-    let aref = r2::ip_ref(dst);
     match try_stage(fast, ss, conn_id, sess, dst, payload, allow_private, staged) {
         Ok(()) => true,
         Err(payload) => {
-            flush_staged_sends(staged);
-            let used = forward_server_dgram(
-                ss,
-                cd,
-                conn_id,
-                sess,
-                aref,
-                payload,
-                allow_private,
-                Some(state),
-            )
-            .await;
-            if let Some((used_dst, life)) = used {
-                arm_fast(fast, conn_id, sess, aref, used_dst, life);
+            // The steady/TRAIN slow path already has an IP. Stage it with the
+            // fast-path sends instead of an immediate `udp_try_send`: the old
+            // shape flushed and sent before every miss, so a train of
+            // interleaved hits and misses paid a flush + syscall per item and
+            // could never group a flow's consecutive payloads. The burst-end
+            // flush now sees the whole train in encounter order. The SSRF check
+            // and `remember_dst` mirror `forward_server_dgram`'s IP arm.
+            if !allow_private && !is_global_ip_cached(dst.ip()) {
+                dgram_drops::bump(&dgram_drops::REFUSED);
+                return false;
             }
-            used.is_some()
+            let Some(sock) = get_or_create_sess(ss, cd, conn_id, sess, None, Some(state)).await
+            else {
+                return false;
+            };
+            remember_dst(ss, sess, dst);
+            staged.push(StagedSend {
+                sock,
+                dst: map_for_dual(dst),
+                payload,
+            });
+            arm_fast(fast, conn_id, sess);
+            true
         }
     }
 }
@@ -2976,8 +2961,8 @@ pub(crate) async fn r2_ingress_open(
             )
             .await;
             match used {
-                Some((used_dst, life)) => {
-                    arm_fast(fast, conn_id, sess, r2::ip_ref(dst), used_dst, life);
+                Some(_) => {
+                    arm_fast(fast, conn_id, sess);
                     Some(Vec::new())
                 }
                 None => {
@@ -3055,7 +3040,7 @@ pub(crate) async fn r2_ingress_open(
                 // this session's later steady frames hit the fast path. (The
                 // spawned slow path deliberately leaves arming to the datagram
                 // loop; here we *are* the datagram loop.)
-                arm_fast(fast, conn_id, sess, target.as_ref(), dst, life);
+                arm_fast(fast, conn_id, sess);
                 r2_stats::bump(&r2_stats::DNS_SYNC_OPENS);
                 // The one address the synchronous probe knows (the memo's first
                 // record) is the flow's validated reply-source set here: it is
@@ -3928,18 +3913,18 @@ async fn handle_conn_inner(
         // syscall amplification of one `sendto` per datagram against one
         // `sendmmsg` per 32.
         //
-        // Sizing: 128 slots (a 440 B payload entry, pinned by the
-        // `size_of::<FastSess>()` assert above, next to a 4 B tag and an 8 B
-        // stamp in the probe arrays). The multi-association shape this comment
-        // documents ("hundreds of sessions") is beyond one heap array, but 64
-        // covered only the DNS + game + handful-of-flows case, and the shipped
-        // client packs up to ~2000 live sessions onto one connection, i.e. once
-        // a table is full *every* arm evicts. 128 doubles the working set for
-        // ~56.5 KiB per connection and admission still charges it through
-        // `R2_INGRESS_FIXED_BYTES`. The remaining gap to `LOCAL_SESS_MAX` is
-        // structural: covering it with slots would cost ~1.8 MiB per
-        // connection, so a miss must stay cheap (an arm now scans only the tag
-        // and stamp arrays) rather than be made impossible by table size.
+        // Sizing: `FAST_SESS_SLOTS` is computed to fit the same ~56.5 KiB
+        // array budget the old 128 × 432 B table used, next to a 4 B tag and an
+        // 8 B stamp in the probe arrays. Removing the inline pin shrank
+        // `FastSess` to 128 B, so the budget now carries ~405 slots (3.1×). The
+        // shipped client packs up to ~2000 live sessions onto one connection,
+        // i.e. once the table is full *every* arm evicts; the larger working set
+        // is a direct cut to that rate, and admission still charges the table
+        // through `R2_INGRESS_FIXED_BYTES`. The remaining gap to
+        // `LOCAL_SESS_MAX` is structural: covering it with slots would cost
+        // ~1.8 MiB per connection, so a miss must stay cheap (an arm now scans
+        // only the tag and stamp arrays) rather than be made impossible by
+        // table size.
         //
         // **Probed, not direct-mapped.** Session ids come from the client's
         // monotonic counter and are never reused, so the live ids on a
@@ -3959,12 +3944,10 @@ async fn handle_conn_inner(
         // before it stages anything, and a miss only means "run the slow path,
         // which re-arms".
         //
-        // The slot count stays a compromise rather than as large as possible:
-        // every slot carries a 255-byte pin buffer for the domain-target
-        // shortcut, and this table lives per *connection* (4096 admitted
-        // connections would be ~105 MiB at this size — the reason the admission
-        // charge was raised alongside the slot count, see
-        // `R2_INGRESS_FIXED_BYTES` in `config::tuning`).
+        // The slot count is computed from a fixed per-connection array budget
+        // (`FAST_SESS_SLOTS` above), so it cannot silently grow the admission
+        // charge as `FastSess` changes; see `R2_INGRESS_FIXED_BYTES` in
+        // `config::tuning`.
         let mut fast = FastTable::new();
         // Target sends staged for the current drain burst, flushed grouped per
         // `(sock, dst)` run by `flush_staged_sends` (one `sendmmsg` per 32 on
@@ -4120,10 +4103,10 @@ async fn handle_conn_inner(
                         continue;
                     };
                     udp_stats::payload(whole.len());
-                    // One resolution for this datagram: the session's own pin, else
-                    // the DNS cache. A domain target whose session is already pinned
+                    // One resolution for this datagram: the session's destination
+                    // memo, else the DNS cache. A domain target already memoized
                     // never reaches `forward_server_dgram` at all.
-                    let want = resolve_fast(&mut fast, &ss, s, a.as_ref(), allow_private);
+                    let want = resolve_fast(&ss, s, a.as_ref(), allow_private);
                     // Stage on the fast path; only the slow path keeps the payload,
                     // and `try_stage` hands it back on a miss so the steady path
                     // pays no `Bytes` clone.
@@ -4158,8 +4141,8 @@ async fn handle_conn_inner(
                         Some(&r2),
                     )
                     .await;
-                    if let Some((dst, life)) = used {
-                        arm_fast(&mut fast, conn_id, s, a.as_ref(), dst, life);
+                    if used.is_some() {
+                        arm_fast(&mut fast, conn_id, s);
                     }
                 } else {
                     if is_batch(&d) {
@@ -4168,7 +4151,7 @@ async fn handle_conn_inner(
                             continue;
                         };
                         let s = b.sess;
-                        let want = resolve_fast(&mut fast, &ss, s, b.addr, allow_private);
+                        let want = resolve_fast(&ss, s, b.addr, allow_private);
                         match want {
                             Some(dst) => {
                                 for p in b.payloads() {
@@ -4204,8 +4187,8 @@ async fn handle_conn_inner(
                                         // Arm from the slow path's answer, so the
                                         // *next* frame for this session hits the
                                         // fast table (see the table comment).
-                                        if let Some((dst2, life)) = used {
-                                            arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
+                                        if used.is_some() {
+                                            arm_fast(&mut fast, conn_id, s);
                                             #[cfg(test)]
                                             BATCH_FAST_ARMS
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4216,10 +4199,34 @@ async fn handle_conn_inner(
                             }
                             None => {
                                 flush_staged_sends(&mut staged);
+                                // Re-probe after the first successful slow
+                                // send. The arm installs the session's slot, so
+                                // the rest of this BATCH can take the fast path
+                                // instead of resolving every payload again —
+                                // which is exactly what the old arm-and-ignore
+                                // loop failed to do.
+                                let mut want: Option<SocketAddr> = None;
                                 for p in b.payloads() {
                                     let off = p.as_ptr() as usize - d.as_ptr() as usize;
                                     let payload = d.slice(off..off + p.len());
                                     udp_stats::payload(p.len());
+                                    let payload = match want {
+                                        Some(dst) => match try_stage(
+                                            &mut fast,
+                                            &ss,
+                                            conn_id,
+                                            s,
+                                            dst,
+                                            payload,
+                                            allow_private,
+                                            &mut staged,
+                                        ) {
+                                            Ok(()) => continue,
+                                            Err(payload) => payload,
+                                        },
+                                        None => payload,
+                                    };
+                                    flush_staged_sends(&mut staged);
                                     let used = forward_server_dgram(
                                         &ss,
                                         &cd,
@@ -4231,15 +4238,9 @@ async fn handle_conn_inner(
                                         Some(&r2),
                                     )
                                     .await;
-                                    // Same arm as the `Some(dst)` arm above: an
-                                    // unarmed table is exactly why `want` was
-                                    // `None`, and the slow path's answer is what
-                                    // installs the slot for the rest of the
-                                    // burst. Discarding it (the old `let _ =`)
-                                    // kept every payload of every BATCH frame on
-                                    // the slow path.
-                                    if let Some((dst2, life)) = used {
-                                        arm_fast(&mut fast, conn_id, s, b.addr, dst2, life);
+                                    if let Some((dst2, _)) = used {
+                                        arm_fast(&mut fast, conn_id, s);
+                                        want = Some(dst2);
                                         #[cfg(test)]
                                         BATCH_FAST_ARMS
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4253,7 +4254,7 @@ async fn handle_conn_inner(
                         dgram_drops::bump(&dgram_drops::REFUSED);
                         continue;
                     };
-                    let want = resolve_fast(&mut fast, &ss, s, a, allow_private);
+                    let want = resolve_fast(&ss, s, a, allow_private);
                     // `d` is already owned (from `read_datagram`), so the slice
                     // borrows it directly: one refcount bump, no payload copy.
                     let off = d.len() - p.len();
@@ -4293,8 +4294,8 @@ async fn handle_conn_inner(
                         Some(&r2),
                     )
                     .await;
-                    if let Some((dst, life)) = used {
-                        arm_fast(&mut fast, conn_id, s, a, dst, life);
+                    if used.is_some() {
+                        arm_fast(&mut fast, conn_id, s);
                     }
                 }
             }

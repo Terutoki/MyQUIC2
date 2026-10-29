@@ -335,24 +335,14 @@ pub(crate) fn fast_allow_cached(
     v
 }
 
-/// The target a datagram names, as `(host, port)`. An IP target reports an
-/// empty host: it has no name that could rotate to another address, so there is
-/// nothing for a pin to re-check. A domain name is never empty on the wire
-/// (`TargetAddrRef::decode` refuses a zero-length one), so the two forms cannot
-/// collide in a [`ConnPin`].
-pub(crate) fn target_name(a: TargetAddrRef<'_>) -> (&str, u16) {
-    match a {
-        TargetAddrRef::Ip(dst) => ("", dst.port()),
-        TargetAddrRef::Domain(h, p) => (h, p),
-    }
-}
-
 /// Resolve this datagram's target once, for both the fragment and the plain
-/// branch. Order matters: the connection's pin first (free, and only trusted
-/// while it still names the pinned session *and* has not expired), then the
-/// session's own memo, then this thread's DNS memo. `None` means "not known
-/// yet" -- `forward_server_dgram` spawns the resolver (which resolves from the
-/// shared caches and stores the session memo), so it is not an error.
+/// branch. Order matters: the caller's pin first (when supplied; free, and
+/// only trusted while it still names the pinned session *and* has not
+/// expired), then the session's own memo, then this thread's DNS memo. `None`
+/// means "not known yet" -- `forward_server_dgram` spawns the resolver (which
+/// resolves from the shared caches and stores the session memo), so it is not
+/// an error. The fast table no longer carries a per-session pin; callers on
+/// the INLINE/legacy path pass a stack-local scratch.
 pub(crate) fn resolve_pin(
     ss: &SessTable,
     pin: &mut Option<ConnPin>,
@@ -368,8 +358,8 @@ pub(crate) fn resolve_pin(
     // `sess_dest_store` writes the memo's `expires` from the same epoch, so the
     // two sides are directly comparable.
     let now = coarse_millis();
-    // The connection-level pin is only trusted for the exact
-    // (session, name, port) it was stored for, and only until its deadline.
+    // The pin is only trusted for the exact (session, name, port) it was
+    // stored for, and only until its deadline.
     // Matching on the session alone would send a datagram naming a *different*
     // target to the address resolved for the previous one -- a silent
     // mis-route; ignoring the deadline would never re-resolve at all.
@@ -380,15 +370,14 @@ pub(crate) fn resolve_pin(
         && pin.expires > now
     {
         // No SSRF recheck here. Every arm site filters *before* it pins
-        // (`resolve_pin`'s own two arms below, and `arm_fast` in accept.rs,
-        // whose dst always came through `forward_server_dgram`'s filter), the
-        // pinned address never changes for the pin's life, and `is_global_ip`
-        // is a pure function of that address — so a recheck could only ever
-        // re-derive `true`, at one thread-local hash per datagram on the
-        // steady domain path. `allow_private` is a per-connection constant, so
-        // neither branch can flip under a live pin either. (An earlier revision
-        // argued a pin "could now read as non-global"; a pure predicate over an
-        // immutable address cannot.)
+        // (`resolve_pin`'s own two arms below; the fast table no longer arms a
+        // pin), the pinned address never changes for the pin's life, and
+        // `is_global_ip` is a pure function of that address — so a recheck
+        // could only ever re-derive `true`, at one thread-local hash per
+        // datagram on this path. `allow_private` is a per-connection constant,
+        // so neither branch can flip under a live pin either. (An earlier
+        // revision argued a pin "could now read as non-global"; a pure
+        // predicate over an immutable address cannot.)
         return Some(pin.addr);
     }
     if let Some((dst, memo_life)) = sess_dest_lookup_ttl(ss, now, s, h, p) {
@@ -442,12 +431,15 @@ pub(crate) fn resolve_pin(
 /// `DNS_CACHE_TTL_MS`, where the 30 s pin wins and behaviour is unchanged.
 ///
 /// Convergence bound: a public DNS flip is served stale for at most the pin's
-/// remaining life (worst 30 s from adoption, usually far less via the clamp);
-/// a flip to a filtered (non-global) address converges on the next datagram —
-/// the pin-hit SSRF recheck in `resolve_pin` treats it as a miss and falls
-/// through to the memo/DNS full-set scan instead of serving or dropping stale
-/// for the rest of the pin life. Steady public flows pay one thread-local
-/// cached bool per hit, no locks, no DNS reads.
+/// remaining life (worst 30 s from adoption, usually far less via the clamp).
+/// There is deliberately **no** pin-hit SSRF recheck: every arm site filters
+/// before it pins, the pinned address never changes, and `is_global_ip` is a
+/// pure function of that address. A name that now resolves to a filtered
+/// (non-global) address therefore does not switch the flow to it; the old
+/// address, which passed the filter when it was pinned, is served until the
+/// pin expires and the next resolution applies the new policy. The
+/// steady/TRAIN path resolves from the flow binding and does not read this
+/// pin at all.
 pub(crate) fn pin_life_ms(remaining_ms: u64) -> u64 {
     DEST_PIN_TTL_MS.min(remaining_ms)
 }

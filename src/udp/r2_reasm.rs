@@ -534,101 +534,105 @@ impl R2Reassembler {
         let n = f.chunk.len();
         let idx = f.idx;
         let middle = idx >= 1 && idx != f.total - 1;
-        let is_new = !self.parts.contains_key(&key);
-        if let Some(p) = self.parts.get(&key) {
-            if p.total != f.total {
-                book_drop(&dgram_drops::REFUSED);
-                return None;
-            }
-            match (&p.ctx, &incoming) {
-                (Some(old), Some(new)) if old != new => {
-                    // A peer trying to splice two sessions/targets into one
-                    // payload: refused on policy.
+        let is_new = match self.parts.get(&key) {
+            Some(p) => {
+                if p.total != f.total {
                     book_drop(&dgram_drops::REFUSED);
                     return None;
                 }
-                _ => {}
-            }
-            if p.got & (1u64 << idx) != 0 {
-                // Duplicate fragment: UDP permits it, delivery already
-                // happened (or will) once. Ignore, don't disturb the partial
-                // — and don't book it as a drop: the payload is not lost.
-                return None;
-            }
-            if middle
-                && let Some(w) = p.unit
-                && w != n
-            {
-                // The segmentation contract: one unit width per payload; a
-                // second width means the positions below are not derivable.
-                book_drop(&dgram_drops::REFUSED);
-                return None;
-            }
-            if p.bytes.saturating_add(n) > MQP_FRAG_MAX_PAYLOAD {
-                // The payload cap: this fragment would push one partial past
-                // the protocol's payload ceiling.
-                book_drop(&dgram_drops::BUFFER_FULL);
-                return None;
-            }
-            let placeable = Partial::pos_of(p.first_len, p.unit, idx).is_some();
-            // A placeable fragment can be the one that reserves the assembly
-            // buffer (`Partial::buf_write` grows it to the fragment's final
-            // position; the first placement also `reserve`s the whole payload
-            // estimate). Charge that reservation up front, not just the
-            // arriving chunk, so the budget check covers the allocation this
-            // mutation makes instead of accepting it and discovering the
-            // overshoot only after `recompute_retained()`.
-            let charge = if placeable {
-                let reserve = if p.buf.capacity() == 0 {
-                    (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
-                } else {
-                    0
-                };
-                n.max(reserve)
-            } else {
-                // Owned chunk: its exact bytes, its per-chunk overhead, and
-                // the slot-array growth when `pending` has to reallocate.
-                pending_charge(p.pending.len(), p.pending.capacity(), n)
-            };
-            // Charge the stale `order` backlog too: those slots are resident
-            // bytes this type is responsible for. The prune bounds the backlog
-            // to a small fraction of the budget, so normal multi-fragment
-            // traffic is unaffected; a stale tail still cannot make the live
-            // set overshoot the stated bound.
-            if self.held_bytes().saturating_add(charge) > FRAG_MAX_HELD_BYTES {
-                // The 256 KiB held-bytes budget: this fragment cannot be
-                // retained without breaking the per-connection bound.
-                book_drop(&dgram_drops::BUFFER_FULL);
-                return None;
-            }
-        } else {
-            // New partial: charge its physical footprint estimate (the first
-            // fragment will reserve `total x len` assembly capacity at most,
-            // later ones an owned pending chunk) **plus the `order` slot the
-            // insertion queues**, and evict under the same pressures as
-            // before — this cannot happen mid-payload. The budget is
-            // `held_bytes` (live retained bytes plus the bounded stale-slot
-            // backlog): eviction reclaims the slots it walks past, and the
-            // prune keeps that overhead far below the fragment budget.
-            let est = if idx == 0 {
-                (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
-            } else {
-                pending_charge(0, 0, n)
-            } + std::mem::size_of::<Partial>()
-                + ORDER_SLOT_BYTES;
-            while self.parts.len() >= FRAG_MAX_PARTIALS
-                || self.held_bytes().saturating_add(est) > FRAG_MAX_HELD_BYTES
-            {
-                // Every evicted partial is an incomplete payload a peer can no
-                // longer complete; the counters are booked per eviction below.
-                if !self.evict_oldest() {
-                    // Nothing left to evict and the new partial still does not
-                    // fit: capacity refusal.
+                match (&p.ctx, &incoming) {
+                    (Some(old), Some(new)) if old != new => {
+                        // A peer trying to splice two sessions/targets into one
+                        // payload: refused on policy.
+                        book_drop(&dgram_drops::REFUSED);
+                        return None;
+                    }
+                    _ => {}
+                }
+                if p.got & (1u64 << idx) != 0 {
+                    // Duplicate fragment: UDP permits it, delivery already
+                    // happened (or will) once. Ignore, don't disturb the partial
+                    // — and don't book it as a drop: the payload is not lost.
+                    return None;
+                }
+                if middle
+                    && let Some(w) = p.unit
+                    && w != n
+                {
+                    // The segmentation contract: one unit width per payload; a
+                    // second width means the positions below are not derivable.
+                    book_drop(&dgram_drops::REFUSED);
+                    return None;
+                }
+                if p.bytes.saturating_add(n) > MQP_FRAG_MAX_PAYLOAD {
+                    // The payload cap: this fragment would push one partial past
+                    // the protocol's payload ceiling.
                     book_drop(&dgram_drops::BUFFER_FULL);
                     return None;
                 }
+                let placeable = Partial::pos_of(p.first_len, p.unit, idx).is_some();
+                // A placeable fragment can be the one that reserves the assembly
+                // buffer (`Partial::buf_write` grows it to the fragment's final
+                // position; the first placement also `reserve`s the whole payload
+                // estimate). Charge that reservation up front, not just the
+                // arriving chunk, so the budget check covers the allocation this
+                // mutation makes instead of accepting it and discovering the
+                // overshoot only after `recompute_retained()`.
+                let charge = if placeable {
+                    let reserve = if p.buf.capacity() == 0 {
+                        (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
+                    } else {
+                        0
+                    };
+                    n.max(reserve)
+                } else {
+                    // Owned chunk: its exact bytes, its per-chunk overhead, and
+                    // the slot-array growth when `pending` has to reallocate.
+                    pending_charge(p.pending.len(), p.pending.capacity(), n)
+                };
+                // Charge the stale `order` backlog too: those slots are resident
+                // bytes this type is responsible for. The prune bounds the backlog
+                // to a small fraction of the budget, so normal multi-fragment
+                // traffic is unaffected; a stale tail still cannot make the live
+                // set overshoot the stated bound.
+                if self.held_bytes().saturating_add(charge) > FRAG_MAX_HELD_BYTES {
+                    // The 256 KiB held-bytes budget: this fragment cannot be
+                    // retained without breaking the per-connection bound.
+                    book_drop(&dgram_drops::BUFFER_FULL);
+                    return None;
+                }
+                false
             }
-        }
+            None => {
+                // New partial: charge its physical footprint estimate (the first
+                // fragment will reserve `total x len` assembly capacity at most,
+                // later ones an owned pending chunk) **plus the `order` slot the
+                // insertion queues**, and evict under the same pressures as
+                // before — this cannot happen mid-payload. The budget is
+                // `held_bytes` (live retained bytes plus the bounded stale-slot
+                // backlog): eviction reclaims the slots it walks past, and the
+                // prune keeps that overhead far below the fragment budget.
+                let est = if idx == 0 {
+                    (usize::from(f.total) * n).min(MQP_FRAG_MAX_PAYLOAD)
+                } else {
+                    pending_charge(0, 0, n)
+                } + std::mem::size_of::<Partial>()
+                    + ORDER_SLOT_BYTES;
+                while self.parts.len() >= FRAG_MAX_PARTIALS
+                    || self.held_bytes().saturating_add(est) > FRAG_MAX_HELD_BYTES
+                {
+                    // Every evicted partial is an incomplete payload a peer can no
+                    // longer complete; the counters are booked per eviction below.
+                    if !self.evict_oldest() {
+                        // Nothing left to evict and the new partial still does not
+                        // fit: capacity refusal.
+                        book_drop(&dgram_drops::BUFFER_FULL);
+                        return None;
+                    }
+                }
+                true
+            }
+        };
 
         let completed = {
             let partial = self

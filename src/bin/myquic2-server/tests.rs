@@ -808,14 +808,7 @@ async fn two_sessions_on_one_connection_both_hit_the_fast_table() {
 
     // Arm both slots through the production slow-path arm.
     for s in [s1, s2] {
-        arm_fast(
-            &mut fast,
-            conn_id,
-            s,
-            TargetAddrRef::Ip(dst),
-            dst,
-            DNS_CACHE_TTL_MS,
-        );
+        arm_fast(&mut fast, conn_id, s);
         assert!(fast.probe(s).is_some(), "arm must publish session {s}");
     }
     assert_eq!(fast.len(), 2, "two sessions, two entries");
@@ -923,14 +916,7 @@ async fn a_full_table_evicts_the_quietest_session() {
         ss.note_live_insert();
         sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
         socks.push(sock);
-        arm_fast(
-            &mut fast,
-            conn_id,
-            s,
-            TargetAddrRef::Ip(dst),
-            dst,
-            DNS_CACHE_TTL_MS,
-        );
+        arm_fast(&mut fast, conn_id, s);
     }
     assert_eq!(fast.len(), FAST_SESS_SLOTS, "premise: the table is full");
     assert!(
@@ -951,14 +937,7 @@ async fn a_full_table_evicts_the_quietest_session() {
         sess_memo_put(conn_id, newcomer, sock.clone(), last, abort, epoch);
         socks.push(sock);
     }
-    arm_fast(
-        &mut fast,
-        conn_id,
-        newcomer,
-        TargetAddrRef::Ip(dst),
-        dst,
-        DNS_CACHE_TTL_MS,
-    );
+    arm_fast(&mut fast, conn_id, newcomer);
 
     assert_eq!(fast.len(), FAST_SESS_SLOTS, "a full table never grows");
     assert!(
@@ -1028,14 +1007,7 @@ async fn a_memo_eviction_keeps_the_fast_slot_serving() {
     ss.note_live_insert();
     sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
     socks.push(sock);
-    arm_fast(
-        &mut fast,
-        conn_id,
-        s,
-        TargetAddrRef::Ip(dst),
-        dst,
-        DNS_CACHE_TTL_MS,
-    );
+    arm_fast(&mut fast, conn_id, s);
     assert!(fast.probe(s).is_some(), "premise: the session is armed");
 
     // One memo table apart: the hash is a bijection mod a power of two, so this
@@ -1059,14 +1031,7 @@ async fn a_memo_eviction_keeps_the_fast_slot_serving() {
 
     // Re-arming on a miss must keep the slot: the session never died, only its
     // memo row was reused.
-    arm_fast(
-        &mut fast,
-        conn_id,
-        s,
-        TargetAddrRef::Ip(dst),
-        dst,
-        DNS_CACHE_TTL_MS,
-    );
+    arm_fast(&mut fast, conn_id, s);
     assert!(
         fast.probe(s).is_some(),
         "a memo miss must not drop the slot"
@@ -1120,26 +1085,12 @@ async fn sparse_session_ids_both_hit_and_a_full_table_never_grows() {
         socks.push(sock);
     }
     for s in [s1, s2, s3] {
-        arm_fast(
-            &mut fast,
-            conn_id,
-            s,
-            TargetAddrRef::Ip(dst),
-            dst,
-            DNS_CACHE_TTL_MS,
-        );
+        arm_fast(&mut fast, conn_id, s);
     }
     // Re-arming an already armed session must update its own slot in place,
     // never append a second copy.
     let i3 = fast.probe(s3).expect("s3 must be armed");
-    arm_fast(
-        &mut fast,
-        conn_id,
-        s3,
-        TargetAddrRef::Ip(dst),
-        dst,
-        DNS_CACHE_TTL_MS,
-    );
+    arm_fast(&mut fast, conn_id, s3);
     assert_eq!(
         fast.probe(s3),
         Some(i3),
@@ -1181,14 +1132,23 @@ async fn sparse_session_ids_both_hit_and_a_full_table_never_grows() {
         overflow.push((s, sock));
     }
     for (s, _) in &overflow {
-        arm_fast(
-            &mut fast,
-            conn_id,
-            *s,
-            TargetAddrRef::Ip(dst),
-            dst,
-            DNS_CACHE_TTL_MS,
-        );
+        // Refresh the memo row immediately before the arm. The fast table is
+        // now larger than the 256-entry memo, so a batch of 406 inserts would
+        // evict the early rows before their arms ran; production arms each
+        // session right after `get_or_create_sess`/`sess_memo_put`.
+        let (sock, last, abort, epoch) = {
+            let sh = ss.shard(*s);
+            let r = sh.read();
+            let e = r.get(s).expect("overflow session is live");
+            (
+                e.sock.clone(),
+                e.last.clone(),
+                e.reader.abort_handle(),
+                e.recent_epoch.clone(),
+            )
+        };
+        sess_memo_put(conn_id, *s, sock, last, abort, epoch);
+        arm_fast(&mut fast, conn_id, *s);
     }
     assert_eq!(fast.len(), FAST_SESS_SLOTS, "the table is fixed-size");
     let (last_s, _) = overflow.last().expect("overflow fixture is non-empty");
@@ -1795,7 +1755,9 @@ async fn the_pin_holds_the_wire_max_name_inline() {
         "a name that cannot be stored whole must not be pinned"
     );
 
-    // An IP target pins under the empty name `target_name` gives it.
+    // The empty name is still a valid pin key. Production no longer arms an
+    // IP target (the pin would have no reader), but `pin_arm` must keep the
+    // empty-key behaviour its tests and callers rely on.
     pin_arm(&mut too_long, 7, "", 443, addr, DNS_CACHE_TTL_MS);
     assert!(too_long.as_ref().is_some_and(|p| pin_is_for(p, "", 443)));
 }

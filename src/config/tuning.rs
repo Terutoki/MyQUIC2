@@ -23,15 +23,14 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 /// small fixed maps next to them. A conservative single term keeps the
 /// admission bound from depending on binary-private types.
 ///
-/// The fast session table is 128 slots (`FAST_SESS_SLOTS` in
-/// `myquic2-server/accept.rs`, up from 64 and originally 16): each slot is a
-/// 432 B `FastSess` (an inline `ConnPin` — 255-byte name + address + deadline,
-/// ~304 B — plus the weak socket handle, the abort handle, and the
-/// liveness/epoch stamps) next to a 4 B tag and an 8 B stamp in the separate
-/// probe arrays, so the table is ~55.5 KiB. With the 16 KiB pre-HELLO
-/// buffer (~72.5 KiB), the per-slot pins and the surrounding maps, 96 KiB is
-/// still a round, conservative charge; `size_of::<FastSess>()` is pinned by a
-/// compile-time assert in `accept.rs` so the arithmetic cannot drift silently.
+/// The fast session table (`FAST_SESS_SLOTS` in `myquic2-server/accept.rs`) is
+/// sized from the same array budget the old 128 × 432 B table used. Each
+/// `FastSess` is now 128 B — the inline `ConnPin` was removed after its only
+/// reader turned out to be the INLINE/legacy path — so the same ~56 KiB
+/// carries ~405 slots. With the 16 KiB pre-HELLO buffer and the
+/// surrounding maps, 96 KiB remains a round, conservative charge; the slot
+/// count is derived from `size_of::<FastSess>()` in `accept.rs`, so the
+/// arithmetic cannot drift silently.
 pub const R2_INGRESS_FIXED_BYTES: u64 = 96 * 1024;
 
 /// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`

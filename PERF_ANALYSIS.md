@@ -623,6 +623,10 @@ left* by it as well as for what the first pass skipped. Four items were found; o
 
 ### 9.1 B1 — fast table working set
 
+> **Follow-up (2026-10-30):** the inline pin was removed and `FAST_SESS_SLOTS` is now
+> computed from the same array budget (~405 slots, 128 B `FastSess`). The
+> 128-slot numbers below are the historical record of B1, not the current table.
+
 `FAST_SESS_SLOTS` was 64 while `LOCAL_SESS_MAX` is 4096, and the shipped client concentrates up to ~2000 live sessions on
 one connection (2 interactive + 2 bulk UDP shards for up to 4,032 associations). Past 64 live sessions *every* arm evicts:
 `fast_arm_index` falls through to the least-recently-active slot, so the table becomes a churn buffer and each datagram

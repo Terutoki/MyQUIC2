@@ -20,9 +20,12 @@
 //! * [`R2StageKind::Inline`] — the no-flow fail-safe: standalone `DATA INLINE`.
 //!
 //! `Open`/`Inline` items break a train run (they are self-describing frames,
-//! not train items); ordering inside one session is preserved because each
+//! not train items). Ordering inside one session is FIFO **at pop time**: each
 //! session's queue is FIFO and the round-robin only ever pops from a queue's
-//! head.
+//! head. The send phase runs outside the stager lock, so two concurrent
+//! drainers can interleave their batches on the wire (the client's
+//! `drain_stage` documents this as inside the UDP/MQP-3 contract); one
+//! drainer's encounter order is preserved.
 //!
 //! # Ownership and accounting
 //!
@@ -298,8 +301,9 @@ impl R2Stager {
         }
     }
 
-    /// Drop queue entries belonging to a closed session (`SESS_CLOSE`), returning
-    /// how many payloads the caller should account for. A closed association's
+    /// Drop queue entries belonging to a closed session (`SESS_CLOSE`). Returns
+    /// how many payloads were dropped; each is already booked as `EGRESS_DEAD`
+    /// here, so the caller must not account them again. A closed association's
     /// queued datagrams must not be sent to a session the server already reaped.
     pub fn drop_session(&mut self, session: u32) -> usize {
         let Some(queue) = self.sessions.remove(&session) else {
