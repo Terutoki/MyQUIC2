@@ -1125,6 +1125,24 @@ The first frame of a flow is not the steady state: `OPEN` / `INLINE` carries the
 - **Full duplex:** 30,000 / 30,000 payloads in both directions, including server-owned and rebind paths. **Paced:** 325,000 / 325,000 with no loss.
 - **Where the numbers come from:** macOS loopback on release binaries. The Linux 2–4 core + `tc netem` matrix is the deployment gate: [`scripts/linux-bench-matrix.sh`](scripts/linux-bench-matrix.sh). These are not WAN predictions; they isolate framing and scheduling effects.
 
+### Small-datagram ceiling
+
+Measured 2026-10-29 on two hosts, same 128 B shape, 8 associations through the shipped 4-connection pool (one row uses a single association), `hotpath_bench` echo target:
+
+| Offered | macOS 27, 10 cores | Linux 6.18, 5-vCPU podman VM |
+| --- | ---: | ---: |
+| 20,000 pps | 0.000 % | — |
+| 40,000 pps | 7.6 % (the knee) | — |
+| 120,000 pps | — | **0.027 %** |
+| 140,000 pps | — | **0.086 %** |
+| 160,000 pps | — | 12.3 % (10–19 % over repeats) |
+| 160,000 pps, 1 assoc | — | 1.6 % |
+
+- **Per-datagram cost sets the ceiling, not the design.** At 120k pps the Linux server burned **0.42 core** (~3.5 µs per round trip); macOS needs **~0.96 core at 40k** (~24 µs) because it has no `sendmmsg`/`recvmmsg`, no UDP GSO/GRO, and `SO_REUSEPORT` hands the group to a single member (`ep_count = 1`). The Linux server logged `endpoints=5` and batched both directions.
+- **Every lost datagram is a full receive queue.** `RcvbufErrors` matched the loss exactly at 120k (487/487) and 140k (1,812/1,812), and covered 93 % of it at 160k; the QUIC sockets' 8 MiB buffers never dropped (`d=0`). The overflow lands on whichever queue is smallest — the echo target, the proxy's app-facing sockets, or a per-session socket.
+- **There is no sender feedback.** DATAGRAM has no flow control, so past the pipe the sender keeps sending and the excess is dropped silently somewhere in the chain. The client stage counts its own drops (`stage_full`, and 2.3 % of pushes at 160k); the receive side below it does not.
+- **The 8 × 1,000 pps acceptance test sits 5× / 17× below these knees.** Loopback with the harness itself saturating is not a WAN capacity spec; method, per-queue attribution and the code reading are in [`PERF_ANALYSIS.md`](PERF_ANALYSIS.md) §13.
+
 ## 🛡️ Security
 
 The security model assumes an untrusted peer and a hostile network. TLS 1.3 authenticates and encrypts the tunnel; MQP's job is narrower but critical: a compressed id must not become an authorization bypass, a rebind must not become an open relay, and a malformed frame must not become a memory or CPU primitive. The defaults are deliberately restrictive — full-cone off, private targets off, token required, and every peer-fillable structure bounded.

@@ -634,9 +634,22 @@ pub fn tcp_listener_dual(bind: &str) -> Result<std::net::TcpListener> {
     // fast open only takes effect when `net.ipv4.tcp_fastopen` allows server
     // mode, and the kernel's refusal is logged once and ignored.
     linux::tune_tcp_listener(&s);
-    s.listen(1024)?;
+    s.listen(LISTEN_BACKLOG)?;
     Ok(s.into())
 }
+
+/// `listen(2)` backlog for every TCP listener (SOCKS ingress, forwards and the
+/// server's TCP chains).
+///
+/// The old value was 1024, which a burst of simultaneous `connect(2)`s can
+/// overflow before the accept loop drains the queue: a 3000-association UDP
+/// burst against the client lost ~9 % of its SOCKS handshakes. 4096 is
+/// Linux's default `net.core.somaxconn`, so the larger request is honoured
+/// there; macOS clamps it to `kern.ipc.somaxconn` (128 by default, `sysctl -w
+/// kern.ipc.somaxconn=4096` raises it) and the backlog is best-effort under
+/// SYN flood by design. The value is only a queue depth — the accept loop and
+/// the admission semaphores still bound how many connections are served.
+pub const LISTEN_BACKLOG: i32 = 4096;
 
 /// Resolve when the process receives a shutdown request: `SIGTERM` or `SIGINT`
 /// on Unix, Ctrl-C elsewhere.

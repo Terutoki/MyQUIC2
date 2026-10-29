@@ -652,7 +652,17 @@ fn stage_open_src(
         DatagramSend::Blocked => {
             // Backpressure: keep the payload queued when possible. It carries
             // no learned `reply_src`; the next reply re-sends the OPEN.
-            match stage.lock().push(item) {
+            //
+            // Bind the push result *before* the `match`: a temporary in the
+            // scrutinee lives until the end of the match (clippy
+            // `significant_drop_in_scrutinee`), and an arm that later takes
+            // another lock would self-deadlock against parking_lot's
+            // non-reentrant mutex.
+            let pushed = {
+                let mut stage = stage.lock();
+                stage.push(item)
+            };
+            match pushed {
                 Ok(_) => (StageDrain::Ok, false),
                 Err(item) => {
                     drop(item);

@@ -751,9 +751,15 @@ impl R2Stager {
             let R2StageKind::Steady { wire_id } = item.kind else {
                 unreachable!("a steady run only holds steady items");
             };
-            let idx = *flow_idx
-                .get(&wire_id)
-                .expect("every run flow was deduped into the flow list");
+            // `take_steady_head` derives `flows` from `run` itself, so this
+            // lookup cannot miss. If a future edit ever breaks that invariant,
+            // drop the frame (the caller books its items as too-large) instead
+            // of panicking the datagram loop that this connection shares
+            // across every association.
+            let Some(&idx) = flow_idx.get(&wire_id) else {
+                debug_assert!(false, "every run flow was deduped into the flow list");
+                return None;
+            };
             *view = (idx, item.payload.as_ref());
         }
         // rev3 single-flow run: the SAME forms (equal-length first) are wire-
@@ -1752,6 +1758,21 @@ mod tests {
         assert_eq!(received, expected);
         assert!(s.is_empty());
     }
+    #[test]
+    fn encode_train_run_drops_a_run_whose_flow_is_not_in_the_list() {
+        // `take_steady_head` builds `flows` from the run, so a missing entry is
+        // unreachable in production; this pins the defensive contract that a
+        // broken invariant returns `None` (booked as too-large by the caller)
+        // instead of panicking the shared datagram loop.
+        let s = R2Stager::new_with_wire(Wire::Rev3);
+        let mut idx = HashMap::default();
+        let run = [steady(7, 1, b"abc"), steady(7, 2, b"abc")];
+        assert!(
+            s.encode_train_run(&[id(1)], &mut idx, &run, 1200).is_none(),
+            "a run item with no flow-list entry must drop the frame, not panic"
+        );
+    }
+
     /// rev3 stager: a single-flow run of equal-length payloads uses the
     /// `SAME_EQUAL` form (one shared item length, no per-item framing), and a
     /// mixed-length single-flow run uses `SAME`; both decode back to the same

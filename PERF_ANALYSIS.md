@@ -906,3 +906,211 @@ Same machine, same command, after the fix:
 
 `per_assoc_recv_min == per_assoc_recv_max` in both runs: delivery is now exact
 per association, not merely right in aggregate.
+
+## 13. Small-datagram ceiling: platform-dependent, silent drops past it
+
+> Measured 2026-10-29 on macOS 27 (arm64, 10 cores — §13.1–13.3) and on Linux
+> 6.18 in a podman VM (Fedora 43, 5 vCPU, 3.8 GiB — §13.4), release build, loopback,
+> 128-byte payloads, 8 associations over the shipped 4-connection pool, with
+> `hotpath_bench echo` as the target. Absolute numbers are host-specific.
+
+### 13.1 macOS: the knee is ~35–40k pps
+
+`hotpath_bench udpmultipaced` offers a fixed aggregate rate and counts what
+returns. One client, one server, 15 s:
+
+| Offered (8 assocs) | Delivered | Loss |
+| --- | --- | --- |
+| 20,000 pps (8 × 2,500) | 299,983 / 299,983 | 0.000 % |
+| 40,000 pps (8 × 5,000) | 554,340 / 599,971 | 7.6 % |
+| 80,000 pps (8 × 10,000) | 414,751 / 1,199,939 | 65.4 % |
+| 80,000 pps, 45 s | 1,056,605 / 3,599,935 | 70.6 % |
+
+An earlier 8 × 5,000 run lost nothing at all, so 40k is the knee itself — small
+changes in machine state move it either side. Past the knee the curve is not
+merely lossy but *inverted*: at twice the offered rate the proxy delivers
+**fewer** datagrams (21–26k) than it does at 40k (35k). A control runs the same
+echo target with no proxy:
+
+`hotpath_bench udpraw 127.0.0.1:19000 1 100000 32` → 74,408 pps, 0.000 % loss.
+
+So host and harness sustain ~74k pps one-way duplicating; the proxy contributes
+four hops and fails at half that.
+
+CPU during the runs (`top -l 2`, ≈25 s windows):
+
+| Offered | client | server | bench | echo |
+| --- | --- | --- | --- | --- |
+| 40k | 214 % | **95.5 %** | 146 % | 67 % |
+| 80k | 220–288 % | 72–91 % | 235 % | 61–77 % |
+
+The server is at ~1.0 core at 40k and cannot go higher at 80k: the ingress
+thread runs `handle_conn_inner` (`accept.rs:3749`), `sess_reader_task`
+(`reader.rs:1495`) and `spawn_dispatcher` (`dispatcher.rs`) on one shard worker,
+and on macOS that is the whole server — `SO_REUSEPORT` delivers the group to a
+single member, so `ep_count` is 1 (`main.rs:198-213`,
+`reuse_port_ingress_supported`).
+
+### 13.2 Where the datagrams actually go
+
+Aligned 60 s windows at 80k pps, one server, one client:
+
+| Point | Count | Share |
+| --- | --- | --- |
+| offered by the app | 3,599,935 | 100 % |
+| pushed into the client stage | 3,596,902 | |
+| packed into DATAGRAM frames | 3,341,385 items / 2,284,335 frames | |
+| client stage drops (`x` 255,423 + `full` 1,381) | 256,804 | 7.1 % |
+| server forwarded (`udp write … sent`) | 1,082,217 | |
+| returned to the app | 1,056,605 | 29.4 % of offered |
+
+Only 7.1 % is dropped by our own policy on the client (`rev2.rs:1515`,
+`stage_or_count`). The rest disappears between the client's `send_datagram`
+(which succeeds) and the server's `recv_datagram` (which returns less). Two
+receive-side queues are involved, and both drop silently:
+
+- the server socket's receive queue — `netstat -s -p udp` "dropped due to full
+  socket buffers" grew by **209,921** during a 10 s 80k run that lost 571,813
+  datagrams, i.e. 37 % of the loss;
+- quinn's per-connection incoming DATAGRAM buffer, `DATAGRAM_BUFFER = 1 MiB`
+  (`limits.rs:84`) — the rest. quinn-proto documents the behaviour
+  (`quinn-proto-0.11.19/src/connection/datagrams.rs:22`): when the receive
+  buffer is full the datagram is *silently* dropped. The peer is not told and
+  the local app only sees a gap.
+
+That is the operational problem: `udp write` falls from ~35k to ~21k pps with
+**no drop counter anywhere on the server** — `stage_full` is 0, because the
+stager queue never fills; the drops happen below it. The only visible number is
+the throughput that did not happen.
+
+### 13.3 Why macOS sits at ~35k pps
+
+Per datagram the ingress thread does two syscalls (`recvfrom` in
+`sess_reader_task`, `sendto` in `flush_staged_sends`), a QUIC receive/decrypt, a
+session lookup, one `R2Stager` push and a `send_datagram` that encodes and
+enqueues. A `sample` profile of the saturated server puts ~55 % of the thread's
+non-idle samples in `__sendto` and ~27 % in `__recvfrom`; crypto does not appear
+at these rates. At 35k pps × 2 syscalls/s ≈ 70k syscalls/s the thread is at its
+syscall budget — the raw echo thread sustains 74k pps with the same two calls
+and nothing else.
+
+Two syscalls per datagram *can* be batched on Linux: `flush_staged_sends`
+(`accept.rs:254`) coalesces consecutive `(socket, destination)` runs into one
+`sendmmsg`, and the client dispatcher does the same for replies
+(`dispatcher.rs:78`, `:718`). But a connection multiplexes every association of
+its egress class and the stager rotates across sessions (`r2_stage::pack_batch`
+→ `pack_one_frame`), so consecutive frames of one drain almost never share a
+destination: the run length is 1 and the fast path is the per-frame one. macOS
+has no `sendmmsg` at all. The reply path on the client has the same shape — in
+a slot thread at 84 % busy, 67 % of samples are `__sendto` under
+`spawn_dispatcher`.
+
+Beyond raw cost there is no feedback: DATAGRAM has no flow control, the client
+keeps `send_datagram`-ing at 80k pps into a 35k pps pipe, and the excess is
+dropped by the kernel/quinn receive buffers. Those buffers are FIFO, so the
+datagrams delivered at 80k are also the oldest: queueing delay grows without
+bound while goodput falls *below* capacity. That is congestion collapse, not
+congestion control.
+
+### 13.4 Linux (podman VM, 5 vCPU): ≥140k pps with the same code
+
+The same binaries and the same shape in a 5-vCPU podman VM (Linux 6.18, Fedora
+43). The server logged
+`endpoints=5` and `udp batch backend: sendmmsg+recvmmsg (sendmmsg=true,
+recvmmsg=true); GSO/GRO auto-probed`, so every batching path macOS lacks was
+taken. 15 s per row:
+
+| Offered (8 assocs) | Delivered | Loss |
+| --- | --- | --- |
+| 120,000 pps (8 × 15,000) | 1,799,441 / 1,799,928 | 0.027 % |
+| 140,000 pps (8 × 17,500) | 2,098,120 / 2,099,932 | 0.086 % |
+| 160,000 pps (8 × 20,000) | 2,104,622 / 2,399,243 | 12.3 % (10–19 % over repeats) |
+| 160,000 pps (1 assoc) | 491,866 / 499,931 | 1.6 % |
+
+CPU at 120k: server **0.42 core**, client 1.03, echo 0.25. That is ~3.5 µs of
+server CPU per 128 B round trip, against ~24 µs on macOS (0.96 core at 40k
+pps) — 6–7× cheaper, because `recvmmsg`/`sendmmsg` and GSO/GRO collapse a burst
+into one receive and one send syscall instead of one pair per datagram. At 120k
+the server is not the constraint.
+
+The 160k row is where the *chain* saturates, not the QUIC layer. Nearly every
+lost datagram is a kernel receive-queue overflow: `RcvbufErrors`
+(`/proc/net/snmp`) grew by 275,056 in the 15 s cell against 294,621 lost (93 %),
+by 487 against 487 at 120k, and by 1,812 against 1,812 at 140k. The QUIC sockets
+themselves never dropped: `*:8443` carries 8 MiB receive buffers and `d=0` on
+every sample. The overflow is spread across whichever queue is momentarily
+smallest — the echo target's sockets (`127.0.0.1:19000`) mostly, the proxy's
+per-association app sockets (`[::ffff:127.0.0.1]:*`, 128 KiB each, seen with
+`r=48000…130560` queued and a few thousand drops), and the server's
+per-session sockets. The proxy's own share is visible: in a 65 s 160k run the
+client stage dropped 2.3 % of pushes (43,981 of 1,938,808) and `stage_full` rose
+by 775 — the two slot threads that both send and receive at 160k pps are at
+their limit, and at 140k they are not. Raising the target's buffers was not
+possible: the container's `/proc/sys` is read-only.
+
+So the per-datagram cost is what separates the two platforms, not the design:
+unbatched 2-syscall-per-datagram on one `SO_REUSEPORT` member on macOS versus
+batched syscalls with GSO/GRO across five on Linux. The earlier "~35k pps
+anywhere" reading of this section was a macOS property; the same code held
+0.09 % loss at 140k pps on a 5-vCPU Linux guest.
+
+### 13.5 What the shape says to change
+
+1. **Bound the sender, not the receivers.** A per-association credit (the
+   `flow_ack`/ctl channel already carries out-of-band control) or a token
+   bucket paced by ACKed datagrams would keep offered load near the measured
+   pipe rate. For a UDP relay, loss is often the right signal to the app; today
+   the app gets loss with no way to pace, and the proxy's buffers add delay on
+   top of it.
+2. **Make receive drops visible.** quinn-proto drops incoming DATAGRAMs
+   silently; a wrapper counter (or a patched quinn) would let the 60 s line
+   report `quinn_rx_drop=N` next to `stage_full`. The stage already counts its
+   own drops (`send_packed_frames`, `BUFFER_FULL`); the layer below it is the
+   blind spot.
+3. **One thread per connection is the unit of scaling.** Shards exist on Linux
+   (`ep_count = cores`), but a connection still lives on one shard. On the
+   5-vCPU guest the 120k pps run used 0.42 core in total, so the per-connection
+   bound was not reached; on macOS it is ~35k pps because the shard's syscall
+   budget is reached there. Spreading a connection's receive loop, QUIC driver
+   and senders across workers would need the shared runtime — measured worse on
+   macOS: `MYQUIC2_SHARD_RUNTIME=0` gave 23.6 % loss at 40k against 12.3 %
+   sharded, because locality beats parallelism at this size. The honest
+   conclusion is a documented per-platform budget, not a fix.
+4. **Batch per session.** `pack_one_frame` rotating sessions is fair but makes
+   server-side `sendmmsg` runs length-1. A per-session pending queue (send up to
+   N frames of one session per call) trades a little fairness for fewer sends —
+   worth measuring on Linux, impossible on macOS.
+5. **Re-check the pieces before blaming them.** Raising
+   `R2_STAGE_MAX_ITEMS`/`_BYTES` 8×/4× moved the loss from 63 % to 70 %
+   (reverted); splitting the client across 8 connections instead of 4 changed
+   it by 0.005 %. Neither the stager caps nor per-connection headroom are the
+   constraint.
+
+### 13.6 What this does not establish
+
+Loopback runs a 4-hop chain on one host and the harness itself burns 2.4 cores,
+so the absolute pps numbers are not a capacity spec. What is portable is the
+structure: a QUIC pass and at least one syscall per datagram on a single thread,
+a receive-side buffer that drops silently, and no sender feedback. It is also
+why the README's 8 × 1,000 pps × 128 B acceptance test passes at 0.000 % loss
+while, on macOS, anything above ~35k pps degrades — the published test sits 5×
+below that host's knee. On the Linux guest the same code held <0.1 % loss to
+140k pps, which is the better evidence that the shape is sound and the ceiling
+is the host's socket path.
+
+Reproduce:
+
+```sh
+cargo build --release
+./target/release/myquic2-server &
+./target/release/examples/hotpath_bench echo 19000 &
+# macOS: 8 x 10,000 -> 65-71 % loss; 8 x 5,000 is the ~40k knee.
+# Linux: 8 x 15,000 -> 0.03 %; 8 x 20,000 -> 12 %, drops on the echo socket and
+# on the proxy's app-facing sockets; the QUIC sockets (:8443, 8 MiB) show d=0.
+./target/release/examples/hotpath_bench \
+  udpmultipaced 127.0.0.1:1080 127.0.0.1:19000 8 10 128 10000
+# macOS:
+netstat -s -p udp | grep 'dropped due to full socket buffers'
+# Linux (netstat may be absent): RcvbufErrors is the 6th field of the Udp: line
+awk '/^Udp:/ {print $2, $6}' /proc/net/snmp
+```

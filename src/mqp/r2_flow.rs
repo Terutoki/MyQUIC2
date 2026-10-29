@@ -802,7 +802,13 @@ impl FlowRegistry {
     /// forged `SESS_CLOSE` for an unknown session costs one hash probe, not a
     /// walk over the whole per-connection table.
     pub fn remove_session(&self, session: u32) -> usize {
-        let ids = match self.by_session.write().remove(&session) {
+        // Drop the index write guard before taking the map write guard: the
+        // temporary in a `match` scrutinee lives to the end of the match
+        // (clippy `significant_drop_in_scrutinee`), which would nest two
+        // different locks of the registry and make the lock order
+        // by_session → map, the reverse of `insert`/`clear`.
+        let indexed = self.by_session.write().remove(&session);
+        let ids = match indexed {
             Some(ids) => ids,
             None => return 0,
         };
