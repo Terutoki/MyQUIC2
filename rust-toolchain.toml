@@ -1,5 +1,5 @@
 [toolchain]
 # The compiler this project builds with. Keep in lockstep with `rust-version`
 # in Cargo.toml and the dtolnay/rust-toolchain pins in .github/workflows.
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]

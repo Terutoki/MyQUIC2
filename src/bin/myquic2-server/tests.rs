@@ -3,8 +3,8 @@ use super::*;
 use myquic2::mqp::ctl_stream;
 use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{
-    CTL_MAX_PER_SEC, FlowBinding, FlowState, R2_MAX_RESOLVED_ADDRS, RegistryError, SessionFlows,
-    SourceMatch,
+    CTL_MAX_PER_SEC, FlowBinding, FlowRegistry, FlowState, R2_MAX_FLOWS_PER_CONN,
+    R2_MAX_FLOWS_PER_SESSION, R2_MAX_RESOLVED_ADDRS, RegistryError, SessionFlows, SourceMatch,
 };
 use myquic2::mqp::r3::CtlMessage;
 use myquic2::mqp::wire::{self, Wire};
@@ -1667,6 +1667,281 @@ async fn sweep_local_reaps_all_expired_in_one_call() {
     let evicted = take_idle(&mut m, &keys, now);
     assert_eq!(evicted.len(), 70);
     assert!(m.is_empty());
+}
+
+/// A sweep purges in bounded batches. Each batch's removal and registry purge
+/// share one shard write guard (the close-vs-install contract), but the guard
+/// is released between batches, so a full-connection reap cannot stall a shard
+/// across one long `remove_sessions` pass. All expired entries are still
+/// reaped, and each id is purged exactly once.
+#[tokio::test]
+async fn sweep_all_purges_in_bounded_batches_without_leaving_expired_entries() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let now: u64 = 3_000_000;
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let n = SWEEP_PURGE_BATCH + 1;
+    for i in 0..n as u32 {
+        // 1, 9, 17, ...: every id lands on shard 1, so one shard produces two
+        // batches and the other seven stay empty.
+        let sess = 1 + i * SESS_SHARDS as u32;
+        assert_eq!(sess as usize % SESS_SHARDS, 1);
+        let entry = capped_session(sess, 1);
+        entry.last.store(0, Ordering::Relaxed);
+        ss.shard(sess).write().insert(sess, entry);
+        ss.note_insert();
+        ss.note_live_insert();
+    }
+    ss.note_empty_state();
+
+    let mut batches: Vec<Vec<u32>> = Vec::new();
+    let evicted = ss.sweep_all_with(now, |ids| batches.push(ids.to_vec()));
+
+    assert_eq!(
+        evicted.len(),
+        n,
+        "a batched sweep still reaps every expired session"
+    );
+    assert_eq!(batches.len(), 2, "one callback per bounded batch");
+    assert!(
+        batches.iter().all(|b| b.len() <= SWEEP_PURGE_BATCH),
+        "a purge batch exceeded the bound: {:?}",
+        batches.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        batches.iter().map(Vec::len).sum::<usize>(),
+        n,
+        "every evicted id is purged exactly once"
+    );
+    assert_eq!(ss.len(), 0, "no expired entry is left behind");
+    abort_evicted(evicted);
+}
+
+/// The batch boundary is a real interleaving window: a datagram touch lands
+/// through the lock-free `last` stamp, without the table lock, so it can occur
+/// after one batch's guard is dropped and before the next batch removes. The
+/// later chunk must re-test the same `now` and keep the touched session — the
+/// same guarantee `take_idle` gives inside one guard.
+#[tokio::test]
+async fn sweep_all_keeps_a_session_touched_between_purge_batches() {
+    use std::sync::atomic::Ordering;
+
+    let _holder_guard = holder_test_guard();
+    let now: u64 = 3_000_000;
+    let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+    let n = SWEEP_PURGE_BATCH * 2;
+    let mut stamps = Vec::with_capacity(n);
+    for i in 0..n as u32 {
+        let sess = 1 + i * SESS_SHARDS as u32;
+        let entry = capped_session(sess, 1);
+        entry.last.store(0, Ordering::Relaxed);
+        stamps.push((sess, entry.last.clone()));
+        ss.shard(sess).write().insert(sess, entry);
+        ss.note_insert();
+        ss.note_live_insert();
+    }
+    ss.note_empty_state();
+
+    // The snapshot is a HashMap iteration, not insertion order: pick the first
+    // id of the *second* chunk from the same iteration the sweep will scan.
+    // (Hard-coding the id made the test depend on hash order and fail when the
+    // chunk size changed.)
+    let order: Vec<u32> = {
+        let m = ss.shard(1).read();
+        m.iter()
+            .filter(|(_, e)| now.saturating_sub(e.last.load(Ordering::Relaxed)) >= SESS_IDLE_MS)
+            .map(|(k, _)| *k)
+            .collect()
+    };
+    assert_eq!(order.len(), n, "every inserted session is expired");
+    let victim = order[SWEEP_PURGE_BATCH];
+    let victim_last = stamps
+        .iter()
+        .find(|(sess, _)| *sess == victim)
+        .map(|(_, last)| last.clone())
+        .expect("the victim is inserted");
+
+    let mut batches: Vec<Vec<u32>> = Vec::new();
+    let evicted = ss.sweep_all_with(now, |ids| {
+        batches.push(ids.to_vec());
+        if batches.len() == 1 {
+            // Exactly what a datagram's throttled touch does: one relaxed store
+            // to the entry's stamp, no session-table lock (which this callback
+            // could not take anyway — it runs under the shard write guard).
+            victim_last.store(now, Ordering::Relaxed);
+        }
+    });
+
+    assert_eq!(batches.len(), 2, "the reap still runs in two batches");
+    assert_eq!(
+        evicted.len(),
+        n - 1,
+        "only the session touched between batches survives"
+    );
+    assert!(
+        evicted.iter().all(|e| e.sess != victim),
+        "the touched session must not be reaped"
+    );
+    assert!(
+        batches.iter().flatten().all(|&id| id != victim),
+        "the touched session's bindings must not be purged"
+    );
+    assert_eq!(ss.len(), 1, "the touched session stays in the table");
+
+    // Teardown: the survivor's reader and permit must not outlive the test.
+    let rest = ss.drain_all();
+    assert_eq!(rest.len(), 1);
+    abort_evicted(rest);
+    abort_evicted(evicted);
+}
+
+/// Calibration benchmark for `SWEEP_PURGE_BATCH` (ignored by default).
+///
+/// The rev2 registry is capped at `R2_MAX_FLOWS_PER_CONN` (4096) bindings per
+/// connection, so "4096 sessions × 64 bindings" is not reachable. The real
+/// worst case for one shard hold is 64 expired sessions that own all 4096
+/// bindings; this builds exactly that (4096 sessions in the table, 64 rich
+/// expired ones on shard 1 with 64 bindings each) and runs the production
+/// remove + purge critical section at several batch sizes.
+///
+/// Run with:
+/// `cargo test --release --bin myquic2-server sweep_hold_bench -- --ignored --nocapture --test-threads=1`
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "microbenchmark; run with --ignored --nocapture"]
+async fn sweep_hold_bench() {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    const SESSIONS: u32 = LOCAL_SESS_MAX as u32;
+    const BINDINGS_PER_RICH: u32 = R2_MAX_FLOWS_PER_SESSION as u32;
+    const RICH: u32 = R2_MAX_FLOWS_PER_CONN as u32 / BINDINGS_PER_RICH;
+    const REPS: usize = 5;
+
+    struct Sample {
+        hold_ns: u64,
+        take_ns: u64,
+        purge_ns: u64,
+    }
+
+    fn stats(v: &[u64]) -> (u64, u64, u64, u64) {
+        let mut v = v.to_vec();
+        v.sort_unstable();
+        let at = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+        (v[0], at(0.50), at(0.99), *v.last().unwrap())
+    }
+
+    let _holder_guard = holder_test_guard();
+    let now: u64 = 3_000_000;
+    let target = TargetAddr::Ip("198.51.100.1:53".parse().unwrap());
+    let is_rich =
+        |sess: u32| sess % (SESS_SHARDS as u32) == 1 && sess / (SESS_SHARDS as u32) < RICH;
+    assert_eq!(
+        (RICH * BINDINGS_PER_RICH) as usize,
+        R2_MAX_FLOWS_PER_CONN,
+        "the benchmark covers the whole registry cap"
+    );
+
+    println!(
+        "sweep_hold_bench sessions={SESSIONS} rich={RICH} bindings={} reps={REPS}",
+        RICH * BINDINGS_PER_RICH
+    );
+
+    for &batch in &[4usize, 8, 16, 32, 64, 128] {
+        let ss = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
+        for sess in 1..=SESSIONS {
+            if is_rich(sess) {
+                continue;
+            }
+            let entry = capped_session(sess, 0);
+            entry.last.store(now, Ordering::Relaxed);
+            ss.shard(sess).write().insert(sess, entry);
+            ss.note_insert();
+            ss.note_live_insert();
+        }
+        ss.note_empty_state();
+
+        let mut samples = Vec::with_capacity(REPS * (RICH as usize / batch).max(1));
+        for rep in 0..=REPS {
+            let reg = FlowRegistry::new(R2_MAX_FLOWS_PER_CONN);
+            let mut local = 1u32;
+            for i in 0..RICH {
+                let sess = 1 + i * SESS_SHARDS as u32;
+                let entry = capped_session(sess, 1);
+                entry.last.store(0, Ordering::Relaxed);
+                ss.shard(sess).write().insert(sess, entry);
+                ss.note_insert();
+                ss.note_live_insert();
+                for _ in 0..BINDINGS_PER_RICH {
+                    let wire_id = r2::make_wire_id(local, true).unwrap();
+                    local += 1;
+                    reg.insert(FlowBinding::new_shared(wire_id, sess, target.clone()))
+                        .expect("binding fits the 4096 cap");
+                }
+            }
+            assert_eq!(reg.len(), (RICH * BINDINGS_PER_RICH) as usize);
+
+            let mut out = Vec::new();
+            let mut purged = 0usize;
+            for sh in &ss.shards {
+                let expired: Vec<u32> = {
+                    let m = sh.read();
+                    m.iter()
+                        .filter(|(_, e)| {
+                            now.saturating_sub(e.last.load(Ordering::Relaxed)) >= SESS_IDLE_MS
+                        })
+                        .map(|(k, _)| *k)
+                        .collect()
+                };
+                if expired.is_empty() {
+                    continue;
+                }
+                for chunk in expired.chunks(batch) {
+                    let t0 = Instant::now();
+                    let mut m = sh.write();
+                    let t_take = Instant::now();
+                    let evicted = take_idle(&mut m, chunk, now);
+                    let take_ns = t_take.elapsed().as_nanos() as u64;
+                    ss.note_live_remove(evicted.len());
+                    let t_purge = Instant::now();
+                    if !evicted.is_empty() {
+                        let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
+                        purged += reg.remove_sessions(&ids);
+                    }
+                    let purge_ns = t_purge.elapsed().as_nanos() as u64;
+                    drop(m);
+                    if rep != 0 {
+                        samples.push(Sample {
+                            hold_ns: t0.elapsed().as_nanos() as u64,
+                            take_ns,
+                            purge_ns,
+                        });
+                    }
+                    out.extend(evicted);
+                }
+            }
+            ss.note_empty_state();
+            assert_eq!(purged, (RICH * BINDINGS_PER_RICH) as usize);
+            assert_eq!(out.len(), RICH as usize);
+            abort_evicted(out);
+        }
+
+        let holds: Vec<u64> = samples.iter().map(|s| s.hold_ns).collect();
+        let takes: Vec<u64> = samples.iter().map(|s| s.take_ns).collect();
+        let purges: Vec<u64> = samples.iter().map(|s| s.purge_ns).collect();
+        let (hmin, h50, h99, hmax) = stats(&holds);
+        let (_, t50, t99, tmax) = stats(&takes);
+        let (_, p50, p99, pmax) = stats(&purges);
+        println!(
+            "batch={batch:3} holds={:3} hold_ns[min/p50/p99/max]={hmin}/{h50}/{h99}/{hmax} \
+             take_ns[p50/p99/max]={t50}/{t99}/{tmax} \
+             purge_ns[p50/p99/max]={p50}/{p99}/{pmax}",
+            samples.len()
+        );
+
+        let rest = ss.drain_all();
+        abort_evicted(rest);
+    }
 }
 
 /// `sweep_local` must re-test each expired key with the same `now` before

@@ -3891,11 +3891,11 @@ async fn handle_conn_inner(
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         let now = mono_millis();
                         // Shard-by-shard sweep, abort after all locks drop. Each
-                        // shard's rev2 bindings are purged in **one** registry
-                        // call while that shard's write lock is still held
+                        // batch's rev2 bindings are purged in **one** registry
+                        // call while that batch's write lock is still held
                         // (`sweep_all_with`): the purge-by-session is collision
                         // safe there, and a full-connection reap costs one
-                        // registry write lock per shard instead of one per
+                        // registry write lock per batch instead of one per
                         // binding.
                         let mut purged = 0usize;
                         let evicted = sess.sweep_all_with(now, |ids| {

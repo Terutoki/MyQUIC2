@@ -1964,8 +1964,8 @@ pub(crate) async fn get_or_create_sess_guarded(
     let now = mono_millis();
     if ss.len_upper_bound(now) >= fair_cap {
         if claim_fair_sweep(now) {
-            // Each shard's bindings are purged in one registry call under that
-            // shard's write lock (`sweep_all_with`); the notifications are sent
+            // Each batch's bindings are purged in one registry call under that
+            // batch's write lock (`sweep_all_with`); the notifications are sent
             // from a detached chunked task so this creation path is not blocked
             // for thousands of sends.
             let mut purged = 0usize;

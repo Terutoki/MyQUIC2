@@ -3,7 +3,7 @@
 <h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-705_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-724_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -618,7 +618,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **705 tests** on macOS (lib 350 + client 198 + server 142 + 15 process-level E2E: 7 forwarding + 8 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **724 tests** on macOS (lib 360 + client 201 + server 148 + 15 process-level E2E: 7 forwarding + 8 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1214,7 +1214,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **718 tests** on the macOS dev box (lib 358 + client 200 + server 145 + 15 process-level E2E: 7 forwarding + 8 wire-revision).
+- **724 tests** on the macOS dev box (lib 360 + client 201 + server 148 + 15 process-level E2E: 7 forwarding + 8 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 15 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -2196,7 +2196,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>705 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>724 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB

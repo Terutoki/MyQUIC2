@@ -84,6 +84,24 @@ pub(crate) type SessMap = HashMap<u32, SessEntry, foldhash::fast::RandomState>;
 
 pub(crate) const SESS_SHARDS: usize = 8;
 
+/// Expired sessions removed (and registry-purged) per shard write hold in
+/// [`ShardedSessTable::sweep_all_with`].
+///
+/// Each batch's removal and purge stay in the *same* critical section — the
+/// close-vs-install collision argument in `sweep_all_with` depends on it — but
+/// the shard guard is released between batches, so a full-connection reap
+/// (up to `LOCAL_SESS_MAX` sessions) cannot hold one shard write lock across
+/// the entire `remove_sessions` pass.
+///
+/// The registry admits at most `R2_MAX_FLOWS_PER_CONN` (4096) bindings per
+/// connection and one session owns at most `R2_MAX_FLOWS_PER_SESSION` (64), so
+/// 16 sessions bound a hold to 1024 binding removals. On an Apple M4 the
+/// concentrated 4096-binding worst case measured ~0.21-0.30 ms max at 16
+/// versus ~0.63-0.84 ms at 64; the total sweep time stayed ~0.6 ms, because
+/// the purge work is the same and the extra lock acquisitions are negligible.
+/// The harness is `tests::sweep_hold_bench` (ignored by default).
+pub(crate) const SWEEP_PURGE_BATCH: usize = 16;
+
 /// How a connection's session readers validate the source of inbound datagrams.
 ///
 /// A session's relay socket is unconnected, so any host that reaches its
@@ -375,8 +393,9 @@ impl ShardedSessTable {
         self.sweep_all_with(now, |_| {})
     }
 
-    /// [`Self::sweep_all`] with a purge callback invoked for each shard's
-    /// removed sessions **while that shard's write lock is still held**.
+    /// [`Self::sweep_all`] with a purge callback invoked for each bounded batch
+    /// of a shard's removed sessions **while that batch's shard write lock is
+    /// still held**.
     ///
     /// The rev2 registry purge needs that lock hold: purging bindings *by
     /// session id* is only collision-safe while no datagram path can recreate a
@@ -384,9 +403,18 @@ impl ShardedSessTable {
     /// the reap, and `get_or_create_sess` inserts under this same shard write
     /// lock, so under the guard every binding the registry still indexes under
     /// a just-removed session id belongs to the entry that was just removed.
-    /// That makes the whole shard's purge one `remove_sessions` call — one
-    /// registry write lock per shard instead of one per binding (4096 write
-    /// locks on a full-connection reap; PERF-7).
+    /// That makes each batch's purge one `remove_sessions` call — one registry
+    /// write lock per batch instead of one per binding (PERF-7).
+    ///
+    /// A full-connection reap is split into [`SWEEP_PURGE_BATCH`] chunks so the
+    /// shard write guard is released between batches instead of spanning the
+    /// whole `remove_sessions` pass. The registry itself admits at most
+    /// `R2_MAX_FLOWS_PER_CONN` (4096) bindings per connection, so that pass is
+    /// bounded by 4096 removals — not 4096 sessions × 64 bindings. The
+    /// collision argument is unchanged: each snapshotted id appears in exactly
+    /// one chunk, and a session recreated after a batch released the lock is
+    /// protected by `take_idle`'s re-test — its fresh `last` is not idle, so it
+    /// survives even if its id is still queued in a later chunk.
     ///
     /// The callback receives the removed session ids. It runs under the shard
     /// write guard and must not take another session-table lock (the purge it
@@ -408,15 +436,17 @@ impl ShardedSessTable {
             if expired.is_empty() {
                 continue;
             }
-            let mut m = sh.write();
-            let evicted = take_idle(&mut m, &expired, now);
-            self.note_live_remove(evicted.len());
-            if !evicted.is_empty() {
-                let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
-                purge(&ids);
+            for chunk in expired.chunks(SWEEP_PURGE_BATCH) {
+                let mut m = sh.write();
+                let evicted = take_idle(&mut m, chunk, now);
+                self.note_live_remove(evicted.len());
+                if !evicted.is_empty() {
+                    let ids: Vec<u32> = evicted.iter().map(|e| e.sess).collect();
+                    purge(&ids);
+                }
+                drop(m);
+                out.extend(evicted);
             }
-            drop(m);
-            out.extend(evicted);
         }
         self.note_empty_state();
         out

@@ -4,6 +4,12 @@ name: CI
 #   1. rustfmt / clippy / tests verify the commit
 #   2. x86_64 Linux release binaries are built and uploaded as workflow
 #      artifacts: static musl (OpenWrt / any x86_64 Linux) and glibc gnu (2.36+).
+#
+# The rust-cache steps disable `add-rust-environment-hash-key`: its post-job
+# cleanup recursively globs the workspace (including `target/`) for
+# Cargo.toml/rust-toolchain files, which overflows @actions/glob's call stack
+# on a full build tree. The lockfile/toolchain hash is supplied explicitly in
+# each cache `key` instead.
 on:
   push:
     branches: ["**"]
@@ -27,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -37,12 +43,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: clippy
+          key: "clippy-${{ hashFiles('Cargo.lock', 'rust-toolchain*', '.cargo/config.toml') }}"
+          add-rust-environment-hash-key: false
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -52,10 +59,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: test
+          key: "test-${{ hashFiles('Cargo.lock', 'rust-toolchain*', '.cargo/config.toml') }}"
+          add-rust-environment-hash-key: false
       - run: cargo test --all-targets
 
   # `debug_assert!` compiles its whole expression away in release, so a
@@ -69,10 +77,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: test-release
+          key: "test-release-${{ hashFiles('Cargo.lock', 'rust-toolchain*', '.cargo/config.toml') }}"
+          add-rust-environment-hash-key: false
       - run: "cargo test --release --lib mqp::"
       # The debug `test` job is the only place the stager/udp tests run by
       # default; a debug-only assertion there once hid a broken release-mode
@@ -86,18 +95,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: x86_64-unknown-linux-musl
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.15.1
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.88.0
         with:
           tool: cargo-zigbuild@0.23.4
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: build-musl
+          key: "build-musl-${{ hashFiles('Cargo.lock', 'rust-toolchain*', '.cargo/config.toml') }}"
+          add-rust-environment-hash-key: false
       - name: Build static binaries
         run: |
           cargo zigbuild --release \
@@ -115,7 +125,7 @@ jobs:
           cp dist/openwrt-x86_64/config-client.toml.sample "pkg/${name}/"
           tar -C pkg -czf "artifacts/${name}.tar.gz" "${name}"
           ls -lh artifacts
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: myquic2-x86_64-unknown-linux-musl
           path: artifacts/*.tar.gz
@@ -129,22 +139,23 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: x86_64-unknown-linux-gnu
       # Same glibc 2.36 symbol floor as the release workflow (see release.yml):
       # a plain `cargo build` on ubuntu-latest linked against the runner's own
       # glibc and produced an artifact that required GLIBC_2.38, which refuses
       # to start on Debian 12 (glibc 2.36). Keep CI and release on one recipe.
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.15.1
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.88.0
         with:
           tool: cargo-zigbuild@0.23.4
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: build-gnu
+          key: "build-gnu-${{ hashFiles('Cargo.lock', 'rust-toolchain*', '.cargo/config.toml') }}"
+          add-rust-environment-hash-key: false
       - name: Build release binaries (glibc 2.36 floor)
         run: |
           cargo zigbuild --release \
@@ -162,7 +173,7 @@ jobs:
           cp dist/openwrt-x86_64/config-client.toml.sample "pkg/${name}/"
           tar -C pkg -czf "artifacts/${name}.tar.gz" "${name}"
           ls -lh artifacts
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: myquic2-x86_64-unknown-linux-gnu
           path: artifacts/*.tar.gz

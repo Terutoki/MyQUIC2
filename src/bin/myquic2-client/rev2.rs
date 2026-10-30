@@ -186,12 +186,13 @@ pub(crate) struct ConnRev2 {
     /// Sessions the server closed that an association has still to consume (see
     /// [`MAX_CLOSED_SESSIONS`]).
     ///
-    /// The `take` guard is the datagram's very first shared read, and the deque
-    /// is empty in steady state (populated only by a `SESS_CLOSE` for a **live**
-    /// association, and forgotten when that association exits): the
+    /// The deque is empty in steady state (populated only by a `SESS_CLOSE` for
+    /// a **live** association, and forgotten when that association exits): the
     /// `closed_len` counter below turns the per-datagram probe into one relaxed
-    /// load, and the exclusive write lock is taken only while a close is
-    /// actually pending. Deque order is insertion order, i.e. eviction order.
+    /// load. While a close is pending, a non-owner's probe is a shared read;
+    /// only a hit for the association the close names takes the consuming
+    /// write lock (a rare stale-counter heal also takes it, but removes
+    /// nothing). Deque order is insertion order, i.e. eviction order.
     closed_sessions: parking_lot::RwLock<VecDeque<u32>>,
     /// Live `closed_sessions` length, maintained under the write lock. A stale
     /// *overshoot* is impossible (writes under the lock refresh it last); a
@@ -548,15 +549,43 @@ impl ConnRev2 {
     }
 
     /// Consume a recorded `SESS_CLOSE` for `sess`.
+    ///
+    /// The steady-state short-circuit is one relaxed load. With a close pending
+    /// (possibly for *another* association: LOGIC-2's idle association that has
+    /// not exited yet), the common probe is a **shared** read lock — an
+    /// exclusive lock here would serialize every uplink datagram of the whole
+    /// connection behind one idle association's pending close. Only a hit for
+    /// this `sess` takes the write lock that consumes it (a rare stale-counter
+    /// heal may also take it, but removes nothing), and the re-scan under the
+    /// write lock keeps "consumed exactly once" even with concurrent probes
+    /// for the same id.
+    ///
+    /// At very high concurrent probe rates the shared reader counter can
+    /// itself become the hotspot; `closed_sessions_probe_bench` measures that
+    /// against a per-association `AtomicBool`, which is the high-fan-in
+    /// alternative. The shipped per-datagram rate is far below that regime.
     pub(crate) fn take_session_closed(&self, sess: u32) -> bool {
-        // The steady-state short-circuit: an empty deque (the common case)
-        // costs one relaxed load instead of an exclusive lock acquisition per
-        // uplink datagram. `closed_len` only says "the lock may be worth
-        // taking" — the deque itself stays the authority, so a concurrent
-        // `note` racing an in-flight probe is refuted (not lost): it refreshes
-        // the count under its own write hold and the next sync picks it up.
+        // The counter only says "the lock may be worth taking"; the deque
+        // itself stays the authority, so a concurrent `note` racing an
+        // in-flight probe is refuted (not lost): it refreshes the count under
+        // its own write hold and the next sync picks it up.
         if self.closed_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return false;
+        }
+        {
+            let closed = self.closed_sessions.read();
+            if !closed.contains(&sess) {
+                if closed.is_empty() {
+                    // Heal a counter that raced the last drain, so the
+                    // short-circuit closes again instead of charging a shared
+                    // lock to every subsequent uplink datagram.
+                    drop(closed);
+                    let closed = self.closed_sessions.write();
+                    self.closed_len
+                        .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                return false;
+            }
         }
         let mut closed = self.closed_sessions.write();
         match closed.iter().position(|&s| s == sess) {
@@ -567,8 +596,9 @@ impl ConnRev2 {
                 true
             }
             None => {
-                // Heal the counter (its earlier read raced a concurrent
-                // drain); one fresh store can only ever be conservative.
+                // The id left the set between our read probe and this write
+                // hold: a concurrent probe consumed it, or the exit path
+                // forgot it.
                 self.closed_len
                     .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
                 false
@@ -581,8 +611,8 @@ impl ConnRev2 {
     /// The association-exit path is the only other consumer of a session's own
     /// close: once the association is gone nothing will call
     /// [`Self::take_session_closed`] for its id, so leaving it behind keeps the
-    /// bounded set non-empty for the connection's life — the every-datagram
-    /// exclusive lock of LOGIC-2 — and lets it occupy a slot that a live
+    /// bounded set non-empty for the connection's life — the per-datagram
+    /// shared probe of LOGIC-2 — and lets it occupy a slot that a live
     /// association's close could need. No-op when nothing is recorded (the
     /// common exit case, one relaxed load).
     pub(crate) fn forget_session_closed(&self, sess: u32) {
@@ -2321,6 +2351,12 @@ mod tests {
         assert!(!r.take_session_closed(7));
         r.note_session_closed(7);
         assert_eq!(r.closed_sessions_len(), 1);
+        // A probe for a *different* association must not consume (or clear)
+        // the pending close: it misses under the shared read probe, and only
+        // the owner of the id takes the write lock.
+        assert!(!r.take_session_closed(8));
+        assert_eq!(r.closed_sessions_snapshot(), vec![7]);
+        assert_eq!(r.closed_sessions_len(), 1);
         assert!(r.take_session_closed(7));
         assert!(
             !r.take_session_closed(7),
@@ -2383,6 +2419,168 @@ mod tests {
         r.forget_session_closed(3);
         assert_eq!(r.closed_sessions_len(), 0);
         assert!(!r.take_session_closed(1));
+    }
+
+    /// Probe-cost benchmark for the pending-close window (ignored by default).
+    ///
+    /// One or more associations hold a pending `SESS_CLOSE` nobody consumes (1
+    /// and the 64-entry cap are both measured); every other association keeps
+    /// uplinking and calls `take_session_closed` for its own id. Compares the
+    /// pre-fix write-lock probe (`Old`), the shipped read-probe (`New`), and a
+    /// per-association `AtomicBool` (load/swap) at 1/2/4/8 threads. Batches of
+    /// 64 probes amortize the clock read, so the percentiles are sustained
+    /// per-op costs.
+    ///
+    /// The tight loop is a contention upper bound: at the shipped packet rate
+    /// the probe is effectively uncontended. It exists to show the shape — the
+    /// shared reader counter can convoy at 8 tight threads (measured ~90-100
+    /// ns/op vs ~6-34 ns/op for the write lock), while a per-association flag
+    /// stays at ~1.3 ns. That is the high-fan-in argument for the flag, not a
+    /// reason to change the shipped 8-association path.
+    ///
+    /// `cargo test --release --bin myquic2-client closed_sessions_probe_bench -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn closed_sessions_probe_bench() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const OPS_PER_THREAD: usize = 500_000;
+        const BATCH: usize = 64;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Mode {
+            Steady,
+            Old,
+            New,
+            AtomicSwap,
+            AtomicLoad,
+        }
+
+        /// The pre-fix implementation: every probe of a non-empty set takes the
+        /// write lock, even when the pending close names another session.
+        fn old_probe(r: &ConnRev2, sess: u32) -> bool {
+            if r.closed_len.load(Ordering::Relaxed) == 0 {
+                return false;
+            }
+            let mut closed = r.closed_sessions.write();
+            match closed.iter().position(|&s| s == sess) {
+                Some(i) => {
+                    let _ = closed.remove(i);
+                    r.closed_len.store(closed.len(), Ordering::Relaxed);
+                    true
+                }
+                None => {
+                    r.closed_len.store(closed.len(), Ordering::Relaxed);
+                    false
+                }
+            }
+        }
+
+        fn run(mode: Mode, threads: usize, pending: u32) -> (u64, u64, Vec<u64>) {
+            let r = Arc::new(ConnRev2::new());
+            if !matches!(mode, Mode::Steady) {
+                // One or more idle associations' closes nobody consumes: the
+                // LOGIC-2 window the fix targets (the set is capped at 64).
+                for sess in 1..=pending {
+                    r.note_session_closed(sess);
+                }
+            }
+            let barrier = Arc::new(Barrier::new(threads + 1));
+            let mut handles = Vec::with_capacity(threads);
+            for t in 0..threads {
+                let r = Arc::clone(&r);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let sess = 1000 + t as u32;
+                    let flag = AtomicBool::new(false);
+                    let probe = || match mode {
+                        Mode::Steady => {
+                            std::hint::black_box(r.take_session_closed(sess));
+                        }
+                        Mode::Old => {
+                            std::hint::black_box(old_probe(&r, sess));
+                        }
+                        Mode::New => {
+                            std::hint::black_box(r.take_session_closed(sess));
+                        }
+                        Mode::AtomicSwap => {
+                            let f = std::hint::black_box(&flag);
+                            std::hint::black_box(f.swap(false, Ordering::Relaxed));
+                        }
+                        Mode::AtomicLoad => {
+                            let f = std::hint::black_box(&flag);
+                            std::hint::black_box(f.load(Ordering::Relaxed));
+                        }
+                    };
+                    for _ in 0..10_000 {
+                        probe();
+                    }
+                    barrier.wait();
+                    let mut batches = Vec::with_capacity(OPS_PER_THREAD / BATCH);
+                    for _ in 0..(OPS_PER_THREAD / BATCH) {
+                        let b0 = quanta::Instant::now();
+                        for _ in 0..BATCH {
+                            probe();
+                        }
+                        let b1 = quanta::Instant::now();
+                        batches.push(b1.saturating_duration_since(b0).as_nanos() as u64);
+                    }
+                    batches
+                }));
+            }
+            let wall0 = quanta::Instant::now();
+            barrier.wait();
+            let mut batches = Vec::new();
+            for h in handles {
+                batches.append(&mut h.join().unwrap());
+            }
+            let wall = quanta::Instant::now().saturating_duration_since(wall0);
+            (
+                wall.as_nanos() as u64,
+                (OPS_PER_THREAD * threads) as u64,
+                batches,
+            )
+        }
+
+        fn pct(sorted: &[u64], q: f64) -> u64 {
+            sorted[((sorted.len() as f64 - 1.0) * q).round() as usize]
+        }
+
+        println!(
+            "closed_sessions_probe_bench ops/thread={OPS_PER_THREAD} batch={BATCH} \
+             (probes 1000+t all miss; pending=0 means no connection-level set)"
+        );
+        for mode in [
+            Mode::Steady,
+            Mode::Old,
+            Mode::New,
+            Mode::AtomicSwap,
+            Mode::AtomicLoad,
+        ] {
+            let pendings: &[u32] = match mode {
+                Mode::Steady | Mode::AtomicSwap | Mode::AtomicLoad => &[0],
+                Mode::Old | Mode::New => &[1, MAX_CLOSED_SESSIONS as u32],
+            };
+            for &pending in pendings {
+                for &threads in &[1usize, 2, 4, 8] {
+                    let (wall_ns, ops, mut batches) = run(mode, threads, pending);
+                    let ns_per_op = wall_ns as f64 / ops as f64;
+                    batches.sort_unstable();
+                    let per_op = |ns: u64| ns as f64 / BATCH as f64;
+                    println!(
+                        "mode={mode:?} pending={pending} threads={threads} ops={ops} \
+                         wall_ms={:.1} ns/op={ns_per_op:.2} p50={:.1} p99={:.1} \
+                         p999={:.1} max={:.1}",
+                        wall_ns as f64 / 1e6,
+                        per_op(pct(&batches, 0.50)),
+                        per_op(pct(&batches, 0.99)),
+                        per_op(pct(&batches, 0.999)),
+                        per_op(*batches.last().unwrap()),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
