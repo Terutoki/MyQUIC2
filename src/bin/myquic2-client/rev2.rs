@@ -2129,6 +2129,12 @@ pub(crate) mod counters {
         /// full (`CTL_QUEUE`). A peer that floods frames this side refuses
         /// while not reading the control stream shows up here.
         ctl_queue_full,
+        /// rev3: the generation's control-stream task exited (the stream died
+        /// while the connection was still up), so the dispatcher retired the
+        /// connection instead of keeping a generation without a reliable
+        /// control plane. Seen after a hard server restart whose stale
+        /// resumption ticket makes the peer reject the client's early data.
+        ctl_stream_closed,
     }
 
     /// Thread-local flush threshold for the data-plane counters: the hot path
@@ -2206,6 +2212,7 @@ pub(crate) mod counters {
         ctl_stream_rx,
         ctl_stream_drop,
         ctl_queue_full,
+        ctl_stream_closed,
     }
 
     impl std::fmt::Display for Rev2Snapshot {

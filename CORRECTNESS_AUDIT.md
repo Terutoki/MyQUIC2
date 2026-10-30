@@ -22,6 +22,7 @@ Method:
 | P3 | stage-full payload drops are counted but anonymous | low | **fixed** |
 | P4 | an invariant `expect` can panic the shared datagram loop | low | **fixed** |
 | P5 | lock guards held across a `match` scrutinee | low | **fixed** |
+| P6 | a hard server restart left the client spinning a core per connection | high | **fixed** |
 
 ### P1 — torn-down resources (verified, no change needed)
 
@@ -111,9 +112,62 @@ Clippy's `significant_drop_in_scrutinee` fired at two sites:
 Both now bind the result before the `match`, so the guard is released at the
 end of the statement. No behaviour change; the lints are clean.
 
+### P6 — post-restart busy loop on a closed control queue (fixed)
+
+Reported symptom: the server restarts, the client reconnects, and a minute later
+one or two client cores sit at 100%. Reproduced end-to-end by
+`rev3_hard_server_restart_reconnect_does_not_burn_cores`
+(`tests/rev3_e2e.rs:1137`): UDP traffic through a running server, 1.5 s for the
+client to store tickets, the server `SIGSTOP`ped past the client's 10 s silence
+watchdog, the paused process `SIGKILL`ed, and a fresh process started from the
+same config (same certificate, new ticket keys). The first redial offers the
+stale ticket, the new process cannot decrypt the early data and rejects 0-RTT
+(`0-RTT rejected` in quinn, `Not resuming` in rustls) while the 1-RTT connection
+itself is healthy.
+
+The rev3 control stream was the only client stream opened while the handshake
+was still in flight, so the rejection reset it (`ZeroRttRejected`).
+`spawn_ctl_stream` (`src/bin/myquic2-client/dispatcher.rs:1240`) then returned
+and dropped the dispatcher's inbound queue. The dispatcher's select arm
+
+```rust
+msg = dispatch_ctl_rx.recv() => { if let Some(msg) = msg { ... } }
+```
+
+had no `None` arm, and a closed, empty tokio `mpsc::Receiver` is ready
+immediately on every poll: the arm became a permanently ready branch, so the
+slot's `current_thread` runtime — one OS thread pinned to a core — spun at 100%
+for the rest of the generation's life. That is one core per affected connection,
+measured at 6.29 cores on a 10-core macOS box (the report's one or two cores is
+the same bug on a smaller client).
+
+Fixed in two layers:
+
+* **Never open the control stream into 0-RTT.** `spawn_ctl_stream` now waits for
+  the handshake phase to settle (`ZeroRttState::wait_settled`, bounded by
+  `DIAL_ATTEMPT_TIMEOUT` and aborted early by `conn.closed()`) before opening
+  the stream. The wait costs at most one round trip and loses nothing: outbound
+  control messages queue in the bounded `CTL_QUEUE` until the stream is up, and
+  no data-path work awaits the control plane. A full-handshake dial settles
+  immediately (`NONE`), so non-resumed connections are unaffected.
+* **Retire a generation whose control stream dies anyway.** The dispatcher's
+  `None` arm now closes the connection (when it is still up) and breaks, so the
+  reconnect loop publishes a fresh generation within its 200 ms–5 s backoff. A
+  rev3 generation without its reliable control plane cannot repair context
+  (`NEED_CONTEXT`), refuse flows (`REJECT`) or deliver closes, so retiring it is
+  the only correct outcome. The retirement is counted as `ctl_stream_closed`
+  (`src/bin/myquic2-client/rev2.rs:2137`).
+
+The E2E test covers both layers: with only the settle wait reverted it fails on
+eight post-restart control-stream teardowns (`connection already closing:
+false`, one per slot); with the original code (both layers absent) it fails on
+CPU — 6.29 cores for the restart sequence that burns 0.01 cores now.
+
 ## Verification
 
-* `cargo test --release`: **721** tests pass (360 lib, 201, 145, 7, 8).
+* `cargo test --all-targets`: **725** tests pass (360 lib, 201 client, 148
+  server, 7 forwarding E2E, 9 wire-revision E2E, including the restart
+  regression test).
 * `cargo clippy --release --all-targets` clean; the
   `significant_drop_in_scrutinee` / `await_holding_lock` runs no longer warn.
 * 3,000-association churn soak: server fds return to the 18-fd baseline after

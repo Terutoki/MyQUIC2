@@ -1222,22 +1222,60 @@ pub(crate) fn handle_r3_ctl(
 /// Spawn the generation's rev3 control-stream task.
 ///
 /// One task per published generation owns the client-opened bidi stream (marker
-/// `0xFF`): it opens it immediately after the generation is published — so on a
-/// resumed connection the marker and the first messages ride the 0-RTT flight —
-/// writes every message the packet path queues through [`ConnRev2::send_ctl`]
-/// in order, and forwards inbound messages to the dispatcher loop, which owns
-/// the flow/stager/reassembly state. QUIC supplies reliability and ordering, so
-/// this direction has no app-level retry and no rate budget.
+/// `0xFF`). It waits for the handshake phase to settle and only then opens the
+/// stream, so the marker and the first messages are never 0-RTT: a peer that
+/// rejects resumption resets early streams, and a control stream reset on an
+/// otherwise healthy connection would strand that generation. Outbound messages
+/// queue in the bounded channel until the stream is up, so the wait costs one
+/// round trip and loses nothing. Once open, the task writes every message the
+/// packet path queues through [`ConnRev2::send_ctl`] in order and forwards
+/// inbound messages to the dispatcher loop, which owns the flow/stager/
+/// reassembly state. QUIC supplies reliability and ordering, so this direction
+/// has no app-level retry and no rate budget.
 ///
 /// The task ends when the stream fails (the connection died) or when the
 /// dispatcher stops consuming (generation replaced); the next generation opens
-/// its own stream.
+/// its own stream. A task that ends while the connection is still up leaves the
+/// dispatcher with a closed queue, which retires that generation at once.
 fn spawn_ctl_stream(
     conn: quinn::Connection,
+    zero_rtt: Arc<ZeroRttState>,
     mut to_server: tokio::sync::mpsc::Receiver<CtlMessage>,
     to_dispatcher: tokio::sync::mpsc::Sender<CtlMessage>,
 ) {
     tokio::spawn(async move {
+        // Wait for the handshake phase to settle **before** opening the stream.
+        //
+        // A bidi stream opened while the handshake is still in flight is a
+        // 0-RTT stream, and a peer that discards the early data resets it. A
+        // hard server restart is exactly that case: the client's resumption
+        // ticket was issued by the *previous* server process, so the new one
+        // cannot decrypt the early data and rejects 0-RTT. The stream then dies
+        // with `ZeroRttRejected` while the 1-RTT connection itself is perfectly
+        // healthy, and killing the control plane would retire a connection the
+        // data path could keep using (see the dispatcher's closed-queue arm).
+        //
+        // Unlike the TCP relay path — `open_bi_and_write_header`, which retries
+        // the open on a 1-RTT stream because a flow's first payload bytes are
+        // latency-critical — the control stream can simply wait: outbound
+        // messages queue in the bounded channel ([`rev2::CTL_QUEUE`], installed
+        // by the dispatcher before this task starts), and nothing on the data
+        // path awaits the control plane. So this stream is never a 0-RTT
+        // stream: on a full-handshake dial the phase is already `NONE` and the
+        // wait returns immediately, on a resumed dial it returns as soon as the
+        // handshake (and with it the peer's 0-RTT verdict) settles.
+        //
+        // The wait is bounded by one dial attempt's budget: a handshake that has
+        // not settled by then is a broken connection, and the open below either
+        // fails or the read side takes the generation down.
+        let deadline = tokio::time::Instant::now() + DIAL_ATTEMPT_TIMEOUT;
+        tokio::select! {
+            () = zero_rtt.wait_settled(deadline) => {}
+            // A dead connection has no control plane to offer, and waiting out
+            // the rest of the settle budget would hold this generation's
+            // outbound queue (and the dispatcher's sender) alive for nothing.
+            _ = conn.closed() => return,
+        }
         let Ok((mut sender, mut receiver)) = ctl_stream::open_client_stream(&conn).await else {
             // No control plane on this generation (connection already dead).
             return;
@@ -1847,7 +1885,12 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                 // be dispatched: a repair or a close queued from then on always
                 // has a writer.
                 rev2.install_ctl_writer(to_server_tx);
-                spawn_ctl_stream(conn.clone(), to_server_rx, dispatch_ctl_tx);
+                spawn_ctl_stream(
+                    conn.clone(),
+                    slot.zero_rtt_state(),
+                    to_server_rx,
+                    dispatch_ctl_tx,
+                );
                 None
             } else {
                 Some(dispatch_ctl_tx)
@@ -1954,15 +1997,55 @@ pub(crate) fn spawn_dispatcher(slot: ConnSlot, hub: Arc<UdpHub>) {
                             break;
                         }
                     }
-                    msg = dispatch_ctl_rx.recv() => {
-                        if let Some(msg) = msg {
+                    msg = dispatch_ctl_rx.recv() => match msg {
+                        Some(msg) => {
                             if ctl_rx_rate.allow(coarse_millis()) {
                                 handle_r3_ctl(&rev2, &hub, &mut r2_reasm, msg);
                             } else {
                                 counters::ctl_stream_drop();
                             }
                         }
-                    }
+                        // `None` is **not** a quiet no-op. A closed receiver is
+                        // ready immediately on every poll, so leaving this arm
+                        // armed would spin this task at 100% of a core for the
+                        // rest of the generation's life (the whole shard thread
+                        // when the dispatcher owns a current-thread runtime) —
+                        // the post-restart CPU burn this arm used to cause:
+                        // `spawn_ctl_stream` exits when the control stream
+                        // dies, which a restarted server does to a 0-RTT
+                        // control stream by rejecting the stale ticket's early
+                        // data, and the connection itself stays healthy.
+                        //
+                        // It means the generation's control-stream task is
+                        // gone: both halves are dropped, and with them the
+                        // reliable control plane that repairs flow context
+                        // (`NEED_CONTEXT`), refuses flows (`REJECT`) and retires
+                        // them (`FLOW_CLOSE`, `SESS_CLOSE`). A rev3 generation
+                        // without one is not usable, so retire the connection
+                        // and let the reconnect loop publish a fresh generation:
+                        // its dispatcher opens a new stream. When the connection
+                        // died first, `close` is a no-op; the generation bump
+                        // from `retire_dead_slot` wakes `wait_conn` below either
+                        // way, so no state is lost and nothing spins.
+                        None => {
+                            // A connection that is already going down is
+                            // reported as such: the teardown resets the stream
+                            // and can wake this arm before the local close is
+                            // recorded, so only the reason is worth logging (and
+                            // only a live connection is retired here).
+                            let closing = conn.close_reason().is_some();
+                            tracing::debug!(
+                                "rev3 control stream closed; retiring generation \
+                                 (stable_id {}, connection already closing: {closing})",
+                                conn.stable_id()
+                            );
+                            if !closing {
+                                counters::ctl_stream_closed();
+                                conn.close(0u32.into(), b"control stream closed");
+                            }
+                            break;
+                        }
+                    },
                     _ = gen_rx.changed() => break,
                     _ = reasm_tick.tick(),
                         if reasm.held_bytes() > 0 || r2_reasm.held_bytes() > 0 =>

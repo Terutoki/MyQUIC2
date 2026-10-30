@@ -391,6 +391,22 @@ impl Harness {
     }
 }
 
+/// Accumulated CPU time of a process, in seconds (`ps -o time=`: `M:SS.ss` or
+/// `H:MM:SS`). The delta across a wall-clock sleep is the process's core usage.
+#[cfg(unix)]
+fn cpu_seconds(pid: u32) -> f64 {
+    let out = Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .expect("spawn ps");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut secs = 0.0f64;
+    for part in text.trim().split(':') {
+        secs = secs * 60.0 + part.trim().parse::<f64>().unwrap_or(0.0);
+    }
+    secs
+}
+
 #[cfg(unix)]
 fn signal(child: &Child, signal: &str) {
     let pid = child.id().to_string();
@@ -1097,4 +1113,138 @@ fn rev3_0rtt_resumption_after_forced_path_break() {
         !server_text.contains("auth failed from"),
         "the server must accept the 0-RTT/re-sent token:\n{server_text}"
     );
+}
+
+/// A *hard* server restart (the old process is gone, a new one starts with fresh
+/// session-ticket keys) must not leave the client burning cores.
+///
+/// This is the reported symptom: server restarts, the client reconnects, and a
+/// minute later one or two cores are pegged at 100%. The mechanism: the client's
+/// resumption ticket was issued by the *previous* server process, so the new one
+/// cannot decrypt the early data and rejects 0-RTT. The rev3 control stream used
+/// to be the only client stream opened before the handshake settled, so it was
+/// the stream that died. Its task then dropped the dispatcher's inbound queue,
+/// and the dispatcher's `select!` kept polling that closed queue as a
+/// permanently-ready branch: a closed, empty `mpsc::Receiver::recv()` resolves
+/// `None` immediately, forever. The fix opens the control stream only after the
+/// handshake verdict (so the rejection cannot reset it) and retires the
+/// generation if the control stream dies anyway instead of spinning on it.
+///
+/// The CPU check is the assertion; the payload round-trip after it makes sure the
+/// fix does not trade a spin for a stalled tunnel.
+#[cfg(unix)]
+#[test]
+fn rev3_hard_server_restart_reconnect_does_not_burn_cores() {
+    let _serial = e2e_guard();
+    let echo = spawn_udp_echo();
+    // The same liveness override as the resumption test: the silence watchdog
+    // fires after ~10 s, so the client notices the stopped server quickly.
+    let server_liveness = "keep_alive_secs = 1\nidle_timeout_secs = 15\n";
+    let client_liveness =
+        "keep_alive_secs = 1\nidle_timeout_secs = 15\nreconnect_timeout_secs = 5\n";
+    let mut h = Harness::start(REV3, true, server_liveness, client_liveness, Some("debug"));
+    assert_wire_selected(&h, REV3);
+    let socks = h.socks_addr();
+    let deadline = Instant::now() + START_TIMEOUT;
+    let (_ctrl, relay) = socks_udp_associate(socks, deadline)
+        .unwrap_or_else(|| panic!("UDP ASSOCIATE never succeeded\n{}", h.logs()));
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind app UDP");
+    let got = socks_udp_roundtrip(
+        &sock,
+        relay,
+        SocksTarget::Ip(echo),
+        b"before-restart",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| panic!("pre-restart payload never echoed\n{}", h.logs()));
+    assert_eq!(got, b"before-restart");
+    // Let the client receive its NewSessionTicket(s) from the old process.
+    thread::sleep(Duration::from_millis(1500));
+
+    // 1. Make the client notice the break and force-close its connection: the
+    //    server is paused past the client's silence watchdog, so the redials
+    //    that follow time out against a silent peer.
+    let anchor = h.client_log_len();
+    h.stop_server();
+    thread::sleep(Duration::from_secs(12));
+
+    // 2. Hard restart: SIGKILL the paused process and start a new one from the
+    //    same config (same certificate, fresh ticket keys).
+    let server_cfg = h.dir.path().join("config-server.toml");
+    let server_log = h.log_path("server.log", false);
+    let _ = fs::copy(&server_log, h.dir.path().join("server-before-restart.log"));
+    let _ = h.server.kill();
+    let _ = h.server.wait();
+    // Everything the still-paused server made the client tear down is in the log
+    // by now (the watchdog fired ~2 s ago). Anchor past it: from here on, any
+    // control-stream teardown belongs to the *new* server and is a regression.
+    let restart_anchor = h.client_log_len();
+    h.server = spawn_bin(
+        env!("CARGO_BIN_EXE_myquic2-server"),
+        &server_cfg,
+        &server_log,
+        Some("debug"),
+    );
+
+    // 3. The client redials: its first successful dial offers the stale ticket
+    //    and the new server rejects the early data.
+    h.wait_client_log("QUIC connected to", anchor, Duration::from_secs(40))
+        .unwrap_or_else(|e| panic!("{e}\n{}", h.logs()));
+    // Let the rejection, the auth re-send and the control-stream teardown land.
+    thread::sleep(Duration::from_secs(2));
+
+    // 4. Measure the client's CPU time over a fixed wall window. A healthy idle
+    //    client is far below one core; a busy-looped dispatcher shard is a whole
+    //    core, one per affected connection.
+    let pid = h.client.id();
+    let before = cpu_seconds(pid);
+    let wall = Duration::from_secs(4);
+    thread::sleep(wall);
+    let cores = (cpu_seconds(pid) - before) / wall.as_secs_f64();
+    let client_text = h.log_text("client.log");
+    let after_restart = client_text.get(restart_anchor..).unwrap_or("");
+    println!(
+        "client CPU after the restart: {cores:.2} cores \
+         (0-RTT rejections after the restart: {}, control-stream teardowns: {})",
+        after_restart.matches("0-RTT rejected").count(),
+        after_restart.matches("control stream closed").count(),
+    );
+    // The test is only meaningful if the new server actually refused the stale
+    // ticket. If this fails, resumption stopped being offered and the repro has
+    // to be rebuilt around a different path break.
+    assert!(
+        after_restart.contains("0-RTT rejected"),
+        "the client never offered 0-RTT after the restart, so the repro exercised \
+         nothing:\n{}",
+        h.logs()
+    );
+    assert!(
+        cores < 0.5,
+        "client burns {cores:.2} cores after reconnecting to the restarted server \
+         (0-RTT rejected: {}):\n{}",
+        client_text.contains("0-RTT rejected"),
+        h.logs()
+    );
+    // The rejected early data must not take the generation's control plane down:
+    // the control stream is opened only once the handshake verdict is known, so
+    // the rejection cannot reset it. Any post-restart teardown would mean a
+    // control stream died on a live connection and the dispatcher had to retire
+    // that generation (the safety net): a needless reconnect and a lost data path.
+    assert_eq!(
+        after_restart.matches("control stream closed").count(),
+        0,
+        "0-RTT rejection killed a rev3 control stream on a live connection:\n{}",
+        h.logs()
+    );
+
+    // 5. The tunnel still forwards after the reconnect.
+    let got = socks_udp_roundtrip(
+        &sock,
+        relay,
+        SocksTarget::Ip(echo),
+        b"after-restart",
+        Instant::now() + Duration::from_secs(15),
+    )
+    .unwrap_or_else(|| panic!("post-restart payload never echoed\n{}", h.logs()));
+    assert_eq!(got, b"after-restart");
 }

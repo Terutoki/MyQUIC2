@@ -141,7 +141,14 @@ FRAG          b0 = 11 | flags[3:0]     fid:u16 · frag_id:u32 · idx:u8 · total
   messages — `ASSOC_CLOSE`, `FLOW_CLOSE`, `REJECT`, `NEED_CONTEXT`, `SESS_CLOSE`,
   `GOAWAY` — framed as `type:u8 | len:u16le | body` (bounded body, hostile input
   rejected before slicing). QUIC retransmits them; the DATAGRAM plane itself
-  stays unreliable and unordered.
+  stays unreliable and unordered. The stream is opened **after the handshake
+  verdict is known, never into 0-RTT**: a peer that rejects resumption resets
+  every early stream, and a control stream reset on an otherwise healthy
+  connection would strand that generation's closes and context repair. The cost
+  is at most one round trip and nothing is lost — outbound control messages
+  queue in the bounded `CTL_QUEUE` until the stream is up. A control-stream task
+  that still dies while the connection is up retires its generation at once
+  (the dispatcher closes the connection; it never spins on the dead queue).
 - **Static capabilities.** There is no `HELLO`/`CAPS` exchange: the revision,
   the flow-id width and the frame-size bounds are a fixed contract selected by
   configuration. ALPN defaults to the shared `h3` label for both revisions, so
@@ -170,11 +177,11 @@ on both revisions (rev3 additionally needs no `HELLO` before data):
 | Step | Client | Server |
 |---|---|---|
 | Dial | `into_0rtt()` returns a usable `Connection` **before** the handshake completes; the pool publishes it immediately (0.5-RTT connection) | `incoming.accept()` + `into_0rtt()` yields the connection immediately; the accept path does **not** await the handshake |
-| First flight | auth token on a 0-RTT uni stream, rev3 `DATA_EXT OPEN`/`INLINE` UDP payloads, SOCKS/forward TCP target-header bidi streams (header written before any app byte is read) | — |
+| First flight | auth token on a 0-RTT uni stream, rev3 `DATA_EXT OPEN`/`INLINE` UDP payloads, SOCKS/forward TCP target-header bidi streams (header written before any app byte is read); the rev3 control stream is deliberately **not** in this set | — |
 | Auth | — | `authenticate()` reads the 0-RTT token and verifies it constant-time **while the handshake is still in flight**; on success it raises `MAX_STREAMS` and **starts `handle_conn` pre-handshake**, so first-flight datagrams and TCP bytes are forwarded without waiting a round trip |
 | Caps / tickets | resumption store sized for 1024 sessions (rustls keeps up to 8 single-use TLS 1.3 tickets per server name) | 4 TLS 1.3 tickets minted per handshake (`send_tls13_tickets = 4`), `max_early_data_size = u32::MAX`, stateful single-use tickets |
 | Stream credit | opens early TCP streams against the **remembered** pre-auth credit | advertises 64 bidi + 8 uni streams pre-auth (remembered by the ticket), raises bidi to 8,192 only after auth; the 8 uni slots cover the early token plus its 1-RTT re-send |
-| Rejection repair | on `ZeroRttAccepted == false` (or a structurally failed early token write) a detached monitor re-sends the token on a fresh 1-RTT uni stream; the connection stays up | `authenticate()` tolerates the discarded/reset early stream and keeps waiting until the 1-RTT token arrives; a complete wrong token still fails closed |
+| Rejection repair | on `ZeroRttAccepted == false` (or a structurally failed early token write) a detached monitor re-sends the token on a fresh 1-RTT uni stream; the connection stays up, and the control stream opens only after that verdict, so the rejection cannot reset it | `authenticate()` tolerates the discarded/reset early stream and keeps waiting until the 1-RTT token arrives; a complete wrong token still fails closed |
 
 - **Replay is accepted by explicit decision.** A bearer token, and any payload,
   in replayable early data can be replayed by an observer inside the ticket
@@ -613,12 +620,13 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 | SSRF/private target | policy refusal before dial/send; counted |
 | Stager full | drop the newest item, count the reason; FIFO is preserved for what remains |
 | Connection lost | in-flight payloads are lost; the pool reconnects and the association reopens; there is no replay |
+| Server restarted under the client | the new process cannot decrypt the stale ticket's early data, so it rejects 0-RTT; the client re-sends the auth token 1-RTT and keeps the connection, and the control stream opens only after that verdict, so the tunnel resumes without a reconnect storm. A control stream that dies anyway retires its generation (counted as `ctl_stream_closed`) instead of spinning. |
 | Peer crash | QUIC close or the 180 s idle sweep reclaims flows, stager items and partials |
 | Unknown first byte / opcode / flag | drop and count; no panic, no connection teardown |
 
 ### 17. Verification snapshot
 
-The current tree has **724 tests** on macOS (lib 360 + client 201 + server 148 + 15 process-level E2E: 7 forwarding + 8 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **725 tests** on macOS (lib 360 + client 201 + server 148 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1214,9 +1222,9 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **724 tests** on the macOS dev box (lib 360 + client 201 + server 148 + 15 process-level E2E: 7 forwarding + 8 wire-revision).
+- **725 tests** on the macOS dev box (lib 360 + client 201 + server 148 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
-- **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 15 process-level E2E tests.
+- **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
 - **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
 
@@ -2196,7 +2204,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>724 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>725 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB
