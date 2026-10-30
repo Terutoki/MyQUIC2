@@ -1208,7 +1208,7 @@ The client and server must run the **same revision**. Certificates are generated
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_interactive_conns` (interactive shards, default 2), `udp_egress_conns` (bulk shards, default 2), `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
 - **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Per-listener caps (`max_conns` / `max_sessions`) sit under process-wide forward budgets (`max_forward_conns` / `max_forward_sessions`, both defaulting to 3/4 of the shared SOCKS limit) so forwarding cannot deny the SOCKS endpoint. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
-- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL`, `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
+- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL` (nonzero busy-polls every UDP socket: it trades idle CPU for wakeup latency, so unset it if a core sits at 100% while idle), `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
 The sample configs are the reference; comments explain defaults and trade-offs.
 

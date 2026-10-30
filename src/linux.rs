@@ -333,6 +333,14 @@ fn apply_busy_poll(fd: RawFd, us: u32) {
         );
         return;
     }
+    // This knob trades idle CPU for wakeup latency: the kernel spins in the
+    // socket's poll path for up to `us` on every read. Say so once, at warn
+    // level, because "one core sits at 100% while idle" is otherwise very
+    // hard to attribute.
+    warn_once(
+        "busy-poll-armed",
+        &format!("MYQUIC2_BUSY_POLL={us}µs: UDP sockets busy-poll (idle CPU rises by design)"),
+    );
     if let Err(e) = set_raw_int(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, 1) {
         // Pre-5.11 kernels: the budget still applies where
         // `net.core.busy_poll` allows it, it just cannot override the sysctl.
@@ -416,8 +424,9 @@ fn get_raw_int(
 /// every socket, so the full message must not repeat per connection.
 fn once(kind: &str) -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static SEEN: [(&str, AtomicBool); 5] = [
+    static SEEN: [(&str, AtomicBool); 6] = [
         ("busy-poll", AtomicBool::new(false)),
+        ("busy-poll-armed", AtomicBool::new(false)),
         ("busy-poll-prefer", AtomicBool::new(false)),
         ("defer-accept", AtomicBool::new(false)),
         ("fastopen", AtomicBool::new(false)),

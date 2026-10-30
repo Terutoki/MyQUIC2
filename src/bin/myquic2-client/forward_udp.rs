@@ -527,7 +527,16 @@ impl UdpForwarder {
                                 );
                             }
                             if (consecutive_recv_errors & 31) == 0 {
-                                tokio::task::yield_now().await;
+                                // A persistent transient error (e.g. an ICMP
+                                // storm on a broken path) makes every recv
+                                // return immediately; `yield_now` alone still
+                                // burns a core because the task is ready again
+                                // at once. Sleep long enough to bound the
+                                // retry rate. A real transient error is
+                                // consumed by the next recv and resets the
+                                // counter, so the common churn case still
+                                // retries without a delay.
+                                tokio::time::sleep(Duration::from_millis(1)).await;
                             }
                             continue;
                         }
