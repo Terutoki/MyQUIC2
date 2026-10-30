@@ -64,23 +64,6 @@ pub(crate) const HELLO_RETRY_SLOW: Duration = Duration::from_secs(2);
 /// state that needs it.
 pub(crate) const HELLO_FAST_WINDOW: Duration = Duration::from_secs(2);
 
-/// Bounded set of server-closed sessions recorded for an association to
-/// consume.
-///
-/// Only a session with a **live association** is recorded (the dispatcher
-/// checks the hub before calling [`ConnRev2::note_session_closed`]) and the
-/// association forgets its id when it exits
-/// ([`ConnRev2::forget_session_closed`]), so the set only ever holds closes
-/// something can still consume and returns to empty in steady state.
-///
-/// Bounded because a peer controls `SESS_CLOSE`. When the set is full the
-/// **oldest** entry is evicted, never the newest: dropping a freshly arrived
-/// close would blackhole that live session's traffic (the uplink never learns
-/// to re-`OPEN`, and the server already purged its bindings), while evicting
-/// an older id at worst makes that association wait for the redial / the
-/// server's 180 s sweep.
-const MAX_CLOSED_SESSIONS: usize = 64;
-
 /// Depth of the rev3 outbound control queue (see
 /// [`ConnRev2::send_ctl`]).
 ///
@@ -183,22 +166,6 @@ pub(crate) struct ConnRev2 {
     /// non-blocking send), never across an await, and never nested with another
     /// stager lock.
     pub(crate) stager: Arc<parking_lot::Mutex<R2Stager>>,
-    /// Sessions the server closed that an association has still to consume (see
-    /// [`MAX_CLOSED_SESSIONS`]).
-    ///
-    /// The `take` guard is the datagram's very first shared read, and the deque
-    /// is empty in steady state (populated only by a `SESS_CLOSE` for a **live**
-    /// association, and forgotten when that association exits): the
-    /// `closed_len` counter below turns the per-datagram probe into one relaxed
-    /// load, and the exclusive write lock is taken only while a close is
-    /// actually pending. Deque order is insertion order, i.e. eviction order.
-    closed_sessions: parking_lot::RwLock<VecDeque<u32>>,
-    /// Live `closed_sessions` length, maintained under the write lock. A stale
-    /// *overshoot* is impossible (writes under the lock refresh it last); a
-    /// stale zero short-takes one extra payload before the next sync re-checks,
-    /// which is ordinary UDP loss. Updated with `Relaxed`: the caller treats
-    /// `false` as "not closed on this datagram" and re-checks on the next sync.
-    closed_len: std::sync::atomic::AtomicUsize,
     /// Targets the server rejected with `CTL FLOW_REJECT` / rev3 `REJECT`,
     /// with their window start and reason-selected TTL (see
     /// [`REJECT_TTL_TRANSIENT_MS`] / [`REJECT_TTL_POLICY_MS`]).
@@ -300,8 +267,6 @@ impl ConnRev2 {
                 0
             }),
             stager: Arc::new(parking_lot::Mutex::new(stager)),
-            closed_sessions: parking_lot::RwLock::new(VecDeque::new()),
-            closed_len: std::sync::atomic::AtomicUsize::new(0),
             rejected: parking_lot::RwLock::new(Vec::new()),
             ctl_tx: parking_lot::Mutex::new(None),
             ctx_repair_rate: parking_lot::Mutex::new(ctl_stream::CtlRate::default_budget()),
@@ -515,98 +480,6 @@ impl ConnRev2 {
             dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
         }
         n
-    }
-
-    /// Record `CTL SESS_CLOSE` from the server for `sess`. Bounded (see
-    /// [`MAX_CLOSED_SESSIONS`]) and idempotent.
-    ///
-    /// The caller only records a close for a session whose association is still
-    /// live (the dispatcher checks the hub): an id with no consumer would stay
-    /// here forever, keeping the per-datagram `closed_len` short-circuit open
-    /// and — at the cap — evicting a live association's close. The association
-    /// drops its entry on exit ([`Self::forget_session_closed`]), which is the
-    /// other half of "the set returns to empty".
-    ///
-    /// At the cap the **oldest** pending id is evicted, never the newest: see
-    /// [`MAX_CLOSED_SESSIONS`]. A duplicate note for an already-present id is a
-    /// no-op (the existing entry keeps its position, so a replayed frame cannot
-    /// promote itself past older pending closes).
-    pub(crate) fn note_session_closed(&self, sess: u32) {
-        let mut closed = self.closed_sessions.write();
-        if closed.contains(&sess) {
-            return;
-        }
-        if closed.len() >= MAX_CLOSED_SESSIONS {
-            closed.pop_front();
-        }
-        closed.push_back(sess);
-        // Refresh under the same lock hold: a concurrent `take` that saw the
-        // pre-push length then did not find its id cannot pass a stale zero to
-        // the *next* sync.
-        self.closed_len
-            .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Consume a recorded `SESS_CLOSE` for `sess`.
-    pub(crate) fn take_session_closed(&self, sess: u32) -> bool {
-        // The steady-state short-circuit: an empty deque (the common case)
-        // costs one relaxed load instead of an exclusive lock acquisition per
-        // uplink datagram. `closed_len` only says "the lock may be worth
-        // taking" — the deque itself stays the authority, so a concurrent
-        // `note` racing an in-flight probe is refuted (not lost): it refreshes
-        // the count under its own write hold and the next sync picks it up.
-        if self.closed_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return false;
-        }
-        let mut closed = self.closed_sessions.write();
-        match closed.iter().position(|&s| s == sess) {
-            Some(i) => {
-                let _ = closed.remove(i);
-                self.closed_len
-                    .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
-                true
-            }
-            None => {
-                // Heal the counter (its earlier read raced a concurrent
-                // drain); one fresh store can only ever be conservative.
-                self.closed_len
-                    .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
-                false
-            }
-        }
-    }
-
-    /// Drop a recorded `SESS_CLOSE` for `sess` without consuming it.
-    ///
-    /// The association-exit path is the only other consumer of a session's own
-    /// close: once the association is gone nothing will call
-    /// [`Self::take_session_closed`] for its id, so leaving it behind keeps the
-    /// bounded set non-empty for the connection's life — the every-datagram
-    /// exclusive lock of LOGIC-2 — and lets it occupy a slot that a live
-    /// association's close could need. No-op when nothing is recorded (the
-    /// common exit case, one relaxed load).
-    pub(crate) fn forget_session_closed(&self, sess: u32) {
-        if self.closed_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
-        }
-        let mut closed = self.closed_sessions.write();
-        if let Some(i) = closed.iter().position(|&s| s == sess) {
-            let _ = closed.remove(i);
-        }
-        self.closed_len
-            .store(closed.len(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Live length of the closed-session set (test/observability probe).
-    #[cfg(test)]
-    pub(crate) fn closed_sessions_len(&self) -> usize {
-        self.closed_len.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Snapshot of the closed-session set in insertion order (test probe).
-    #[cfg(test)]
-    pub(crate) fn closed_sessions_snapshot(&self) -> Vec<u32> {
-        self.closed_sessions.read().iter().copied().collect()
     }
 
     /// Record that the server rejected a flow for `target` with `reason`. The
@@ -851,30 +724,17 @@ pub(crate) fn send_sess_close(
         None => bind.and_then(|b| pool.slot(pool.udp_global_slot(b.index)).rev2()),
     };
     let reached = cached.as_ref().map(|(_, rev2)| rev2.clone()).or(fallback);
-    if let Some(rev2) = &reached {
-        if epoch != 0 && rev2.epoch == epoch {
-            // Release the session's bindings (client-owned and accepted
-            // server-owned alike) and any payload still queued for it, so a
-            // later drain cannot send frames for a session the server is about
-            // to reap. The stager books each dropped payload as an egress
-            // death, exactly like a closed connection.
-            let _ = rev2.registry.remove_session(sess);
-            let _ = rev2.stager.lock().drop_session(sess);
-        }
-        // The association is the only consumer of its recorded close; drop it
-        // so an exit that never syncs again cannot leave the bounded set
-        // non-empty (LOGIC-2). Harmless when nothing is recorded.
-        rev2.forget_session_closed(sess);
-    }
-    // Every dispatcher generation can hold a note for this session (the close
-    // is recorded on whichever connection's dispatcher received it). A slot's
-    // `rev2()` is a lock-free load, and exit is rare, so sweep them all: with
-    // `bind == None` (an association that never sent) this is the only place
-    // the note can be released.
-    for i in 0..pool.slots_total() {
-        if let Some(rev2) = pool.slot(i).rev2() {
-            rev2.forget_session_closed(sess);
-        }
+    if let Some(rev2) = &reached
+        && epoch != 0
+        && rev2.epoch == epoch
+    {
+        // Release the session's bindings (client-owned and accepted
+        // server-owned alike) and any payload still queued for it, so a later
+        // drain cannot send frames for a session the server is about to reap.
+        // The stager books each dropped payload as an egress death, exactly
+        // like a closed connection.
+        let _ = rev2.registry.remove_session(sess);
+        let _ = rev2.stager.lock().drop_session(sess);
     }
 
     // rev3: the exit signal is one `ASSOC_CLOSE` on the reliable control
@@ -945,6 +805,14 @@ pub(crate) struct UplinkFlows {
     pub(crate) flows: SessionFlows,
     /// Connection epoch the current `flows` belong to.
     pub(crate) epoch: u64,
+    /// This association's `SESS_CLOSE` signal, shared with its hub entry.
+    ///
+    /// The close is raised by whichever dispatcher received it (rev2 DATAGRAM
+    /// or rev3 stream) and consumed here, by the association that owns the
+    /// session — never by a connection-wide scan. An unraised signal costs one
+    /// relaxed load per uplink payload; see [`CloseSignal`] for why this
+    /// replaced the connection-level queue.
+    closed: Arc<CloseSignal>,
     /// One-slot memo of the binding the last uplink datagram used.
     ///
     /// A steady association sends to the same target it used microseconds ago:
@@ -964,10 +832,14 @@ pub(crate) struct UplinkFlows {
 }
 
 impl UplinkFlows {
-    pub(crate) fn new() -> Self {
+    /// `closed` is the association's signal from its hub entry
+    /// ([`AssocEntry::closed`]); tests that do not exercise `SESS_CLOSE` pass a
+    /// fresh [`CloseSignal`].
+    pub(crate) fn new(closed: Arc<CloseSignal>) -> Self {
         Self {
             flows: SessionFlows::new(),
             epoch: 0,
+            closed,
             last: None,
             pending: UplinkPending::default(),
         }
@@ -985,7 +857,13 @@ impl UplinkFlows {
     /// connection (the server reaped the session; a steady frame would name ids
     /// it no longer holds), so the bindings are also removed from the registry
     /// and forgotten.
-    pub(crate) fn sync(&mut self, rev2: &ConnRev2, sess: u32) {
+    ///
+    /// The close signal is consumed *before* the epoch check: a redial already
+    /// invalidates every binding, so a close raised for the previous
+    /// generation is moot, and swallowing it here keeps the flag from leaking
+    /// into a future `sync` that might otherwise reset fresh bindings.
+    pub(crate) fn sync(&mut self, rev2: &ConnRev2) {
+        let closed = self.closed.take();
         if self.epoch != rev2.epoch {
             self.flows = SessionFlows::new();
             self.epoch = rev2.epoch;
@@ -993,7 +871,7 @@ impl UplinkFlows {
             counters::flow_table_reset();
             return;
         }
-        if rev2.take_session_closed(sess) {
+        if closed {
             for b in self.flows.iter() {
                 b.mark_closed();
                 let _ = rev2.registry.remove(b.wire_id);
@@ -1386,7 +1264,7 @@ pub(crate) fn send_uplink(
     // caller derives `limit`/class policy from it and Phase-2 per-class quotas
     // (spec §7.2/§2.3) key on it.
     let _ = bind;
-    up.sync(rev2, sess);
+    up.sync(rev2);
     // The fragmenter is per association but the wire is per connection: pin it
     // on every send (cheap `Copy` field store) so a reconnect onto another
     // revision re-encodes fragments correctly, and rev2 keeps identical bytes.
@@ -2322,86 +2200,56 @@ mod tests {
     }
 
     #[test]
-    fn closed_sessions_are_consumed_once_and_the_set_empties() {
-        let r = ConnRev2::new();
-        assert_eq!(r.closed_sessions_len(), 0);
-        assert!(!r.take_session_closed(7));
-        r.note_session_closed(7);
-        assert_eq!(r.closed_sessions_len(), 1);
-        // A probe for a *different* association must not consume (or clear)
-        // the pending close: it misses under the shared read probe, and only
-        // the owner of the id takes the write lock.
-        assert!(!r.take_session_closed(8));
-        assert_eq!(r.closed_sessions_snapshot(), vec![7]);
-        assert_eq!(r.closed_sessions_len(), 1);
-        assert!(r.take_session_closed(7));
-        assert!(
-            !r.take_session_closed(7),
-            "a close is consumed exactly once"
-        );
-        assert_eq!(
-            r.closed_sessions_len(),
-            0,
-            "the len short-circuit must close again once consumed"
-        );
-        // A duplicate note is one id, not one per frame.
-        r.note_session_closed(9);
-        r.note_session_closed(9);
-        assert_eq!(r.closed_sessions_len(), 1);
-        assert_eq!(r.closed_sessions_snapshot(), vec![9]);
-        assert!(r.take_session_closed(9));
-        assert_eq!(r.closed_sessions_len(), 0);
+    fn close_signal_is_consumed_once() {
+        let sig = CloseSignal::new();
+        assert!(!sig.take(), "a fresh signal is unraised");
+        sig.raise();
+        assert!(sig.take(), "raise is visible to take");
+        assert!(!sig.take(), "a close is consumed exactly once");
+        // Duplicate raises (rev2 sends the frame x3, rev3 retransmits) collapse
+        // into one bit: both mean the same session is gone, so the reset must
+        // run once and the next sync must not reset fresh bindings again.
+        sig.raise();
+        sig.raise();
+        assert!(sig.take());
+        assert!(!sig.take());
     }
 
+    /// The server's `SESS_CLOSE` resets the association that owns the session,
+    /// once, on its next uplink sync.
     #[test]
-    fn closed_sessions_cap_evicts_the_oldest() {
+    fn session_close_resets_the_owning_uplinks_bindings() {
         let r = ConnRev2::new();
-        // One past the cap: the *oldest* id must be the one evicted, never the
-        // newest (dropping a fresh close would blackhole a live association).
-        for s in 1..=(MAX_CLOSED_SESSIONS as u32 + 1) {
-            r.note_session_closed(s);
-        }
-        assert_eq!(r.closed_sessions_len(), MAX_CLOSED_SESSIONS);
-        let kept = r.closed_sessions_snapshot();
-        assert_eq!(kept.len(), MAX_CLOSED_SESSIONS);
-        assert!(!kept.contains(&1), "the oldest id was evicted");
-        assert!(kept.contains(&(MAX_CLOSED_SESSIONS as u32 + 1)));
-        assert!(
-            !r.take_session_closed(1),
-            "the evicted id is not consumable"
-        );
-        assert!(
-            r.take_session_closed(2),
-            "the next-oldest entry is untouched"
-        );
-        assert!(r.take_session_closed(MAX_CLOSED_SESSIONS as u32 + 1));
-    }
+        let sig = Arc::new(CloseSignal::new());
+        let mut up = UplinkFlows::new(sig.clone());
+        up.sync(&r);
+        let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        let b = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
+        b.mark_open();
 
-    #[test]
-    fn forget_session_closed_returns_the_set_to_empty() {
-        let r = ConnRev2::new();
-        r.note_session_closed(1);
-        r.note_session_closed(2);
-        r.note_session_closed(3);
-        // Association exit: its own pending close must not outlive it.
-        r.forget_session_closed(2);
-        assert_eq!(r.closed_sessions_len(), 2);
-        assert!(!r.take_session_closed(2));
-        // Forgetting an absent id (the common exit case) is a no-op.
-        r.forget_session_closed(99);
-        assert_eq!(r.closed_sessions_snapshot(), vec![1, 3]);
-        // The final exit forgets the rest: the per-datagram short-circuit is
-        // back to one relaxed load with no lock.
-        r.forget_session_closed(1);
-        r.forget_session_closed(3);
-        assert_eq!(r.closed_sessions_len(), 0);
-        assert!(!r.take_session_closed(1));
+        // Unraised: the steady sync is a no-op.
+        up.sync(&r);
+        assert_eq!(up.flows.len(), 1);
+        assert_eq!(b.state(), FlowState::Open);
+
+        sig.raise();
+        up.sync(&r);
+        assert!(up.flows.is_empty(), "the bindings are forgotten");
+        assert!(up.last.is_none(), "the memo is invalidated with them");
+        assert_eq!(b.state(), FlowState::Closed);
+        assert!(
+            r.registry.get(b.wire_id).is_none(),
+            "the dead binding is purged from the shared registry"
+        );
+        // Consumed: a second sync has nothing left to reset.
+        up.sync(&r);
+        assert!(up.flows.is_empty());
     }
 
     #[test]
     fn inline_fallback_when_registry_is_full() {
         let r = ConnRev2::new();
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
         // Fill the connection registry by hand (its cap is the shared default).
         // The filler target differs from `addr`: ids are allocated from 1, so
@@ -2437,7 +2285,7 @@ mod tests {
             assert!(r.registry.insert(b).is_ok());
         }
         assert!(!r.registry.has_capacity());
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         for i in 0..64u16 {
             let addr = SocketAddr::from(([198, 51, 100, 9], 4000 + i));
             assert!(
@@ -2481,7 +2329,7 @@ mod tests {
             assert!(r.registry.insert(b).is_ok());
         }
         assert!(!r.registry.has_capacity(), "premise: the table is full");
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let reused = ensure_binding(&r, &mut up, sess, &TargetAddrRef::Ip(addr))
             .expect("a full registry must still reuse an installed server-owned flow");
         assert_eq!(reused.wire_id, server.wire_id);
@@ -2505,7 +2353,7 @@ mod tests {
             r2::R2_REJECT_TABLE_FULL,
             coarse_millis(),
         );
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         assert!(
             ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).is_none(),
             "a rejected target must fall back to INLINE"
@@ -2581,7 +2429,7 @@ mod tests {
     #[test]
     fn rejected_targets_reclaim_session_slots_for_new_targets() {
         let r = ConnRev2::new();
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let now = coarse_millis();
         // Open 64 distinct targets first: that is the state a burst of
         // FLOW_REJECTs lands on.
@@ -2621,23 +2469,24 @@ mod tests {
         assert!(r.registry.get(fresh.wire_id).is_some());
     }
 
-    /// N-1: a server-side purge can arrive without a consumable `SESS_CLOSE`
-    /// note (the client's bounded set may have evicted it). The shared binding
-    /// is marked closed by the purge, so the next uplink must re-open instead
-    /// of sending steady frames for an id the server no longer holds.
+    /// N-1: a server-side purge can arrive without its `SESS_CLOSE` ever
+    /// reaching this association (the DATAGRAM was lost, or the association was
+    /// not live when the dispatcher received it). The shared binding is marked
+    /// closed by the purge, so the next uplink must re-open instead of sending
+    /// steady frames for an id the server no longer holds.
     #[test]
     fn registry_purge_without_a_close_note_is_recovered() {
         let r = ConnRev2::new();
-        let mut up = UplinkFlows::new();
-        up.sync(&r, 1);
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
+        up.sync(&r);
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
         let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         first.mark_open();
-        // The server reaped the session and the note was never recorded (or was
-        // evicted at MAX_CLOSED_SESSIONS): `sync` sees nothing.
+        // The server reaped the session and this association never got the
+        // signal: `sync` sees nothing.
         assert_eq!(r.registry.remove_session(1), 1);
         assert_eq!(first.state(), FlowState::Closed);
-        up.sync(&r, 1);
+        up.sync(&r);
         assert!(
             up.last.is_some(),
             "premise: the memo still holds the dead flow"
@@ -2653,7 +2502,7 @@ mod tests {
     #[test]
     fn closed_binding_is_reopened_with_a_fresh_id() {
         let r = ConnRev2::new();
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
         let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         assert_eq!(first.state(), FlowState::Opening);
@@ -2667,12 +2516,12 @@ mod tests {
 
     #[test]
     fn uplink_sync_resets_on_epoch_change() {
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let r1 = ConnRev2::new();
-        up.sync(&r1, 7);
+        up.sync(&r1);
         assert_eq!(up.epoch, r1.epoch);
         let r2 = ConnRev2::new();
-        up.sync(&r2, 7);
+        up.sync(&r2);
         assert_eq!(up.epoch, r2.epoch);
         assert!(up.flows.is_empty());
     }
@@ -2680,7 +2529,7 @@ mod tests {
     #[test]
     fn uplink_memo_serves_the_steady_target_without_a_second_binding() {
         let r = ConnRev2::new();
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
         let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         // The steady hit: same association, same target, live binding — served
@@ -2716,7 +2565,7 @@ mod tests {
         );
         // An epoch reset drops the memo with the flow table.
         let r2 = ConnRev2::new();
-        up.sync(&r2, 1);
+        up.sync(&r2);
         assert!(up.last.is_none(), "redial invalidates the memo");
     }
 
@@ -2773,7 +2622,7 @@ mod tests {
         let r = ConnRev2::new();
         let now = coarse_millis();
         let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let first = ensure_binding(&r, &mut up, 1, &TargetAddrRef::Ip(addr)).unwrap();
         first.mark_open();
         // A reject closes the flow and arms the target's INLINE window.
@@ -2858,7 +2707,7 @@ mod tests {
     /// either bound (never the oldest item of a burst).
     #[test]
     fn pending_hold_is_bounded_and_drops_the_newest() {
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let addr: SocketAddr = "198.51.100.9:53".parse().unwrap();
         for i in 0..PENDING_MAX_ITEMS {
             let p = [i as u8];
@@ -2876,7 +2725,7 @@ mod tests {
 
         // Byte bound: a second association with large payloads stops at the
         // byte cap with fewer than the item cap.
-        let mut big = UplinkFlows::new();
+        let mut big = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let chunk = vec![0u8; PENDING_MAX_BYTES / 2];
         assert!(big.hold_pending(&TargetAddrRef::Ip(addr), &chunk));
         assert!(big.hold_pending(&TargetAddrRef::Ip(addr), &chunk));
@@ -2889,7 +2738,7 @@ mod tests {
     /// `NO_EGRESS` loss is booked per expired payload.
     #[test]
     fn pending_hold_expires_oldest_first_and_books_each_loss() {
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let addr: SocketAddr = "198.51.100.9:53".parse().unwrap();
         let t0 = mono_millis();
         assert!(up.pending.try_push(&TargetAddrRef::Ip(addr), b"old", t0));

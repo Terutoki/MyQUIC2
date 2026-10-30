@@ -1586,7 +1586,7 @@ async fn client_n_pack_flushes_one_ordered_batch_frame() {
 async fn client_rev2_open_until_ack_then_steady_and_train() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -1691,7 +1691,7 @@ async fn client_rev2_open_until_ack_then_steady_and_train() {
 async fn client_rev2_domain_flow_opens_with_domain_addr() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Domain("example.com".to_string(), 53);
     let bind = UdpBind {
@@ -1766,7 +1766,7 @@ async fn client_rev2_inline_fallback_when_registry_full() {
         let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 1, filler.clone());
         assert!(rev2.registry.insert(b).is_ok());
     }
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -1974,7 +1974,7 @@ async fn rev2_handshake_without_caps_keeps_the_connection_usable() {
         "a lost CAPS must be recovered by another HELLO, not a redial"
     );
     // ... and the connection carries rev2 DATA with no negotiated caps at all.
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
     let bind = UdpBind {
@@ -5360,7 +5360,7 @@ async fn dispatch_rev2_unknown_id_is_dropped() {
 
 /// `CTL` handling: `CAPS` stores the limits, `FLOW_ACK` confirms an uplink
 /// binding, `FLOW_REJECT`/`FLOW_CLOSE` close and forget one, and `SESS_CLOSE`
-/// reaches the association through the bounded notification set.
+/// reaches the association through its per-association close signal.
 #[tokio::test]
 async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
     let rev2 = ConnRev2::new();
@@ -5445,8 +5445,8 @@ async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
     assert_eq!(c.state(), FlowState::Closed);
     assert!(rev2.registry.get(c.wire_id).is_none());
 
-    // SESS_CLOSE: recorded for the association to consume exactly once.
-    assert!(!rev2.take_session_closed(42));
+    // SESS_CLOSE: raised on the association's own hub entry, exactly once.
+    assert!(!assoc.entry.closed.take());
     assert_eq!(
         send(
             &rev2,
@@ -5458,16 +5458,10 @@ async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
         ),
         0
     );
-    assert!(rev2.take_session_closed(42));
-    assert!(!rev2.take_session_closed(42));
-    assert_eq!(
-        rev2.closed_sessions_len(),
-        0,
-        "a consumed close leaves no stale id behind"
-    );
-    // A close for a session this process has no association for is NOT
-    // recorded: nothing could consume it, so it would keep the set non-empty
-    // (per-datagram lock path) and could evict a live association's close.
+    assert!(assoc.entry.closed.take());
+    assert!(!assoc.entry.closed.take(), "a consumed close is not sticky");
+    // A close for a session this process has no association for has nobody to
+    // signal: the dispatcher checks the hub first, so no state is touched.
     assert_eq!(
         send(
             &rev2,
@@ -5479,8 +5473,6 @@ async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
         ),
         0
     );
-    assert!(!rev2.take_session_closed(43));
-    assert_eq!(rev2.closed_sessions_len(), 0);
 }
 
 /// A `SESS_CLOSE` makes the association forget its bindings so the next uplink
@@ -5489,8 +5481,9 @@ async fn dispatch_rev2_ctl_caps_ack_reject_close_sess_close() {
 #[test]
 fn rev2_session_close_makes_the_uplink_reopen() {
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
-    up.sync(&rev2, 7);
+    let sig = Arc::new(CloseSignal::new());
+    let mut up = UplinkFlows::new(sig.clone());
+    up.sync(&rev2);
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let binding = {
         let b = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
@@ -5499,20 +5492,22 @@ fn rev2_session_close_makes_the_uplink_reopen() {
         b
     };
     binding.mark_open();
-    rev2.note_session_closed(7);
-    up.sync(&rev2, 7);
+    sig.raise();
+    up.sync(&rev2);
     assert!(up.flows.is_empty(), "the session's bindings are forgotten");
     assert!(
         rev2.registry.get(binding.wire_id).is_none(),
         "and dropped from the connection registry"
     );
-    // A different session is unaffected.
-    rev2.note_session_closed(8);
-    up.sync(&rev2, 7);
-    assert!(
-        rev2.take_session_closed(8),
-        "the other session's flag is kept"
-    );
+    // The flag was consumed: a fresh binding opened after the reset must
+    // survive the next sync (a sticky flag would reset it again and reopen on
+    // every datagram).
+    let fresh = FlowBinding::new_shared(r2::make_wire_id(2, false).unwrap(), 7, addr);
+    assert!(rev2.registry.insert(fresh.clone()).is_ok());
+    assert!(up.flows.insert(fresh.clone()));
+    up.sync(&rev2);
+    assert_eq!(up.flows.len(), 1, "the close was consumed exactly once");
+    assert!(rev2.registry.get(fresh.wire_id).is_some());
 }
 
 /// The egress cache publishes a rev2 generation as soon as its state exists,
@@ -5563,7 +5558,7 @@ async fn queued_datagrams_flush_in_order_on_a_new_generation() {
     let pool = ConnPool::new(1, Vec::new(), true, true, 1);
     let egress = SharedEgress::default();
     let mut bind: Option<UdpBind> = None;
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
 
@@ -5672,7 +5667,7 @@ async fn queue_until_publish_is_bounded_and_books_the_newest_drop() {
     // Item bound: hold exactly PENDING_MAX_ITEMS one-byte payloads, then the
     // next one is dropped (the oldest stay).
     let mut bind: Option<UdpBind> = None;
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     for _ in 0..PENDING_MAX_ITEMS {
         send_payload_uplink(
@@ -5721,7 +5716,7 @@ async fn queue_until_publish_is_bounded_and_books_the_newest_drop() {
     // Byte bound: 8 KiB payloads fill PENDING_MAX_BYTES with fewer items, and
     // the ninth is refused although the item bound is far from reached.
     let mut bind2: Option<UdpBind> = None;
-    let mut up2 = UplinkFlows::new();
+    let mut up2 = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag2 = R2Fragmenter::new();
     let big = vec![0u8; PENDING_MAX_BYTES / 8];
     for _ in 0..8 {
@@ -5761,7 +5756,7 @@ async fn queue_until_publish_is_bounded_and_books_the_newest_drop() {
 /// is worse than a lost one).
 #[test]
 fn expired_held_datagrams_are_dropped_and_accounted() {
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
     let now = mono_millis();
     assert!(up.hold_pending_at(&target.as_ref(), b"old", now));
@@ -6047,7 +6042,7 @@ async fn recv_rev2_fragments(
 async fn client_rev2_large_payload_fragments_open_then_steady() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -6119,7 +6114,7 @@ async fn client_rev2_large_payload_fragments_open_then_steady() {
 async fn client_rev2_large_payload_fits_one_data_frame() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -6198,7 +6193,7 @@ async fn client_rev2_large_inline_fragments() {
         let b = FlowBinding::new_shared(r2::make_wire_id(i, false).unwrap(), 2, filler.clone());
         assert!(rev2.registry.insert(b).is_ok());
     }
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -6244,7 +6239,7 @@ async fn client_rev2_caps_frame_cap_forces_fragments() {
         ..r2::Caps::default()
     });
     assert!(rev2.is_ready());
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -6256,7 +6251,7 @@ async fn client_rev2_caps_frame_cap_forces_fragments() {
     let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
     binding.mark_open();
     assert!(rev2.registry.insert(binding.clone()).is_ok());
-    up.sync(&rev2, 7);
+    up.sync(&rev2);
     assert!(up.flows.insert(binding));
     let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
     let conn_limit = client_conn.max_datagram_size().unwrap();
@@ -6302,12 +6297,12 @@ async fn client_rev2_large_after_queued_small_keeps_order() {
         class: EgressClass::Interactive,
         index: 0,
     };
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
     binding.mark_open();
     assert!(rev2.registry.insert(binding.clone()).is_ok());
-    up.sync(&rev2, 7);
+    up.sync(&rev2);
     assert!(up.flows.insert(binding.clone()));
     let limit = 400usize;
 
@@ -6368,7 +6363,7 @@ async fn client_rev2_large_after_queued_small_keeps_order() {
 async fn client_rev2_unencodable_addr_is_too_large() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let bind = UdpBind {
         class: EgressClass::Interactive,
@@ -6565,8 +6560,8 @@ async fn rev2_stager_packs_two_associations_into_one_dict_train() {
     };
     let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
-    let mut up_a = UplinkFlows::new();
-    let mut up_b = UplinkFlows::new();
+    let mut up_a = UplinkFlows::new(Arc::new(CloseSignal::new()));
+    let mut up_b = UplinkFlows::new(Arc::new(CloseSignal::new()));
 
     // Open both flows (one standalone OPEN each) and ack them, exactly like two
     // associations whose first datagrams opened a flow.
@@ -6679,8 +6674,8 @@ async fn rev2_stager_preserves_per_session_order_across_drains() {
     };
     let a = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let b = TargetAddr::Ip("203.0.113.7:5353".parse().unwrap());
-    let mut up_a = UplinkFlows::new();
-    let mut up_b = UplinkFlows::new();
+    let mut up_a = UplinkFlows::new(Arc::new(CloseSignal::new()));
+    let mut up_b = UplinkFlows::new(Arc::new(CloseSignal::new()));
     // Open and ack both flows deterministically.
     for (sess, target, up) in [(1u32, &a, &mut up_a), (2u32, &b, &mut up_b)] {
         assert!(
@@ -6875,7 +6870,7 @@ async fn rev2_stage_queue_full_accounts_buffer_full() {
     // One byte of capacity: no payload can ever be queued.
     let rev2 = ConnRev2::with_stager_capacity(8, 1);
     rev2.on_caps(r2::Caps::default());
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
     let bind = UdpBind {
@@ -6913,7 +6908,7 @@ async fn rev2_stage_queue_full_accounts_buffer_full() {
 async fn rev2_stage_drain_propagates_connection_lost() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let rev2 = rev2_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let limit = client_conn.max_datagram_size().unwrap();
     let addr = TargetAddr::Ip("198.51.100.9:4242".parse().unwrap());
@@ -6925,7 +6920,7 @@ async fn rev2_stage_drain_propagates_connection_lost() {
     let binding = FlowBinding::new_shared(r2::make_wire_id(1, false).unwrap(), 7, addr.clone());
     binding.mark_open();
     assert!(rev2.registry.insert(binding.clone()).is_ok());
-    up.sync(&rev2, 7);
+    up.sync(&rev2);
     assert!(up.flows.insert(binding.clone()));
     assert!(
         rev2.push_stage(R2StageItem {
@@ -6987,8 +6982,8 @@ async fn rev2_stager_resets_with_the_connection_generation() {
     // A fresh generation's stager is empty, and an association's flow table is
     // reset by the epoch check, so the old item can never be sent with new ids.
     assert_eq!(new.stage_len(), 0);
-    let mut up = UplinkFlows::new();
-    up.sync(&new, 1);
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
+    up.sync(&new);
     assert!(up.flows.is_empty());
 }
 
@@ -7074,7 +7069,7 @@ async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
     // Uplink: the app replies to that source on a real connection; the frame
     // must carry the server-owned id (owner bit 1), not a fresh client id.
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     let bind = UdpBind {
         class: EgressClass::Interactive,
@@ -7202,7 +7197,7 @@ async fn rev2_sess_close_purges_registry_entries() {
         rev2.registry.get(other_session.wire_id).is_some(),
         "another session's flows are untouched"
     );
-    assert!(rev2.take_session_closed(7));
+    assert!(assoc.entry.closed.take());
     // `remove_session` detaches the bindings from the registry; the
     // association's own `sync` marks the ones it still holds closed when it
     // consumes the `SESS_CLOSE` flag, so no tombstone is needed here.
@@ -7335,9 +7330,8 @@ async fn sess_close_cleanup_reaches_the_slot_without_a_published_handle() {
     server_conn.close(0u32.into(), b"done");
 }
 
-/// LOGIC-8/LOGIC-2: the exit cleanup is generation-gated and forgets a pending
-/// close on every reachable generation. A newer generation's fresh tables must
-/// never be touched by the old association's exit.
+/// LOGIC-8: the exit cleanup is generation-gated: a newer generation's fresh
+/// tables must never be touched by the old association's exit.
 #[test]
 fn sess_close_cleanup_never_touches_a_newer_generation() {
     let pool = ConnPool::new(1, Vec::new(), true, true, 1);
@@ -7365,11 +7359,6 @@ fn sess_close_cleanup_never_touches_a_newer_generation() {
         })
         .is_ok()
     );
-    // A close was recorded on the new generation's dispatcher while the
-    // association was still live; its exit must release that note too.
-    new.note_session_closed(7);
-    assert_eq!(new.closed_sessions_len(), 1);
-
     // The old association exits: its epoch no longer matches the slot's.
     send_sess_close(&egress, &pool, Some(bind), 7, old.epoch);
 
@@ -7382,26 +7371,6 @@ fn sess_close_cleanup_never_touches_a_newer_generation() {
         1,
         "nor its staged payloads (they belong to other sessions)"
     );
-    assert_eq!(
-        new.closed_sessions_len(),
-        0,
-        "the exit still forgets the pending close recorded for its session"
-    );
-}
-
-/// LOGIC-2: an association that never sent a datagram has no `UdpBind`, but its
-/// pending close note must still be released at exit (otherwise the bounded set
-/// never drains and every uplink datagram pays the lock).
-#[test]
-fn sess_close_without_bind_still_forgets_pending_close() {
-    let pool = ConnPool::new(1, Vec::new(), true, true, 1);
-    let egress = SharedEgress::default();
-    let state = rev2_state();
-    pool.slot(0).set_rev2(state.clone());
-    state.note_session_closed(7);
-    assert_eq!(state.closed_sessions_len(), 1);
-    send_sess_close(&egress, &pool, None, 7, 0);
-    assert_eq!(state.closed_sessions_len(), 0);
 }
 
 /// LOGIC-3: an `OPEN|SRC` binding frame (server-owned install or a rebind of a
@@ -7618,10 +7587,10 @@ async fn dispatch_rev2_install_failure_sends_flow_reject() {
     server_conn.close(0u32.into(), b"done");
 }
 
-/// LOGIC-2: the dispatcher records a `SESS_CLOSE` only for a live association,
-/// so duplicate/forged closes cannot accumulate stale ids in the bounded set.
+/// The dispatcher raises a `SESS_CLOSE` on a live association only; a close for
+/// an exiting or unknown association reaches no consumer.
 #[tokio::test]
-async fn dispatch_rev2_sess_close_for_a_dead_association_is_not_recorded() {
+async fn dispatch_rev2_sess_close_for_a_dead_association_is_not_signalled() {
     let assoc = test_assoc().await;
     let hub = UdpHub::new();
     hub.publish(7, assoc.entry.clone());
@@ -7633,22 +7602,21 @@ async fn dispatch_rev2_sess_close_for_a_dead_association_is_not_recorded() {
         let frame = r2::encode_ctl(&r2::Ctl::SessClose { sess, reason: 0 });
         dispatch_r2(rev2, cache, &hub, &mut reasm, None, frame, &mut out)
     };
-    // Live association: recorded, consumed once.
+    // Live association: raised, consumed once.
     assert_eq!(send(&rev2, &mut cache, 7), 0);
-    assert_eq!(rev2.closed_sessions_len(), 1);
-    assert!(rev2.take_session_closed(7));
-    assert_eq!(rev2.closed_sessions_len(), 0);
+    assert!(assoc.entry.closed.take());
+    assert!(!assoc.entry.closed.take());
     // Exiting association (hub entry still served but no longer alive): not
-    // recorded, so a peer cannot fill the set with ids nobody will consume.
+    // raised, so a peer cannot arm a signal nobody will consume.
     assoc
         .entry
         .alive
         .store(false, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(send(&rev2, &mut cache, 7), 0);
-    assert_eq!(rev2.closed_sessions_len(), 0);
-    // Unknown session: same verdict.
+    assert!(!assoc.entry.closed.take());
+    // Unknown session: same verdict (no entry, no signal).
     assert_eq!(send(&rev2, &mut cache, 99), 0);
-    assert_eq!(rev2.closed_sessions_len(), 0);
+    assert!(!assoc.entry.closed.take());
 }
 
 /// LOGIC-11: every SOCKS5 UDP framing reject books a drop (notably `FRAG != 0`,
@@ -8602,7 +8570,7 @@ async fn rev3_handshake_is_a_noop_and_never_sends_hello() {
 async fn rev3_context_frames_then_steady_without_any_ack() {
     let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
     let state = rev3_state();
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new_with_wire(Wire::Rev3);
     let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
     let bind = UdpBind {
@@ -8731,7 +8699,7 @@ async fn rev3_id_exhaustion_falls_back_to_inline_without_burning_ids() {
     }
     let allocated = state.ids.allocated();
     assert_eq!(allocated, wire::MAX_R3_LOCAL_ID);
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new_with_wire(Wire::Rev3);
     let addr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
     let bind = UdpBind {
@@ -8792,7 +8760,7 @@ async fn rev3_server_owned_flow_reuses_steady_without_context() {
     binding.set_reply_src(addr.socket_addr().unwrap());
     binding.mark_open();
     assert!(state.registry.insert(binding.clone()).is_ok());
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new_with_wire(Wire::Rev3);
     let bind = UdpBind {
         class: EgressClass::Interactive,
@@ -8958,7 +8926,7 @@ async fn rev3_control_messages_match_the_rev2_actions() {
     );
     assert!(state.registry.get(id_b).is_none());
     assert_eq!(b.state(), FlowState::Closed);
-    assert!(state.take_session_closed(sess));
+    assert!(assoc.entry.closed.take());
 
     // FLOW_CLOSE: remove one flow.
     let id_c = r2::make_wire_id(3, false).unwrap();
@@ -9191,7 +9159,7 @@ async fn rev3_full_duplex_round_trip_through_egress_and_dispatcher() {
     // Uplink through the real egress path (single-flight acquire + memo store).
     let target = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
     let mut bind: Option<UdpBind> = None;
-    let mut up = UplinkFlows::new();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
     let mut frag = R2Fragmenter::new();
     send_payload_uplink(
         &pool,
@@ -9314,7 +9282,7 @@ async fn held_datagram_expiry_then_fresh_generation_delivers_the_next_payload() 
         // One persistent "peer": its uplink state and binding survive the
         // generation change, exactly like a udp_forward peer session.
         let mut bind: Option<UdpBind> = None;
-        let mut up = UplinkFlows::new();
+        let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
         let mut frag = R2Fragmenter::new_with_wire(wire);
 
         // No egress published: the payload is held, not dropped.

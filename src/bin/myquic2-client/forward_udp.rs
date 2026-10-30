@@ -297,6 +297,7 @@ impl UdpForwarder {
         // that was just sent, but the dispatcher resolves the session through
         // the hub, so publishing first removes the window entirely.
         self.hub.publish(sess, entry.clone());
+        let closed = entry.closed.clone();
         self.peers.insert(
             src,
             PeerSession {
@@ -304,7 +305,7 @@ impl UdpForwarder {
                 hub: self.hub.clone(),
                 _fwd_permit: fwd_permit,
                 entry,
-                uplink: UplinkFlows::new(),
+                uplink: UplinkFlows::new(closed),
                 frag: R2Fragmenter::new(),
                 bind: None,
             },

@@ -1089,16 +1089,16 @@ pub(crate) fn handle_r2_ctl_at(
             // closed session must go: a receive-only (server-owned) binding is
             // otherwise never removed by the association's own uplink sync.
             let _ = rev2.registry.remove_session(sess);
-            // Record the notification only for a session with a live
-            // association. A close for an unknown/exiting session has no
-            // consumer: it would occupy the bounded set for the connection's
-            // life (keeping the per-datagram `closed_len` short-circuit open)
-            // and, once the cap is reached, evict a live association's close —
-            // i.e. blackhole it. A peer can therefore not accumulate stale ids
-            // here no matter how many `SESS_CLOSE` frames it sends.
-            let live = hub.entry(sess).is_some_and(|e| e.is_alive());
-            if live {
-                rev2.note_session_closed(sess);
+            // Tell the association itself, if it is still live: the next
+            // uplink sync marks its bindings closed and re-`OPEN`s them. The
+            // signal is per association, so a close for an idle or exiting
+            // session cannot make any *other* association's payloads take a
+            // shared lock (unlike the old connection-level close queue, whose
+            // every-datagram write lock was LOGIC-2).
+            if let Some(entry) = hub.entry(sess)
+                && entry.is_alive()
+            {
+                entry.closed.raise();
             }
             counters::sess_close_rx();
         }
@@ -1169,9 +1169,13 @@ pub(crate) fn handle_r3_ctl(
             // Both client-owned and accepted server-owned bindings of the
             // reaped session must go (see the rev2 `SESS_CLOSE` arm).
             let _ = rev2.registry.remove_session(sess);
-            let live = hub.entry(sess).is_some_and(|e| e.is_alive());
-            if live {
-                rev2.note_session_closed(sess);
+            // Per-association signal, consumed by its own uplink sync; see the
+            // rev2 `SESS_CLOSE` arm for why this is not a connection-level
+            // queue any more (LOGIC-2).
+            if let Some(entry) = hub.entry(sess)
+                && entry.is_alive()
+            {
+                entry.closed.raise();
             }
             counters::sess_close_rx();
         }

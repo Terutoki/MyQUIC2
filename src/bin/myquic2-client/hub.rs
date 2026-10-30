@@ -64,6 +64,17 @@ pub(crate) struct AssocEntry {
     pub(crate) app: ArcSwapOption<SocketAddr>,
     /// Cleared by the association as it exits.
     pub(crate) alive: std::sync::atomic::AtomicBool,
+    /// Set by a dispatcher that receives a `SESS_CLOSE` for this association's
+    /// session; consumed by the association's own uplink [`sync`] (see
+    /// [`CloseSignal`]).
+    ///
+    /// The `Arc` lets the association's uplink state hold the signal without
+    /// borrowing the entry (the entry outlives it, but the uplink is moved
+    /// between tasks in tests); it is one allocation per association, i.e. per
+    /// SOCKS UDP control connection, never per datagram.
+    ///
+    /// [`sync`]: crate::rev2::UplinkFlows::sync
+    pub(crate) closed: Arc<CloseSignal>,
     /// Inbound activity, as one bit: set (relaxed) by whichever dispatcher
     /// writes a reply to this association, consumed by the association's own
     /// idle tick.
@@ -141,6 +152,54 @@ pub(crate) const ASSOC_IDLE_MS: u64 = 180_000;
 /// store on every datagram.
 pub(crate) const ASSOC_TOUCH_INTERVAL_MS: u64 = 1000;
 
+/// Per-association "the server closed this association's session" signal.
+///
+/// A rev2 `CTL SESS_CLOSE` DATAGRAM and a rev3 `SESS_CLOSE` control message mean
+/// the same thing to the association: its server-side session is gone, so its
+/// bindings must be forgotten and the next payload must re-`OPEN` instead of
+/// naming ids the server no longer holds. The signal carries that one bit from
+/// whichever dispatcher received the frame to the association's own uplink,
+/// without a connection-wide lock.
+///
+/// This replaces the former `ConnRev2::closed_sessions`, a bounded
+/// connection-level `RwLock<VecDeque<u32>>` probed by every uplink datagram.
+/// A close that no association consumed — a reaped-but-idle association, which
+/// the server's 60 s sweep produces in thousands — kept that lock's slow path
+/// armed for the whole connection, so every payload of every *other*
+/// association took the same exclusive write lock. On a J1900 that convoy
+/// saturated a core (commit 3178c86). A per-association flag cannot be armed by
+/// anyone else's close, so the steady path is one relaxed load.
+pub(crate) struct CloseSignal(std::sync::atomic::AtomicBool);
+
+impl CloseSignal {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Raise the signal. Idempotent and wait-free: called from the dispatcher's
+    /// single per-connection task.
+    #[inline]
+    pub(crate) fn raise(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Consume the signal, returning whether it was raised.
+    ///
+    /// The unraised steady state is one relaxed load. The swap's acquire
+    /// orders the dispatcher's earlier `SESS_CLOSE` cleanup (registry and
+    /// stager purge, which the dispatcher already performed) before the
+    /// association's own binding reset; a duplicate raise racing the swap is
+    /// harmless — both mean "this session is gone", and the reset is one
+    /// idempotent action.
+    #[inline]
+    pub(crate) fn take(&self) -> bool {
+        if !self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.0.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
 impl AssocEntry {
     pub(crate) fn new(relay: Arc<tokio::net::UdpSocket>) -> Self {
         Self::with_reply_mode(relay, false)
@@ -164,6 +223,7 @@ impl AssocEntry {
             confirmed: std::sync::atomic::AtomicU64::new(0),
             app: ArcSwapOption::const_empty(),
             alive: std::sync::atomic::AtomicBool::new(true),
+            closed: Arc::new(CloseSignal::new()),
             replied: std::sync::atomic::AtomicBool::new(false),
             last: std::sync::atomic::AtomicU64::new(mono_millis()),
             raw_reply,

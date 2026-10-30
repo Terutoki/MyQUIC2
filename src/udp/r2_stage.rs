@@ -491,10 +491,11 @@ impl R2Stager {
     /// This runs under the caller's stager lock, which is the point of the
     /// split: the burst drains used to hold that lock across encode **and**
     /// the whole series of `try_send_datagram` calls, so every association's
-    /// `push` waited behind one slow send. Packing is pointer moves and
-    /// bookkeeping; [`send_packed_frames`] then writes to the wire without
-    /// the lock, and [`Self::requeue_unsent`] returns anything left over
-    /// behind a fresh (non-blocking-on-send) lock hold.
+    /// `push` waited behind one slow send. Packing still encodes and copies
+    /// each payload while the lock is held (the encoder allocates the DATAGRAM
+    /// body), but [`send_packed_frames`] then writes to the wire without the
+    /// lock, and [`Self::requeue_unsent`] returns anything left over behind a
+    /// fresh (non-blocking-on-send) lock hold.
     ///
     /// The batch bound is what keeps a blocked send buffer cheap: the caller
     /// only re-encodes a few frames before the first `Blocked` verdict, not

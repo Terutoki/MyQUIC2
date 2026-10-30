@@ -689,7 +689,7 @@ pub(crate) async fn udp_associate_inner(
     // `uplink` also owns the per-target `SessionFlows` table and the connection
     // epoch: after a redial the bindings are forgotten and re-opened on the new
     // wire (see `UplinkFlows::sync`).
-    let mut uplink = UplinkFlows::new();
+    let mut uplink = UplinkFlows::new(entry.closed.clone());
     'assoc: loop {
         tokio::select! {
             r = relay.recv_from(&mut buf) => {
