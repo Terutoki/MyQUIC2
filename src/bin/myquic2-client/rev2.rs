@@ -77,6 +77,15 @@ pub(crate) const HELLO_FAST_WINDOW: Duration = Duration::from_secs(2);
 /// (`CTL_IN_QUEUE`), so both ends of the control plane are sized alike.
 pub(crate) const CTL_QUEUE: usize = 64;
 
+/// How long the connection's stager-retry task waits before retrying a drain
+/// that left payloads queued behind a full DATAGRAM send buffer.
+///
+/// This is the client-side tail bound for request/response traffic: a DNS
+/// query or a game tick whose frame found the shared send buffer full must not
+/// wait for the next uplink packet. Two milliseconds is below a DNS retry or a
+/// game tick, and the timer only runs while the stager is non-empty.
+const STAGE_RETRY_DELAY: Duration = Duration::from_millis(2);
+
 /// How long a target the server rejected (`CTL FLOW_REJECT`) is sent `INLINE`
 /// before the uplink retries an `OPEN`.
 ///
@@ -193,6 +202,11 @@ pub(crate) struct ConnRev2 {
     /// may discard wholesale on a rejected resumption, so it must not spend the
     /// no-ACK binding-context budget.
     handshake_done: std::sync::atomic::AtomicBool,
+    /// Wakes the connection's stager-retry task when a drain leaves payloads
+    /// queued (the DATAGRAM send buffer was full). One task per connection
+    /// retries the shared stager, so a one-shot request/response flow does not
+    /// have to wait for the owner association's next uplink packet.
+    stage_retry: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for ConnRev2 {
@@ -271,6 +285,7 @@ impl ConnRev2 {
             ctl_tx: parking_lot::Mutex::new(None),
             ctx_repair_rate: parking_lot::Mutex::new(ctl_stream::CtlRate::default_budget()),
             handshake_done: std::sync::atomic::AtomicBool::new(false),
+            stage_retry: tokio::sync::Notify::new(),
         })
     }
 
@@ -470,11 +485,54 @@ impl ConnRev2 {
     /// self-describing and FRAG reassembly is keyed by index — and it is the
     /// price of keeping quinn sends outside the stager lock.
     pub(crate) fn drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainOutcome {
-        drain_staged(conn, &self.stager, limit, |at| {
+        let outcome = drain_staged(conn, &self.stager, limit, |at| {
             counters::stage_full();
             let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
             warn_stage_full(n, at);
-        })
+        });
+        // The drain is the only writer; once it releases the lock, a non-empty
+        // queue means the send buffer is full or the budget ran out. Wake the
+        // per-connection retry task instead of waiting for the next app packet.
+        if !self.stager.lock().is_empty() {
+            self.stage_retry.notify_one();
+        }
+        outcome
+    }
+
+    /// Spawn the connection's stager-retry task.
+    ///
+    /// Association burst-ends call [`Self::drain_stage`] on their own path; if
+    /// that drain leaves payloads queued, this task retries every
+    /// [`STAGE_RETRY_DELAY`] until the queue is empty. It is per connection
+    /// (not per association) because the stager is shared, and it exits with
+    /// `conn`. Without it, a one-shot DNS query that hit a full send buffer had
+    /// to wait for the next uplink packet, which for a request/response flow
+    /// may never come.
+    pub(crate) fn spawn_stage_retry(self: &Arc<Self>, conn: quinn::Connection) {
+        let rev2 = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = conn.closed() => return,
+                    _ = rev2.stage_retry.notified() => {}
+                }
+                loop {
+                    tokio::select! {
+                        _ = conn.closed() => return,
+                        _ = tokio::time::sleep(STAGE_RETRY_DELAY) => {}
+                    }
+                    let Some(limit) = conn.max_datagram_size() else {
+                        return;
+                    };
+                    let limit = rev2.frame_limit(limit);
+                    counters::stage_retry();
+                    let _ = rev2.drain_stage(&conn, limit);
+                    if rev2.stage_len() == 0 {
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Number of payloads currently queued on this connection.
@@ -2104,6 +2162,9 @@ pub(crate) mod counters {
         stage_drop,
         /// Pushes that found the queue full and had to drain before retrying.
         stage_full,
+        /// Stager drains retried by the per-connection timer after a drain
+        /// left payloads queued behind a full DATAGRAM send buffer.
+        stage_retry,
         /// Payloads sent as rev2 `FRAG` (fragmented) frames.
         frag_tx,
         /// Rev2 `FRAG` frames decoded from the downlink.
@@ -2218,6 +2279,7 @@ pub(crate) mod counters {
         inline_tx,
         stage_drop,
         stage_full,
+        stage_retry,
         flow_open,
         server_flow_accept,
         server_flow_reuse,
@@ -2244,7 +2306,7 @@ pub(crate) mod counters {
                 f,
                 "hello={} handshake={}/{}/{} caps={} frames_rx={} ack={}/{} reject={}/{} \
                  close={} sess_close={}/{} flow_open={} srv={}/{} open={} steady={} \
-                 inline={}/{} stage={}p/{}d/{}f/{}i/{}x/{}full hold={}q/{}f/{}full/{}stale \
+                 inline={}/{} stage={}p/{}d/{}f/{}i/{}x/{}full/{}retry hold={}q/{}f/{}full/{}stale \
                  frag={}/{}/{} unknown_id={} drops={} resets={}/{} ctl={}/{}/{} \
                  r3ctl={}/{} nctx={}/{} aclose={} qfull={}",
                 self.hello_tx,
@@ -2273,6 +2335,7 @@ pub(crate) mod counters {
                 self.stage_items,
                 self.stage_drop,
                 self.stage_full,
+                self.stage_retry,
                 self.egress_queued,
                 self.egress_flushed,
                 self.egress_hold_full,

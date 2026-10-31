@@ -467,23 +467,32 @@ impl FastTable {
     /// linear scan over ~405 tags, so caching the last hit turns that scan into
     /// one scan per frame. The tag is re-checked so an eviction between items
     /// (or a stale cache after `insert`) cannot turn into a wrong slot.
+    ///
+    /// Counters are **not** recorded here: a tag hit can still fail the live
+    /// check or the socket upgrade in [`try_stage`], and reporting it as a hit
+    /// made `fast_table` an upper bound. [`Self::note_path`] records the final
+    /// result at the `try_stage` boundary instead.
     #[inline]
     pub(crate) fn probe_cached(&mut self, s: u32) -> Option<usize> {
         if let Some((cached_s, idx)) = self.probe_cache
             && cached_s == s
             && self.tags[idx] == s
         {
-            self.note(true);
             return Some(idx);
         }
         let idx = self.probe(s);
         self.probe_cache = idx.map(|i| (s, i));
-        self.note(idx.is_some());
         idx
     }
 
+    /// Record the final result of one `try_stage` attempt.
+    ///
+    /// `true` only when the payload was staged (slot found, live, socket
+    /// upgraded); `false` whenever the slow path had to take over. This is the
+    /// hit rate the 60 s `fast_table` line reports; a tag hit that failed the
+    /// live/upgrade checks counts as a miss because that is what it cost.
     #[inline]
-    fn note(&mut self, hit: bool) {
+    pub(crate) fn note_path(&mut self, hit: bool) {
         if hit {
             self.hits += 1;
         } else {
@@ -690,6 +699,24 @@ pub(crate) fn resolve_fast(
 /// way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_stage(
+    fast: &mut FastTable,
+    ss: &SessTable,
+    conn_id: usize,
+    s: u32,
+    dst: SocketAddr,
+    payload: Bytes,
+    allow_private: bool,
+    staged: &mut Vec<StagedSend>,
+) -> Result<(), Bytes> {
+    let result = try_stage_inner(fast, ss, conn_id, s, dst, payload, allow_private, staged);
+    // One counter update per datagram, on the final outcome: a probe hit that
+    // failed the live/upgrade checks is a miss for the fast-path hit rate.
+    fast.note_path(result.is_ok());
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_stage_inner(
     fast: &mut FastTable,
     ss: &SessTable,
     conn_id: usize,

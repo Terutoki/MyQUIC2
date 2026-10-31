@@ -83,6 +83,10 @@ pub(crate) fn spawn_conn_loop(
                     let rev2 = ConnRev2::new_with_wire(wire);
                     slot.set_rev2(rev2.clone());
                     slot.publish(&conn);
+                    // Retry the shared stager when a drain leaves payloads
+                    // behind a full DATAGRAM send buffer; one task per
+                    // connection generation, exits with `conn`.
+                    rev2.spawn_stage_retry(conn.clone());
                     // Establishment is inbound progress: seed the routing
                     // stamp before publishing the live hint, so the first
                     // selections of the new generation never read the previous

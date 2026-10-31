@@ -576,11 +576,11 @@ pub(crate) fn stage_has_backlog(stage: &Arc<parking_lot::Mutex<R2Stager>>) -> bo
 /// the only other trigger to drain is the end of some session's reply burst.
 /// A quiet tail — the last replies of a burst, with no further traffic on any
 /// session — therefore used to sit in the stager until connection close and was
-/// then dropped (accounted only by the stager's own teardown path). Twenty
+/// then dropped (accounted only by the stager's own teardown path). Five
 /// milliseconds bounds the tail's added latency well inside one app-visible
-/// RTT while costing two wakeups per second and *only* while frames are
-/// queued.
-pub(crate) const STAGE_RETRY_MS: u64 = 20;
+/// RTT — and inside a DNS retry or a game tick — while costing ten wakeups per
+/// second and *only* while frames are queued.
+pub(crate) const STAGE_RETRY_MS: u64 = 5;
 
 /// One session reader's batch of small replies, pushed at its burst boundary.
 ///

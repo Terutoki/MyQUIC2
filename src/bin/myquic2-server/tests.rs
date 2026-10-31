@@ -5641,6 +5641,7 @@ fn fast_table_counts_unsolved_sessions() {
     let before = r2_stats::FAST_MISSES.load(Ordering::Relaxed);
     let mut table = FastTable::new();
     assert_eq!(table.probe_cached(0xDEAD_BEEF), None);
+    table.note_path(false);
     table.flush_stats();
     assert!(
         r2_stats::FAST_MISSES.load(Ordering::Relaxed) > before,
