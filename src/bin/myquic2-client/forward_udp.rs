@@ -305,7 +305,7 @@ impl UdpForwarder {
                 hub: self.hub.clone(),
                 _fwd_permit: fwd_permit,
                 entry,
-                uplink: UplinkFlows::new(closed),
+                uplink: UplinkFlows::new_unbatched(closed),
                 frag: R2Fragmenter::new(),
                 bind: None,
             },
@@ -597,7 +597,7 @@ impl UdpForwarder {
                     // Connection-scoped dashboard: all sessions' small payloads
                     // staged on these bindings go out together.
                     for b in touched.drain(..) {
-                        drain_assoc_stage(&self.egress, &self.pool, b);
+                        drain_assoc_stage(&self.egress, &self.pool, b, None);
                     }
                     record_drain_batch(drained);
                 }

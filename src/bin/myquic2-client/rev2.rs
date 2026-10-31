@@ -432,13 +432,28 @@ impl ConnRev2 {
 
     /// Queue one ready-to-send small payload for this connection.
     ///
-    /// Returns the post-push queue length so `stage_or_count` can fire the
-    /// opportunistic drain on the same lock hold (this used to be a second
-    /// `MutexGuard` acquisition per staged payload just to read the length).
-    /// The item comes back when the bounded queue is full; the caller owns
-    /// the drop policy (see [`send_uplink`]).
+    /// Test seam for the single-push shape; the association path stages a
+    /// whole burst through [`Self::push_stage_batch`].
+    #[cfg(test)]
     pub(crate) fn push_stage(&self, item: R2StageItem) -> Result<usize, R2StageItem> {
         self.stager.lock().push(item)
+    }
+
+    /// Queue a whole burst of small payloads with one lock hold.
+    ///
+    /// The association stages every small payload of a receive burst here and
+    /// pushes it only at the burst boundary, so the shared stager mutex is
+    /// acquired once per burst instead of once per datagram. Items that do not
+    /// fit remain in `items` for the caller's drain-and-retry; the accepted
+    /// ones are counted on this side so the burst path does not pay one
+    /// counter call per item.
+    pub(crate) fn push_stage_batch(&self, items: &mut Vec<R2StageItem>) -> Result<usize, usize> {
+        let before = items.len();
+        let result = self.stager.lock().push_batch(items);
+        for _ in 0..before - items.len() {
+            counters::stage_push();
+        }
+        result
     }
 
     /// Two-phase drain of the connection's queued payloads.
@@ -829,6 +844,25 @@ pub(crate) struct UplinkFlows {
     /// Payloads held while no egress connection exists, bounded and flushed in
     /// order once a fresh handle appears (W3: queue-until-publish).
     pending: UplinkPending,
+    /// Whether small payloads are batched until the caller's burst boundary.
+    ///
+    /// SOCKS associations own a receive burst and flush at its end, so they
+    /// batch. The UDP-forward listeners stage per datagram and only retain the
+    /// egress bindings for the burst, not the per-peer uplink handles, so they
+    /// keep the per-datagram push (see [`UplinkFlows::new_unbatched`]).
+    stage_batching: bool,
+    /// Small payloads staged during the current receive burst, not yet handed
+    /// to the connection stager.
+    ///
+    /// The stager is shared by every association of a connection, so pushing
+    /// each payload as it is produced made the same mutex the per-datagram
+    /// serialisation point. The association already processes up to
+    /// `LAST_HOP_DRAIN` datagrams per burst, so it keeps them here and pushes
+    /// them once with [`ConnRev2::push_stage_batch`] before the burst's drain.
+    /// Order is the push order, which is the order [`send_uplink`] produced
+    /// the items, so per-session FIFO is unchanged. The buffer is bounded by
+    /// [`r2::R2_MAX_TRAIN_ITEMS`] (one train's worth) in `stage_or_count`.
+    stage_batch: Vec<R2StageItem>,
 }
 
 impl UplinkFlows {
@@ -836,12 +870,26 @@ impl UplinkFlows {
     /// ([`AssocEntry::closed`]); tests that do not exercise `SESS_CLOSE` pass a
     /// fresh [`CloseSignal`].
     pub(crate) fn new(closed: Arc<CloseSignal>) -> Self {
+        Self::new_with_batching(closed, true)
+    }
+
+    /// [`Self::new`] for a caller that cannot flush at a burst boundary: every
+    /// small payload is pushed to the shared stager immediately, exactly like
+    /// the pre-batch path. The UDP-forward listeners use this because their
+    /// burst loop retains bindings, not per-peer uplinks.
+    pub(crate) fn new_unbatched(closed: Arc<CloseSignal>) -> Self {
+        Self::new_with_batching(closed, false)
+    }
+
+    fn new_with_batching(closed: Arc<CloseSignal>, stage_batching: bool) -> Self {
         Self {
             flows: SessionFlows::new(),
             epoch: 0,
             closed,
             last: None,
             pending: UplinkPending::default(),
+            stage_batching,
+            stage_batch: Vec::new(),
         }
     }
 
@@ -850,13 +898,16 @@ impl UplinkFlows {
     ///
     /// A redial invalidates every binding: ids are connection-scoped and the
     /// new connection starts with an empty registry, so the association must
-    /// re-`OPEN` its targets on the new wire. Payloads still queued on the old
-    /// connection's stager travel with that connection — it accounts them when
-    /// it is torn down; this association never clears another session's items.
-    /// A server `SESS_CLOSE` means the same for this session even on a live
-    /// connection (the server reaped the session; a steady frame would name ids
-    /// it no longer holds), so the bindings are also removed from the registry
-    /// and forgotten.
+    /// re-`OPEN` its targets on the new wire. Payloads already pushed to the
+    /// old connection's stager travel with that connection — it accounts them
+    /// when it is torn down; this association never clears another session's
+    /// items. The association-local batch has not been pushed yet, so it
+    /// cannot travel: it is dropped here and accounted exactly like the old
+    /// stager's teardown would have accounted those payloads. A server
+    /// `SESS_CLOSE` means the same for this session even on a live connection
+    /// (the server reaped the session; a steady frame would name ids it no
+    /// longer holds), so the bindings are also removed from the registry and
+    /// forgotten.
     ///
     /// The close signal is consumed *before* the epoch check: a redial already
     /// invalidates every binding, so a close raised for the previous
@@ -865,6 +916,7 @@ impl UplinkFlows {
     pub(crate) fn sync(&mut self, rev2: &ConnRev2) {
         let closed = self.closed.take();
         if self.epoch != rev2.epoch {
+            self.drop_stage_batch();
             self.flows = SessionFlows::new();
             self.epoch = rev2.epoch;
             self.last = None;
@@ -872,6 +924,7 @@ impl UplinkFlows {
             return;
         }
         if closed {
+            self.drop_stage_batch();
             for b in self.flows.iter() {
                 b.mark_closed();
                 let _ = rev2.registry.remove(b.wire_id);
@@ -879,6 +932,99 @@ impl UplinkFlows {
             self.flows = SessionFlows::new();
             self.last = None;
             counters::session_reset();
+        }
+    }
+
+    /// Push this burst's staged items into the connection stager with one lock
+    /// hold, draining once if it is full.
+    ///
+    /// Returns the same shape [`stage_or_count`] returns: a quiet
+    /// `frames: 1` when the batch was queued, or the drain verdict (and its
+    /// frame count) when a drain was needed and failed. On a still-full queue
+    /// after one drain, the remaining items are dropped with the per-payload
+    /// `BUFFER_FULL` accounting that the single-push path used, and the first
+    /// lost id is reported to the rate-limited warning.
+    pub(crate) fn flush_stage(
+        &mut self,
+        rev2: &ConnRev2,
+        conn: &quinn::Connection,
+        limit: usize,
+    ) -> PayloadSend {
+        if self.stage_batch.is_empty() {
+            return PayloadSend {
+                frames: 0,
+                failed: None,
+            };
+        }
+        // A batch built for an older generation names a session the current
+        // server never opened. This is the same loss the old connection's
+        // stager books on teardown; `sync` normally drops it earlier, but the
+        // epoch can also change between the last send of a burst and its
+        // drain.
+        if self.epoch != rev2.epoch {
+            self.drop_stage_batch();
+            return PayloadSend {
+                frames: 0,
+                failed: None,
+            };
+        }
+        let mut drained = PayloadSend {
+            frames: 0,
+            failed: None,
+        };
+        for attempt in 0..2 {
+            match rev2.push_stage_batch(&mut self.stage_batch) {
+                Ok(queued) => {
+                    // Same opportunistic drain as the single-push path: one
+                    // train's worth of cross-session items is where the
+                    // queue is worth a send even if this burst is over.
+                    if queued >= r2::R2_MAX_TRAIN_ITEMS {
+                        drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
+                    }
+                    return match drained.failed {
+                        None => PayloadSend {
+                            frames: 1,
+                            failed: None,
+                        },
+                        Some(failed) => PayloadSend {
+                            frames: drained.frames,
+                            failed: Some(failed),
+                        },
+                    };
+                }
+                Err(_) if attempt == 0 => {
+                    counters::stage_full();
+                    drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
+                }
+                Err(_) => break,
+            }
+        }
+        let mut total = 0u64;
+        let mut first = None;
+        for item in self.stage_batch.drain(..) {
+            if first.is_none() {
+                first = Some(item.ids());
+            }
+            total = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+        }
+        warn_stage_full(total, first);
+        PayloadSend {
+            frames: drained.frames,
+            failed: drained.failed.or(Some(DatagramSend::Blocked)),
+        }
+    }
+
+    /// Drop a batch that was built for a connection generation (or a session)
+    /// that no longer exists.
+    ///
+    /// These payloads never reached the stager, so nothing else can account
+    /// them; `EGRESS_DEAD` is the same category the stager uses when the
+    /// connection's queue is cleared at teardown.
+    fn drop_stage_batch(&mut self) {
+        let dropped = self.stage_batch.len();
+        self.stage_batch.clear();
+        for _ in 0..dropped {
+            dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
         }
     }
 
@@ -1274,15 +1420,17 @@ pub(crate) fn send_uplink(
     // legacy fragmenter reported exactly this as a `TooLarge` drop and that is
     // still the right accounting (the app chose an impossible target).
     if addr.header().is_err() {
+        let flushed = up.flush_stage(rev2, conn, limit);
         let drained = drain_conn_stage(rev2, conn, limit);
-        return prefer_severe(drained, bad_address_header());
+        return prefer_severe(prefer_severe(flushed, drained), bad_address_header());
     }
     let Some(binding) = ensure_binding(rev2, up, sess, addr) else {
         counters::inline_fallback();
         if payload.len() > BATCH_SMALL_MAX {
+            let flushed = up.flush_stage(rev2, conn, limit);
             let drained = drain_conn_stage(rev2, conn, limit);
             return prefer_severe(
-                drained,
+                prefer_severe(flushed, drained),
                 send_standalone(
                     conn,
                     limit,
@@ -1305,7 +1453,7 @@ pub(crate) fn send_uplink(
             },
             payload: Bytes::copy_from_slice(payload),
         };
-        return stage_or_count(rev2, conn, limit, item);
+        return stage_or_count(rev2, conn, limit, up, item);
     };
     // Binding form or steady frame for this payload. rev2: ACK-gated
     // (`Opening` repeats OPEN). rev3: self-confirming, the first
@@ -1330,13 +1478,15 @@ pub(crate) fn send_uplink(
             kind,
             payload: Bytes::copy_from_slice(payload),
         };
-        return stage_or_count(rev2, conn, limit, item);
+        return stage_or_count(rev2, conn, limit, up, item);
     }
-    // Larger than one staged item: drain the connection queue first so this
-    // standalone payload cannot overtake a session's earlier small payloads.
+    // Larger than one staged item: flush this burst's batch and drain the
+    // connection queue first so this standalone payload cannot overtake a
+    // session's earlier small payloads.
+    let flushed = up.flush_stage(rev2, conn, limit);
     let drained = drain_conn_stage(rev2, conn, limit);
     prefer_severe(
-        drained,
+        prefer_severe(flushed, drained),
         send_standalone(
             conn,
             limit,
@@ -1384,69 +1534,33 @@ pub(crate) fn uses_binding_context(
     }
 }
 
-/// Push one staged item, draining once if the queue is full.
+/// Add one small payload to the association's burst batch.
 ///
-/// Returns a "queued" [`PayloadSend`] (`frames: 1`, no failure) on success so
-/// the shared recovery path stays quiet; a drain verdict reached while making
-/// room is still propagated (a dead connection must invalidate the egress
-/// cache even though this payload was queued for the next drain).
+/// The batch is pushed to the shared stager once per receive burst (or when it
+/// reaches one train's worth), so the per-payload mutex acquisition and the
+/// full-queue retry live in [`UplinkFlows::flush_stage`]. Returns a "queued"
+/// [`PayloadSend`] (`frames: 1`, no failure) so the shared recovery path stays
+/// quiet; a flush verdict reached through the batch bound is propagated as
+/// before.
 fn stage_or_count(
     rev2: &ConnRev2,
     conn: &quinn::Connection,
     limit: usize,
+    up: &mut UplinkFlows,
     item: R2StageItem,
 ) -> PayloadSend {
-    let mut item = item;
-    let mut drained = PayloadSend {
-        frames: 0,
-        failed: None,
-    };
-    for attempt in 0..2 {
-        match rev2.push_stage(item) {
-            Ok(queued) => {
-                counters::stage_push();
-                // Opportunistic drain at one train's worth of queued items:
-                // cross-session items meet here, and the queue stays bounded
-                // even when the pushing association's burst is interrupted.
-                // The push call itself now returns the post-push length, so
-                // this no longer pays a second lock acquisition for the read.
-                if queued >= r2::R2_MAX_TRAIN_ITEMS {
-                    drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
-                }
-                return match drained.failed {
-                    None => PayloadSend {
-                        frames: 1,
-                        failed: None,
-                    },
-                    Some(other) => PayloadSend {
-                        frames: drained.frames,
-                        failed: Some(other),
-                    },
-                };
-            }
-            Err(back) => {
-                item = back;
-                if attempt == 0 {
-                    counters::stage_full();
-                    drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
-                }
-            }
-        }
+    up.stage_batch.push(item);
+    // One train's worth is the bound the single-push path used to fire its
+    // opportunistic drain at. A receive burst is smaller than this, so the
+    // normal flush point is the association's burst boundary; a caller that
+    // stages outside a burst still cannot grow the buffer without bound. A
+    // caller without a burst boundary flushes every item instead.
+    if !up.stage_batching || up.stage_batch.len() >= r2::R2_MAX_TRAIN_ITEMS {
+        return up.flush_stage(rev2, conn, limit);
     }
-    // Still full after a drain: the payload is dropped and accounted with the
-    // same verdict a full DATAGRAM send buffer produces — unless the drain saw
-    // a more severe verdict (a dead connection), which the caller must still
-    // act on.
-    //
-    // The item is still owned here, so the drop can name the association/flow
-    // that lost it: "which app socket?" is the first question an operator asks
-    // of the counter. Doing this after the loop keeps the success path free of
-    // the id extraction.
-    let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-    warn_stage_full(n, Some(item.ids()));
     PayloadSend {
-        frames: drained.frames,
-        failed: drained.failed.or(Some(DatagramSend::Blocked)),
+        frames: 1,
+        failed: None,
     }
 }
 
@@ -1752,11 +1866,22 @@ fn ensure_binding(
 /// available the items stay queued for the next drain: one association must
 /// never clear another session's payloads, and a genuinely dead connection
 /// accounts them at teardown (`ConnRev2::clear_stage` / the stager's `Drop`).
-pub(crate) fn drain_assoc_stage(egress: &SharedEgress, pool: &ConnPool, bind: UdpBind) {
+///
+/// `up` is the caller's burst batch: `Some` pushes it into the stager first
+/// (one lock hold for the whole burst), `None` is the per-datagram forwarder
+/// path, which already pushed everything it staged.
+pub(crate) fn drain_assoc_stage(
+    egress: &SharedEgress,
+    pool: &ConnPool,
+    bind: UdpBind,
+    up: Option<&mut UplinkFlows>,
+) {
+    let mut up = up;
     let now = coarse_millis();
     let drained = egress.with_fresh(bind, now, |c, limit, rev2| {
         let limit = rev2.frame_limit(limit);
-        map_drain_outcome(rev2.drain_stage(c, limit))
+        let flushed = flush_assoc_batch(&mut up, rev2, c, limit);
+        prefer_severe(flushed, map_drain_outcome(rev2.drain_stage(c, limit)))
     });
     if let Some(sent) = drained {
         recover_send_outcome(egress, bind, sent);
@@ -1768,8 +1893,28 @@ pub(crate) fn drain_assoc_stage(egress: &SharedEgress, pool: &ConnPool, bind: Ud
     if let Some(h) = egress.acquire(pool, bind, now) {
         egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
         let limit = h.rev2.frame_limit(h.limit);
-        let sent = map_drain_outcome(h.rev2.drain_stage(&h.conn, limit));
+        let flushed = flush_assoc_batch(&mut up, &h.rev2, &h.conn, limit);
+        let sent = prefer_severe(
+            flushed,
+            map_drain_outcome(h.rev2.drain_stage(&h.conn, limit)),
+        );
         recover_send_outcome(egress, bind, sent);
+    }
+}
+
+/// Push the caller's burst batch before a drain, if this caller batches.
+fn flush_assoc_batch(
+    up: &mut Option<&mut UplinkFlows>,
+    rev2: &ConnRev2,
+    conn: &quinn::Connection,
+    limit: usize,
+) -> PayloadSend {
+    match up {
+        Some(up) => up.flush_stage(rev2, conn, limit),
+        None => PayloadSend {
+            frames: 0,
+            failed: None,
+        },
     }
 }
 

@@ -1108,6 +1108,13 @@ async fn a_memo_eviction_keeps_the_fast_slot_serving() {
         .is_ok(),
         "the session keeps its fast-path hit"
     );
+    // The per-frame cache returns the same slot on repeated probes and a clear
+    // invalidates it instead of pinning a stale index.
+    let idx = fast.probe(s).expect("still armed");
+    assert_eq!(fast.probe_cached(s), Some(idx));
+    assert_eq!(fast.probe_cached(s), Some(idx));
+    assert!(fast.clear(s));
+    assert!(fast.probe_cached(s).is_none());
 }
 
 /// Sparse session ids must all hit, and a table over capacity must evict rather

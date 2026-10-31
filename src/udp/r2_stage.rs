@@ -468,6 +468,38 @@ impl R2Stager {
         Ok(self.queued_items)
     }
 
+    /// Queue one burst of items with a single lock hold, in order.
+    ///
+    /// The per-payload `push` takes the same mutex once per datagram; at the
+    /// fan-in this stager serves (every association of a connection on the
+    /// client, every session reader of a connection on the server) that
+    /// acquisition is the contended part, not the bookkeeping. Callers already
+    /// own a bounded burst (one association's `LAST_HOP_DRAIN`, or one session
+    /// reader's reply burst), so they can hand it over whole.
+    ///
+    /// Items that do not fit stay in `items` in their original order, so the
+    /// caller can drain and retry exactly like the single-push path. Returns
+    /// the post-push queue length; on `Err`, the number of items accepted
+    /// before the queue filled.
+    pub fn push_batch(&mut self, items: &mut Vec<R2StageItem>) -> Result<usize, usize> {
+        if items.is_empty() {
+            return Ok(self.queued_items);
+        }
+        // Consume from the front and keep the caller's allocation: taking the
+        // Vec would leave it at capacity 0, so the next burst would allocate
+        // again just to hand the items over. The shift is over at most one
+        // burst (`LAST_HOP_DRAIN`), and the items are pointer-sized moves.
+        let total = items.len();
+        for accepted in 0..total {
+            let item = items.remove(0);
+            if let Err(back) = self.push(item) {
+                items.insert(0, back);
+                return Err(accepted);
+            }
+        }
+        Ok(self.queued_items)
+    }
+
     /// Drop everything, returning how many items the caller must account for
     /// (connection death / teardown).
     pub fn clear(&mut self) -> usize {
@@ -1268,6 +1300,32 @@ mod tests {
         let mut s = R2Stager::with_capacity(8, 2);
         assert!(s.push(steady(1, 1, b"aa")).is_ok());
         assert!(s.push(steady(1, 2, b"bb")).is_err());
+    }
+
+    #[test]
+    fn push_batch_keeps_the_unaccepted_tail_in_order() {
+        let mut s = R2Stager::with_capacity(2, 64);
+        let mut items = vec![
+            steady(1, 1, b"aa"),
+            steady(1, 2, b"bb"),
+            steady(1, 3, b"cc"),
+        ];
+        assert_eq!(s.push_batch(&mut items), Err(2));
+        assert_eq!(s.len(), 2);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].payload, &b"cc"[..]);
+        let queued: Vec<&[u8]> = s.sessions[&1].iter().map(|i| &i.payload[..]).collect();
+        assert_eq!(queued, vec![&b"aa"[..], &b"bb"[..]]);
+    }
+
+    #[test]
+    fn push_batch_of_a_whole_fitting_burst_is_one_call() {
+        let mut s = R2Stager::with_capacity(4, 256);
+        let mut items = vec![steady(1, 1, b"aa"), steady(2, 2, b"bb")];
+        assert_eq!(s.push_batch(&mut items), Ok(2));
+        assert!(items.is_empty());
+        assert_eq!(s.len(), 2);
+        assert!(s.push_batch(&mut items).is_ok());
     }
 
     #[test]

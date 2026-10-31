@@ -408,6 +408,14 @@ pub(crate) struct FastTable {
     /// Full-name domain pins for the INLINE/legacy `resolve_fast` path.
     /// Bounded and separate from the hot slots so IP targets never grow it.
     pins: [Option<ConnPin>; DOMAIN_PIN_SLOTS],
+    /// Last hit's `(session, slot)`.
+    ///
+    /// Every item of one v3 frame carries the same `sess`, so a frame that
+    /// stages 32 items would otherwise scan the tag array 32 times. Only the
+    /// connection's single ingress poller touches this table, so a plain field
+    /// is enough; `insert`/`clear` invalidate it because they can move the
+    /// session (or reuse its slot).
+    probe_cache: Option<(u32, usize)>,
 }
 
 /// The tag of a free slot. Session 0 is never allocated.
@@ -421,6 +429,7 @@ impl FastTable {
             slots: [const { None }; FAST_SESS_SLOTS],
             pin_tags: [EMPTY_TAG; DOMAIN_PIN_SLOTS],
             pins: [const { None }; DOMAIN_PIN_SLOTS],
+            probe_cache: None,
         }
     }
 
@@ -439,6 +448,25 @@ impl FastTable {
             return None;
         }
         self.tags.iter().position(|&tag| tag == s)
+    }
+
+    /// [`Self::probe`] with a one-entry cache for the current frame's session.
+    ///
+    /// A v3 DATAGRAM can stage many items for the same `sess`; the probe is a
+    /// linear scan over ~405 tags, so caching the last hit turns that scan into
+    /// one scan per frame. The tag is re-checked so an eviction between items
+    /// (or a stale cache after `insert`) cannot turn into a wrong slot.
+    #[inline]
+    pub(crate) fn probe_cached(&mut self, s: u32) -> Option<usize> {
+        if let Some((cached_s, idx)) = self.probe_cache
+            && cached_s == s
+            && self.tags[idx] == s
+        {
+            return Some(idx);
+        }
+        let idx = self.probe(s);
+        self.probe_cache = idx.map(|i| (s, i));
+        idx
     }
 
     /// Where to publish `s`: its own slot, else the first free slot, else the
@@ -485,11 +513,13 @@ impl FastTable {
         self.ages[idx] = entry.last.load(std::sync::atomic::Ordering::Relaxed);
         self.tags[idx] = entry.sess;
         self.slots[idx] = Some(entry);
+        self.probe_cache = None;
     }
 
     /// Drop `s`'s entry. Returns whether there was one.
     pub(crate) fn clear(&mut self, s: u32) -> bool {
         self.pin_clear(s);
+        self.probe_cache = None;
         match self.probe(s) {
             Some(idx) => {
                 self.tags[idx] = EMPTY_TAG;
@@ -624,7 +654,7 @@ pub(crate) fn try_stage(
     allow_private: bool,
     staged: &mut Vec<StagedSend>,
 ) -> Result<(), Bytes> {
-    let Some(idx) = fast.probe(s) else {
+    let Some(idx) = fast.probe_cached(s) else {
         return Err(payload);
     };
     // `probe` only returns populated slots; keep the fallback a miss rather

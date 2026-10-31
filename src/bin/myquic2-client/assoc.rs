@@ -812,12 +812,12 @@ pub(crate) async fn udp_associate_inner(
                     }
                 }
                 // Phase 2: this burst's small payloads sit in the
-                // connection-scoped stager (together with any other
-                // association's items nobody drained yet); drain it now. Large
-                // payloads already drained inside `send_uplink` before going
-                // out directly.
+                // association-local batch; push them into the connection
+                // stager with one lock hold and drain it now. Large payloads
+                // already flushed and drained inside `send_uplink` before
+                // going out directly.
                 if let Some(b) = bind {
-                    drain_assoc_stage(&egress_shared, &pool, b);
+                    drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
                 }
                 record_drain_batch(drained);
             }
@@ -888,7 +888,7 @@ pub(crate) async fn udp_associate_inner(
                         &mut frag,
                         coarse_millis(),
                     );
-                    drain_assoc_stage(&egress_shared, &pool, b);
+                    drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
                 }
             }
         }
@@ -900,7 +900,7 @@ pub(crate) async fn udp_associate_inner(
     // session's payloads; a genuinely dead connection accounts them at
     // teardown.
     if let Some(b) = bind {
-        drain_assoc_stage(&egress_shared, &pool, b);
+        drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
     }
     // W3: whatever is still held for an egress handle that never returned is
     // lost with the association. Book it (`NO_EGRESS`, one per payload) rather

@@ -37,7 +37,15 @@ fn rev3_reasm() -> R2Reassembler {
 /// Phase 2: small payloads queue in the connection-scoped stager and a drain
 /// (the association's burst end) writes them. Tests that call `send_uplink`
 /// directly drive that drain explicitly.
-fn drain_now(rev2: &ConnRev2, conn: &quinn::Connection, limit: usize) {
+fn drain_now(
+    rev2: &ConnRev2,
+    conn: &quinn::Connection,
+    limit: usize,
+    ups: &mut [&mut UplinkFlows],
+) {
+    for up in ups {
+        let _ = up.flush_stage(rev2, conn, limit);
+    }
     let _ = rev2.drain_stage(conn, limit);
 }
 
@@ -1612,7 +1620,7 @@ async fn client_rev2_open_until_ack_then_steady_and_train() {
     // only queues it; the drain (the association's burst end in production)
     // writes it.
     assert!(send(b"one", &mut up, &mut frag).complete());
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the open frame must arrive")
@@ -1630,7 +1638,7 @@ async fn client_rev2_open_until_ack_then_steady_and_train() {
     // (2) Still Opening: the next payload repeats OPEN (a lost open/ack must
     // only delay compression, never delivery).
     assert!(send(b"two", &mut up, &mut frag).complete());
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the repeated open must arrive")
@@ -1645,7 +1653,7 @@ async fn client_rev2_open_until_ack_then_steady_and_train() {
     // with only the wire id, a 2-byte header for ids below 64.
     binding.mark_open();
     assert!(send(b"three", &mut up, &mut frag).complete());
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the steady frame must arrive")
@@ -1666,8 +1674,9 @@ async fn client_rev2_open_until_ack_then_steady_and_train() {
     // several wire ids).
     assert!(send(b"aaaa", &mut up, &mut frag).complete());
     assert!(send(b"bb", &mut up, &mut frag).complete());
+    let _ = up.flush_stage(&rev2, &client_conn, limit);
     assert_eq!(rev2.stage_len(), 2, "both payloads wait for the drain");
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the train frame must arrive")
@@ -1713,7 +1722,7 @@ async fn client_rev2_domain_flow_opens_with_domain_addr() {
         )
         .complete()
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the domain open must arrive")
@@ -1738,7 +1747,7 @@ async fn client_rev2_domain_flow_opens_with_domain_addr() {
         )
         .complete()
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the compressed domain frame must arrive")
@@ -1797,7 +1806,7 @@ async fn client_rev2_inline_fallback_when_registry_full() {
         0,
         "the INLINE fail-safe must not consume a never-reused wire id"
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the inline frame must arrive")
@@ -1996,7 +2005,7 @@ async fn rev2_handshake_without_caps_keeps_the_connection_usable() {
         )
         .complete()
     );
-    drain_now(&state, &client_conn, limit);
+    drain_now(&state, &client_conn, limit, &mut [&mut up]);
     let d = read_next_data(&server_conn).await;
     let f = r2::decode_data(&d).expect("the payload must be rev2 DATA");
     assert_eq!(f.payload, b"no-caps-payload");
@@ -5618,7 +5627,7 @@ async fn queued_datagrams_flush_in_order_on_a_new_generation() {
         counters::since(&before_counters).egress_flushed >= 3,
         "each held payload handed back to the send path is counted"
     );
-    drain_assoc_stage(&egress, &pool, bind.unwrap());
+    drain_assoc_stage(&egress, &pool, bind.unwrap(), Some(&mut up));
 
     // Wire order is exactly the hold order followed by the new payload, and
     // the frames are ordinary rev2 DATA: the flush reuses the normal encoder.
@@ -6579,7 +6588,7 @@ async fn rev2_stager_packs_two_associations_into_one_dict_train() {
         )
         .complete()
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up_a]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("session 1 open")
@@ -6600,7 +6609,7 @@ async fn rev2_stager_packs_two_associations_into_one_dict_train() {
         )
         .complete()
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up_b]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("session 2 open")
@@ -6637,8 +6646,10 @@ async fn rev2_stager_packs_two_associations_into_one_dict_train() {
         )
         .complete()
     );
+    let _ = up_a.flush_stage(&rev2, &client_conn, limit);
+    let _ = up_b.flush_stage(&rev2, &client_conn, limit);
     assert_eq!(rev2.stage_len(), 2, "both payloads wait for one drain");
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up_a, &mut up_b]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the cross-session train must arrive")
@@ -6692,7 +6703,7 @@ async fn rev2_stager_preserves_per_session_order_across_drains() {
             )
             .complete()
         );
-        drain_now(&rev2, &client_conn, limit);
+        drain_now(&rev2, &client_conn, limit, &mut [up]);
         let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
             .await
             .expect("open")
@@ -6734,7 +6745,7 @@ async fn rev2_stager_preserves_per_session_order_across_drains() {
             .complete()
         );
     }
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up_a, &mut up_b]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("train")
@@ -6763,7 +6774,7 @@ async fn rev2_stager_preserves_per_session_order_across_drains() {
         )
         .complete()
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up_a]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("later payload")
@@ -6821,7 +6832,7 @@ async fn rev2_stager_open_and_inline_items_are_standalone() {
     ] {
         assert!(rev2.push_stage(item).is_ok());
     }
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut []);
     let mut frames = Vec::new();
     for _ in 0..3 {
         let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
@@ -6890,8 +6901,12 @@ async fn rev2_stage_queue_full_accounts_buffer_full() {
         &mut up,
         &mut frag,
     );
-    assert_eq!(sent.failed, Some(DatagramSend::Blocked));
-    assert_eq!(sent.frames, 0);
+    // Batching defers the stager verdict to the burst flush (the association
+    // boundary), which is where the real caller learns it.
+    assert!(sent.complete(), "the payload waits in the burst batch");
+    let flushed = up.flush_stage(&rev2, &client_conn, limit);
+    assert_eq!(flushed.failed, Some(DatagramSend::Blocked));
+    assert_eq!(flushed.frames, 0);
     assert_eq!(rev2.stage_len(), 0, "a refused payload is not queued");
     assert!(
         dgram_drops::snapshot().since(&before).buffer_full >= 1,
@@ -7090,7 +7105,7 @@ async fn rev2_server_owned_open_installs_and_reuses_on_uplink() {
         )
         .complete()
     );
-    drain_now(&rev2, &client_conn, limit);
+    drain_now(&rev2, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the app reply must reach the server")
@@ -8140,8 +8155,8 @@ async fn udp_forward_demuxes_peers_and_delivers_raw_replies() {
     let sess_b = fwd.peer_sess(b).expect("peer b session");
     assert_ne!(sess_a, sess_b, "peers must not share a session");
     assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 2);
-    drain_assoc_stage(&egress, &pool, ba);
-    drain_assoc_stage(&egress, &pool, bb);
+    drain_assoc_stage(&egress, &pool, ba, None);
+    drain_assoc_stage(&egress, &pool, bb, None);
 
     // Each session opened with the configured target; payloads are verbatim.
     let mut opens = std::collections::HashMap::new();
@@ -8463,7 +8478,7 @@ async fn udp_forward_idle_sweep_sends_sess_close() {
     let bind_used = fwd.handle_datagram(peer, b"q", t0).expect("a binding");
     let sess = fwd.peer_sess(peer).expect("the peer session");
     // Flush the OPEN first so the next datagram is unambiguous.
-    drain_assoc_stage(&egress, &pool, bind_used);
+    drain_assoc_stage(&egress, &pool, bind_used, None);
     let _open = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
         .await
         .expect("the DATA OPEN must arrive")
@@ -8594,7 +8609,7 @@ async fn rev3_context_frames_then_steady_without_any_ack() {
     let mut id = None;
     for payload in [&b"one"[..], b"two"] {
         assert!(send(payload, &mut up, &mut frag).complete());
-        drain_now(&state, &client_conn, limit);
+        drain_now(&state, &client_conn, limit, &mut [&mut up]);
         let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
             .await
             .expect("a context frame must arrive")
@@ -8623,7 +8638,7 @@ async fn rev3_context_frames_then_steady_without_any_ack() {
     );
     // Third payload: a steady frame with only the packed 2-byte header.
     assert!(send(b"three", &mut up, &mut frag).complete());
-    drain_now(&state, &client_conn, limit);
+    drain_now(&state, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the steady frame must arrive")
@@ -8730,7 +8745,7 @@ async fn rev3_id_exhaustion_falls_back_to_inline_without_burning_ids() {
         allocated,
         "exhaustion must not burn ids"
     );
-    drain_now(&state, &client_conn, limit);
+    drain_now(&state, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the INLINE payload must arrive")
@@ -8781,7 +8796,7 @@ async fn rev3_server_owned_flow_reuses_steady_without_context() {
         )
         .complete()
     );
-    drain_now(&state, &client_conn, limit);
+    drain_now(&state, &client_conn, limit, &mut [&mut up]);
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
         .expect("the steady reuse frame must arrive")
@@ -9174,7 +9189,7 @@ async fn rev3_full_duplex_round_trip_through_egress_and_dispatcher() {
         SessionKind::Socks,
     );
     let bind = bind.expect("the first payload binds the egress class");
-    drain_assoc_stage(&egress, &pool, bind);
+    drain_assoc_stage(&egress, &pool, bind, Some(&mut up));
 
     let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
         .await
@@ -9332,7 +9347,7 @@ async fn held_datagram_expiry_then_fresh_generation_delivers_the_next_payload() 
             0,
             "{wire:?}: fresh generation sends, no hold"
         );
-        drain_assoc_stage(&egress, &pool, bind);
+        drain_assoc_stage(&egress, &pool, bind, Some(&mut up));
         let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
             .await
             .unwrap_or_else(|_| panic!("{wire:?}: post-outage payload was not sent"))
