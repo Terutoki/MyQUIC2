@@ -257,6 +257,7 @@ async fn copy_tcp_quic_inner(
     idle: Duration,
     ack: Option<Duration>,
 ) -> Result<(u64, u64)> {
+    use futures_util::future::FutureExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Liveness stamp shared by both directions, in the coarse millisecond epoch
@@ -316,9 +317,10 @@ async fn copy_tcp_quic_inner(
             let mut total = 0u64;
             let mut stamped = 0u64;
             let mut stamped_dir = 0u64;
+            let mut eof = false;
             loop {
                 reserve_copy_chunk(&mut bufs[cur]);
-                let n = match tr.read_buf(&mut bufs[cur]).await {
+                let mut n = match tr.read_buf(&mut bufs[cur]).await {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
@@ -329,6 +331,31 @@ async fn copy_tcp_quic_inner(
                         ));
                     }
                 };
+                // A request/response or gaming TCP flow often emits several
+                // small writes back-to-back. The first `read_buf` can return
+                // only the first segment, and paying one QUIC stream write (and
+                // one wake of the connection driver) per segment multiplies the
+                // per-packet cost. Poll again without waiting: `now_or_never`
+                // only consumes bytes that are already readable, so this adds
+                // no timer and no latency; it just folds the burst into one
+                // write. Stop at the chunk size to keep the buffer bounded.
+                while n < COPY_CHUNK {
+                    match tr.read_buf(&mut bufs[cur]).now_or_never() {
+                        Some(Ok(0)) => {
+                            eof = true;
+                            break;
+                        }
+                        Some(Ok(k)) => n += k,
+                        Some(Err(e)) => {
+                            let total_copy = total;
+                            release_copy_bufs(&mut bufs);
+                            return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
+                            ));
+                        }
+                        None => break,
+                    }
+                }
                 // Hand the filled buffer to quinn as an owned `Bytes` so a bulk
                 // chunk crosses no memcpy boundary at all (quinn's `write_chunk`
                 // moves it into `unacked_segments`); the remaining allocation is
@@ -363,6 +390,9 @@ async fn copy_tcp_quic_inner(
                 let now = coarse_millis();
                 touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
                 touch_stamp(&c2s_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
+                if eof {
+                    break;
+                }
             }
             send.finish().ok();
             release_copy_bufs(&mut bufs);
