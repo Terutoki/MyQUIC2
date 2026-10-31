@@ -400,8 +400,9 @@ fn udp_socket_dual_impl_addr(
     probe_udp_socket_buffers(&s, buf);
     s.bind(&addr.into())?;
     // Linux-only, best-effort socket tuning (see `linux::tune_udp_socket`):
-    // busy polling when `MYQUIC2_BUSY_POLL` opted in, applied to every UDP
-    // socket this crate creates — QUIC endpoints, relay and session sockets.
+    // busy polling is on by default (50 µs) and `MYQUIC2_BUSY_POLL=0` disables
+    // it, applied to every UDP socket this crate creates — QUIC endpoints,
+    // relay and session sockets.
     linux::tune_udp_socket(&s);
     Ok(s.into())
 }

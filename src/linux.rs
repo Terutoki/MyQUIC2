@@ -9,8 +9,10 @@
 //! - [`busy_poll_us`] (`MYQUIC2_BUSY_POLL=<µs>`): `SO_BUSY_POLL` (plus
 //!   `SO_PREFER_BUSY_POLL` where the kernel has it) on every UDP socket this
 //!   crate creates — QUIC endpoints *and* per-session/relay sockets. Polling
-//!   the NIC budget on a waiting read trades CPU for wakeup latency; off by
-//!   default (a router should not burn cycles speculatively).
+//!   the NIC budget on a waiting read trades CPU for wakeup latency; on by
+//!   default at [`BUSY_POLL_DEFAULT_US`] because the shipped exit nodes carry
+//!   small interactive datagrams, and `MYQUIC2_BUSY_POLL=0` turns it off for
+//!   a router that should not burn cycles speculatively.
 //! - [`tcp_notsent_lowat`] (`MYQUIC2_TCP_NOTSET_LOWAT=<bytes>`):
 //!   `TCP_NOTSENT_LOWAT` on every relay TCP stream, so the kernel's send
 //!   buffer cannot pile up megabytes of unsent bytes ahead of a slow path —
@@ -33,8 +35,9 @@
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 
-/// `MYQUIC2_BUSY_POLL`: `SO_BUSY_POLL` budget in microseconds. Unset or `0`
-/// leaves every socket in normal interrupt-driven mode; values are clamped to
+/// `MYQUIC2_BUSY_POLL`: `SO_BUSY_POLL` budget in microseconds. Unset uses
+/// [`BUSY_POLL_DEFAULT_US`]; an explicit `0` (or a malformed value) leaves
+/// every socket in normal interrupt-driven mode. Values are clamped to
 /// [`BUSY_POLL_MAX_US`].
 const ENV_BUSY_POLL: &str = "MYQUIC2_BUSY_POLL";
 
@@ -42,6 +45,12 @@ const ENV_BUSY_POLL: &str = "MYQUIC2_BUSY_POLL";
 /// the work it is supposed to accelerate, and a typo should not turn a router
 /// into a space heater.
 pub const BUSY_POLL_MAX_US: u32 = 1_000;
+
+/// Default `SO_BUSY_POLL` budget when `MYQUIC2_BUSY_POLL` is unset. 50 µs is
+/// long enough to cover a NIC's poll budget on the small interactive packets
+/// that dominate DNS and games, and short enough that an idle core still
+/// reaches the scheduler between bursts.
+pub const BUSY_POLL_DEFAULT_US: u32 = 50;
 
 /// `MYQUIC2_TCP_NOTSET_LOWAT`: `TCP_NOTSENT_LOWAT` in bytes for relay TCP
 /// streams. Unset uses [`NOTSET_LOWAT_DEFAULT`]; `0` leaves the kernel
@@ -148,8 +157,9 @@ const DEFER_ACCEPT_SECS: i32 = 1;
 /// keep before falling back to the normal handshake.
 const FASTOPEN_QLEN: i32 = 16;
 
-/// Effective `SO_BUSY_POLL` budget, parsed once per process (invalid values
-/// fall back to off, like every other env knob in this crate).
+/// Effective `SO_BUSY_POLL` budget, parsed once per process. Unset uses
+/// [`BUSY_POLL_DEFAULT_US`]; an explicit zero or an invalid value falls back
+/// to off, like every other env knob in this crate.
 #[must_use]
 pub fn busy_poll_us() -> u32 {
     static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -157,9 +167,15 @@ pub fn busy_poll_us() -> u32 {
 }
 
 fn parse_busy_poll(v: Option<&str>) -> u32 {
-    v.and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-        .min(BUSY_POLL_MAX_US)
+    match v {
+        None => BUSY_POLL_DEFAULT_US,
+        Some(s) => s
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .unwrap_or(0)
+            .min(BUSY_POLL_MAX_US),
+    }
 }
 
 /// Effective `TCP_NOTSENT_LOWAT` in bytes, parsed once per process; `0` means
@@ -334,12 +350,14 @@ fn apply_busy_poll(fd: RawFd, us: u32) {
         return;
     }
     // This knob trades idle CPU for wakeup latency: the kernel spins in the
-    // socket's poll path for up to `us` on every read. Say so once, at warn
-    // level, because "one core sits at 100% while idle" is otherwise very
-    // hard to attribute.
-    warn_once(
+    // socket's poll path for up to `us` on every read. The default is now on,
+    // so the armed notice is informational (debug) rather than a warning; the
+    // doc comment on `BUSY_POLL_DEFAULT_US` explains the trade for operators.
+    debug_once(
         "busy-poll-armed",
-        &format!("MYQUIC2_BUSY_POLL={us}µs: UDP sockets busy-poll (idle CPU rises by design)"),
+        &format!(
+            "SO_BUSY_POLL={us}µs on UDP sockets (MYQUIC2_BUSY_POLL=0 disables; idle CPU rises by design)"
+        ),
     );
     if let Err(e) = set_raw_int(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, 1) {
         // Pre-5.11 kernels: the budget still applies where
@@ -461,8 +479,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn busy_poll_parses_clamps_and_defaults_off() {
-        assert_eq!(parse_busy_poll(None), 0);
+    fn busy_poll_parses_clamps_and_defaults_on() {
+        assert_eq!(parse_busy_poll(None), BUSY_POLL_DEFAULT_US);
         assert_eq!(parse_busy_poll(Some("")), 0);
         assert_eq!(parse_busy_poll(Some("banana")), 0);
         assert_eq!(parse_busy_poll(Some("0")), 0);

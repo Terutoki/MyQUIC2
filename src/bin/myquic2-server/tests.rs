@@ -943,17 +943,21 @@ fn domain_pin_side_cache_is_keyed_and_cleared_with_the_slot() {
     );
 }
 
-/// A full table must evict the **quietest** session: never grow, never
-/// mis-route.
+/// A full set must evict the **quietest** session in that set: never grow,
+/// never mis-route.
 ///
-/// Session ids are monotonic and never reused, so nothing else reclaims a slot:
-/// without an eviction order the table would simply stop admitting new
+/// Session ids are monotonic and never reused, so nothing else reclaims a
+/// slot: without an eviction order the table would simply stop admitting new
 /// sessions once full. The order is the session's own liveness stamp, advanced
 /// on a hit — a reaped or idle session stops advancing it and ages out, which
 /// is also why the arm scan no longer has to look for dead entries (two
 /// atomics per slot) and now only reads the tag and stamp arrays.
+///
+/// The table is eight sets of [`FAST_GROUP_SLOTS`] ways: an arm in a full set
+/// evicts that set's quietest entry, and an arm in another set must leave it
+/// alone.
 #[tokio::test]
-async fn a_full_table_evicts_the_quietest_session() {
+async fn a_full_set_evicts_its_quietest_session() {
     let ss: SessTable = Arc::new(ShardedSessTable::new(ReplyFilter::Restricted));
     let conn_id = next_conn_id();
     let mut fast = FastTable::new();
@@ -962,8 +966,26 @@ async fn a_full_table_evicts_the_quietest_session() {
 
     let mut socks = Vec::new();
     // The quiet session is stamped a minute ago; every other session is fresh.
+    // `quiet` and `newcomer` share a set, so the newcomer can only evict it
+    // from that set — and the outsider below must not touch it from another.
     let quiet = 5u32;
-    let fresh: Vec<u32> = (0..FAST_SESS_SLOTS as u32 - 1).map(|i| 1_000 + i).collect();
+    let newcomer = 13u32;
+    let outsider = 9_000u32;
+    let quiet_set = quiet as usize & (FAST_TABLE_GROUPS - 1);
+    let mut fresh: Vec<u32> = Vec::with_capacity(FAST_SESS_SLOTS - 1);
+    for group in 0..FAST_TABLE_GROUPS {
+        let want = if group == quiet_set {
+            FAST_GROUP_SLOTS - 1
+        } else {
+            FAST_GROUP_SLOTS
+        };
+        fresh.extend(
+            (1_000u32..)
+                .filter(|s| (*s as usize & (FAST_TABLE_GROUPS - 1)) == group)
+                .take(want),
+        );
+    }
+    assert_eq!(fresh.len(), FAST_SESS_SLOTS - 1);
     for (s, idle) in std::iter::once((quiet, 60_000u64)).chain(fresh.iter().map(|&s| (s, 0u64))) {
         let entry = capped_session(s, idle);
         let sock = entry.sock.clone();
@@ -982,25 +1004,26 @@ async fn a_full_table_evicts_the_quietest_session() {
         "premise: the quiet session is armed"
     );
 
-    // One more session: the table has no free slot, so this arm can only evict.
-    let newcomer = 9_000u32;
+    // One more session in the quiet session's set: no free slot there, so this
+    // arm can only evict that set's quietest entry.
     {
-        let entry = capped_session(newcomer, 0);
+        let s = newcomer;
+        let entry = capped_session(s, 0);
         let sock = entry.sock.clone();
         let last = entry.last.clone();
         let epoch = entry.recent_epoch.clone();
         let abort = entry.reader.abort_handle();
-        ss.shard(newcomer).write().insert(newcomer, entry);
+        ss.shard(s).write().insert(s, entry);
         ss.note_live_insert();
-        sess_memo_put(conn_id, newcomer, sock.clone(), last, abort, epoch);
+        sess_memo_put(conn_id, s, sock.clone(), last, abort, epoch);
         socks.push(sock);
+        arm_fast(&mut fast, conn_id, s);
     }
-    arm_fast(&mut fast, conn_id, newcomer);
 
     assert_eq!(fast.len(), FAST_SESS_SLOTS, "a full table never grows");
     assert!(
         fast.probe(quiet).is_none(),
-        "the quietest session must lose its slot"
+        "the quietest session in the set must lose its slot"
     );
     assert!(
         fast.probe(newcomer).is_some(),
@@ -1034,6 +1057,30 @@ async fn a_full_table_evicts_the_quietest_session() {
         )
         .is_err(),
         "the evicted session must take the slow path, not a stale slot"
+    );
+
+    // A full set elsewhere evicts its own quietest entry, never this set's
+    // newcomer: the sets are independent.
+    {
+        let entry = capped_session(outsider, 0);
+        let sock = entry.sock.clone();
+        let last = entry.last.clone();
+        let epoch = entry.recent_epoch.clone();
+        let abort = entry.reader.abort_handle();
+        ss.shard(outsider).write().insert(outsider, entry);
+        ss.note_live_insert();
+        sess_memo_put(conn_id, outsider, sock.clone(), last, abort, epoch);
+        socks.push(sock);
+        arm_fast(&mut fast, conn_id, outsider);
+    }
+    assert_eq!(fast.len(), FAST_SESS_SLOTS, "a full table never grows");
+    assert!(
+        fast.probe(newcomer).is_some(),
+        "another set's arm must not evict this set's newcomer"
+    );
+    assert!(
+        fast.probe(outsider).is_some(),
+        "the outsider's own set must hold it"
     );
 }
 
@@ -5688,6 +5735,7 @@ fn rev2_report_line_is_delta_based_and_quiet_when_idle() {
         frag_frames: 6,
         frag_complete: 5,
         stage_full_drops: 0,
+        sess_created: 1,
         session_end_bindings: 1,
         full_cone_flows: 1,
         ctl_streams: 1,
@@ -5730,6 +5778,7 @@ fn rev2_report_line_is_delta_based_and_quiet_when_idle() {
         "refused=1",
         "accepted=6",
         "complete=5",
+        "sess_created=1",
         "session_end=1",
         "full_cone=1",
         "streams=1",

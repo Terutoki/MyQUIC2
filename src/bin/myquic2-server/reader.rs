@@ -2321,6 +2321,9 @@ pub(crate) async fn get_or_create_sess_guarded(
                 ss.note_live_remove(1);
                 (false, None, true, false, purged_reaped)
             } else {
+                // Published: this is the session-creation rate the DNS-churn
+                // question turns on (one socket + reader per new association).
+                r2_stats::bump(&r2_stats::SESS_CREATED);
                 (
                     true,
                     Some((sock.clone(), last_pre.clone(), reader_abort.clone())),

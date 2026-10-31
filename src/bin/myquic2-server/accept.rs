@@ -357,6 +357,26 @@ const FAST_TABLE_ARRAY_BYTES: usize = 128 * (432 + 12);
 pub(crate) const FAST_SESS_SLOTS: usize =
     FAST_TABLE_ARRAY_BYTES / (std::mem::size_of::<FastSess>() + 12);
 const _: () = assert!(FAST_SESS_SLOTS >= 128);
+
+/// Set-associative groups in [`FastTable`]. Session ids are monotonic and
+/// never reused, so the low bits are a cheap set selector: eight sets of 71
+/// ways keep the probe and arm scans to one 71-entry group instead of the
+/// full 568-slot array, while still bounding each group to an exact LRU.
+///
+/// Groups are not a replacement for capacity: a hot set can evict sooner than
+/// a globally-LRU table would, and the `fast_table` counters expose whether
+/// that matters. They are a pure scan reduction with no extra memory.
+pub(crate) const FAST_TABLE_GROUPS: usize = 8;
+pub(crate) const FAST_GROUP_SLOTS: usize = FAST_SESS_SLOTS / FAST_TABLE_GROUPS;
+const _: () = assert!(FAST_TABLE_GROUPS.is_power_of_two());
+const _: () = assert!(FAST_SESS_SLOTS.is_multiple_of(FAST_TABLE_GROUPS));
+
+/// First slot of `s`'s set. The mask is valid because the group count is a
+/// power of two (asserted above).
+#[inline]
+const fn group_start(s: u32) -> usize {
+    (s as usize & (FAST_TABLE_GROUPS - 1)) * FAST_GROUP_SLOTS
+}
 // A field added to `FastSess` costs working-set slots one-for-one; 88 B is the
 // size that buys ~568 slots from the fixed array budget.
 const _: () = assert!(std::mem::size_of::<FastSess>() <= 88);
@@ -445,27 +465,32 @@ impl FastTable {
 
     /// The slot describing `s`, or `None`.
     ///
-    /// A full scan of the tag array with **no chains**. The previous
-    /// linear-probing version stopped at the first hole, which made an entry
-    /// unreachable after an eviction — a miss, so safe — but also *unevictable*:
-    /// its stamp is shared with the live session and keeps advancing, so it
-    /// never looked like the quietest entry; and an arm that landed in a hole
-    /// could install a second entry for a session that already had one.
-    /// Scanning the tag array is a handful of nanoseconds and removes both.
+    /// Scans **one 71-entry set**, not the full 568-slot array, and uses no
+    /// chains. The previous linear-probing version stopped at the first hole,
+    /// which made an entry unreachable after an eviction — a miss, so safe —
+    /// but also *unevictable*: its stamp is shared with the live session and
+    /// keeps advancing, so it never looked like the quietest entry; and an arm
+    /// that landed in a hole could install a second entry for a session that
+    /// already had one. Set-association keeps the no-chain guarantee while
+    /// cutting the scan by [`FAST_TABLE_GROUPS`].
     #[inline]
     pub(crate) fn probe(&self, s: u32) -> Option<usize> {
         if s == EMPTY_TAG {
             return None;
         }
-        self.tags.iter().position(|&tag| tag == s)
+        let start = group_start(s);
+        self.tags[start..start + FAST_GROUP_SLOTS]
+            .iter()
+            .position(|&tag| tag == s)
+            .map(|i| start + i)
     }
 
     /// [`Self::probe`] with a one-entry cache for the current frame's session.
     ///
-    /// A v3 DATAGRAM can stage many items for the same `sess`; the probe is a
-    /// linear scan over the slot array, so caching the last hit turns that scan into
-    /// one scan per frame. The tag is re-checked so an eviction between items
-    /// (or a stale cache after `insert`) cannot turn into a wrong slot.
+    /// A v3 DATAGRAM can stage many items for the same `sess`; the probe scans
+    /// one 71-entry set, so caching the last hit turns one scan per frame into
+    /// at most one. The tag is re-checked so an eviction between items (or a
+    /// stale cache after `insert`) cannot turn into a wrong slot.
     ///
     /// Counters are **not** recorded here: a tag hit can still fail the live
     /// check or the socket upgrade in [`try_stage`], and reporting it as a hit
@@ -514,21 +539,23 @@ impl FastTable {
         }
     }
 
-    /// Where to publish `s`: its own slot, else the first free slot, else the
-    /// quietest one.
+    /// Where to publish `s` in its set: its own slot, else the first free
+    /// slot, else the quietest one in that set.
     ///
-    /// The table is a working set, not a router, so once it overflows the least
-    /// recently active session loses its slot and simply takes the slow path
-    /// on its next datagram.
+    /// The table is a working set, not a router, so once a set overflows the
+    /// least recently active session in it loses its slot and simply takes the
+    /// slow path on its next datagram.
     pub(crate) fn arm_index(&self, s: u32) -> usize {
-        // One pass over tags+ages, not `probe` + first-free + oldest: the table
-        // is now large enough (~570 slots) that three separate scans would
-        // dominate an arm. The pass still returns the session's own slot first,
-        // then the first free slot, then the quietest occupied one.
+        let start = group_start(s);
+        // One pass over the set's tags+ages, not `probe` + first-free +
+        // oldest: the set is 71 ways, but three separate scans still cost more
+        // than one. The pass returns the session's own slot first, then the
+        // first free slot, then the quietest occupied one.
         let mut free = None;
-        let mut victim = 0;
+        let mut victim = start;
         let mut oldest = u64::MAX;
-        for (idx, &tag) in self.tags.iter().enumerate() {
+        for idx in start..start + FAST_GROUP_SLOTS {
+            let tag = self.tags[idx];
             if s != EMPTY_TAG && tag == s {
                 return idx;
             }
@@ -555,6 +582,11 @@ impl FastTable {
     /// Dropping the previous entry releases its `Weak<UdpSocket>` handle, so a
     /// slot reclaimed from a reaped session holds nothing that outlives it.
     pub(crate) fn insert(&mut self, idx: usize, entry: FastSess) {
+        debug_assert_eq!(
+            group_start(entry.sess),
+            idx - idx % FAST_GROUP_SLOTS,
+            "insert must stay inside the session's set"
+        );
         self.ages[idx] = entry.last.load(std::sync::atomic::Ordering::Relaxed);
         self.tags[idx] = entry.sess;
         self.slots[idx] = Some(entry);
@@ -1213,6 +1245,11 @@ pub(crate) mod r2_stats {
     /// Fast-table item lookups that found no slot and fell through to
     /// `get_or_create_sess`.
     pub(crate) static FAST_MISSES: AtomicU64 = AtomicU64::new(0);
+    /// Sessions published by the slow path (`get_or_create_sess`). The 60 s
+    /// report pairs this with the UDP datagram delta: a DNS client that opens
+    /// one socket per query makes this rate approach the query rate, which is
+    /// the churn a shared-session design would have to amortize.
+    pub(crate) static SESS_CREATED: AtomicU64 = AtomicU64::new(0);
     /// Server-owned flows created for full-cone / unsolicited downlink sources
     /// (`DATA OPEN|SRC` with an id from the server's half).
     pub(crate) static FULL_CONE_FLOWS: AtomicU64 = AtomicU64::new(0);
@@ -1276,6 +1313,7 @@ pub(crate) mod r2_stats {
         pub(crate) frag_frames: u64,
         pub(crate) frag_complete: u64,
         pub(crate) stage_full_drops: u64,
+        pub(crate) sess_created: u64,
         pub(crate) session_end_bindings: u64,
         pub(crate) full_cone_flows: u64,
         pub(crate) ctl_streams: u64,
@@ -1323,6 +1361,7 @@ pub(crate) mod r2_stats {
                 frag_frames: d(self.frag_frames, prev.frag_frames),
                 frag_complete: d(self.frag_complete, prev.frag_complete),
                 stage_full_drops: d(self.stage_full_drops, prev.stage_full_drops),
+                sess_created: d(self.sess_created, prev.sess_created),
                 session_end_bindings: d(self.session_end_bindings, prev.session_end_bindings),
                 full_cone_flows: d(self.full_cone_flows, prev.full_cone_flows),
                 ctl_streams: d(self.ctl_streams, prev.ctl_streams),
@@ -1355,7 +1394,7 @@ pub(crate) mod r2_stats {
                  dns: sync_open={} dns_fail={} policy_drop={} sess_refused={} open_drops={}; \
                  ctl: hellos={} caps={} bad_hello={} sess_close={} flow_close={} stale_close={}; \
                  frag: refused={} accepted={} complete={}; \
-                 stage_full={} session_end={} full_cone={}; \
+                 stage_full={} sess_created={} session_end={} full_cone={}; \
                  ctl-stream: streams={} second={} bad_first={} msgs={} dropped={} errors={} need_ctx(sent/recv/dropped)={}/{}/{}; \
                  fast_table: hits={} misses={}",
                 self.opens,
@@ -1382,6 +1421,7 @@ pub(crate) mod r2_stats {
                 self.frag_frames,
                 self.frag_complete,
                 self.stage_full_drops,
+                self.sess_created,
                 self.session_end_bindings,
                 self.full_cone_flows,
                 self.ctl_streams,
@@ -1431,6 +1471,7 @@ pub(crate) mod r2_stats {
             frag_frames: FRAG_FRAMES.load(Ordering::Relaxed),
             frag_complete: FRAG_COMPLETE.load(Ordering::Relaxed),
             stage_full_drops: STAGE_FULL_DROPS.load(Ordering::Relaxed),
+            sess_created: SESS_CREATED.load(Ordering::Relaxed),
             session_end_bindings: SESSION_END_BINDINGS.load(Ordering::Relaxed),
             full_cone_flows: FULL_CONE_FLOWS.load(Ordering::Relaxed),
             ctl_streams: CTL_STREAMS.load(Ordering::Relaxed),
