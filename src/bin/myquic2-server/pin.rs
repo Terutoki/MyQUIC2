@@ -306,33 +306,15 @@ pub(crate) fn is_global_ip_cached(ip: IpAddr) -> bool {
     })
 }
 
-/// SSRF verdict for the connection reader's last fast-path destination.
+/// SSRF verdict for a fast-path destination.
 ///
-/// `is_global_ip_cached` is already thread-local memoized, but a steady
-/// single-target flow still paid its `RefCell` borrow plus hash-and-compare
-/// on every datagram. This one-entry pin skips even that: a datagram for the
-/// same `(session, dst)` reuses the verdict outright. It is keyed on the full
-/// `SocketAddr` conservatively (a port change re-derives, which is always
-/// safe), cleared wherever the allowlist mirror is, and — like the memo it
-/// shadows — pure over the IP, so caching it changes no security outcome.
-pub(crate) fn fast_allow_cached(
-    cache: &mut Option<(u32, SocketAddr, bool)>,
-    allow_private: bool,
-    s: u32,
-    dst: SocketAddr,
-) -> bool {
-    if allow_private {
-        return true;
-    }
-    if let Some((cs, cd, v)) = *cache
-        && cs == s
-        && cd == dst
-    {
-        return v;
-    }
-    let v = is_global_ip_cached(dst.ip());
-    *cache = Some((s, dst, v));
-    v
+/// The fast slot used to carry a one-entry `(sess, dst, verdict)` pin to skip
+/// this call. At 40 bytes per slot that pin cost more working-set capacity
+/// than it saved: `is_global_ip_cached` is already an O(1) hashed per-thread
+/// memo keyed by IP, and the verdict is pure, so recomputing it keeps the same
+/// security outcome while the slot count grows by roughly 40%.
+pub(crate) fn fast_allow(allow_private: bool, dst: SocketAddr) -> bool {
+    allow_private || is_global_ip_cached(dst.ip())
 }
 
 /// Resolve this datagram's target once, for both the fragment and the plain

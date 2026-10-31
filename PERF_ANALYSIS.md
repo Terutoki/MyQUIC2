@@ -623,11 +623,12 @@ left* by it as well as for what the first pass skipped. Four items were found; o
 
 ### 9.1 B1 — fast table working set
 
-> **Follow-up (2026-10-30):** the inline pin moved out of the hot slot and
-> `FAST_SESS_SLOTS` is now computed from the same array budget (~405 slots,
-> 128 B `FastSess`); a bounded 48-entry domain-pin side cache restores the
-> INLINE/legacy lock-free hit. The 128-slot numbers below are the historical
-> record of B1, not the current table.
+> **Follow-up (2026-10-31):** the inline pin and then the per-slot SSRF
+> verdict moved out of the hot slot, so `FAST_SESS_SLOTS` is computed from the
+> same array budget at 88 B `FastSess` (~568 slots); the thread-local
+> `is_global_ip_cached` memo supplies the verdict, and a bounded 48-entry
+> domain-pin side cache restores the INLINE/legacy lock-free hit. The 128-slot
+> numbers below are the historical record of B1, not the current table.
 
 `FAST_SESS_SLOTS` was 64 while `LOCAL_SESS_MAX` is 4096, and the shipped client concentrates up to ~2000 live sessions on
 one connection (2 interactive + 2 bulk UDP shards for up to 4,032 associations). Past 64 live sessions *every* arm evicts:

@@ -324,10 +324,6 @@ pub(crate) struct FastSess {
     /// after the first datagram). Keeps the session id inside the tuple so
     /// [`mirror_record`] is used unchanged.
     last_dst: Option<(u32, SocketAddr, u64)>,
-    /// SSRF verdict for the last fast-path destination of this session (see
-    /// `fast_allow_cached`): steady single-target flows skip the re-derivation
-    /// after the first datagram. Validated by the same epoch mechanism.
-    allow: Option<(u32, SocketAddr, bool)>,
 }
 
 impl FastSess {
@@ -361,6 +357,9 @@ const FAST_TABLE_ARRAY_BYTES: usize = 128 * (432 + 12);
 pub(crate) const FAST_SESS_SLOTS: usize =
     FAST_TABLE_ARRAY_BYTES / (std::mem::size_of::<FastSess>() + 12);
 const _: () = assert!(FAST_SESS_SLOTS >= 128);
+// A field added to `FastSess` costs working-set slots one-for-one; 88 B is the
+// size that buys ~568 slots from the fixed array budget.
+const _: () = assert!(std::mem::size_of::<FastSess>() <= 88);
 
 /// Full-name domain pins kept beside the fast slots.
 ///
@@ -464,7 +463,7 @@ impl FastTable {
     /// [`Self::probe`] with a one-entry cache for the current frame's session.
     ///
     /// A v3 DATAGRAM can stage many items for the same `sess`; the probe is a
-    /// linear scan over ~405 tags, so caching the last hit turns that scan into
+    /// linear scan over the slot array, so caching the last hit turns that scan into
     /// one scan per frame. The tag is re-checked so an eviction between items
     /// (or a stale cache after `insert`) cannot turn into a wrong slot.
     ///
@@ -523,7 +522,7 @@ impl FastTable {
     /// on its next datagram.
     pub(crate) fn arm_index(&self, s: u32) -> usize {
         // One pass over tags+ages, not `probe` + first-free + oldest: the table
-        // is now large enough (~405 slots) that three separate scans would
+        // is now large enough (~570 slots) that three separate scans would
         // dominate an arm. The pass still returns the session's own slot first,
         // then the first free slot, then the quietest occupied one.
         let mut free = None;
@@ -734,7 +733,7 @@ fn try_stage_inner(
     let Some(slot) = fast.get_mut(idx) else {
         return Err(payload);
     };
-    if !slot.is_live_for(s) || !fast_allow_cached(&mut slot.allow, allow_private, s, dst) {
+    if !slot.is_live_for(s) || !fast_allow(allow_private, dst) {
         return Err(payload);
     }
     // A failed upgrade means the session exited since the liveness check: treat
@@ -811,7 +810,6 @@ pub(crate) fn arm_fast(fast: &mut FastTable, conn_id: usize, s: u32) {
                             abort,
                             epoch,
                             last_dst: None,
-                            allow: None,
                         },
                     );
                     // `insert` stamped the slot from the entry's own `last`.
@@ -4139,9 +4137,10 @@ async fn handle_conn_inner(
         //
         // Sizing: `FAST_SESS_SLOTS` is computed to fit the same ~55.4 KiB
         // array budget the old 128 × 432 B table used, next to a 4 B tag and an
-        // 8 B stamp in the probe arrays. Removing the inline pin shrank
-        // `FastSess` to 128 B, so the budget now carries ~405 slots (3.1×). The
-        // shipped client packs up to ~2000 live sessions onto one connection,
+        // 8 B stamp in the probe arrays. Removing the inline pin and then the
+        // per-slot SSRF verdict shrank `FastSess` to 88 B, so the budget now
+        // carries ~570 slots (4.4× the old 128). The shipped client packs up to
+        // ~2000 live sessions onto one connection,
         // i.e. once the table is full *every* arm evicts; the larger working set
         // is a direct cut to that rate, and admission still charges the table
         // through `R2_INGRESS_FIXED_BYTES`. The remaining gap to
