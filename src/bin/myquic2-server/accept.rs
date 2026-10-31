@@ -416,10 +416,19 @@ pub(crate) struct FastTable {
     /// is enough; `insert`/`clear` invalidate it because they can move the
     /// session (or reuse its slot).
     probe_cache: Option<(u32, usize)>,
+    /// Items resolved from this table since the last stats flush.
+    hits: u64,
+    /// Items that fell through to the shard table since the last stats flush.
+    misses: u64,
 }
 
 /// The tag of a free slot. Session 0 is never allocated.
 const EMPTY_TAG: u32 = 0;
+
+/// Lookups per connection before the local hit/miss counters are added to the
+/// process-wide report. One relaxed RMW per 8192 items keeps the counters off
+/// the per-datagram critical path while still resolving a few per second.
+const FAST_STATS_EVERY: u64 = 8192;
 
 impl FastTable {
     pub(crate) const fn new() -> Self {
@@ -430,6 +439,8 @@ impl FastTable {
             pin_tags: [EMPTY_TAG; DOMAIN_PIN_SLOTS],
             pins: [const { None }; DOMAIN_PIN_SLOTS],
             probe_cache: None,
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -462,11 +473,37 @@ impl FastTable {
             && cached_s == s
             && self.tags[idx] == s
         {
+            self.note(true);
             return Some(idx);
         }
         let idx = self.probe(s);
         self.probe_cache = idx.map(|i| (s, i));
+        self.note(idx.is_some());
         idx
+    }
+
+    #[inline]
+    fn note(&mut self, hit: bool) {
+        if hit {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        if (self.hits + self.misses) & (FAST_STATS_EVERY - 1) == 0 {
+            self.flush_stats();
+        }
+    }
+
+    /// Publish the local counters to the 60 s report and reset them.
+    pub(crate) fn flush_stats(&mut self) {
+        if self.hits != 0 {
+            r2_stats::FAST_HITS.fetch_add(self.hits, std::sync::atomic::Ordering::Relaxed);
+            self.hits = 0;
+        }
+        if self.misses != 0 {
+            r2_stats::FAST_MISSES.fetch_add(self.misses, std::sync::atomic::Ordering::Relaxed);
+            self.misses = 0;
+        }
     }
 
     /// Where to publish `s`: its own slot, else the first free slot, else the
@@ -600,6 +637,14 @@ impl FastTable {
         if stamp > self.ages[idx] {
             self.ages[idx] = stamp;
         }
+    }
+}
+
+impl Drop for FastTable {
+    fn drop(&mut self) {
+        // Publish a connection's tail counts; the periodic flush only reaches
+        // the global report every 8192 lookups.
+        self.flush_stats();
     }
 }
 
@@ -1137,6 +1182,12 @@ pub(crate) mod r2_stats {
     /// Staged small replies dropped because the connection stager was full
     /// (bounded queue) or could not be re-queued after a drain.
     pub(crate) static STAGE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
+    /// Fast-table item lookups that found a slot (the hit rate the table is
+    /// sized for; a slot may still fail its liveness check).
+    pub(crate) static FAST_HITS: AtomicU64 = AtomicU64::new(0);
+    /// Fast-table item lookups that found no slot and fell through to
+    /// `get_or_create_sess`.
+    pub(crate) static FAST_MISSES: AtomicU64 = AtomicU64::new(0);
     /// Server-owned flows created for full-cone / unsolicited downlink sources
     /// (`DATA OPEN|SRC` with an id from the server's half).
     pub(crate) static FULL_CONE_FLOWS: AtomicU64 = AtomicU64::new(0);
@@ -1211,6 +1262,8 @@ pub(crate) mod r2_stats {
         pub(crate) need_context_sent: u64,
         pub(crate) need_context_recv: u64,
         pub(crate) need_context_dropped: u64,
+        pub(crate) fast_hits: u64,
+        pub(crate) fast_misses: u64,
     }
 
     impl Snapshot {
@@ -1256,6 +1309,8 @@ pub(crate) mod r2_stats {
                 need_context_sent: d(self.need_context_sent, prev.need_context_sent),
                 need_context_recv: d(self.need_context_recv, prev.need_context_recv),
                 need_context_dropped: d(self.need_context_dropped, prev.need_context_dropped),
+                fast_hits: d(self.fast_hits, prev.fast_hits),
+                fast_misses: d(self.fast_misses, prev.fast_misses),
             }
         }
 
@@ -1276,7 +1331,8 @@ pub(crate) mod r2_stats {
                  ctl: hellos={} caps={} bad_hello={} sess_close={} flow_close={} stale_close={}; \
                  frag: refused={} accepted={} complete={}; \
                  stage_full={} session_end={} full_cone={}; \
-                 ctl-stream: streams={} second={} bad_first={} msgs={} dropped={} errors={} need_ctx(sent/recv/dropped)={}/{}/{}",
+                 ctl-stream: streams={} second={} bad_first={} msgs={} dropped={} errors={} need_ctx(sent/recv/dropped)={}/{}/{}; \
+                 fast_table: hits={} misses={}",
                 self.opens,
                 self.acks,
                 self.rejects,
@@ -1312,6 +1368,8 @@ pub(crate) mod r2_stats {
                 self.need_context_sent,
                 self.need_context_recv,
                 self.need_context_dropped,
+                self.fast_hits,
+                self.fast_misses,
             )
         }
     }
@@ -1359,6 +1417,8 @@ pub(crate) mod r2_stats {
             need_context_sent: NEED_CONTEXT_SENT.load(Ordering::Relaxed),
             need_context_recv: NEED_CONTEXT_RECV.load(Ordering::Relaxed),
             need_context_dropped: NEED_CONTEXT_DROPPED.load(Ordering::Relaxed),
+            fast_hits: FAST_HITS.load(Ordering::Relaxed),
+            fast_misses: FAST_MISSES.load(Ordering::Relaxed),
         }
     }
 

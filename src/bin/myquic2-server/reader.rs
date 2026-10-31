@@ -582,34 +582,118 @@ pub(crate) fn stage_has_backlog(stage: &Arc<parking_lot::Mutex<R2Stager>>) -> bo
 /// queued.
 pub(crate) const STAGE_RETRY_MS: u64 = 20;
 
-/// Push one staged item; when the bounded queue is full, drain once and retry.
+/// One session reader's batch of small replies, pushed at its burst boundary.
 ///
-/// A push that still fails after a drain is a local-buffer drop: the payload is
-/// counted as `BUFFER_FULL` (the same class as a full send buffer) plus the
-/// rev2 `STAGE_FULL_DROPS` counter, and is not booked as sent.
-fn stage_push(
-    c2: &quinn::Connection,
-    stage: &Arc<parking_lot::Mutex<R2Stager>>,
-    item: R2StageItem,
-    limit: &mut usize,
-    last_too_large_probe_ms: &mut u64,
-) -> StageDrain {
-    let item = {
-        let mut st = stage.lock();
-        match st.push(item) {
-            Ok(_) => return StageDrain::Ok,
-            Err(item) => item,
+/// The per-reply push took the connection-wide stager mutex once per reply.
+/// A reader handles up to `LAST_HOP_DRAIN` replies per burst, and the stager
+/// is shared by every session of the connection, so that acquisition was the
+/// contended part, not the enqueue. The reader keeps the items here and hands
+/// them over with one `push_batch`; every path that sends a frame outside the
+/// stager flushes first, so per-session FIFO is preserved.
+pub(crate) struct StageBatch {
+    stage: Arc<parking_lot::Mutex<R2Stager>>,
+    pending: Vec<R2StageItem>,
+}
+
+impl StageBatch {
+    pub(crate) fn new(stage: Arc<parking_lot::Mutex<R2Stager>>) -> Self {
+        Self {
+            stage,
+            pending: Vec::new(),
         }
-    };
-    let verdict = drain_stage(c2, stage, limit, last_too_large_probe_ms);
-    let mut st = stage.lock();
-    if st.push(item).is_ok() {
-        return verdict;
     }
-    drop(st);
-    dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-    r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
-    verdict
+
+    /// The stager this batch feeds; the direct-send paths still need it.
+    fn stage(&self) -> &Arc<parking_lot::Mutex<R2Stager>> {
+        &self.stage
+    }
+
+    /// Queue one small reply; the next [`Self::flush`] pushes it.
+    fn push(&mut self, item: R2StageItem) {
+        self.pending.push(item);
+    }
+
+    /// Push the batch under one lock hold, leaving it in the stager.
+    ///
+    /// On a full queue the unaccepted tail stays in `pending`; the caller may
+    /// drain and retry. Test harnesses also use this to stage several readers
+    /// before one shared drain (the production path always flushes).
+    pub(crate) fn push_pending(&mut self) -> Result<usize, usize> {
+        if self.pending.is_empty() {
+            return Ok(0);
+        }
+        let mut st = self.stage.lock();
+        st.push_batch(&mut self.pending)
+    }
+
+    /// Push the batch under one lock hold, then drain.
+    ///
+    /// A full queue drains once and retries; a push that still fails is a
+    /// local-buffer drop, accounted exactly like the old one-item path
+    /// (`BUFFER_FULL` plus `STAGE_FULL_DROPS`). The drain is part of the flush
+    /// because every caller is either the burst boundary or about to send a
+    /// standalone frame that must not overtake these items.
+    pub(crate) fn flush(
+        &mut self,
+        c2: &quinn::Connection,
+        limit: &mut usize,
+        last_too_large_probe_ms: &mut u64,
+    ) -> StageDrain {
+        if self.pending.is_empty() {
+            return StageDrain::Ok;
+        }
+        let mut verdict = StageDrain::Ok;
+        if self.push_pending().is_err() {
+            verdict = drain_stage(c2, &self.stage, limit, last_too_large_probe_ms);
+            if verdict == StageDrain::Terminal {
+                self.drop_pending();
+                return StageDrain::Terminal;
+            }
+            if self.push_pending().is_err() {
+                self.drop_pending();
+            }
+        }
+        worse(
+            verdict,
+            drain_stage(c2, &self.stage, limit, last_too_large_probe_ms),
+        )
+    }
+
+    /// Flush, then drain even when the batch is empty (test harnesses stage
+    /// several readers before one shared drain).
+    #[cfg(test)]
+    pub(crate) fn drain(
+        &mut self,
+        c2: &quinn::Connection,
+        limit: &mut usize,
+        last_too_large_probe_ms: &mut u64,
+    ) -> StageDrain {
+        let flushed = self.flush(c2, limit, last_too_large_probe_ms);
+        worse(
+            flushed,
+            drain_stage(c2, &self.stage, limit, last_too_large_probe_ms),
+        )
+    }
+
+    fn drop_pending(&mut self) {
+        for item in self.pending.drain(..) {
+            drop(item);
+            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+            r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+        }
+    }
+}
+
+/// `Terminal` is the only verdict callers must act on; keep it across a
+/// flushed batch and the drain that follows it.
+fn worse(a: StageDrain, b: StageDrain) -> StageDrain {
+    if a == StageDrain::Terminal || b == StageDrain::Terminal {
+        StageDrain::Terminal
+    } else if a == StageDrain::TooLarge || b == StageDrain::TooLarge {
+        StageDrain::TooLarge
+    } else {
+        StageDrain::Ok
+    }
 }
 
 /// Stage the first frame of a rebinding flow (`DATA OPEN|SRC`) and learn the
@@ -1180,7 +1264,7 @@ pub(crate) fn handle_session_reply(
     src_raw: SocketAddr,
     reply_filter: ReplyFilter,
     r2: &mut R2ReplyState,
-    stage: &Arc<parking_lot::Mutex<R2Stager>>,
+    batch: &mut StageBatch,
     frag2: &mut R2Fragmenter,
     flows: &arc_swap::ArcSwap<FlowTable>,
     limit: &mut usize,
@@ -1243,7 +1327,7 @@ pub(crate) fn handle_session_reply(
         // Nothing can be sent on this path: draining with a zero budget makes
         // the stager account every queued payload as a `TooLarge` drop instead
         // of leaving them to connection teardown, then the reader exits.
-        let _ = drain_stage(c2, stage, limit, &mut *last_too_large_probe_ms);
+        let _ = batch.flush(c2, limit, &mut *last_too_large_probe_ms);
         return ReplyDisposition::BreakSession;
     }
     let src = SocketAddr::new(unmap(src_raw.ip()), src_raw.port());
@@ -1381,14 +1465,18 @@ pub(crate) fn handle_session_reply(
             payload: Bytes::copy_from_slice(payload),
         };
         let verdict = if is_rebind {
+            // A standalone OPEN|SRC is sent outside the stager, so the burst's
+            // earlier replies must be pushed and drained first.
+            let flushed = batch.flush(c2, limit, &mut *last_too_large_probe_ms);
             let (verdict, sent) = stage_open_src(
                 c2,
-                stage,
+                batch.stage(),
                 item,
                 limit,
                 &mut *last_too_large_probe_ms,
                 r2.wire(),
             );
+            let verdict = worse(flushed, verdict);
             if sent {
                 if let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref() {
                     binding.set_reply_src(src);
@@ -1400,7 +1488,8 @@ pub(crate) fn handle_session_reply(
             }
             verdict
         } else {
-            stage_push(c2, stage, item, limit, &mut *last_too_large_probe_ms)
+            batch.push(item);
+            StageDrain::Ok
         };
         return match verdict {
             StageDrain::Terminal => ReplyDisposition::BreakSession,
@@ -1413,7 +1502,7 @@ pub(crate) fn handle_session_reply(
     // A reply too large for one staged frame must not overtake smaller replies
     // already queued for this flow: drain the connection stager first (it may
     // carry this session's earlier payloads), then send directly.
-    match drain_stage(c2, stage, limit, &mut *last_too_large_probe_ms) {
+    match batch.flush(c2, limit, &mut *last_too_large_probe_ms) {
         StageDrain::Ok | StageDrain::TooLarge => {}
         StageDrain::Terminal => return ReplyDisposition::BreakSession,
     }
@@ -1555,6 +1644,10 @@ pub(crate) async fn sess_reader_task(
     // and binding install). Small replies are pushed to the connection-scoped
     // `stage`; nothing is retained in this task across awaits.
     let mut r2 = R2ReplyState::new(r2_flows, r2_conn);
+    // Small replies are batched per receive burst and handed to the shared
+    // stager with one lock hold at the burst boundary (or before an immediate
+    // standalone send inside `handle_session_reply`).
+    let mut batch = StageBatch::new(stage.clone());
     // Retry timer for a drain that left frames queued on a full DATAGRAM send
     // buffer (see `stage_has_backlog`/`STAGE_RETRY_MS`). The first `tick()`
     // consumes the interval's immediate first fire; from then on the arm only
@@ -1634,7 +1727,7 @@ pub(crate) async fn sess_reader_task(
                     $src,
                     reply_filter,
                     &mut r2,
-                    &stage,
+                    &mut batch,
                     &mut frag2,
                     flows.as_ref(),
                     &mut limit,
@@ -1706,7 +1799,13 @@ pub(crate) async fn sess_reader_task(
             };
             match disposition {
                 ReplyDisposition::Continue => {}
-                ReplyDisposition::BreakSession => break 'session,
+                ReplyDisposition::BreakSession => {
+                    // The session is going away, but the batch still belongs to
+                    // the connection: hand it over so another reader can send
+                    // it, exactly like the old per-reply push.
+                    let _ = batch.flush(&c2, &mut limit, &mut last_too_large_probe_ms);
+                    break 'session;
+                }
             }
         }
         // Drain-burst boundary: this is where a burst's small replies (from
@@ -1715,9 +1814,7 @@ pub(crate) async fn sess_reader_task(
         // cross-session dict TRAIN. A terminal verdict means DATAGRAM support or
         // the connection is gone: exit after the stager has accounted the
         // refused frame (remaining items stay queued for the connection drop).
-        if drain_stage(&c2, &stage, &mut limit, &mut last_too_large_probe_ms)
-            == StageDrain::Terminal
-        {
+        if batch.flush(&c2, &mut limit, &mut last_too_large_probe_ms) == StageDrain::Terminal {
             break 'session;
         }
         // A `Blocked` verdict left the remaining items queued; arm the retry

@@ -4726,7 +4726,7 @@ async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
         let r = ss.shard(7).read();
         r.get(&7).expect("session 7").r2_flows.clone()
     };
-    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut batch = StageBatch::new(Arc::new(parking_lot::Mutex::new(R2Stager::new())));
     let mut frag2 = R2Fragmenter::new();
     let mut r2 = R2ReplyState::new(r2_flows, None);
     let mut limit = server_conn.max_datagram_size().unwrap();
@@ -4743,7 +4743,7 @@ async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
         src,
         ReplyFilter::Restricted,
         &mut r2,
-        &stage,
+        &mut batch,
         &mut frag2,
         flows.as_ref(),
         &mut limit,
@@ -4758,7 +4758,7 @@ async fn reply_v3_flow_admits_an_evicted_allowlist_host() {
     );
     assert_eq!(disposition, ReplyDisposition::Continue);
     assert_eq!(
-        drain_stage(&server_conn, &stage, &mut limit, &mut probe),
+        batch.flush(&server_conn, &mut limit, &mut probe),
         StageDrain::Ok
     );
     // The reply is authorized by the live v3 flow mapping, but no rev2 binding
@@ -5633,6 +5633,21 @@ fn never_logged_sentinel_claims_immediately() {
     );
 }
 
+/// The per-connection counters surface the fast-table hit rate in the 60 s
+/// report without putting a global RMW on every item.
+#[test]
+fn fast_table_counts_unsolved_sessions() {
+    use std::sync::atomic::Ordering;
+    let before = r2_stats::FAST_MISSES.load(Ordering::Relaxed);
+    let mut table = FastTable::new();
+    assert_eq!(table.probe_cached(0xDEAD_BEEF), None);
+    table.flush_stats();
+    assert!(
+        r2_stats::FAST_MISSES.load(Ordering::Relaxed) > before,
+        "a miss must be published to the 60 s report"
+    );
+}
+
 /// W9: the rev2 counters are surfaced in the 60 s report as **deltas**, the
 /// line stays quiet when nothing moved, and it names the counters an operator
 /// needs (opens/acks/rejects/compression mix/DNS loss classes/control).
@@ -5683,6 +5698,8 @@ fn rev2_report_line_is_delta_based_and_quiet_when_idle() {
         need_context_sent: 1,
         need_context_recv: 1,
         need_context_dropped: 0,
+        fast_hits: 41,
+        fast_misses: 59,
     };
     let delta = now.since(&zero);
     assert_eq!(delta, now, "the first interval is the totals");
@@ -5703,6 +5720,7 @@ fn rev2_report_line_is_delta_based_and_quiet_when_idle() {
         "policy_drop=1",
         "sess_refused=1",
         "open_drops=5",
+        "fast_table: hits=41 misses=59",
         "hellos=1",
         "caps=1",
         "sess_close=1",
@@ -7361,7 +7379,7 @@ struct R2ReplyHarness {
     r2: R2ReplyState,
     frag2: R2Fragmenter,
     flows: Arc<arc_swap::ArcSwap<FlowTable>>,
-    stage: Arc<parking_lot::Mutex<R2Stager>>,
+    batch: StageBatch,
     limit: usize,
     last_probe: u64,
     last_touch: u64,
@@ -7402,7 +7420,7 @@ impl R2ReplyHarness {
             // without a connection is the shipped rev2 default.
             frag2: R2Fragmenter::new_with_wire(conn.as_ref().map_or(Wire::Rev2, |c| c.wire())),
             flows,
-            stage,
+            batch: StageBatch::new(stage),
             limit,
             last_probe: 0,
             last_touch: 0,
@@ -7430,7 +7448,7 @@ impl R2ReplyHarness {
             src,
             self.reply_filter,
             &mut self.r2,
-            &self.stage,
+            &mut self.batch,
             &mut self.frag2,
             self.flows.as_ref(),
             &mut self.limit,
@@ -7445,14 +7463,16 @@ impl R2ReplyHarness {
         )
     }
 
+    /// Push this reader's pending batch without draining, so a test can stage
+    /// several readers before one shared drain.
+    fn stage(&mut self) {
+        self.batch.push_pending().expect("test stager has room");
+    }
+
     /// Drain the connection stager once (the session reader's burst boundary).
     fn drain(&mut self) -> StageDrain {
-        drain_stage(
-            &self.server,
-            &self.stage,
-            &mut self.limit,
-            &mut self.last_probe,
-        )
+        self.batch
+            .drain(&self.server, &mut self.limit, &mut self.last_probe)
     }
 }
 
@@ -7765,6 +7785,8 @@ async fn rev2_stage_cross_session_dict_train() {
         hb.reply(b"from-b", src_b),
         ReplyDisposition::Continue
     ));
+    ha.stage();
+    hb.stage();
     assert_eq!(ha.drain(), StageDrain::Ok);
     let frame = r2_read_frame(&client).await;
     let train = r2::decode_train(&frame).expect("two sessions must share one dict TRAIN");
@@ -7829,6 +7851,7 @@ async fn rev2_stage_queue_full_drops_and_counts() {
         h.reply(b"dropped", src),
         ReplyDisposition::Continue
     ));
+    assert_eq!(h.drain(), StageDrain::Ok);
     assert!(
         dgram_drops::snapshot().buffer_full > full_before,
         "a full staging queue is a BUFFER_FULL drop"
@@ -7967,6 +7990,7 @@ async fn rev2_stage_fairness_quiet_session_shares_first_frame() {
         quiet.reply(b"quiet", quiet_src),
         ReplyDisposition::Continue
     ));
+    quiet.stage();
     assert_eq!(busy.drain(), StageDrain::Ok);
     // The first frame is a dict train that already carries the quiet session's
     // payload: the round-robin cursor interleaves it with the busy session.
