@@ -7605,6 +7605,34 @@ impl R2ReplyHarness {
     }
 }
 
+/// A burst boundary must drain the connection-wide stager even when this
+/// reader's batch is empty: another reader may have queued an item, and the
+/// old `flush` early-return left it for the 5 ms retry timer (or, worse, let a
+/// later direct `OPEN|SRC` overtake it).
+#[tokio::test]
+async fn empty_batch_flush_still_drains_the_shared_stager() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _flows, _binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    remember_dst(&ss, 7, src);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server_conn.clone(), stage, None);
+
+    assert!(matches!(
+        h.reply(b"flush-empty", src),
+        ReplyDisposition::Continue
+    ));
+    h.batch.push_pending().expect("test stager has room");
+    assert_eq!(
+        h.batch.flush(&server_conn, &mut h.limit, &mut h.last_probe),
+        StageDrain::Ok
+    );
+
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("steady DATA");
+    assert_eq!(data.payload, b"flush-empty");
+}
+
 /// Large uplink: fragmented `OPEN` (sent out of order) installs the flow,
 /// delivers the whole payload and is ACKed; fragmented steady frames then
 /// resolve through the registry at completion.

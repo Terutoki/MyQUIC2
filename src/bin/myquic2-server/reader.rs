@@ -639,9 +639,10 @@ impl StageBatch {
         limit: &mut usize,
         last_too_large_probe_ms: &mut u64,
     ) -> StageDrain {
-        if self.pending.is_empty() {
-            return StageDrain::Ok;
-        }
+        // Drain even when this batch is empty: the stager is connection-wide,
+        // so another reader may have left items queued, and a rebind's direct
+        // send must not overtake them. The old early return skipped that
+        // burst-boundary drain.
         let mut verdict = StageDrain::Ok;
         if self.push_pending().is_err() {
             verdict = drain_stage(c2, &self.stage, limit, last_too_large_probe_ms);
@@ -705,18 +706,25 @@ fn worse(a: StageDrain, b: StageDrain) -> StageDrain {
 /// and the old "no failure and no dropped items" connection-level verdict
 /// could not distinguish this frame's fate from another session's. Sending it
 /// directly gives an exact per-frame verdict: `reply_src` is learned only on
-/// `Sent`. On `Blocked` the payload is offered to the stager (the burst-end
-/// drain will retry it) and `reply_src` stays unlearned, so the next reply
+/// `Sent`. On `Blocked` the payload joins the burst batch (the burst-end flush
+/// will push and drain it) and `reply_src` stays unlearned, so the next reply
 /// repeats the OPEN — which is exactly the idempotent rebind the protocol
 /// wants. A queue that is also full is an ordinary UDP drop.
 fn stage_open_src(
     c2: &quinn::Connection,
-    stage: &Arc<parking_lot::Mutex<R2Stager>>,
+    batch: &mut StageBatch,
     item: R2StageItem,
     limit: &mut usize,
     last_too_large_probe_ms: &mut u64,
     wire: Wire,
 ) -> (StageDrain, bool) {
+    // A direct send must not overtake items already queued for this session.
+    // The stager is shared, so check it even though this reader's batch was
+    // flushed just before this call.
+    if batch.stage().lock().has_session(item.session) {
+        batch.push(item);
+        return (StageDrain::Ok, false);
+    }
     // Same revision-aware encoder a batched drain uses, so a directly-sent
     // binding frame is byte-identical to a staged one on both wires.
     let body = match encode_standalone_item_for(wire, &item, *limit) {
@@ -734,28 +742,12 @@ fn stage_open_src(
             (StageDrain::Ok, true)
         }
         DatagramSend::Blocked => {
-            // Backpressure: keep the payload queued when possible. It carries
-            // no learned `reply_src`; the next reply re-sends the OPEN.
-            //
-            // Bind the push result *before* the `match`: a temporary in the
-            // scrutinee lives to the end of the match (clippy
-            // `significant_drop_in_scrutinee`), so an arm that later took a
-            // second stager lock would nest two `parking_lot` guards. No arm
-            // does today; keeping the guard's scope to one statement makes
-            // that impossible to introduce by accident.
-            let pushed = {
-                let mut queue = stage.lock();
-                queue.push(item)
-            };
-            match pushed {
-                Ok(_) => (StageDrain::Ok, false),
-                Err(item) => {
-                    drop(item);
-                    dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-                    r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
-                    (StageDrain::Ok, false)
-                }
-            }
+            // Backpressure: hold the payload in this reader's burst batch. It
+            // carries no learned `reply_src`; the next reply re-sends the OPEN.
+            // The burst-end flush pushes the batch in arrival order and drains,
+            // so this frame cannot be overtaken by a later direct send.
+            batch.push(item);
+            (StageDrain::Ok, false)
         }
         DatagramSend::TooLarge => {
             book_too_large(1);
@@ -1470,7 +1462,7 @@ pub(crate) fn handle_session_reply(
             let flushed = batch.flush(c2, limit, &mut *last_too_large_probe_ms);
             let (verdict, sent) = stage_open_src(
                 c2,
-                batch.stage(),
+                batch,
                 item,
                 limit,
                 &mut *last_too_large_probe_ms,

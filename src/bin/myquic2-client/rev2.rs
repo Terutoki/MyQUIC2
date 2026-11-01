@@ -522,6 +522,10 @@ impl ConnRev2 {
                         _ = tokio::time::sleep(STAGE_RETRY_DELAY) => {}
                     }
                     let Some(limit) = conn.max_datagram_size() else {
+                        // None means the peer never negotiated DATAGRAM, so no
+                        // retry can ever send. Account the queued payloads as
+                        // egress death instead of leaving them for teardown.
+                        let _ = rev2.clear_stage();
                         return;
                     };
                     let limit = rev2.frame_limit(limit);
@@ -996,9 +1000,10 @@ impl UplinkFlows {
     /// Push this burst's staged items into the connection stager with one lock
     /// hold, draining once if it is full.
     ///
-    /// Returns the same shape [`stage_or_count`] returns: a quiet
-    /// `frames: 1` when the batch was queued, or the drain verdict (and its
-    /// frame count) when a drain was needed and failed. On a still-full queue
+    /// Returns the same shape [`stage_or_count`] returns: at least one frame
+    /// when the batch was queued (plus any opportunistic drain's frames), or
+    /// the drain verdict (and its frame count) when a drain was needed and
+    /// failed. On a still-full queue
     /// after one drain, the remaining items are dropped with the per-payload
     /// `BUFFER_FULL` accounting that the single-push path used, and the first
     /// lost id is reported to the rate-limited warning.
@@ -1041,7 +1046,9 @@ impl UplinkFlows {
                     }
                     return match drained.failed {
                         None => PayloadSend {
-                            frames: 1,
+                            // One frame is queued for the common case; keep the
+                            // opportunistic drain's count when it fired.
+                            frames: drained.frames.max(1),
                             failed: None,
                         },
                         Some(failed) => PayloadSend {

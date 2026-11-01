@@ -252,6 +252,12 @@ pub struct R2Stager {
     /// cannot live in a stager field) rather than a fresh per-frame `Vec`.
     run_scratch: Vec<R2StageItem>,
     unique_scratch: Vec<u32>,
+    /// Serializes whole drains (claim + encode + send). Two drainers can be
+    /// live at once — an association burst-end and the connection retry task —
+    /// and both claim under the stager lock but send outside it; without this
+    /// gate the later claim could reach the wire before the earlier one.
+    /// Held only on the synchronous drain path, never across an await.
+    drain_gate: std::sync::Arc<parking_lot::Mutex<()>>,
 }
 
 impl Default for R2Stager {
@@ -294,6 +300,7 @@ impl R2Stager {
             max_train_items: r2::R2_MAX_TRAIN_ITEMS,
             run_scratch: Vec::new(),
             unique_scratch: Vec::new(),
+            drain_gate: std::sync::Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -305,6 +312,17 @@ impl R2Stager {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queued_items == 0
+    }
+
+    /// Whether `session` currently has items queued.
+    ///
+    /// A direct send for a session (the rebind `OPEN|SRC` fast path) must not
+    /// overtake items already queued for the same session.
+    #[must_use]
+    pub fn has_session(&self, session: u32) -> bool {
+        self.sessions
+            .get(&session)
+            .is_some_and(|queue| !queue.is_empty())
     }
 
     #[must_use]
@@ -1142,13 +1160,12 @@ pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOut
         // Move the body out (a `Bytes` header swap, no payload copy): the
         // slot's body is dead after quinn owns it. `encode_claimed` fills every
         // body before the send loop starts; a `None` here is a broken
-        // claim/encode invariant, handled as a size-class drop instead of a
-        // panic on the shared datagram loop.
+        // claim/encode invariant. Stop the send without a drop verdict so
+        // `requeue_unsent` can put the frame's items back in order (accounting
+        // it here as dropped would double-book the same payloads).
         let Some(body) = q.frames[idx].body.take() else {
-            let dropped = q.frames[idx].item_len;
-            out.items_dropped = dropped;
+            debug_assert!(false, "send_packed_frames requires encode_claimed");
             out.failed = Some(DatagramSend::TooLarge);
-            book_too_large(dropped as usize);
             break;
         };
         match try_send_datagram(conn, body) {
@@ -1285,6 +1302,12 @@ pub fn drain_staged(
 ) -> R2DrainOutcome {
     let mut total = R2DrainOutcome::default();
     let mut q = PackedFrames::default();
+    // Serialize the whole drain: claim order and wire order must agree when
+    // two drainers (an association burst-end and the connection retry task)
+    // race on the same stager. Both used to claim under the stager lock but
+    // send outside it, so the second claim could overtake the first send.
+    let drain_gate = stage.lock().drain_gate.clone();
+    let _drain_guard = drain_gate.lock();
     let mut handled = 0usize;
     loop {
         if stage.lock().is_empty() {
@@ -1603,6 +1626,15 @@ mod tests {
         assert_eq!(s.clear(), 2);
         assert!(s.is_empty());
         assert!(s.next_frame(1162).is_none());
+    }
+
+    #[test]
+    fn has_session_reports_only_queued_sessions() {
+        let mut s = R2Stager::new();
+        assert!(!s.has_session(7));
+        s.push(steady(7, 1, b"x")).unwrap();
+        assert!(s.has_session(7));
+        assert!(!s.has_session(8));
     }
 
     #[test]
