@@ -2,10 +2,15 @@
 //!
 //! Two caches, deliberately separate namespaces:
 //!
-//! - **positive**: `(inserted at, address set)` with a 120 s lifetime. Moka
-//!   owns capacity bounding and eviction; the stored `Instant` is the authority
-//!   for the remaining life a caller clamps its own deadlines against (moka
-//!   exposes no remaining-TTL query).
+//! - **positive**: `(inserted at, address set)` with a 120 s *freshness* life
+//!   inside a longer (`+ DNS_STALE_WINDOW`) resident life. Moka owns capacity
+//!   bounding and eviction; the stored `Instant` is the authority both for the
+//!   remaining life a caller clamps its own deadlines against (moka exposes no
+//!   remaining-TTL query) and for telling a fresh entry from a stale one: an
+//!   entry past `inserted + DNS_CACHE_TTL` is stale, is still served (RFC 8767,
+//!   see [`DNS_STALE_WINDOW`]), and must be paired with a background refresh
+//!   ([`DNS_STALE_MEMO_TTL`] explains why the sync memo is let through again
+//!   while that happens).
 //! - **negative**: verdict-only entries with a 10 s lifetime. A failed lookup
 //!   must never be expressible in the positive keyspace: `try_get_with` treats
 //!   any present value as the cached answer, so a negative sentinel stored
@@ -54,11 +59,39 @@ pub(crate) type DnsCacheVal = (Instant, Arc<[IpAddr]>);
 /// 120 s is a deliberate middle ground: it halves the upstream query rate of
 /// the 60 s it replaced, while keeping the stale-answer window in the same
 /// order as common resolver/TTL floors (a name that moves is followed within
-/// two minutes). The layers above (per-thread memo, session destination memo,
-/// 30 s pin) all clamp to an entry's remaining life, so this value bounds the
-/// worst-case staleness end to end.
+/// two minutes while the background refresh can reach upstream). The layers
+/// above (per-thread memo, session destination memo, 30 s pin) all clamp to an
+/// entry's remaining life, so this value bounds the worst-case staleness end to
+/// end; `DNS_STALE_WINDOW` is what covers the case where the refresh cannot be
+/// made at all.
 pub const DNS_CACHE_TTL_MS: u64 = 120_000;
 pub(crate) const DNS_CACHE_TTL: Duration = Duration::from_millis(DNS_CACHE_TTL_MS);
+
+/// How long past its freshness deadline a positive entry may still answer.
+///
+/// The model is RFC 8767's serve-stale: an expired record is a far better
+/// answer than a failed connection, and the refresh that every stale hit
+/// schedules usually repairs the entry within one query RTT. The window only
+/// becomes visible when that refresh cannot be made at all — upstream down,
+/// permits exhausted, the resolver hung — which is exactly the case where the
+/// old behaviour handed the caller an error and the client a failed dial.
+///
+/// It also bounds the worst case of a *changed* record: a stale answer is
+/// served at most this long, and only while every refresh attempt keeps
+/// failing. The layers above (per-thread memo, session destination memo, 30 s
+/// pin) still clamp to the entry's own deadline, so they cannot extend it.
+pub(crate) const DNS_STALE_WINDOW: Duration = Duration::from_secs(3_600);
+
+/// How long a **stale** answer is memoized in the packet path's per-thread memo.
+///
+/// Short on purpose. The memo is what lets the sync probe answer without the
+/// async path, but the async path is the only code that can schedule a refresh
+/// (the sync path cannot spawn tasks). A stale memo life of a whole stale window
+/// would hide the staleness from the one place that repairs it, so the packet
+/// path is let through to the async path once a second; that path re-serves the
+/// same stale answer from a moka hit (nanoseconds) while the refresh it already
+/// started completes.
+pub(crate) const DNS_STALE_MEMO_TTL: Duration = Duration::from_secs(1);
 
 /// How long a negative entry that *is* a verdict is kept: the resolver
 /// answered that the name does not resolve (NXDOMAIN/NODATA, or the blocking
@@ -120,9 +153,46 @@ pub(crate) const DNS_NEG_MAX: usize = 4096;
 pub(crate) const DNS_CACHE_MAX_ADDRS: usize = 32;
 /// Wall-clock budget for a single upstream DNS lookup. Client-side dial
 /// timeouts are sized to cover this plus the TCP connect budget.
-pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// This is the budget for the *whole* lookup, retries included: it wraps the
+/// hickory future ([`super::resolve::resolve_ips`]), so it is the only wall the
+/// caller can rely on. The per-attempt timeout below has to be derived from it,
+/// not set independently — see `DNS_QUERY_TIMEOUT`.
+pub const DNS_LOOKUP_TIMEOUT_MS: u64 = 5_000;
+pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_millis(DNS_LOOKUP_TIMEOUT_MS);
+
+/// Budget for **one** upstream query attempt, and how many extra attempts
+/// hickory may make inside [`DNS_LOOKUP_TIMEOUT`].
+///
+/// hickory's own defaults are `timeout = 5 s` with `attempts = 2`, i.e. the
+/// same wall as ours: the first attempt was allowed to consume the entire
+/// budget, so the retry the resolver had been configured to make could never
+/// run. A single lost UDP datagram then cost the full 5 s, and a name server
+/// that would have answered the second try never got one.
+///
+/// 1.5 s per attempt fits three attempts (1 + `DNS_LOOKUP_ATTEMPTS`) inside the
+/// 5 s wall with room to spare: a dropped query recovers at ~1.5 s, and a
+/// resolver that is entirely unreachable still fails inside the same wall as
+/// before. The `assert!` below is the invariant; `configure_resolver_options`
+/// is the single place that installs both values.
+pub(crate) const DNS_QUERY_TIMEOUT_MS: u64 = 1_500;
+pub(crate) const DNS_QUERY_TIMEOUT: Duration = Duration::from_millis(DNS_QUERY_TIMEOUT_MS);
+pub(crate) const DNS_LOOKUP_ATTEMPTS: usize = 2;
+
+/// The attempt budget must leave room for the retries, or the retries are dead
+/// code (the state this constant pair replaced).
+const _: () = assert!(
+    DNS_QUERY_TIMEOUT_MS * (DNS_LOOKUP_ATTEMPTS as u64 + 1) < DNS_LOOKUP_TIMEOUT_MS,
+    "one query attempt times (1 + retries) must fit inside DNS_LOOKUP_TIMEOUT"
+);
 
 type DnsHasher = foldhash::fast::RandomState;
+/// Successful resolutions. The value's `Instant` is the **insertion** instant,
+/// so freshness is `inserted + DNS_CACHE_TTL`; the cache's own TTL is that plus
+/// [`DNS_STALE_WINDOW`], i.e. it only evicts answers that cannot be served
+/// stale any more. Serving a stale entry is paired with a refresh by
+/// `resolve::resolve_all_cached`, which is what keeps the window from being the
+/// normal case.
 pub(crate) type PosCache = Cache<DnsCacheKey, DnsCacheVal, DnsHasher>;
 /// Negative verdicts. The value is the instant the refusal **expires** (not the
 /// instant it was recorded): a resolver that finds a host-keyed verdict while
@@ -141,7 +211,7 @@ pub(crate) fn positives() -> &'static PosCache {
         Cache::builder()
             .name("dns-pos")
             .max_capacity(DNS_CACHE_MAX as u64)
-            .time_to_live(DNS_CACHE_TTL)
+            .time_to_live(DNS_CACHE_TTL + DNS_STALE_WINDOW)
             .build_with_hasher(DnsHasher::default())
     })
 }

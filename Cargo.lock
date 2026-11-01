@@ -597,15 +597,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "happy-eyeballs"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b03efc53e47ce5738bd8abb7981c77e8406ece6b502f32f8bcf459903de601e"
-dependencies = [
- "tokio",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1061,7 +1052,6 @@ dependencies = [
  "fast-socks5",
  "foldhash",
  "futures-util",
- "happy-eyeballs",
  "hickory-resolver",
  "ipnet",
  "metrics",

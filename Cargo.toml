@@ -179,11 +179,11 @@ mimalloc = "0.1"
 # client reconnect loop (`bin/myquic2-client/auth.rs`). `std` only: only the
 # `Backoff` iterator is used, sleeps stay `tokio::time::sleep`.
 backon = { version = "1.6.0", default-features = false, features = ["std"] }
-# happy-eyeballs: RFC 8305 staggered racing replaces the hand-rolled
-# `JoinSet` + `watch` cancellation in `server/tcp.rs::dial_happy_eyeballs`.
-# `tokio` only: `happy_eyeballs::tokio::connect` + a 4 s `timeout` budget.
-# Filtering (`allow_private`) and the 8-candidate cap stay in our code.
-happy-eyeballs = { version = "0.2.1", default-features = false, features = ["tokio"] }
+# (no happy-eyeballs dependency: `server/tcp.rs::race_dial` races the
+# candidates in the caller's `dns_ip_preference` order and advances on a failed
+# attempt instead of on the 250 ms tick. The crate's `tokio::connect`
+# re-partitioned the list v6-first and waited out the stagger after a failure,
+# which cost every TCP flow the stagger on a network with a broken v6 route.)
 # fast-socks5 (MIT): `consts` (VER/CMD/ATYP/REP) replace the hand-written
 # SOCKS5 magic numbers in `bin/myquic2-client/socks.rs`. Framing only: the
 # ASSOCIATE leniency and optimistic CONNECT timing stay hand-rolled.

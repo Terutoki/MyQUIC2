@@ -283,21 +283,26 @@ pub(crate) async fn read_mqp_target(
     Ok(TargetAddr::decode(&buf[..len])?.0)
 }
 
+/// Stagger between successive attempts of one dial (RFC 8305's 250 ms).
+///
+/// This is what bounds a *silently dropped* first attempt: the next candidate
+/// starts when it elapses, so a connect that never answers costs the stagger
+/// rather than the whole budget. An attempt that fails outright does not wait
+/// for it — see [`race_dial`].
+const DIAL_STAGGER: Duration = Duration::from_millis(250);
+
+/// Total wall for one dial. The client-side ACK wait is sized to cover it.
+const DIAL_BUDGET: Duration = Duration::from_secs(4);
+
 /// Connect to the first candidate that succeeds.
 ///
 /// `cands` is borrowed so the IP-literal path allocates nothing. Filtering
-/// (`allow_private`) and the 8-candidate cap stay here; the staggered
-/// alternating-family racing itself is `happy-eyeballs` (RFC 8305, 250 ms
-/// stagger internally) instead of the hand-rolled `JoinSet` + `watch`
-/// cancellation. Total budget 4 s is kept via `timeout` so the client-side ACK
-/// wait still covers it.
+/// (`allow_private`) and the 8-candidate cap stay here; the racing itself is
+/// [`race_dial`], in the caller's order. Total budget [`DIAL_BUDGET`] so the
+/// client-side ACK wait still covers it.
 ///
-/// Single-candidate fast path: IP-literal targets (the dominant case, and the
-/// reason the old hand-rolled version special-cased them) get one direct
-/// connect — no `lookup_host` clone, no partition/merge `Vec`s, no `JoinSet`,
-/// no attempt/delay task spawns. The crate is only consulted when there is
-/// actually a race to run; delegating the single case to it re-introduced
-/// several allocations and two task spawns per TCP flow for nothing.
+/// Single-candidate fast path: IP-literal targets (the dominant case) get one
+/// direct connect — no `JoinSet`, no attempt/delay task spawns, no timer.
 ///
 /// Socket options are the **caller's**: `handle_tcp_stream` calls
 /// [`myquic2::linux::tune_relay_tcp`] once on the returned socket. This function
@@ -305,10 +310,12 @@ pub(crate) async fn read_mqp_target(
 /// twice — and the single-candidate arm (every IP-literal flow) tuned a socket
 /// before it had even been returned. One owner, one tuning.
 ///
-/// Note: `happy-eyeballs` re-interleaves v6/v4 (v6-first per RFC 8305) after
-/// `lookup_host`, so a `dns_ip_preference = "ipv4"` deployment still resolves
-/// v4-first but races v6-first. That matches the RFC default; strict v4-first
-/// racing would need input-order racing instead of this crate.
+/// This used to delegate the race to `happy-eyeballs`, which re-partitioned the
+/// list v6-first after `lookup_host` and re-interleaved it, so a
+/// `dns_ip_preference = "ipv4"` deployment resolved v4-first and then raced
+/// v6-first on every flow; and it waited out the 250 ms stagger even when the
+/// attempt it was waiting on had already failed, so an unreachable v6 route cost
+/// the stagger before the working v4 candidate was even tried.
 pub(crate) async fn dial_happy_eyeballs(
     cands: &[SocketAddr],
     allow_private: bool,
@@ -326,28 +333,152 @@ pub(crate) async fn dial_happy_eyeballs(
             break;
         }
     }
-    if n == 0 {
-        return None;
+    match n {
+        0 => None,
+        1 => tokio::time::timeout(DIAL_BUDGET, connect_attempt(accept[0]))
+            .await
+            .ok()
+            .flatten(),
+        _ => tokio::time::timeout(DIAL_BUDGET, race_dial(&accept[..n]))
+            .await
+            .ok()
+            .flatten(),
     }
-    if let [only] = &accept[..n] {
-        return match tokio::time::timeout(
-            Duration::from_secs(4),
-            tokio::net::TcpStream::connect(*only),
-        )
-        .await
-        {
-            Ok(Ok(s)) => Some(s),
-            _ => None,
-        };
+}
+
+/// One connection attempt. Any failure is just "not this candidate": the dial
+/// only needs a winner, and the caller's reset code does not depend on why.
+async fn connect_attempt(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
+    tokio::net::TcpStream::connect(addr).await.ok()
+}
+
+/// Race the candidates in the order the caller produced them, one new attempt
+/// per [`DIAL_STAGGER`] — plus a new attempt the moment one fails.
+///
+/// The order is the caller's, not RFC 8305's v6-first re-interleave: `cands`
+/// comes from a `dns_ip_preference`-sorted answer (see the alternating-family
+/// fill in `handle_tcp_stream`), so the first entry is the family the operator
+/// asked to try first. Racing in that order is what makes the preference mean
+/// something on the wire.
+///
+/// Advancing on failure instead of on the tick is the latency point of this
+/// function: a refused or unroutable connect fails in microseconds-to-
+/// milliseconds, and waiting out the remaining stagger for a candidate that has
+/// already answered "no" adds that delay to every new flow on a broken route.
+///
+/// The winner is the earliest candidate to connect, regardless of which family
+/// it is; returning drops the set (and so cancels the surviving attempts, whose
+/// half-open sockets close with their futures).
+async fn race_dial(cands: &[SocketAddr]) -> Option<tokio::net::TcpStream> {
+    debug_assert!(cands.len() > 1);
+    let mut attempts: tokio::task::JoinSet<Option<tokio::net::TcpStream>> =
+        tokio::task::JoinSet::new();
+    let mut next = 0;
+    attempts.spawn(connect_attempt(cands[0]));
+    next += 1;
+    loop {
+        tokio::select! {
+            biased;
+            joined = attempts.join_next(), if !attempts.is_empty() => {
+                // Success wins the race; anything else (a failure, or a
+                // panicked attempt) just frees the slot.
+                if let Some(Ok(Some(stream))) = joined {
+                    return Some(stream);
+                }
+            }
+            // The stagger elapsed: widen the race by one candidate.
+            () = tokio::time::sleep(DIAL_STAGGER), if next < cands.len() => {}
+            else => return None,
+        }
+        if next == cands.len() && attempts.is_empty() {
+            return None;
+        }
+        if next < cands.len() {
+            attempts.spawn(connect_attempt(cands[next]));
+            next += 1;
+        }
     }
-    // Total budget 4s; the client-side ACK wait is sized to cover it.
-    let res = tokio::time::timeout(
-        Duration::from_secs(4),
-        happy_eyeballs::tokio::connect(&accept[..n]),
-    )
-    .await;
-    match res {
-        Ok(Ok(s)) => Some(s),
-        _ => None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loopback port nothing listens on: port 1 needs root to bind, so a
+    /// `connect` there is refused immediately and deterministically.
+    fn refused_addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 1))
+    }
+
+    /// The latency point of the in-house race: an attempt that failed must not
+    /// keep the next candidate waiting out the stagger. A refused v6 route (or a
+    /// closed port) answers in microseconds; the old delegation to
+    /// `happy-eyeballs` still waited the 250 ms tick before trying the next
+    /// address, which every new flow on such a network paid.
+    #[tokio::test]
+    async fn a_failed_attempt_advances_without_waiting_the_stagger() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let started = std::time::Instant::now();
+        let stream = race_dial(&[refused_addr(), live])
+            .await
+            .expect("the live candidate must connect");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            live,
+            "the winner must be the candidate that actually accepted"
+        );
+        assert!(
+            elapsed < DIAL_STAGGER,
+            "a refused attempt must advance immediately, took {elapsed:?}"
+        );
+    }
+
+    /// Racing order is the caller's (a `dns_ip_preference`-sorted list), so the
+    /// first candidate that can accept wins; the second is only started after
+    /// the stagger, which this pins by requiring the first.
+    #[tokio::test]
+    async fn the_first_candidate_to_accept_wins() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (a, b) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+        let stream = race_dial(&[a, b]).await.expect("one of them must connect");
+        assert_eq!(stream.peer_addr().unwrap(), a);
+    }
+
+    /// The single-candidate arm (every IP-literal flow) is one direct connect
+    /// with the shared 4 s budget: no `JoinSet`, no stagger, no extra task.
+    #[tokio::test]
+    async fn a_single_candidate_is_one_direct_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let stream = dial_happy_eyeballs(&[live], true)
+            .await
+            .expect("a live single candidate must connect");
+        assert_eq!(stream.peer_addr().unwrap(), live);
+
+        let started = std::time::Instant::now();
+        assert!(dial_happy_eyeballs(&[refused_addr()], true).await.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a refused single candidate must fail without the budget"
+        );
+    }
+
+    /// The SSRF filter runs before any attempt, for both arms: a private
+    /// address with `allow_private = false` produces no candidate at all (and so
+    /// no socket).
+    #[tokio::test]
+    async fn a_private_candidate_is_not_dialled_without_permission() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let private = listener.local_addr().unwrap();
+        assert!(dial_happy_eyeballs(&[private], false).await.is_none());
+        assert!(
+            dial_happy_eyeballs(&[private, private], false)
+                .await
+                .is_none(),
+            "the cap is applied after the filter, so both candidates must be gone"
+        );
     }
 }

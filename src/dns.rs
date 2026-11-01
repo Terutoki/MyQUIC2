@@ -18,5 +18,7 @@ pub use resolve::{
     lookup_cached_fast_with_ttl, lookup_cached_sync, resolve_all, resolve_all_cached,
     resolve_server_addr, resolve_server_side, set_ip_preference,
 };
-pub(crate) use store::{DNS_CACHE_MAX, DNS_NEG_MAX, DNS_NEG_TTL, negatives, positives};
+pub(crate) use store::{
+    DNS_CACHE_MAX, DNS_NEG_MAX, DNS_NEG_TTL, DNS_STALE_WINDOW, negatives, positives,
+};
 pub use store::{DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT};

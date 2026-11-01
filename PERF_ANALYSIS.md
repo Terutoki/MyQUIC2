@@ -1307,3 +1307,144 @@ The end-to-end effect is bounded by how often the memo probe is on the hot path 
 fast-table pin never reaches it, so the gain shows up on new flows, pin refreshes and cache turns, not on a steady
 `udpdomain` run. The §13 caveat applies unchanged: `hotpath_bench` is the instrument for end-to-end claims, and this
 batch did not run it.
+
+## 15. Ninth Batch: DNS latency — a retry budget that could not retry, a TTL cliff, and a dial that waited on its own stagger (2026-11-01, post-18d8ace)
+
+The eighth batch made the DNS path cheap per packet. This one is about the per-*flow* latency that remains once the
+probe is cheap: where a lookup has to happen at all, how long its worst case is, and how its answer is used. Three
+findings, in the order of how much client-visible time they cost.
+
+The starting point is that the obvious levers were already in place: A and AAAA are queried in parallel
+(`LookupIpStrategy` defaults to `Ipv6AndIpv4`), nameservers are hedged (`num_concurrent_reqs` defaults to 2), and the
+sync probe is ~30 ns. The remaining latency was not in the resolver; it was in three places around it.
+
+### 15.1 B1 — the configured retries could never run
+
+`hickory`'s `ResolverOpts` defaults are `timeout = 5 s` with `attempts = 2`, and `DNS_LOOKUP_TIMEOUT` is also 5 s. The
+two budgets were the same number, so the first attempt was allowed to consume the whole wall and the retries the
+resolver had been configured to make were dead code: one lost UDP datagram cost the client the full 5 s, and a name
+server that would have answered on the second try never got a second try.
+
+`attempts` is hickory's count of *additional* tries (`RetryDnsHandle`, `hickory-net-0.26.1/src/xfer/retry_dns_handle.rs`:
+`NoRecordsFound`/`NoConnections` are not retried, `Busy` is retried without decrementing, everything else decrements
+and re-sends). The budget is now derived from the wall instead of set beside it:
+
+| constant | value | role |
+| --- | --- | --- |
+| `DNS_QUERY_TIMEOUT` (`src/dns/store.rs:178-179`) | 1.5 s | one attempt, retransmissions included |
+| `DNS_LOOKUP_ATTEMPTS` (`src/dns/store.rs:180`) | 2 | extra attempts |
+| `DNS_LOOKUP_TIMEOUT` (`src/dns/store.rs:161-162`) | 5 s | wall around the whole lookup, unchanged |
+
+A `const _: () = assert!(...)` (`src/dns/store.rs:184-187`) now refuses to compile the pair if
+`DNS_QUERY_TIMEOUT × (1 + DNS_LOOKUP_ATTEMPTS)` does not fit inside the wall, and
+`hickory_response_cache_is_disabled_and_ttls_stay_bounded` pins both values plus that arithmetic. Worst case is
+unchanged at 4.5 s of attempts inside a 5 s wall; the case that changed is a *dropped* query, which now recovers at
+~1.5 s instead of failing at 5 s.
+
+### 15.2 A1/A2 — serve-stale and refresh, so a TTL expiry is a repair instead of a stall
+
+A positive entry lived exactly 120 s. One millisecond later the next datagram for that name had no answer to serve,
+and `forward_server_dgram`'s domain arm *holds* the datagram while a resolution runs: one upstream RTT behind the
+resolver's own upstream RTT, 10–50 ms on a good path and 100–300 ms over LTE/VPN — for an answer this process already
+had a moment earlier. Nothing about the old answer was wrong, either: it is the address the previous datagram was sent
+to.
+
+The store now separates **freshness** from **residency** (`src/dns/store.rs:63-96`):
+
+- `DNS_CACHE_TTL` (120 s) is the freshness deadline, unchanged, and is still what every layer above clamps against.
+- `DNS_STALE_WINDOW` (1 h) is how long past it an entry may still answer — RFC 8767's model. The moka TTL is
+  `TTL + window`, so the cache only evicts answers that cannot be served stale any more.
+- `DNS_STALE_MEMO_TTL` (1 s) is what a *stale* hit is memoized for in the per-thread memo. Short on purpose: the memo
+  is what lets the sync probe skip the async path, but the async path is the only place that can schedule a refresh,
+  so the packet path must come back within a second rather than for the entry's whole remaining window.
+
+`resolve_all_cached` serves the stale entry immediately and claims a refresh (`src/dns/resolve.rs:646-650`,
+`request_refresh`/`refresh_positive` at `src/dns/resolve.rs:834-900`):
+
+- one refresh per name at a time, process-wide (`RefreshClaim`, an `Arc<str>` in a `parking_lot::Mutex<HashSet>`,
+  released by `Drop` so a cancelled task cannot wedge the name);
+- background refreshes draw from **their own** permit pool (`DNS_REFRESH_PERMITS = 256`,
+  `src/dns/resolve.rs:451-456`), never from `dns_slow_path_limiter`: a burst of expired entries must not consume the
+  admission budget of the datagrams that have no answer at all. (The first draft reused the slow-path pool; the
+  existing `slow_path_limiter_has_the_charged_permit_count` test caught it as a 1023-vs-1024 flake, which is the same
+  signal admission accounting would have seen.)
+- a failed refresh writes **no** negative entry: the name demonstrably resolves — we are serving its own previous
+  answer — and a refusal would both flip the sync path's memo to `Negative` for a working name and break the
+  positive/negative disjointness the caches are built on. The stale entry keeps serving and the next stale hit retries.
+- a successful refresh replaces the entry with a fresh one, removes any negative entry and bumps the epoch, exactly
+  like a foreground success. If a foreground resolution refreshed the entry while the background lookup was in flight,
+  the background write is skipped so the insertion instant stays monotone.
+
+The refresh path cannot use the positive cache's `try_get_with` single flight: a present (stale) entry is a *hit*, so
+that call would hand back the stale value instead of running the init. That is why the claim set exists rather than a
+second cache or a sentinel — one cache, one entry, one refresh.
+
+### 15.3 C1 — the dial no longer waits on its own stagger
+
+`dial_happy_eyeballs` (`src/bin/myquic2-server/tcp.rs:319-401`) used to delegate the race to `happy-eyeballs 0.2.1`,
+which cost more than it saved:
+
+- Its `tokio::connect` re-partitioned the address list v6-first and re-interleaved it, so a
+  `dns_ip_preference = "ipv4"` deployment resolved v4-first and then raced v6-first — the preference stopped meaning
+  anything on the wire.
+- It held `CONNECTION_ATTEMPT_DELAY = 250 ms` as a hard-coded stagger and, after an attempt *failed*, kept waiting for
+  the delay task (`Ok(Err(_)) => error.get_or_insert(e)` then continues). A refused or unroutable first candidate —
+  which answers in microseconds — therefore cost every new TCP flow the full 250 ms before the second candidate was
+  even tried. On a network that advertises AAAA but cannot route v6, that is more than the DNS lookup itself.
+
+`race_dial` (`src/bin/myquic2-server/tcp.rs:372-401`) keeps the caller's order (which is the
+`dns_ip_preference`-sorted, family-alternating list `handle_tcp_stream` builds) and starts the next candidate
+**immediately when one fails**, keeping the 250 ms stagger only for candidates that have not been reached yet. The
+single-candidate arm (every IP-literal flow) is unchanged: one direct connect under the same 4 s budget. The
+dependency is gone (`Cargo.toml:182-186` records why), so the crate's re-interleaving cannot come back.
+
+New tests (`src/bin/myquic2-server/tcp.rs:404-484`): `a_failed_attempt_advances_without_waiting_the_stagger` (refused
+port first, live listener second: must connect and must not spend the stagger — the old code failed this by
+construction), `the_first_candidate_to_accept_wins` (order is the caller's), `a_single_candidate_is_one_direct_connect`
+(and a refused single candidate fails without the budget), `a_private_candidate_is_not_dialled_without_permission`
+(the SSRF filter runs before any attempt, on both arms).
+
+### 15.4 New tests for the stale path
+
+All deterministic, no network (the seeded host is an IP literal, so the background re-resolve runs hickory's literal
+path): `positive_life_splits_fresh_from_stale_at_the_ttl` (the boundary is the deadline, not the residency),
+`a_stale_entry_is_served_and_refreshed` (served from the entry; the memo life is the stale life, not the TTL; the
+entry's insertion instant moves only once the refresh lands), `a_fresh_entry_does_not_schedule_a_refresh` (eight fresh
+hits leave the entry byte-identical).
+
+### 15.5 Examined and deliberately not changed
+
+- **A3, per-record TTLs** instead of the flat 120 s: the right long-term shape (a 300 s CDN record is re-resolved 2–5×
+  more than needed, a 30 s record is over-cached), but it changes the value type of both caches and every clamp above
+  them. Serve-stale removes the *latency* of a re-resolution, which is the part this batch was for; the query-rate part
+  is a separate change.
+- **A4, building the resolver at startup**: `upstream_resolver` is a `OnceLock`, so `builder_tokio()` runs inside the
+  first lookup, synchronously on a tokio worker (the macOS SystemConfiguration read is ms-scale). Warming it from
+  `spawn_blocking` at startup is a few lines, but it needs a startup hook the server binary does not currently have for
+  DNS, and it does not touch steady-state latency.
+- **B2, search-list RTTs**: hickory's `ndots` default and the resolv.conf search list make a single-label name walk the
+  suffixes sequentially. A `ndots = 0`/FQDN mode for strict SOCKS semantics is a behaviour change (LAN short names stop
+  resolving), not a pure win.
+- **C2, no happy-eyeballs for UDP**: `forward_server_dgram` takes the first address that passes the filter and pins it
+  for 30 s. A dead first address costs the application's retransmit timer, and `FlowBinding::resolved` already holds
+  the whole list — but racing datagrams means duplicating sends, and per-datagram duplication is exactly the cost this
+  design removed.
+- **C3, parking concurrent datagrams on an in-flight resolution** instead of refusing them (DnsGate `InFlight`): the
+  right fix, but it changes the gate's ownership model and needs a per-target broadcast, not a counter.
+- **D1, resolving in parallel with the first QUIC packet** (client-side hint): a wire change (rev4), and it trades
+  split-horizon/VPN correctness for one RTT.
+
+### 15.6 Verification
+
+`cargo fmt --all --check` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test --all-targets` **739 passed / 0 failed / 1 ignored** (lib 371, client 199, server 153, `forward_e2e` 7,
+`rev3_e2e` 9).
+
+### 15.7 What this does not establish
+
+The stale-path and retry changes are verified by behaviour, not by a latency microbenchmark: the stale hit's cost is a
+moka hit, a mutex-guarded claim and one task spawn, and the path it replaces is bounded below by one upstream query
+RTT, so the direction is unambiguous but the milliseconds are field numbers. Serve-stale also does not make a *wrong*
+answer diagnosable from the outside: a stale answer is indistinguishable from a fresh one at the API. The instrument
+for end-to-end p50/p99 remains `hotpath_bench udpdomain` (the only mode that exercises the relay DNS path), which this
+batch did not run; `examples/dns_probe_bench.rs` measures the probe function only and is unaffected by this batch.
