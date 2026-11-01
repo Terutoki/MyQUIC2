@@ -524,7 +524,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | Flow registry | 4096 live flows per connection | send: `INLINE` fallback; receive: `FLOW_REJECT(table_full)` |
 | Flows per session | 64 | same fallback/reject path |
 | Resolved addresses | 16 per flow | DNS result truncation |
-| DNS positive cache | 10,240 names x at most 32 retained addresses (120 s) | entry-capped moka; per-name address-set cap (`DNS_CACHE_MAX_ADDRS`) so a hostile multi-record answer cannot grow the cache |
+| DNS positive cache | 10,240 names x at most 32 retained addresses (each answer's own TTL, clamped to 10-300 s) | entry-capped moka; per-name address-set cap (`DNS_CACHE_MAX_ADDRS`) so a hostile multi-record answer cannot grow the cache; a past-TTL entry is still served for up to an hour while a background refresh runs (RFC 8767) |
 | Pending DNS opens | 16 | admission gate on the domain slow path |
 | `TRAIN` | 64 items | packer and decoder |
 | Stager | 1,024 items / 256 KiB per connection | enqueue admission |
@@ -2013,7 +2013,7 @@ flowchart TB
         HC["handle_conn<br/>sweep 60 s<br/>uni drain · reader"]
         R["DATAGRAM reader<br/>await head · drain 32<br/>FastSess 16 · reassembler"]
         F{"target form?"}
-        DN["📌 domain<br/>ConnPin → DestMemo 30 s<br/>→ moka 120 s → hickory 5 s"]
+        DN["📌 domain<br/>ConnPin → DestMemo 30 s<br/>→ moka record TTL → hickory 5 s"]
         SS["🛡️ IP gate<br/>is_global_ip_cached<br/>allow_private"]
         HC --> R --> F
         F -->|"domain"| DN
@@ -2102,7 +2102,7 @@ flowchart LR
     accTitle: Resolver cache ladder
     accDescr: Resolution falls from the thread-local memo to the shared moka cache and then to hickory, before the address passes the SSRF gate.
     Q(["🌐 host + port"]) --> TM["🔥 thread memo<br/>64 sets × 2 ways"]
-    TM -->|"miss"| MK["☁️ moka shared<br/>host key · 120 s / 10 s"]
+    TM -->|"miss"| MK["☁️ moka shared<br/>host key · TTL 10-300 s / neg 10 s"]
     MK -->|"miss"| H["📡 hickory<br/>5 s · cancellable"]
     H --> C["🎯 A / AAAA"]
     C --> P["🛡️ SSRF / ipnet"]

@@ -96,6 +96,11 @@ async fn main() -> Result<()> {
     // Warm the quanta clock (one-time lazy calibration, worst case ~200 ms)
     // and start its upkeep thread before the first packet can pay for either.
     let _ = coarse_millis();
+    // Build the upstream resolver before the first datagram (so no lookup pays
+    // for reading the platform configuration) and keep watching that
+    // configuration, so a Wi-Fi/VPN/DHCP nameserver change is picked up instead
+    // of being burned into the process for its whole lifetime.
+    spawn_resolver_watch();
     let a = Args::parse();
     let c: ServerConf = load_toml(&a.config)?;
     // Wire revision: validate the `wire_rev`/ALPN pair before any socket or

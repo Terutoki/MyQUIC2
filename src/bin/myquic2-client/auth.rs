@@ -55,14 +55,23 @@ pub(crate) fn spawn_conn_loop(
     egress: std::sync::Arc<super::egress::SharedEgress>,
 ) {
     tokio::spawn(async move {
+        // Addresses tried per dial attempt before this iteration is given up as
+        // failed. Three covers the ordinary cases (v4 only, v6 only, both) plus
+        // one spare without letting a black-holed endpoint burn a whole backoff
+        // window on a long candidate list.
+        const DIAL_ADDR_CANDIDATES: usize = 3;
         // 0-RTT phase handle of this slot's current generation: `dial_once`
         // resets and advances it, and the TCP open path reads it to retry an
         // early stream after a 0-RTT rejection.
         let zero_rtt = slot.zero_rtt_state();
         let mut backoff = reconnect_backoff();
+        // The address that carried the previous connection. Put it first on the
+        // next attempt: after a network change the preference order may still
+        // name the family that was just proven dead.
+        let mut last_good: Option<SocketAddr> = None;
         loop {
-            let server: SocketAddr = match resolve_server_addr(&server_str).await {
-                Ok(a) => a,
+            let candidates = match resolve_server_addrs(&server_str, DIAL_ADDR_CANDIDATES).await {
+                Ok(v) => prefer_last_good(v, last_good),
                 Err(e) => {
                     let wait = backoff.next().unwrap_or(Duration::from_secs(5))
                         + Duration::from_millis(jitter_ms());
@@ -71,8 +80,9 @@ pub(crate) fn spawn_conn_loop(
                     continue;
                 }
             };
-            match dial_once(&ep, &cfg, server, &sname, &auth, &zero_rtt).await {
-                Ok(conn) => {
+            match dial_candidates(&ep, &cfg, &candidates, &sname, &auth, &zero_rtt).await {
+                Ok((server, conn)) => {
+                    last_good = Some(server);
                     info!("QUIC connected to {server}");
                     // MQP-3 connection state is created per dial for the
                     // configured wire revision (`wire_rev` + ALPN, fixed for
@@ -247,7 +257,7 @@ pub(crate) fn spawn_conn_loop(
                 Err(e) => {
                     let wait = backoff.next().unwrap_or(Duration::from_secs(5))
                         + Duration::from_millis(jitter_ms());
-                    warn!("dial {server} failed: {e:#}; retry in {wait:?}");
+                    warn!("dial {server_str} failed: {e:#}; retry in {wait:?}");
                     tokio::time::sleep(wait).await;
                 }
             }
@@ -328,6 +338,55 @@ pub(crate) fn retire_dead_slot(
 /// first attempt that lands after a server restart succeed instead of waiting
 /// out the previous attempt's timeout.
 pub(crate) const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Put the address that carried the previous connection first, keeping every
+/// other candidate in the resolver's preference order.
+///
+/// Reconnect attempts used to re-race the same single address forever. The
+/// address that worked last is the cheapest possible hint for the next attempt,
+/// and it is the only thing that survives a network change where the recorded
+/// preference (say "IPv6 first") still names a family that is now unroutable.
+pub(crate) fn prefer_last_good(
+    mut addrs: Vec<SocketAddr>,
+    last: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if let Some(last) = last
+        && let Some(i) = addrs.iter().position(|a| *a == last)
+        && i != 0
+    {
+        addrs.remove(i);
+        addrs.insert(0, last);
+    }
+    addrs
+}
+
+/// Dial the first candidate that answers, in order.
+///
+/// One failure is not the iteration's failure: a dead first address (an AAAA
+/// record on a network without a v6 route is the common case) must not cost the
+/// client the 5 s attempt budget *and* the backoff that follows. Every failed
+/// candidate is logged at debug; the last error is returned, so the caller's
+/// `warn!` still names the reason the iteration failed.
+async fn dial_candidates(
+    ep: &quinn::Endpoint,
+    cfg: &quinn::ClientConfig,
+    candidates: &[SocketAddr],
+    sname: &str,
+    auth: &str,
+    zero_rtt: &Arc<ZeroRttState>,
+) -> anyhow::Result<(SocketAddr, quinn::Connection)> {
+    let mut last_err = None;
+    for &server in candidates {
+        match dial_once(ep, cfg, server, sname, auth, zero_rtt).await {
+            Ok(conn) => return Ok((server, conn)),
+            Err(e) => {
+                tracing::debug!("dial {server} failed ({e:#}); trying the next address");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no server address to dial")))
+}
 
 /// Confirm that a freshly dialed connection is actually alive before it is
 /// published to the shared slot.

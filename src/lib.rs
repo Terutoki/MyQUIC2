@@ -107,15 +107,16 @@ pub use dns::{
     dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed, dns_slow_path_limiter,
     ip_preference, is_global_ip, lookup_cached_fast, lookup_cached_fast_with_ttl,
     lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached, resolve_server_addr,
-    resolve_server_side, set_ip_preference, unmap,
+    resolve_server_addrs, resolve_server_side, set_ip_preference, spawn_resolver_watch, unmap,
 };
 /// Test-only compatibility surface: the unit tests below address the moved
 /// DNS internals through the crate root (`use super::*`).
 #[allow(unused_imports)]
 pub(crate) use dns::{
-    DNS_CACHE_MAX, DNS_KEY_BUF, DNS_MEMO, DNS_NEG_MAX, DNS_NEG_TTL, DNS_STALE_WINDOW, DnsMemoSlot,
-    MEMO_KEY_BYTES, MEMO_SETS, MEMO_WAYS, bump_neg_epoch, dns_key, dns_key_owned, dns_memo_hash,
-    dns_memo_set, memo_peek_both, memo_put, neg_epoch, negatives, positives,
+    DNS_CACHE_MAX, DNS_KEY_BUF, DNS_MEMO, DNS_NEG_MAX, DNS_NEG_TTL, DNS_RECORD_TTL_MAX,
+    DNS_STALE_WINDOW, DnsMemoSlot, MEMO_KEY_BYTES, MEMO_SETS, MEMO_WAYS, bump_neg_epoch, dns_key,
+    dns_key_owned, dns_memo_hash, dns_memo_set, memo_peek_both, memo_put, neg_epoch, negatives,
+    positives,
 };
 pub use stats::drops::dgram_drops;
 pub use stats::udp_stats::{self, UdpSnapshot};
@@ -3359,8 +3360,9 @@ mod tests {
         );
         assert_eq!(
             positives().policy().time_to_live(),
-            Some(Duration::from_millis(DNS_CACHE_TTL_MS) + DNS_STALE_WINDOW),
-            "a positive entry outlives its freshness deadline by exactly the stale window"
+            Some(DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW),
+            "a positive entry outlives its freshness deadline by exactly the stale window; \
+             the longest deadline any answer can have is the record-TTL cap"
         );
         assert_eq!(negatives().policy().time_to_live(), Some(DNS_NEG_TTL));
     }

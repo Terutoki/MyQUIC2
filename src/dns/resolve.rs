@@ -57,8 +57,9 @@ use super::key::{
 };
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, memo_put_with_epoch, neg_epoch};
 use super::store::{
-    DNS_CACHE_MAX_ADDRS, DNS_CACHE_TTL, DNS_INCONCLUSIVE_TTL, DNS_LOOKUP_ATTEMPTS,
-    DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, DNS_QUERY_TIMEOUT, DNS_STALE_MEMO_TTL, negatives, positives,
+    DNS_CACHE_MAX, DNS_CACHE_MAX_ADDRS, DNS_CACHE_TTL, DNS_INCONCLUSIVE_TTL, DNS_LOOKUP_ATTEMPTS,
+    DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, DNS_QUERY_TIMEOUT, DNS_RECORD_TTL_MAX, DNS_RECORD_TTL_MIN,
+    DNS_STALE_MEMO_TTL, DNS_STALE_WINDOW, negatives, positives,
 };
 use crate::coarse_millis;
 
@@ -150,13 +151,14 @@ pub async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
 /// Uncached `(host, port)` resolution: the upstream lookup plus the caller's
 /// port attached to every address.
 ///
-/// This is the path for callers that must not be served a cached answer (the
-/// client's `server_addr` dial) and for [`resolve_server_addr`]. The shared
-/// caches only ever hold port-free addresses, so this composes the same
-/// [`resolve_ips`] primitive the cache-fill path uses and materializes the
-/// caller's port on the way out.
+/// This is the path for callers that must not be served a cached answer
+/// ([`resolve_all`]), and it is what the client's endpoint resolution used
+/// before it moved onto the cache (see [`resolve_server_addrs`]). The shared caches only
+/// ever hold port-free addresses, so this composes the same [`resolve_ips`]
+/// primitive the cache-fill path uses and materializes the caller's port on the
+/// way out.
 async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>> {
-    let ips = resolve_ips(host, port, timeout)
+    let (ips, _) = resolve_ips(host, port, timeout)
         .await
         .map_err(LookupFailure::into_error)?;
     let mut addrs: Vec<SocketAddr> = ips
@@ -229,8 +231,33 @@ impl std::fmt::Display for LookupFailure {
     }
 }
 
+/// The name to hand hickory for `host`: fully qualified when the target is
+/// already a dotted name, untouched otherwise.
+///
+/// hickory tries the bare name first when it has more labels than `ndots`
+/// (default 1), so a *successful* lookup of a dotted target costs one query
+/// either way. The difference is the failure path: a relative name then walks
+/// the whole resolv.conf search list, one serial round trip per suffix, before
+/// the NXDOMAIN that produces the negative verdict. For a strict SOCKS target
+/// the search list is never what was meant — `no-such-host.example.com` should
+/// not become `no-such-host.example.com.corp.example` — so the dotted form is
+/// both faster and more correct.
+///
+/// A single-label target (`intranet`, `printer`) keeps the search list: that is
+/// the only way a short LAN name resolves at all. IP literals are left alone —
+/// `lookup_ip` returns them without a query, and a trailing dot would make the
+/// literal unparseable.
+fn query_name(host: &str) -> std::borrow::Cow<'_, str> {
+    let dotted = host.contains('.');
+    if dotted && !host.ends_with('.') && host.parse::<IpAddr>().is_err() {
+        std::borrow::Cow::Owned(format!("{host}."))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 /// Resolve just the addresses of `host` — no port — in the resolver's own
-/// order.
+/// order, together with the TTL the answer asked to be cached for.
 ///
 /// This is the upstream primitive behind both the uncached resolution path and
 /// the host-keyed positive cache's init future: A/AAAA answers are independent
@@ -240,19 +267,35 @@ impl std::fmt::Display for LookupFailure {
 /// `SocketAddr`s for the uncached path, `IpAddr`s before the cache insert — so
 /// a cache hit always hands back a set in the same family order a fresh
 /// resolution would.
+///
+/// The query is made fully qualified whenever the target already carries a dot
+/// (see [`query_name`]): a search-list walk after a failure is one serial round
+/// trip per suffix, and the failures are exactly the lookups whose cost the
+/// negative cache's 10 s verdict is supposed to hide.
 async fn resolve_ips(
     host: &str,
     port: u16,
     timeout: Duration,
-) -> std::result::Result<Vec<IpAddr>, LookupFailure> {
-    let ips = tokio::time::timeout(timeout, async {
-        let ips: Vec<IpAddr> = match upstream_resolver() {
+) -> std::result::Result<(Vec<IpAddr>, Duration), LookupFailure> {
+    let query = query_name(host);
+    let (ips, ttl) = tokio::time::timeout(timeout, async {
+        let (ips, ttl): (Vec<IpAddr>, Duration) = match upstream_resolver() {
             // The IP-literal case is handled inside `lookup_ip` directly, and
             // the system hosts file is consulted before any upstream query
-            // (`ResolveHosts::Auto` is the default), so `localhost` and other
-            // /etc/hosts entries keep resolving.
-            Ok(r) => match r.lookup_ip(host).await {
-                Ok(lookup) => lookup.iter().collect(),
+            // (`ResolveHosts::Auto` is the default; it compares against
+            // fully-qualified keys, so the FQDN form below still matches
+            // `/etc/hosts`), so `localhost` and other hosts entries keep
+            // resolving.
+            Ok(r) => match r.lookup_ip(query.as_ref()).await {
+                Ok(lookup) => {
+                    // The answer's own TTL — the minimum over its records, as
+                    // hickory computes it for `valid_until`. This is what the
+                    // name's owner asked us to cache for.
+                    let ttl = lookup
+                        .valid_until()
+                        .saturating_duration_since(Instant::now());
+                    (lookup.iter().collect(), ttl)
+                }
                 Err(e) => return Err(LookupFailure::from_resolver(e)),
             },
             // The platform DNS configuration could not be read (see
@@ -262,10 +305,12 @@ async fn resolve_ips(
             // the timeout wrapping this future (see [`getaddrinfo_ips`]).
             Err(why) => {
                 tracing::debug!("hickory resolver unavailable ({why}); using getaddrinfo");
-                getaddrinfo_ips(host, port).await?
+                // `getaddrinfo` reports no TTL: the documented default applies,
+                // clamped like any other answer.
+                (getaddrinfo_ips(host, port).await?, DNS_CACHE_TTL)
             }
         };
-        Ok::<Vec<IpAddr>, LookupFailure>(ips)
+        Ok::<(Vec<IpAddr>, Duration), LookupFailure>((ips, ttl))
     })
     .await
     .map_err(|_| {
@@ -273,7 +318,7 @@ async fn resolve_ips(
         // name's status is unknown, so this must never become a verdict.
         LookupFailure::Inconclusive(anyhow::anyhow!("dns lookup timed out after {timeout:?}"))
     })??;
-    Ok(ips)
+    Ok((ips, ttl))
 }
 
 /// Permits for the blocking `getaddrinfo` fallback.
@@ -361,14 +406,173 @@ async fn getaddrinfo_ips(host: &str, port: u16) -> std::result::Result<Vec<IpAdd
 /// Pure so the "hickory is not a second TTL authority" invariant is pinned by
 /// a unit test.
 fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts) {
-    opts.positive_max_ttl = Some(DNS_CACHE_TTL);
+    // hickory clamps the TTLs of every answer it returns to this window, even
+    // with its cache disabled (`ResponseCache::clamp_positive_ttls` rewrites the
+    // TTLs before the `Lookup` is built). The ceiling therefore has to be the
+    // store's own record-TTL cap, not the default 120 s window: with the old
+    // value the outer cache could never see a TTL above 120 s, so a name whose
+    // owner asked for 300 s was still re-resolved early.
+    opts.positive_max_ttl = Some(DNS_RECORD_TTL_MAX);
     opts.negative_max_ttl = Some(DNS_NEG_TTL);
     opts.cache_size = 0;
     opts.timeout = DNS_QUERY_TIMEOUT;
     opts.attempts = DNS_LOOKUP_ATTEMPTS;
 }
 
-/// Process-wide upstream resolver, built once from the platform's own DNS
+/// How often [`spawn_resolver_watch`] re-reads the platform's DNS
+/// configuration. Long enough to be free (one file read on Linux/OpenWrt, one
+/// dynamic-store query on macOS), short enough that a VPN coming up is picked
+/// up before the stale window it would otherwise hide behind.
+pub const RESOLVER_CONFIG_POLL: Duration = Duration::from_secs(30);
+
+/// One generation of the process-wide upstream resolver.
+struct ResolverGen {
+    /// `Err` is the do-not-use-hickory signal for the `getaddrinfo` fallback;
+    /// the reason is logged when the generation is built.
+    resolver: Result<std::sync::Arc<hickory_resolver::TokioResolver>, String>,
+    /// Nameserver addresses and search list this generation was built from, in
+    /// a form that compares cheaply. Empty when the platform configuration
+    /// could not be read at all.
+    fingerprint: Vec<String>,
+}
+
+impl ResolverGen {
+    fn error(reason: String, fingerprint: Vec<String>) -> Self {
+        tracing::warn!(
+            "hickory resolver init failed ({reason}); dns lookups fall back to getaddrinfo"
+        );
+        Self {
+            resolver: Err(reason),
+            fingerprint,
+        }
+    }
+}
+
+/// The platform configuration's nameservers and search list, as strings.
+///
+/// Only used to decide "did the network's DNS configuration change?", so it
+/// covers exactly what a rebuild would pick up: the servers a query is sent to
+/// and the suffixes a bare name is expanded with.
+fn config_fingerprint(config: &hickory_resolver::config::ResolverConfig) -> Vec<String> {
+    let mut f: Vec<String> = config
+        .name_servers()
+        .iter()
+        .map(|ns| ns.ip.to_string())
+        .collect();
+    if let Some(domain) = config.domain() {
+        f.push(domain.to_string().to_ascii_lowercase());
+    }
+    f.extend(
+        config
+            .search()
+            .iter()
+            .map(|name| name.to_string().to_ascii_lowercase()),
+    );
+    f
+}
+
+/// Read the platform configuration and build a resolver generation from it.
+///
+/// Blocking by design: reading the System Configuration dynamic store is a
+/// syscall plus a plist parse, and parsing `resolv.conf` touches the
+/// filesystem. Both callers (`spawn_resolver_watch` and the tests) run it off a
+/// runtime worker.
+fn build_resolver_gen() -> ResolverGen {
+    let (config, _options) = match hickory_resolver::system_conf::read_system_conf() {
+        Ok(pair) => pair,
+        Err(e) => return ResolverGen::error(e.to_string(), Vec::new()),
+    };
+    let fingerprint = config_fingerprint(&config);
+    tracing::info!(
+        nameservers = ?config
+            .name_servers()
+            .iter()
+            .map(|ns| ns.ip.to_string())
+            .collect::<Vec<_>>(),
+        domain = ?config.domain().map(|d| d.to_string()),
+        search = ?config
+            .search()
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>(),
+        "dns resolver configuration"
+    );
+    let mut builder = hickory_resolver::TokioResolver::builder_with_config(
+        config,
+        hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+    );
+    configure_resolver_options(builder.options_mut());
+    match builder.build() {
+        Ok(resolver) => ResolverGen {
+            resolver: Ok(std::sync::Arc::new(resolver)),
+            fingerprint,
+        },
+        Err(e) => ResolverGen::error(e.to_string(), fingerprint),
+    }
+}
+
+/// The current resolver generation (built on first access).
+///
+/// A plain `OnceLock` meant the resolver was built from whatever the platform
+/// configuration said *at the first lookup* and never re-read: after a Wi-Fi
+/// change, a VPN coming up or a DHCP renewal the process kept querying
+/// nameservers that were no longer reachable, and every cold name paid the full
+/// lookup budget until it gave up. Serve-stale then *hid* that failure behind
+/// its window. Now the generation is swappable and [`spawn_resolver_watch`]
+/// replaces it when the configuration changes.
+fn resolver_gen() -> &'static arc_swap::ArcSwap<ResolverGen> {
+    static GEN: std::sync::OnceLock<arc_swap::ArcSwap<ResolverGen>> = std::sync::OnceLock::new();
+    GEN.get_or_init(|| arc_swap::ArcSwap::from_pointee(build_resolver_gen()))
+}
+
+/// Warm the resolver and keep following the platform's DNS configuration.
+///
+/// Idempotent; the binaries call it once at startup. The first build runs in a
+/// blocking task, so the process's *first* lookup never pays for reading the
+/// platform configuration (nor blocks a worker doing it), and each poll
+/// compares the nameserver/search fingerprint before rebuilding — a rebuild is
+/// a new [`hickory_resolver::TokioResolver`], so lookups already in flight
+/// simply finish on the generation they started with.
+pub fn spawn_resolver_watch() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    tokio::spawn(async {
+        // Warm: build the first generation off the runtime.
+        if let Err(e) = tokio::task::spawn_blocking(|| {
+            let _ = resolver_gen().load();
+        })
+        .await
+        {
+            tracing::debug!("dns resolver warm-up task failed ({e})");
+        }
+        loop {
+            tokio::time::sleep(RESOLVER_CONFIG_POLL).await;
+            let fresh = tokio::task::spawn_blocking(|| {
+                hickory_resolver::system_conf::read_system_conf()
+                    .ok()
+                    .map(|(config, _)| config_fingerprint(&config))
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(fresh) = fresh else { continue };
+            if resolver_gen().load().fingerprint == fresh {
+                continue;
+            }
+            match tokio::task::spawn_blocking(build_resolver_gen).await {
+                Ok(next) => {
+                    tracing::info!("dns configuration changed; rebuilt the upstream resolver");
+                    resolver_gen().store(std::sync::Arc::new(next));
+                }
+                Err(e) => tracing::debug!("dns resolver rebuild task failed ({e})"),
+            }
+        }
+    });
+}
+
+/// Process-wide upstream resolver, built from the platform's own DNS
 /// configuration: resolv.conf on Linux/OpenWrt, the System Configuration
 /// dynamic store on macOS. Its lookups are cancellable async futures, so the
 /// `timeout` wrapper around the caller actually stops the work instead of
@@ -392,30 +596,12 @@ fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts)
 /// layer is also pure overhead here: it duplicates a lookup the outer cache
 /// already deduplicates, and its hits bypass the thread memo that the packet
 /// paths rely on to avoid even a cache probe.
-///
-/// `Err` is only the do-not-use-hickory signal for the fallback above; the
-/// reason is logged once, at construction.
-fn upstream_resolver() -> Result<&'static hickory_resolver::TokioResolver, &'static str> {
-    static RESOLVER: std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>> =
-        std::sync::OnceLock::new();
-    RESOLVER
-        .get_or_init(|| {
-            let built = hickory_resolver::TokioResolver::builder_tokio().and_then(|mut b| {
-                configure_resolver_options(b.options_mut());
-                b.build()
-            });
-            match built {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::warn!(
-                        "hickory resolver init failed ({e}); dns lookups fall back to getaddrinfo"
-                    );
-                    Err(e.to_string())
-                }
-            }
-        })
-        .as_ref()
-        .map_err(String::as_str)
+fn upstream_resolver() -> Result<std::sync::Arc<hickory_resolver::TokioResolver>, String> {
+    let generation = resolver_gen().load();
+    match &generation.resolver {
+        Ok(resolver) => Ok(std::sync::Arc::clone(resolver)),
+        Err(reason) => Err(reason.clone()),
+    }
 }
 
 /// Concurrent resolver waiters the DNS slow path admits process-wide.
@@ -585,14 +771,24 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 /// Whether a positive entry read from the store is still fresh, and if so how
 /// much life it has left.
 ///
-/// Answers from the entry's own insertion instant, never from a
-/// remaining-life query (moka has none for `time_to_live` caches): the cache
-/// keeps an entry for [`DNS_CACHE_TTL`] *plus* the stale window that lets it
-/// still answer after that, so "is it resident" and "is it fresh" stopped being
-/// the same question. `None` means stale — servable, but it owes a refresh.
-fn positive_life(inserted: Instant, now: Instant) -> Option<Duration> {
-    let deadline = inserted + DNS_CACHE_TTL;
+/// Answers from the entry's own freshness deadline, never from a remaining-life
+/// query (moka has none for `time_to_live` caches): the cache keeps an entry for
+/// the longest record TTL *plus* the stale window that lets it still answer
+/// after that, so "is it resident" and "is it fresh" stopped being the same
+/// question. `None` means stale — servable, but it owes a refresh.
+///
+/// The deadline comes from the answer itself ([`record_ttl`]), not from a flat
+/// constant: a 30 s-TTL name used to stay "fresh" for 120 s (stale data served
+/// as if current), and a 300 s-TTL name was re-resolved two to five times more
+/// often than its owner asked for.
+fn positive_life(deadline: Instant, now: Instant) -> Option<Duration> {
     (deadline > now).then(|| deadline - now)
+}
+
+/// The freshness window an answer may have: its own TTL, clamped to
+/// [`DNS_RECORD_TTL_MIN`]..[`DNS_RECORD_TTL_MAX`].
+fn record_ttl(ttl: Duration) -> Duration {
+    ttl.clamp(DNS_RECORD_TTL_MIN, DNS_RECORD_TTL_MAX)
 }
 
 /// `Err` covers three cases with distinct meanings for the caller: a live
@@ -643,11 +839,11 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // the stale-serving note on this function — with one addition: it owes a
     // background refresh, claimed here so a burst of datagrams for the same
     // expired name starts exactly one upstream query, not one per datagram.
-    if let Some((inserted, ips)) = positives().get(host_key).await {
-        if positive_life(inserted, Instant::now()).is_none() {
+    if let Some((deadline, ips)) = positives().get(host_key).await {
+        if positive_life(deadline, Instant::now()).is_none() {
             request_refresh(host_key, port);
         }
-        return Ok(materialize_cached(memo_key, inserted, &ips, port));
+        return Ok(materialize_cached(memo_key, deadline, &ips, port));
     }
     // The negative check comes before the single-flight machinery: a known-bad
     // name must be refused without spawning a resolution, and (unlike a
@@ -695,7 +891,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     let outcome = positives()
         .try_get_with_by_ref(host_key, async {
             match resolve_ips(host, port, DNS_LOOKUP_TIMEOUT).await {
-                Ok(ips) => {
+                Ok((ips, ttl)) => {
                     let now = Instant::now();
                     // The cache's invariant: every stored set is ordered with
                     // the configured preferred family first (the resolver's own
@@ -709,6 +905,10 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                     // bounds memory without changing which address leads.
                     let ips = prepare_cache_ips(ips);
                     let ips: Arc<[IpAddr]> = Arc::from(ips);
+                    // The entry's freshness deadline is the answer's own TTL,
+                    // clamped; the stale window is what makes it outlive that
+                    // deadline in the cache.
+                    let deadline = now + record_ttl(ttl);
                     // A success clears the negative entry (the name resolves
                     // now) and bumps the epoch so other threads' stale
                     // negative memos stop refusing. Done before returning, so
@@ -716,7 +916,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                     if negatives().remove(host_key).await.is_some() {
                         bump_neg_epoch();
                     }
-                    Ok((now, ips))
+                    Ok((deadline, ips))
                 }
                 Err(failure) => {
                     // Negatively cache the *name*, so every port of it is
@@ -740,7 +940,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         // The init owner and every single-flight waiter land here; the helper
         // also runs for the warm-hit arm above, so the port attachment and the
         // per-thread memo write can never drift between the two paths.
-        Ok((inserted, ips)) => Ok(materialize_cached(memo_key, inserted, &ips, port)),
+        Ok((deadline, ips)) => Ok(materialize_cached(memo_key, deadline, &ips, port)),
         Err(e) => Err(anyhow::anyhow!("{e}")),
     }
 }
@@ -781,10 +981,10 @@ fn prepare_cache_ips(mut ips: Vec<IpAddr>) -> Vec<IpAddr> {
 /// entry's remaining life (never extended); a **stale** entry is memoized for
 /// [`DNS_STALE_MEMO_TTL`] instead, which is what lets the packet path keep
 /// answering it while still returning to `resolve_all_cached` — the only place
-/// that can schedule the repair — once a second.
+/// that can schedule the repair — once per [`DNS_STALE_MEMO_TTL`].
 fn materialize_cached(
     memo_key: &str,
-    inserted: Instant,
+    deadline: Instant,
     ips: &[IpAddr],
     port: u16,
 ) -> Arc<[SocketAddr]> {
@@ -804,40 +1004,78 @@ fn materialize_cached(
         // the only one that can schedule the refresh. (Writing no memo for a
         // stale entry would put every datagram of an expired-but-served flow on
         // the resolver-task slow path.)
-        let deadline = match positive_life(inserted, now) {
+        let memo_deadline = match positive_life(deadline, now) {
             Some(life) => now + life,
-            None => now + DNS_STALE_MEMO_TTL,
+            None => {
+                // Never memoize past the point where the entry itself leaves
+                // the cache, or the sync probe would keep answering an address
+                // the store has forgotten.
+                let leaves = deadline + DNS_STALE_WINDOW;
+                now + DNS_STALE_MEMO_TTL.min(leaves.saturating_duration_since(now))
+            }
         };
-        memo_put(memo_key, Some(first), deadline);
+        memo_put(memo_key, Some(first), memo_deadline);
     }
     addrs
 }
 
-/// Names with a background refresh in flight, process-wide.
-fn refresh_in_flight() -> &'static parking_lot::Mutex<std::collections::HashSet<Arc<str>>> {
-    static IN_FLIGHT: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<Arc<str>>>> =
-        std::sync::OnceLock::new();
-    IN_FLIGHT.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+/// How long a name is left alone after a refresh attempt, successful or not.
+///
+/// The claim below already collapses concurrent attempts to one, but a *failed*
+/// attempt used to release its claim immediately, so the next stale hit — and
+/// with upstream DNS down every hit is a stale hit — started another lookup.
+/// The result was a retry loop paced by request rate rather than by time, on top
+/// of the same upstream that is failing. This is the floor between attempts, per
+/// name, independent of how many flows want one.
+const DNS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Names with a refresh in flight, or one that failed within the cooldown.
+///
+/// The value is the earliest instant a *new* attempt may start; a running
+/// attempt reserves its own slot until `DNS_LOOKUP_TIMEOUT + cooldown`, and the
+/// claim's `Drop` rewrites that to `now + DNS_REFRESH_COOLDOWN`, so a crashed or
+/// cancelled task cannot wedge a name forever.
+fn refresh_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<Arc<str>, Instant>> {
+    static REGISTRY: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<Arc<str>, Instant>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Drop-guard proving one name has a refresh in flight; releases the claim when
-/// the refresh task ends, including on cancellation.
+/// Drop-guard for one name's refresh slot; leaves the cooldown running when the
+/// attempt ends, including on cancellation.
 struct RefreshClaim(Arc<str>);
 
 impl Drop for RefreshClaim {
     fn drop(&mut self) {
-        refresh_in_flight().lock().remove(&*self.0);
+        let until = Instant::now() + DNS_REFRESH_COOLDOWN;
+        if let Some(slot) = refresh_registry().lock().get_mut(&*self.0) {
+            *slot = (*slot).min(until);
+        }
     }
 }
 
-/// Claim the single refresh slot for `host_key`, or `None` if one is running.
-fn claim_refresh(host_key: &str) -> Option<RefreshClaim> {
-    let mut in_flight = refresh_in_flight().lock();
-    if in_flight.contains(host_key) {
+/// Claim `host_key`'s refresh slot, or `None` while one is running or cooling
+/// down.
+fn claim_refresh(host_key: &str, now: Instant) -> Option<RefreshClaim> {
+    let mut registry = refresh_registry().lock();
+    if registry.get(host_key).is_some_and(|until| *until > now) {
+        return None;
+    }
+    // The registry is keyed by name, so a long-lived process that sees many
+    // failing names could grow it without bound. Prune on the way in, and give
+    // up rather than exceed the cache's own entry budget.
+    if registry.len() >= DNS_CACHE_MAX {
+        registry.retain(|_, until| *until > now);
+    }
+    if registry.len() >= DNS_CACHE_MAX {
         return None;
     }
     let key: Arc<str> = Arc::from(host_key);
-    in_flight.insert(Arc::clone(&key));
+    registry.insert(
+        Arc::clone(&key),
+        now + DNS_LOOKUP_TIMEOUT + DNS_REFRESH_COOLDOWN,
+    );
     Some(RefreshClaim(key))
 }
 
@@ -849,7 +1087,7 @@ fn claim_refresh(host_key: &str) -> Option<RefreshClaim> {
 /// reused for this — a present (stale) entry is a hit, so that call would hand
 /// back the stale value instead of running the init — hence [`RefreshClaim`].
 fn request_refresh(host_key: &str, port: u16) {
-    let Some(claim) = claim_refresh(host_key) else {
+    let Some(claim) = claim_refresh(host_key, Instant::now()) else {
         return;
     };
     tokio::spawn(async move {
@@ -865,8 +1103,9 @@ fn request_refresh(host_key: &str, port: u16) {
 /// resolves, we are answering from its own previous answer, and a refusal would
 /// both flip the sync path's memo to `Negative` for a working name and break the
 /// positive/negative disjointness the cache contract rests on. Retries are the
-/// next stale hit's job, which the short stale memo life guarantees happens
-/// within a second.
+/// next stale hit's job; the stale memo life bounds how soon that can happen and
+/// [`DNS_REFRESH_COOLDOWN`] bounds how often, so a failing upstream is polled on
+/// a fixed schedule instead of at request rate.
 async fn refresh_positive(host_key: &str, port: u16) {
     // Background work draws from its own pool, never from the foreground
     // admission budget `dns_slow_path_limiter` bounds: a burst of expired
@@ -877,7 +1116,7 @@ async fn refresh_positive(host_key: &str, port: u16) {
     let Ok(_permit) = dns_refresh_limiter().clone().try_acquire_owned() else {
         return;
     };
-    if let Ok(ips) = resolve_ips(host_key, port, DNS_LOOKUP_TIMEOUT).await {
+    if let Ok((ips, ttl)) = resolve_ips(host_key, port, DNS_LOOKUP_TIMEOUT).await {
         let now = Instant::now();
         // A foreground resolution may have refreshed the entry while this
         // lookup was in flight; prefer the newer answer and keep the
@@ -885,15 +1124,18 @@ async fn refresh_positive(host_key: &str, port: u16) {
         let already_fresh = positives()
             .get(host_key)
             .await
-            .is_some_and(|(inserted, _)| positive_life(inserted, now).is_some());
+            .is_some_and(|(deadline, _)| positive_life(deadline, now).is_some());
         if already_fresh {
             return;
         }
+        let deadline = now + record_ttl(ttl);
         let ips: Arc<[IpAddr]> = Arc::from(prepare_cache_ips(ips));
         // A plain `insert`, not `try_get_with`: this replaces a value that is
         // serving traffic, and the callers of the stale path must not wait for
         // it.
-        positives().insert(host_key.to_owned(), (now, ips)).await;
+        positives()
+            .insert(host_key.to_owned(), (deadline, ips))
+            .await;
         // The name resolves, so any refusal it accumulated must go — the same
         // bookkeeping a foreground success does, for the same reason
         // (`resolve_all_cached`'s negative probe would otherwise keep the name
@@ -981,18 +1223,21 @@ async fn seed_positive(
     let host_key = dns_host_key_owned(host);
     let memo_key = dns_key_owned(host, port);
     let now = Instant::now();
-    let inserted = now.checked_sub(age).unwrap_or(now);
+    // `age` is how long ago the entry was resolved, so its freshness deadline is
+    // the default TTL minus that age (seeds describe entries the production path
+    // would have written with [`DNS_CACHE_TTL`]).
+    let deadline = (now + DNS_CACHE_TTL).checked_sub(age).unwrap_or(now);
     // Keep the test-only seeds under the same retained-set bound as production
     // inserts (the invariant is what the cache and its readers assume).
     ips.truncate(DNS_CACHE_MAX_ADDRS);
     positives()
-        .insert(host_key.clone(), (inserted, Arc::from(ips)))
+        .insert(host_key.clone(), (deadline, Arc::from(ips)))
         .await;
     if negatives().remove(host_key.as_str()).await.is_some() {
         bump_neg_epoch();
     }
     if let Some(addr) = memo_addr {
-        memo_put(&memo_key, Some(addr), inserted + DNS_CACHE_TTL);
+        memo_put(&memo_key, Some(addr), deadline);
     }
 }
 
@@ -1030,18 +1275,46 @@ async fn record_negative(host_key: &str, memo_key: &str) {
     record_refusal(host_key, memo_key, DNS_NEG_TTL).await;
 }
 
-/// Accept `IP:port` or `hostname:port` for the QUIC server address.
+/// Accept `IP:port` or `hostname:port` for the QUIC server address, taking the
+/// most preferred address.
 pub async fn resolve_server_addr(s: &str) -> Result<SocketAddr> {
+    let mut addrs = resolve_server_addrs(s, 1).await?;
+    Ok(addrs.remove(0))
+}
+
+/// Every address of a configured `host:port` endpoint, in preference order
+/// ([`ip_preference`] first), capped at `max`. An IP literal is one address and
+/// never touches the resolver.
+///
+/// Unlike [`resolve_all_timeout`], this goes through the shared positive cache:
+/// single-flight, serve-stale, and a cached negative verdict. The client
+/// re-resolves its own server endpoint on *every* reconnect attempt, so an
+/// uncached lookup put one DNS round trip — or, when the resolver was down, one
+/// timeout — in front of each of them, and returned a single address that the
+/// dial loop then had no alternative to.
+///
+/// The list is what lets a dial fall through to the next address when the most
+/// preferred one is a dead end (the classic: AAAA present in the answer, IPv6
+/// unroutable on the network).
+pub async fn resolve_server_addrs(s: &str, max: usize) -> Result<Vec<SocketAddr>> {
     if let Ok(a) = s.parse::<SocketAddr>() {
-        return Ok(a);
+        return Ok(vec![a]);
     }
     let (host, port) = s
         .rsplit_once(':')
         .context("bad server_addr, want host:port")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let port: u16 = port.parse().context("bad server port")?;
-    let v = resolve_all_timeout(host, port, DNS_LOOKUP_TIMEOUT).await?;
-    v.into_iter().next().context("dns empty")
+    let addrs: Vec<SocketAddr> = resolve_all_cached(host, port)
+        .await?
+        .iter()
+        .copied()
+        .take(max.max(1))
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("dns empty");
+    }
+    Ok(addrs)
 }
 
 #[cfg(test)]
@@ -1074,7 +1347,11 @@ mod tests {
             opts.cache_size, 0,
             "hickory's internal cache must be disabled; the outer moka caches are the only TTL authority"
         );
-        assert_eq!(opts.positive_max_ttl, Some(DNS_CACHE_TTL));
+        assert_eq!(
+            opts.positive_max_ttl,
+            Some(DNS_RECORD_TTL_MAX),
+            "hickory clamps every answer's TTL, so its ceiling must match the store's record-TTL cap"
+        );
         assert_eq!(opts.negative_max_ttl, Some(DNS_NEG_TTL));
         // The attempt budget is *derived* from the module's lookup wall: a
         // per-attempt timeout at hickory's 5 s default made the first attempt
@@ -1330,33 +1607,127 @@ mod tests {
     /// cache's residency: the store now keeps an entry for the stale window past
     /// its TTL (so a stale answer can still serve while the refresh runs), which
     /// means "it is in the cache" no longer implies "it is current".
+    /// A failing upstream must be retried on a fixed schedule, not once per
+    /// stale hit: every flow riding a stale entry asks for a refresh, and without
+    /// the cooldown each of those asks became another lookup against the same
+    /// failing server.
     #[test]
-    fn positive_life_splits_fresh_from_stale_at_the_ttl() {
-        let inserted = Instant::now();
-        assert_eq!(
-            positive_life(inserted, inserted),
-            Some(DNS_CACHE_TTL),
-            "a just-inserted entry has its whole life"
+    fn a_failed_refresh_is_cooled_down_per_name() {
+        let host = "cooldown-refresh.example.test";
+        let t0 = Instant::now();
+        let claim = claim_refresh(host, t0).expect("the first attempt is free");
+        assert!(
+            claim_refresh(host, t0).is_none(),
+            "an attempt in flight must block a second one"
         );
-        let one_ms_left = inserted + DNS_CACHE_TTL - Duration::from_millis(1);
+        drop(claim);
+        // The cooldown is anchored at the moment the attempt ended, not at the
+        // moment it started.
+        let ended = Instant::now();
+        assert!(
+            claim_refresh(host, ended).is_none(),
+            "the cooldown must outlive the attempt that failed"
+        );
+        assert!(
+            claim_refresh(
+                host,
+                ended + DNS_REFRESH_COOLDOWN - Duration::from_millis(1)
+            )
+            .is_none(),
+            "the name stays unavailable until the cooldown is over"
+        );
+        assert!(
+            claim_refresh(
+                host,
+                ended + DNS_REFRESH_COOLDOWN + Duration::from_millis(1)
+            )
+            .is_some(),
+            "the name must become refreshable again once the cooldown ends"
+        );
+    }
+
+    /// The generation key must move when the platform configuration moves — and
+    /// only then. A stale key means the watcher either misses a nameserver
+    /// change (the cliff it exists to close) or rebuilds the resolver on every
+    /// poll (a new connection pool every 30 s).
+    #[test]
+    fn the_resolver_fingerprint_tracks_nameservers_and_search() {
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+
+        let base = ResolverConfig::default();
+        let fingerprint = config_fingerprint(&base);
+        assert_eq!(fingerprint, config_fingerprint(&ResolverConfig::default()));
+
+        let mut nameserver = ResolverConfig::default();
+        nameserver.add_name_server(NameServerConfig::udp([192, 0, 2, 53].into()));
+        assert_ne!(
+            config_fingerprint(&nameserver),
+            fingerprint,
+            "a different name server must be a different generation"
+        );
+
+        let mut search = ResolverConfig::default();
+        search.add_search(
+            hickory_resolver::proto::rr::Name::from_ascii("corp.example")
+                .expect("test literal is a valid name"),
+        );
+        assert_ne!(
+            config_fingerprint(&search),
+            fingerprint,
+            "a different search list must be a different generation"
+        );
+    }
+
+    #[test]
+    fn positive_life_splits_fresh_from_stale_at_the_deadline() {
+        let now = Instant::now();
+        let deadline = now + DNS_CACHE_TTL;
         assert_eq!(
-            positive_life(inserted, one_ms_left),
+            positive_life(deadline, now),
+            Some(DNS_CACHE_TTL),
+            "an entry written now has its whole window"
+        );
+        let one_ms_left = deadline - Duration::from_millis(1);
+        assert_eq!(
+            positive_life(deadline, one_ms_left),
             Some(Duration::from_millis(1)),
             "the remainder is what an adopting caller clamps against"
         );
         assert_eq!(
-            positive_life(inserted, inserted + DNS_CACHE_TTL),
+            positive_life(deadline, deadline),
             None,
             "the deadline itself is stale, not fresh"
         );
         assert_eq!(
-            positive_life(
-                inserted,
-                inserted + DNS_CACHE_TTL + Duration::from_secs(600)
-            ),
+            positive_life(deadline, deadline + Duration::from_secs(600)),
             None,
             "anything inside the stale window is stale, never fresh"
         );
+    }
+
+    /// The freshness window comes from the answer, not from a constant: a short
+    /// TTL must not be served as fresh for the default window, and a long one
+    /// must not be re-resolved early.
+    #[test]
+    fn the_freshness_window_is_the_answers_own_ttl_clamped() {
+        assert_eq!(
+            record_ttl(Duration::from_secs(1)),
+            DNS_RECORD_TTL_MIN,
+            "a tiny TTL is raised to the floor"
+        );
+        assert_eq!(
+            record_ttl(Duration::from_secs(86_400)),
+            DNS_RECORD_TTL_MAX,
+            "a day-long TTL is capped"
+        );
+        assert_eq!(
+            record_ttl(Duration::from_secs(60)),
+            Duration::from_secs(60),
+            "an ordinary TTL is taken as-is"
+        );
+        // The zero TTL an IP-literal answer effectively carries must not make
+        // every datagram a lookup.
+        assert_eq!(record_ttl(Duration::ZERO), DNS_RECORD_TTL_MIN);
     }
 
     /// A stale entry is **served**, and the repair happens beside the caller:

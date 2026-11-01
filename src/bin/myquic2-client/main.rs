@@ -171,6 +171,12 @@ fn main_runtime_workers_for(cores: usize, sharded: bool, slots: usize, pins_slot
 }
 
 async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
+    // Build the upstream resolver now, off the runtime, and keep watching the
+    // platform configuration: the client re-resolves its own server endpoint on
+    // every reconnect, so a resolver that was never initialised (or that still
+    // pointed at the nameservers of the network the machine has since left) is
+    // on the reconnect path.
+    spawn_resolver_watch();
     if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {
         anyhow::bail!(
             "auth_token is {} B, over the {AUTH_TOKEN_MAX_BYTES} B wire cap (server only reads the first {AUTH_TOKEN_MAX_BYTES} B, so a longer token can never authenticate)",

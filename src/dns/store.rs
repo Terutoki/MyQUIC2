@@ -2,15 +2,19 @@
 //!
 //! Two caches, deliberately separate namespaces:
 //!
-//! - **positive**: `(inserted at, address set)` with a 120 s *freshness* life
-//!   inside a longer (`+ DNS_STALE_WINDOW`) resident life. Moka owns capacity
-//!   bounding and eviction; the stored `Instant` is the authority both for the
-//!   remaining life a caller clamps its own deadlines against (moka exposes no
-//!   remaining-TTL query) and for telling a fresh entry from a stale one: an
-//!   entry past `inserted + DNS_CACHE_TTL` is stale, is still served (RFC 8767,
-//!   see [`DNS_STALE_WINDOW`]), and must be paired with a background refresh
-//!   ([`DNS_STALE_MEMO_TTL`] explains why the sync memo is let through again
-//!   while that happens).
+//! - **positive**: `(freshness deadline, address set)` inside a longer
+//!   (`+ DNS_STALE_WINDOW`) resident life. Moka owns capacity bounding and
+//!   eviction; the stored `Instant` is the authority both for the remaining life
+//!   a caller clamps its own deadlines against (moka exposes no remaining-TTL
+//!   query) and for telling a fresh entry from a stale one: an entry past its
+//!   deadline is stale, is still served (RFC 8767, see [`DNS_STALE_WINDOW`]),
+//!   and must be paired with a background refresh ([`DNS_STALE_MEMO_TTL`]
+//!   explains why the sync memo is let through again while that happens). The
+//!   deadline is the answer's **own TTL**, clamped to
+//!   [`DNS_RECORD_TTL_MIN`]..[`DNS_RECORD_TTL_MAX`] — not a constant: a
+//!   30 s-TTL name must not be served as fresh for 120 s, and a 300 s-TTL name
+//!   must not be re-resolved early. [`DNS_CACHE_TTL`] is the default for answers
+//!   that carry no TTL at all (the `getaddrinfo` fallback).
 //! - **negative**: verdict-only entries with a 10 s lifetime. A failed lookup
 //!   must never be expressible in the positive keyspace: `try_get_with` treats
 //!   any present value as the cached answer, so a negative sentinel stored
@@ -44,28 +48,43 @@ use moka::future::Cache;
 /// Owned cache key: the normalized host, no port — see the module docs.
 pub(crate) type DnsCacheKey = String;
 
-/// `(inserted at, address set)`: the `Arc<[IpAddr]>` makes a cache hit and
-/// every single-flight waiter clone a refcount instead of the vector, and the
-/// insertion instant keeps the TTL-exposing lookups honest (moka has no
-/// per-entry remaining-life API). The addresses are **port-free** on purpose;
+/// `(freshness deadline, address set)`: the `Arc<[IpAddr]>` makes a cache hit
+/// and every single-flight waiter clone a refcount instead of the vector, and
+/// the deadline keeps the TTL-exposing lookups honest (moka has no per-entry
+/// remaining-life API). The addresses are **port-free** on purpose;
 /// `resolve_all_cached` materializes `SocketAddr`s with the caller's port.
 pub(crate) type DnsCacheVal = (Instant, Arc<[IpAddr]>);
 
-/// Positive DNS cache TTL, in milliseconds. The `Duration` below is derived
-/// from it so the two can never drift, and callers that arm their own deadline
-/// from a cache hit clamp against the entry's *remaining* life measured with
-/// these units.
+/// Default positive freshness window, in milliseconds, for answers that carry no
+/// TTL of their own — in practice the `getaddrinfo` fallback. The `Duration`
+/// below is derived from it so the two can never drift.
 ///
-/// 120 s is a deliberate middle ground: it halves the upstream query rate of
-/// the 60 s it replaced, while keeping the stale-answer window in the same
-/// order as common resolver/TTL floors (a name that moves is followed within
-/// two minutes while the background refresh can reach upstream). The layers
-/// above (per-thread memo, session destination memo, 30 s pin) all clamp to an
-/// entry's remaining life, so this value bounds the worst-case staleness end to
-/// end; `DNS_STALE_WINDOW` is what covers the case where the refresh cannot be
-/// made at all.
+/// A resolved answer is normally cached for **its own TTL**, clamped to
+/// [`DNS_RECORD_TTL_MIN`]..[`DNS_RECORD_TTL_MAX`]; this constant is what stands
+/// in when there is nothing to read. 120 s was the flat value in earlier
+/// revisions: it halved the upstream query rate of the 60 s before it, but it
+/// also overwrote what each record actually asked for (see the module docs and
+/// [`crate::dns::resolve`]'s `record_ttl`). Callers that arm their own deadline
+/// from a cache hit still clamp against the entry's *remaining* life; the stale
+/// window is what covers the case where the refresh cannot be made at all.
 pub const DNS_CACHE_TTL_MS: u64 = 120_000;
 pub(crate) const DNS_CACHE_TTL: Duration = Duration::from_millis(DNS_CACHE_TTL_MS);
+
+/// Shortest freshness window a resolved answer may have.
+///
+/// The answer's own TTL decides how long it stays fresh, but a record set that
+/// asked for zero (or a couple of) seconds must not turn every datagram into a
+/// lookup: the answer is already this old by the time the surrounding machinery
+/// — single flight, serve-stale, the negative verdict — hands it on.
+pub(crate) const DNS_RECORD_TTL_MIN: Duration = Duration::from_secs(10);
+
+/// Longest freshness window a resolved answer may have.
+///
+/// The other half of the same clamp: a record whose TTL is a day should still be
+/// re-resolved when the name's owner moves a CDN endpoint, and the stale window
+/// exists precisely because a TTL is a hint, not a promise. 300 s is the
+/// conventional ceiling (and what most resolvers clamp to).
+pub(crate) const DNS_RECORD_TTL_MAX: Duration = Duration::from_secs(300);
 
 /// How long past its freshness deadline a positive entry may still answer.
 ///
@@ -82,16 +101,23 @@ pub(crate) const DNS_CACHE_TTL: Duration = Duration::from_millis(DNS_CACHE_TTL_M
 /// pin) still clamp to the entry's own deadline, so they cannot extend it.
 pub(crate) const DNS_STALE_WINDOW: Duration = Duration::from_secs(3_600);
 
-/// How long a **stale** answer is memoized in the packet path's per-thread memo.
+/// How long a **stale** answer is memoized in the packet path's per-thread memo,
+/// i.e. how often an actively used stale flow re-enters the async path.
 ///
-/// Short on purpose. The memo is what lets the sync probe answer without the
+/// Bounded on purpose. The memo is what lets the sync probe answer without the
 /// async path, but the async path is the only code that can schedule a refresh
-/// (the sync path cannot spawn tasks). A stale memo life of a whole stale window
-/// would hide the staleness from the one place that repairs it, so the packet
-/// path is let through to the async path once a second; that path re-serves the
-/// same stale answer from a moka hit (nanoseconds) while the refresh it already
-/// started completes.
-pub(crate) const DNS_STALE_MEMO_TTL: Duration = Duration::from_secs(1);
+/// (the sync path cannot spawn tasks), so a stale memo life of a whole stale
+/// window would hide the staleness from the one place that repairs it.
+///
+/// It was one second, which meant every flow riding a stale entry paid a waiter
+/// task, a `dns_slow_path_limiter` permit, a moka probe and a refresh-claim lock
+/// *every second* — and with upstream DNS down, every flow is a stale flow, so
+/// that churn competed for the admission budget with the cold flows that have no
+/// answer at all. Five seconds keeps the repair prompt (a refresh already starts
+/// on the first stale hit) without making the repair mechanism the load. The
+/// per-name cooldown in [`crate::dns::resolve`] paces the lookups themselves, so
+/// this constant no longer carries that job.
+pub(crate) const DNS_STALE_MEMO_TTL: Duration = Duration::from_secs(5);
 
 /// How long a negative entry that *is* a verdict is kept: the resolver
 /// answered that the name does not resolve (NXDOMAIN/NODATA, or the blocking
@@ -211,7 +237,7 @@ pub(crate) fn positives() -> &'static PosCache {
         Cache::builder()
             .name("dns-pos")
             .max_capacity(DNS_CACHE_MAX as u64)
-            .time_to_live(DNS_CACHE_TTL + DNS_STALE_WINDOW)
+            .time_to_live(DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW)
             .build_with_hasher(DnsHasher::default())
     })
 }

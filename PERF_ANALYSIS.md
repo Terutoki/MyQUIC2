@@ -1448,3 +1448,176 @@ RTT, so the direction is unambiguous but the milliseconds are field numbers. Ser
 answer diagnosable from the outside: a stale answer is indistinguishable from a fresh one at the API. The instrument
 for end-to-end p50/p99 remains `hotpath_bench udpdomain` (the only mode that exercises the relay DNS path), which this
 batch did not run; `examples/dns_probe_bench.rs` measures the probe function only and is unaffected by this batch.
+
+## 16. Tenth Batch: the reconnect that re-resolved, the resolver that never noticed, and a TTL nobody read (2026-11-01, post-192dede)
+
+§15 removed the retry-budget dead end, the TTL cliff and the dial stagger. This batch is the second pass over the same
+axis — *does the lookup have to happen at all, how long is its worst case, and how is the answer used* — and it starts
+with the two places where the answer was "the lookup happens again, for no reason".
+
+### 16.1 The client re-resolved its own server endpoint on every reconnect (item 1)
+
+`spawn_conn_loop` called `resolve_server_addr` on every iteration of its reconnect loop, and that function was the
+*uncached* path: `resolve_all_timeout` (`src/dns/resolve.rs`), i.e. a fresh upstream query — or a full
+`DNS_LOOKUP_TIMEOUT` — in front of every redial, on a path that by design retries for as long as the server is away.
+It then returned `v.into_iter().next()`, one address, and `dial_once` used only that one with a 5 s attempt budget.
+
+Two failures follow from that shape:
+
+- A network where the AAAA record is present but IPv6 is unroutable (a v4-only uplink, a VPN that captures v6) makes
+  the preferred address a permanent dead end: every reconnect re-races the same address, and the address that would
+  work is never tried at all.
+- The reconnect latency floor becomes one DNS RTT *plus* the backoff, even though the answer had not changed.
+
+The fix is `resolve_server_addrs(s, max)` (`src/dns/resolve.rs:1299`): the shared positive cache's path
+(single-flight, serve-stale, negative verdicts), the caller's port attached, preference order preserved, capped at
+`DIAL_ADDR_CANDIDATES = 3` (`src/bin/myquic2-client/auth.rs:65`). `resolve_server_addr` is now that function with
+`max = 1`, so the two cannot drift.
+
+The dial side (`src/bin/myquic2-client/auth.rs:349` and `:370`) remembers the address that carried the previous
+connection (`prefer_last_good`, promoted to the front, rest of the order untouched) and tries the candidates in order,
+falling through on failure (`dial_candidates`, each failure logged at debug, the last error returned so the
+iteration's `warn!` still names the reason). One dead first address now costs one attempt, not the whole iteration.
+
+What it does not do: parallel racing of the candidates (the TCP path's `race_dial` does that, but a QUIC handshake
+race needs one endpoint per attempt and the client's endpoint is shared), and the address hint of item 7, which needs
+a wire revision.
+
+### 16.2 The resolver was built once and never looked at the network again (item 2)
+
+`upstream_resolver()` was a process-lifetime `OnceLock` built lazily inside the first lookup, from the platform's DNS
+configuration *as it was then*. A laptop that joins a VPN, changes Wi-Fi, or gets a new DHCP lease keeps pointing at
+the previous network's nameservers for the life of the process. Every cold name then burns the whole attempt budget
+(`DNS_QUERY_TIMEOUT x 3`) against a server it cannot reach, and serve-stale only hides that for the hour its window
+lasts — after which resolution for *new* names simply stops working until the process restarts.
+
+The resolver is now a swappable generation (`src/dns/resolve.rs:426`-`:600`):
+
+- `build_resolver_gen()` reads `hickory_resolver::system_conf::read_system_conf()` itself, builds
+  `TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())`, applies
+  [`configure_resolver_options`] and records a **fingerprint** of the configuration (nameserver IPs, domain, search
+  list, lowercased) alongside it. `Err` remains the "use `getaddrinfo`" signal for the fallback.
+- `resolver_gen()` holds the current generation in an `ArcSwap`, and `upstream_resolver()` hands out an `Arc` clone:
+  a lookup in flight across a swap keeps its old resolver alive to completion, and the swap itself is a single atomic.
+- `spawn_resolver_watch()` is called at startup by both binaries (`src/bin/myquic2-server/main.rs:103`,
+  `src/bin/myquic2-client/main.rs:179`). It warms the generation in `spawn_blocking` — the first lookup no longer
+  reads SystemConfiguration/resolv.conf on a runtime worker — and then polls the platform configuration every
+  `RESOLVER_CONFIG_POLL = 30 s` (`src/dns/resolve.rs:426`), rebuilding only when the fingerprint moved. Both the read
+  and the rebuild run off-runtime.
+
+30 s is the compromise: a VPN coming up is picked up before the stale window it would otherwise hide behind, and the
+steady-state cost is one small file read (Linux/OpenWrt) or one dynamic-store query (macOS) per half minute.
+
+The `gen` identifier is a reserved keyword in edition 2024; the first build of this failed with
+`error: expected identifier, found reserved keyword 'gen'`. Worth remembering when naming anything
+generation-shaped in this crate.
+
+### 16.3 The stale path was pacing itself at request rate (item 4, correcting §15.2)
+
+§15's serve-stale memoized a stale answer for `DNS_STALE_MEMO_TTL = 1 s`, which "lets the packet path keep answering
+it while still returning to `resolve_all_cached` once a second". That is the *repair* latency, and it was fine. What
+was not fine: the same one-second expiry also paced the **retries**, because a failed refresh released its in-flight
+claim immediately — so with upstream DNS down, every stale flow asked for a refresh once a second, each of those
+became a fresh attempt against the failing server, and each attempt also cost a waiter task, a
+`dns_slow_path_limiter` permit and a moka probe. The admission budget that exists to bound flows with no answer was
+being spent on flows that already had one.
+
+Two changes (`src/dns/resolve.rs:1030`-`:1070`, `src/dns/store.rs:120`):
+
+- `DNS_REFRESH_COOLDOWN = 5 s`, tracked per name in a `HashMap<Arc<str>, Instant>` ("do not start a refresh before
+  this instant"). The claim reserves its own slot for `DNS_LOOKUP_TIMEOUT + cooldown` while the task runs, and its
+  `Drop` rewrites that to `now + cooldown`, so a cancelled or panicked task cannot wedge a name and a failing one is
+  retried on a fixed schedule rather than at request rate. The map is pruned on insertion and refuses to exceed
+  `DNS_CACHE_MAX` entries — it is keyed by name, so it is the one structure here that could otherwise grow forever.
+- `DNS_STALE_MEMO_TTL` becomes 5 s, and `materialize_cached` clamps it to the entry's own remaining residency
+  (`deadline + DNS_STALE_WINDOW`), so the memo can never outlive the store.
+
+Net effect per active stale flow: one async re-entry per 5 s instead of per second, and one upstream attempt per name
+per 5 s instead of per second *per flow*.
+
+### 16.4 The freshness window was a constant, not the answer's TTL (item 5)
+
+The positive cache stored `inserted_at` and treated `inserted_at + DNS_CACHE_TTL` (120 s) as freshness. Both
+directions were wrong, and one of them was a correctness issue:
+
+- A name whose TTL is 30 s was served as *fresh* for 120 s — four times longer than its owner allowed, with no refresh
+  scheduled because the entry still looked current.
+- A name whose TTL is 300 s was re-resolved every 120 s — 2.5x the upstream traffic its owner asked for, each
+  re-resolution a chance to wait on a cold lookup.
+
+The store now holds `(freshness deadline, address set)` (`src/dns/store.rs:56`), and the deadline is the answer's own
+TTL (`Lookup::valid_until`, the minimum over the returned records), clamped by `record_ttl`
+(`src/dns/resolve.rs:790`) to `DNS_RECORD_TTL_MIN = 10 s` .. `DNS_RECORD_TTL_MAX = 300 s`
+(`src/dns/store.rs:79`, `:87`). The floor keeps a zero-TTL record from turning every datagram into a lookup; the
+ceiling is the conventional one and bounds how long a moved CDN endpoint can be served from a 24 h record.
+
+Two consequences worth naming:
+
+- `configure_resolver_options` had to raise hickory's `positive_max_ttl` from `DNS_CACHE_TTL` (120 s) to
+  `DNS_RECORD_TTL_MAX`. hickory clamps **every** answer's TTL to that window even with its cache disabled
+  (`ResponseCache::clamp_positive_ttls` rewrites the TTLs before the `Lookup` is built), so the old value would have
+  silently capped the whole feature at 120 s.
+- `DNS_CACHE_TTL` did not disappear: it is now the *default* for answers that carry no TTL at all (the `getaddrinfo`
+  fallback, which reports none). The seeds in the tests describe entries the production path would have written with
+  that default, so `dns_cache_seed_aged(host, port, addr, age)` derives the deadline as `now + DNS_CACHE_TTL - age`.
+
+The freshness/staleness split itself is unchanged: past the deadline an entry is served and refreshed (RFC 8767),
+inside the window it is served and nothing else happens.
+
+### 16.5 A dotted target is a fully qualified name (item 6)
+
+hickory applies the resolv.conf search list after a failed bare-name query, one serial round trip per suffix. For a
+SOCKS target that is never what was meant: `no-such-host.example.com` should not be retried as
+`no-such-host.example.com.corp.example`, and on a slow or lossy link those extra round trips are exactly what the
+negative verdict is supposed to make rare.
+
+`query_name` (`src/dns/resolve.rs:253`) returns the target with a trailing dot when it already contains a dot, and
+leaves single-label targets alone — `intranet` still walks the search list, which is the only way a short LAN name
+resolves at all. IP literals are excluded explicitly: `lookup_ip` short-circuits them before parsing, and a trailing
+dot would make the literal unparseable. The hosts file still matches: `Hosts::lookup_static_host` compares against
+fully-qualified keys.
+
+The trade-off, stated plainly: a dotted LAN name that used to resolve *through* a search suffix
+(`printer.office` + `corp.example`) now resolves only as the literal `printer.office.`. That is the behaviour a
+strict SOCKS target implies, but it is a behaviour change, and a user who relied on search-suffix completion for a
+dotted short name would need the full name.
+
+### 16.6 Examined and deliberately not changed
+
+- **Parking datagrams on an in-flight resolution (item 3).** The gate still answers `GateClaim::InFlight` by dropping
+  the datagram, so the second and third datagram of a cold name wait for the app's own retransmit. Parking them would
+  remove that wait, but it needs somewhere to keep the payloads: a bounded per-entry queue, a memory term in the
+  `dns_inflight_memory_bytes` accounting that admission charges, and a flush/cancel lifecycle tied to the waiter. That
+  is a memory-bound redesign of the relay's most contended path, not a latency tweak, and it changes the drop
+  semantics the refusal counters describe. Deferred deliberately; it is the largest remaining item.
+- **Client address hint on the wire (item 7).** Still the biggest structural win (the DNS lookup overlaps the QUIC
+  handshake instead of preceding it) and still a wire revision: it needs a hint field in the Hello, a server-side
+  policy for trusting it, and a split-horizon/VPN answer for when the client's view and the server's view disagree.
+- **UDP happy eyeballs (item 8).** With no failure signal from the app, the relay would be racing addresses blind and
+  spending packets on the losing ones. Documented, not implemented.
+- **Throughput-only leftovers**: the 261-byte key-buffer memset and the 64-slot `is_global_ip_cached` are irrelevant to
+  latency and were left alone.
+
+### 16.7 Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo test --all-targets`
+**743 passed, 0 failed, 1 ignored** (lib 374, client 200, server 153, `tests/forward_e2e.rs` 7, `tests/rev3_e2e.rs` 9).
+
+New tests, all behavioural rather than mock-based:
+
+- `src/dns/resolve.rs`: `the_resolver_fingerprint_tracks_nameservers_and_search` (a changed nameserver or search list
+  is a new generation, an unchanged config is not), `a_failed_refresh_is_cooled_down_per_name` (in-flight blocks a
+  second attempt, the cooldown outlives the attempt, the name becomes claimable again only after it),
+  `the_freshness_window_is_the_answers_own_ttl_clamped` (floor, cap, pass-through, zero), plus the renamed
+  `positive_life_splits_fresh_from_stale_at_the_deadline`.
+- `src/bin/myquic2-client/tests.rs`: `dial_candidates_prefer_the_last_good_address` (no hint keeps order, hint first is
+  a no-op, hint promoted with the rest stable, stale hint ignored).
+
+### 16.8 What this does not establish
+
+There is still no latency microbenchmark for any of this. The numbers here are structural — the reconnect path lost one
+uncached lookup and gained a candidate list, the resolver gained a 30 s re-read, the stale path lost four of five
+async re-entries per second, and the TTL now follows the record — and the only honest end-to-end instrument remains
+`hotpath_bench udpdomain`, which this batch did not run. Serve-stale and the new refresh cooldown also make the
+*diagnosis* of a slow lookup harder from the outside: a stale answer is indistinguishable from a fresh one at the API,
+and a refresh that is being cooled down looks exactly like one that is running.

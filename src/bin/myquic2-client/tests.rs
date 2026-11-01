@@ -332,6 +332,37 @@ fn slot_liveness_is_the_maintained_atomic() {
     assert!(!slot.is_live());
 }
 
+/// The dial candidate order: the last address that carried a connection goes
+/// first, everything else keeps the resolver's preference order. This is what
+/// stops a reconnect from re-racing the family that was just proven dead.
+#[test]
+fn dial_candidates_prefer_the_last_good_address() {
+    let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+    let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+    let v4b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+
+    // Without a hint the resolver's order is untouched.
+    assert_eq!(
+        auth::prefer_last_good(vec![v6, v4a, v4b], None),
+        vec![v6, v4a, v4b]
+    );
+    // A hint that is already first changes nothing.
+    assert_eq!(
+        auth::prefer_last_good(vec![v6, v4a, v4b], Some(v6)),
+        vec![v6, v4a, v4b]
+    );
+    // A hint further down is promoted, and the rest keeps its relative order.
+    assert_eq!(
+        auth::prefer_last_good(vec![v6, v4a, v4b], Some(v4b)),
+        vec![v4b, v6, v4a]
+    );
+    // A hint that is no longer in the answer (address changed) is ignored.
+    assert_eq!(
+        auth::prefer_last_good(vec![v6, v4a], Some(v4b)),
+        vec![v6, v4a]
+    );
+}
+
 /// The routing table, row by row; the first three blocks are the *old*
 /// dual-pool assertions restated for the generalized selector, so a
 /// two-slot pool still behaves exactly as it did (including "keep the
