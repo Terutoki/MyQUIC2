@@ -25,11 +25,14 @@ pub(crate) const DNS_GATE_INFLIGHT_TTL_MS: u64 = 15_000;
 /// How long an "unusable" verdict (every record filtered, or the lookup failed)
 /// is trusted before the next datagram may spawn a fresh resolution.
 ///
-/// Deliberately short: the shared DNS layer already negative-caches failures
-/// for `DNS_NEG_TTL` (10 s), so this stands in for a verdict that already exists
-/// upstream and cannot outlive it. It exists because that upstream verdict is
-/// only reachable synchronously from a *warm* thread memo, and a spawned waiter
-/// warms only its own worker's.
+/// Deliberately short: the shared DNS layer already records the failure
+/// (`DNS_NEG_TTL` — 10 s — for a name the resolver answered for, the 1 s
+/// `DNS_INCONCLUSIVE_TTL` backoff when no answer was obtained), and this stands
+/// in for a refusal that already exists upstream. It is the *longer* of the two
+/// when the failure was inconclusive, which is intended: the gate is per target,
+/// so it can afford to wait out a blip that the host-wide entry does not. It
+/// exists because the upstream refusal is only reachable synchronously from a
+/// *warm* thread memo, and a spawned waiter warms only its own worker's.
 pub(crate) const DNS_GATE_UNUSABLE_TTL_MS: u64 = 5_000;
 
 /// Test-only count of spawned resolver waiters.
@@ -414,7 +417,9 @@ pub(crate) fn resolve_forward_target(
     port: u16,
     allow_private: bool,
 ) -> ForwardResolution {
-    let now = coarse_millis();
+    // No clock up front: a memo hit already carries its own remaining life, and
+    // this runs once per datagram on the slow path. Only the session-memo
+    // fallbacks need "now", and they are the rarer arm.
     let addrs = match lookup_cached_fast_with_ttl(host, port) {
         (CachedLookup::Negative, _) => return ForwardResolution::Negative,
         (CachedLookup::Addr(dst), life) => {
@@ -423,16 +428,18 @@ pub(crate) fn resolve_forward_target(
             } else {
                 // First record filtered: the session memo may hold a usable
                 // address from an earlier resolver pass.
-                match sess_dest_lookup_ttl(ss, now, s, host, port) {
+                match sess_dest_lookup_ttl(ss, coarse_millis(), s, host, port) {
                     Some(v) => v,
                     None => return ForwardResolution::Unresolved,
                 }
             }
         }
-        (CachedLookup::Unknown, _) => match sess_dest_lookup_ttl(ss, now, s, host, port) {
-            Some(v) => v,
-            None => return ForwardResolution::Unresolved,
-        },
+        (CachedLookup::Unknown, _) => {
+            match sess_dest_lookup_ttl(ss, coarse_millis(), s, host, port) {
+                Some(v) => v,
+                None => return ForwardResolution::Unresolved,
+            }
+        }
     };
     if allow_private || is_global_ip_cached(addrs.0.ip()) {
         ForwardResolution::Addr(addrs.0, addrs.1)

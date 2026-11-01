@@ -3037,12 +3037,13 @@ async fn r2_forward_domain_open_bg(
             // there is no address to send this payload to, and inventing one
             // would be exactly the SSRF hole the policy exists to close.
             //
-            // No in-budget retry is possible: `resolve_all_cached` records the
-            // failure as a host-keyed negative cache entry (`DNS_NEG_TTL`,
-            // 10 s) *before* returning it, so a retry inside this 5 s budget can
-            // only re-read that verdict. It would add an await and a second
-            // wakeup on the ingress path and never succeed; the payload stays an
-            // ordinary UDP drop (the client's own retransmission is the retry).
+            // No in-budget retry: `resolve_all_cached` records the failure as a
+            // host-keyed refusal (`DNS_NEG_TTL` — 10 s — for a name the resolver
+            // answered for, the 1 s `DNS_INCONCLUSIVE_TTL` backoff otherwise)
+            // *before* returning it, so a retry inside this 5 s budget would
+            // mostly re-read the refusal, and would add an await plus a second
+            // wakeup on the ingress path to do it. The payload stays an ordinary
+            // UDP drop (the client's own retransmission is the retry).
             // The distinct counter is what makes the loss observable instead of
             // folded into the shared `REFUSED`.
             r2_stats::bump(&r2_stats::DNS_OPEN_DNS_FAIL);

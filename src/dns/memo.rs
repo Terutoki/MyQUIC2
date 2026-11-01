@@ -166,22 +166,46 @@ thread_local! {
         const { std::cell::RefCell::new([[DnsMemoSlot::EMPTY; MEMO_WAYS]; MEMO_SETS]) };
 }
 
-/// Multiply-fold plus a finalizer. The finalizer matters here in a way it did
-/// not for the old direct-mapped table: the set index comes from the low bits
-/// of the result, and DNS names share long suffixes (`…example.com`, `…cdn.net`),
-/// so the raw fold leaves those bits correlated between unrelated names and
-/// would pile them into the same set — the exact conflict the associativity is
-/// meant to remove. ~4 ns per lookup, paid once per packet.
+/// Chunked multiply-fold plus a finalizer.
+///
+/// The fold consumes eight bytes per multiply, not one: the byte-at-a-time
+/// chain it replaces was a *dependent* multiply per byte (~4 cycles each, so
+/// ~24 ns for a 50-byte name), and this probe is paid once per datagram that
+/// reaches the relay's slow path. Measured with `examples/dns_probe_bench.rs`,
+/// the whole warm probe is ~15 ns for a 4-byte host and ~41 ns for a 50-byte one
+/// with the old fold; the hash was the part that grew with the name.
+///
+/// The finalizer matters here in a way it did not for the old direct-mapped
+/// table: the set index comes from the low bits of the result, and DNS names
+/// share long suffixes (`…example.com`, `…cdn.net`), so the raw fold leaves
+/// those bits correlated between unrelated names and would pile them into the
+/// same set — the exact conflict the associativity is meant to remove. The
+/// splitmix64 finalizer is a bijection, so it cannot merge two fold states into
+/// one; it only spreads bits. Nothing depends on the value itself: the hash is a
+/// filter, and [`DnsMemoSlot::matches`] compares the full key, so a collision
+/// costs a compare, never a wrong answer.
 #[inline]
 pub(crate) fn dns_memo_hash(key: &str) -> u64 {
     const K: u64 = 0x9e3779b97f4a7c15;
-    let mut h: u64 = 0;
-    for b in key.as_bytes() {
-        h = h.wrapping_mul(K).wrapping_add(*b as u64);
+    let bytes = key.as_bytes();
+    // Length-mixed seed: the tail of a name is the part two unrelated names are
+    // most likely to share, so a zero seed lets a short key hide in a long
+    // key's suffix shape.
+    let mut h = (bytes.len() as u64).wrapping_mul(K);
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for c in chunks {
+        h = (h ^ u64::from_le_bytes(*c)).wrapping_mul(K);
     }
-    h ^= h >> 29;
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        h = (h ^ u64::from_le_bytes(tail)).wrapping_mul(K);
+    }
+    h ^= h >> 30;
     h = h.wrapping_mul(0xbf58476d1ce4e5b9);
-    h ^ (h >> 32)
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d049bb133111eb);
+    h ^ (h >> 31)
 }
 
 /// Set index. `MEMO_SETS` is a power of two, so this is a mask, and the low

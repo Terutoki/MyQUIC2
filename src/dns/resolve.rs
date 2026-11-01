@@ -51,7 +51,8 @@ use super::key::{
 };
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, memo_put_with_epoch, neg_epoch};
 use super::store::{
-    DNS_CACHE_MAX_ADDRS, DNS_CACHE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, negatives, positives,
+    DNS_CACHE_MAX_ADDRS, DNS_CACHE_TTL, DNS_INCONCLUSIVE_TTL, DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL,
+    negatives, positives,
 };
 use crate::coarse_millis;
 
@@ -149,7 +150,9 @@ pub async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
 /// [`resolve_ips`] primitive the cache-fill path uses and materializes the
 /// caller's port on the way out.
 async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>> {
-    let ips = resolve_ips(host, port, timeout).await?;
+    let ips = resolve_ips(host, port, timeout)
+        .await
+        .map_err(LookupFailure::into_error)?;
     let mut addrs: Vec<SocketAddr> = ips
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
@@ -159,6 +162,65 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
     let pref = ip_preference();
     addrs.sort_by_key(|addr| pref.sort_key(*addr));
     Ok(addrs)
+}
+
+/// Why a lookup produced no address set, split by what it says about the name.
+///
+/// The negative cache's TTL is a claim, so the two failure classes must not
+/// share one: a **verdict** means the resolver answered that the name has no
+/// address for us, and holding that for [`DNS_NEG_TTL`] is the point of the
+/// cache; anything else — our own timeout, a saturated blocking fallback, a
+/// name server that is down — says nothing about the name and may only be held
+/// for the short [`DNS_INCONCLUSIVE_TTL`] backoff, or one transient blip would
+/// refuse a perfectly good name on every port for 10 s.
+#[derive(Debug)]
+enum LookupFailure {
+    /// The resolver answered: the name does not resolve.
+    Verdict(anyhow::Error),
+    /// No answer was obtained: timeout, saturation, transport/protocol error.
+    Inconclusive(anyhow::Error),
+}
+
+impl LookupFailure {
+    /// Classify a hickory lookup error. `NoRecordsFound` is the resolver
+    /// reporting NXDOMAIN or NODATA — a fact about the name. Every other
+    /// variant (`Timeout`, `Io`, `Proto`, `Busy`, `NoConnections`, …) is this
+    /// process failing to reach an answer, which must not be cached as a
+    /// verdict.
+    fn from_resolver(err: hickory_resolver::net::NetError) -> Self {
+        let verdict = err.is_no_records_found();
+        let err = anyhow::anyhow!("dns lookup failed: {err}");
+        if verdict {
+            Self::Verdict(err)
+        } else {
+            Self::Inconclusive(err)
+        }
+    }
+
+    /// How long a refusal derived from this failure may be cached.
+    fn retry_ttl(&self) -> Duration {
+        match self {
+            Self::Verdict(_) => DNS_NEG_TTL,
+            Self::Inconclusive(_) => DNS_INCONCLUSIVE_TTL,
+        }
+    }
+
+    /// The underlying error, with its context chain intact.
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Verdict(e) | Self::Inconclusive(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for LookupFailure {
+    /// Renders the same `{e:#}` chain the plain `anyhow::Error` did, so the
+    /// errors the callers hand back are unchanged by the classification.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verdict(e) | Self::Inconclusive(e) => write!(f, "{e:#}"),
+        }
+    }
 }
 
 /// Resolve just the addresses of `host` — no port — in the resolver's own
@@ -172,20 +234,21 @@ async fn resolve_all_timeout(host: &str, port: u16, timeout: Duration) -> Result
 /// `SocketAddr`s for the uncached path, `IpAddr`s before the cache insert — so
 /// a cache hit always hands back a set in the same family order a fresh
 /// resolution would.
-async fn resolve_ips(host: &str, port: u16, timeout: Duration) -> Result<Vec<IpAddr>> {
+async fn resolve_ips(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::result::Result<Vec<IpAddr>, LookupFailure> {
     let ips = tokio::time::timeout(timeout, async {
         let ips: Vec<IpAddr> = match upstream_resolver() {
             // The IP-literal case is handled inside `lookup_ip` directly, and
             // the system hosts file is consulted before any upstream query
             // (`ResolveHosts::Auto` is the default), so `localhost` and other
             // /etc/hosts entries keep resolving.
-            Ok(r) => {
-                let lookup = r
-                    .lookup_ip(host)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("dns lookup failed: {e}"))?;
-                lookup.iter().collect()
-            }
+            Ok(r) => match r.lookup_ip(host).await {
+                Ok(lookup) => lookup.iter().collect(),
+                Err(e) => return Err(LookupFailure::from_resolver(e)),
+            },
             // The platform DNS configuration could not be read (see
             // `upstream_resolver`): degrade to the blocking `getaddrinfo` path
             // instead of losing name resolution entirely. That path is bounded
@@ -196,10 +259,14 @@ async fn resolve_ips(host: &str, port: u16, timeout: Duration) -> Result<Vec<IpA
                 getaddrinfo_ips(host, port).await?
             }
         };
-        Ok::<Vec<IpAddr>, anyhow::Error>(ips)
+        Ok::<Vec<IpAddr>, LookupFailure>(ips)
     })
     .await
-    .context("dns lookup timed out")??;
+    .map_err(|_| {
+        // The budget is ours, not the resolver's: we gave up waiting. The
+        // name's status is unknown, so this must never become a verdict.
+        LookupFailure::Inconclusive(anyhow::anyhow!("dns lookup timed out after {timeout:?}"))
+    })??;
     Ok(ips)
 }
 
@@ -235,28 +302,39 @@ fn dns_blocking_fallback_limiter() -> &'static std::sync::Arc<tokio::sync::Semap
 /// abandon this future while the thread keeps running, and the bound has to
 /// cover the thread. Exhaustion fails fast with a clear error instead of letting
 /// the blocking pool grow to `max_blocking_threads`; the failure is then
-/// single-flighted/negatively cached by the callers like any other lookup
-/// failure.
-async fn getaddrinfo_ips(host: &str, port: u16) -> Result<Vec<IpAddr>> {
+/// single-flighted and cached as an *inconclusive* one by the callers (a
+/// [`DNS_INCONCLUSIVE_TTL`] backoff, not a verdict).
+///
+/// Every failure of this path is inconclusive on purpose: libc gives no portable
+/// way to tell "this name does not exist" from `EAI_AGAIN`, and this path only
+/// runs at all when hickory could not be built — a state in which claiming a
+/// verdict about a name is the least defensible thing we could do.
+async fn getaddrinfo_ips(host: &str, port: u16) -> std::result::Result<Vec<IpAddr>, LookupFailure> {
     use std::net::ToSocketAddrs as _;
     let host = host.to_owned();
     let limiter = std::sync::Arc::clone(dns_blocking_fallback_limiter());
-    let ips = tokio::task::spawn_blocking(move || -> Result<Vec<IpAddr>> {
-        let _permit = limiter.try_acquire_owned().map_err(|_| {
-            anyhow::anyhow!(
-                "dns getaddrinfo fallback saturated ({DNS_BLOCKING_FALLBACK_PERMITS} blocking \
-                 resolvers already running)"
-            )
-        })?;
-        let ips: Vec<IpAddr> = (host.as_str(), port)
-            .to_socket_addrs()
-            .context("getaddrinfo")?
-            .map(|sa| sa.ip())
-            .collect();
-        Ok(ips)
-    })
-    .await
-    .context("getaddrinfo task join")??;
+    let ips =
+        tokio::task::spawn_blocking(move || -> std::result::Result<Vec<IpAddr>, LookupFailure> {
+            let _permit = limiter.try_acquire_owned().map_err(|_| {
+                LookupFailure::Inconclusive(anyhow::anyhow!(
+                    "dns getaddrinfo fallback saturated ({DNS_BLOCKING_FALLBACK_PERMITS} blocking \
+                     resolvers already running)"
+                ))
+            })?;
+            let ips: Vec<IpAddr> = (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| {
+                    LookupFailure::Inconclusive(anyhow::Error::new(e).context("getaddrinfo"))
+                })?
+                .map(|sa| sa.ip())
+                .collect();
+            Ok(ips)
+        })
+        .await
+        .map_err(|e| {
+            // A panicked blocking task: our bug, not a fact about the name.
+            LookupFailure::Inconclusive(anyhow::Error::new(e).context("getaddrinfo task join"))
+        })??;
     Ok(ips)
 }
 
@@ -455,9 +533,10 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 /// per-`(host, port)` *positive* memo is written on every caller's return path
 /// — `materialize_cached` runs for the init owner and every waiter alike — so
 /// a caller that observes the outcome also observes a warmed cache. A failed
-/// lookup is negatively cached (host verdict + this port's memo) inside the
-/// init, before the error is published to any waiter: the old publish-order
-/// contract, kept.
+/// lookup is negatively cached (host-keyed refusal + this port's memo) inside
+/// the init, before the error is published to any waiter: the old
+/// publish-order contract, kept. How long that refusal lasts depends on what
+/// the failure says about the name — see [`LookupFailure`].
 ///
 /// **Lookup order.** A warm positive entry is probed *first*: it is the common
 /// outcome for a name this process resolved in the last [`DNS_CACHE_TTL`], and
@@ -465,7 +544,7 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 /// stores are disjoint by construction (a negative is only written by the
 /// single-flight init that ran because no positive entry existed, and a
 /// successful resolution clears it before publishing its entry — see
-/// `record_negative` and `seed_positive`), so probing positive first cannot
+/// `record_refusal` and `seed_positive`), so probing positive first cannot
 /// serve an address for a refused name. The negative probe then runs only on a
 /// positive miss, where it keeps its job: refuse a known-bad name without
 /// touching the single-flight machinery. This removes one hashed `moka` probe
@@ -474,8 +553,10 @@ pub fn lookup_cached_sync(host: &str, port: u16) -> Option<SocketAddr> {
 /// per-thread DNS memo falls back to for a new port or after its TTL.
 ///
 /// `Err` covers three cases with distinct meanings for the caller: a live
-/// negative entry ("dns negative cached" — a policy refusal), a genuine
-/// resolution failure, and (via the init's timeout) a timeout.
+/// negative entry ("dns negative cached" — a policy refusal, whose remaining
+/// life is the entry's own deadline), a resolution failure the resolver
+/// reported as a verdict, and a lookup that produced no answer at all (a
+/// short-backoff [`LookupFailure::Inconclusive`]).
 pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
     // Stack-built per-(host, port) key for this thread's memo. The fallback
     // only triggers for hosts longer than the 255-byte wire limit.
@@ -518,8 +599,8 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // would miss the sync memo on every datagram and spawn a resolver task
     // each time, forever (the slow-path limiter bounds concurrency, not the
     // per-datagram task rate). The deadline cannot outlive the shared entry:
-    // it is derived from the entry's own insertion instant, which the negative
-    // cache stores for exactly this reason.
+    // it is read off the entry's own stored deadline, which the negative cache
+    // keeps for exactly this reason.
     //
     // The epoch is sampled **before** the probe. A concurrent success removes
     // the negative entry and bumps `NEG_EPOCH`; if this write sampled the epoch
@@ -529,15 +610,25 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // `memo_put_with_epoch` re-checks the epoch at publication and drops the
     // write if it moved; the shared caches stay the authority either way.
     let epoch_before_probe = neg_epoch();
-    if let Some(inserted_at) = negatives().get(host_key).await {
-        let remaining = DNS_NEG_TTL.saturating_sub(inserted_at.elapsed());
-        let _written = memo_put_with_epoch(
-            memo_key,
-            None,
-            Instant::now() + remaining,
-            epoch_before_probe,
-        );
-        anyhow::bail!("dns negative cached");
+    if let Some(expires_at) = negatives().get(host_key).await {
+        // The entry stores its own deadline (a 10 s verdict, or a 1 s
+        // inconclusive backoff — see [`LookupFailure`]), so the remaining life
+        // is read off it rather than derived from a fixed TTL.
+        let remaining = expires_at.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _written = memo_put_with_epoch(
+                memo_key,
+                None,
+                Instant::now() + remaining,
+                epoch_before_probe,
+            );
+            anyhow::bail!("dns negative cached");
+        }
+        // Logically expired but still resident (moka's own 10 s TTL is only an
+        // eviction bound above the per-entry deadline): fall through to a fresh
+        // lookup. The entry is left in place on purpose — removing it here could
+        // delete a *fresher* refusal another thread just wrote for this name,
+        // and `try_get_with_by_ref` below already single-flights the re-lookup.
     }
     let outcome = positives()
         .try_get_with_by_ref(host_key, async {
@@ -565,14 +656,20 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                     }
                     Ok((now, ips))
                 }
-                Err(e) => {
+                Err(failure) => {
                     // Negatively cache the *name*, so every port of it is
                     // refused after one failure, and memoize this port too so
                     // the sync packet path refuses this exact target without
                     // spawning a resolver. Other ports hit the shared host
                     // verdict above, which memoizes their own port there.
-                    record_negative(host_key, memo_key).await;
-                    Err(format!("{e:#}"))
+                    //
+                    // The TTL comes from the failure's class: a name the
+                    // resolver actually answered for is refused for
+                    // `DNS_NEG_TTL`, while a lookup that never got an answer
+                    // (timeout, saturated fallback) is only held off for the
+                    // short `DNS_INCONCLUSIVE_TTL` backoff.
+                    record_refusal(host_key, memo_key, failure.retry_ttl()).await;
+                    Err(failure.to_string())
                 }
             }
         })
@@ -733,18 +830,22 @@ async fn seed_positive(
     }
 }
 
-/// Record that resolving the name `host_key` failed, so the packet paths can
-/// refuse it without spawning a resolver per datagram: the shared verdict is
-/// host-keyed (every port refuses), and `memo_key` is this thread's
-/// per-`(host, port)` memo entry.
+/// Record that resolving the name `host_key` failed, for `ttl`.
+///
+/// The shared entry is host-keyed (every port refuses) and the value is the
+/// instant the refusal **expires**, so a caller that finds it while asking about
+/// another port can memoize *that* port for exactly the life the verdict has
+/// left. `memo_key` is this thread's per-`(host, port)` memo entry, given the
+/// same deadline.
 ///
 /// Runs inside [`resolve_all_cached`]'s init future, before the error is
 /// published to waiters; the single-flight serialization is what makes the
 /// write safe — no live positive entry can exist while the init that writes
 /// this runs (the old "never downgrade a live positive" probe guarded a
 /// contention window that no longer exists).
-async fn record_negative(host_key: &str, memo_key: &str) {
+async fn record_refusal(host_key: &str, memo_key: &str, ttl: Duration) {
     let now = Instant::now();
+    let expires = now + ttl;
     // Sample the epoch before publishing the shared verdict, then fence the
     // thread-memo write on it: an unrelated success that bumps `NEG_EPOCH` in
     // between must not produce a memo tagged as newer than the entry it was
@@ -752,8 +853,15 @@ async fn record_negative(host_key: &str, memo_key: &str) {
     // thread one slow-path probe on its next lookup; the shared negative entry
     // is still the authority for every port.
     let epoch = neg_epoch();
-    negatives().insert(host_key.to_owned(), now).await;
-    let _ = memo_put_with_epoch(memo_key, None, now + DNS_NEG_TTL, epoch);
+    negatives().insert(host_key.to_owned(), expires).await;
+    let _ = memo_put_with_epoch(memo_key, None, expires, epoch);
+}
+
+/// Record a **verdict**: the resolver answered that the name does not resolve.
+/// The seeding helper and its tests use this entry point; production failures go
+/// through [`record_refusal`] with the TTL their class earns.
+async fn record_negative(host_key: &str, memo_key: &str) {
+    record_refusal(host_key, memo_key, DNS_NEG_TTL).await;
 }
 
 /// Accept `IP:port` or `hostname:port` for the QUIC server address.
@@ -1050,6 +1158,107 @@ mod tests {
             "got: {err:#}"
         );
         assert_eq!(lookup_cached_fast(host, port), CachedLookup::Negative);
+    }
+
+    /// The negative cache's lifetime is a claim about the *name*, so only a
+    /// resolver answer may be cached as one. `NoRecordsFound` (NXDOMAIN/NODATA)
+    /// is the only hickory variant that qualifies; a timeout — and every other
+    /// transport/protocol failure — says nothing about the name and may only be
+    /// held for the short backoff.
+    #[test]
+    fn only_a_resolver_answer_is_cached_as_a_verdict() {
+        let timeout = LookupFailure::from_resolver(hickory_resolver::net::NetError::Timeout);
+        assert!(
+            matches!(timeout, LookupFailure::Inconclusive(_)),
+            "a timeout must not become a verdict about the name"
+        );
+        assert_eq!(timeout.retry_ttl(), DNS_INCONCLUSIVE_TTL);
+        assert!(
+            DNS_INCONCLUSIVE_TTL < DNS_NEG_TTL,
+            "a backoff must be shorter than a verdict"
+        );
+        let verdict = LookupFailure::Verdict(anyhow::anyhow!("no records"));
+        assert_eq!(verdict.retry_ttl(), DNS_NEG_TTL);
+        assert_eq!(verdict.to_string(), "no records");
+    }
+
+    /// An inconclusive failure must not refuse the name for the verdict TTL: the
+    /// shared entry carries a ~1 s deadline, and another port of the same name
+    /// that finds it is memoized for exactly the life it has left, not for
+    /// [`DNS_NEG_TTL`].
+    #[tokio::test]
+    async fn an_inconclusive_failure_backs_off_briefly() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
+        let (host, port) = ("inconclusive.resolve.test", 19704u16);
+        let other_port = port + 1;
+        let host_key = dns_host_key_owned(host);
+        let memo_key = dns_key_owned(host, port);
+        record_refusal(&host_key, &memo_key, DNS_INCONCLUSIVE_TTL).await;
+
+        let deadline = negatives()
+            .get(host)
+            .await
+            .expect("the refusal is shared by name");
+        let life = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            life > Duration::ZERO && life <= DNS_INCONCLUSIVE_TTL,
+            "an inconclusive failure must expire with the backoff, got {life:?}"
+        );
+        assert_eq!(lookup_cached_fast(host, port), CachedLookup::Negative);
+
+        // A *different* port reaches the shared entry and memoizes its own
+        // (host, port) with the entry's remaining life.
+        let err = resolve_all_cached(host, other_port).await.unwrap_err();
+        assert!(
+            err.to_string().contains("dns negative cached"),
+            "got: {err:#}"
+        );
+        let (probe, memo_life) = lookup_cached_fast_with_ttl(host, other_port);
+        assert_eq!(probe, CachedLookup::Negative);
+        assert!(
+            memo_life <= DNS_INCONCLUSIVE_TTL.as_millis() as u64,
+            "another port must not inherit the verdict TTL, got {memo_life} ms"
+        );
+
+        // The verdict path keeps the full claim, which is the whole difference.
+        record_refusal(&host_key, &memo_key, DNS_NEG_TTL).await;
+        let life = negatives()
+            .get(host)
+            .await
+            .expect("the verdict replaced the backoff")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            life > DNS_INCONCLUSIVE_TTL,
+            "a verdict must outlive the backoff, got {life:?}"
+        );
+    }
+
+    /// A stored deadline that has passed must not refuse anything: the entry is
+    /// a deadline, not a switch, and moka may keep it resident for the rest of
+    /// its own 10 s TTL. An IP literal pins the fall-through deterministically
+    /// (hickory answers it without a network query).
+    #[tokio::test]
+    async fn an_expired_refusal_falls_through_to_a_fresh_lookup() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
+        // A literal no other test uses, so a warm positive entry cannot make
+        // this test pass without exercising the fall-through.
+        let (host, port) = ("127.0.0.2", 19705u16);
+        negatives()
+            .insert(host.to_owned(), Instant::now() - Duration::from_secs(1))
+            .await;
+        assert!(
+            negatives().get(host).await.is_some(),
+            "premise: the expired entry is still resident"
+        );
+
+        let got = resolve_all_cached(host, port)
+            .await
+            .expect("the literal resolves");
+        assert_eq!(&got[..], &[SocketAddr::from(([127, 0, 0, 2], port))]);
+        assert!(
+            negatives().get(host).await.is_none(),
+            "the success must clear the stale entry"
+        );
     }
 
     /// Concurrent callers of one cold key must all receive the same address

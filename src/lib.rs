@@ -1016,6 +1016,55 @@ mod tests {
         }
     }
 
+    /// The hash is a filter, not a proof — the slot compares the whole key — but
+    /// the *set index* it produces still has to spread over the names a relay
+    /// actually sees. The case that matters is the one the module docs call out:
+    /// unrelated names that share a long suffix (`…example.com`, `…cdn.net`).
+    /// A raw fold leaves those bits correlated and piles them into one set, so
+    /// this pins both the spread and the chunk-boundary behaviour. Every input is
+    /// fixed, so these are stable properties of the function, not samples.
+    #[test]
+    fn dns_memo_hash_spreads_sets_over_suffix_shared_names() {
+        let mut sets = [0u32; MEMO_SETS];
+        let mut n = 0u32;
+        for suffix in [".example.com", ".cdn.net", ".static.example.org"] {
+            for i in 0..171 {
+                let k = format!("host-{i}{suffix}\0443");
+                let h = dns_memo_hash(&k);
+                assert_eq!(h, dns_memo_hash(&k), "hash must be deterministic");
+                let set = dns_memo_set(h);
+                assert!(set < MEMO_SETS, "set index {set} out of range");
+                sets[set] += 1;
+                n += 1;
+            }
+        }
+        assert_eq!(sets.iter().sum::<u32>(), n);
+        // 513 names over 64 sets averages ~8 per set; a fold that clusters one
+        // suffix fills a handful of sets and leaves the rest near-empty. 4x the
+        // mean is far above what a mixed hash produces and far below what the
+        // unmixed fold did.
+        let mean = f64::from(n) / MEMO_SETS as f64;
+        let max = sets.iter().copied().max().unwrap_or(0);
+        assert!(
+            f64::from(max) < 4.0 * mean,
+            "set index is not spread: max {max} vs mean {mean:.1} ({sets:?})"
+        );
+        // Every byte must reach the hash, including bytes past the last full
+        // eight-byte chunk.
+        for i in 0..24usize {
+            let mut a = String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let mut b = a.clone();
+            b.replace_range(i..i + 1, "b");
+            a.push_str("\x00443");
+            b.push_str("\x00443");
+            assert_ne!(
+                dns_memo_hash(&a),
+                dns_memo_hash(&b),
+                "byte {i} is not folded into the hash"
+            );
+        }
+    }
+
     /// A same-set collision must not resurrect the evicted key, and — the part
     /// that actually matters for correctness — must never serve the wrong
     /// address. The old direct-mapped version could not mis-serve either, so

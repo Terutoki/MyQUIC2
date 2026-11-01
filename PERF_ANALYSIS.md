@@ -1130,3 +1130,180 @@ netstat -s -p udp | grep 'dropped due to full socket buffers'
 # Linux (netstat may be absent): RcvbufErrors is the 6th field of the Udp: line
 awk '/^Udp:/ {print $2, $6}' /proc/net/snmp
 ```
+
+---
+
+## 14. Eighth Batch: the DNS probe's hash, and a verdict that was not one (2026-11-01, post-bd791be)
+
+Scope: `src/dns/**` only, plus one clock read on the server's slow path. No configuration values and no dependencies
+changed. The two findings are independent: a hot-path cost that was ~2x too high for what it did, and a cache entry
+that claimed more than the lookup behind it knew.
+
+### 14.1 What the synchronous probe actually costs
+
+`lookup_cached_fast` (`src/dns/resolve.rs:392-432` before this batch) is the datagram path's DNS answer: it builds the
+per-`(host, port)` key on the stack, probes this thread's two-way memo, and returns the memoized address plus its
+remaining life. It runs whenever the connection fast table's pin misses (`resolve_fast` → `resolve_pin`,
+`src/bin/myquic2-server/accept.rs:707-725`, and `resolve_forward_target`, `src/bin/myquic2-server/forward.rs:413-452`);
+a steady flow with a warm pin pays only `fast.probe_cached` + `is_global_ip_cached` and never reaches it. So the probe
+is not the dominant per-packet cost — but it is the cost a *new* flow or a pin refresh pays, and it was paying for a
+hash it did not need to pay that much for.
+
+Everything in the probe is length-independent except the hash: `DnsMemoSlot::matches` compares the full key only on a
+hash+length match, `dns_key` lowercases in place, `from_utf8` validates a stack prefix. The measurement (a
+`examples/dns_probe_bench.rs` harness, 20M `black_box`ed calls, ns/op) separated the two:
+
+| probe case | before | meaning |
+|---|---|---|
+| `coarse_millis()` alone | 0.97 | clock is not the problem |
+| warm hit, 4-byte host | 15.24 | ~12 ns fixed overhead + ~3 ns hash |
+| warm hit, mixed names (4–50 B) | 29.6 | |
+| warm hit, 50-byte host | 40.81 | ~12 ns fixed + ~29 ns hash |
+| cold miss (no clock read) | 21.78 | the hash is paid on a miss too |
+
+The old hash (`src/dns/memo.rs:176-185`, `h = h*0x9e3779b97f4a7c15 + b` per byte, then two multiplies) is a serial
+dependency chain: 4 cycles/byte, i.e. ~30 ns on a 50-byte name and nothing at all on a 4-byte one. It is the only term
+that scales with the name.
+
+### 14.2 The replacement: length-mixed, eight bytes at a time
+
+`dns_memo_hash` (`src/dns/memo.rs:188-206`) now seeds with the length, folds eight-byte little-endian words with one
+multiply each, packs the tail into one more word (a zero-padded tail needs its length mixed in, hence the seed), and
+finishes with splitmix64:
+
+```rust
+let mut h = (bytes.len() as u64).wrapping_mul(K);
+let (chunks, rem) = bytes.as_chunks::<8>();
+for c in chunks { h = (h ^ u64::from_le_bytes(*c)).wrapping_mul(K); }
+if !rem.is_empty() { /* zero-padded tail, one more fold */ }
+h ^= h >> 30; h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+h ^= h >> 27; h = h.wrapping_mul(0x94d049bb133111eb); h ^ (h >> 31)
+```
+
+Replacing it is safe by construction: the hash is only a *filter* — `DnsMemoSlot::matches` still compares the full key,
+so a collision costs a miss, never a wrong address — and every test that exercises the memo finds its same-set keys
+dynamically through `dns_memo_set(dns_memo_hash(&k))`, so none of them asserts a concrete hash value. The two
+properties the old function's doc called out were checked before landing:
+
+- **set spread** — 200k names `host-{i}.example.com`: coefficient of variation of the 64 set loads 0.0182 → 0.0200
+  (perfect is 0.0179), i.e. still even.
+- **suffix correlation** — the reason the old finalizer existed (names sharing `….example.com` share their tail bytes):
+  20k-name sets scored CV 0.0667 → 0.0485 for `.example.com` and 0.0569 → 0.0569 for `.cdn.net`. No regression.
+
+`dns_memo_hash_spreads_sets_over_suffix_shared_names` (`src/lib.rs:1027`) pins the spread bound and that every byte of
+the first 24 reaches the hash, which covers the tail-packing branch a name under eight bytes would otherwise skip.
+
+### 14.3 Measured, interleaved
+
+Both variants were prebuilt and the runs alternated (`old new new old old new`), because a single-machine run drifts by
+~1.7x between sessions: the `coarse_millis()` control line read 0.97 ns/op in the first session and 1.66–1.86 ns/op in
+this one, with unchanged code. Medians of three runs each, ns/op:
+
+| probe case | old | new | delta |
+|---|---|---|---|
+| warm hit, mixed names | 51.14 | 30.71 | **−40 %** |
+| warm hit, 50-byte host | 69.53 | 33.59 | **−52 %** |
+| warm hit, 4-byte host | 27.07 | 22.70 | −16 % |
+| cold miss (no clock read) | 39.33 | 24.10 | −39 % |
+| negative hit | 44.29 | 33.55 | −24 % |
+| `coarse_millis()` control | 1.84 | 1.66 | unchanged (noise) |
+
+The control line is the point: the machine state was the same on both sides, so the delta belongs to the hash. The
+short-name case gains least, as expected — a 4-byte key's hash was already two multiplies — and the cold miss gains
+because the probe hashes the key whether the set lookup hits or misses.
+
+Reproduce:
+
+```sh
+cargo run --release --example dns_probe_bench
+# Interleaved A/B: build, copy the binary, stash src/, rebuild, copy, pop, then alternate the two binaries.
+```
+
+### 14.4 The logic defect: one TTL for two different claims
+
+`resolve_all_cached` negatively caches a failed lookup so the datagram path can refuse a dead name without spawning a
+resolver per packet — the comment there is explicit that the per-thread memo, not the slow-path semaphore, is what
+bounds the *rate* of spawned lookups. The defect was that it treated every failure as the same claim. Before this batch
+`record_negative` (`src/dns/resolve.rs:746-757`) wrote a 10 s host-keyed entry for **all** of them, including:
+
+- the outer `DNS_LOOKUP_TIMEOUT` expiring — we stopped waiting; the resolver may still be fine and the name certainly is;
+- `dns getaddrinfo fallback saturated (…)` — our own permit set was full, which says nothing about any name;
+- a name server that is down or unreachable (a Wi-Fi roam, a VPN coming up, a paused laptop).
+
+A name that resolves perfectly well could therefore be refused on every port for 10 s because one lookup hit a blip —
+the cache was answering a question it had not asked. The obvious "just don't cache those" is wrong for the reason the
+existing comment gives: with no entry at all, the per-datagram path re-spawns a resolver task per datagram during an
+outage, and the semaphore only bounds how many run at once.
+
+The fix splits the claim by what the lookup learned (`src/dns/resolve.rs:177-224`):
+
+| failure | class | cached for |
+|---|---|---|
+| resolver answered `NoRecordsFound` (NXDOMAIN/NODATA) | `LookupFailure::Verdict` | `DNS_NEG_TTL` = 10 s |
+| libc `getaddrinfo` failed on the fallback path | `Inconclusive` (see below) | `DNS_INCONCLUSIVE_TTL` = 1 s |
+| outer timeout, fallback saturation, blocking-task panic | `Inconclusive` | `DNS_INCONCLUSIVE_TTL` = 1 s |
+| hickory transport/protocol/timeout/`Busy` error | `Inconclusive` | `DNS_INCONCLUSIVE_TTL` = 1 s |
+
+Classification is per-answer, not per-message: hickory 0.26's `NetError::is_no_records_found()` is the only predicate
+that says "the resolver answered about this name" (`hickory_resolver::net::NetError`, re-exported, so no dependency was
+added). The `getaddrinfo` fallback claims no verdict at all — libc gives no portable way to tell `EAI_NONAME` from
+`EAI_AGAIN`, and that path only runs when hickory could not be built, which is the worst moment to guess.
+
+Three mechanical consequences had to be handled together:
+
+1. **The negative entry stores its deadline, not its insertion instant** (`src/dns/store.rs:127-136`). The cached
+   remaining life is what another port of the same name memoizes, so a per-entry TTL is only expressible if the entry
+   carries it; the cache's own 10 s moka TTL is now just an eviction bound above the per-entry deadline. The single
+   reader (`src/dns/resolve.rs:612-628`) subtracts the entry's deadline from the clock instead of from a compile-time
+   constant.
+2. **An entry whose deadline has passed must not refuse anything.** It can still be resident (moka evicts lazily), so
+   the probe checks the remaining life rather than the entry's presence and falls through to a fresh lookup. It is not
+   removed on the way past: another thread may have just written a fresher refusal for the same name, and
+   `try_get_with` single-flights the re-lookup anyway.
+3. **The error text a caller sees is unchanged** except for the timeout, which now reads
+   `dns lookup timed out after 5s` instead of `dns lookup timed out: deadline has elapsed` (nothing asserted on either).
+   `LookupFailure` renders the same `{e:#}` chain the plain `anyhow::Error` did.
+
+The asymmetry with the server's own gate is intentional and worth stating: `DNS_GATE_UNUSABLE_TTL_MS`
+(`src/bin/myquic2-server/forward.rs:26-36`) is 5 s and therefore *longer* than the 1 s backoff. The gate is per target
+and the negative entry is per name, so during a blip the target-level gate is what holds most datagrams off while the
+host-wide entry stops refusing as soon as the resolver might be healthy again. Neither one can outlive the shared
+entry's deadline for a *different* target, which is what the `resolve_all_cached` memoization preserves.
+
+New tests, all deterministic (no network): `only_a_resolver_answer_is_cached_as_a_verdict`,
+`an_inconclusive_failure_backs_off_briefly` (also pins that a second port inherits the entry's *remaining* life, not
+the verdict TTL) and `an_expired_refusal_falls_through_to_a_fresh_lookup` (uses an IP literal, so the re-lookup runs
+the real init path without an upstream query).
+
+### 14.5 Examined and deliberately not changed
+
+- **`resolve_forward_target`'s up-front clock read** (`src/bin/myquic2-server/forward.rs:413-452`): it called
+  `coarse_millis()` before the memo probe, then the probe read the clock again on a hit. The probe already returns the
+  remaining life, so only the session-memo fallbacks need "now"; they now read it inline. One fewer clock read on every
+  slow-path datagram, and the probe's own read is unchanged.
+- **`is_global_ip` at `accept.rs:2971` (`policy_resolved`), `forward.rs:629` (`deliver_resolved_server_dgram`) and
+  `tcp.rs:321` (`dial_happy_eyeballs`)** stays uncached, unlike the packet path's `is_global_ip_cached`. Each of these
+  runs once per resolution or per dial, and the fallback addresses are one-shot: filling the 64-slot direct-mapped
+  packet-path cache with them would evict the hot entries it exists to serve. §4's rule ("`is_global_ip` only on a
+  cache miss") is the right one, and these three sites are not misses on that path.
+- **`upstream_resolver`'s process-lifetime `OnceLock`** (`src/dns/resolve.rs:364-390`) is a real limitation, not a bug
+  this batch could fix: the resolver is built once from the platform's DNS configuration, so a nameserver change (VPN
+  up/down, Wi-Fi roam, DHCP renewal) is never picked up, and every lookup keeps timing out against a dead server. The
+  1 s backoff makes that state recover quickly *once the config changes*, but nothing re-reads the config. Fixing it
+  needs a watcher (inotify on `/etc/resolv.conf`, `SystemConfiguration` dynamic-store notifications on macOS) and a
+  swap of the resolver behind the same `OnceLock`, which is a separate design change; it is recorded here so the
+  limitation is documented rather than implied.
+
+### 14.6 Verification
+
+`cargo fmt --all --check` clean · `cargo clippy --all-targets -- -D warnings` clean ·
+`cargo test --all-targets` **732 passed / 0 failed / 1 ignored** (lib 368, client 199, server 149,
+`forward_e2e` 7, `rev3_e2e` 9).
+
+### 14.7 What this does not establish
+
+The probe numbers are a one-machine loopback microbenchmark of a pure function; they do not become a pps or p99 claim.
+The end-to-end effect is bounded by how often the memo probe is on the hot path at all — a steady flow with a warm
+fast-table pin never reaches it, so the gain shows up on new flows, pin refreshes and cache turns, not on a steady
+`udpdomain` run. The §13 caveat applies unchanged: `hotpath_bench` is the instrument for end-to-end claims, and this
+batch did not run it.

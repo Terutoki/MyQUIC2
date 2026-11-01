@@ -11,7 +11,11 @@
 //!   any present value as the cached answer, so a negative sentinel stored
 //!   there would be served as a resolution result forever (it would never
 //!   re-resolve). Two caches keep the refusal check a plain `get` and make
-//!   "resolution failed" and "resolution succeeded" writes disjoint.
+//!   "resolution failed" and "resolution succeeded" writes disjoint. The entry
+//!   records its own **expiry** instant, so a lookup that did not learn a
+//!   verdict — a timeout, a saturated fallback, an unreachable name server —
+//!   can be refused for a much shorter `retry backoff`
+//!   ([`DNS_INCONCLUSIVE_TTL`]) than a name the resolver actually answered for.
 //!
 //! Both caches are keyed by the **normalized host only** (`dns::key`'s
 //! [`dns_host_key`](super::key::dns_host_key)), never by `(host, port)`: A/AAAA
@@ -55,7 +59,26 @@ pub(crate) type DnsCacheVal = (Instant, Arc<[IpAddr]>);
 /// worst-case staleness end to end.
 pub const DNS_CACHE_TTL_MS: u64 = 120_000;
 pub(crate) const DNS_CACHE_TTL: Duration = Duration::from_millis(DNS_CACHE_TTL_MS);
+
+/// How long a negative entry that *is* a verdict is kept: the resolver
+/// answered that the name does not resolve (NXDOMAIN/NODATA, or the blocking
+/// fallback's own "name or service not known"). Refusing the name for this
+/// long is the point — it is a fact about the name, not about our health, and
+/// it is what stops a dead name from spawning a resolver task per datagram.
 pub(crate) const DNS_NEG_TTL: Duration = Duration::from_secs(10);
+
+/// How long a lookup that produced **no answer** is kept: the outer
+/// [`DNS_LOOKUP_TIMEOUT`] expired, the blocking fallback had no permit, or the
+/// resolver reported a transport/protocol failure. Nothing was learned about
+/// the name, so it must not be refused for [`DNS_NEG_TTL`] — a name that
+/// resolves fine would then stay broken on every port for 10 s after a
+/// transient blip (a Wi-Fi roam, a name server restart, a paused laptop). It is
+/// still recorded, briefly, for one reason: the negative entry is what bounds
+/// the *rate* at which the datagram path spawns resolver tasks (the slow-path
+/// limiter bounds concurrency, not rate), so dropping the entry entirely would
+/// trade a 10 s false refusal for one resolver task per datagram during an
+/// outage. 1 s is a retry backoff, not a verdict.
+pub(crate) const DNS_INCONCLUSIVE_TTL: Duration = Duration::from_millis(1_000);
 /// Capacity bounds. Moka's TinyLFU admission + LRU eviction replace the old
 /// per-shard batch eviction, and a failing-domain flood cannot evict
 /// positives (separate cache). The positive bound was raised with the TTL —
@@ -101,12 +124,15 @@ pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 type DnsHasher = foldhash::fast::RandomState;
 pub(crate) type PosCache = Cache<DnsCacheKey, DnsCacheVal, DnsHasher>;
-/// Negative verdicts. The value is the instant the failure was recorded, not
-/// `()`: a resolver that finds a host-keyed verdict while asking about a
-/// *different* port must memoize that port with the verdict's **remaining**
-/// life, so the sync packet path refuses it without spawning a resolver task
-/// per datagram, while the memo can never outlive the shared entry it was
-/// derived from.
+/// Negative verdicts. The value is the instant the refusal **expires** (not the
+/// instant it was recorded): a resolver that finds a host-keyed verdict while
+/// asking about a *different* port must memoize that port with the verdict's
+/// **remaining** life, so the sync packet path refuses it without spawning a
+/// resolver task per datagram, while the memo can never outlive the shared
+/// entry it was derived from. Storing the deadline rather than the recording
+/// instant is what lets one name carry two lifetimes — a 10 s verdict versus a
+/// 1 s "we did not learn anything" backoff ([`DNS_INCONCLUSIVE_TTL`]) — in the
+/// same cache, whose own 10 s moka TTL is only an eviction bound above them.
 pub(crate) type NegCache = Cache<DnsCacheKey, Instant, DnsHasher>;
 
 pub(crate) fn positives() -> &'static PosCache {
