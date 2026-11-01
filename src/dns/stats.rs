@@ -8,8 +8,13 @@
 //! and the fix for each is different. So the async path counts the classes it
 //! serves and times the two things a user waits on:
 //!
-//! * `lookup` — one upstream resolution, from `resolve_ips` entry to answer
-//!   (including the `getaddrinfo` fallback). The number that a cold name pays.
+//! * `lookup` — one upstream resolution on a *foreground* path, from
+//!   `resolve_ips` entry to answer (including the `getaddrinfo` fallback). The
+//!   number that a cold name pays.
+//! * `refresh` — the same, for a background serve-stale refresh. Kept apart
+//!   because the two are fixed differently: a slow `lookup` is a cold flow
+//!   waiting, a slow `refresh` only delays how long a stale answer keeps being
+//!   served.
 //! * `waiter` — one gated datagram, from the spawn that owns it to the moment
 //!   its payload is handed to the socket. The number a *packet* waits, which is
 //!   what a cold flow's first exchange actually costs.
@@ -111,7 +116,12 @@ struct Counters {
     refresh_started: AtomicU64,
     refresh_ok: AtomicU64,
     refresh_fail: AtomicU64,
+    /// Follower datagrams parked behind an in-flight resolution instead of
+    /// being dropped, and how many of them the waiter went on to deliver.
+    parked: AtomicU64,
+    parked_delivered: AtomicU64,
     lookup: Histogram,
+    refresh_lookup: Histogram,
     waiter: Histogram,
 }
 
@@ -125,7 +135,10 @@ static COUNTERS: Counters = Counters {
     refresh_started: AtomicU64::new(0),
     refresh_ok: AtomicU64::new(0),
     refresh_fail: AtomicU64::new(0),
+    parked: AtomicU64::new(0),
+    parked_delivered: AtomicU64::new(0),
     lookup: Histogram::new(),
+    refresh_lookup: Histogram::new(),
     waiter: Histogram::new(),
 };
 
@@ -170,6 +183,21 @@ pub(crate) fn refresh_finished(ok: bool) {
 /// Time one upstream resolution (see the module docs for what is included).
 pub(crate) fn lookup_took(elapsed: Duration) {
     COUNTERS.lookup.record(elapsed);
+}
+
+/// Time one background refresh's upstream resolution.
+pub(crate) fn refresh_lookup_took(elapsed: Duration) {
+    COUNTERS.refresh_lookup.record(elapsed);
+}
+
+/// One follower datagram was parked behind an in-flight resolution.
+pub fn parked() {
+    COUNTERS.parked.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One parked follower was delivered by the waiter that resolved its name.
+pub fn parked_delivered() {
+    COUNTERS.parked_delivered.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Time one gated datagram from its spawn to the socket hand-off.
@@ -228,6 +256,12 @@ impl HistSnapshot {
     }
 
     /// This interval's samples, given the previous absolute snapshot.
+    ///
+    /// `max_us` is left as the *process-lifetime* maximum — it is not
+    /// subtractable — so an interval's own ceiling is `percentile_us(100)`,
+    /// which is a bucket bound rather than an exact sample. The printed line
+    /// uses that and says `max<=` to be honest about it; reading `max_us()` off a
+    /// delta would report a sample that may have happened hours ago.
     #[must_use]
     pub fn since(&self, prev: &Self) -> Self {
         let mut counts = [0u64; BUCKETS];
@@ -258,7 +292,10 @@ pub struct Snapshot {
     pub refresh_started: u64,
     pub refresh_ok: u64,
     pub refresh_fail: u64,
+    pub parked: u64,
+    pub parked_delivered: u64,
     pub lookup: HistSnapshot,
+    pub refresh_lookup: HistSnapshot,
     pub waiter: HistSnapshot,
 }
 
@@ -281,7 +318,10 @@ pub fn snapshot() -> Snapshot {
         refresh_started: COUNTERS.refresh_started.load(Ordering::Relaxed),
         refresh_ok: COUNTERS.refresh_ok.load(Ordering::Relaxed),
         refresh_fail: COUNTERS.refresh_fail.load(Ordering::Relaxed),
+        parked: COUNTERS.parked.load(Ordering::Relaxed),
+        parked_delivered: COUNTERS.parked_delivered.load(Ordering::Relaxed),
         lookup: COUNTERS.lookup.snapshot(),
+        refresh_lookup: COUNTERS.refresh_lookup.snapshot(),
         waiter: COUNTERS.waiter.snapshot(),
     }
 }
@@ -300,7 +340,10 @@ impl Snapshot {
             refresh_started: self.refresh_started.saturating_sub(prev.refresh_started),
             refresh_ok: self.refresh_ok.saturating_sub(prev.refresh_ok),
             refresh_fail: self.refresh_fail.saturating_sub(prev.refresh_fail),
+            parked: self.parked.saturating_sub(prev.parked),
+            parked_delivered: self.parked_delivered.saturating_sub(prev.parked_delivered),
             lookup: self.lookup.since(&prev.lookup),
+            refresh_lookup: self.refresh_lookup.since(&prev.refresh_lookup),
             waiter: self.waiter.since(&prev.waiter),
         }
     }
@@ -317,7 +360,7 @@ impl std::fmt::Display for Snapshot {
         write!(
             f,
             "{} fresh, {} stale, {} refused, {} cold ({} verdict, {} inconclusive), \
-             {} refresh ({} ok, {} failed)",
+             {} refresh ({} ok, {} failed), {} parked ({} delivered)",
             self.fresh,
             self.stale,
             self.refused,
@@ -326,17 +369,26 @@ impl std::fmt::Display for Snapshot {
             self.inconclusive,
             self.refresh_started,
             self.refresh_ok,
-            self.refresh_fail
+            self.refresh_fail,
+            self.parked,
+            self.parked_delivered
         )?;
-        for (name, h) in [("lookup", &self.lookup), ("waiter", &self.waiter)] {
+        for (name, h) in [
+            ("lookup", &self.lookup),
+            ("refresh", &self.refresh_lookup),
+            ("waiter", &self.waiter),
+        ] {
             if h.count() > 0 {
+                // `max<=` because this is a bucket bound, not the exact sample:
+                // the interval delta cannot subtract a maximum, and the
+                // process-lifetime one would outlive its own interval.
                 write!(
                     f,
-                    "; {name} n={} p50<={} p99<={} max={}",
+                    "; {name} n={} p50<={} p99<={} max<={}",
                     h.count(),
                     duration_us(h.percentile_us(50)),
                     duration_us(h.percentile_us(99)),
-                    duration_us(h.max_us()),
+                    duration_us(h.percentile_us(100)),
                 )?;
             }
         }
@@ -418,6 +470,31 @@ mod tests {
             0,
             "a counter-only interval has no samples"
         );
+    }
+
+    /// A printed maximum must describe *its own* interval. The absolute
+    /// snapshot exposes the process-lifetime maximum, and the interval delta
+    /// cannot subtract it, so the line prints the interval's ceiling bound
+    /// instead — one 4 s timeout must not make every later line claim 4 s.
+    #[test]
+    fn a_printed_maximum_belongs_to_its_interval() {
+        let h = Histogram::new();
+        h.record(Duration::from_secs(4));
+        let before = h.snapshot();
+        h.record(Duration::from_millis(1));
+        let interval = h.snapshot().since(&before);
+        assert_eq!(
+            interval.max_us(),
+            4_000_000,
+            "the field stays the lifetime maximum"
+        );
+        let line = Snapshot {
+            lookup: interval,
+            ..Snapshot::default()
+        }
+        .to_string();
+        assert!(line.contains("max<=1.0ms"), "{line}");
+        assert!(!line.contains("4.0s"), "{line}");
     }
 
     #[test]

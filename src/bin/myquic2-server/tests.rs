@@ -3386,6 +3386,7 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
     // Phase 1: cold name, fresh session 11.
     let before = dgram_drops::snapshot();
     let spawns_before = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
+    let parked_before = myquic2::dns::stats::snapshot();
     // The process-wide `dgram_drops` counters are shared with every
     // concurrently running test, so exact accounting for this burst uses the
     // gate's own counter (local to this SessTable); the global deltas are only
@@ -3426,11 +3427,20 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
         delivered >= 1,
         "the one waiter's payload must reach the target"
     );
+    // The followers of the claim are parked and delivered by the waiter, so the
+    // burst reaches the target as inline + the waiter's own + its parked set.
+    let parked = myquic2::dns::stats::snapshot()
+        .since(&parked_before)
+        .parked_delivered;
+    assert!(
+        parked > 0,
+        "the burst behind one claim must park a follower instead of dropping it"
+    );
     assert_eq!(
         delivered as usize,
-        inline + 1,
-        "every datagram is delivered by the single waiter or inline; a \u{22}dropped\u{22} \
-         payload here means the gate lost one"
+        inline + 1 + parked as usize,
+        "every datagram is delivered by the single waiter (its own plus {parked} \
+         parked), or inline; a \u{22}dropped\u{22} payload here means the gate lost one"
     );
     let gate_refs = ss.dns_gate.refusals() - gate_before;
     assert_eq!(
@@ -3452,6 +3462,7 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
     // served inline (zero spawns) and every datagram is delivered.
     let before2 = dgram_drops::snapshot();
     let spawns_before2 = DNS_WAITER_SPAWNS.load(Ordering::Relaxed);
+    let parked_before2 = myquic2::dns::stats::snapshot();
     let gate_before2 = ss.dns_gate.refusals();
     let mut inline2 = 0usize;
     for _ in 0..40 {
@@ -3485,10 +3496,14 @@ async fn l2_dns_burst_coalesces_to_one_waiter_per_session() {
         spawns2 <= 1,
         "a warm-name burst must coalesce to at most one waiter, spawned {spawns2}"
     );
+    let parked2 = myquic2::dns::stats::snapshot()
+        .since(&parked_before2)
+        .parked_delivered;
     assert_eq!(
         delivered2 as usize,
-        inline2 + spawns2 as usize,
-        "every datagram is delivered by the single waiter or inline"
+        inline2 + spawns2 as usize + parked2 as usize,
+        "every datagram is delivered by the single waiter (its own plus {parked2} \
+         parked), or inline"
     );
     assert_eq!(
         delivered2 as u64 + gate_refs2,
@@ -3667,7 +3682,7 @@ fn dns_gate_coalesces_and_caches_unusable_verdicts() {
         host,
         port,
         token,
-        Some(Duration::from_millis(DNS_GATE_UNUSABLE_TTL_MS)),
+        Some(Duration::from_millis(DNS_GATE_FILTERED_TTL_MS)),
         t0 + 2,
     );
     assert_eq!(gate.probe_for_test(s, host, port, t0 + 2), Some(true));
@@ -3676,9 +3691,157 @@ fn dns_gate_coalesces_and_caches_unusable_verdicts() {
         GateClaim::Unusable
     ));
     assert!(matches!(
-        gate.claim(s, host, port, t0 + 2 + DNS_GATE_UNUSABLE_TTL_MS + 1),
+        gate.claim(s, host, port, t0 + 2 + DNS_GATE_FILTERED_TTL_MS + 1),
         GateClaim::Proceed(_)
     ));
+}
+
+/// A routing verdict is remembered per exact address, and only long enough to
+/// save the next datagram — never as a policy decision.
+#[test]
+fn a_routing_failure_condemns_only_that_address() {
+    let addr: SocketAddr = "192.0.2.7:443".parse().unwrap();
+    assert!(!is_unreachable(addr), "premise: nothing is marked yet");
+    mark_unreachable(addr);
+    assert!(
+        is_unreachable(addr),
+        "the failed address is skipped next time"
+    );
+    assert!(
+        !is_unreachable("192.0.2.7:8443".parse().unwrap()),
+        "the port is part of the key"
+    );
+    assert!(
+        !is_unreachable("192.0.2.8:443".parse().unwrap()),
+        "another address of the same name is unaffected"
+    );
+    assert!(
+        forward::is_routing_error(std::io::ErrorKind::NetworkUnreachable)
+            && forward::is_routing_error(std::io::ErrorKind::HostUnreachable)
+            && forward::is_routing_error(std::io::ErrorKind::AddrNotAvailable)
+            && !forward::is_routing_error(std::io::ErrorKind::PermissionDenied),
+        "only the unreachable family may condemn an address"
+    );
+}
+
+/// The filtered-verdict window is bounded by the answer's own life, and capped
+/// so one filtered name cannot hold a gate slot for an unbounded time.
+#[tokio::test]
+async fn a_filtered_verdict_is_bounded_by_the_answers_life() {
+    let (host, port) = ("filteredwindow.invalid", 19731u16);
+    // Uncached: a memo miss falls back to a fresh-answer bound, capped.
+    assert_eq!(
+        filtered_ttl_ms(host, port),
+        DNS_GATE_FILTERED_TTL_MS,
+        "a miss must use the fresh bound, not a stale leftover"
+    );
+    // A seeded answer's remaining life is smaller than the cap and is what the
+    // gate must hold: the verdict cannot change while this answer is cached.
+    let addr: SocketAddr = "192.0.2.9:443".parse().unwrap();
+    let age = Duration::from_millis(DNS_CACHE_TTL_MS.saturating_sub(3_000));
+    dns_cache_seed_aged(host, port, addr, age).await;
+    let window = filtered_ttl_ms(host, port);
+    assert!(
+        window > 0 && window <= 3_100,
+        "the window is the entry's remaining life (~3 s), got {window} ms"
+    );
+}
+
+/// Followers of an in-flight claim are parked and handed back in arrival order,
+/// and both bounds hold.
+#[test]
+fn dns_gate_parks_followers_until_the_answer() {
+    let gate = DnsGate::new();
+    let (s, host, port) = (31u32, "parked.test", 443u16);
+    let t0 = 1_000u64;
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    // Nothing is parked before anyone arrives, and a verdict claim parks nothing.
+    assert!(gate.take_parked(s, host, port, token).is_empty());
+    for i in 0..DNS_GATE_PARK_ITEMS {
+        assert!(
+            gate.park(s, host, port, t0 + 1, Bytes::from(vec![i as u8; 16])),
+            "park {i} must fit the item and byte bounds"
+        );
+    }
+    assert!(
+        !gate.park(s, host, port, t0 + 1, Bytes::from_static(b"overflow")),
+        "the item bound must refuse the fifth datagram"
+    );
+    let parked = gate.take_parked(s, host, port, token);
+    assert_eq!(
+        parked.len(),
+        DNS_GATE_PARK_ITEMS,
+        "every parked item returns"
+    );
+    for (i, item) in parked.iter().enumerate() {
+        assert_eq!(item[0], i as u8, "arrival order is preserved");
+    }
+    assert!(
+        gate.take_parked(s, host, port, token).is_empty(),
+        "taking twice returns nothing: the claim handed its followers over once"
+    );
+    // A completed claim cannot park: the in-flight state is gone.
+    gate.finish(s, host, port, token, None, t0 + 2);
+    assert!(
+        !gate.park(s, host, port, t0 + 3, Bytes::from_static(b"late")),
+        "a finished claim must not accept followers"
+    );
+}
+
+/// The byte bound, and the case a follower must not be parked at all: a claim
+/// owned by another generation (an evicted slot) hands back nothing.
+#[test]
+fn dns_gate_park_bounds_and_generation_ownership() {
+    let gate = DnsGate::new();
+    let (s, host, port) = (32u32, "parkbytes.test", 443u16);
+    let t0 = 1_000u64;
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    // One datagram that fits the item bound but not the byte bound.
+    assert!(
+        !gate.park(
+            s,
+            host,
+            port,
+            t0 + 1,
+            Bytes::from(vec![0u8; DNS_GATE_PARK_BYTES + 1])
+        ),
+        "the byte bound must refuse an oversized datagram"
+    );
+    assert!(gate.park(s, host, port, t0 + 1, Bytes::from_static(b"ok")));
+    assert!(
+        gate.take_parked(s, host, port, token.wrapping_add(1))
+            .is_empty(),
+        "only the claim's own generation may take its followers"
+    );
+    assert_eq!(
+        gate.take_parked(s, host, port, token).len(),
+        1,
+        "the real generation still holds the parked datagram"
+    );
+    // An unusable verdict parks nothing (there is no answer coming).
+    let token2 = match gate.claim(33, host, port, t0 + 2) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    gate.finish(
+        33,
+        host,
+        port,
+        token2,
+        Some(Duration::from_millis(1_000)),
+        t0 + 2,
+    );
+    assert!(
+        !gate.park(33, host, port, t0 + 3, Bytes::from_static(b"x")),
+        "a refused name has no answer to wait for"
+    );
+    let _ = token;
 }
 
 /// The gate's refusal window follows the failure's own class, so it no longer
@@ -3729,7 +3892,7 @@ fn dns_gate_refusal_window_follows_the_failure_class() {
         GateClaim::Proceed(_)
     ));
 
-    // The policy refusal keeps the flat default window.
+    // The filtered verdict keeps its own (capped) window.
     let gate = DnsGate::new();
     let token = match gate.claim(s, host, port, t0) {
         GateClaim::Proceed(token) => token,
@@ -3740,15 +3903,15 @@ fn dns_gate_refusal_window_follows_the_failure_class() {
         host,
         port,
         token,
-        Some(Duration::from_millis(DNS_GATE_UNUSABLE_TTL_MS)),
+        Some(Duration::from_millis(DNS_GATE_FILTERED_TTL_MS)),
         t0,
     );
     assert!(matches!(
-        gate.claim(s, host, port, t0 + DNS_GATE_UNUSABLE_TTL_MS - 1),
+        gate.claim(s, host, port, t0 + DNS_GATE_FILTERED_TTL_MS - 1),
         GateClaim::Unusable
     ));
     assert!(matches!(
-        gate.claim(s, host, port, t0 + DNS_GATE_UNUSABLE_TTL_MS + 1),
+        gate.claim(s, host, port, t0 + DNS_GATE_FILTERED_TTL_MS + 1),
         GateClaim::Proceed(_)
     ));
 }

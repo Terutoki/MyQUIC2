@@ -17,8 +17,8 @@ pub use resolve::{
     CachedLookup, DnsFailure, IpPreference, dns_cache_seed, dns_cache_seed_aged,
     dns_cache_seed_set, dns_neg_cache_seed, dns_slow_path_limiter, ip_preference,
     lookup_cached_fast, lookup_cached_fast_with_ttl, lookup_cached_sync, resolve_all,
-    resolve_all_cached, resolve_server_addr, resolve_server_addrs, resolve_server_side,
-    set_ip_preference, spawn_resolver_watch,
+    resolve_all_cached, resolve_server_addr, resolve_server_addrs, resolve_server_addrs_fresh,
+    resolve_server_side, set_ip_preference, spawn_resolver_watch,
 };
 pub use stats::{Snapshot as DnsStats, dns_stats, waiter_took};
 pub(crate) use store::{

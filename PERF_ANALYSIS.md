@@ -1893,3 +1893,166 @@ datagrams (§16.6's deferred item 3) would help — that is exactly what the
 resolver poll still cannot see a change that leaves nameservers, search list and
 hosts file identical but changes resolver *options*; that is documented at the
 fingerprint rather than fixed.
+
+## 18. Twelfth Batch: a routing verdict, parked followers, and four reasons a cached answer outlives its truth (2026-11-01, post-44f5081)
+
+The eleventh batch built the instrument; this one acts on what it measures and on
+the review of that batch. Five of the six items are behavioural — each removes a
+case where the DNS layer knows something that the datagram path then throws away:
+the kernel saying "no route", the answer naming several addresses, a filtered
+verdict that cannot change while its answer is cached, a client retrying an
+address list built before the network moved, a truncated answer served as if it
+were complete. The sixth is the instrument itself: the line printed a lifetime
+maximum where it promised an interval one.
+
+### 18.1 A `sendto` routing error is a verdict, not packet loss
+
+`deliver_resolved_server_dgram` used to take the first policy-allowed record and
+send once. On a network that advertises AAAA without a working IPv6 route — the
+common shape of a broken dual-stack network — that first address is unroutable,
+`sendto` fails immediately with `ENETUNREACH`, and the failure is booked as
+`udp_write failed` exactly like a full socket. Nothing noticed that the same
+answer held an address that worked, and the session memo kept the dead one for
+its whole life.
+
+`udp_try_send_or_return` (`src/udp/retry.rs:250`) is the new primitive: it books
+the failure as before and hands the payload back with the error kind, so a caller
+that owns a *record set* can try the next address. `udp_try_send` is now a thin
+wrapper (`let _ = udp_try_send_or_return(..)`), so every existing caller keeps
+its behaviour and its accounting.
+
+The delivery path walks the allowed addresses in preference order
+(`src/bin/myquic2-server/forward.rs:918`) and stops at the first the kernel
+accepted; a routing error (`NetworkUnreachable | HostUnreachable |
+AddrNotAvailable`) condemns that address in a thread-local, direct-mapped hint
+(`mark_unreachable`, `:561`, 16 slots, 10 s) and the loop continues. When a later
+address wins, it is written to the session destination memo and the reply
+allowlist (`sess_dest_store` + `remember_dst`), so the *next* datagram is answered
+inline by `resolve_forward_target` and the pin armed from it carries the address
+that works. `resolve_forward_target` now treats a recently unroutable address as
+a miss (`:527`), which is what routes that next datagram through the waiter
+instead of repeating the failure forever.
+
+Three deliberate limits. The first candidate is always tried, because the hint is
+a ten-second memory and not a fact; only later candidates are skipped. The staged
+burst path cannot retry per datagram (it groups frames for one `sendmmsg` pass),
+so it only records the verdict and lets the next datagram repair — documented at
+the call site. And the hint is advisory in one direction only: it can make the
+gate deliver to a second address from the same answer, never to an address the
+egress policy filtered, and "no allowed address" still fails closed.
+
+### 18.2 Followers wait instead of being dropped
+
+The gate's whole purpose is one waiter per `(session, name, port)`, and the
+datagrams that arrived during the flight were dropped — ordinary UDP loss, but a
+loss the application pays for with its own retransmit timer (200 ms on a QUIC
+PTO, ~1 s on a TCP-style RTO) for a name that was already being resolved. That is
+the case the `waiter` histogram was added for.
+
+`DnsGate::park` (`src/bin/myquic2-server/forward.rs:389`) stores a follower in
+the live in-flight entry, bounded by `DNS_GATE_PARK_ITEMS` (4 datagrams) and
+`DNS_GATE_PARK_BYTES` (8 KiB) per claim. When the answer lands, the waiter takes
+them in arrival order (`take_parked`, `:424`) and sends each through
+`deliver_resolved_server_dgram` — the session, memo and allowlist are already
+warm, so each is one DATAGRAM send — bumping `dns::stats::parked_delivered()`.
+Anything still parked when the claim completes without an answer (a verdict, a
+cancelled waiter, an evicted slot) is counted as `dgram_drops::REFUSED` per
+datagram in `finish` (`:462`), so a parked datagram is never silently discarded.
+
+The memory is charged, not hand-waved: a parked set only exists while its claim's
+waiter holds a slow-path permit, so `dns_inflight_memory_bytes`
+(`src/config/tuning.rs:663`) counts one `DNS_WAITER_PARK_BYTES` (8 KiB) per
+permit — at most 8 MiB process-wide at the 1,024-permit cap. Overflow and the
+`Unusable` arm keep the old refuse-and-count behaviour, and the line now reports
+`{parked} parked ({parked_delivered} delivered)`.
+
+### 18.3 A filtered verdict lasts as long as its answer
+
+`DNS_GATE_UNUSABLE_TTL_MS` was a flat 5 s window for the one refusal the DNS
+layer never sees: the resolver answered, but every record was filtered by the
+egress policy. That verdict is a property of the *answer* — the same records,
+filtered by the same policy — so it cannot change while the answer is cached, and
+5 s re-spawned the same doomed resolution up to twenty-four times over one
+300 s-cached answer.
+
+`filtered_ttl_ms` (`src/bin/myquic2-server/forward.rs:82`) returns the entry's
+remaining life, capped by `DNS_GATE_FILTERED_TTL_MS` (60 s) so one name cannot
+hold a gate slot indefinitely; a memo miss falls back to the fresh-answer bound.
+A fresh resolution re-decides either way, which is what keeps the window honest.
+
+### 18.4 The client's second failure
+
+The reconnect loop reads `resolve_server_addrs` every iteration, which is right
+while the cache holds a live answer. But a positive entry is served for up to
+`DNS_STALE_WINDOW` (1 h) past its freshness deadline, so a machine that moved
+networks keeps retrying the addresses of the network it left — and
+`prefer_last_good` puts the last one it *did* reach first, which after a change
+is the wrong hint.
+
+Two consecutive failed iterations say the answer is wrong rather than the
+attempt. `should_force_refresh` (failures >= 2, a pure predicate) then calls
+`resolve_server_addrs_fresh` (`src/dns/resolve.rs:1298`), which removes the
+positive and negative entries and resolves again, and clears `last_good` for the
+next attempt. The next iteration reads the now-fresh cache; the counter saturates
+rather than wrapping, and the ordinary path re-populates the cache for the
+iterations that follow.
+
+### 18.5 A truncated answer over TCP
+
+`opts.try_tcp_on_error = true` in `configure_resolver_options`
+(`src/dns/resolve.rs:459`). hickory's alternative on TC=1 is to serve the partial
+UDP record set — silently dropping addresses — and because hickory's own cache is
+deliberately disabled, every cold lookup would pay that again. The retry is
+bounded by the same 1.5 s × 2 budget as any other attempt.
+
+### 18.6 The refresh histogram, and two accounting bugs
+
+`refresh_positive` now times its own lookup into `stats::refresh_lookup_took`
+(`src/dns/resolve.rs:1152`), separate from the foreground `lookup` histogram:
+"slow DNS" has two meanings, and the datagram path's p99 is the one users feel
+while a refresh's p99 only delays how long a stale answer keeps being served.
+
+Both review findings of the eleventh batch are fixed here. `HistSnapshot::since`
+printed the process-lifetime `max_us` as the interval's maximum, so a histogram
+that recorded one 4 s outlier once printed `max=4.0s` in every subsequent
+minute; an interval's ceiling is now `percentile_us(100)`, a bucket bound
+(`max<=`), and `max_us` is documented as the lifetime maximum it is. And
+`send_packed_frames`'s missing-body arm had lost its `book_too_large` /
+`items_dropped` accounting while `requeue_unsent` starts at the frame *after* the
+failed one, so the payloads left the queue unbooked.
+
+The line now reads, for an interval:
+
+```
+dns (60s): 412 fresh, 6 stale, 2 refused, 3 cold (1 verdict, 2 inconclusive),
+           6 refresh (4 ok, 2 failed), 9 parked (9 delivered);
+           lookup n=3 p50<=8.0ms p99<=128.0ms max<=256.0ms;
+           refresh n=6 p50<=16.0ms p99<=256.0ms max<=256.0ms;
+           waiter n=3 p50<=4.0ms p99<=64.0ms max<=64.0ms
+```
+
+### 18.7 Verification
+
+`cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test --all-targets` **760 passed / 0 failed / 1 ignored**
+(lib 383, client 202, server 159 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9).
+New tests: `a_routing_failure_condemns_only_that_address` (exact-address match,
+port in the key, the three routable kinds and one that must not condemn),
+`a_filtered_verdict_is_bounded_by_the_answers_life` (fresh bound on a miss,
+remaining life for a seeded answer, capped),
+`dns_gate_parks_followers_until_the_answer` (arrival order, both bounds, a
+finished claim parks nothing), `dns_gate_park_bounds_and_generation_ownership`
+(only the owning generation takes its followers, a verdict parks nothing),
+`a_second_failed_iteration_forces_an_uncached_lookups` (the threshold and the
+saturating counter) and `a_printed_maximum_belongs_to_its_interval`.
+
+### 18.8 What this does not establish
+
+No measurement backs the parking item: the `waiter` line's p99 against the `app
+RTO` is the number that decides whether 8 KiB per claim is worth it, and that
+still needs a `hotpath_bench udpdomain` run under a cold-name burst. The routing
+hint is remembered per thread (a hash slot, ten seconds), so two workers can
+disagree about one address for that window — it only costs a datagram. The
+deferred structural items are unchanged: the rev4 client address hint on the wire
+(split-horizon needs a fallback design) and UDP happy-eyeballs without feedback,
+which §18.1's feedback partially supersedes.

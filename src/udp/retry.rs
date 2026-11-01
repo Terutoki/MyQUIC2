@@ -231,8 +231,32 @@ fn retry_shard_for(dst: &SocketAddr) -> &'static RetryShard {
 /// in a bounded set), and one slow destination cannot head-of-line-block every
 /// other session behind a single queue; a full shard drops (UDP semantics).
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
+    // The error kind is dropped here: this path has exactly one destination, so
+    // there is nothing to fall back to. `udp_try_send_or_return` exists for the
+    // callers that do (a DNS record set).
+    let _ = udp_try_send_or_return(sock, dst, payload);
+}
+
+/// [`udp_try_send`], but hands the payload back when the kernel refused the
+/// datagram outright — anything except `WouldBlock`, which is queued.
+///
+/// The caller that owns a *record set* has second and third addresses to try,
+/// and a local `sendto` error is the one loss signal a proxy can actually see:
+/// `ENETUNREACH`/`EHOSTUNREACH` on the first (say, IPv6-only-advertised) address
+/// is not packet loss, it is a routing verdict that arrives immediately. The
+/// accounting for that failure is still booked here — each attempt is one
+/// `failed()` on the 60 s line — and the caller decides whether trying the next
+/// address is worth a `retry` label of its own.
+pub fn udp_try_send_or_return(
+    sock: &Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    payload: Bytes,
+) -> std::result::Result<(), (std::io::ErrorKind, Bytes)> {
     match sock.try_send_to(&payload, dst) {
-        Ok(_) => udp_write::sent(),
+        Ok(_) => {
+            udp_write::sent();
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             let req = UdpRetry {
                 sock: sock.clone(),
@@ -252,10 +276,12 @@ pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload:
                     format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
                 });
             }
+            Ok(())
         }
         Err(e) => {
             let n = udp_write::failed();
             warn_udp_write(UdpWriteDrop::SendFailed, n, || e.to_string());
+            Err((e.kind(), payload))
         }
     }
 }

@@ -72,6 +72,9 @@ pub(crate) fn spawn_conn_loop(
         // next attempt: after a network change the preference order may still
         // name the family that was just proven dead.
         let mut last_good: Option<SocketAddr> = None;
+        // Consecutive failed dial iterations. Two in a row say the *answer* is
+        // wrong, not the attempt (see `should_force_refresh`).
+        let mut failures: u32 = 0;
         loop {
             let candidates = match resolve_server_addrs(&server_str, DIAL_ADDR_CANDIDATES).await {
                 Ok(v) => prefer_last_good(v, last_good),
@@ -86,6 +89,7 @@ pub(crate) fn spawn_conn_loop(
             match dial_candidates(&ep, &cfg, &candidates, &sname, &auth, &zero_rtt).await {
                 Ok((server, conn)) => {
                     last_good = Some(server);
+                    failures = 0;
                     info!("QUIC connected to {server}");
                     // MQP-3 connection state is created per dial for the
                     // configured wire revision (`wire_rev` + ALPN, fixed for
@@ -258,6 +262,23 @@ pub(crate) fn spawn_conn_loop(
                     tokio::time::sleep(wait).await;
                 }
                 Err(e) => {
+                    // Two failures in a row say the answer, not the attempt, is
+                    // wrong: the cached list is a snapshot that may predate a
+                    // network change, and its addresses survive for the answer's
+                    // TTL plus the serve-stale window. Re-resolving past the
+                    // cache every second failure costs one DNS round trip
+                    // against an otherwise endless black hole, and the attempt
+                    // after it starts from a list that was just built.
+                    failures = failures.saturating_add(1);
+                    if should_force_refresh(failures) {
+                        if let Err(e) =
+                            resolve_server_addrs_fresh(&server_str, DIAL_ADDR_CANDIDATES).await
+                        {
+                            tracing::debug!("re-resolve {server_str} failed: {e:#}");
+                        }
+                        // The remembered address came from the same stale list.
+                        last_good = None;
+                    }
                     let wait = backoff.next().unwrap_or(Duration::from_secs(5))
                         + Duration::from_millis(jitter_ms());
                     warn!("dial {server_str} failed: {e:#}; retry in {wait:?}");
@@ -387,6 +408,20 @@ pub(crate) fn prefer_last_good(
 /// caps the list at three (`DIAL_ADDR_CANDIDATES`), so the worst case is 6 s.
 pub(crate) fn attempt_budget(candidates: usize) -> Duration {
     (DIAL_ATTEMPT_TIMEOUT / candidates.max(1) as u32).max(DIAL_MIN_ATTEMPT)
+}
+
+/// Does a failed-iteration count call for a resolution that ignores the cache?
+///
+/// One failure is ordinary (the server was restarting, the path dropped). Two in
+/// a row, with a fresh backoff between them, say the address list itself is
+/// wrong — and the list the loop reads is a cached answer that keeps being served
+/// after its freshness deadline ([`DNS_STALE_WINDOW`]). Re-resolving past the
+/// cache then costs one DNS round trip; *not* doing it costs a black hole bounded
+/// only by the answer's TTL plus that window.
+///
+/// A pure predicate so the threshold is testable without a socket.
+pub(crate) const fn should_force_refresh(failures: u32) -> bool {
+    failures >= 2
 }
 
 /// Dial the first candidate that answers, in order.

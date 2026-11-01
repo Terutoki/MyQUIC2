@@ -648,6 +648,16 @@ const DNS_WAITER_HOST_BYTES: u64 = 255;
 /// payload retention is already covered by the payload term above.
 const DNS_WAITER_STRUCT_BYTES: u64 = 512;
 
+/// Follower payloads one DNS slow-path waiter may park behind its claim.
+///
+/// Parking delays the datagrams that arrive during a cold resolution instead of
+/// dropping them, and the parked set lives in the claim the waiter owns — one
+/// claim per permit, so the set is bounded per permit by
+/// `DNS_GATE_PARK_BYTES` in `bin/myquic2-server/forward.rs`. It is charged here
+/// with the waiter because that is the object holding it: when the waiter
+/// finishes, the set is either delivered or counted as dropped.
+const DNS_WAITER_PARK_BYTES: u64 = 8 * 1024;
+
 /// Worst-case resolver-waiter state the DNS slow path can hold.
 ///
 /// The slow path is gated by the [`DNS_SLOW_PATH_PERMITS`]-permit semaphore in
@@ -662,7 +672,10 @@ const DNS_WAITER_STRUCT_BYTES: u64 = 512;
 #[must_use]
 pub fn dns_inflight_memory_bytes() -> u64 {
     (DNS_SLOW_PATH_PERMITS as u64).saturating_mul(
-        crate::UDP_RECV_MAX as u64 + DNS_WAITER_HOST_BYTES + DNS_WAITER_STRUCT_BYTES,
+        crate::UDP_RECV_MAX as u64
+            + DNS_WAITER_HOST_BYTES
+            + DNS_WAITER_STRUCT_BYTES
+            + DNS_WAITER_PARK_BYTES,
     )
 }
 
@@ -813,12 +826,15 @@ mod tests {
     }
 
     /// The DNS term must price one full permit count of worst-case waiters
-    /// (max payload + wire-limit name + fixed structure), not just the payload.
+    /// (max payload + wire-limit name + fixed structure + the followers such a
+    /// waiter can park), not just the payload.
     #[test]
     fn dns_inflight_budget_covers_every_permit_at_the_worst_waiter() {
         assert_eq!(DNS_SLOW_PATH_PERMITS, 1024);
-        let per_waiter =
-            crate::UDP_RECV_MAX as u64 + DNS_WAITER_HOST_BYTES + DNS_WAITER_STRUCT_BYTES;
+        let per_waiter = crate::UDP_RECV_MAX as u64
+            + DNS_WAITER_HOST_BYTES
+            + DNS_WAITER_STRUCT_BYTES
+            + DNS_WAITER_PARK_BYTES;
         assert_eq!(
             dns_inflight_memory_bytes(),
             DNS_SLOW_PATH_PERMITS as u64 * per_waiter

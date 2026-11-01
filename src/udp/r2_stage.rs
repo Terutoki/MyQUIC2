@@ -1160,12 +1160,18 @@ pub fn send_packed_frames(conn: &Connection, q: &mut PackedFrames) -> R2DrainOut
         // Move the body out (a `Bytes` header swap, no payload copy): the
         // slot's body is dead after quinn owns it. `encode_claimed` fills every
         // body before the send loop starts; a `None` here is a broken
-        // claim/encode invariant. Stop the send without a drop verdict so
-        // `requeue_unsent` can put the frame's items back in order (accounting
-        // it here as dropped would double-book the same payloads).
+        // claim/encode invariant. [`R2Stager::requeue_unsent`] starts at the
+        // frame *after* this one, so these payloads leave the queue either way:
+        // account them as the size-class drop this path has always been. A
+        // silent loss here is exactly what the drop counters exist to rule out,
+        // and the `debug_assert` still makes the invariant fail loudly in tests
+        // instead of hiding behind a counter.
         let Some(body) = q.frames[idx].body.take() else {
             debug_assert!(false, "send_packed_frames requires encode_claimed");
+            let missing = q.frames[idx].item_len;
+            out.items_dropped = missing;
             out.failed = Some(DatagramSend::TooLarge);
+            book_too_large(missing as usize);
             break;
         };
         match try_send_datagram(conn, body) {

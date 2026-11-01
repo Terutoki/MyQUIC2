@@ -107,8 +107,8 @@ pub use dns::{
     dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed,
     dns_slow_path_limiter, dns_stats, ip_preference, is_global_ip, lookup_cached_fast,
     lookup_cached_fast_with_ttl, lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
-    resolve_server_addr, resolve_server_addrs, resolve_server_side, set_ip_preference,
-    spawn_resolver_watch, unmap, waiter_took,
+    resolve_server_addr, resolve_server_addrs, resolve_server_addrs_fresh, resolve_server_side,
+    set_ip_preference, spawn_resolver_watch, unmap, waiter_took,
 };
 /// Test-only compatibility surface: the unit tests below address the moved
 /// DNS internals through the crate root (`use super::*`).
@@ -131,8 +131,8 @@ pub use udp::{
     BURST_SLOT, DatagramSend, DgramFragmenter, DgramReassembler, LAST_HOP_DRAIN, PayloadSend,
     SendFrame, UdpWriteDrop, batch_backend, batch_report, burst_msg_copy, record_drain_batch,
     record_extra_syscalls, record_send_group, recv_burst, recvmmsg_available, send_udp_datagram,
-    sendmmsg_available, try_send_datagram, udp_try_send, udp_try_send_grouped, udp_try_send_slice,
-    with_burst_msg,
+    sendmmsg_available, try_send_datagram, udp_try_send, udp_try_send_grouped,
+    udp_try_send_or_return, udp_try_send_slice, with_burst_msg,
 };
 // `pub(crate)` re-exports for the unit tests below (`use super::*`); unused in
 // the non-test build.
@@ -3934,8 +3934,9 @@ mod tests {
         let dns = dns_inflight_memory_bytes();
         assert_eq!(
             dns,
-            1024 * (UDP_RECV_MAX as u64 + 255 + 512),
-            "1,024 DNS slow-path waiters x (payload + host + task structure)"
+            1024 * (UDP_RECV_MAX as u64 + 255 + 512 + 8 * 1024),
+            "1,024 DNS slow-path waiters x (payload + host + task structure + \
+             the followers one waiter can park)"
         );
         assert!(dns > 8 * 1024 * 1024, "DNS waiter term must be a real term");
         let scratch = worker_scratch_bytes(4);

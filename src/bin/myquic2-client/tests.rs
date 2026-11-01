@@ -388,6 +388,21 @@ fn attempt_budget_is_shared_by_the_candidates() {
     assert!(wall <= Duration::from_secs(6), "got {wall:?}");
 }
 
+/// A second consecutive failure — and only the second — re-resolves past the
+/// cache.
+#[test]
+fn a_second_failed_iteration_forces_an_uncached_lookups() {
+    // One failure is ordinary (a restart, a path drop): the cached list is still
+    // the cheap answer and a DNS round trip would only delay the retry.
+    assert!(!auth::should_force_refresh(0));
+    assert!(!auth::should_force_refresh(1));
+    // Two in a row say the answer is wrong; the counter saturates instead of
+    // wrapping so a long outage keeps re-resolving once per iteration.
+    assert!(auth::should_force_refresh(2));
+    assert!(auth::should_force_refresh(3));
+    assert!(auth::should_force_refresh(u32::MAX));
+}
+
 /// The routing table, row by row; the first three blocks are the *old*
 /// dual-pool assertions restated for the generalized selector, so a
 /// two-slot pool still behaves exactly as it did (including "keep the

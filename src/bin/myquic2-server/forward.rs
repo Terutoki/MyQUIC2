@@ -22,31 +22,67 @@ pub(crate) const DNS_GATE_SLOTS: usize = 8;
 /// never re-spawned by the backstop.
 pub(crate) const DNS_GATE_INFLIGHT_TTL_MS: u64 = 15_000;
 
-/// How long a **policy** refusal is trusted before the next datagram may spawn
-/// a fresh resolution.
+/// Datagrams parked behind one in-flight resolution.
 ///
-/// This is now only the default for the one refusal the DNS layer never sees:
-/// the resolver answered, but every record was filtered by the egress policy
-/// (see [`gate_ttl_ms`]). A DNS failure carries its own class instead —
-/// `DNS_NEG_TTL` (10 s) for a verdict, `DNS_INCONCLUSIVE_TTL` (1 s) for a
-/// backoff — and the gate mirrors exactly that, so an application retransmitting
-/// at 1.2 s after a transient timeout is not dropped for a name the shared cache
-/// would already re-resolve.
+/// A cold name's burst used to be one spawn plus N drops: every datagram after
+/// the first was refused, so the application waited out its own retransmit timer
+/// (200 ms on QUIC PTO, ~1 s on a TCP-style RTO) for a name that was already
+/// being resolved. Parking the followers removes that wait, at the cost of
+/// holding their payloads for the length of one lookup. Four is enough for the
+/// DNS-shaped case (a query and its retransmits, or a small burst of a new
+/// flow); beyond that the datagram is ordinary UDP loss again, which the peer
+/// already handles.
+pub(crate) const DNS_GATE_PARK_ITEMS: usize = 4;
+
+/// Payload bytes parked behind one in-flight resolution.
 ///
-/// The gate still needs a window of its own because the upstream refusal is only
-/// reachable synchronously from a *warm* thread memo, and a spawned waiter warms
-/// only its own worker's.
-pub(crate) const DNS_GATE_UNUSABLE_TTL_MS: u64 = 5_000;
+/// The item cap alone does not bound memory — one "datagram" can be up to
+/// `UDP_RECV_MAX` — so the byte cap does, and it is charged in
+/// [`myquic2::config::tuning::dns_inflight_memory_bytes`] as one park buffer per
+/// slow-path permit (a parked set only exists while its claim's waiter holds a
+/// permit).
+pub(crate) const DNS_GATE_PARK_BYTES: usize = 8 * 1024;
+
+/// Ceiling on how long a **policy** refusal is trusted.
+///
+/// This is the one refusal the DNS layer never sees: the resolver answered, but
+/// every record was filtered by the egress policy (see [`filtered_ttl_ms`]). A
+/// DNS failure carries its own class instead — `DNS_NEG_TTL` (10 s) for a
+/// verdict, `DNS_INCONCLUSIVE_TTL` (1 s) for a backoff — and the gate mirrors
+/// exactly that, so an application retransmitting at 1.2 s after a transient
+/// timeout is not dropped for a name the shared cache would already re-resolve.
+///
+/// A filtered verdict is different from both: it is a property of the *answer*
+/// (these records, in this order), and the answer cannot change while it is
+/// cached. So the gate holds for the answer's own remaining life, capped here —
+/// 60 s covers a full-TTL answer without letting one filtered name keep a gate
+/// slot indefinitely, and the flat 5 s this replaced re-spawned the same doomed
+/// resolution up to twenty-four times per cached answer.
+pub(crate) const DNS_GATE_FILTERED_TTL_MS: u64 = 60_000;
 
 /// The gate's deadline for a refused name, in milliseconds.
 ///
 /// A DNS failure carries its own class (`DnsFailure::retry_ttl`: 10 s for a
 /// verdict, 1 s for a backoff) and the gate trusts it, so a retransmit that the
-/// shared cache would re-resolve is not dropped here. The flat
-/// [`DNS_GATE_UNUSABLE_TTL_MS`] remains for the one refusal the DNS layer never
-/// sees: every record of an answered name filtered by the egress policy.
+/// shared cache would re-resolve is not dropped here. [`filtered_ttl_ms`] is the
+/// third case: an answered name whose every record the egress policy filtered.
 fn gate_ttl_ms(ttl: Duration) -> u64 {
     u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How long "every record of this answer is filtered" stays true.
+///
+/// It stays true exactly as long as the cached answer does: the same record set,
+/// filtered by the same policy, is the same verdict, and a fresh resolution
+/// re-decides either way. So the window is the entry's remaining life, capped by
+/// [`DNS_GATE_FILTERED_TTL_MS`] to bound one name's hold on a gate slot. A memo
+/// miss (another thread overwrote the slot, or the answer was just seeded) falls
+/// back to a full fresh-answer bound, because `resolve_all_cached` has just
+/// memoized it for this thread.
+pub(crate) fn filtered_ttl_ms(host: &str, port: u16) -> u64 {
+    let (_, life) = lookup_cached_fast_with_ttl(host, port);
+    let life = if life == 0 { DNS_CACHE_TTL_MS } else { life };
+    life.min(DNS_GATE_FILTERED_TTL_MS)
 }
 
 /// Test-only count of spawned resolver waiters.
@@ -79,7 +115,6 @@ enum GateState {
     Unusable,
 }
 
-#[derive(Clone, Copy)]
 struct GateEntry {
     /// Hash of the normalized `(session, host, port)` — see [`DnsGate::key`].
     key: u64,
@@ -89,6 +124,13 @@ struct GateEntry {
     /// backstop expired and the slot was reused) must not clear or rewrite a
     /// newer claim for the same key.
     generation: u32,
+    /// Followers that arrived while this claim was in flight, in arrival order.
+    /// Delivered by the waiter once it has an answer (see [`DnsGate::park`]);
+    /// anything still here when the claim completes without one is counted as
+    /// dropped.
+    parked: Vec<Bytes>,
+    /// Payload bytes in `parked`, bounded by [`DNS_GATE_PARK_BYTES`].
+    parked_bytes: usize,
 }
 
 struct GateInner {
@@ -109,10 +151,12 @@ struct GateInner {
 /// slow-path permit, two moka lookups and two allocations per packet, on a path
 /// a peer can drive with a public name that resolves to a private address.
 ///
-/// The gate makes that one waiter per `(session, name, port)`: later datagrams
-/// during the flight are dropped (UDP semantics — the application retries or the
-/// answer arrives), and an unusable verdict is remembered briefly so the next
-/// packets are refused inline for one hash + one mutex instead of a task spawn.
+/// The gate makes that one waiter per `(session, name, port)`: the datagrams
+/// that arrive during the flight are parked behind the claim (bounded by
+/// [`DNS_GATE_PARK_ITEMS`]/[`DNS_GATE_PARK_BYTES`], delivered as soon as the
+/// answer lands — see [`DnsGate::park`]) and overflow is ordinary UDP loss, and
+/// an unusable verdict is remembered for its class's window so the next packets
+/// are refused inline for one hash + one mutex instead of a task spawn.
 ///
 /// It never *admits* anything: a gate decision can only drop a datagram or let
 /// it spawn, so the SSRF policy and `allow_private` semantics are unchanged.
@@ -161,7 +205,9 @@ impl DnsGate {
     pub(crate) fn new() -> Self {
         Self {
             inner: parking_lot::Mutex::new(GateInner {
-                entries: [None; DNS_GATE_SLOTS],
+                // `GateEntry` owns a parked-payload vector, so the array is
+                // built element-wise instead of copied from `[None; N]`.
+                entries: std::array::from_fn(|_| None),
                 next_generation: 0,
             }),
             seed: std::hash::RandomState::new(),
@@ -281,7 +327,7 @@ impl DnsGate {
         let slot = inner
             .entries
             .iter()
-            .position(|e| e.is_none_or(|x| x.deadline <= now_ms))
+            .position(|e| e.as_ref().is_none_or(|x| x.deadline <= now_ms))
             // All slots live: overwrite round-robin. An evicted in-flight
             // claim's waiter still delivers its payload; its `finish` finds no
             // matching generation and is a no-op.
@@ -292,9 +338,61 @@ impl DnsGate {
             state: GateState::InFlight,
             deadline,
             generation,
+            parked: Vec::new(),
+            parked_bytes: 0,
         });
         self.publish_hot(key, GateState::InFlight, deadline);
         GateClaim::Proceed(generation)
+    }
+
+    /// Park a follower datagram behind the in-flight claim it arrived during.
+    ///
+    /// Returns `false` when there is no live in-flight claim for the key (the
+    /// answer landed between the caller's `claim` and this call) or when the
+    /// queue bounds are full — both are the old behaviour, ordinary UDP loss.
+    ///
+    /// The datagram is *delayed*, not admitted: it is sent only once the answer
+    /// this claim is waiting for arrives, through the same delivery path as the
+    /// datagram that spawned the waiter, so the address is one the egress policy
+    /// already approved.
+    pub(crate) fn park(&self, s: u32, host: &str, port: u16, now_ms: u64, payload: Bytes) -> bool {
+        let key = self.key(s, host, port);
+        let mut inner = self.inner.lock();
+        let Some(entry) = inner
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|e| e.key == key && e.state == GateState::InFlight && e.deadline > now_ms)
+        else {
+            return false;
+        };
+        if entry.parked.len() >= DNS_GATE_PARK_ITEMS
+            || entry.parked_bytes.saturating_add(payload.len()) > DNS_GATE_PARK_BYTES
+        {
+            return false;
+        }
+        entry.parked_bytes += payload.len();
+        entry.parked.push(payload);
+        true
+    }
+
+    /// Take the followers parked behind `generation`'s claim, in arrival order.
+    ///
+    /// Only that generation's claim may hand them back: a waiter that outlived
+    /// its entry must not deliver a newer claim's datagrams.
+    pub(crate) fn take_parked(&self, s: u32, host: &str, port: u16, generation: u32) -> Vec<Bytes> {
+        let key = self.key(s, host, port);
+        let mut inner = self.inner.lock();
+        let Some(entry) = inner
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|e| e.key == key && e.generation == generation)
+        else {
+            return Vec::new();
+        };
+        entry.parked_bytes = 0;
+        std::mem::take(&mut entry.parked)
     }
 
     /// Complete a claim taken by [`claim`](Self::claim).
@@ -316,10 +414,28 @@ impl DnsGate {
         let key = self.key(s, host, port);
         let now = now_ms;
         let mut inner = self.inner.lock();
+        // Followers parked behind this claim are delivered by its waiter before
+        // it finishes. Anything still here means the claim ended without an
+        // answer (a verdict, a cancelled waiter, an evicted slot), so those
+        // datagrams are ordinary UDP loss: counted, never silently discarded.
+        // Taken before any branch below replaces the entry and its vectors.
+        let parked_lost: usize = inner
+            .entries
+            .iter_mut()
+            .flatten()
+            .filter(|e| e.key == key && e.generation == generation)
+            .map(|e| {
+                e.parked_bytes = 0;
+                std::mem::take(&mut e.parked).len()
+            })
+            .sum();
+        for _ in 0..parked_lost {
+            dgram_drops::bump(&dgram_drops::REFUSED);
+        }
         if let Some(slot) = inner
             .entries
             .iter_mut()
-            .find(|e| e.is_some_and(|x| x.key == key))
+            .find(|e| e.as_ref().is_some_and(|x| x.key == key))
             && slot.as_ref().is_some_and(|e| e.generation == generation)
         {
             if let Some(ttl) = unusable {
@@ -329,6 +445,8 @@ impl DnsGate {
                     state: GateState::Unusable,
                     deadline,
                     generation,
+                    parked: Vec::new(),
+                    parked_bytes: 0,
                 });
                 self.publish_hot(key, GateState::Unusable, deadline);
             } else {
@@ -345,7 +463,7 @@ impl DnsGate {
             if let Some(slot) = inner
                 .entries
                 .iter_mut()
-                .find(|e| e.is_none_or(|x| x.deadline <= now))
+                .find(|e| e.as_ref().is_none_or(|x| x.deadline <= now))
             {
                 let deadline = now.saturating_add(gate_ttl_ms(ttl));
                 *slot = Some(GateEntry {
@@ -353,6 +471,8 @@ impl DnsGate {
                     state: GateState::Unusable,
                     deadline,
                     generation,
+                    parked: Vec::new(),
+                    parked_bytes: 0,
                 });
                 self.publish_hot(key, GateState::Unusable, deadline);
             }
@@ -390,6 +510,76 @@ impl DnsGate {
             .find(|e| e.key == key && e.deadline > now_ms)
             .map(|e| e.state == GateState::Unusable)
     }
+}
+
+/// Addresses whose last datagram the kernel refused with a *routing* error, and
+/// how long to skip them.
+///
+/// This is the one loss signal a proxy can actually observe: `sendto` returning
+/// `ENETUNREACH`/`EHOSTUNREACH` is not packet loss, it is a verdict that arrives
+/// immediately, and on a network that advertises AAAA without a working IPv6
+/// route it is the normal outcome for the preferred family. Without it the
+/// answer's first address stays pinned for `DEST_PIN_TTL_MS` and the flow is a
+/// black hole; with it the next allowed address is tried once and, if it works,
+/// becomes the one the session memo and the fast table carry.
+///
+/// Thread-local, direct-mapped, exact-address matched: a collision only forgets
+/// a hint, and an expired entry only costs one more datagram on a dead address.
+/// It is never a correctness input — the SSRF policy still decides what may be
+/// dialled, and "no allowed address" still fails closed through the gate.
+const UNREACHABLE_SLOTS: usize = 16;
+
+/// How long a routing verdict is trusted before the address is tried again.
+const UNREACHABLE_TTL_MS: u64 = 10_000;
+
+thread_local! {
+    static UNREACHABLE: std::cell::RefCell<[(Option<SocketAddr>, u64); UNREACHABLE_SLOTS]> =
+        const { std::cell::RefCell::new([(None, 0); UNREACHABLE_SLOTS]) };
+}
+
+fn unreachable_idx(addr: SocketAddr) -> usize {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = 0u64;
+    match addr.ip() {
+        std::net::IpAddr::V4(a) => {
+            for o in a.octets() {
+                h = h.wrapping_mul(K).wrapping_add(u64::from(o));
+            }
+        }
+        std::net::IpAddr::V6(a) => {
+            for s in a.segments() {
+                h = h.wrapping_mul(K).wrapping_add(u64::from(s));
+            }
+        }
+    }
+    h = h.wrapping_mul(K).wrapping_add(u64::from(addr.port()));
+    (h as usize) & (UNREACHABLE_SLOTS - 1)
+}
+
+/// Remember that the kernel had no route to `addr` just now.
+pub(crate) fn mark_unreachable(addr: SocketAddr) {
+    let deadline = coarse_millis().saturating_add(UNREACHABLE_TTL_MS);
+    UNREACHABLE.with(|c| c.borrow_mut()[unreachable_idx(addr)] = (Some(addr), deadline));
+}
+
+/// Was `addr` refused with a routing error within the last [`UNREACHABLE_TTL_MS`]?
+pub(crate) fn is_unreachable(addr: SocketAddr) -> bool {
+    let now = coarse_millis();
+    UNREACHABLE.with(|c| {
+        let slot = c.borrow()[unreachable_idx(addr)];
+        slot.0 == Some(addr) && slot.1 > now
+    })
+}
+
+/// A `sendto` error that means "this address cannot be reached from here",
+/// as opposed to a socket-level problem that would hit every address equally.
+pub(crate) fn is_routing_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -437,11 +627,18 @@ pub(crate) fn resolve_forward_target(
     let addrs = match lookup_cached_fast_with_ttl(host, port) {
         (CachedLookup::Negative, _) => return ForwardResolution::Negative,
         (CachedLookup::Addr(dst), life) => {
-            if allow_private || is_global_ip_cached(dst.ip()) {
+            // Two reasons to distrust the memo's single address: the policy
+            // filters it, or the kernel recently said it has no route to it
+            // ([`mark_unreachable`]). Either way the session memo may already
+            // hold an address this host *can* reach — that is what the fallback
+            // in [`deliver_resolved_server_dgram`] stores — and only when it does
+            // not is a resolution worth spawning. The clock read is paid on the
+            // slow path only, and only after the policy check passed.
+            if (allow_private || is_global_ip_cached(dst.ip())) && !is_unreachable(dst) {
                 (dst, life)
             } else {
-                // First record filtered: the session memo may hold a usable
-                // address from an earlier resolver pass.
+                // First record filtered (or unroutable): the session memo may
+                // hold a usable address from an earlier resolver pass.
                 match sess_dest_lookup_ttl(ss, coarse_millis(), s, host, port) {
                     Some(v) => v,
                     None => return ForwardResolution::Unresolved,
@@ -539,7 +736,22 @@ pub(crate) async fn forward_server_dgram(
                             dst: mapped,
                             payload,
                         }),
-                        None => udp_try_send(&sock, mapped, payload),
+                        None => {
+                            if let Err((kind, _)) = udp_try_send_or_return(&sock, mapped, payload)
+                                && is_routing_error(kind)
+                            {
+                                // No route to the pinned address. Marking it is
+                                // enough: the next datagram for this target
+                                // treats a recently unroutable address as a miss
+                                // in `resolve_forward_target`, the waiter that
+                                // follows walks the rest of the answer, and the
+                                // address that works is stored in the session
+                                // memo. Retrying here would need the record set —
+                                // one cache await on a path that is otherwise
+                                // syscall-only — to save a single datagram.
+                                mark_unreachable(dst);
+                            }
+                        }
                     }
                     return Some((dst, life));
                 }
@@ -563,7 +775,22 @@ pub(crate) async fn forward_server_dgram(
             let now = coarse_millis();
             let generation = match ss.dns_gate.claim(s, h, p, now) {
                 GateClaim::Proceed(generation) => generation,
-                GateClaim::InFlight | GateClaim::Unusable => {
+                GateClaim::InFlight => {
+                    // A follower: park it behind the claim so it is sent when the
+                    // answer lands, instead of making the application wait out
+                    // its own retransmit timer for a name that is already being
+                    // resolved. A full queue or a claim that just completed is
+                    // ordinary UDP loss.
+                    if ss.dns_gate.park(s, h, p, now, payload) {
+                        myquic2::dns::stats::parked();
+                    } else {
+                        dgram_drops::bump(&dgram_drops::REFUSED);
+                        #[cfg(test)]
+                        ss.dns_gate.note_refusal();
+                    }
+                    return None;
+                }
+                GateClaim::Unusable => {
                     dgram_drops::bump(&dgram_drops::REFUSED);
                     #[cfg(test)]
                     ss.dns_gate.note_refusal();
@@ -608,6 +835,30 @@ pub(crate) async fn forward_server_dgram(
                 )
                 .await;
                 waiter_took(spawned.elapsed());
+                if unusable.is_none() {
+                    // The answer landed: send the datagrams that arrived while it
+                    // was in flight. They go through the same delivery path, so
+                    // the session, the destination memo and the reply allowlist
+                    // are already warm, and each is one DATAGRAM send instead of
+                    // a packet the application had to retransmit.
+                    let parked = task_ss.dns_gate.take_parked(s, &host, p, generation);
+                    for payload in parked {
+                        let _ = deliver_resolved_server_dgram(
+                            &task_ss,
+                            &cd,
+                            conn_id,
+                            s,
+                            &host,
+                            p,
+                            payload,
+                            allow_private,
+                            r2_task.as_ref(),
+                            None,
+                        )
+                        .await;
+                        myquic2::dns::stats::parked_delivered();
+                    }
+                }
                 // Success or a name-level failure: always complete the claim, or
                 // every later datagram for this target would be dropped as
                 // in-flight until the backstop expires. The waiter guard drops
@@ -632,11 +883,18 @@ pub(crate) async fn forward_server_dgram(
 ///
 /// Returns `Some(ttl)` when the name itself yielded no usable address (every
 /// record filtered, or the lookup failed): the outcome [`DnsGate`] caches for
-/// that long. The TTL is the failure's own class for a DNS refusal, and the flat
-/// [`DNS_GATE_UNUSABLE_TTL_MS`] when the resolver answered but the policy
-/// filtered every record. A resource refusal from `get_or_create_sess` is not a
-/// DNS verdict and returns `None`, so it never suppresses the next datagram's
-/// retry.
+/// that long. The TTL is the failure's own class for a DNS refusal, and
+/// [`filtered_ttl_ms`] when the resolver answered but the policy filtered every
+/// record. A resource refusal from `get_or_create_sess` is not a DNS verdict and
+/// returns `None`, so it never suppresses the next datagram's retry.
+///
+/// The answer can hold several addresses, and the first one is not always the
+/// reachable one: on a network that advertises AAAA without a working IPv6 route
+/// the kernel refuses `sendto` immediately with `ENETUNREACH`. So the send walks
+/// the allowed addresses in preference order, skips ones a recent routing error
+/// condemned ([`mark_unreachable`]), and — when a later address works — stores it
+/// in the session memo so the next datagram ([`resolve_forward_target`]) and the
+/// fast-table pin armed from it use it instead of repeating the failure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn deliver_resolved_server_dgram(
     ss: &SessTable,
@@ -650,34 +908,13 @@ pub(crate) async fn deliver_resolved_server_dgram(
     r2: Option<&Arc<R2ConnState>>,
     waiter: Option<&DnsWaiter>,
 ) -> Option<Duration> {
-    let dst = match resolve_all_cached(host, port).await {
-        Ok(v) => match v
-            .iter()
-            .copied()
-            .find(|a| allow_private || is_global_ip(a.ip()))
-        {
-            Some(v) => v,
-            // Every record filtered: policy refusal, counted like the inline
-            // negative arm.
-            None => {
-                dgram_drops::bump(&dgram_drops::REFUSED);
-                return Some(Duration::from_millis(DNS_GATE_UNUSABLE_TTL_MS));
-            }
-        },
+    let addrs = match resolve_all_cached(host, port).await {
+        Ok(v) => v,
         Err(e) => {
             dgram_drops::bump(&dgram_drops::REFUSED);
             return Some(e.retry_ttl());
         }
     };
-    // The client may have closed the association while the DNS lookup was in
-    // flight. Check the close before paying socket()/permit and again through
-    // the guarded creation (which re-reads the flag inside the session shard's
-    // write critical section, so it cannot race `take_session`). A cancelled
-    // waiter returns "not a DNS verdict" so the gate does not cache anything
-    // for the next datagram.
-    if waiter.is_some_and(DnsWaiter::is_cancelled) {
-        return None;
-    }
     // The DNS *entry* may be older than `DNS_CACHE_TTL_MS`: `resolve_all_cached`
     // serves a host-keyed cache hit (every port shares one entry) and only then
     // memoizes this `(host, port)`. Pass the entry's actual remaining life so
@@ -688,12 +925,36 @@ pub(crate) async fn deliver_resolved_server_dgram(
         let (_, life) = lookup_cached_fast_with_ttl(host, port);
         if life == 0 { DNS_CACHE_TTL_MS } else { life }
     };
+    // The policy verdict is applied here, before any socket work, and the whole
+    // allowed set is kept: the first address is a preference, not a decision.
+    let allowed: Vec<SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| allow_private || is_global_ip(a.ip()))
+        .collect();
+    let Some(&preferred) = allowed.first() else {
+        // Every record filtered: policy refusal, counted like the inline
+        // negative arm. The verdict is a property of the *answer*, so the gate
+        // may hold it for the answer's own remaining life instead of a flat
+        // window that re-spawned this doomed resolution every few seconds.
+        dgram_drops::bump(&dgram_drops::REFUSED);
+        return Some(Duration::from_millis(filtered_ttl_ms(host, port)));
+    };
+    // The client may have closed the association while the DNS lookup was in
+    // flight. Check the close before paying socket()/permit and again through
+    // the guarded creation (which re-reads the flag inside the session shard's
+    // write critical section, so it cannot race `take_session`). A cancelled
+    // waiter returns "not a DNS verdict" so the gate does not cache anything
+    // for the next datagram.
+    if waiter.is_some_and(DnsWaiter::is_cancelled) {
+        return None;
+    }
     let sock = match get_or_create_sess_guarded(
         ss,
         cd,
         conn_id,
         s,
-        Some((host, port, dst, remaining_ms)),
+        Some((host, port, preferred, remaining_ms)),
         r2,
         waiter.map(DnsWaiter::cancelled_flag),
     )
@@ -719,8 +980,43 @@ pub(crate) async fn deliver_resolved_server_dgram(
         if waiter.is_some_and(DnsWaiter::is_cancelled) {
             return None;
         }
-        remember_dst(ss, s, dst);
-        udp_try_send(&sock, map_for_dual(dst), payload);
+        let mut payload = payload;
+        let mut sent_to = None;
+        for (i, cand) in allowed.iter().copied().enumerate() {
+            // The first candidate is always tried: a routing verdict is a hint
+            // with a ten-second memory, not a fact, and giving up on the only
+            // remaining address would turn "unreachable just now" into "never
+            // tried again".
+            if i > 0 && is_unreachable(cand) {
+                continue;
+            }
+            match udp_try_send_or_return(&sock, map_for_dual(cand), payload) {
+                Ok(()) => {
+                    sent_to = Some(cand);
+                    break;
+                }
+                Err((kind, back)) => {
+                    payload = back;
+                    if is_routing_error(kind) {
+                        mark_unreachable(cand);
+                        continue;
+                    }
+                    // Anything else is a socket-level problem that would hit
+                    // every address equally: the loss is already booked by
+                    // `udp_try_send_or_return`, so stop rather than multiply it.
+                    break;
+                }
+            }
+        }
+        let target = sent_to.unwrap_or(preferred);
+        remember_dst(ss, s, target);
+        if target != preferred {
+            // The preferred address could not be reached and a later one worked.
+            // Store it where the next datagram looks: the preference list has
+            // proven wrong for this host, so the session memo — and the pin
+            // armed from it — must not keep choosing the dead address.
+            sess_dest_store(ss, s, host, port, target, remaining_ms);
+        }
     }
     None
 }

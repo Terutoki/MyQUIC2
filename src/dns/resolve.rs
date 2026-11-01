@@ -468,6 +468,13 @@ fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts)
     opts.cache_size = 0;
     opts.timeout = DNS_QUERY_TIMEOUT;
     opts.attempts = DNS_LOOKUP_ATTEMPTS;
+    // A truncated UDP answer (a record set larger than the sender's EDNS0
+    // buffer) is retried over TCP. The alternative hickory offers is to serve
+    // the partial set, which for a name with many records silently drops
+    // addresses — and with hickory's own cache disabled every cold lookup would
+    // pay that loss again. The TCP connect only happens on truncation, so the
+    // steady state is unchanged.
+    opts.try_tcp_on_error = true;
 }
 
 /// How often [`spawn_resolver_watch`] re-reads the platform's DNS
@@ -1252,7 +1259,13 @@ async fn refresh_positive(host_key: &str, port: u16) {
         return;
     };
     stats::refresh_started();
-    let looked = resolve_ips(host_key, port, DNS_LOOKUP_TIMEOUT).await;
+    // `resolve_ips_timed` rather than `resolve_ips`: the latter books the
+    // duration into the foreground `lookup` histogram, and a background refresh
+    // is the one lookup a user is *not* waiting on. Timed into its own bucket
+    // here so neither number is an average of the other.
+    let started = Instant::now();
+    let looked = resolve_ips_timed(host_key, port, DNS_LOOKUP_TIMEOUT).await;
+    stats::refresh_lookup_took(started.elapsed());
     stats::refresh_finished(looked.is_ok());
     if let Ok((ips, ttl)) = looked {
         let now = Instant::now();
@@ -1489,6 +1502,41 @@ pub async fn resolve_server_addrs(s: &str, max: usize) -> Result<Vec<SocketAddr>
     Ok(addrs)
 }
 
+/// [`resolve_server_addrs`], but resolving *past* the cache.
+///
+/// The client's reconnect loop reads the cached list on every iteration, which
+/// is right while that list is live. After consecutive failed dials the list is
+/// the suspect: a positive entry keeps being served for up to
+/// [`DNS_STALE_WINDOW`] past its freshness deadline, so a machine that moved
+/// networks (laptop closed, VPN dropped, Wi-Fi switched) can keep retrying the
+/// addresses of the network it left for an hour. This drops the answer from both
+/// stores — a refusal would otherwise fail the call without asking upstream —
+/// resolves once more, and leaves the ordinary path to re-populate the cache for
+/// the iterations that follow.
+pub async fn resolve_server_addrs_fresh(s: &str, max: usize) -> Result<Vec<SocketAddr>> {
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Ok(vec![a]);
+    }
+    let (host, port) = s
+        .rsplit_once(':')
+        .context("bad server_addr, want host:port")?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port: u16 = port.parse().context("bad server port")?;
+    let host_key = dns_host_key_owned(host);
+    let _ = positives().remove(host_key.as_str()).await;
+    let _ = negatives().remove(host_key.as_str()).await;
+    let addrs: Vec<SocketAddr> = resolve_all_cached(host, port)
+        .await?
+        .iter()
+        .copied()
+        .take(max.max(1))
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("dns empty");
+    }
+    Ok(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::key::dns_key_owned;
@@ -1534,6 +1582,10 @@ mod tests {
         assert!(
             opts.timeout * (opts.attempts as u32 + 1) < DNS_LOOKUP_TIMEOUT,
             "one attempt x (1 + retries) must fit inside the lookup wall"
+        );
+        assert!(
+            opts.try_tcp_on_error,
+            "a truncated UDP answer must be retried over TCP, not served as a partial record set"
         );
     }
 
