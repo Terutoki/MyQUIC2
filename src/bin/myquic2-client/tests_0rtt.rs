@@ -148,9 +148,17 @@ async fn dial_until_resumed(
 ) -> (quinn::Connection, Arc<ZeroRttState>) {
     for _ in 0..attempts {
         let state = ZeroRttState::new();
-        let conn = dial_once(client_ep, ccfg, addr, "test.com", TOKEN, &state)
-            .await
-            .expect("dial must succeed");
+        let conn = dial_once(
+            client_ep,
+            ccfg,
+            addr,
+            "test.com",
+            TOKEN,
+            &state,
+            DIAL_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .expect("dial must succeed");
         if state.phase() == ZeroRttState::PENDING {
             return (conn, state);
         }
@@ -455,6 +463,7 @@ async fn resumed_dial_sends_token_hello_and_udp_in_first_flight() {
         "test.com",
         TOKEN,
         &state_first,
+        DIAL_ATTEMPT_TIMEOUT,
     )
     .await
     .expect("the first (full-handshake) dial must succeed");
@@ -612,6 +621,7 @@ async fn rejected_early_data_resends_the_token_1rtt() {
         "test.com",
         TOKEN,
         &mint_state,
+        DIAL_ATTEMPT_TIMEOUT,
     )
     .await
     .expect("the ticket-minting dial must succeed");
@@ -642,9 +652,17 @@ async fn rejected_early_data_resends_the_token_1rtt() {
     let (proxy_addr, proxy) =
         spawn_delay_proxy(ep_rejecting.local_addr().unwrap(), PROXY_DELAY).await;
     let state = ZeroRttState::new();
-    let conn = dial_once(&client_ep, &ccfg, proxy_addr, "test.com", TOKEN, &state)
-        .await
-        .expect("a rejected 0-RTT resumption must still complete the connection");
+    let conn = dial_once(
+        &client_ep,
+        &ccfg,
+        proxy_addr,
+        "test.com",
+        TOKEN,
+        &state,
+        DIAL_ATTEMPT_TIMEOUT,
+    )
+    .await
+    .expect("a rejected 0-RTT resumption must still complete the connection");
     assert_eq!(
         state.phase(),
         ZeroRttState::PENDING,

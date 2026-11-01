@@ -363,6 +363,31 @@ fn dial_candidates_prefer_the_last_good_address() {
     );
 }
 
+/// The reconnect iteration's wall is shared by its candidates, not multiplied:
+/// three addresses at the full attempt budget each would hold the pool's dead
+/// generation for 15 s, which is the arithmetic `DIAL_ATTEMPT_TIMEOUT` exists to
+/// prevent (it is the same 15 s the constant's own doc argues against).
+#[test]
+fn attempt_budget_is_shared_by_the_candidates() {
+    use std::time::Duration;
+
+    // One address keeps the whole budget, and a defensive zero still dials.
+    assert_eq!(auth::attempt_budget(1), auth::DIAL_ATTEMPT_TIMEOUT);
+    assert_eq!(auth::attempt_budget(0), auth::DIAL_ATTEMPT_TIMEOUT);
+    // Two split it evenly.
+    assert_eq!(auth::attempt_budget(2), auth::DIAL_ATTEMPT_TIMEOUT / 2);
+    // Three stop at the floor rather than shrinking further, and the iteration
+    // stays within the documented order of magnitude instead of 3 × 5 s.
+    let each = auth::attempt_budget(3);
+    assert!(
+        each >= Duration::from_secs(2),
+        "a slice must fit a handshake"
+    );
+    let wall = each * 3;
+    assert!(wall > auth::DIAL_ATTEMPT_TIMEOUT);
+    assert!(wall <= Duration::from_secs(6), "got {wall:?}");
+}
+
 /// The routing table, row by row; the first three blocks are the *old*
 /// dual-pool assertions restated for the generalized selector, so a
 /// two-slot pool still behaves exactly as it did (including "keep the

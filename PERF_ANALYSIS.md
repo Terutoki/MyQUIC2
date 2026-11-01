@@ -1621,3 +1621,70 @@ async re-entries per second, and the TTL now follows the record — and the only
 `hotpath_bench udpdomain`, which this batch did not run. Serve-stale and the new refresh cooldown also make the
 *diagnosis* of a slow lookup harder from the outside: a stale answer is indistinguishable from a fresh one at the API,
 and a refresh that is being cooled down looks exactly like one that is running.
+
+### 16.9 Review of this batch: the attempt budget I split and then re-multiplied
+
+A read-only review of `fad78a8` against every invariant the batch claims found one
+real defect and five stale comments. The defect is mine, from item 1.
+
+`dial_candidates` (`src/bin/myquic2-client/auth.rs:401`) walks up to
+`DIAL_ADDR_CANDIDATES` = 3 addresses in sequence, and each `dial_once` enforced
+`t0 + DIAL_ATTEMPT_TIMEOUT`. One reconnect iteration could therefore hold the
+loop — and the pool's dead generation — for 3 × 5 s. That is the exact
+arithmetic `DIAL_ATTEMPT_TIMEOUT`'s own doc rejects: it exists because "without an
+explicit bound a dead path costs ~15 s per attempt". Item 1 fixed the case where
+a dead first address never gave way; it reintroduced the 15 s worst case for the
+case where all candidates hang.
+
+The fix keeps the iteration's wall bounded by sharing it:
+
+```rust
+fn attempt_budget(candidates: usize) -> Duration {
+    (DIAL_ATTEMPT_TIMEOUT / candidates.max(1) as u32).max(DIAL_MIN_ATTEMPT)
+}
+```
+
+so one address (the common case) still gets the whole 5 s, two get 2.5 s each,
+and three stop at `DIAL_MIN_ATTEMPT` = 2 s — a 6 s worst case instead of 15 s,
+with every slice still long enough for a full handshake on a high-RTT link.
+`dial_once` now takes the budget explicitly instead of reading the constant, and
+`attempt_budget_is_shared_by_the_candidates` pins the split (1 → 5 s, 2 → 2.5 s,
+3 → 2 s, wall ≤ 6 s).
+
+The comment corrections, all consequences of item 5 replacing the flat TTL with
+a per-record deadline:
+
+- `PosCache`'s doc still described the value as an insertion instant
+  (`src/dns/store.rs:217`); it is the freshness deadline, and the cache's own TTL
+  is `DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW`.
+- `materialize_cached`'s "comes back within a second"
+  (`src/dns/resolve.rs:1003`) predates `DNS_STALE_MEMO_TTL` being retuned to 5 s.
+- `CachedLookup`'s variants still said "a fresh address"/"a fresh negative
+  entry"; a stale answer is memoized too, with the short stale life, and the
+  negative life is the refusal's backoff, not a fixed window.
+- `upstream_resolver`'s doc argued that clamping hickory's TTLs had been
+  abandoned because the two layers were independent stores. That is still why
+  hickory's *cache* is disabled, but the clamp itself is now back on purpose at
+  `DNS_RECORD_TTL_MAX`: hickory rewrites every returned answer's TTL even with
+  `cache_size = 0`, so the clamp has to be the store's own ceiling or the store
+  can never see a TTL above it. The paragraph now states the current
+  arrangement instead of the rejected one.
+
+Checked and left alone: `materialize_cached`'s `saturating_duration_since` before
+the `.min(DNS_STALE_MEMO_TTL)` (no panic if the clock passes eviction),
+`seed_positive`'s `checked_sub`, `refresh_positive` writing neither a negative
+entry nor an overwrite of an already-fresh entry, `RefreshClaim::Drop`'s cooldown
+after cancellation, `claim_refresh`'s bound, and the store's moka TTL being
+always ≥ any entry's `deadline + DNS_STALE_WINDOW`.
+
+One dependency behaviour was verified rather than assumed, because item 6's FQDN
+rewrite could have broken `/etc/hosts`: `Hosts::insert` sets `set_fqdn(true)` on
+every stored name (`hickory-resolver-0.26.3/src/hosts.rs:114-117`),
+`lookup_static_host` sets it on the query name too (`hosts.rs:60-66`), and
+`impl Hash for Name` includes `is_fqdn`
+(`hickory-proto-0.26.3/src/rr/domain/name.rs:1127-1136`) — so `host` and `host.`
+hit the same hosts entry and the trailing dot cannot defeat an override.
+
+Verification after the fixes: `cargo fmt --all --check` clean,
+`cargo clippy --all-targets -- -D warnings` clean, `cargo test --all-targets`
+744 passed / 0 failed / 1 ignored (the extra test is the attempt-budget one).

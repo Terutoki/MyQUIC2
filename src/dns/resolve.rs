@@ -586,16 +586,20 @@ pub fn spawn_resolver_watch() {
 /// of live libc resolver calls.
 ///
 /// Its internal response cache is disabled (see
-/// [`configure_resolver_options`]): the moka caches above ([`DNS_CACHE_TTL`]
-/// positive, [`DNS_NEG_TTL`] negative) plus their per-thread memos and moka's
-/// single-flight are the only TTL authority. An earlier revision clamped
-/// hickory's TTLs to the same windows and claimed the two layers therefore
-/// agreed, but they are independent stores: hickory could serve an entry for
-/// its whole TTL *after* the outer entry expired, so a name could be answered
-/// up to ~240 s stale (one `DNS_CACHE_TTL` window in each layer). The second
-/// layer is also pure overhead here: it duplicates a lookup the outer cache
-/// already deduplicates, and its hits bypass the thread memo that the packet
-/// paths rely on to avoid even a cache probe.
+/// [`configure_resolver_options`]): the moka caches above (per-record positive,
+/// [`DNS_NEG_TTL`] negative) plus their per-thread memos and moka's
+/// single-flight are the only TTL authority. An earlier revision left hickory's
+/// cache *enabled* with a TTL window of its own; because the two were
+/// independent stores, hickory could serve an entry for its whole TTL *after*
+/// the outer entry expired — up to ~240 s stale — and its hits bypassed the
+/// thread memo the packet paths rely on to avoid even a cache probe.
+///
+/// hickory still *clamps* the TTL of every answer it returns, cache or not
+/// (`ResponseCache::clamp_positive_ttls` rewrites the message before the
+/// `Lookup` is built), so [`configure_resolver_options`] sets that clamp to
+/// [`DNS_RECORD_TTL_MAX`] — the store's own ceiling. The clamp can therefore
+/// never shorten a life the store would honour, and the store's `time_to_live`
+/// (`DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW`) is the only eviction bound.
 fn upstream_resolver() -> Result<std::sync::Arc<hickory_resolver::TokioResolver>, String> {
     let generation = resolver_gen().load();
     match &generation.resolver {
@@ -645,10 +649,16 @@ fn dns_refresh_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// Result of a synchronous cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedLookup {
-    /// A fresh address is cached in this thread's memo.
+    /// An address is cached in this thread's memo: still fresh, or served stale
+    /// while a background refresh runs (that memo life is at most
+    /// [`DNS_STALE_MEMO_TTL`], so the packet path returns to the async path that
+    /// can schedule the refresh). Either way it is the best answer available
+    /// without waiting.
     Addr(SocketAddr),
-    /// A fresh negative entry says the name will not resolve; do not spawn a
-    /// resolver task for this packet.
+    /// A negative entry says the name does not resolve right now; do not spawn a
+    /// resolver task for this packet. The memo life is the refusal's remaining
+    /// backoff ([`DNS_NEG_TTL`] for a verdict, [`DNS_INCONCLUSIVE_TTL`] for a
+    /// lookup that produced no answer).
     Negative,
     /// Not in this thread's memo; the caller must use the async resolver.
     Unknown,
@@ -1000,10 +1010,10 @@ fn materialize_cached(
         // probe can never outlive the store. A stale one gets the *short* stale
         // memo life rather than no memo at all: the packet path keeps answering
         // the published answer without returning to this async path on every
-        // datagram, but it does come back within a second — and this path is
-        // the only one that can schedule the refresh. (Writing no memo for a
-        // stale entry would put every datagram of an expired-but-served flow on
-        // the resolver-task slow path.)
+        // datagram, but it does come back within `DNS_STALE_MEMO_TTL` — and this
+        // path is the only one that can schedule the refresh. (Writing no memo
+        // for a stale entry would put every datagram of an expired-but-served
+        // flow on the resolver-task slow path.)
         let memo_deadline = match positive_life(deadline, now) {
             Some(life) => now + life,
             None => {
@@ -1758,7 +1768,7 @@ mod tests {
 
         // The stale hit warms the memo for the *short* stale life, not for the
         // remaining TTL, so the packet path comes back to this async path (the
-        // only place that can schedule the refresh) within a second.
+        // only place that can schedule the refresh) within `DNS_STALE_MEMO_TTL`.
         let (hit, life) = lookup_cached_fast_with_ttl(host, port);
         assert_eq!(hit, CachedLookup::Addr(addr));
         assert!(

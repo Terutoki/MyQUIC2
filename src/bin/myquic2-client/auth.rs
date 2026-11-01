@@ -328,7 +328,8 @@ pub(crate) fn retire_dead_slot(
     true
 }
 
-/// Cap on a single dial attempt.
+/// Cap on a single reconnect iteration's dialing, and the budget a lone
+/// candidate gets.
 ///
 /// Without an explicit bound a dead path costs ~15 s per attempt: QUIC keeps
 /// retransmitting the Initial until the handshake PTO budget runs out, and the
@@ -337,7 +338,19 @@ pub(crate) fn retire_dead_slot(
 /// which `shared` still holds the previous, dead connection, and it lets the
 /// first attempt that lands after a server restart succeed instead of waiting
 /// out the previous attempt's timeout.
+///
+/// This is the *iteration*'s budget, not each candidate's — see
+/// [`attempt_budget`] for how several addresses share it.
 pub(crate) const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Floor for one candidate's slice of [`DIAL_ATTEMPT_TIMEOUT`] when the answer
+/// carries several addresses.
+///
+/// A slice shorter than this could not fit a full handshake on a high-RTT link,
+/// so the split stops shrinking here: three candidates cost at most 6 s, which
+/// is the same order as the documented single-attempt cap (and still far below
+/// the 15 s that cap exists to prevent).
+const DIAL_MIN_ATTEMPT: Duration = Duration::from_secs(2);
 
 /// Put the address that carried the previous connection first, keeping every
 /// other candidate in the resolver's preference order.
@@ -360,6 +373,19 @@ pub(crate) fn prefer_last_good(
     addrs
 }
 
+/// One attempt's budget when `candidates` addresses are tried in sequence.
+///
+/// [`DIAL_ATTEMPT_TIMEOUT`] bounds the *iteration*: the doc on that constant
+/// rejects a 15 s attempt because it keeps the pool pointing at a dead
+/// generation while the reconnect loop is stuck. Giving every candidate the full
+/// budget would reintroduce exactly that arithmetic, so candidates share it —
+/// one address (the common case) still gets all 5 s, two get 2.5 s each, and
+/// [`DIAL_MIN_ATTEMPT`] stops the split from starving a candidate. The caller
+/// caps the list at three (`DIAL_ADDR_CANDIDATES`), so the worst case is 6 s.
+pub(crate) fn attempt_budget(candidates: usize) -> Duration {
+    (DIAL_ATTEMPT_TIMEOUT / candidates.max(1) as u32).max(DIAL_MIN_ATTEMPT)
+}
+
 /// Dial the first candidate that answers, in order.
 ///
 /// One failure is not the iteration's failure: a dead first address (an AAAA
@@ -375,9 +401,10 @@ async fn dial_candidates(
     auth: &str,
     zero_rtt: &Arc<ZeroRttState>,
 ) -> anyhow::Result<(SocketAddr, quinn::Connection)> {
+    let budget = attempt_budget(candidates.len());
     let mut last_err = None;
     for &server in candidates {
-        match dial_once(ep, cfg, server, sname, auth, zero_rtt).await {
+        match dial_once(ep, cfg, server, sname, auth, zero_rtt, budget).await {
             Ok(conn) => return Ok((server, conn)),
             Err(e) => {
                 tracing::debug!("dial {server} failed ({e:#}); trying the next address");
@@ -480,6 +507,11 @@ pub(crate) fn zero_rtt_counters() -> (u64, u64, u64, u64) {
 /// re-sends the token on a fresh 1-RTT stream when the early data was discarded.
 /// Fresh (non-resumed) dials keep the old behaviour: wait for the handshake,
 /// then send the token 1-RTT.
+/// One candidate's dial, bounded by `budget`.
+///
+/// The budget is explicit so a multi-address answer can split one iteration's
+/// wall across its candidates instead of multiplying it ([`attempt_budget`]);
+/// a lone candidate gets [`DIAL_ATTEMPT_TIMEOUT`].
 pub(crate) async fn dial_once(
     ep: &quinn::Endpoint,
     cfg: &quinn::ClientConfig,
@@ -487,6 +519,7 @@ pub(crate) async fn dial_once(
     name: &str,
     auth_token: &str,
     zero_rtt: &Arc<ZeroRttState>,
+    budget: Duration,
 ) -> Result<quinn::Connection> {
     let t0 = tokio::time::Instant::now();
     // One deadline for the whole attempt, the auth stages included. The stages
@@ -495,7 +528,7 @@ pub(crate) async fn dial_once(
     // slot for up to 15 s — contradicting this constant's documented promise
     // and widening the window in which the pool still advertises the previous,
     // dead connection. Every stage below now shares this instant.
-    let deadline = t0 + DIAL_ATTEMPT_TIMEOUT;
+    let deadline = t0 + budget;
     // Every dial resets the slot's phase: a publication is always paired with
     // the phase of the handshake that produced it (the connection loop publishes
     // after this returns).
@@ -548,7 +581,7 @@ pub(crate) async fn dial_once(
         Err(connecting) => {
             let conn = match tokio::time::timeout_at(deadline, connecting).await {
                 Ok(r) => r?,
-                Err(_) => anyhow::bail!("handshake timed out after {DIAL_ATTEMPT_TIMEOUT:?}"),
+                Err(_) => anyhow::bail!("handshake timed out after {budget:?}"),
             };
             if !ensure_dialed_alive(&conn).await {
                 anyhow::bail!("connection closed immediately after the handshake");

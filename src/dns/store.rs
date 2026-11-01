@@ -213,12 +213,14 @@ const _: () = assert!(
 );
 
 type DnsHasher = foldhash::fast::RandomState;
-/// Successful resolutions. The value's `Instant` is the **insertion** instant,
-/// so freshness is `inserted + DNS_CACHE_TTL`; the cache's own TTL is that plus
-/// [`DNS_STALE_WINDOW`], i.e. it only evicts answers that cannot be served
-/// stale any more. Serving a stale entry is paired with a refresh by
-/// `resolve::resolve_all_cached`, which is what keeps the window from being the
-/// normal case.
+/// Successful resolutions. The value's `Instant` is the answer's **freshness
+/// deadline** (`insertion + record_ttl(ttl)`, where the TTL is the record's own,
+/// clamped to [`DNS_RECORD_TTL_MIN`]..[`DNS_RECORD_TTL_MAX`]), so freshness is
+/// `deadline > now`; the cache's own TTL is
+/// `DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW`, i.e. it only evicts answers that
+/// cannot be served stale any more. Serving a stale entry is paired with a
+/// refresh by `resolve::resolve_all_cached`, which is what keeps the window from
+/// being the normal case.
 pub(crate) type PosCache = Cache<DnsCacheKey, DnsCacheVal, DnsHasher>;
 /// Negative verdicts. The value is the instant the refusal **expires** (not the
 /// instant it was recorded): a resolver that finds a host-keyed verdict while
