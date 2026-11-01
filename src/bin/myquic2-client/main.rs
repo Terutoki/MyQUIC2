@@ -177,6 +177,19 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     // pointed at the nameservers of the network the machine has since left) is
     // on the reconnect path.
     spawn_resolver_watch();
+    // Resolve our own endpoint now, while no connection is waiting on it: the
+    // first reconnect then finds the answer in the cache instead of paying a
+    // lookup (or, worse, the lookup budget) before its first packet. The task is
+    // detached because startup must not block on DNS; a failure is the
+    // reconnect loop's to report, in its own words.
+    if c.server_addr.parse::<std::net::SocketAddr>().is_err() {
+        let addr = c.server_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = resolve_server_addrs(&addr, auth::DIAL_ADDR_CANDIDATES).await {
+                tracing::debug!("startup resolve of {addr} failed ({e:#}); the dial will retry");
+            }
+        });
+    }
     if c.auth_token.len() > AUTH_TOKEN_MAX_BYTES {
         anyhow::bail!(
             "auth_token is {} B, over the {AUTH_TOKEN_MAX_BYTES} B wire cap (server only reads the first {AUTH_TOKEN_MAX_BYTES} B, so a longer token can never authenticate)",

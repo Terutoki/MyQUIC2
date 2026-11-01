@@ -1761,3 +1761,135 @@ row and both Mermaid nodes, the `Cargo.toml` comment left in place of the
 Verification after the fixes: `cargo fmt --all --check` clean,
 `cargo clippy --all-targets -- -D warnings` clean, `cargo test --all-targets`
 746 passed / 0 failed / 1 ignored (two tests added by this round).
+
+## 17. Eleventh Batch: measuring the DNS path, and the small cliffs around it (2026-11-01, post-ef4922b)
+
+Every DNS optimization so far was justified by a mechanism — a warm hit never
+touches the network, a stale hit answers while a refresh runs, a refusal answers
+from the negative cache — and none of it was *visible*: the 60 s lines counted
+datagrams and drops, not how a name was resolved, and there was no p50/p99 of
+resolution latency anywhere. That makes the next decision (park datagrams behind
+an in-flight resolution, or add an address hint to the wire) a guess about which
+cost dominates. So this batch adds the instrument first, then the three small
+items that needed no decision.
+
+### 17.1 The instrument: resolution classes and two histograms
+
+`src/dns/stats.rs` is a small module of process-global relaxed atomics. It counts
+what the async path did — `fresh`, `stale`, `refused`, `cold`, plus failures
+split into `verdict` and `inconclusive`, and background refreshes as
+`started`/`ok`/`failed` — and times two things a user actually waits on:
+
+| Histogram | Start | End | What it answers |
+|---|---|---|---|
+| `lookup` | `resolve_ips` entry (`src/dns/resolve.rs:312`) | answer, both arms, fallback included | how long one upstream resolution took |
+| `waiter` | just before the gated `tokio::spawn` (`src/bin/myquic2-server/forward.rs:594`) | socket hand-off (`src/bin/myquic2-server/forward.rs:610`) | how long a *datagram* waited for a cold name |
+
+Both are 16 log-scale buckets from 250 µs to 4 s plus a catch-all
+(`src/dns/stats.rs:28`), because the interesting distinction is
+"sub-millisecond cache work" versus "one to four seconds of upstream failure",
+not 3 ms versus 4 ms. A percentile reports the *upper bound* of its bucket, so
+the line reads "p99 is at most this" — which is what a timeout budget needs.
+
+The counters are bumped where the class is decided, one relaxed `fetch_add` on a
+path that already pays a resolution: the warm arm distinguishes fresh from stale
+before it requests a refresh (`src/dns/resolve.rs:954`), the negative arm counts
+before it bails (`:996`), the `try_get_with` init future counts a resolution it
+actually started (`:1012`, which is why "cold" counts resolutions rather than
+callers), and the failure arm splits verdict from backoff (`:1053`). Background
+work counts what it *started* — after the refresh permit, not at the claim
+(`:1254`) — so the line cannot report refreshes that never ran.
+
+The reporter prints one line for the interval, and only when something moved
+(`src/bin/myquic2-server/reporter.rs:239`):
+
+```
+dns (60s): 412 fresh, 6 stale, 2 refused, 3 cold (1 verdict, 2 inconclusive),
+           6 refresh (4 ok, 2 failed); lookup n=3 p50<=8.0ms p99<=128.0ms max=141.2ms;
+           waiter n=3 p50<=8.0ms p99<=128.0ms max=141.9ms
+```
+
+The `waiter` histogram is the number to decide the next two items with: if its
+p99 sits near `lookup`'s p99, parking datagrams behind the in-flight resolution
+buys real time; if it sits near p50 of a warm hit, the datagram is mostly waiting
+for the app's own retransmit, which is a different fix. `examples/dns_probe_bench.rs`
+still measures only the sync probe and says nothing about either.
+
+### 17.2 The gate learned the failure's class
+
+`DNS_GATE_UNUSABLE_TTL_MS` was one flat 5 s window for every refusal, while the
+store behind it refuses for 10 s (a verdict) or 1 s (an inconclusive backoff).
+So an application retransmitting 1.2 s after a transient timeout was dropped by
+the gate for a name the shared cache would already have re-resolved, and — in
+the other direction — a verdict's 10 s was cut to 5 s, spawning a wasted lookup
+halfway through.
+
+`resolve_all_cached` now returns `DnsFailure` (message + `retry_ttl`,
+`src/dns/resolve.rs:250`) instead of a bare `anyhow::Error`: the refusal's own
+class travels with the error, `deliver_resolved_server_dgram` returns
+`Option<Duration>` (`src/bin/myquic2-server/forward.rs:641`) and `DnsGate::finish`
+takes that option (`:307`), so the gate mirrors exactly what the store decided.
+The flat window survives only for the one refusal the DNS layer never sees: the
+resolver answered and every record was filtered by the egress policy
+(`gate_ttl_ms`, `src/bin/myquic2-server/forward.rs:48`). A cancelled waiter still
+reports `None` — "not a DNS verdict" — so a close never caches anything.
+
+### 17.3 The resolver follows the network in 5 s, not 30
+
+`RESOLVER_CONFIG_POLL` was 30 s. The read it paces is a `stat` plus a parse
+(`resolv.conf`) or one System Configuration query (macOS), so 30 s bought nothing
+but a window in which a VPN coming up left cold names pointed at dead
+nameservers — serve-stale only hides that for names already answered. It is now
+5 s (`src/dns/resolve.rs:483`), which bounds the exposure to the first retry an
+application would make anyway. Platform change notifications would be tighter
+still and need a dependency per platform for a window this small; that is stated
+in the constant's doc rather than left implicit.
+
+### 17.4 The client resolves its own endpoint before it needs it
+
+The client re-resolves `server_addr` on every reconnect (cached, three
+candidates, `last_good` first), but the *first* connect still found an empty
+cache unless the operator's timing was lucky. `client_main` now spawns one
+`resolve_server_addrs(.., DIAL_ADDR_CANDIDATES)` right after
+`spawn_resolver_watch()` (`src/bin/myquic2-client/main.rs:188`), detached and
+only for a non-literal endpoint, so the first reconnect pays a cache hit instead
+of a lookup. `DIAL_ADDR_CANDIDATES` moved from a task-local constant to a module
+one (`src/bin/myquic2-client/auth.rs:50`) so both paths ask for the same list.
+
+### 17.5 The hosts file the poll could not see
+
+The generation fingerprint covered nameservers, domain and search list — not
+`/etc/hosts`, whose table is built *with* the generation. A local override (the
+usual way to pin an internal name) therefore never took effect until restart,
+and the 30 s→5 s poll would not have changed that. The fingerprint now appends
+the hosts file's mtime and length (`hosts_fingerprint`,
+`src/dns/resolve.rs:541`; `generation_fingerprint`, `:565`), so an edit rebuilds
+the generation on the next tick. Metadata rather than a content hash: the file
+is re-read only when it actually changed, and a same-length rewrite moves the
+mtime. Non-Unix platforms return an empty entry — hickory reads the platform's
+own database there, which has no single path to stat.
+
+### 17.6 Verification
+
+`cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test --all-targets` **754 passed / 0 failed / 1 ignored**
+(lib 382, client 201, server 155 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9).
+New tests: four for the histogram/line itself (bucket bounds, the catch-all
+bucket, interval subtraction, the line naming every class and skipping empty
+histograms), `dns_gate_refusal_window_follows_the_failure_class`
+(`src/bin/myquic2-server/tests.rs:3689`) pinning the 1 s/10 s/5 s split,
+`the_generation_fingerprint_covers_the_hosts_file`
+(`src/dns/resolve.rs:1834`), and an assertion in the existing
+negative-cache test that the returned `DnsFailure` carries the verdict's
+remaining life.
+
+### 17.7 What this does not establish
+
+The histograms are observational, not a benchmark: no before/after, no load
+sweep, and the buckets are coarse by design. Nothing here shows that parking
+datagrams (§16.6's deferred item 3) would help — that is exactly what the
+`waiter` line is now for, and the decision is waiting on numbers from
+`hotpath_bench udpdomain` rather than on another mechanism argument. The
+resolver poll still cannot see a change that leaves nameservers, search list and
+hosts file identical but changes resolver *options*; that is documented at the
+fingerprint rather than fixed.

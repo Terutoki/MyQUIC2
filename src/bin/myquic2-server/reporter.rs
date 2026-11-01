@@ -173,6 +173,11 @@ pub(crate) fn spawn_udp_reporter() {
         // would otherwise stay invisible until that thread's next 256-record or
         // 1 s flush.
         let mut prev_r2 = r2_stats::snapshot();
+        // The DNS line is the one this batch exists for: it says *which* path a
+        // lookup took (a fresh hit never touches the network, a stale hit answers
+        // and refreshes beside the caller, a refusal answers from the negative
+        // cache) and how long the two things a user waits on actually took.
+        let mut prev_dns = dns_stats();
         loop {
             tick.tick().await;
             let now = udp_stats::snapshot();
@@ -230,6 +235,12 @@ pub(crate) fn spawn_udp_reporter() {
             if let Some(line) = r2_report_line(&dr2) {
                 info!("{line}");
             }
+            let now_dns = dns_stats();
+            let ddns = now_dns.since(&prev_dns);
+            if !ddns.is_idle() {
+                info!("dns (60s): {ddns}");
+            }
+            prev_dns = now_dns;
             prev_d = now_d;
             prev = now;
             prev_w = now_w;

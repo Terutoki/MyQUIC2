@@ -3662,7 +3662,14 @@ fn dns_gate_coalesces_and_caches_unusable_verdicts() {
         GateClaim::InFlight
     ));
     // A completed unusable verdict is remembered, and expires on its own.
-    gate.finish(s, host, port, token, true, t0 + 2);
+    gate.finish(
+        s,
+        host,
+        port,
+        token,
+        Some(Duration::from_millis(DNS_GATE_UNUSABLE_TTL_MS)),
+        t0 + 2,
+    );
     assert_eq!(gate.probe_for_test(s, host, port, t0 + 2), Some(true));
     assert!(matches!(
         gate.claim(s, host, port, t0 + 3),
@@ -3670,6 +3677,78 @@ fn dns_gate_coalesces_and_caches_unusable_verdicts() {
     ));
     assert!(matches!(
         gate.claim(s, host, port, t0 + 2 + DNS_GATE_UNUSABLE_TTL_MS + 1),
+        GateClaim::Proceed(_)
+    ));
+}
+
+/// The gate's refusal window follows the failure's own class, so it no longer
+/// over-reaches: before this, every refusal got the flat 5 s window, which meant
+/// an application retransmitting at 1.2 s after a transient timeout was dropped
+/// for a name the shared cache would already have re-resolved.
+#[test]
+fn dns_gate_refusal_window_follows_the_failure_class() {
+    let (s, host, port) = (12u32, "backoff.test", 53u16);
+    let t0 = 1_000u64;
+
+    // Inconclusive failure: a 1 s backoff.
+    let gate = DnsGate::new();
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    gate.finish(s, host, port, token, Some(Duration::from_millis(1_000)), t0);
+    assert!(
+        matches!(gate.claim(s, host, port, t0 + 500), GateClaim::Unusable),
+        "inside the backoff the verdict still answers inline"
+    );
+    assert!(
+        matches!(gate.claim(s, host, port, t0 + 1_200), GateClaim::Proceed(_)),
+        "past the 1 s backoff the next datagram must spawn a lookup again"
+    );
+
+    // Resolver verdict: the full 10 s, unchanged.
+    let gate = DnsGate::new();
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    gate.finish(
+        s,
+        host,
+        port,
+        token,
+        Some(Duration::from_millis(10_000)),
+        t0,
+    );
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + 9_000),
+        GateClaim::Unusable
+    ));
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + 10_001),
+        GateClaim::Proceed(_)
+    ));
+
+    // The policy refusal keeps the flat default window.
+    let gate = DnsGate::new();
+    let token = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    gate.finish(
+        s,
+        host,
+        port,
+        token,
+        Some(Duration::from_millis(DNS_GATE_UNUSABLE_TTL_MS)),
+        t0,
+    );
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + DNS_GATE_UNUSABLE_TTL_MS - 1),
+        GateClaim::Unusable
+    ));
+    assert!(matches!(
+        gate.claim(s, host, port, t0 + DNS_GATE_UNUSABLE_TTL_MS + 1),
         GateClaim::Proceed(_)
     ));
 }
@@ -3699,7 +3778,7 @@ fn dns_gate_backstop_expires_and_a_stale_finish_is_ignored() {
         host,
         port,
         stale,
-        false,
+        None,
         t0 + DNS_GATE_INFLIGHT_TTL_MS + 2,
     );
     assert_eq!(
@@ -3713,7 +3792,7 @@ fn dns_gate_backstop_expires_and_a_stale_finish_is_ignored() {
         host,
         port,
         fresh,
-        false,
+        None,
         t0 + DNS_GATE_INFLIGHT_TTL_MS + 3,
     );
     assert_eq!(
@@ -3743,7 +3822,7 @@ fn dns_gate_fast_hint_is_invalidated_by_a_delivered_finish_and_expires() {
     ));
     // Delivered → the inner entry *and* the hint are gone; a fresh datagram
     // must be admitted (spawned) again, never refused by a stale InFlight.
-    gate.finish(s, host, port, token, false, t0 + 2);
+    gate.finish(s, host, port, token, None, t0 + 2);
     assert!(
         matches!(gate.claim(s, host, port, t0 + 3), GateClaim::Proceed(_)),
         "the hint must not outlive a delivered finish"
@@ -8329,7 +8408,7 @@ async fn cancelled_generic_dns_waiter_does_not_create_a_session() {
     )
     .await;
     assert!(
-        !delivered,
+        delivered.is_none(),
         "a cancelled waiter reports no DNS verdict (nothing to cache)"
     );
     assert_eq!(
@@ -8386,7 +8465,10 @@ async fn generic_dns_slow_path_clamps_the_session_memo_to_the_entry_life() {
         None,
     )
     .await;
-    assert!(!delivered, "a delivered datagram is not a DNS verdict");
+    assert!(
+        delivered.is_none(),
+        "a delivered datagram is not a DNS verdict"
+    );
     let mut buf = [0u8; 64];
     let (n, _) = tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf))
         .await

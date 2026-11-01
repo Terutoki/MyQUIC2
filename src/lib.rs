@@ -103,11 +103,12 @@ pub(crate) use transport::incoming_stream_credits;
 // `MQP_DGRAM_MAX` / `clamp_keep_alive` are exercised by the unit tests below
 // through `use super::*` (`DATAGRAM_BUFFER` is also read by `config::tuning`).
 pub use dns::{
-    CachedLookup, DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT, IpPreference, dns_cache_seed,
-    dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed, dns_slow_path_limiter,
-    ip_preference, is_global_ip, lookup_cached_fast, lookup_cached_fast_with_ttl,
-    lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached, resolve_server_addr,
-    resolve_server_addrs, resolve_server_side, set_ip_preference, spawn_resolver_watch, unmap,
+    CachedLookup, DNS_CACHE_TTL_MS, DNS_LOOKUP_TIMEOUT, DnsFailure, DnsStats, IpPreference,
+    dns_cache_seed, dns_cache_seed_aged, dns_cache_seed_set, dns_neg_cache_seed,
+    dns_slow_path_limiter, dns_stats, ip_preference, is_global_ip, lookup_cached_fast,
+    lookup_cached_fast_with_ttl, lookup_cached_sync, map_for_dual, resolve_all, resolve_all_cached,
+    resolve_server_addr, resolve_server_addrs, resolve_server_side, set_ip_preference,
+    spawn_resolver_watch, unmap, waiter_took,
 };
 /// Test-only compatibility surface: the unit tests below address the moved
 /// DNS internals through the crate root (`use super::*`).

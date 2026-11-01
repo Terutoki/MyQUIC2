@@ -41,6 +41,14 @@ fn reconnect_backoff() -> impl Iterator<Item = Duration> {
 /// inbound-progress stamp: one keepalive interval plus this sampling tick.
 pub(crate) const WATCHDOG_POLL: Duration = Duration::from_secs(1);
 
+/// Addresses tried per dial iteration before it is given up as failed.
+///
+/// Three covers the ordinary cases (v4 only, v6 only, both) plus one spare
+/// without letting a black-holed endpoint burn a whole backoff window on a long
+/// candidate list. Shared with the startup pre-resolve in `main`, so both ask
+/// the cache for the same list.
+pub(crate) const DIAL_ADDR_CANDIDATES: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_conn_loop(
     ep: quinn::Endpoint,
@@ -55,11 +63,6 @@ pub(crate) fn spawn_conn_loop(
     egress: std::sync::Arc<super::egress::SharedEgress>,
 ) {
     tokio::spawn(async move {
-        // Addresses tried per dial attempt before this iteration is given up as
-        // failed. Three covers the ordinary cases (v4 only, v6 only, both) plus
-        // one spare without letting a black-holed endpoint burn a whole backoff
-        // window on a long candidate list.
-        const DIAL_ADDR_CANDIDATES: usize = 3;
         // 0-RTT phase handle of this slot's current generation: `dial_once`
         // resets and advances it, and the TCP open path reads it to retry an
         // early stream after a 0-RTT rejection.

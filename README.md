@@ -601,10 +601,10 @@ MQP-3 is a passenger, not a replacement. The transport choices that matter most:
 | UDP hub | `src/bin/myquic2-client/hub.rs`, `assoc.rs` | SOCKS5 UDP association, 4,032 cap, app address lock |
 | Server ingress | `src/bin/myquic2-server/accept.rs` | token auth, flow install (rev3/rev2 framing), admission; rev2 `HELLO`/`CAPS` |
 | Server forwarding | `src/bin/myquic2-server/reader.rs`, `table.rs`, `forward.rs`, `pin.rs` | session sockets, source matching, DNS/SSRF, reply pinning |
-| Observability | `src/stats/*`, reporter | frame/item/drop/flow counters and periodic summaries |
+| Observability | `src/stats/*`, `src/dns/stats.rs`, reporter | frame/item/drop/flow counters, DNS resolution classes with lookup/waiter latency histograms, and periodic summaries |
 | Benchmarks | `examples/hotpath_bench.rs`, `scripts/linux-bench-matrix.sh` | all-size sweep, mixed small-packet load, pacing, full duplex |
 
-The counters are intentionally granular: bytes and frames by kind, `TRAIN` items, inline fallbacks, flow opens/acks/rejects/closes, compression ratio, reassembly partials, stager depth, drop reason and transport stats. A regression in framing shows up as a ratio change, not as a vague latency wobble. For packet-level work, qlog and `tcpdump` see one MQP frame per DATAGRAM; for CPU work, the hot-path bench isolates encode, decode, staging and send.
+The counters are intentionally granular: bytes and frames by kind, `TRAIN` items, inline fallbacks, flow opens/acks/rejects/closes, compression ratio, reassembly partials, stager depth, drop reason, transport stats, and — on the DNS path — how a resolution was served (fresh, stale, refused, cold) plus p50/p99 of the upstream lookup and of the datagram that waited for it. A regression in framing shows up as a ratio change, not as a vague latency wobble. For packet-level work, qlog and `tcpdump` see one MQP frame per DATAGRAM; for CPU work, the hot-path bench isolates encode, decode, staging and send.
 
 ### 16. Compatibility and failure behavior
 

@@ -22,18 +22,32 @@ pub(crate) const DNS_GATE_SLOTS: usize = 8;
 /// never re-spawned by the backstop.
 pub(crate) const DNS_GATE_INFLIGHT_TTL_MS: u64 = 15_000;
 
-/// How long an "unusable" verdict (every record filtered, or the lookup failed)
-/// is trusted before the next datagram may spawn a fresh resolution.
+/// How long a **policy** refusal is trusted before the next datagram may spawn
+/// a fresh resolution.
 ///
-/// Deliberately short: the shared DNS layer already records the failure
-/// (`DNS_NEG_TTL` — 10 s — for a name the resolver answered for, the 1 s
-/// `DNS_INCONCLUSIVE_TTL` backoff when no answer was obtained), and this stands
-/// in for a refusal that already exists upstream. It is the *longer* of the two
-/// when the failure was inconclusive, which is intended: the gate is per target,
-/// so it can afford to wait out a blip that the host-wide entry does not. It
-/// exists because the upstream refusal is only reachable synchronously from a
-/// *warm* thread memo, and a spawned waiter warms only its own worker's.
+/// This is now only the default for the one refusal the DNS layer never sees:
+/// the resolver answered, but every record was filtered by the egress policy
+/// (see [`gate_ttl_ms`]). A DNS failure carries its own class instead —
+/// `DNS_NEG_TTL` (10 s) for a verdict, `DNS_INCONCLUSIVE_TTL` (1 s) for a
+/// backoff — and the gate mirrors exactly that, so an application retransmitting
+/// at 1.2 s after a transient timeout is not dropped for a name the shared cache
+/// would already re-resolve.
+///
+/// The gate still needs a window of its own because the upstream refusal is only
+/// reachable synchronously from a *warm* thread memo, and a spawned waiter warms
+/// only its own worker's.
 pub(crate) const DNS_GATE_UNUSABLE_TTL_MS: u64 = 5_000;
+
+/// The gate's deadline for a refused name, in milliseconds.
+///
+/// A DNS failure carries its own class (`DnsFailure::retry_ttl`: 10 s for a
+/// verdict, 1 s for a backoff) and the gate trusts it, so a retransmit that the
+/// shared cache would re-resolve is not dropped here. The flat
+/// [`DNS_GATE_UNUSABLE_TTL_MS`] remains for the one refusal the DNS layer never
+/// sees: every record of an answered name filtered by the egress policy.
+fn gate_ttl_ms(ttl: Duration) -> u64 {
+    u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Test-only count of spawned resolver waiters.
 ///
@@ -296,7 +310,7 @@ impl DnsGate {
         host: &str,
         port: u16,
         generation: u32,
-        unusable: bool,
+        unusable: Option<Duration>,
         now_ms: u64,
     ) {
         let key = self.key(s, host, port);
@@ -308,8 +322,8 @@ impl DnsGate {
             .find(|e| e.is_some_and(|x| x.key == key))
             && slot.as_ref().is_some_and(|e| e.generation == generation)
         {
-            if unusable {
-                let deadline = now.saturating_add(DNS_GATE_UNUSABLE_TTL_MS);
+            if let Some(ttl) = unusable {
+                let deadline = now.saturating_add(gate_ttl_ms(ttl));
                 *slot = Some(GateEntry {
                     key,
                     state: GateState::Unusable,
@@ -324,7 +338,7 @@ impl DnsGate {
                 *slot = None;
                 self.clear_hot();
             }
-        } else if unusable {
+        } else if let Some(ttl) = unusable {
             // The claim was evicted (or its backstop expired and the slot was
             // reused) while the waiter ran: still publish the verdict, in the
             // first free/expired slot, so the next datagrams can refuse inline.
@@ -333,7 +347,7 @@ impl DnsGate {
                 .iter_mut()
                 .find(|e| e.is_none_or(|x| x.deadline <= now))
             {
-                let deadline = now.saturating_add(DNS_GATE_UNUSABLE_TTL_MS);
+                let deadline = now.saturating_add(gate_ttl_ms(ttl));
                 *slot = Some(GateEntry {
                     key,
                     state: GateState::Unusable,
@@ -575,6 +589,9 @@ pub(crate) async fn forward_server_dgram(
             // generic path has no per-flow coalescing key for the close to
             // cancel (see `R2ConnState::dns_waiters`).
             let waiter = r2.map(|st| st.begin_dns_waiter(s));
+            // From just before the spawn to the socket hand-off: the latency a
+            // *datagram* pays for a cold name, which is what an application sees.
+            let spawned = std::time::Instant::now();
             tokio::spawn(async move {
                 let _permit = permit;
                 let unusable = deliver_resolved_server_dgram(
@@ -590,6 +607,7 @@ pub(crate) async fn forward_server_dgram(
                     waiter.as_ref(),
                 )
                 .await;
+                waiter_took(spawned.elapsed());
                 // Success or a name-level failure: always complete the claim, or
                 // every later datagram for this target would be dropped as
                 // in-flight until the backstop expires. The waiter guard drops
@@ -612,10 +630,13 @@ pub(crate) async fn forward_server_dgram(
 
 /// Deliver one datagram from a gated resolver waiter.
 ///
-/// Returns `true` when the name itself yielded no usable address (every record
-/// filtered, or the lookup failed): the outcome [`DnsGate`] caches briefly. A
-/// resource refusal from `get_or_create_sess` is not a DNS verdict and returns
-/// `false`, so it never suppresses the next datagram's retry.
+/// Returns `Some(ttl)` when the name itself yielded no usable address (every
+/// record filtered, or the lookup failed): the outcome [`DnsGate`] caches for
+/// that long. The TTL is the failure's own class for a DNS refusal, and the flat
+/// [`DNS_GATE_UNUSABLE_TTL_MS`] when the resolver answered but the policy
+/// filtered every record. A resource refusal from `get_or_create_sess` is not a
+/// DNS verdict and returns `None`, so it never suppresses the next datagram's
+/// retry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn deliver_resolved_server_dgram(
     ss: &SessTable,
@@ -628,7 +649,7 @@ pub(crate) async fn deliver_resolved_server_dgram(
     allow_private: bool,
     r2: Option<&Arc<R2ConnState>>,
     waiter: Option<&DnsWaiter>,
-) -> bool {
+) -> Option<Duration> {
     let dst = match resolve_all_cached(host, port).await {
         Ok(v) => match v
             .iter()
@@ -640,12 +661,12 @@ pub(crate) async fn deliver_resolved_server_dgram(
             // negative arm.
             None => {
                 dgram_drops::bump(&dgram_drops::REFUSED);
-                return true;
+                return Some(Duration::from_millis(DNS_GATE_UNUSABLE_TTL_MS));
             }
         },
-        Err(_) => {
+        Err(e) => {
             dgram_drops::bump(&dgram_drops::REFUSED);
-            return true;
+            return Some(e.retry_ttl());
         }
     };
     // The client may have closed the association while the DNS lookup was in
@@ -655,7 +676,7 @@ pub(crate) async fn deliver_resolved_server_dgram(
     // waiter returns "not a DNS verdict" so the gate does not cache anything
     // for the next datagram.
     if waiter.is_some_and(DnsWaiter::is_cancelled) {
-        return false;
+        return None;
     }
     // The DNS *entry* may be older than `DNS_CACHE_TTL_MS`: `resolve_all_cached`
     // serves a host-keyed cache hit (every port shares one entry) and only then
@@ -696,10 +717,10 @@ pub(crate) async fn deliver_resolved_server_dgram(
     };
     if let Some(sock) = sock {
         if waiter.is_some_and(DnsWaiter::is_cancelled) {
-            return false;
+            return None;
         }
         remember_dst(ss, s, dst);
         udp_try_send(&sock, map_for_dual(dst), payload);
     }
-    false
+    None
 }

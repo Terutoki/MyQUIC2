@@ -56,6 +56,7 @@ use super::key::{
     DNS_HOST_KEY_BUF, DNS_KEY_BUF, dns_host_key, dns_host_key_owned, dns_key, dns_key_owned,
 };
 use super::memo::{bump_neg_epoch, memo_peek_both, memo_put, memo_put_with_epoch, neg_epoch};
+use super::stats;
 use super::store::{
     DNS_CACHE_MAX, DNS_CACHE_MAX_ADDRS, DNS_CACHE_TTL, DNS_INCONCLUSIVE_TTL, DNS_LOOKUP_ATTEMPTS,
     DNS_LOOKUP_TIMEOUT, DNS_NEG_TTL, DNS_QUERY_TIMEOUT, DNS_RECORD_TTL_MAX, DNS_RECORD_TTL_MIN,
@@ -205,6 +206,11 @@ impl LookupFailure {
         }
     }
 
+    /// Whether this failure is a fact about the name rather than about us.
+    fn is_verdict(&self) -> bool {
+        matches!(self, Self::Verdict(_))
+    }
+
     /// How long a refusal derived from this failure may be cached.
     fn retry_ttl(&self) -> Duration {
         match self {
@@ -230,6 +236,37 @@ impl std::fmt::Display for LookupFailure {
         }
     }
 }
+
+/// A refused resolution as the callers see it: the message, plus how long the
+/// refusal is meant to keep answering.
+///
+/// The TTL is part of the error because its *class* differs — a resolver verdict
+/// is a 10 s statement about the name, a timeout is a 1 s backoff — and the
+/// server's DNS gate mirrors the verdict for the following datagrams (see
+/// `DnsGate::finish`). Without it the gate applied one flat 5 s window, so an
+/// application retransmitting at 1.2 s after a transient timeout was dropped
+/// for a name the store would have retried immediately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsFailure {
+    message: String,
+    retry_ttl: Duration,
+}
+
+impl DnsFailure {
+    /// How long this refusal may be answered from cache.
+    #[must_use]
+    pub fn retry_ttl(&self) -> Duration {
+        self.retry_ttl
+    }
+}
+
+impl std::fmt::Display for DnsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DnsFailure {}
 
 /// The name to hand hickory for `host`: fully qualified when the target is
 /// already a dotted name, untouched otherwise.
@@ -273,6 +310,20 @@ fn query_name(host: &str) -> std::borrow::Cow<'_, str> {
 /// trip per suffix, and the failures are exactly the lookups whose cost the
 /// negative cache's 10 s verdict is supposed to hide.
 async fn resolve_ips(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::result::Result<(Vec<IpAddr>, Duration), LookupFailure> {
+    // One counter pair per upstream resolution: the 60 s line's `lookup`
+    // histogram is this call's duration, early returns included.
+    let started = Instant::now();
+    let out = resolve_ips_timed(host, port, timeout).await;
+    stats::lookup_took(started.elapsed());
+    out
+}
+
+/// The body of [`resolve_ips`], separated so every return path is timed once.
+async fn resolve_ips_timed(
     host: &str,
     port: u16,
     timeout: Duration,
@@ -420,10 +471,16 @@ fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts)
 }
 
 /// How often [`spawn_resolver_watch`] re-reads the platform's DNS
-/// configuration. Long enough to be free (one file read on Linux/OpenWrt, one
-/// dynamic-store query on macOS), short enough that a VPN coming up is picked
-/// up before the stale window it would otherwise hide behind.
-pub const RESOLVER_CONFIG_POLL: Duration = Duration::from_secs(30);
+/// configuration.
+///
+/// The read is a `stat` plus a parse: `resolv.conf` on Linux/OpenWrt, one
+/// System Configuration query on macOS. At 30 s a VPN coming up could leave cold
+/// names pointed at dead nameservers for half a minute (serve-stale only hides
+/// that for names already answered); 5 s costs a negligible fraction of one
+/// worker's CPU and bounds the window to the first retry an application would
+/// make anyway. Platform change notifications would be better still, but they
+/// need a dependency per platform for a window this small.
+pub const RESOLVER_CONFIG_POLL: Duration = Duration::from_secs(5);
 
 /// One generation of the process-wide upstream resolver.
 struct ResolverGen {
@@ -471,6 +528,46 @@ fn config_fingerprint(config: &hickory_resolver::config::ResolverConfig) -> Vec<
     f
 }
 
+/// The hosts file the resolver generation parses, as metadata.
+///
+/// The hosts table is built *with* the generation, so an edit to `/etc/hosts`
+/// only takes effect when the generation is rebuilt. The nameserver fingerprint
+/// cannot see that edit, so without this a local override (the usual way to pin
+/// an internal name) would not be picked up for the process's lifetime.
+///
+/// Metadata, not a hash: the file is re-read only when it actually changed, and
+/// a same-length rewrite moves the mtime.
+#[cfg(unix)]
+fn hosts_fingerprint() -> String {
+    const HOSTS: &str = "/etc/hosts";
+    match std::fs::metadata(HOSTS) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("hosts {mtime} {}", meta.len())
+        }
+        Err(_) => "hosts absent".to_string(),
+    }
+}
+
+/// Non-Unix: hickory reads the platform's own hosts database, which has no
+/// single path to stat, so the poll follows nameservers only.
+#[cfg(not(unix))]
+fn hosts_fingerprint() -> String {
+    String::new()
+}
+
+/// The full generation fingerprint: the platform configuration plus the files
+/// its build parses (see [`hosts_fingerprint`]).
+fn generation_fingerprint(config: &hickory_resolver::config::ResolverConfig) -> Vec<String> {
+    let mut f = config_fingerprint(config);
+    f.push(hosts_fingerprint());
+    f
+}
+
 /// Read the platform configuration and build a resolver generation from it.
 ///
 /// Blocking by design: reading the System Configuration dynamic store is a
@@ -482,7 +579,7 @@ fn build_resolver_gen() -> ResolverGen {
         Ok(pair) => pair,
         Err(e) => return ResolverGen::error(e.to_string(), Vec::new()),
     };
-    let fingerprint = config_fingerprint(&config);
+    let fingerprint = generation_fingerprint(&config);
     tracing::info!(
         nameservers = ?config
             .name_servers()
@@ -552,7 +649,7 @@ pub fn spawn_resolver_watch() {
             let fresh = tokio::task::spawn_blocking(|| {
                 hickory_resolver::system_conf::read_system_conf()
                     .ok()
-                    .map(|(config, _)| config_fingerprint(&config))
+                    .map(|(config, _)| generation_fingerprint(&config))
             })
             .await
             .ok()
@@ -817,7 +914,10 @@ fn record_ttl(ttl: Duration) -> Duration {
 /// tell the two paths apart, by design; the entry it receives is a valid
 /// answer either way, and the shorter memo life ([`DNS_STALE_MEMO_TTL`]) brings
 /// the packet path back here to observe the repaired entry.
-pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
+pub async fn resolve_all_cached(
+    host: &str,
+    port: u16,
+) -> std::result::Result<Arc<[SocketAddr]>, DnsFailure> {
     // Stack-built per-(host, port) key for this thread's memo. The fallback
     // only triggers for hosts longer than the 255-byte wire limit.
     let mut kbuf = [0u8; DNS_KEY_BUF];
@@ -851,7 +951,10 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     // expired name starts exactly one upstream query, not one per datagram.
     if let Some((deadline, ips)) = positives().get(host_key).await {
         if positive_life(deadline, Instant::now()).is_none() {
+            stats::stale_hit();
             request_refresh(host_key, port);
+        } else {
+            stats::fresh_hit();
         }
         return Ok(materialize_cached(memo_key, deadline, &ips, port));
     }
@@ -890,7 +993,11 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                 Instant::now() + remaining,
                 epoch_before_probe,
             );
-            anyhow::bail!("dns negative cached");
+            stats::refused_hit();
+            return Err(DnsFailure {
+                message: "dns negative cached".to_owned(),
+                retry_ttl: remaining,
+            });
         }
         // Logically expired but still resident (moka's own 10 s TTL is only an
         // eviction bound above the per-entry deadline): fall through to a fresh
@@ -900,6 +1007,9 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
     }
     let outcome = positives()
         .try_get_with_by_ref(host_key, async {
+            // Runs once per resolution: moka single-flights this future, so it
+            // counts resolutions started, not callers that arrived.
+            stats::cold_started();
             match resolve_ips(host, port, DNS_LOOKUP_TIMEOUT).await {
                 Ok((ips, ttl)) => {
                     let now = Instant::now();
@@ -940,8 +1050,13 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
                     // `DNS_NEG_TTL`, while a lookup that never got an answer
                     // (timeout, saturated fallback) is only held off for the
                     // short `DNS_INCONCLUSIVE_TTL` backoff.
-                    record_refusal(host_key, memo_key, failure.retry_ttl()).await;
-                    Err(failure.to_string())
+                    stats::failed(failure.is_verdict());
+                    let retry_ttl = failure.retry_ttl();
+                    record_refusal(host_key, memo_key, retry_ttl).await;
+                    Err(DnsFailure {
+                        message: failure.to_string(),
+                        retry_ttl,
+                    })
                 }
             }
         })
@@ -957,7 +1072,10 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
             // may have answered the name in the meantime; outside the
             // single-flight that is safe to check and repair.
             withdraw_refusal_if_answered(host_key, memo_key, port).await;
-            Err(anyhow::anyhow!("{e}"))
+            Err(DnsFailure {
+                message: e.message.clone(),
+                retry_ttl: e.retry_ttl,
+            })
         }
     }
 }
@@ -1133,7 +1251,10 @@ async fn refresh_positive(host_key: &str, port: u16) {
     let Ok(_permit) = dns_refresh_limiter().clone().try_acquire_owned() else {
         return;
     };
-    if let Ok((ips, ttl)) = resolve_ips(host_key, port, DNS_LOOKUP_TIMEOUT).await {
+    stats::refresh_started();
+    let looked = resolve_ips(host_key, port, DNS_LOOKUP_TIMEOUT).await;
+    stats::refresh_finished(looked.is_ok());
+    if let Ok((ips, ttl)) = looked {
         let now = Instant::now();
         // A foreground resolution may have refreshed the entry while this
         // lookup was in flight. Best effort: this check and the `insert` below
@@ -1550,6 +1671,11 @@ mod tests {
             err.to_string().contains("dns negative cached"),
             "a host-keyed negative entry must refuse another port, got: {err:#}"
         );
+        assert!(
+            err.retry_ttl() <= DNS_NEG_TTL && !err.retry_ttl().is_zero(),
+            "a refusal must carry the verdict's remaining life for the gate, got {:?}",
+            err.retry_ttl()
+        );
         // The refusing call must warm this port's thread memo, or every
         // datagram for that port would spawn a resolver task forever: the
         // shared verdict is only reachable from the async path, and only the
@@ -1701,6 +1827,29 @@ mod tests {
     /// only then. A stale key means the watcher either misses a nameserver
     /// change (the cliff it exists to close) or rebuilds the resolver on every
     /// poll (a new connection pool every 30 s).
+    /// The generation fingerprint must include the hosts file's metadata: the
+    /// hosts table is built with the generation, so an `/etc/hosts` edit that the
+    /// nameserver fingerprint cannot see would otherwise never be picked up.
+    #[test]
+    fn the_generation_fingerprint_covers_the_hosts_file() {
+        use hickory_resolver::config::ResolverConfig;
+
+        let config = ResolverConfig::default();
+        let print = generation_fingerprint(&config);
+        let hosts = hosts_fingerprint();
+        assert_eq!(
+            print.last().map(String::as_str),
+            Some(hosts.as_str()),
+            "the hosts entry is appended to the config fingerprint"
+        );
+        assert_eq!(
+            print,
+            generation_fingerprint(&config),
+            "a fingerprint is a pure function of the inputs"
+        );
+        assert!(print.len() > config_fingerprint(&config).len());
+    }
+
     #[test]
     fn the_resolver_fingerprint_tracks_nameservers_and_search() {
         use hickory_resolver::config::{NameServerConfig, ResolverConfig};
