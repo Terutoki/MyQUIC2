@@ -1688,3 +1688,76 @@ hit the same hosts entry and the trailing dot cannot defeat an override.
 Verification after the fixes: `cargo fmt --all --check` clean,
 `cargo clippy --all-targets -- -D warnings` clean, `cargo test --all-targets`
 744 passed / 0 failed / 1 ignored (the extra test is the attempt-budget one).
+
+### 16.10 Review round two: the disjointness the refresh could break
+
+Round two reviewed the whole series (`bd791be..c67e9ed`: `18d8ace`, `192dede`,
+`fad78a8`, `c67e9ed` — 18 files, +2304/−257) rather than one batch, because the
+batches interact. One real defect, one missing test and two cosmetic items came
+out of it.
+
+**The defect.** §16.4's positive/negative split rests on a single-flight
+argument: a foreground resolution only runs when the positive entry is *absent*,
+so its refusal can never coexist with a live answer. `refresh_positive`
+(`src/dns/resolve.rs:1126`) deliberately bypasses `try_get_with` — it must, or
+the present stale entry would be handed back instead of re-resolved — and writes
+with a plain `insert`. So it is not single-flighted against a foreground init.
+The window is narrow (the entry has to be evicted by moka capacity pressure, i.e.
+absent at the same instant a refresh is in flight) but the outcome is exactly
+the state the split forbids: both stores hold a live entry for the name. The warm
+arm keeps serving the answer, so nothing looks wrong until that answer ages out —
+then the negative probe refuses a name that resolves, on every port, and this
+thread's memo was tagged `Negative`.
+
+The repair cannot live in `record_refusal`: that runs inside the init future, and
+moka holds the key's single-flight for the init's whole duration, so a
+`positives().get(..)` from inside it waits for itself. It is therefore a
+post-init step, `withdraw_refusal_if_answered`
+(`src/dns/resolve.rs:1316`), called from `resolve_all_cached`'s `Err` arm once
+the single-flight has been released: a *fresh* positive means the refusal is
+stale by construction, so it is removed (bumping `NEG_EPOCH` when it was there, so
+other threads' negative memos stop trusting it) and this thread's memo is
+rewritten with the live answer so the packet path agrees with the store. Covered
+by `a_refusal_is_withdrawn_when_a_refresh_answered_first`, which seeds the exact
+coexisting state, calls the helper, and asserts both the store and the memo flip
+back.
+
+**The missing test.** `query_name` (`src/dns/resolve.rs:250`) — item 6's FQDN
+rewrite — had no test at all. `query_name_makes_dotted_targets_fully_qualified`
+now pins the four cases that matter: a dotted name gains the dot, an FQDN is left
+alone, a single label keeps the search list, and IP literals (`192.0.2.7`, `::1`,
+`[::1]`) are untouched.
+
+**Cosmetics.** `refresh_positive`'s comment claimed it would "prefer the newer
+answer and keep the insertion instant monotone"; the freshness check and the
+insert are not atomic, so a foreground write landing between them can be replaced
+by this older answer. Both are valid answers and the deadline only moves earlier,
+so it is now documented as best effort instead of asserted as a property. And a
+dead `let _written = memo_put_with_epoch(..)` binding in the negative branch
+became `let _ =`.
+
+**Verified rather than changed.** `LookupFailure::from_resolver`'s predicate is
+correct: `is_no_records_found()` is `matches!(self, Self::Dns(DnsError::NoRecordsFound { .. }))`
+(`hickory-net-0.26.3/src/error.rs:177-184`), which covers NXDOMAIN (the
+`NoRecordsFound` carrying `ResponseCode::NXDomain` that `is_nx_domain` singles
+out) and NODATA, while `Timeout`/`Io`/`Proto`/`Busy`/`NoConnections` stay
+inconclusive — so only an answer is cached as a verdict. `race_dial`
+(`src/bin/myquic2-server/tcp.rs:372`) is sound: the `biased;` select polls
+completions first, a failed attempt falls straight through to spawning the next
+candidate, the `else` arm is only reachable once every candidate was spawned and
+every attempt finished, and returning drops the `JoinSet`, cancelling survivors.
+`spawn_resolver_watch` (`src/dns/resolve.rs:536`) `continue`s on a transient
+`read_system_conf` failure instead of swapping in an error generation; its
+fingerprint covers nameservers, domain and search, not `ResolverOpts` (a `ndots`
+change alone would not rebuild — acceptable, and now stated). The stale memo life
+is always `≤ (deadline + DNS_STALE_WINDOW)`, and moka's positive TTL is
+`DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW` (3900 s), so the stale window can never
+outlive the store. `DNS_GATE_UNUSABLE_TTL_MS` (5 s) deliberately exceeds
+`DNS_INCONCLUSIVE_TTL` (1 s): the gate is per target, so it can afford to wait out
+a blip where the store must not refuse every port for that long. README's cache
+row and both Mermaid nodes, the `Cargo.toml` comment left in place of the
+`happy-eyeballs` dependency, and `examples/dns_probe_bench.rs` all match the code.
+
+Verification after the fixes: `cargo fmt --all --check` clean,
+`cargo clippy --all-targets -- -D warnings` clean, `cargo test --all-targets`
+746 passed / 0 failed / 1 ignored (two tests added by this round).

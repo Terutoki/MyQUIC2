@@ -884,7 +884,7 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         // is read off it rather than derived from a fixed TTL.
         let remaining = expires_at.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            let _written = memo_put_with_epoch(
+            let _ = memo_put_with_epoch(
                 memo_key,
                 None,
                 Instant::now() + remaining,
@@ -951,7 +951,14 @@ pub async fn resolve_all_cached(host: &str, port: u16) -> Result<Arc<[SocketAddr
         // also runs for the warm-hit arm above, so the port attachment and the
         // per-thread memo write can never drift between the two paths.
         Ok((deadline, ips)) => Ok(materialize_cached(memo_key, deadline, &ips, port)),
-        Err(e) => Err(anyhow::anyhow!("{e}")),
+        Err(e) => {
+            // The refusal was published inside the init future, where a probe of
+            // the same key would deadlock (see the helper). A background refresh
+            // may have answered the name in the meantime; outside the
+            // single-flight that is safe to check and repair.
+            withdraw_refusal_if_answered(host_key, memo_key, port).await;
+            Err(anyhow::anyhow!("{e}"))
+        }
     }
 }
 
@@ -1129,8 +1136,11 @@ async fn refresh_positive(host_key: &str, port: u16) {
     if let Ok((ips, ttl)) = resolve_ips(host_key, port, DNS_LOOKUP_TIMEOUT).await {
         let now = Instant::now();
         // A foreground resolution may have refreshed the entry while this
-        // lookup was in flight; prefer the newer answer and keep the
-        // insertion instant monotone.
+        // lookup was in flight. Best effort: this check and the `insert` below
+        // are not atomic, so a foreground write landing between them can be
+        // replaced by this older answer. Both are valid answers for the name and
+        // the freshness deadline only moves earlier, so the cost is one early
+        // re-resolve at worst — not worth a second lock on the serving path.
         let already_fresh = positives()
             .get(host_key)
             .await
@@ -1283,6 +1293,37 @@ async fn record_refusal(host_key: &str, memo_key: &str, ttl: Duration) {
 /// through [`record_refusal`] with the TTL their class earns.
 async fn record_negative(host_key: &str, memo_key: &str) {
     record_refusal(host_key, memo_key, DNS_NEG_TTL).await;
+}
+
+/// Withdraw a refusal that a background refresh has just falsified.
+///
+/// [`record_refusal`] runs inside the positive cache's init future, where a
+/// same-key probe is not allowed: moka holds the key's single-flight for the
+/// whole init, so a `positives().get(..)` from inside it waits for itself. A
+/// refresh can still finish in between — it writes with a plain `insert` (it
+/// must: `try_get_with` would hand back the present stale entry instead of
+/// re-resolving), so it is not single-flighted against the init. If its answer
+/// lands after this init's refusal, both stores hold a live entry for the name,
+/// which is exactly the state the positive/negative split forbids: the warm arm
+/// serves the answer, but a port that asks after the positive entry ages out
+/// would be refused, and this thread's memo was tagged `Negative`.
+///
+/// Called after the init future has returned, i.e. once the single-flight is
+/// released. A fresh positive means the refusal is stale by construction: remove
+/// it (bumping `NEG_EPOCH` when it was there, so other threads' negative memos
+/// stop trusting it) and rewrite this thread's memo with the live answer, so the
+/// packet path agrees with the store.
+async fn withdraw_refusal_if_answered(host_key: &str, memo_key: &str, port: u16) {
+    let Some((deadline, ips)) = positives().get(host_key).await else {
+        return;
+    };
+    if positive_life(deadline, Instant::now()).is_none() {
+        return;
+    }
+    if negatives().remove(host_key).await.is_some() {
+        bump_neg_epoch();
+    }
+    materialize_cached(memo_key, deadline, &ips, port);
 }
 
 /// Accept `IP:port` or `hostname:port` for the QUIC server address, taking the
@@ -1738,6 +1779,62 @@ mod tests {
         // The zero TTL an IP-literal answer effectively carries must not make
         // every datagram a lookup.
         assert_eq!(record_ttl(Duration::ZERO), DNS_RECORD_TTL_MIN);
+    }
+
+    /// The search list is for short LAN names, not for dotted targets: a dotted
+    /// name is handed over fully qualified so a failure costs one query instead
+    /// of one per resolv.conf suffix. Literals must come back untouched.
+    #[test]
+    fn query_name_makes_dotted_targets_fully_qualified() {
+        assert_eq!(query_name("example.com"), "example.com.");
+        assert_eq!(query_name("foo.corp."), "foo.corp.");
+        assert_eq!(query_name("printer"), "printer");
+        assert_eq!(query_name("localhost"), "localhost");
+        assert_eq!(query_name("192.0.2.7"), "192.0.2.7");
+        assert_eq!(query_name("::1"), "::1");
+        assert_eq!(query_name("[::1]"), "[::1]");
+    }
+
+    /// The refusal race: a background refresh (plain `insert`) can land after a
+    /// foreground init already wrote its refusal, which leaves both stores
+    /// holding the name — the one state the positive/negative split forbids.
+    /// The withdrawal puts the stores and this thread's memo back in agreement.
+    #[tokio::test]
+    async fn a_refusal_is_withdrawn_when_a_refresh_answered_first() {
+        let _guard = DNS_CACHE_TEST_LOCK.lock().await;
+        let host = "127.0.0.10";
+        let port = 19_708u16;
+        let addr: std::net::SocketAddr = "127.0.0.10:19708".parse().unwrap();
+        // Both writes landed, in the order the race produces: the answer first,
+        // the refusal after it.
+        dns_cache_seed(host, port, addr).await;
+        dns_neg_cache_seed(host, port).await;
+        assert!(
+            negatives().get(host).await.is_some(),
+            "premise: a refusal and a live answer coexist"
+        );
+        assert_eq!(lookup_cached_fast(host, port), CachedLookup::Negative);
+
+        let mut kbuf = [0u8; DNS_KEY_BUF];
+        let memo_key = dns_key(host, port, &mut kbuf).unwrap().to_owned();
+        let mut hbuf = [0u8; DNS_HOST_KEY_BUF];
+        let host_key = dns_host_key(host, &mut hbuf).unwrap().to_owned();
+
+        withdraw_refusal_if_answered(&host_key, &memo_key, port).await;
+
+        assert!(
+            negatives().get(host).await.is_none(),
+            "a live answer must withdraw the refusal it raced"
+        );
+        assert_eq!(
+            lookup_cached_fast(host, port),
+            CachedLookup::Addr(addr),
+            "the packet path must follow the store instead of its own memo"
+        );
+
+        // Idempotent: nothing left to withdraw, nothing rewritten wrongly.
+        withdraw_refusal_if_answered(&host_key, &memo_key, port).await;
+        assert_eq!(lookup_cached_fast(host, port), CachedLookup::Addr(addr));
     }
 
     /// A stale entry is **served**, and the repair happens beside the caller:
