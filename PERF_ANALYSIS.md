@@ -2151,3 +2151,88 @@ retry a staged burst, so a burst that meets a routing error loses the datagrams
 already grouped — the next datagram re-resolves through the slow path. And
 parking still has no measurement behind it; the `waiter` line's p99 under a
 cold-name burst is what would justify the 8 KiB per claim.
+
+## 20. Thirteenth Batch: the retry cadence that scaled with sessions (2026-11-02, post-a3c345c)
+
+This batch comes out of a latency review rather than a CPU audit, and the steady
+state is not where it found anything: one datagram still costs one
+exact-capacity allocation, one payload copy and one lock inside quinn, and the
+burst paths already use `recvmmsg`/`sendmmsg` with no per-packet timer. What was
+left were **recovery paths that only run under backlog** — exactly when the
+latency budget is thinnest, and where a cadence chosen per object can multiply
+by the number of objects.
+
+### 20.1 One 5 ms timer per session over a connection-wide queue
+
+The reply stager is per connection (`R2ConnState::stage`), but the retry that
+recovers a drain left queued behind a full DATAGRAM send buffer was per session:
+`sess_reader_task` armed its own `STAGE_RETRY_MS = 5` interval whenever its last
+burst-end probe saw a backlog (`stage_has_backlog`). The probe is honest — the
+queue really is shared — so on a connection whose send buffer is full and whose
+sessions have queued tails, **every session arms the same timer over the same
+queue**: with `MIN_SESSION_SHARE = 1024`, that is up to ~1024 wakeups per 5 ms
+per connection, all on the shard's single pinned thread, each taking the stager
+gate and quinn's connection state only to re-conclude that the buffer is still
+full. The wakeups also compete with the one thread that can free the buffer:
+the shard runtime also runs quinn's endpoint driver, whose transmit is what
+makes space. The recovery path was throttling its own recovery.
+
+The timer is gone. `R2ConnState` gained `stage_retry: tokio::sync::Notify`
+(accept.rs:1676), `notify_stage_retry` (accept.rs:1929) and one
+`spawn_stage_retry` task per connection (accept.rs:1949, spawned at
+accept.rs:4102), which owns the drain budget probe state and loops
+drain → probe → 5 ms wait while a backlog remains, exiting with the connection.
+A session reader now only notifies at its burst boundary when the probe still
+sees a backlog (reader.rs:1806): `Notify` stores one permit, so a burst of
+notifies from many sessions collapses into one wakeup, and the cadence is
+`O(1)` per connection instead of `O(sessions)`.
+
+### 20.2 The client's retry task slept before it drained, on the driver thread
+
+`ConnRev2::spawn_stage_retry` runs on the slot's pinned current-thread runtime —
+the same thread as the slot's quinn endpoint driver — and its loop waited
+`STAGE_RETRY_DELAY = 2 ms` *before* every drain attempt. Two costs: the common
+case (the send buffer had space again by the time the wakeup ran) paid a full
+2 ms of added tail latency for nothing, and the drain itself used the blocking
+`drain_staged`, which waits on the stager lock, the connection's drain gate and
+quinn's state. A blocking `lock()` on that thread stalls the endpoint driver,
+and with it every connection on the slot.
+
+The task now drains first and sleeps only when a drain reported a blocked send
+buffer, and it drains with `try_drain_staged` (r2_stage.rs:1362), which
+`try_lock`s the stager and the gate and reports `R2DrainAttempt::Busy`
+(r2_stage.rs:1321) instead of waiting; the retry task treats `Busy` as "retry on
+the next cadence", never as "empty" (`stage_known_empty`, rev2.rs:521). The
+blocking variant is kept for association tasks, where waiting is correct, and
+both share one drain body (r2_stage.rs:1388). The one remaining blocking hold on
+the driver thread is the requeue after a failed send, where the gate is already
+ours and only producers contend. The stale doc on `drain_stage` that claimed the
+send phase was not serialised (the drain gate has serialised it since 44f5081)
+is corrected at the same time.
+
+### 20.3 Verification
+
+`cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test --all-targets` **763 passed / 0 failed / 1 ignored**
+(lib 383, client 202, server 162 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9),
+and `cargo test --release --lib udp::` **92 passed**. New test
+`the_connection_retry_task_drains_each_notified_backlog` notifies *before*
+spawning the task (which pins `Notify`'s stored permit), then pushes and waits
+for the connection task to empty the stager a second time — a lost permit or a
+one-shot task would fail one of the two rounds. The existing probe test
+is retitled to the connection-wide wording; nothing else in the area had a test
+that drove the per-session timer, which is why removing it was safe.
+
+### 20.4 What this does not establish
+
+There is no measurement behind the wakeup reduction yet. It is structural
+(`O(sessions)` → `O(1)` per connection), but the claim that it costs real CPU
+should be checked on the Linux target the same way §17 checks DNS: a
+many-session connection (hundreds of interactive associations) with a saturated
+DATAGRAM send buffer, watching shard CPU and per-association RTT p99 with and
+without the change. The cadence itself is unchanged (5 ms server, 2 ms client),
+so the recovery bound is the same; only the number of wakeups paying it is.
+Two findings from the same review are still open and deliberately not addressed
+here: `initial_mtu = 1200` starving PMTU discovery on busy connections (§13
+covers the small-datagram ceiling, not this), and the per-connection FIFO's lack
+of inter-flow fairness (P3-9).

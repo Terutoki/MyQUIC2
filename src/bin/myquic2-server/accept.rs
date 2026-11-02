@@ -1665,6 +1665,15 @@ pub(crate) struct R2ConnState {
     /// `&mut self`); its critical sections are pure encode/try-send work, never
     /// an await.
     pub(crate) stage: Arc<parking_lot::Mutex<R2Stager>>,
+    /// Wakeup for the connection's single drain-retry task
+    /// ([`R2ConnState::spawn_stage_retry`]).
+    ///
+    /// A session reader that leaves frames queued behind a full DATAGRAM send
+    /// buffer notifies this instead of arming a timer of its own: the stager is
+    /// per connection, so the retry cadence must be too. `Notify` stores one
+    /// permit, so a burst of notifies from many sessions collapses into one
+    /// wakeup.
+    stage_retry: tokio::sync::Notify,
     /// Last `CAPS` reply stamp (`coarse_millis` epoch; `0` = never).
     last_caps_ms: std::sync::atomic::AtomicU64,
     /// Domain `DATA OPEN`s whose DNS lookup / first send is running on a
@@ -1890,6 +1899,7 @@ impl R2ConnState {
             // The stager encodes with the connection's revision (rev2 default
             // keeps the shipped byte stream).
             stage: Arc::new(parking_lot::Mutex::new(R2Stager::new_with_wire(wire))),
+            stage_retry: tokio::sync::Notify::new(),
             last_caps_ms: std::sync::atomic::AtomicU64::new(0),
             pending_dns_opens: parking_lot::Mutex::new(std::collections::HashMap::new()),
             pending_dns_bytes: std::sync::atomic::AtomicUsize::new(0),
@@ -1908,6 +1918,81 @@ impl R2ConnState {
     #[must_use]
     pub(crate) fn wire(&self) -> Wire {
         self.wire
+    }
+
+    /// Wake the connection's drain-retry task.
+    ///
+    /// Called by a session reader whose burst-end drain left frames in the
+    /// shared stager (see `stage_has_backlog`). Cheap and idempotent: `Notify`
+    /// stores one permit, so a burst of notifies from many sessions collapses
+    /// into one wakeup.
+    pub(crate) fn notify_stage_retry(&self) {
+        self.stage_retry.notify_one();
+    }
+
+    /// Spawn this connection's single stager-retry task.
+    ///
+    /// The connection stager is shared by every session reader of the
+    /// connection, and a drain that leaves frames queued because the DATAGRAM
+    /// send buffer is full has no natural wakeup: the buffer only frees when
+    /// quinn's driver transmits, and a quiet tail may never see another reply
+    /// burst. The old answer was one 5 ms timer per session, armed while that
+    /// session saw a backlog; on a connection with thousands of sessions that is
+    /// thousands of wakeups per 5 ms, each taking the same stager gate and
+    /// quinn's connection state only to conclude that nothing can be sent —
+    /// exactly the CPU the shard's endpoint driver needs while the uplink is
+    /// hot. One task per connection pays that cost once, and it scales with
+    /// backlog rather than with session count.
+    ///
+    /// The task keeps its own budget probe state, so a `TooLarge` verdict here
+    /// re-probes the live path the same way a session reader would.
+    ///
+    /// Its drains block (`drain_stage`, not `try_drain_staged`) because every
+    /// task of this connection — the ingress reader, the session readers, and
+    /// this one — runs on the shard's single pinned current-thread runtime, so
+    /// a contended lock is never held by a thread this one waits on. Moving a
+    /// shard to a `multi_thread` runtime would invalidate that: switch this
+    /// task to `try_drain_staged` before doing so.
+    pub(crate) fn spawn_stage_retry(self: &Arc<Self>, conn: quinn::Connection) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            // `None` means the handshake never negotiated DATAGRAM. No session
+            // can exist in that case (`get_or_create_sess_guarded` gates on
+            // `max_datagram_size`), so nothing can ever be queued and there is
+            // no tail to recover; unlike the client, there is no
+            // pre-handshake session state to clear.
+            let Some(mut limit) = conn.max_datagram_size() else {
+                return;
+            };
+            let mut last_too_large_probe_ms = 0u64;
+            loop {
+                tokio::select! {
+                    _ = conn.closed() => return,
+                    _ = state.stage_retry.notified() => {}
+                }
+                loop {
+                    match drain_stage(
+                        &conn,
+                        &state.stage,
+                        &mut limit,
+                        &mut last_too_large_probe_ms,
+                    ) {
+                        StageDrain::Terminal => return,
+                        StageDrain::Ok | StageDrain::TooLarge => {}
+                    }
+                    if !stage_has_backlog(&state.stage) {
+                        break;
+                    }
+                    // The queue is still non-empty and no send failed: the
+                    // DATAGRAM buffer is full. Wait for quinn's driver to make
+                    // room, or for the connection to go away.
+                    tokio::select! {
+                        _ = conn.closed() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(STAGE_RETRY_MS)) => {}
+                    }
+                }
+            }
+        });
     }
 
     /// Attach the outbound control-stream queue (rev3, once the client's
@@ -4026,6 +4111,9 @@ async fn handle_conn_inner(
     // this connection's wire revision. Shared by this handler, the datagram
     // reader, the sweeper and every session reader.
     let r2_state = R2ConnState::new_with_wire(wire);
+    // One drain-retry task for the connection's shared stager: session readers
+    // only notify it (see `R2ConnState::spawn_stage_retry`).
+    r2_state.spawn_stage_retry(conn.clone());
     // rev3 reliable control plane: one client-opened bidi stream. `ctl_out` is
     // the server→client writer queue (installed when the stream is accepted);
     // `ctl_in` carries the peer's messages to the datagram loop, which owns the

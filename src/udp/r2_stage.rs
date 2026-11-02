@@ -1300,23 +1300,128 @@ pub fn book_too_large(n: usize) {
 /// frame onto the wire, so the drain returns `Blocked` without encoding
 /// anything. That is what turns the old "one full-queue pack per payload while
 /// blocked" behaviour into O(1) per payload.
+///
+/// Every lock this variant takes may wait. That is right on an association's
+/// own task, and wrong for a caller that shares a thread with the QUIC endpoint
+/// driver (the client's per-connection retry task); that one uses
+/// [`try_drain_staged`].
 pub fn drain_staged(
     conn: &Connection,
     stage: &parking_lot::Mutex<R2Stager>,
     limit: usize,
-    mut on_requeue_overflow: impl FnMut(Option<(u32, Option<u32>)>),
+    on_requeue_overflow: impl FnMut(Option<(u32, Option<u32>)>),
 ) -> R2DrainOutcome {
+    // `try_only = false` never reports contention: every lock in the core
+    // blocks. A `None` here would mean that invariant broke, not that a
+    // drainer was busy, so surface it instead of reporting a clean no-op.
+    drain_staged_inner(conn, stage, limit, false, on_requeue_overflow)
+        .expect("the blocking drain cannot report contention")
+}
+
+/// What one [`try_drain_staged`] call did.
+///
+/// Marked `#[must_use]` because the type exists so that
+/// [`R2DrainAttempt::Busy`] is never mistaken for "the queue is empty": a
+/// discarded result has to be a compile error, not a silent no-op.
+#[must_use]
+#[derive(Debug)]
+pub enum R2DrainAttempt {
+    /// The stager and its drain gate were acquired and the drain ran to one of
+    /// the usual stopping points (queue empty, send buffer full, frame/item
+    /// budget spent).
+    Drained(R2DrainOutcome),
+    /// Another drainer held the stager or the gate, and this call did nothing.
+    /// Not to be read as "the queue is empty": the holder is already draining
+    /// and will wake the retry task again if frames remain.
+    Busy,
+}
+
+impl R2DrainAttempt {
+    /// Whether another drainer was already active, so this attempt did nothing.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy)
+    }
+
+    /// Whether this attempt sent everything it could: not [`Self::Busy`] and no
+    /// send failed. The queue itself may still hold frames another producer
+    /// pushed concurrently, so callers pair this with their own emptiness probe.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Drained(outcome) if outcome.failed.is_none())
+    }
+}
+
+/// Non-blocking variant of [`drain_staged`].
+///
+/// The client's stager-retry task runs on the slot's pinned current-thread
+/// runtime, which is also the QUIC endpoint driver for every connection on that
+/// slot: a blocking `lock()` there can stall the driver (and with it the
+/// slot's ingress and egress) behind an association that is merely pushing. So
+/// this variant `try_lock`s and reports [`R2DrainAttempt::Busy`] instead of
+/// waiting. The drainer it lost to is already making progress, and whoever
+/// owns that drainer must re-notify when frames are left over — the client's
+/// `ConnRev2::drain_stage` does exactly that.
+///
+/// The requeue after a failed send still takes a short blocking hold: it is the
+/// only way to keep the unsent tail, and at that point the drain gate is
+/// already ours, so only producers contend for it and each holds it for a
+/// couple of instructions.
+pub fn try_drain_staged(
+    conn: &Connection,
+    stage: &parking_lot::Mutex<R2Stager>,
+    limit: usize,
+    on_requeue_overflow: impl FnMut(Option<(u32, Option<u32>)>),
+) -> R2DrainAttempt {
+    match drain_staged_inner(conn, stage, limit, true, on_requeue_overflow) {
+        Some(outcome) => R2DrainAttempt::Drained(outcome),
+        None => R2DrainAttempt::Busy,
+    }
+}
+
+/// Lock the stager, or give up when `try_only` and it is contended.
+fn stage_lock<'a>(
+    stage: &'a parking_lot::Mutex<R2Stager>,
+    try_only: bool,
+) -> Option<parking_lot::MutexGuard<'a, R2Stager>> {
+    if try_only {
+        stage.try_lock()
+    } else {
+        Some(stage.lock())
+    }
+}
+
+/// Shared drain body; `None` means a `try_only` attempt gave up with no work
+/// done (and must therefore not be reported as a completed drain).
+fn drain_staged_inner(
+    conn: &Connection,
+    stage: &parking_lot::Mutex<R2Stager>,
+    limit: usize,
+    try_only: bool,
+    mut on_requeue_overflow: impl FnMut(Option<(u32, Option<u32>)>),
+) -> Option<R2DrainOutcome> {
     let mut total = R2DrainOutcome::default();
     let mut q = PackedFrames::default();
     // Serialize the whole drain: claim order and wire order must agree when
     // two drainers (an association burst-end and the connection retry task)
     // race on the same stager. Both used to claim under the stager lock but
     // send outside it, so the second claim could overtake the first send.
-    let drain_gate = stage.lock().drain_gate.clone();
-    let _drain_guard = drain_gate.lock();
+    let drain_gate = stage_lock(stage, try_only)?.drain_gate.clone();
+    let _drain_guard = if try_only {
+        drain_gate.try_lock()?
+    } else {
+        drain_gate.lock()
+    };
     let mut handled = 0usize;
+    // Whether this attempt got past the gate and actually touched the queue.
+    // A `try_only` attempt that never did must report `Busy`, not `Drained`.
+    let mut progress = false;
     loop {
-        if stage.lock().is_empty() {
+        let empty = match stage_lock(stage, try_only) {
+            Some(st) => st.is_empty(),
+            None => return if progress { Some(total) } else { None },
+        };
+        if empty {
             break;
         }
         if conn.datagram_send_buffer_space() == 0 {
@@ -1324,7 +1429,10 @@ pub fn drain_staged(
             break;
         }
         let more = {
-            let mut st = stage.lock();
+            let mut st = match stage_lock(stage, try_only) {
+                Some(st) => st,
+                None => return if progress { Some(total) } else { None },
+            };
             if st.is_empty() {
                 false
             } else {
@@ -1334,6 +1442,7 @@ pub fn drain_staged(
                 // this is also the loop's progress bound (including items
                 // dropped as too large, which never enter `q`).
                 handled = handled.saturating_add(before.saturating_sub(st.len()));
+                progress = true;
                 more
             }
         };
@@ -1363,7 +1472,7 @@ pub fn drain_staged(
             break;
         }
     }
-    total
+    Some(total)
 }
 
 #[cfg(test)]

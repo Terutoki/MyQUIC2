@@ -561,16 +561,16 @@ pub(crate) fn drain_stage(
 ///
 /// [`StageDrain::Ok`] conflates "everything sent" with "buffer full, the rest
 /// stayed queued" (backpressure is not a fault, see [`stage_verdict`]). A
-/// session reader uses this one-lock probe at its burst boundary to arm the
-/// short retry timer ([`STAGE_RETRY_MS`]) only when frames are actually
-/// stranded; an idle connection whose stager is empty never arms it, so steady
-/// state pays nothing.
+/// session reader uses this one-lock probe at its burst boundary to decide
+/// whether to wake the connection's retry task ([`R2ConnState::notify_stage_retry`]);
+/// that task re-probes after every drain, so a connection whose stager is empty
+/// never runs a timer at all.
 pub(crate) fn stage_has_backlog(stage: &Arc<parking_lot::Mutex<R2Stager>>) -> bool {
     !stage.lock().is_empty()
 }
 
-/// How long a session reader waits before retrying a drain that left frames
-/// queued because the DATAGRAM send buffer was full.
+/// How long the connection's retry task waits before retrying a drain that left
+/// frames queued because the DATAGRAM send buffer was full.
 ///
 /// Such a drain returns `StageDrain::Ok` and keeps the remaining items queued;
 /// the only other trigger to drain is the end of some session's reply burst.
@@ -578,8 +578,8 @@ pub(crate) fn stage_has_backlog(stage: &Arc<parking_lot::Mutex<R2Stager>>) -> bo
 /// session — therefore used to sit in the stager until connection close and was
 /// then dropped (accounted only by the stager's own teardown path). Five
 /// milliseconds bounds the tail's added latency well inside one app-visible
-/// RTT — and inside a DNS retry or a game tick — while costing ten wakeups per
-/// second and *only* while frames are queued.
+/// RTT — and inside a DNS retry or a game tick. It is a *connection-wide*
+/// cadence, not a per-session one: see [`R2ConnState::spawn_stage_retry`].
 pub(crate) const STAGE_RETRY_MS: u64 = 5;
 
 /// One session reader's batch of small replies, pushed at its burst boundary.
@@ -1640,32 +1640,19 @@ pub(crate) async fn sess_reader_task(
     // stager with one lock hold at the burst boundary (or before an immediate
     // standalone send inside `handle_session_reply`).
     let mut batch = StageBatch::new(stage.clone());
-    // Retry timer for a drain that left frames queued on a full DATAGRAM send
-    // buffer (see `stage_has_backlog`/`STAGE_RETRY_MS`). The first `tick()`
-    // consumes the interval's immediate first fire; from then on the arm only
-    // exists while `stage_backlog` is true, so a connection with nothing queued
-    // polls no timer at all.
-    let mut stage_retry = tokio::time::interval(Duration::from_millis(STAGE_RETRY_MS));
-    stage_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    stage_retry.tick().await;
-    let mut stage_backlog = false;
+    // A drain that leaves frames queued behind a full DATAGRAM send buffer gets
+    // no timer of its own: the stager is connection-wide, so the burst boundary
+    // below wakes the connection's single retry task instead
+    // (`R2ConnState::notify_stage_retry`). A per-session timer here would arm
+    // one wakeup per session per `STAGE_RETRY_MS` — thousands of them on a busy
+    // connection — all queued behind the same stager gate for a queue only
+    // quinn's driver can unblock.
     'session: loop {
         let (n, src) = tokio::select! {
             r = rs.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(_) => break,
             },
-            _ = stage_retry.tick(), if stage_backlog => {
-                // Backpressure cleared our earlier drain: retry now. Terminal
-                // keeps the reader's flush-and-exit contract; on success the
-                // queue is empty and the arm disappears again.
-                match drain_stage(&c2, &stage, &mut limit, &mut last_too_large_probe_ms) {
-                    StageDrain::Terminal => break 'session,
-                    StageDrain::Ok | StageDrain::TooLarge => {}
-                }
-                stage_backlog = stage_has_backlog(&stage);
-                continue;
-            }
             _ = tick.tick() => {
                 if c2.close_reason().is_some()
                     || mono_millis()
@@ -1809,11 +1796,15 @@ pub(crate) async fn sess_reader_task(
         if batch.flush(&c2, &mut limit, &mut last_too_large_probe_ms) == StageDrain::Terminal {
             break 'session;
         }
-        // A `Blocked` verdict left the remaining items queued; arm the retry
-        // timer so a quiet tail cannot wait for another session's burst (or
-        // connection close). One stager-lock probe per burst, and the timer is
-        // disarmed as soon as the queue is empty.
-        stage_backlog = stage_has_backlog(&stage);
+        // A `Blocked` verdict left the remaining items queued: wake the
+        // connection's retry task so a quiet tail cannot wait for another
+        // session's burst (or connection close). One stager-lock probe per
+        // burst; every session's notify collapses into the same task.
+        if stage_has_backlog(&stage)
+            && let Some(state) = r2.conn.as_ref()
+        {
+            state.notify_stage_retry();
+        }
         record_drain_batch(drained);
     }
     // Every exit above breaks to here, so the buffer is recycled exactly once

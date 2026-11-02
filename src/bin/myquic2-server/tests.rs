@@ -8923,13 +8923,16 @@ async fn unknown_sess_close_does_not_touch_a_live_sessions_bindings() {
 
 /// LOGIC-5: the stager retry trigger is "frames are still queued after a
 /// drain". The probe is false for an empty stager, true while frames are
-/// queued, and false again once a drain empties it — so the session reader's
-/// retry timer exists only while a quiet tail is actually stranded.
+/// queued, and false again once a drain empties it — so the connection's retry
+/// task is only woken while a quiet tail is actually stranded.
 #[tokio::test]
 async fn stage_backlog_probe_arms_only_while_frames_are_queued() {
     let (client_conn, server_conn) = stream_test_pair().await;
     let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
-    assert!(!stage_has_backlog(&stage), "an empty stager arms nothing");
+    assert!(
+        !stage_has_backlog(&stage),
+        "an empty stager needs no wakeup"
+    );
     for i in 0..2u32 {
         stage
             .lock()
@@ -8944,7 +8947,7 @@ async fn stage_backlog_probe_arms_only_while_frames_are_queued() {
     }
     assert!(
         stage_has_backlog(&stage),
-        "queued frames are what arms the retry timer"
+        "queued frames are what wake the retry task"
     );
     let mut limit = server_conn.max_datagram_size().unwrap_or(0);
     let mut probe = 0u64;
@@ -8954,8 +8957,57 @@ async fn stage_backlog_probe_arms_only_while_frames_are_queued() {
     );
     assert!(
         !stage_has_backlog(&stage),
-        "an emptied stager disarms the retry timer"
+        "an emptied stager leaves the retry task nothing to do"
     );
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// Push one small steady payload into `stage`, as a session reader would.
+fn push_tail(stage: &Arc<parking_lot::Mutex<R2Stager>>, wire_id: u32) {
+    stage
+        .lock()
+        .push(R2StageItem {
+            session: 7,
+            kind: R2StageKind::Steady {
+                wire_id: r2::make_wire_id(wire_id, false).unwrap(),
+            },
+            payload: Bytes::from_static(b"tail"),
+        })
+        .expect("a fresh stager has room");
+}
+
+/// Wait for the connection's retry task to empty `stage` on its own.
+async fn drained_within(stage: &Arc<parking_lot::Mutex<R2Stager>>, round: u32) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while stage_has_backlog(stage) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("round {round}: the retry task left the backlog queued"));
+}
+
+/// LOGIC-5 (connection half): the single per-connection retry task drains the
+/// shared stager on a notify and stays alive for the next backlog — the
+/// property that replaced one 5 ms timer per session. The first wakeup lands
+/// before the task is spawned, which pins `Notify`'s stored permit: a
+/// lost-permit bug would strand that tail until the next push.
+#[tokio::test]
+async fn the_connection_retry_task_drains_each_notified_backlog() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let state = R2ConnState::new_with_wire(Wire::Rev2);
+    let stage = state.stage.clone();
+    push_tail(&stage, 1);
+    assert!(stage_has_backlog(&stage), "premise: frames are queued");
+    state.notify_stage_retry();
+    state.spawn_stage_retry(server_conn.clone());
+    drained_within(&stage, 0).await;
+    // Round two proves the task outlives the drain that emptied the queue.
+    push_tail(&stage, 2);
+    assert!(stage_has_backlog(&stage), "premise: frames are queued");
+    state.notify_stage_retry();
+    drained_within(&stage, 1).await;
     client_conn.close(0u32.into(), b"done");
     server_conn.close(0u32.into(), b"done");
 }

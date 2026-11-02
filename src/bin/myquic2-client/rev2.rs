@@ -41,7 +41,8 @@ use myquic2::mqp::r3::CtlMessage;
 use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::r2_frag::R2FragFlow;
 use myquic2::udp::{
-    R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
+    R2DrainAttempt, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
+    try_drain_staged,
 };
 use std::collections::VecDeque;
 
@@ -478,12 +479,11 @@ impl ConnRev2 {
     /// queue is empty, the item budget for one call is spent, or a send fails.
     /// On a failure the unsent tail is requeued behind a fresh hold, so a full
     /// send buffer can never make every subsequent payload re-encode the whole
-    /// queue. Packing is serialised by the stager lock, but the send phase is
-    /// not: two concurrent associations drain disjoint batches, and their
-    /// DATAGRAMs can interleave on the wire (a later-packed batch may be sent
-    /// first). That is inside the UDP / MQP-3 contract — every frame is
-    /// self-describing and FRAG reassembly is keyed by index — and it is the
-    /// price of keeping quinn sends outside the stager lock.
+    /// queue. Claim and send are serialised per connection by the stager's
+    /// drain gate (see `r2_stage::drain_staged`): two drainers — this path and
+    /// the connection retry task — must not reorder each other's frames, since a
+    /// later claim overtaking an earlier send would reorder one association's
+    /// FIFO.
     pub(crate) fn drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainOutcome {
         let outcome = drain_staged(conn, &self.stager, limit, |at| {
             counters::stage_full();
@@ -499,15 +499,46 @@ impl ConnRev2 {
         outcome
     }
 
+    /// Non-blocking drain for the retry task (see [`Self::spawn_stage_retry`]).
+    ///
+    /// This path runs on the slot's pinned current-thread runtime, which the
+    /// slot's QUIC endpoint driver also runs on, so it must never block:
+    /// contention is reported as [`R2DrainAttempt::Busy`] and retried on the
+    /// next cadence. Accounting is the same as [`Self::drain_stage`]'s.
+    pub(crate) fn try_drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainAttempt {
+        try_drain_staged(conn, &self.stager, limit, |at| {
+            counters::stage_full();
+            let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+            warn_stage_full(n, at);
+        })
+    }
+
+    /// Whether the stager is known to be empty, without blocking.
+    ///
+    /// `false` for a contended stager: a producer holds it for a couple of
+    /// instructions, and "unknown" must not be read as "drained" by the retry
+    /// task.
+    pub(crate) fn stage_known_empty(&self) -> bool {
+        matches!(self.stager.try_lock().as_deref(), Some(st) if st.is_empty())
+    }
+
     /// Spawn the connection's stager-retry task.
     ///
-    /// Association burst-ends call [`Self::drain_stage`] on their own path; if
-    /// that drain leaves payloads queued, this task retries every
-    /// [`STAGE_RETRY_DELAY`] until the queue is empty. It is per connection
-    /// (not per association) because the stager is shared, and it exits with
-    /// `conn`. Without it, a one-shot DNS query that hit a full send buffer had
-    /// to wait for the next uplink packet, which for a request/response flow
-    /// may never come.
+    /// Association burst-ends drain on their own path; a drain that leaves
+    /// payloads queued wakes this task instead of waiting for the next app
+    /// packet ([`Self::drain_stage`] notifies). It is per connection (not per
+    /// association) because the stager is shared, and it exits with `conn`.
+    /// Without it, a one-shot DNS query that hit a full send buffer had to wait
+    /// for the next uplink packet, which for a request/response flow may never
+    /// come.
+    ///
+    /// The task drains *before* it sleeps: the wakeup already proves frames are
+    /// queued, and the common case — the send buffer had space again by the
+    /// time the wakeup ran — is then served without the old unconditional
+    /// [`STAGE_RETRY_DELAY`] of added latency. It drains with
+    /// [`Self::try_drain_stage`] and probes emptiness with
+    /// [`Self::stage_known_empty`], never with a blocking lock: this task
+    /// shares its thread with the endpoint driver.
     pub(crate) fn spawn_stage_retry(self: &Arc<Self>, conn: quinn::Connection) {
         let rev2 = Arc::clone(self);
         tokio::spawn(async move {
@@ -517,10 +548,6 @@ impl ConnRev2 {
                     _ = rev2.stage_retry.notified() => {}
                 }
                 loop {
-                    tokio::select! {
-                        _ = conn.closed() => return,
-                        _ = tokio::time::sleep(STAGE_RETRY_DELAY) => {}
-                    }
                     let Some(limit) = conn.max_datagram_size() else {
                         // None means the peer never negotiated DATAGRAM, so no
                         // retry can ever send. Account the queued payloads as
@@ -529,10 +556,19 @@ impl ConnRev2 {
                         return;
                     };
                     let limit = rev2.frame_limit(limit);
-                    counters::stage_retry();
-                    let _ = rev2.drain_stage(&conn, limit);
-                    if rev2.stage_len() == 0 {
+                    let attempt = rev2.try_drain_stage(&conn, limit);
+                    if !attempt.is_busy() {
+                        counters::stage_retry();
+                    }
+                    if attempt.is_complete() && rev2.stage_known_empty() {
                         break;
+                    }
+                    // Still backpressured, or another drainer holds the gate:
+                    // the blocked send buffer is the only reason to wait, and
+                    // the cadence below is a recovery tail, not the steady path.
+                    tokio::select! {
+                        _ = conn.closed() => return,
+                        _ = tokio::time::sleep(STAGE_RETRY_DELAY) => {}
                     }
                 }
             }
