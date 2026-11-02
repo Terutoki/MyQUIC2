@@ -308,12 +308,21 @@ impl DnsGate {
             }
         }
         let mut inner = self.inner.lock();
-        if let Some(e) = inner
+        // A live `InFlight` claim outranks a live verdict: the resolution is
+        // running right now, and a stale `Unusable` copy must not shadow it.
+        let hit = inner
             .entries
             .iter()
             .flatten()
-            .find(|e| e.key == key && e.deadline > now_ms)
-        {
+            .find(|e| e.key == key && e.deadline > now_ms && e.state == GateState::InFlight)
+            .or_else(|| {
+                inner
+                    .entries
+                    .iter()
+                    .flatten()
+                    .find(|e| e.key == key && e.deadline > now_ms)
+            });
+        if let Some(e) = hit {
             // Refresh the hint with the authoritative verdict (this claim
             // already paid the lock; the followers do not have to).
             self.publish_hot(key, e.state, e.deadline);
@@ -432,12 +441,10 @@ impl DnsGate {
         for _ in 0..parked_lost {
             dgram_drops::bump(&dgram_drops::REFUSED);
         }
-        if let Some(slot) = inner
-            .entries
-            .iter_mut()
-            .find(|e| e.as_ref().is_some_and(|x| x.key == key))
-            && slot.as_ref().is_some_and(|e| e.generation == generation)
-        {
+        if let Some(slot) = inner.entries.iter_mut().find(|e| {
+            e.as_ref()
+                .is_some_and(|x| x.key == key && x.generation == generation)
+        }) {
             if let Some(ttl) = unusable {
                 let deadline = now.saturating_add(gate_ttl_ms(ttl));
                 *slot = Some(GateEntry {
@@ -460,6 +467,19 @@ impl DnsGate {
             // The claim was evicted (or its backstop expired and the slot was
             // reused) while the waiter ran: still publish the verdict, in the
             // first free/expired slot, so the next datagrams can refuse inline.
+            //
+            // Unless a newer claim for the same key owns the name now: its own
+            // `finish` publishes the authoritative verdict, and a copy placed in
+            // a lower slot would shadow that claim's live `InFlight` in
+            // `claim`'s scan — refusing datagrams for a name being resolved.
+            if inner
+                .entries
+                .iter()
+                .flatten()
+                .any(|x| x.key == key && x.deadline > now)
+            {
+                return;
+            }
             if let Some(slot) = inner
                 .entries
                 .iter_mut()
@@ -652,12 +672,20 @@ pub(crate) fn resolve_forward_target(
             }
         }
     };
-    if allow_private || is_global_ip_cached(addrs.0.ip()) {
+    if (allow_private || is_global_ip_cached(addrs.0.ip())) && !is_unreachable(addrs.0) {
         ForwardResolution::Addr(addrs.0, addrs.1)
     } else {
-        // The session memo only ever stores filtered-passing addresses, so this
-        // is unreachable in practice; fail closed through the slow path (which
-        // scans the full set for a usable record) rather than serve it.
+        // Two ways to get here, both of which must spawn rather than serve:
+        // a filtered address (the session memo only ever stores
+        // filtered-passing ones, so this is unreachable in practice), or an
+        // address the kernel called unroutable. The second is the common one
+        // now: the session memo still holds the resolution's first record, so
+        // without this check the *same* condemned address would come straight
+        // back out of the memo, the send would fail again, and nothing would
+        // ever spawn the waiter that walks the rest of the answer. Falling
+        // through to `Unresolved` is what recovers the name — the waiter
+        // re-sends the record set, condemns the first address again (index 0 is
+        // always tried) and stores the one that worked in the session memo.
         ForwardResolution::Unresolved
     }
 }
@@ -740,16 +768,23 @@ pub(crate) async fn forward_server_dgram(
                             if let Err((kind, _)) = udp_try_send_or_return(&sock, mapped, payload)
                                 && is_routing_error(kind)
                             {
-                                // No route to the pinned address. Marking it is
-                                // enough: the next datagram for this target
-                                // treats a recently unroutable address as a miss
-                                // in `resolve_forward_target`, the waiter that
-                                // follows walks the rest of the answer, and the
-                                // address that works is stored in the session
-                                // memo. Retrying here would need the record set —
-                                // one cache await on a path that is otherwise
-                                // syscall-only — to save a single datagram.
+                                // No route to the memoized address. Marking it
+                                // makes the next datagram a miss in
+                                // `resolve_forward_target` (see the
+                                // `is_unreachable` check there): the waiter that
+                                // follows walks the rest of the answer and stores
+                                // the address that works in the session memo.
+                                //
+                                // The `None` matters as much as the mark: this
+                                // return value is what arms the fast table
+                                // (`arm_fast_with_target`), and a pinned address
+                                // is served by `resolve_fast` without consulting
+                                // the verdict at all — the datagram was dropped, so
+                                // pinning the address it failed to reach would
+                                // black-hole the flow for the pin's whole life
+                                // instead of recovering it on the next packet.
                                 mark_unreachable(dst);
+                                return None;
                             }
                         }
                     }
@@ -843,7 +878,7 @@ pub(crate) async fn forward_server_dgram(
                     // a packet the application had to retransmit.
                     let parked = task_ss.dns_gate.take_parked(s, &host, p, generation);
                     for payload in parked {
-                        let _ = deliver_resolved_server_dgram(
+                        let outcome = deliver_resolved_server_dgram(
                             &task_ss,
                             &cd,
                             conn_id,
@@ -856,7 +891,13 @@ pub(crate) async fn forward_server_dgram(
                             None,
                         )
                         .await;
-                        myquic2::dns::stats::parked_delivered();
+                        // Only a datagram that actually left is delivered: the
+                        // `Some` outcome (filtered / refused) already booked a
+                        // `REFUSED` drop inside, and counting it twice would
+                        // report a delivery that did not happen.
+                        if outcome.is_none() {
+                            myquic2::dns::stats::parked_delivered();
+                        }
                     }
                 }
                 // Success or a name-level failure: always complete the claim, or
@@ -1008,14 +1049,18 @@ pub(crate) async fn deliver_resolved_server_dgram(
                 }
             }
         }
-        let target = sent_to.unwrap_or(preferred);
-        remember_dst(ss, s, target);
-        if target != preferred {
-            // The preferred address could not be reached and a later one worked.
-            // Store it where the next datagram looks: the preference list has
-            // proven wrong for this host, so the session memo — and the pin
-            // armed from it — must not keep choosing the dead address.
-            sess_dest_store(ss, s, host, port, target, remaining_ms);
+        if let Some(sent) = sent_to {
+            // Only an address a datagram actually went to may enter the reply
+            // allowlist: `remember_dst` widens what the reverse table accepts,
+            // and every candidate failing is a datagram that was never sent.
+            remember_dst(ss, s, sent);
+            if sent != preferred {
+                // The preferred address could not be reached and a later one worked.
+                // Store it where the next datagram looks: the preference list
+                // has proven wrong for this host, so the session memo — and the
+                // pin armed from it — must not keep choosing the dead address.
+                sess_dest_store(ss, s, host, port, sent, remaining_ms);
+            }
         }
     }
     None

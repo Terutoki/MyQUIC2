@@ -3724,6 +3724,39 @@ fn a_routing_failure_condemns_only_that_address() {
     );
 }
 
+/// A routing verdict must reach the cache lookups, not only the send: a
+/// memoized address nothing can reach has to miss, so the slow path spawns the
+/// waiter that walks the rest of the answer and stores a working record.
+#[tokio::test]
+async fn a_condemned_memo_address_returns_to_the_slow_path() {
+    let host = "condemned-memo.test";
+    let port = 19802u16;
+    let addr: SocketAddr = "93.184.216.34:19802".parse().unwrap();
+    dns_cache_seed(host, port, addr).await;
+    let (ss, _sock) = sess_with_dest(None);
+    assert!(
+        matches!(
+            resolve_forward_target(&ss, 7, host, port, false),
+            ForwardResolution::Addr(a, _) if a == addr
+        ),
+        "premise: a reachable memoized answer is served"
+    );
+    mark_unreachable(addr);
+    assert_eq!(
+        resolve_forward_target(&ss, 7, host, port, false),
+        ForwardResolution::Unresolved,
+        "a condemned address must miss instead of being handed to the pin"
+    );
+    // The session memo stored the first record too; the verdict has to apply to
+    // that fallback as well, or it would hand the dead address straight back.
+    sess_dest_store(&ss, 7, host, port, addr, DNS_CACHE_TTL_MS);
+    assert_eq!(
+        resolve_forward_target(&ss, 7, host, port, false),
+        ForwardResolution::Unresolved,
+        "the session-memo fallback must apply the same verdict"
+    );
+}
+
 /// The filtered-verdict window is bounded by the answer's own life, and capped
 /// so one filtered name cannot hold a gate slot for an unbounded time.
 #[tokio::test]
@@ -3842,6 +3875,67 @@ fn dns_gate_park_bounds_and_generation_ownership() {
         "a refused name has no answer to wait for"
     );
     let _ = token;
+}
+
+/// A verdict published for a claim whose slot was evicted must not shadow a
+/// newer live claim for the same name: `claim` would otherwise refuse a name
+/// that is being resolved right now.
+#[test]
+fn a_stale_verdict_cannot_shadow_a_newer_live_claim() {
+    let gate = DnsGate::new();
+    let (s, host, port) = (34u32, "shadowed.test", 443u16);
+    let t0 = 1_000u64;
+    let evicted = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    // Seven fillers occupy slots 1..=7; the ninth claim finds every slot live
+    // and overwrites slot 0 round-robin, evicting the name's own claim.
+    let mut tokens = Vec::new();
+    for i in 0..7 {
+        let filler = format!("filler-{i}.test");
+        tokens.push(match gate.claim(35, &filler, port, t0) {
+            GateClaim::Proceed(token) => token,
+            other => panic!("a cold key must be admitted, got {other:?}"),
+        });
+    }
+    let ejected = match gate.claim(36, "ejected.test", port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    assert!(
+        gate.probe_for_test(s, host, port, t0).is_none(),
+        "premise: the name's claim was evicted"
+    );
+    // Free slot 1, so the name's next claim lands *above* slot 0 — that is the
+    // layout a stale verdict needs to be able to shadow it.
+    gate.finish(35, "filler-0.test", port, tokens[0], None, t0);
+    let live = match gate.claim(s, host, port, t0) {
+        GateClaim::Proceed(token) => token,
+        other => panic!("a cold key must be admitted, got {other:?}"),
+    };
+    // Free slot 0: the first free slot a stray verdict would land in.
+    gate.finish(36, "ejected.test", port, ejected, None, t0);
+    // The evicted claim's waiter now publishes its own verdict. A newer claim
+    // for the same name is live, so its verdict must not be published.
+    gate.finish(
+        s,
+        host,
+        port,
+        evicted,
+        Some(Duration::from_millis(10_000)),
+        t0,
+    );
+    assert_eq!(
+        gate.probe_for_test(s, host, port, t0),
+        Some(false),
+        "the live claim still reads as in flight, not as a verdict"
+    );
+    assert!(
+        matches!(gate.claim(s, host, port, t0), GateClaim::InFlight),
+        "a datagram arriving now parks behind the live claim instead of being refused"
+    );
+    gate.finish(s, host, port, live, None, t0);
 }
 
 /// The gate's refusal window follows the failure's own class, so it no longer

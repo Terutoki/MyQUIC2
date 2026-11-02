@@ -656,7 +656,7 @@ const DNS_WAITER_STRUCT_BYTES: u64 = 512;
 /// `DNS_GATE_PARK_BYTES` in `bin/myquic2-server/forward.rs`. It is charged here
 /// with the waiter because that is the object holding it: when the waiter
 /// finishes, the set is either delivered or counted as dropped.
-const DNS_WAITER_PARK_BYTES: u64 = 8 * 1024;
+pub(crate) const DNS_WAITER_PARK_BYTES: u64 = 8 * 1024;
 
 /// Worst-case resolver-waiter state the DNS slow path can hold.
 ///

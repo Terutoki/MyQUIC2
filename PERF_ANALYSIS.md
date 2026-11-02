@@ -2056,3 +2056,98 @@ disagree about one address for that window — it only costs a datagram. The
 deferred structural items are unchanged: the rev4 client address hint on the wire
 (split-horizon needs a fallback design) and UDP happy-eyeballs without feedback,
 which §18.1's feedback partially supersedes.
+
+## 19. Review of the twelfth batch: a verdict that never reached the pin (2026-11-02, post-8498957)
+
+### 19.1 The routing verdict never reached the fast path
+
+The batch's first item gave `sendto` a memory: a routing error condemns the
+address for ten seconds, and the next datagram to the same name skips it. The
+review found that in the case the feature exists for — the answer already in a
+memo, so no resolution step runs — the verdict was recorded and then thrown
+away twice over.
+
+First, the cached-`Addr` arm of `forward_server_dgram` marked the address and
+still returned `Some((dst, life))`. That return value is what the slow path
+hands to `arm_fast_with_target`, which pins `(name, address)` in the
+connection's fast table; the steady-state fast path serves a pin without
+consulting the routing hint. So a condemned address went on being pinned for the
+rest of its life — up to `DNS_CACHE_TTL_MS`, two minutes — and the recovery the
+commit message describes could not start either: the waiter that walks the rest
+of the answer is only spawned on a slow-path *miss*, and the fast path never
+missed. One datagram paid for the failed `sendto`; every following one was
+black-holed.
+
+Second, the session-destination memo handed the condemned address straight back.
+`resolve_forward_target` falls through to `sess_dest_lookup_ttl` when the
+thread's own memo cannot answer — and that memo was seeded with the resolution's
+first record, the very address the send had just failed to reach. The final
+policy gate checked the private/global rule but not the verdict, so the function
+returned `Addr(dead)` again and again: never `Unresolved`, never a waiter, one
+failed syscall per datagram until the memo's life ran out.
+
+The fixes are one condition and one `return`: the gate now reads
+`(allow_private || is_global_ip_cached(..)) && !is_unreachable(..)`, and the
+cached arm returns `None` on a routing error instead of `Some((dst, life))`. The
+second half matters as much as the mark — a value that arms the pin is a promise
+that the address works.
+
+### 19.2 Two accounting slips
+
+A parked follower was delivered through `deliver_resolved_server_dgram` and its
+outcome discarded, then counted as delivered unconditionally. The `Some`
+outcome means the datagram was *not* sent (filtered, or refused by the DNS
+gate), and that path already books a `REFUSED` drop inside — so one datagram was
+counted both as refused and as delivered. The bump now happens only for the
+`None` outcome.
+
+`remember_dst` was called with `sent_to.unwrap_or(preferred)`, recording the
+preferred address into the session's recent-destination set even when no
+candidate accepted the datagram. That set is what the reply allowlist consults,
+so a datagram that reached nobody widened the reverse allowlist for an address
+the peer was never contacted at. Only the address that took the datagram is
+recorded now, and the session memo is only re-pinned when that address differs
+from the preferred one.
+
+### 19.3 A stale verdict could shadow a live claim
+
+Two defects in the DNS gate's eight-slot array, both reachable only with a
+specific slot layout but deterministic once reached.
+
+`finish` located its entry by key and then compared the generation, so an older
+expired entry for the same name could shadow the claim that was finishing. The
+lookup is now by `(key, generation)`.
+
+Worse, when the claim's entry had been evicted, `finish` published its verdict
+into the first free slot without asking whether a *newer* claim for the same
+name was already live. If that verdict landed in a lower slot, `claim`'s
+in-order scan found it first and refused datagrams for a name that was being
+resolved at that moment — for the verdict's whole window. `finish` now publishes
+nothing when a live entry for the key exists (the newer claim publishes its own
+verdict), and `claim` prefers a live `InFlight` entry over a live verdict even
+when both match. The new test builds the layout by hand — evicted claim, live
+claim one slot above, verdict published for the old generation — and fails
+without the guard.
+
+### 19.4 Verification
+
+`cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test --all-targets` **762 passed / 0 failed / 1 ignored**
+(lib 383, client 202, server 161 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9).
+New tests: `a_condemned_memo_address_returns_to_the_slow_path` (a reachable memo
+answer is served, the same answer misses once condemned, and the session-memo
+fallback applies the same verdict — reverted, the fix fails it with
+`left: Addr(93.184.216.34:19802, 30000)`, `right: Unresolved`) and
+`a_stale_verdict_cannot_shadow_a_newer_live_claim` (the layout above; reverted,
+the live claim reads as a verdict). The lib-side memory assertion now prices
+`DNS_WAITER_PARK_BYTES` instead of a literal.
+
+### 19.5 What this does not establish
+
+The verdict is still per-thread and ten seconds long: a worker that has not sent
+to the address yet tries it once more, paying one failed syscall, and two
+workers can disagree for that window. The failed-candidate path still cannot
+retry a staged burst, so a burst that meets a routing error loses the datagrams
+already grouped — the next datagram re-resolves through the slow path. And
+parking still has no measurement behind it; the `waiter` line's p99 under a
+cold-name burst is what would justify the 8 KiB per claim.

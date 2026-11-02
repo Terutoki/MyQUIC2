@@ -3934,7 +3934,7 @@ mod tests {
         let dns = dns_inflight_memory_bytes();
         assert_eq!(
             dns,
-            1024 * (UDP_RECV_MAX as u64 + 255 + 512 + 8 * 1024),
+            1024 * (UDP_RECV_MAX as u64 + 255 + 512 + crate::config::tuning::DNS_WAITER_PARK_BYTES),
             "1,024 DNS slow-path waiters x (payload + host + task structure + \
              the followers one waiter can park)"
         );
