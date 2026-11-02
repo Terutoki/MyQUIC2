@@ -582,7 +582,11 @@ pub(crate) fn stage_has_backlog(stage: &Arc<parking_lot::Mutex<R2Stager>>) -> bo
 /// cadence, not a per-session one: see [`R2ConnState::spawn_stage_retry`].
 pub(crate) const STAGE_RETRY_MS: u64 = 5;
 
-/// One session reader's batch of small replies, pushed at its burst boundary.
+/// One session reader's batch of replies, pushed at its burst boundary.
+///
+/// The batch normally holds small replies, but a single-frame reply that found
+/// the DATAGRAM buffer full is queued here too (see [`stage_large_reply`]), so
+/// backpressure does not turn into a drop.
 ///
 /// The per-reply push took the connection-wide stager mutex once per reply.
 /// A reader handles up to `LAST_HOP_DRAIN` replies per burst, and the stager
@@ -608,7 +612,7 @@ impl StageBatch {
         &self.stage
     }
 
-    /// Queue one small reply; the next [`Self::flush`] pushes it.
+    /// Queue one reply; the next [`Self::flush`] pushes it.
     fn push(&mut self, item: R2StageItem) {
         self.pending.push(item);
     }
@@ -763,6 +767,50 @@ fn stage_open_src(
     }
 }
 
+/// Queue a large reply that found the DATAGRAM send buffer full.
+///
+/// The stager is the connection's bounded retry queue. A single-frame reply
+/// that fits the path budget but not the current buffer occupancy is an
+/// ordinary backpressure event, not a lost datagram: queue it with the same
+/// item shape the small-reply path uses and let the connection's retry task
+/// drain it when quinn has room. The queue is byte- and item-capped, and a
+/// reply that does not fit is accounted by `StageBatch`'s normal full-queue
+/// drop path.
+///
+/// Only single-frame `Blocked` sends reach this helper. A fragmented send may
+/// have already put part of its frame set on the wire; retrying the whole
+/// payload would duplicate fragments, so those keep their existing drop
+/// accounting.
+pub(crate) fn stage_large_reply(
+    batch: &mut StageBatch,
+    s: u32,
+    r2_match: Option<&SourceMatch>,
+    src: SocketAddr,
+    payload: &[u8],
+) {
+    let kind = match r2_match {
+        Some(SourceMatch::Exact(binding)) => R2StageKind::Steady {
+            wire_id: binding.wire_id,
+        },
+        Some(SourceMatch::Rebind(binding)) => R2StageKind::Open {
+            wire_id: binding.wire_id,
+            sess: s,
+            addr: TargetAddr::Ip(src),
+            src: true,
+        },
+        None => R2StageKind::Inline {
+            sess: s,
+            addr: TargetAddr::Ip(src),
+            src: true,
+        },
+    };
+    batch.push(R2StageItem {
+        session: s,
+        kind,
+        payload: Bytes::copy_from_slice(payload),
+    });
+}
+
 /// Re-read the live path budget under the shared probe throttle.
 fn reprobe_large(c2: &quinn::Connection, limit: &mut usize, last_too_large_probe_ms: &mut u64) {
     let now_probe = mono_millis().max(1);
@@ -777,9 +825,11 @@ fn reprobe_large(c2: &quinn::Connection, limit: &mut usize, last_too_large_probe
 pub(crate) enum R2LargeReply {
     /// Every frame was queued (per-reply payload accounting already done).
     Sent,
-    /// A single-frame send found the DATAGRAM buffer full; the payload is an
-    /// ordinary UDP drop and *nothing has counted it*, so the reader books
-    /// `dgram_drops::BUFFER_FULL` (OBS-1).
+    /// A single-frame send found the DATAGRAM buffer full. Nothing was sent:
+    /// the reader queues the payload in the shared stager and lets the
+    /// connection's retry task send it when the buffer drains. A caller that
+    /// chooses not to queue it must book `dgram_drops::BUFFER_FULL` itself
+    /// (see `large_reply_disposition`).
     Blocked,
     /// A single-frame encoding does not fit the live path budget; the payload is
     /// a drop the reader books as `dgram_drops::TOO_LARGE` and re-probes the
@@ -1514,7 +1564,23 @@ pub(crate) fn handle_session_reply(
         now,
         r2.wire(),
     );
-    match large_reply_disposition(sent, c2, limit, last_too_large_probe_ms) {
+    let disposition = if sent == R2LargeReply::Blocked {
+        // Backpressure, not loss: the reply fits one frame and the path budget,
+        // but the shared DATAGRAM buffer is momentarily full. Queue it in the
+        // stager and flush now. Waiting for the burst boundary would let a
+        // burst of `LAST_HOP_DRAIN` large replies accumulate in this session's
+        // pre-stager batch, multiplying the stager's 256 KiB cap by the burst
+        // size; flushing here keeps the backlog in the connection-wide stager,
+        // which is already bounded and drained by the retry task.
+        stage_large_reply(batch, s, r2_match.as_ref(), src, payload);
+        match batch.flush(c2, limit, last_too_large_probe_ms) {
+            StageDrain::Terminal => ReplyDisposition::BreakSession,
+            StageDrain::Ok | StageDrain::TooLarge => ReplyDisposition::Continue,
+        }
+    } else {
+        large_reply_disposition(sent, c2, limit, last_too_large_probe_ms)
+    };
+    match disposition {
         ReplyDisposition::Continue => {
             // rev3 no-ACK: a fully queued context frame counts toward the K=2
             // window (the fragmenter already learned the source above).
@@ -1532,10 +1598,14 @@ pub(crate) fn handle_session_reply(
 /// Book one large-reply verdict and decide the reader's next move (OBS-1).
 ///
 /// Kept separate from [`handle_session_reply`] so the OBS-1 accounting contract
-/// is unit-testable: a single-frame `Blocked`/`TooLarge` drop is booked here
-/// (nothing else sees it), a fragmented drop is **not** re-booked (the shared
-/// fragmenter accounts its own per-payload drop), and a size verdict re-probes
-/// the live path budget at most once per probe interval.
+/// is unit-testable. Production calls this for every verdict except
+/// [`R2LargeReply::Blocked`]: the reader queues a blocked single-frame reply in
+/// the shared stager (see [`stage_large_reply`]), so it is backpressure rather
+/// than a drop. The `Blocked` arm remains the contract for a caller that
+/// chooses to drop instead: nothing else sees that payload, so it books
+/// `BUFFER_FULL` exactly once. A fragmented drop is **not** re-booked (the
+/// shared fragmenter accounts its own per-payload drop), and a size verdict
+/// re-probes the live path budget at most once per probe interval.
 pub(crate) fn large_reply_disposition(
     sent: R2LargeReply,
     c2: &quinn::Connection,
@@ -1557,11 +1627,9 @@ pub(crate) fn large_reply_disposition(
     };
     match sent {
         R2LargeReply::Sent => {}
-        // The single-frame send was refused by the full DATAGRAM buffer and
-        // nothing else books that drop. Without this counter a saturated
-        // downlink silently loses exactly the replies larger than the staging
-        // threshold, and the only signal ("UDP works for small replies") says
-        // nothing.
+        // A non-queuing caller refused to hold the payload, so it is lost and
+        // nothing else books that drop. (The server reader queues `Blocked`
+        // and never reaches this arm for it — see the function docs.)
         R2LargeReply::Blocked => {
             dgram_drops::bump(&dgram_drops::BUFFER_FULL);
         }

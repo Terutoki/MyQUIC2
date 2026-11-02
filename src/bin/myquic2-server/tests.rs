@@ -8245,6 +8245,42 @@ async fn rev2_stage_preserves_per_session_order_across_drains() {
     server.close(0u32.into(), b"done");
 }
 
+/// A single-frame reply that finds the DATAGRAM buffer full is queued, not
+/// dropped: it keeps the steady-DATA shape of the direct path and waits in the
+/// shared stager for the connection retry task.
+#[tokio::test]
+async fn blocked_large_reply_is_staged_as_steady_data() {
+    let (client, server) = stream_test_pair().await;
+    let src: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, _flows, binding) = rev2_reply_fixture(TargetAddr::Ip(src), Vec::new());
+    remember_dst(&ss, 7, src);
+    let wire_id = binding.wire_id;
+    let matched = SourceMatch::Exact(binding);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut batch = StageBatch::new(stage.clone());
+    // Above BATCH_SMALL_MAX, but still one rev2 DATA frame.
+    let payload = vec![0x5Au8; 900];
+
+    stage_large_reply(&mut batch, 7, Some(&matched), src, &payload);
+    assert_eq!(batch.push_pending(), Ok(1), "the reply fits the queue");
+    assert_eq!(stage.lock().queued_bytes(), payload.len());
+    assert_eq!(stage.lock().len(), 1);
+
+    let mut limit = server.max_datagram_size().unwrap_or(0);
+    let mut probe = 0u64;
+    assert_eq!(
+        drain_stage(&server, &stage, &mut limit, &mut probe),
+        StageDrain::Ok
+    );
+    let frame = r2_read_frame(&client).await;
+    let data = r2::decode_data(&frame).expect("a staged large reply is steady DATA");
+    assert_eq!(data.id, Some(wire_id));
+    assert_eq!(data.payload, payload);
+
+    client.close(0u32.into(), b"done");
+    server.close(0u32.into(), b"done");
+}
+
 /// A full staging queue drops the payload with `BUFFER_FULL` accounting and
 /// never books it as sent or emits a frame.
 #[tokio::test]
@@ -9013,10 +9049,11 @@ async fn the_connection_retry_task_drains_each_notified_backlog() {
 }
 
 /// OBS-1 (server half): a large reply's drop is booked exactly once, in the
-/// class that actually lost it. Single-frame `Blocked`/`TooLarge` verdicts are
-/// booked here (nothing else sees them); a fragmented drop is *not* re-booked
-/// (the shared fragmenter accounts its own per-payload drop); `Terminal` ends
-/// the reader.
+/// class that actually lost it. Production queues `Blocked` instead (see
+/// `blocked_large_reply_is_staged_as_steady_data`); this test pins the fallback
+/// for a non-queuing caller, where nothing else books the payload. A fragmented
+/// drop is *not* re-booked (the shared fragmenter accounts its own per-payload
+/// drop); `Terminal` ends the reader.
 #[tokio::test]
 async fn large_reply_verdict_books_its_drop_once() {
     let (client_conn, server_conn) = stream_test_pair().await;
@@ -9035,7 +9072,7 @@ async fn large_reply_verdict_books_its_drop_once() {
     let d = dgram_drops::snapshot().since(&before);
     assert_eq!(
         d.buffer_full, 1,
-        "a single-frame Blocked large reply is a BUFFER_FULL drop"
+        "a non-queuing Blocked verdict is a BUFFER_FULL drop"
     );
 
     let before = dgram_drops::snapshot();

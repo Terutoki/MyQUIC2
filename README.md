@@ -629,7 +629,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **766 tests** on macOS (lib 383 + client 205 + server 162 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **769 tests** on macOS (lib 384 + client 206 + server 163 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1218,6 +1218,7 @@ The client and server must run the **same revision**. Certificates are generated
 - **Wire:** `wire_rev` (`2` = rev2 rollback, `3` = rev3 default; unset = build default) — both binaries must agree. Both revisions default to the same `h3` ALPN label, so a mismatched pair is not rejected at the handshake; deploy matched binaries, or pin distinct `alpn` labels on both sides for a TLS-level skew gate. See [MQP-3 rev3](#-mqp-3-rev3-wire-default).
 - **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_interactive_conns` (interactive shards, default 2), `udp_egress_conns` (bulk shards, default 2), `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
+- **Interactive routing:** `interactive_ports` pins TCP flows to slot 0 and puts matching UDP destinations on the interactive egress class. Default: SSH 22, DNS 53, NTP 123, RDP 3389, STUN/TURN 3478–3481, VNC 5900.
 - **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Per-listener caps (`max_conns` / `max_sessions`) sit under process-wide forward budgets (`max_forward_conns` / `max_forward_sessions`, both defaulting to 3/4 of the shared SOCKS limit) so forwarding cannot deny the SOCKS endpoint. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
 - **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL` (busy-poll budget for every UDP socket, default 50 µs; `0` disables it. It trades idle CPU for wakeup latency, so set `0` if a core sits at 100% while idle), `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
 
@@ -1225,7 +1226,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **766 tests** on the macOS dev box (lib 383 + client 205 + server 162 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **769 tests** on the macOS dev box (lib 384 + client 206 + server 163 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -2207,7 +2208,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>766 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>769 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB

@@ -95,7 +95,11 @@ quic_conns = 4
 # half the cores on many-core hosts; 1 restores the single bulk connection.
 # Ignored with udp_split = false.
 # udp_egress_conns = 2
-# interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
+# Destination ports pinned to the interactive TCP slot and UDP class (default
+# SSH 22, DNS 53, NTP 123, RDP 3389, STUN/TURN 3478-3481, VNC 5900). TCP flows
+# to these ports use slot 0 instead of a bulk cwnd; UDP destinations here take
+# precedence over udp_bulk_ports and share the interactive shards.
+# interactive_ports = [22, 53, 123, 3389, 3478, 3479, 3480, 3481, 5900]
 # Destination UDP ports always treated as bulk egress, whatever their first
 # packet size (default [51820, 1194] = WireGuard, OpenVPN). Needed because the
 # egress class is fixed by the association's first datagram and a tunnel's

@@ -50,7 +50,10 @@ quic_conns = 4
 # half the cores on many-core hosts; 1 restores the single bulk connection.
 # Ignored with udp_split = false.
 # udp_egress_conns = 2
-# interactive_ports = [53, 123, 3478, 3479, 3480, 3481]
+# Destination ports pinned to the interactive TCP slot and UDP class (default
+# SSH 22, DNS 53, NTP 123, RDP 3389, STUN/TURN 3478-3481, VNC 5900). TCP flows
+# use slot 0; UDP destinations share the interactive shards.
+# interactive_ports = [22, 53, 123, 3389, 3478, 3479, 3480, 3481, 5900]
 # Max concurrent UDP associations (default 4032, clamped 1..=4032). Each
 # association owns a relay socket whose kernel buffer caps dominate its cost
 # (~256 KiB on Linux after the kernel's SO_*BUF doubling) plus an ~8.3 KiB

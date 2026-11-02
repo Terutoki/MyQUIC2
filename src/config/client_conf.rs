@@ -93,6 +93,18 @@ pub struct ClientConf {
     // the only reliable isolation.
     #[serde(default)]
     pub quic_conns: Option<usize>,
+    /// Destination ports pinned to the **interactive** class.
+    ///
+    /// For TCP, every flow to one of these ports uses slot 0, so a probe or
+    /// an interactive session never queues behind bulk traffic on the same
+    /// congestion window. For UDP, the same list takes precedence over
+    /// [`Self::udp_bulk_ports`] and the first-payload size heuristic.
+    ///
+    /// Unset = the shipped latency-sensitive set: SSH (22), DNS (53), NTP
+    /// (123), RDP (3389), STUN/TURN (3478-3481) and VNC (5900). Every TCP port
+    /// listed here shares slot 0's congestion window, and every UDP port shares
+    /// the interactive shard set, so add a port only when its traffic is
+    /// latency-sensitive.
     #[serde(default)]
     pub interactive_ports: Option<Vec<u16>>,
     /// Destination UDP ports that always ride the **bulk** egress class,
@@ -342,10 +354,14 @@ impl ClientConf {
             .clamp(1, MAX_SOCKS_CONNS)
     }
 
+    /// Destination ports pinned to the interactive TCP slot and UDP class.
+    ///
+    /// Defaults cover the common latency probes and remote shells: SSH (22),
+    /// DNS (53), NTP (123), RDP (3389), STUN/TURN (3478-3481) and VNC (5900).
     pub fn interactive_port_list(&self) -> Vec<u16> {
         self.interactive_ports
             .clone()
-            .unwrap_or_else(|| vec![53, 123, 3478, 3479, 3480, 3481])
+            .unwrap_or_else(|| vec![22, 53, 123, 3389, 3478, 3479, 3480, 3481, 5900])
     }
 
     /// Destination ports forced to the bulk egress class regardless of first
@@ -649,6 +665,18 @@ server_cert_file = "server-cert.pem"
              {extra}"
         ))
         .expect("the config with a custom socks_listen must parse")
+    }
+
+    #[test]
+    fn default_interactive_ports_cover_latency_protocols() {
+        let c = parse_ok("");
+        let ports = c.interactive_port_list();
+        for p in [22, 53, 123, 3389, 3478, 3479, 3480, 3481, 5900] {
+            assert!(ports.contains(&p), "port {p} missing from {ports:?}");
+        }
+        // An explicit list still replaces the defaults wholesale.
+        let c = parse_ok("interactive_ports = [443]\n");
+        assert_eq!(c.interactive_port_list(), vec![443]);
     }
 
     #[test]

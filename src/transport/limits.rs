@@ -82,9 +82,11 @@ const _: () = {
 /// client bin); UDP-vs-UDP fairness would need per-session queues that DATAGRAM
 /// semantics deliberately do not provide. What the client does instead is bound
 /// the *time* this buffer can hold: the tuned preset refuses a payload that
-/// would leave more than ten milliseconds of path rate queued
-/// (`ConnRev2::admit_uplink`), so the deep buffer absorbs bursts without turning
-/// into a seconds-long FIFO on a slow link.
+/// would leave more than ten milliseconds of path rate queued, for both staged
+/// payloads (`ConnRev2::admit_uplink`) and one-frame payloads above the staging
+/// threshold (`ConnRev2::admit_standalone`). The deep buffer then absorbs
+/// bursts without turning into a seconds-long FIFO on a slow link. The bulk
+/// preset deliberately keeps the cap off and is bounded by the buffer size.
 pub(crate) const DATAGRAM_BUFFER: usize = 1024 * 1024;
 
 /// Bulk-class DATAGRAM buffer: 2MB absorbs bursts on the bulk UDP/TCP

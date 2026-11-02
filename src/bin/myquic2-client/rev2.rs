@@ -61,7 +61,15 @@ use std::collections::VecDeque;
 /// bottleneck rate and the real bound is nearer twenty milliseconds. That
 /// direction is deliberate — the window is a ceiling on *queueing*, and `srtt`
 /// rising under bufferbloat pulls it back down. `0` disables the cap; the bulk
-/// preset always runs with `0` (see [`ConnRev2::configure_queue_window`]).
+/// preset always runs with `0` (see [`ConnRev2::configure_queue_window`]),
+/// because a bulk flow is throughput-oriented and its DATAGRAM buffer is the
+/// intended burst sink.
+///
+/// The window covers both paths that can put a payload in that buffer: staged
+/// payloads (`stage_or_count`) and standalone payloads above `BATCH_SMALL_MAX`
+/// (`admit_standalone`), whether they fit one frame or need fragmentation.
+/// Without the latter, the largest packets — the ones that fill the buffer
+/// fastest — would bypass the cap entirely.
 pub(crate) const UDP_QUEUE_WINDOW_MS: u32 = 10;
 
 /// Floor for the queue window's byte budget.
@@ -382,8 +390,7 @@ impl ConnRev2 {
     ///
     /// Cost per call is two relaxed loads, the stager probe, and one
     /// `datagram_send_buffer_space()` read — which takes the connection state
-    /// lock. It is meant for the small-payload uplink path (once per payload),
-    /// not per frame.
+    /// lock. It runs once per UDP payload, never per encoded frame.
     ///
     /// `true` when the window is disabled or no rate has been sampled yet.
     #[must_use]
@@ -393,19 +400,9 @@ impl ConnRev2 {
         len: usize,
         batched: usize,
     ) -> bool {
-        let window_ms = self
-            .queue_window_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if window_ms == 0 {
+        let Some(cap) = self.queue_window_cap(conn) else {
             return true;
-        }
-        self.refresh_queue_cap(conn, window_ms);
-        let cap = self
-            .queue_cap_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if cap == 0 {
-            return true;
-        }
+        };
         fits_queue_window(
             cap,
             self.dg_send_bytes
@@ -415,6 +412,52 @@ impl ConnRev2 {
             batched,
             len,
         )
+    }
+
+    /// Queue-window admission for a payload sent through the standalone path.
+    ///
+    /// Payloads above [`BATCH_SMALL_MAX`] do not enter the stager; they are
+    /// encoded and handed to quinn directly (one DATA frame, or the fragmenter
+    /// when they exceed it). They still share the connection's DATAGRAM send
+    /// buffer, so the same ten-millisecond budget must cover them. The caller flushes the burst batch first, so there is no
+    /// pre-stager occupancy (`batched == 0`); the stager's own backlog still
+    /// counts, because those items are waiting for the same buffer.
+    ///
+    /// One exception: a payload larger than the whole window is judged by the
+    /// backlog it would join, not by its own size. A 60 KiB datagram on a slow
+    /// link is one payload, not a backlog, and refusing it would make large UDP
+    /// payloads impossible there. It is admitted while the existing backlog is
+    /// within the window and refused once a previous payload has pushed the
+    /// queue over it.
+    #[must_use]
+    pub(crate) fn admit_standalone(&self, conn: &quinn::Connection, len: usize) -> bool {
+        let Some(cap) = self.queue_window_cap(conn) else {
+            return true;
+        };
+        fits_standalone_window(
+            cap,
+            self.dg_send_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            conn.datagram_send_buffer_space(),
+            self.stager.lock().queued_bytes(),
+            len,
+        )
+    }
+
+    /// Current queue-window byte budget, or `None` while the cap is disabled
+    /// (bulk preset) or no rate has been sampled yet.
+    fn queue_window_cap(&self, conn: &quinn::Connection) -> Option<usize> {
+        let window_ms = self
+            .queue_window_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if window_ms == 0 {
+            return None;
+        }
+        self.refresh_queue_cap(conn, window_ms);
+        let cap = self
+            .queue_cap_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (cap != 0).then_some(cap)
     }
 
     /// Re-sample [`Self::queue_cap_bytes`] from the live path.
@@ -1688,8 +1731,10 @@ pub(crate) fn send_uplink(
         if payload.len() > BATCH_SMALL_MAX {
             let flushed = up.flush_stage(rev2, conn, limit);
             let drained = drain_conn_stage(rev2, conn, limit);
-            return prefer_severe(
-                prefer_severe(flushed, drained),
+            // The window covers one-frame payloads too; without this check the
+            // largest packets bypass it and can sit in the send buffer for a
+            // path-rate fraction far above the intended ten milliseconds.
+            let sent = if rev2.admit_standalone(conn, payload.len()) {
                 send_standalone(
                     conn,
                     limit,
@@ -1700,8 +1745,11 @@ pub(crate) fn send_uplink(
                     frag,
                     rev2.wire(),
                     false,
-                ),
-            );
+                )
+            } else {
+                over_queue_window(rev2)
+            };
+            return prefer_severe(prefer_severe(flushed, drained), sent);
         }
         let item = R2StageItem {
             session: sess,
@@ -1744,8 +1792,7 @@ pub(crate) fn send_uplink(
     // session's earlier small payloads.
     let flushed = up.flush_stage(rev2, conn, limit);
     let drained = drain_conn_stage(rev2, conn, limit);
-    prefer_severe(
-        prefer_severe(flushed, drained),
+    let sent = if rev2.admit_standalone(conn, payload.len()) {
         send_standalone(
             conn,
             limit,
@@ -1756,8 +1803,11 @@ pub(crate) fn send_uplink(
             frag,
             rev2.wire(),
             context,
-        ),
-    )
+        )
+    } else {
+        over_queue_window(rev2)
+    };
+    prefer_severe(prefer_severe(flushed, drained), sent)
 }
 
 /// Whether this payload must carry the binding form for `binding`.
@@ -2050,6 +2100,32 @@ fn fits_queue_window(
         .saturating_add(batched)
         .saturating_add(len)
         <= cap
+}
+
+/// Whether a standalone `len`-byte payload may join a queue whose backlog is
+/// `staged + occupancy`.
+///
+/// Unlike [`fits_queue_window`], a payload larger than the whole time budget is
+/// judged by the *backlog* it would join, not by its own size: a 60 KiB
+/// datagram on a slow link is one payload, not queueing delay, and rejecting it
+/// would make large UDP payloads impossible there. Once the existing backlog is
+/// over budget, the new payload is refused and the backlog waits for the retry
+/// task instead of being deepened.
+#[must_use]
+fn fits_standalone_window(
+    cap: usize,
+    capacity: usize,
+    space: usize,
+    staged: usize,
+    len: usize,
+) -> bool {
+    let occupancy = capacity.saturating_sub(space);
+    let queued = staged.saturating_add(occupancy);
+    if len > cap {
+        queued <= cap
+    } else {
+        queued.saturating_add(len) <= cap
+    }
 }
 
 /// A payload refused by the connection's uplink queue window.
@@ -2701,6 +2777,54 @@ mod tests {
         assert!(fits_queue_window(1000, 1024, 2048, 0, 0, 1000));
         // Saturating math: a corrupt counter refuses rather than wraps around.
         assert!(!fits_queue_window(1000, 1024, 1024, usize::MAX, 0, 1));
+    }
+
+    #[test]
+    fn a_standalone_payload_larger_than_the_window_is_admitted_when_alone() {
+        // One 60 KiB datagram on a slow link: nothing is queued, so it is one
+        // payload, not backlog, and must not be refused by the 8 KiB budget.
+        assert!(fits_standalone_window(
+            8 * 1024,
+            1 << 20,
+            1 << 20,
+            0,
+            60 * 1024
+        ));
+        // A large payload behind a backlog that is still within the window is
+        // admitted too: its own size is not queueing delay.
+        assert!(fits_standalone_window(
+            8 * 1024,
+            1 << 20,
+            (1 << 20) - 4 * 1024,
+            0,
+            60 * 1024
+        ));
+        // A backlog already over the window is the signal to stop, not the
+        // second payload's size.
+        assert!(!fits_standalone_window(
+            8 * 1024,
+            1 << 20,
+            (1 << 20) - 60 * 1024,
+            0,
+            1
+        ));
+        // A normal payload still obeys the ordinary window while queued.
+        assert!(fits_standalone_window(
+            8 * 1024,
+            1 << 20,
+            (1 << 20) - 1024,
+            0,
+            1024
+        ));
+        assert!(!fits_standalone_window(
+            8 * 1024,
+            1 << 20,
+            (1 << 20) - 7 * 1024,
+            0,
+            2 * 1024
+        ));
+        // Saturating math never wraps into an admission.
+        assert!(!fits_standalone_window(1000, 1024, 1024, usize::MAX, 1));
     }
 
     #[test]
