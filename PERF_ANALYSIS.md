@@ -2236,3 +2236,108 @@ Two findings from the same review are still open and deliberately not addressed
 here: `initial_mtu = 1200` starving PMTU discovery on busy connections (§13
 covers the small-datagram ceiling, not this), and the per-connection FIFO's lack
 of inter-flow fairness (P3-9).
+
+## 21. Fourteenth Batch: the queue that held a second of delay (2026-11-02, post-b94f54b)
+
+§20 left two findings open: `initial_mtu = 1200` starving PMTU discovery, and
+the per-connection FIFO's missing time bound (P3-9). This batch takes the second
+one. The first remains open: it is one line of transport configuration, but its
+effect is a packet-count and byte-count change on every path above 1150 B, so it
+wants the A/B from §13 rather than another structural argument.
+
+### 21.1 The bound
+
+One connection's uplink queue was two byte caps with nothing relating them to
+time: the stager (1,024 items / 256 KiB, `r2_stage.rs`) and quinn's DATAGRAM
+send buffer (1 MB tuned, 2 MB bulk, `limits.rs`). Their sum is one FIFO shared
+by every association of the connection, so its worst-case delay is `queue/rate`
+— 5.2 s at 2 Mbps, 1.05 s at 10 Mbps, 105 ms at 100 Mbps, 10 ms at 1 Gbps. On
+the same connection that carries the interactive UDP class (P3-9), a
+misclassified flow or one burst could therefore park a game tick behind a
+second of someone else's data.
+
+The tuned preset now refuses a payload that would leave more than
+`UDP_QUEUE_WINDOW_MS` (10 ms) of *path rate* queued
+(`rev2.rs`: `queue_window_bytes`, `ConnRev2::admit_uplink`,
+`over_queue_window`). The budget is `cwnd / srtt × window`, clamped to
+`UDP_QUEUE_FLOOR_BYTES` (8 KiB)..=`R2_STAGE_MAX_BYTES` (256 KiB) and re-sampled
+at most every 250 ms from `Connection::stats()`. The sample is throttled off the
+per-payload path; the admission check is two relaxed loads, one `queued_bytes()`
+probe and one `datagram_send_buffer_space()` read — and that last one *is* a
+connection-state lock, so a tuned connection now takes the state lock once per
+small payload in addition to the send. At interactive rates (tens to hundreds of
+packets per second) that is a few hundred uncontended acquisitions per second,
+which is invisible; it is not free, though, and if a tuned slot ever carries a
+misclassified high-rate flow the next step should be to cache occupancy in an
+atomic maintained by the drain path (which already reads the space) instead of
+re-reading it per payload. `queue_window_ms == 0` short-circuits before any of
+these.
+
+Two accuracy caveats belong with the formula. First, `cwnd` on the BBR preset
+targets two bandwidth-delay products, so `cwnd / srtt` is roughly **twice** the
+bottleneck rate and the effective window lands near 20 ms rather than 10 ms;
+that direction is safe (a looser cap), and `srtt` inflation under bufferbloat
+tightens it again, which is the behaviour one wants. Second, the accounting below
+is exact *at check time*, not an aggregate bound: each association reads the
+counters once and then, if admitted, flushes a whole train later, so concurrent
+associations can overshoot the cap by about one train each — still inside the
+stager's 256 KiB, and the window is a latency bound, not a memory bound.
+
+The occupancy figure itself is exact: the transport's buffer size is not readable
+back from quinn (only the setter exists), so
+`transport::datagram_send_buffer_bytes(bulk)` lifts the same constant the
+transport was built from through `main` → `spawn_conn_loop`, where the preset is
+already chosen. `space > capacity` saturates to zero occupancy, so a
+mis-plumbed capacity can only make the window looser, never drop a healthy
+queue.
+
+Drop, not hold. The payload is refused at the front and counted as `over_cap`
+(`dgram_drops::OVER_CAP`, printed in the client's 60 s budget line). Holding it
+and retrying would move the same bytes from quinn's buffer into the stager and
+change nothing about the delay; `frames: 0, failed: None` keeps
+`recover_send_outcome` quiet, because this is a policy decision rather than a
+stale egress handle. The bulk preset runs with `0`: its buffer is sized for
+throughput, and nothing latency-critical is supposed to share it.
+
+Scope is deliberate. Only the small-payload path is admitted through the
+window; payloads above `BATCH_SMALL_MAX` take the fragmenter's standalone path,
+which already gates a multi-frame payload on aggregate DATAGRAM space and drops
+it whole rather than queueing frames that cannot reassemble. TCP flows are not
+affected (they run on streams with their own windows), and with `udp_split` off
+the single shared UDP connection is the bulk preset, so no window is armed.
+
+### 21.2 Verification
+
+`cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test --all-targets` **766 passed / 0 failed / 1 ignored** (lib
+383, client 205, server 162 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9). New
+tests: `the_queue_window_follows_the_path_rate` covers the rate shape, both
+clamps, the `0` kill switch and a sub-millisecond RTT sample;
+`a_payload_over_the_window_is_dropped_without_a_failure_verdict` pins that the
+drop books `over_cap` while still reporting `Sent`, i.e. no recovery arm fires;
+`the_window_counts_everything_already_waiting` pins the admission accounting —
+stager backlog plus quinn occupancy plus the pre-stager batch, the saturating
+capacity arithmetic, and the exact-fit boundary.
+
+### 21.3 What this does not establish
+
+There is still no measurement. The mechanism is structural and the numbers above
+are arithmetic from `cwnd` and `srtt`, but the claim that it changes an
+app-visible tail should be checked the same way §17 checked DNS: a shaped uplink
+(2–10 Mbps, 40–80 ms RTT) with one interactive association at 60 pps and a
+bulk-class flow saturating the connection, comparing per-datagram RTT p99 with
+the window at 0 and at 10 ms. What to expect: identical numbers while the path
+is not saturated (the queue never reaches the budget), and a bounded tail
+instead of a growing one when it is.
+
+Two limits are known and accepted. First, the *class* decision is still made
+once per association from the first payload (`pool.udp_class`), and admission
+has no per-flow isolation: the window is one aggregate FIFO, so a flow that
+looks interactive and behaves bulk fills the budget and *its own* next payload is
+most likely the one refused — but a neighbour's payload arriving while the
+budget is spent is refused too. That is the same shared-queue trade as P3-9,
+now with a time bound instead of an unbounded one; it is counted (`over_cap`)
+rather than silent, and a flow that keeps filling the window does see reduced
+throughput. Second, P3-9 itself is untouched: the interactive class still shares
+one connection, and this change bounds the damage of that sharing rather than
+removing it.

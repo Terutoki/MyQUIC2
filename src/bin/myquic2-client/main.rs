@@ -382,8 +382,11 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             // Per-slot transport preset (see `slot_uses_bulk_preset`): only
             // the dedicated bulk UDP class connection gets the coarse bulk
             // preset; the TCP pool and the interactive UDP class keep the
-            // tuned 2/5 ms one.
-            let cfg = if slot_uses_bulk_preset(&pool, i) {
+            // tuned 2/5 ms one. The same flag also selects the uplink queue
+            // window: the tuned preset bounds its queue to ten milliseconds of
+            // path rate, the bulk preset keeps the deep buffer.
+            let bulk = slot_uses_bulk_preset(&pool, i);
+            let cfg = if bulk {
                 ccfg_bulk.clone()
             } else {
                 ccfg_interactive.clone()
@@ -393,6 +396,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
                 pin_core,
                 sock,
                 cfg,
+                bulk,
                 server_str.clone(),
                 c.server_name.clone(),
                 c.auth_token.clone(),
@@ -442,7 +446,8 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             spawn_dispatcher(pool.slot(i), hub.clone());
         }
         for (i, ep) in eps.iter().enumerate() {
-            let cfg = if slot_uses_bulk_preset(&pool, i) {
+            let bulk = slot_uses_bulk_preset(&pool, i);
+            let cfg = if bulk {
                 ccfg_bulk.clone()
             } else {
                 ccfg_interactive.clone()
@@ -458,6 +463,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
                 watchdog_silence,
                 i,
                 egress_shared.clone(),
+                bulk,
             );
         }
         (eps, Vec::new())
@@ -757,6 +763,7 @@ fn spawn_slot_shard(
     pin_core: Option<usize>,
     sock: std::net::UdpSocket,
     cfg: quinn::ClientConfig,
+    bulk: bool,
     server: String,
     server_name: String,
     auth: String,
@@ -820,6 +827,7 @@ fn spawn_slot_shard(
                     watchdog_silence,
                     idx,
                     egress,
+                    bulk,
                 );
                 let _ = ready.send(Ok(()));
                 let _ = shutdown.wait_for(|v| *v).await;

@@ -80,12 +80,34 @@ const _: () = {
 /// latency-sensitive one out of the buffer. Only UDP-vs-TCP isolation is
 /// structural (the client gives UDP its own connection, see `ConnPool` in the
 /// client bin); UDP-vs-UDP fairness would need per-session queues that DATAGRAM
-/// semantics deliberately do not provide.
+/// semantics deliberately do not provide. What the client does instead is bound
+/// the *time* this buffer can hold: the tuned preset refuses a payload that
+/// would leave more than ten milliseconds of path rate queued
+/// (`ConnRev2::admit_uplink`), so the deep buffer absorbs bursts without turning
+/// into a seconds-long FIFO on a slow link.
 pub(crate) const DATAGRAM_BUFFER: usize = 1024 * 1024;
 
 /// Bulk-class DATAGRAM buffer: 2MB absorbs bursts on the bulk UDP/TCP
 /// connections without the 4MB worst case per connection.
 pub(crate) const DATAGRAM_BUFFER_BULK: usize = 2 * 1024 * 1024;
+
+/// Bytes of DATAGRAM send buffer a transport preset is built with.
+///
+/// `bulk` selects the bulk preset exactly as [`build_transport_tuned_class`]
+/// does. QUIC's transport configuration exposes the size as a setter only, so a
+/// caller that needs to turn `Connection::datagram_send_buffer_space()` into an
+/// occupancy figure has to take the same value from here rather than read it
+/// back off the connection.
+///
+/// [`build_transport_tuned_class`]: crate::transport::build_transport_tuned_class
+#[must_use]
+pub fn datagram_send_buffer_bytes(bulk: bool) -> usize {
+    if bulk {
+        DATAGRAM_BUFFER_BULK
+    } else {
+        DATAGRAM_BUFFER
+    }
+}
 
 /// Upper bound for one MQP-2 datagram on the wire: the largest address form
 /// (1 + 1 + 255 + 2) plus the type/session header. Kept as a named constant so

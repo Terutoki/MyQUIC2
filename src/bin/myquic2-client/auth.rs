@@ -61,6 +61,7 @@ pub(crate) fn spawn_conn_loop(
     watchdog_silence: Duration,
     idx: usize,
     egress: std::sync::Arc<super::egress::SharedEgress>,
+    bulk: bool,
 ) {
     tokio::spawn(async move {
         // 0-RTT phase handle of this slot's current generation: `dial_once`
@@ -98,6 +99,16 @@ pub(crate) fn spawn_conn_loop(
                     // the generation they are handed, never a neighbouring
                     // generation's.
                     let rev2 = ConnRev2::new_with_wire(wire);
+                    // The queue window is a property of the transport preset
+                    // the slot dials with: the tuned (interactive/TCP) preset
+                    // bounds its uplink queue to ten milliseconds of path rate,
+                    // the bulk preset keeps the deep buffer it was tuned for.
+                    // Both the window and the buffer size come from the same
+                    // `bulk` flag `main` used to pick `cfg`.
+                    rev2.configure_queue_window(
+                        if bulk { 0 } else { UDP_QUEUE_WINDOW_MS },
+                        myquic2::transport::datagram_send_buffer_bytes(bulk),
+                    );
                     slot.set_rev2(rev2.clone());
                     slot.publish(&conn);
                     // Retry the shared stager when a drain leaves payloads

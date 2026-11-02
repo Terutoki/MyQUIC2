@@ -514,6 +514,8 @@ Backpressure is handled at the sender, not by unbounded queues:
 
 The stager drops the **newest** item when its bound is reached, never the oldest: dropping old data would break per-session FIFO and silently reorder the stream. Every drop is counted by reason, so a full queue is visible rather than silent.
 
+The client also bounds queue **time**, not just bytes. On the tuned (interactive and TCP) preset a payload is admitted only while the bytes already waiting — the connection's stager plus the unsent part of quinn's DATAGRAM send buffer — stay below ten milliseconds of the path's own rate (`cwnd / srtt × 10 ms`, clamped to 8 KiB..256 KiB and re-sampled every 250 ms). `cwnd / srtt` is an upper bound on the rate (about twice it on the BBR preset, so the real bound sits nearer twenty milliseconds), and the window is one shared queue, so a neighbour that fills it can cost this flow a packet as well. Past the budget the newest payload is dropped and counted as `over_cap` instead of being queued: 256 KiB is a second of delay on a 2 Mbps uplink and two milliseconds on a LAN, and a datagram that has waited a second is not worth sending. The bulk preset keeps the deep buffer, because there throughput rather than delay is the point.
+
 ### 12. Resource bounds and admission
 
 Every peer-fillable structure is bounded, and the bounds are part of the protocol contract rather than incidental implementation details.
@@ -528,6 +530,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | Pending DNS opens | 16 | admission gate on the domain slow path |
 | `TRAIN` | 64 items | packer and decoder |
 | Stager | 1,024 items / 256 KiB per connection | enqueue admission |
+| Uplink queue window | 10 ms of path rate, clamped to 8 KiB..256 KiB (tuned preset only) | client admission; the surplus payload is dropped as `over_cap` |
 | Pack batch | 4 frames / 64 items | stager drain |
 | Control-plane queues | 64 messages per direction (`CTL_QUEUE` client, `CTL_IN_QUEUE` server) | bounded on both ends of the reliable stream: an outbound overflow drops the message and counts `ctl_queue_full`, an inbound overflow applies QUIC flow control to the peer instead of buffering it |
 | Reassembly | 2 s / 256 partials / 256 KiB per connection | reassembler sweep (both MQP-2 and the rev2/rev3 plane; the ordering index is pruned, not just the partials) |
@@ -626,7 +629,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **725 tests** on macOS (lib 360 + client 201 + server 148 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **766 tests** on macOS (lib 383 + client 205 + server 162 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1222,7 +1225,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **725 tests** on the macOS dev box (lib 360 + client 201 + server 148 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **766 tests** on the macOS dev box (lib 383 + client 205 + server 162 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -2204,7 +2207,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>725 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>766 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB

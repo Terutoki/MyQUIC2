@@ -40,11 +40,47 @@ use myquic2::mqp::r2_flow::{
 use myquic2::mqp::r3::CtlMessage;
 use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::r2_frag::R2FragFlow;
+use myquic2::udp::r2_stage::R2_STAGE_MAX_BYTES;
 use myquic2::udp::{
     R2DrainAttempt, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
     try_drain_staged,
 };
 use std::collections::VecDeque;
+
+/// Milliseconds of the path's own rate that the tuned preset admits ahead of
+/// quinn's pacer.
+///
+/// The budget is `cwnd / srtt × this`, so it tracks the link the connection
+/// actually has: 8 KiB (the floor) at 2 Mbps, about 125 KB at 100 Mbps, and the
+/// whole stager past ~1 Gbps. That is the shape a fixed byte cap cannot express
+/// — the same 256 KiB queue is a second of delay on a phone uplink and two
+/// milliseconds on a LAN.
+///
+/// `cwnd` is an upper bound on the rate, not the rate itself: the BBR preset
+/// targets two bandwidth-delay products, so the estimate runs about twice the
+/// bottleneck rate and the real bound is nearer twenty milliseconds. That
+/// direction is deliberate — the window is a ceiling on *queueing*, and `srtt`
+/// rising under bufferbloat pulls it back down. `0` disables the cap; the bulk
+/// preset always runs with `0` (see [`ConnRev2::configure_queue_window`]).
+pub(crate) const UDP_QUEUE_WINDOW_MS: u32 = 10;
+
+/// Floor for the queue window's byte budget.
+///
+/// A congestion event collapses `cwnd` for a few RTTs. Without a floor the
+/// budget would shrink to a few hundred bytes exactly while the path is
+/// recovering, and one loss would turn into a run of deliberate drops. Eight
+/// kilobytes is a handful of MTU-sized datagrams — enough to keep a burst
+/// flowing, still below any queue that could add a visible delay at the rates
+/// that reach the floor.
+pub(crate) const UDP_QUEUE_FLOOR_BYTES: usize = 8 * 1024;
+
+/// Minimum spacing between queue-window samples.
+///
+/// A sample calls `Connection::stats()`, which takes the connection state lock;
+/// once per quarter second is invisible, once per datagram is not, and a
+/// quarter second is still short against a congestion window that moves over
+/// RTTs.
+const QUEUE_SAMPLE_MS: u64 = 250;
 
 /// Retry cadence for `CTL HELLO` until `CAPS` arrives.
 pub(crate) const HELLO_RETRY: Duration = Duration::from_millis(200);
@@ -208,6 +244,22 @@ pub(crate) struct ConnRev2 {
     /// retries the shared stager, so a one-shot request/response flow does not
     /// have to wait for the owner association's next uplink packet.
     stage_retry: tokio::sync::Notify,
+    /// Milliseconds of path rate the uplink queue may hold; `0` disables the
+    /// cap (bulk preset). Armed per dial by
+    /// [`Self::configure_queue_window`], read with one relaxed load per
+    /// admitted payload.
+    queue_window_ms: std::sync::atomic::AtomicU32,
+    /// DATAGRAM send-buffer bytes the transport was built with. quinn exposes
+    /// only the setter, so the value rides in with the window
+    /// ([`myquic2::transport::datagram_send_buffer_bytes`]); it turns
+    /// `datagram_send_buffer_space()` into an occupancy figure.
+    dg_send_bytes: std::sync::atomic::AtomicUsize,
+    /// Last sampled byte budget (`cwnd / srtt × window`, clamped). `0` means
+    /// "not sampled yet", which admits everything rather than stalling a
+    /// connection that has no rate estimate.
+    queue_cap_bytes: std::sync::atomic::AtomicUsize,
+    /// `mono_millis()` of the last sample (see [`QUEUE_SAMPLE_MS`]).
+    queue_sampled_ms: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for ConnRev2 {
@@ -287,7 +339,103 @@ impl ConnRev2 {
             ctx_repair_rate: parking_lot::Mutex::new(ctl_stream::CtlRate::default_budget()),
             handshake_done: std::sync::atomic::AtomicBool::new(false),
             stage_retry: tokio::sync::Notify::new(),
+            queue_window_ms: std::sync::atomic::AtomicU32::new(0),
+            dg_send_bytes: std::sync::atomic::AtomicUsize::new(
+                myquic2::transport::datagram_send_buffer_bytes(false),
+            ),
+            queue_cap_bytes: std::sync::atomic::AtomicUsize::new(0),
+            queue_sampled_ms: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Arm the uplink queue window for this connection generation.
+    ///
+    /// `window_ms` is milliseconds of path rate (`0` disables the cap) and
+    /// `dg_send_bytes` the DATAGRAM send buffer the transport was built with
+    /// ([`myquic2::transport::datagram_send_buffer_bytes`]). Called once per
+    /// dial from the transport preset and before the connection is published,
+    /// so no send can observe a half-armed window.
+    pub(crate) fn configure_queue_window(&self, window_ms: u32, dg_send_bytes: usize) {
+        self.queue_window_ms
+            .store(window_ms, std::sync::atomic::Ordering::Relaxed);
+        self.dg_send_bytes
+            .store(dg_send_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.queue_cap_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether one more `len`-byte payload fits this connection's uplink queue
+    /// window, with `batched` bytes already waiting in the association's
+    /// pre-stager batch.
+    ///
+    /// Bounds *queueing delay*, not throughput: what is already waiting is the
+    /// stager's backlog plus quinn's DATAGRAM send buffer, and the budget is
+    /// [`UDP_QUEUE_WINDOW_MS`] of the path's own rate. A fast, healthy path
+    /// never reaches it; a connection whose queue would otherwise sit for
+    /// hundreds of milliseconds refuses the *newest* payload instead — the
+    /// trade UDP recommends for exactly this case, and the one quinn itself
+    /// makes when the buffer is full.
+    ///
+    /// The window is one aggregate FIFO: there is no per-flow isolation, so a
+    /// neighbour that fills it can also cost an interactive flow a payload.
+    /// That is the shared-queue trade P3-9 describes, bounded in time.
+    ///
+    /// Cost per call is two relaxed loads, the stager probe, and one
+    /// `datagram_send_buffer_space()` read — which takes the connection state
+    /// lock. It is meant for the small-payload uplink path (once per payload),
+    /// not per frame.
+    ///
+    /// `true` when the window is disabled or no rate has been sampled yet.
+    #[must_use]
+    pub(crate) fn admit_uplink(
+        &self,
+        conn: &quinn::Connection,
+        len: usize,
+        batched: usize,
+    ) -> bool {
+        let window_ms = self
+            .queue_window_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if window_ms == 0 {
+            return true;
+        }
+        self.refresh_queue_cap(conn, window_ms);
+        let cap = self
+            .queue_cap_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cap == 0 {
+            return true;
+        }
+        fits_queue_window(
+            cap,
+            self.dg_send_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            conn.datagram_send_buffer_space(),
+            self.stager.lock().queued_bytes(),
+            batched,
+            len,
+        )
+    }
+
+    /// Re-sample [`Self::queue_cap_bytes`] from the live path.
+    ///
+    /// Throttled to one `stats()` per [`QUEUE_SAMPLE_MS`]: that call takes the
+    /// connection state lock, so it must not ride the per-payload path.
+    fn refresh_queue_cap(&self, conn: &quinn::Connection, window_ms: u32) {
+        let now = mono_millis();
+        let last = self
+            .queue_sampled_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < QUEUE_SAMPLE_MS {
+            return;
+        }
+        self.queue_sampled_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        let path = conn.stats().path;
+        self.queue_cap_bytes.store(
+            queue_window_bytes(path.cwnd, path.rtt, window_ms),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Application-layer wire revision of this connection.
@@ -1033,6 +1181,16 @@ impl UplinkFlows {
         }
     }
 
+    /// Bytes held in [`Self::stage_batch`], for the queue-window admission.
+    ///
+    /// Summed rather than counted: the batch is one train's worth
+    /// ([`r2::R2_MAX_TRAIN_ITEMS`]) of small payloads, so the sum is cheaper
+    /// than keeping a parallel counter in step with every push, flush and
+    /// dropped batch.
+    fn stage_batch_bytes(&self) -> usize {
+        self.stage_batch.iter().map(|item| item.payload.len()).sum()
+    }
+
     /// Push this burst's staged items into the connection stager with one lock
     /// hold, draining once if it is full.
     ///
@@ -1650,6 +1808,12 @@ fn stage_or_count(
     up: &mut UplinkFlows,
     item: R2StageItem,
 ) -> PayloadSend {
+    // The window is checked before the batch grows, so the payload that would
+    // push the queue past ten milliseconds of path rate is the one refused. A
+    // disabled window (`0`) short-circuits before any lock or `stats()` call.
+    if !rev2.admit_uplink(conn, item.payload.len(), up.stage_batch_bytes()) {
+        return over_queue_window(rev2);
+    }
     up.stage_batch.push(item);
     // One train's worth is the bound the single-push path used to fire its
     // opportunistic drain at. A receive burst is smaller than this, so the
@@ -1839,6 +2003,78 @@ fn bad_address_header() -> PayloadSend {
     PayloadSend {
         frames: 0,
         failed: Some(DatagramSend::TooLarge),
+    }
+}
+
+/// Byte budget for one queue window of a path: `cwnd / srtt × window`, clamped
+/// to [`UDP_QUEUE_FLOOR_BYTES`]..=[`R2_STAGE_MAX_BYTES`].
+///
+/// Pure so the shape is testable without a live connection. The upper clamp is
+/// the stager's own byte cap: a window wider than the queue it bounds would be
+/// a no-op with extra arithmetic.
+#[must_use]
+fn queue_window_bytes(cwnd: u64, rtt: Duration, window_ms: u32) -> usize {
+    if window_ms == 0 {
+        return 0;
+    }
+    // A sub-millisecond sample would make the rate unbounded; a path cannot be
+    // faster than the loopback floor, and one millisecond keeps the division
+    // finite.
+    let rtt = rtt.max(Duration::from_millis(1));
+    let per_second = cwnd as f64 / rtt.as_secs_f64();
+    let budget = per_second * (f64::from(window_ms) / 1000.0);
+    // Float-to-int casts saturate, so a huge `cwnd` clamps instead of wrapping.
+    (budget as usize).clamp(UDP_QUEUE_FLOOR_BYTES, R2_STAGE_MAX_BYTES)
+}
+
+/// Whether a `len`-byte payload fits `cap` once the bytes already waiting for
+/// the wire are counted.
+///
+/// Occupancy is derived from the transport's configured buffer and the space
+/// the connection still reports. `space > capacity` saturates to zero rather
+/// than wrapping, so a capacity plumbed one preset off can only make the window
+/// looser, never refuse every payload. Pure so the accounting is testable
+/// without a live connection.
+#[must_use]
+fn fits_queue_window(
+    cap: usize,
+    capacity: usize,
+    space: usize,
+    staged: usize,
+    batched: usize,
+    len: usize,
+) -> bool {
+    let occupancy = capacity.saturating_sub(space);
+    staged
+        .saturating_add(occupancy)
+        .saturating_add(batched)
+        .saturating_add(len)
+        <= cap
+}
+
+/// A payload refused by the connection's uplink queue window.
+///
+/// Dropped rather than held: the queue is already longer than
+/// [`UDP_QUEUE_WINDOW_MS`] of the path's rate, so retrying it would either add
+/// stale data to the same backlog or move the wait from quinn's buffer into the
+/// stager. `frames: 0, failed: None` keeps [`recover_send_outcome`] quiet — this
+/// is a deliberate policy drop, not a connection fault, and nothing about the
+/// egress handle is stale.
+fn over_queue_window(rev2: &ConnRev2) -> PayloadSend {
+    let cap = rev2
+        .queue_cap_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let n = dgram_drops::bump(&dgram_drops::OVER_CAP);
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NEVER_LOGGED);
+    static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if claim_log_window_counted(&LAST, &SUPPRESSED, mono_millis()).is_some() {
+        tracing::warn!(
+            "udp datagram dropped: the {cap} B uplink queue window is full ({n} so far)"
+        );
+    }
+    PayloadSend {
+        frames: 0,
+        failed: None,
     }
 }
 
@@ -2408,6 +2644,64 @@ pub(crate) mod counters {
 mod tests {
     use super::*;
     use myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_SESSION;
+
+    #[test]
+    fn the_queue_window_follows_the_path_rate() {
+        // 1 MB/s: ten milliseconds is 10 KB.
+        assert_eq!(
+            queue_window_bytes(100_000, Duration::from_millis(100), UDP_QUEUE_WINDOW_MS),
+            10_000
+        );
+        // 100 MB/s: 1 MB, clamped to the stager's own byte cap.
+        assert_eq!(
+            queue_window_bytes(10_000_000, Duration::from_millis(100), UDP_QUEUE_WINDOW_MS),
+            R2_STAGE_MAX_BYTES
+        );
+        // A collapsed cwnd must not shrink the queue below the floor, or one
+        // loss would turn into a run of deliberate drops while it recovers.
+        assert_eq!(
+            queue_window_bytes(1_200, Duration::from_millis(100), UDP_QUEUE_WINDOW_MS),
+            UDP_QUEUE_FLOOR_BYTES
+        );
+        // Zero disables the cap outright (the bulk preset, and the kill switch).
+        assert_eq!(
+            queue_window_bytes(10_000_000, Duration::from_millis(100), 0),
+            0
+        );
+        // A sub-millisecond sample cannot divide by zero or run away.
+        assert_eq!(
+            queue_window_bytes(10_000_000, Duration::ZERO, UDP_QUEUE_WINDOW_MS),
+            R2_STAGE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn a_payload_over_the_window_is_dropped_without_a_failure_verdict() {
+        let r = ConnRev2::new();
+        r.configure_queue_window(UDP_QUEUE_WINDOW_MS, 1024 * 1024);
+        r.queue_cap_bytes
+            .store(1024, std::sync::atomic::Ordering::Relaxed);
+        let before = dgram_drops::snapshot().over_cap;
+        let sent = over_queue_window(&r);
+        // A deliberate policy drop: nothing was queued, and no recovery arm
+        // (which would invalidate the shared egress handle) may fire.
+        assert_eq!(sent.frames, 0);
+        assert_eq!(sent.outcome(), DatagramSend::Sent);
+        assert_eq!(dgram_drops::snapshot().over_cap, before + 1);
+    }
+
+    #[test]
+    fn the_window_counts_everything_already_waiting() {
+        // 500 B unsent in quinn, 200 B in the stager, 100 B in the batch: a
+        // 200 B payload fills a 1 KiB window exactly.
+        assert!(fits_queue_window(1000, 1_000_000, 999_500, 200, 100, 200));
+        assert!(!fits_queue_window(1000, 1_000_000, 999_500, 200, 100, 201));
+        // A capacity plumbed one preset off (space above it) cannot wrap into a
+        // huge occupancy and refuse everything.
+        assert!(fits_queue_window(1000, 1024, 2048, 0, 0, 1000));
+        // Saturating math: a corrupt counter refuses rather than wraps around.
+        assert!(!fits_queue_window(1000, 1024, 1024, usize::MAX, 0, 1));
+    }
 
     #[test]
     fn fresh_state_is_not_ready_and_allocates_client_ids() {

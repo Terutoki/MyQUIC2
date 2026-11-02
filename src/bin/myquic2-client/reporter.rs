@@ -59,19 +59,21 @@ pub(crate) fn spawn_udp_reporter() {
             let dd = now_d.since(&prev_d);
             if dd.lost() > 0 {
                 info!(
-                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (session cap), {} dropped (DNS slow-path budget), {} refused (policy); totals too_large={} buffer_full={} no_egress={} egress_dead={} session_full={} dns_budget={} refused={}",
+                    "udp budget (60s): {} dropped (no egress connection), {} dropped (egress died), {} dropped (session cap), {} dropped (DNS slow-path budget), {} refused (policy), {} dropped (uplink queue window); totals too_large={} buffer_full={} no_egress={} egress_dead={} session_full={} dns_budget={} refused={} over_cap={}",
                     dd.no_egress,
                     dd.egress_dead,
                     dd.session_full,
                     dd.dns_budget,
                     dd.refused,
+                    dd.over_cap,
                     now_d.too_large,
                     now_d.buffer_full,
                     now_d.no_egress,
                     now_d.egress_dead,
                     now_d.session_full,
                     now_d.dns_budget,
-                    now_d.refused
+                    now_d.refused,
+                    now_d.over_cap
                 );
             }
             // Reported on its own line, and outside `lost()`: a late reply to a

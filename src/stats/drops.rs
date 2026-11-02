@@ -74,6 +74,21 @@ pub mod dgram_drops {
     /// counters (the flood case is exactly fd exhaustion); the call site also
     /// emits one rate-limited warning.
     pub static SESS_CREATE_FAILED: AtomicU64 = AtomicU64::new(0);
+    /// The payload was refused by the connection's **uplink queue window**: the
+    /// tuned (interactive) preset admits at most ten milliseconds of *estimated*
+    /// path rate ahead of quinn's pacer, and this datagram would have pushed
+    /// the queued bytes past that (`ConnRev2::admit_uplink`, client-only).
+    ///
+    /// A deliberate *latency* trade, not a capacity fault: the datagram is
+    /// dropped rather than queued, so a flow that would otherwise wait hundreds
+    /// of milliseconds behind a saturated connection loses its newest packet
+    /// instead. The window is one aggregate queue, so the victim is whoever
+    /// arrives while the budget is spent, not necessarily the flow that spent
+    /// it. Split from `BUFFER_FULL` because the two say different things
+    /// to an operator — `BUFFER_FULL` is "the transport had no room at all",
+    /// this is "the queue was bounded on purpose" — and from `NO_EGRESS`,
+    /// which is an outage rather than a policy. Client-only.
+    pub static OVER_CAP: AtomicU64 = AtomicU64::new(0);
 
     /// Every drop counter in one read, so the 60 s report cannot silently omit
     /// one. Named fields rather than a tuple: a tuple read at two call sites
@@ -91,6 +106,7 @@ pub mod dgram_drops {
         pub unknown_sess: u64,
         pub refused: u64,
         pub sess_create_failed: u64,
+        pub over_cap: u64,
     }
 
     impl DropSnapshot {
@@ -107,6 +123,7 @@ pub mod dgram_drops {
                 unknown_sess: d(self.unknown_sess, prev.unknown_sess),
                 refused: d(self.refused, prev.refused),
                 sess_create_failed: d(self.sess_create_failed, prev.sess_create_failed),
+                over_cap: d(self.over_cap, prev.over_cap),
             }
         }
 
@@ -129,6 +146,7 @@ pub mod dgram_drops {
                 .saturating_add(self.egress_dead)
                 .saturating_add(self.refused)
                 .saturating_add(self.sess_create_failed)
+                .saturating_add(self.over_cap)
         }
     }
 
@@ -149,6 +167,7 @@ pub mod dgram_drops {
             unknown_sess: UNKNOWN_SESS.load(Ordering::Relaxed),
             refused: REFUSED.load(Ordering::Relaxed),
             sess_create_failed: SESS_CREATE_FAILED.load(Ordering::Relaxed),
+            over_cap: OVER_CAP.load(Ordering::Relaxed),
         }
     }
 
