@@ -4648,6 +4648,133 @@ async fn udp_associate_serves_its_first_datagram_without_a_startup_sleep() {
     spinner.abort();
 }
 
+/// The steady state follows its egress slot's runtime when one exists.
+///
+/// The unit tests normally have no slot runtime, so every association runs
+/// inline on the caller's runtime; the sharded topology installs one per slot
+/// and moves the association onto it after the first datagram (which is what
+/// fixes the egress class). This test installs a real current-thread runtime on
+/// another thread — the exact shape `spawn_slot_shard` builds — and pins the
+/// two properties migration could break: the first datagram is still served
+/// *before* the move, and the loop keeps reading the relay socket *after* it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
+    // A slot runtime on its own thread, as `spawn_slot_shard` builds it.
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let slot_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("slot runtime");
+        handle_tx
+            .send(rt.handle().clone())
+            .expect("hand over handle");
+        rt.block_on(async {
+            let _ = stop_rx.await;
+        });
+    });
+    let handle = handle_rx.recv().expect("slot runtime handle");
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let mut control = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (control_server, _) = l.accept().await.unwrap();
+
+    let pool = ConnPool::new(1, vec![], true, true, 1);
+    // A one-byte payload to 127.0.0.1:53 with no configured interactive ports
+    // classifies as Interactive -> UDP-range index 0 -> this slot.
+    let slot_handle = handle.clone();
+    pool.slot(pool.udp_global_slot(0)).set_runtime(handle);
+    let hub = Arc::new(UdpHub::new());
+    let egress: Arc<SharedEgress> = Arc::new(SharedEgress::default());
+    let task = tokio::spawn(handle_udp_associate(
+        control_server,
+        pool,
+        hub.clone(),
+        egress,
+    ));
+
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    let relay = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    );
+    let entry = hub
+        .subs
+        .iter()
+        .find_map(|shard| shard.load().values().next().cloned())
+        .expect("the association must publish its entry before the SOCKS reply");
+
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_addr = app.local_addr().unwrap();
+    let mut frame = vec![0, 0, 0, 0x01, 127, 0, 0, 1, 0, 53];
+    frame.extend_from_slice(b"q");
+    app.send_to(&frame, relay).await.unwrap();
+
+    // Datagram one is served by the pre-migration phase, and publishing the app
+    // address is the observable that it happened.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while entry.app().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first datagram was never served"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        entry.app().map(|a| a.port()),
+        Some(app_addr.port()),
+        "the app address is the one the datagram came from"
+    );
+
+    // Wait past the 1 s liveness throttle (`ASSOC_TOUCH_INTERVAL_MS`) with
+    // enough margin for the coarse clock's one-second granularity.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // Block the slot runtime's only thread. If the steady state really moved
+    // there, the second datagram cannot be read until the block ends; if it
+    // stayed inline on this runtime, it is read immediately. That difference is
+    // what makes this test discriminate migration from the old topology rather
+    // than merely exercising a loop.
+    slot_handle.spawn(async {
+        std::thread::sleep(Duration::from_millis(2_000));
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stamp_before = entry.last.load(std::sync::atomic::Ordering::Relaxed);
+    app.send_to(&frame, relay).await.unwrap();
+    let blocked_until = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < blocked_until {
+        assert_eq!(
+            entry.last.load(std::sync::atomic::Ordering::Relaxed),
+            stamp_before,
+            "the loop ran inline: a migrated loop cannot be polled while its slot thread is blocked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The block ends; the queued steady state reads the datagram and advances
+    // the stamp.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while entry.last.load(std::sync::atomic::Ordering::Relaxed) == stamp_before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the migrated loop never read the second datagram"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        entry.is_alive(),
+        "the steady state must still be running after the move"
+    );
+
+    task.abort();
+    let _ = stop_tx.send(());
+    slot_thread.join().expect("slot thread joins");
+}
+
 /// The per-slot transport preset split: only the dedicated bulk UDP shards
 /// may dial with the coarse bulk preset. TCP slots and the interactive UDP
 /// class keep the tuned low-latency preset — the old wiring gave *both* UDP

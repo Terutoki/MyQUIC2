@@ -807,6 +807,11 @@ fn spawn_slot_shard(
                     return;
                 }
             };
+            // Publish the handle before the endpoint exists: an association
+            // whose first datagram resolves to this slot may ask for it the
+            // moment the slot reports ready, and a `None` there would leave
+            // that association on the main runtime for its whole life.
+            slot.set_runtime(rt_thread.handle().clone());
             rt_thread.block_on(async move {
                 let qrt = Arc::new(quinn::TokioRuntime);
                 let ep = match qrt.wrap_udp_socket(sock) {

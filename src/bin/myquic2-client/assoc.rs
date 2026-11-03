@@ -584,6 +584,356 @@ fn process_staged_copy(
     Some(ctx.process(&buf[..n], app))
 }
 
+/// One drain burst from the relay socket: the awaited head plus up to
+/// `LAST_HOP_DRAIN - 1` more datagrams, processed in place where the platform
+/// allows it, then this burst's staged batch is pushed and drained.
+///
+/// Extracted from the association loop because the **first** datagram must be
+/// consumed before the loop's runtime can be chosen: it fixes the egress class,
+/// and with it the slot whose driver will carry every later frame. Both callers
+/// (the pre-migration phase and the steady-state loop) pass the same context,
+/// so there is exactly one copy of the burst body.
+///
+/// `head` is the datagram the caller's `recv_from` already returned.
+fn relay_burst(
+    ctx: &mut AppDgramCtx<'_>,
+    relay: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+    head: (usize, SocketAddr),
+) -> AppDgram {
+    let mut pending = Some(head);
+    let mut drained = 0usize;
+    // recvmmsg burst state (Linux): `burst_i < burst_n` consumes staged
+    // datagrams; otherwise one refill syscall covers the remaining per-wakeup
+    // budget. Both counters stay 0 on the portable path, where the
+    // `try_recv_from` arm below runs.
+    let mut burst_n = 0usize;
+    let mut burst_i = 0usize;
+    for _ in 0..LAST_HOP_DRAIN {
+        // Resolve the next datagram and run the shared body while it is still
+        // in place: `pending` is the awaited head (first iteration only), the
+        // extras come from the burst scratch without a copy, or from
+        // `try_recv_from` on kernels without `recvmmsg`.
+        let action = if let Some((n, app)) = pending.take() {
+            drained += 1;
+            ctx.process(&buf[..n], app)
+        } else if burst_i < burst_n {
+            let i = burst_i;
+            burst_i += 1;
+            match with_burst_msg(i, |msg, app| {
+                drained += 1;
+                ctx.process(msg, app)
+            }) {
+                Some(action) => action,
+                // No burst scratch on this thread (every non-Linux build, where
+                // `recvmmsg` is unavailable): keep the portable copy-out path.
+                None => match process_staged_copy(ctx, i, buf, &mut drained) {
+                    Some(action) => action,
+                    None => break,
+                },
+            }
+        } else {
+            match recv_burst(relay, LAST_HOP_DRAIN - drained) {
+                Some(0) => break,
+                Some(k) => {
+                    burst_n = k;
+                    burst_i = 1;
+                    match with_burst_msg(0, |msg, app| {
+                        drained += 1;
+                        ctx.process(msg, app)
+                    }) {
+                        Some(action) => action,
+                        None => match process_staged_copy(ctx, 0, buf, &mut drained) {
+                            Some(action) => action,
+                            None => break,
+                        },
+                    }
+                }
+                None => match relay.try_recv_from(buf) {
+                    Ok((n, app)) => {
+                        drained += 1;
+                        ctx.process(&buf[..n], app)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    // A drained-packet error ends the burst, not the
+                    // association: the head already proved the socket live this
+                    // poll.
+                    Err(_) => break,
+                },
+            }
+        };
+        match action {
+            AppDgram::Continue => {}
+            // The old arm jumped straight out of the association, skipping the
+            // burst-end drain and the batch counter: keep that exact shape, so
+            // a future fatal arm cannot start silently draining half a burst.
+            AppDgram::BreakAssoc => return AppDgram::BreakAssoc,
+        }
+    }
+    // Phase 2: this burst's small payloads sit in the association-local batch;
+    // push them into the connection stager with one lock hold and drain it now.
+    // Large payloads already flushed and drained inside `send_uplink` before
+    // going out directly.
+    //
+    // Only when this burst actually staged something: with the batch empty
+    // there is nothing of ours to push, and any connection-queue leftover
+    // belongs to a drain that reported `Blocked`/`TooLarge` and already woke
+    // the per-connection retry task.
+    if let Some(b) = *ctx.bind
+        && ctx.uplink.has_staged_batch()
+    {
+        drain_assoc_stage(ctx.egress_shared, ctx.pool, b, Some(&mut *ctx.uplink));
+    }
+    record_drain_batch(drained);
+    AppDgram::Continue
+}
+
+/// Drain the SOCKS control connection after a readability event.
+///
+/// Returns `true` when the app closed it (the association must end). The
+/// control connection carries no data after the reply (RFC 1928), so anything
+/// read here is discarded, but an *active* control connection counts as
+/// activity and refreshes the idle stamp.
+fn drain_control(tcp: &tokio::net::TcpStream, entry: &AssocEntry) -> bool {
+    let mut closed = false;
+    let mut got = false;
+    // Bounded drain (8 KiB per readiness event): an unbounded loop inside one
+    // select branch lets a flooding local app starve the relay and idle
+    // branches. Tokio keeps readiness set until a `WouldBlock`, so the
+    // remainder is picked up on the next poll. Hoisted out of the loop: the
+    // buffer's contents are discarded, so zeroing it once per iteration was up
+    // to 8 KiB of dead stores per readiness event.
+    let mut b = [0u8; 512];
+    for _ in 0..16 {
+        match tcp.try_read(&mut b) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {
+                got = true;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    if got {
+        // An open control connection that is actively used counts as activity;
+        // only truly abandoned associations idle out. Stored directly, not
+        // through `touch`: this is already gated on an actual read.
+        entry
+            .last
+            .store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+    closed
+}
+
+/// Release the W3 queue-until-publish hold onto the current egress handle, then
+/// write what it staged.
+///
+/// Both triggers (the backstop tick and the publish notification) run exactly
+/// this body, so they cannot drift.
+fn flush_hold(
+    egress_shared: &SharedEgress,
+    pool: &ConnPool,
+    sess: u32,
+    bind: UdpBind,
+    uplink: &mut UplinkFlows,
+    frag: &mut R2Fragmenter,
+) {
+    let _ = flush_pending_uplink(
+        egress_shared,
+        pool,
+        sess,
+        bind,
+        uplink,
+        frag,
+        coarse_millis(),
+    );
+    drain_assoc_stage(egress_shared, pool, bind, Some(uplink));
+}
+
+/// Teardown shared by every association exit path (pre-migration and steady
+/// state).
+///
+/// Ordering is load-bearing: the final drain runs before `SESS_CLOSE` so the
+/// close cannot overtake a data frame; payloads still held for an egress handle
+/// that never returned are booked rather than dropped silently; the receive
+/// buffer goes back to its thread-local pool.
+fn finish_assoc(
+    egress_shared: &SharedEgress,
+    pool: &ConnPool,
+    sess: u32,
+    bind: Option<UdpBind>,
+    uplink: &mut UplinkFlows,
+    buf: Vec<u8>,
+) -> Result<()> {
+    // Final drain before the control-plane teardown: whatever this association
+    // queued in its last burst (and any other session's items that nobody
+    // drained yet) goes out first. The queue is connection-scoped, so this
+    // never clears another session's payloads; a genuinely dead connection
+    // accounts them at teardown.
+    if let Some(b) = bind {
+        drain_assoc_stage(egress_shared, pool, b, Some(uplink));
+    }
+    // W3: whatever is still held for an egress handle that never returned is
+    // lost with the association. Book it (`NO_EGRESS`, one per payload) rather
+    // than dropping it silently.
+    uplink.clear_pending();
+    // Session teardown runs even when no egress handle was ever acquired or the
+    // generation is still in its handshake window: the local half (registry
+    // bindings + staged payloads + the pending close notification) must not
+    // wait for `is_ready()`/a refresh, and only the best-effort `SESS_CLOSE`
+    // datagram is conditional on a negotiated, live connection (LOGIC-8).
+    send_sess_close(egress_shared, pool, bind, sess, uplink.epoch);
+    assoc_recycle_buf(buf);
+    Ok(())
+}
+
+/// The association's steady state, once its first datagram has fixed the egress
+/// class.
+///
+/// Owned rather than borrowed because it is handed to the egress slot's runtime
+/// (`ConnSlot::runtime`) when the sharded topology is on: the relay socket stays
+/// registered on the main runtime (it was created there), and tokio delivers
+/// readiness to a task on any live runtime, so the task can move while the
+/// registration does not. The slot then runs the recv, the encode, quinn's
+/// connection-state lock and the driver poll on one thread instead of handing
+/// each datagram across two cores.
+struct AssocSession {
+    tcp: tokio::net::TcpStream,
+    pool: ConnPool,
+    egress_shared: Arc<SharedEgress>,
+    sess: u32,
+    entry: Arc<AssocEntry>,
+    relay: Arc<tokio::net::UdpSocket>,
+    expected_app_ip: Option<IpAddr>,
+    frag: R2Fragmenter,
+    uplink: UplinkFlows,
+    bind: Option<UdpBind>,
+    published_app: Option<SocketAddr>,
+    activity_stamp: u64,
+    /// Marks the hub entry dead (and drops the relay socket) when the steady
+    /// state ends, including when a runtime shutdown drops this future.
+    _alive: AliveGuard,
+}
+
+/// The steady-state relay loop for one association.
+///
+/// Runs on the egress slot's runtime when one is available, and inline on the
+/// caller's runtime otherwise (the shared-runtime topology and every unit test).
+/// The loop body is unchanged; only where it runs differs.
+async fn run_assoc(session: AssocSession) -> Result<()> {
+    let AssocSession {
+        tcp,
+        pool,
+        egress_shared,
+        sess,
+        entry,
+        relay,
+        expected_app_ip,
+        mut frag,
+        mut uplink,
+        mut bind,
+        mut published_app,
+        mut activity_stamp,
+        _alive,
+    } = session;
+    // The receive-buffer pool is thread-local, so the steady state takes its
+    // buffer from the thread that will poll it instead of inheriting the one
+    // the pre-migration phase used (which went back to that thread's pool).
+    let mut buf = assoc_recv_buf();
+    // Timers are created here, on the runtime that will poll them (the slot in
+    // the sharded topology), so no tick goes through another runtime's timer
+    // wheel. The jitter phase is baked into the first deadline, never slept
+    // off before serving the relay socket; `interval_at` keeps the
+    // desynchronized 30 s schedule and starts immediately.
+    let phase_ms = jitter_ms();
+    let mut idle_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(phase_ms),
+        Duration::from_secs(ASSOC_IDLE_TICK_SECS),
+    );
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // W3 queue-until-publish flush timer. The branch is armed only while the
+    // association holds payloads (`uplink.has_pending()` guard), so a healthy
+    // association pays no wakeup; the interval's first (immediately-ready) tick
+    // fires as soon as the select is polled again, then once per
+    // `PENDING_FLUSH_TICK` until the hold drains.
+    let mut pending_flush = tokio::time::interval(PENDING_FLUSH_TICK);
+    pending_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    'assoc: loop {
+        tokio::select! {
+            r = relay.recv_from(&mut buf) => {
+                let head = match r {
+                    Ok(head) => head,
+                    // A transient socket error must end this association only;
+                    // the wrapper still removes the hub subscription.
+                    Err(_) => break 'assoc,
+                };
+                let mut ctx = AppDgramCtx {
+                    sess,
+                    pool: &pool,
+                    egress_shared: &egress_shared,
+                    entry: &entry,
+                    expected_app_ip,
+                    published_app: &mut published_app,
+                    activity_stamp: &mut activity_stamp,
+                    bind: &mut bind,
+                    uplink: &mut uplink,
+                    frag: &mut frag,
+                };
+                if let AppDgram::BreakAssoc = relay_burst(&mut ctx, &relay, &mut buf, head) {
+                    break 'assoc;
+                }
+            }
+            // Fresh future per iteration, on purpose: `readable()` is an
+            // `async fn`, and polling its state machine after it has returned
+            // `Ready` panics ("async fn resumed after completion") — a pinned
+            // future crashed every association whose control connection fired
+            // readability once without closing. The per-iteration registration
+            // it saves is one slab churn per drained burst, not per packet.
+            _ = tcp.readable() => {
+                if drain_control(&tcp, &entry) {
+                    break 'assoc;
+                }
+            }
+            _ = idle_tick.tick() => {
+                // Both directions count, but only one of them reads a clock:
+                // the relay loop stamps `last` for app-side traffic, and this
+                // tick folds the dispatcher's `replied` flag in for the reply
+                // side, so a receive-only flow is not reaped out from under the
+                // app and the per-reply path stays clock-free.
+                if entry.idle_since_tick(mono_millis(), ASSOC_IDLE_MS) {
+                    break 'assoc;
+                }
+            }
+            // W3: the bounded queue-until-publish hold is non-empty, so the
+            // egress connection may have returned since the last attempt. The
+            // `tick` is the backstop; the `wait_publish` arm below is the
+            // low-latency trigger, so a one-shot payload held across a cold
+            // start or a redial leaves as soon as a handle exists instead of
+            // waiting up to the 100 ms cadence.
+            _ = pending_flush.tick(), if uplink.has_pending() => {
+                if let Some(b) = bind {
+                    flush_hold(&egress_shared, &pool, sess, b, &mut uplink, &mut frag);
+                }
+            }
+            // W3 low-latency trigger: a fresh egress handle was published for
+            // this binding, so release the hold now. The guard keeps a healthy
+            // association from registering the future at all.
+            _ = egress_shared.wait_publish(bind), if uplink.has_pending() => {
+                if let Some(b) = bind {
+                    flush_hold(&egress_shared, &pool, sess, b, &mut uplink, &mut frag);
+                }
+            }
+        }
+    }
+    finish_assoc(&egress_shared, &pool, sess, bind, &mut uplink, buf)
+}
+
 pub(crate) async fn udp_associate_inner(
     mut tcp: tokio::net::TcpStream,
     pool: ConnPool,
@@ -616,7 +966,8 @@ pub(crate) async fn udp_associate_inner(
     // owned this state.
     let entry = Arc::new(AssocEntry::new(relay.clone()));
     hub.publish(sess, entry.clone());
-    // Cleared on every exit path out of this function, including the `?` below.
+    // Cleared on every exit path out of this function (including the `?`
+    // below), and by the steady state once it owns the guard after the move.
     let _alive = AliveGuard(entry.clone());
     write_socks_reply(&mut tcp, 0x00, relay_reply).await?;
     // Pin the app's source IP to the SOCKS control connection's peer. The
@@ -630,323 +981,120 @@ pub(crate) async fn udp_associate_inner(
     // loop's local copy of "when did I last store it", so the store stays at one
     // per second instead of one per app datagram.
     let mut activity_stamp = mono_millis();
-    // app -> QUIC with this association's sess. Idle assoc (no packets
-    // either way for 180s) is reaped so leaked TCP controls cannot hold
-    // relay sockets forever (B6).
-    //
-    // `UDP_RECV_MAX`, not 2048: the socket must be able to hold any datagram
-    // the protocol can carry, or the kernel truncates it before the fragmenter
-    // ever sees it. The SOCKS5 header sits in front of the payload, so the
-    // buffer covers both (`n == buf.len()` below reports a truncation).
-    // Pooled (see `assoc_recv_buf`): same length, so that check is unchanged.
+    // Scratch for the pre-migration phase only. The pool is thread-local, so
+    // this buffer goes back to *this* thread's pool before the steady state
+    // moves and the loop takes its own from the target thread's pool.
     let mut buf = assoc_recv_buf();
     // One rev2 fragment-id counter per association (the receiver's key is
     // `(wire_id, frag_id)` / `(INLINE, sess, frag_id)`).
     let mut frag = R2Fragmenter::new();
-    // Fixed-schedule interval (not a re-armed sleep): TCP control chatter must
-    // not reset the idle timer and keep an otherwise dead association alive.
-    //
-    // The jitter phase is baked into the interval's **first deadline**, never
-    // slept off before this loop. The sleep used to run after the SOCKS reply
-    // had already told the app the relay was ready, so the app's first
-    // datagram — a DNS query, a STUN binding, a game handshake: the most
-    // latency-sensitive one — sat unread in the relay socket while the
-    // association was not even polling. `jitter_ms()` is bounded to 0..=199,
-    // so that was up to ~200 ms of pure added latency per association
-    // (1.4x a 140 ms RTT). `interval_at` keeps the same desynchronized tick
-    // schedule and starts serving the relay socket immediately.
-    let phase_ms = jitter_ms(); // 0..=199; desynchronizes the 30 s tick phase
-    let mut idle_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_millis(phase_ms),
-        Duration::from_secs(ASSOC_IDLE_TICK_SECS),
-    );
-    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // W3 queue-until-publish flush timer. The branch is armed only while the
-    // association holds payloads (`uplink.has_pending()` guard), so a healthy
-    // association pays no wakeup; when the hold fills during an outage the
-    // interval's first (immediately-ready) tick fires as soon as the select is
-    // polled again, then once per `PENDING_FLUSH_TICK` until the hold drains.
-    let mut pending_flush = tokio::time::interval(PENDING_FLUSH_TICK);
-    pending_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Local copy of the last published app address: the value almost never
     // changes (one UDP socket per association), so only publish on change
     // instead of storing per packet.
     let mut published_app: Option<SocketAddr> = None;
     // Egress binding (class + shard), fixed by the first datagram that reaches
-    // the send path and kept for the association's life (see [`UdpBind`]);
-    // until then every datagram would bind from itself, which cannot happen
-    // because the first send binds before it goes out.
+    // the send path and kept for the association's life (see [`UdpBind`]).
     let mut bind: Option<UdpBind> = None;
-    // MQP-3 rev2 uplink staging (Phase 2): a new destination gets a
-    // connection-scoped wire id and its first frames are standalone `DATA OPEN`
-    // /`DATA INLINE` items; confirmed flows become `Steady` items. Small
-    // payloads are queued in the **connection's** stager and drained at each
-    // burst end (also before a large standalone send and on exit), so items
-    // from several associations can share one cross-session `TRAIN dict`.
-    // Every payload size rides rev2: one `DATA` frame when it fits the live
-    // limit, rev2 `FRAG` frames otherwise (no legacy MQP-2 frame is produced).
-    //
-    // `uplink` also owns the per-target `SessionFlows` table and the connection
-    // epoch: after a redial the bindings are forgotten and re-opened on the new
-    // wire (see `UplinkFlows::sync`).
+    // MQP-3 rev2 uplink staging (Phase 2). `uplink` also owns the per-target
+    // `SessionFlows` table and the connection epoch: after a redial the
+    // bindings are forgotten and re-opened on the new wire.
     let mut uplink = UplinkFlows::new(entry.closed.clone());
-    'assoc: loop {
+    // The first datagram is consumed here, before the steady state moves,
+    // because it is what fixes the egress class — and therefore which slot
+    // runtime the steady state belongs on. Every later burst runs inside
+    // `run_assoc`, and this phase only needs the 30 s idle tick.
+    //
+    // The jitter phase is baked into the interval's first deadline, never slept
+    // off before this loop: the old shape slept *after* the SOCKS reply had
+    // already told the app the relay was ready, so the app's first datagram —
+    // a DNS query, a STUN binding, a game handshake: the most latency-sensitive
+    // one — sat unread for up to ~200 ms.
+    let phase_ms = jitter_ms();
+    let mut idle_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(phase_ms),
+        Duration::from_secs(ASSOC_IDLE_TICK_SECS),
+    );
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let head = loop {
         tokio::select! {
-            r = relay.recv_from(&mut buf) => {
-                // Bounded ingress drain: the awaited head plus up to
-                // `LAST_HOP_DRAIN - 1` more, so one readiness event moves up
-                // to 32 app datagrams instead of one wakeup per datagram. On
-                // Linux the extras come from one `recvmmsg` burst per refill;
-                // a kernel without it keeps the per-frame `try_recv_from` arm.
-                // Tokio keeps readiness set until a `WouldBlock`, so the
-                // remainder is picked up on the next poll; nothing queues in
-                // userspace (no HOL). `AppDgram::Continue` below advances the
-                // drain — the same packet-skip as before; only the head error
-                // ends the association.
-                //
-                // F6: staged (recvmmsg) datagrams are processed **in place**
-                // through `with_burst_msg`, so they never pay the extra
-                // burst-scratch -> `buf` copy. The awaited head has no burst
-                // staging and keeps using `buf`.
-                let mut pending = match r {
-                    Ok(x) => Some(x),
-                    // A transient socket error must end this association only;
-                    // the wrapper still removes the hub subscription.
-                    Err(_) => break 'assoc,
-                };
-                let mut drained = 0usize;
-                // recvmmsg burst state (Linux): `burst_i < burst_n` consumes
-                // staged datagrams; otherwise one refill syscall covers the
-                // remaining per-wakeup budget. Both counters stay 0 on the
-                // portable path, where the `try_recv_from` arm below runs.
-                let mut burst_n = 0usize;
-                let mut burst_i = 0usize;
-                // F6: the per-datagram body lives in `AppDgramCtx::process`, so
-                // the recvmmsg-staged arm can run it while the payload is still
-                // in the thread-local burst scratch (`with_burst_msg`) instead
-                // of copying it out to `buf` first. The context borrows the
-                // association state mutably; it is scoped to this drain burst
-                // and released before the deferred TRAIN flush below.
-                let mut ctx = AppDgramCtx {
-                    sess,
-                    pool: &pool,
-                    egress_shared: &egress_shared,
-                    entry: &entry,
-                    expected_app_ip,
-                    published_app: &mut published_app,
-                    activity_stamp: &mut activity_stamp,
-                    bind: &mut bind,
-                    uplink: &mut uplink,
-                    frag: &mut frag,
-                };
-                for _ in 0..LAST_HOP_DRAIN {
-                    // Resolve the next datagram and run the shared body while
-                    // it is still in place: `pending` is the awaited head
-                    // (first iteration only), the extras come from the burst
-                    // scratch without a copy, or from `try_recv_from` on
-                    // kernels without `recvmmsg`.
-                    let action = if let Some((n, app)) = pending.take() {
-                        drained += 1;
-                        ctx.process(&buf[..n], app)
-                    } else if burst_i < burst_n {
-                        let i = burst_i;
-                        burst_i += 1;
-                        match with_burst_msg(i, |msg, app| {
-                            drained += 1;
-                            ctx.process(msg, app)
-                        }) {
-                            Some(action) => action,
-                            // No burst scratch on this thread (every non-Linux
-                            // build, where `recvmmsg` is unavailable): keep the
-                            // portable copy-out path.
-                            None => {
-                                match process_staged_copy(&mut ctx, i, &mut buf, &mut drained) {
-                                    Some(action) => action,
-                                    None => break,
-                                }
-                            }
-                        }
-                    } else {
-                        match recv_burst(&relay, LAST_HOP_DRAIN - drained) {
-                            Some(0) => break,
-                            Some(k) => {
-                                burst_n = k;
-                                burst_i = 1;
-                                match with_burst_msg(0, |msg, app| {
-                                    drained += 1;
-                                    ctx.process(msg, app)
-                                }) {
-                                    Some(action) => action,
-                                    None => {
-                                        match process_staged_copy(
-                                            &mut ctx,
-                                            0,
-                                            &mut buf,
-                                            &mut drained,
-                                        ) {
-                                            Some(action) => action,
-                                            None => break,
-                                        }
-                                    }
-                                }
-                            }
-                            None => match relay.try_recv_from(&mut buf) {
-                                Ok((n, app)) => {
-                                    drained += 1;
-                                    ctx.process(&buf[..n], app)
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                                // A drained-packet error ends the burst, not the
-                                // association: the head already proved the socket
-                                // live this poll.
-                                Err(_) => break,
-                            },
-                        }
-                    };
-                    match action {
-                        AppDgram::Continue => {}
-                        // No current body arm ends the association; the variant
-                        // keeps the drain's two control actions explicit so a
-                        // future fatal arm cannot silently swallow it.
-                        AppDgram::BreakAssoc => break 'assoc,
-                    }
+            r = relay.recv_from(&mut buf) => match r {
+                Ok(head) => break head,
+                // A transient socket error must end this association only; the
+                // wrapper still removes the hub subscription.
+                Err(_) => {
+                    return finish_assoc(&egress_shared, &pool, sess, bind, &mut uplink, buf);
                 }
-                // Phase 2: this burst's small payloads sit in the
-                // association-local batch; push them into the connection
-                // stager with one lock hold and drain it now. Large payloads
-                // already flushed and drained inside `send_uplink` before
-                // going out directly.
-                //
-                // Only when this burst actually staged something: with the
-                // batch empty there is nothing of ours to push, and any
-                // connection-queue leftover belongs to a drain that reported
-                // `Blocked`/`TooLarge` and already woke the per-connection
-                // retry task — so the old unconditional call was a gate, two
-                // stager locks and a quinn state probe bought for a no-op on
-                // every burst (including the one-payload request/response
-                // shape).
-                if let Some(b) = bind
-                    && uplink.has_staged_batch()
-                {
-                    drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
-                }
-                record_drain_batch(drained);
-            }
-            // Fresh future per iteration, on purpose: `readable()` is an
-            // `async fn`, and polling its state machine after it has returned
-            // `Ready` panics ("async fn resumed after completion") — a pinned
-            // future crashed every association whose control connection fired
-            // readability once without closing. The per-iteration registration
-            // it saves is one slab churn per drained burst, not per packet.
+            },
             _ = tcp.readable() => {
-                let mut closed = false;
-                let mut got = false;
-                // Bounded drain (8 KiB per readiness event): an unbounded loop
-                // inside one select branch lets a flooding local app starve the
-                // relay and idle branches. Tokio keeps readiness set until a
-                // `WouldBlock`, so the remainder is picked up on the next poll.
-                // Hoisted out of the loop: the buffer's contents are discarded
-                // (RFC 1928 puts no data on the control connection after the
-                // reply), so zeroing it once per iteration was up to 8 KiB of
-                // dead stores per readiness event.
-                let mut b = [0u8; 512];
-                for _ in 0..16 {
-                    match tcp.try_read(&mut b) {
-                        Ok(0) => { closed = true; break; }
-                        Ok(_) => { got = true; }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => { closed = true; break; }
-                    }
-                }
-                if got {
-                    // An open control connection that is actively used counts
-                    // as activity; only truly abandoned associations idle out.
-                    // Stored directly, not through `touch`: this is already
-                    // gated on an actual read.
-                    entry
-                        .last
-                        .store(mono_millis(), std::sync::atomic::Ordering::Relaxed);
-                }
-                if closed {
-                    break 'assoc;
+                if drain_control(&tcp, &entry) {
+                    return finish_assoc(&egress_shared, &pool, sess, bind, &mut uplink, buf);
                 }
             }
             _ = idle_tick.tick() => {
-                // Both directions count, but only one of them reads a clock: the
-                // relay loop stamps `last` for app-side traffic, and this tick
-                // folds the dispatcher's `replied` flag in for the reply side, so
-                // a receive-only flow is not reaped out from under the app and
-                // the per-reply path stays clock-free.
                 if entry.idle_since_tick(mono_millis(), ASSOC_IDLE_MS) {
-                    break 'assoc;
-                }
-            }
-            // W3: the bounded queue-until-publish hold is non-empty, so the
-            // egress connection may have returned since the last attempt. Flush
-            // in FIFO order, then write the flushed small payloads (they are
-            // staged on the connection; a burst end normally drains them, but an
-            // association whose app is waiting for a reply sends no next burst).
-            // Armed only while the hold is non-empty: the steady association
-            // never wakes for this branch.
-            //
-            // The `tick` is the backstop; the `wait_publish` arm below is the
-            // low-latency trigger, so a one-shot payload held across a cold
-            // start or a redial leaves as soon as a handle exists instead of
-            // waiting up to the 100 ms cadence.
-            _ = pending_flush.tick(), if uplink.has_pending() => {
-                if let Some(b) = bind {
-                    let _ = flush_pending_uplink(
-                        &egress_shared,
-                        &pool,
-                        sess,
-                        b,
-                        &mut uplink,
-                        &mut frag,
-                        coarse_millis(),
-                    );
-                    drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
-                }
-            }
-            // W3 low-latency trigger: a fresh egress handle was published for
-            // this binding, so release the hold now. Same body as the tick; the
-            // guard keeps a healthy association from registering the future at
-            // all.
-            _ = egress_shared.wait_publish(bind), if uplink.has_pending() => {
-                if let Some(b) = bind {
-                    let _ = flush_pending_uplink(
-                        &egress_shared,
-                        &pool,
-                        sess,
-                        b,
-                        &mut uplink,
-                        &mut frag,
-                        coarse_millis(),
-                    );
-                    drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
+                    return finish_assoc(&egress_shared, &pool, sess, bind, &mut uplink, buf);
                 }
             }
         }
+    };
+    let first = {
+        let mut ctx = AppDgramCtx {
+            sess,
+            pool: &pool,
+            egress_shared: &egress_shared,
+            entry: &entry,
+            expected_app_ip,
+            published_app: &mut published_app,
+            activity_stamp: &mut activity_stamp,
+            bind: &mut bind,
+            uplink: &mut uplink,
+            frag: &mut frag,
+        };
+        relay_burst(&mut ctx, &relay, &mut buf, head)
+    };
+    if let AppDgram::BreakAssoc = first {
+        return finish_assoc(&egress_shared, &pool, sess, bind, &mut uplink, buf);
     }
-    // Final drain before the control-plane teardown: whatever this
-    // association queued in its last burst (and any other session's items that
-    // nobody drained yet) goes out first, so `SESS_CLOSE` cannot overtake a
-    // data frame. The queue is connection-scoped, so this never clears another
-    // session's payloads; a genuinely dead connection accounts them at
-    // teardown.
-    if let Some(b) = bind {
-        drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
-    }
-    // W3: whatever is still held for an egress handle that never returned is
-    // lost with the association. Book it (`NO_EGRESS`, one per payload) rather
-    // than dropping it silently.
-    uplink.clear_pending();
-    // Session teardown runs even when no egress handle was ever acquired or the
-    // generation is still in its handshake window: the local half (registry
-    // bindings + staged payloads + the pending close notification) must not
-    // wait for `is_ready()`/a refresh, and only the best-effort `SESS_CLOSE`
-    // datagram is conditional on a negotiated, live connection (LOGIC-8).
-    send_sess_close(&egress_shared, &pool, bind, sess, uplink.epoch);
+    // Hand the steady state to the slot that owns the egress binding (the
+    // interactive class's shard for a small/interactive-port flow, a bulk shard
+    // for the rest), so the recv, the encode, quinn's connection-state lock and
+    // the driver poll all run on one thread instead of crossing cores per
+    // datagram. The relay socket stays registered on the main runtime (it was
+    // created there) — tokio delivers readiness to a task on any live runtime,
+    // and this one lives for the process.
+    //
+    // With no slot runtime (shared-runtime topology, unit tests) the loop runs
+    // inline on the caller's runtime, which is the pre-existing shape.
+    let target = bind.and_then(|b| pool.slot(pool.udp_global_slot(b.index)).runtime());
+    // The pool is thread-local: hand the pre-migration buffer back to *this*
+    // thread before the steady state takes its own from the runtime it lands on.
     assoc_recycle_buf(buf);
+    let session = AssocSession {
+        tcp,
+        pool,
+        egress_shared,
+        sess,
+        entry,
+        relay,
+        expected_app_ip,
+        frag,
+        uplink,
+        bind,
+        published_app,
+        activity_stamp,
+        _alive,
+    };
+    match target {
+        Some(handle) => match handle.spawn(run_assoc(session)).await {
+            Ok(result) => result?,
+            // The slot runtime is shutting down and dropped the task. The
+            // session's own drops (`AliveGuard`, relay, uplink) still ran, and
+            // the pre-sharding shape dropped these tasks just as silently.
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => return Err(anyhow::anyhow!("udp association task: {e}")),
+        },
+        None => run_assoc(session).await?,
+    }
     Ok(())
 }
 

@@ -2448,26 +2448,82 @@ inherit the bulk pairing's 10 ms ACK delay.
 ### 22.7 Verification
 
 `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` and
-`cargo test --all-targets` all clean: **771 passed, 0 failed, 1 ignored**
-(lib 384, client 208, server 163 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9).
+`cargo test --all-targets` all clean: **772 passed, 0 failed, 1 ignored**
+(lib 384, client 209, server 163 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9).
 New tests: `a_fresh_sockets_first_send_bypasses_tokios_readiness_gate` (the raw
-path sends and does not count `retried`) and
-`publishing_an_egress_handle_wakes_the_held_association` (the Notify trigger);
+path sends and does not count `retried`),
+`publishing_an_egress_handle_wakes_the_held_association` (the Notify trigger)
+and `udp_association_keeps_serving_after_it_moves_to_its_slot_runtime` (§22.8);
 `rev2_stage_queue_full_drops_and_counts` pins that the lone-reply fast path
 still falls back to the drop path when the stager cannot accept the item.
 
-### 22.8 Deliberately not changed
 
-- **The client's app-side tasks still run on the main runtime** while the QUIC
-  driver runs on a pinned slot thread. Moving the association task to the slot
-  runtime is blocked on *when* the egress class is decided: `pool.udp_class`
-  needs the first payload's destination port **and size**, so the slot (and
-  therefore the runtime) is not known at spawn. Doing it properly needs either
-  (a) a design decision to pick the class earlier (port/config based, losing
-  the first-payload size heuristic), or (b) a per-slot app-socket loop with its
-  own reactor, which is a new subsystem rather than a fix. The per-packet
-  *cost* of the split is reduced by §22.1/§22.2 (no per-payload state lock, one
-  drain probe), but the cross-core wake and the packing effect remain.
+### 22.8 Client: the steady state follows its egress slot's runtime
+
+The client's app-side tasks (SOCKS accepts, TCP pumps, UDP associations) run on
+the multi-threaded main runtime, while each pool slot's quinn endpoint and
+driver run on a pinned current-thread runtime. Every uplink datagram therefore
+crossed cores for the connection-state `std::sync::Mutex` inside
+`send_datagram` (the driver holds that same mutex across up to
+`MAX_TRANSMIT_DATAGRAMS` socket sends) and for the driver wake, and a producer
+that keeps sending from another core prevents quinn from packing several
+DATAGRAM frames into one packet.
+
+The obvious fix — spawn the association on the slot's runtime — is blocked by
+*when* the egress class is decided: `pool.udp_class` needs the first payload's
+destination port **and size**, so for a SOCKS `UDP ASSOCIATE` (whose request
+usually carries `0.0.0.0:0`) neither the class nor the slot exists at spawn
+time. Two shapes were considered and rejected:
+
+- pick the class earlier from port/config and drop the first-payload size
+  heuristic: a semantic change that misclassifies every generic-port UDP flow
+  (the exact traffic the heuristic exists for);
+- a per-slot app-socket reactor: a new subsystem, not a fix.
+
+What ships instead is a **first-datagram task migration**, which keeps the
+class decision exactly as it was:
+
+1. The association runs on the main runtime as before: relay socket, hub entry,
+   SOCKS reply, and the *first* datagram. That datagram is processed by the
+   same `relay_burst` body the loop uses, and it fixes `bind` (class + shard).
+2. The steady state then moves to `pool.slot(pool.udp_global_slot(bind.index))
+   .runtime()` — the runtime of the slot whose connection will carry every
+   later frame. `ConnSlot` gains the handle when `spawn_slot_shard` builds its
+   current-thread runtime. With no handle (shared-runtime topology, unit tests)
+   the loop runs inline, which is the previous shape.
+3. The relay socket's registration stays on the main runtime; only the *task*
+   moves. Tokio delivers readiness to a task on any live runtime, and the main
+   runtime lives for the process, so this is the accepted cross-runtime shape:
+   registration here, polling there. The receive buffer is recycled on the
+   thread that acquired it and re-acquired on the target thread (the pool is
+   thread-local), the loop's timers are created on the target runtime, and a
+   `JoinError::is_cancelled` is treated as shutdown rather than a fault.
+4. The caller still awaits the association's `JoinHandle`, so the SOCKS
+   admission permit and the hub reservation keep their lifetime, and a panic in
+   the steady state is reported as an error instead of silently killing a slot.
+
+What this buys: the recv, the encode, quinn's connection-state lock and the
+driver poll run on one core; the state lock is uncontended (same thread as the
+driver) and the frames a burst stages are queued before the driver polls, so
+the packer sees them. What remains is one cross-thread readiness wake per
+burst — the main runtime's I/O driver observes the relay socket and wakes the
+slot task — which is cheaper than the cross-core mutex hand-off it replaces.
+
+Verification: the e2e suites already exercise this (the real client binary
+runs the sharded topology, and `rev3_e2e` round-trips SOCKS UDP associations
+through it). A dedicated unit test makes the placement itself observable:
+`udp_association_keeps_serving_after_it_moves_to_its_slot_runtime` installs a
+real current-thread runtime on another thread, blocks that thread, and asserts
+the second datagram is *not* consumed while the thread is blocked and *is*
+consumed once it frees — an inline loop would read it immediately. Reverting
+the migration makes that test fail (checked), so it pins the topology, not just
+the loop.
+
+### 22.9 Deliberately not changed
+
+- The client's app-side task placement, which was the largest item left open by
+  the first half of this batch, is taken in §22.8 rather than deferred: it is
+  the one item that needed a design of its own.
 - **The server fast table's capacity.** 568 slots against a documented ~1000
   sessions per connection is a real slow-path rate, but the fix is a
   memory/admission tradeoff (a 4096-slot table is ~360 KiB per connection).

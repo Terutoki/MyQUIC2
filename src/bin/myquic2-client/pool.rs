@@ -196,6 +196,19 @@ pub(crate) struct ConnSlot {
     /// the clear path resets it on death, so a restored live hint can never
     /// pair a fresh generation with the previous one's stale stamp.
     pub(crate) last_rx_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// This slot's runtime handle, installed by `spawn_slot_shard` once the
+    /// slot thread has built its current-thread runtime.
+    ///
+    /// The sharded topology runs one QUIC endpoint, one driver and one DATAGRAM
+    /// dispatcher per slot on a pinned thread; the associations that ride a
+    /// slot were, until now, still driven from the multi-threaded main runtime,
+    /// so every uplink datagram crossed cores for quinn's connection-state lock
+    /// and a driver wake. An association whose egress class is decided (it is,
+    /// by its first datagram) can move its steady-state loop here, which makes
+    /// the send, the driver poll and the DATAGRAM packing all local to one
+    /// thread. `None` in the shared-runtime topology and in unit tests, which
+    /// is exactly when the loop runs inline on the caller's runtime.
+    pub(crate) runtime: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
 }
 
 impl ConnSlot {
@@ -209,7 +222,19 @@ impl ConnSlot {
             live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rev2: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             last_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            runtime: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Install this slot's runtime handle (called once, from the slot thread).
+    pub(crate) fn set_runtime(&self, handle: tokio::runtime::Handle) {
+        let _ = self.runtime.set(handle);
+    }
+
+    /// The slot's runtime handle, or `None` while the slot thread has not
+    /// started one (shared-runtime topology, unit tests).
+    pub(crate) fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.runtime.get().cloned()
     }
 
     /// This slot's 0-RTT phase handle (cheap `Arc` clone; see
