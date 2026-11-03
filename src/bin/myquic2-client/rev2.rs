@@ -388,21 +388,20 @@ impl ConnRev2 {
     /// neighbour that fills it can also cost an interactive flow a payload.
     /// That is the shared-queue trade P3-9 describes, bounded in time.
     ///
-    /// Cost per call is the stager probe (a short `parking_lot` hold) and, only
-    /// near the budget, one `datagram_send_buffer_space()` read — which takes
-    /// the connection state lock. It runs once per UDP payload, never per
-    /// encoded frame.
+    /// Cost per call is the stager probe (a short `parking_lot` hold) and one
+    /// `datagram_send_buffer_space()` read — which takes the connection state
+    /// lock. It runs once per UDP payload, never per encoded frame.
     ///
-    /// The state lock is the expensive half: quinn's driver holds that same
-    /// mutex across `process_conn_events` and up to `MAX_TRANSMIT_DATAGRAMS`
-    /// socket sends, so a probe racing a busy driver parks this producer for
-    /// tens of microseconds — once per payload, on the connection whose whole
-    /// purpose is latency. The stager backlog is this process's own term and is
-    /// readable under a lock the caller takes anyway moments later, so it gates
-    /// the probe: while half the window is free, admitting one payload cannot
-    /// push the stager half of the FIFO past the budget, and quinn's buffer is
-    /// bounded by its size and drained by its driver. The exact probe runs only
-    /// where its answer can change the verdict.
+    /// The state lock is quinn's, and its driver holds that same mutex across
+    /// `process_conn_events` and up to `MAX_TRANSMIT_DATAGRAMS` socket sends, so
+    /// a probe racing a busy driver can park this producer. A previous revision
+    /// tried to skip the probe while the stager backlog alone was under half the
+    /// window; that is not a sound substitution. The invariant is the *combined*
+    /// occupancy (stager + quinn's unsent DATAGRAM bytes), and a slow path keeps
+    /// quinn's 1 MiB buffer above the window on its own — exactly the state the
+    /// window exists to shed. Admitting there queues payloads behind an
+    /// already-over-budget buffer instead of dropping the newest, which is the
+    /// policy the window promises and the reason the probe is unconditional.
     ///
     /// `true` when the window is disabled or no rate has been sampled yet.
     #[must_use]
@@ -415,21 +414,12 @@ impl ConnRev2 {
         let Some(cap) = self.queue_window_cap(conn) else {
             return true;
         };
-        let staged = self.stager.lock().queued_bytes();
-        if staged
-            .saturating_add(batched)
-            .saturating_add(len)
-            .saturating_mul(2)
-            <= cap
-        {
-            return true;
-        }
         fits_queue_window(
             cap,
             self.dg_send_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             conn.datagram_send_buffer_space(),
-            staged,
+            self.stager.lock().queued_bytes(),
             batched,
             len,
         )
@@ -455,19 +445,15 @@ impl ConnRev2 {
         let Some(cap) = self.queue_window_cap(conn) else {
             return true;
         };
-        let staged = self.stager.lock().queued_bytes();
-        // Same cheap-first rule as [`Self::admit_uplink`]. A payload larger
-        // than the whole window never passes the cheap gate, which is right:
-        // that is exactly the case the exact rule below exists for.
-        if staged.saturating_add(len).saturating_mul(2) <= cap {
-            return true;
-        }
+        // The combined bound, exactly as `admit_uplink`: the stager backlog
+        // alone cannot stand in for quinn's occupancy (see that function's
+        // note on why the probe is unconditional).
         fits_standalone_window(
             cap,
             self.dg_send_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             conn.datagram_send_buffer_space(),
-            staged,
+            self.stager.lock().queued_bytes(),
             len,
         )
     }

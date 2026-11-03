@@ -2359,22 +2359,27 @@ take in quinn — the same mutex `ConnectionDriver::poll` holds across
 probe racing a busy driver can park a work-stealing worker for tens of
 microseconds, once per payload, on the connection whose purpose is latency.
 
-The cheap gate is now the stager's own backlog (a `parking_lot` hold the
-caller is about to take anyway): while `staged + batched + len <= cap / 2`, the
-payload is admitted without touching quinn. The exact probe runs only when its
-answer can change the verdict. The time bound is no looser: with quinn empty the
-whole queue is now bounded at half the window (plus one payload); with quinn
-full the exact check refuses as before, so the stager half stays under `cap/2`.
+**Correction (§23): the cheap gate described here was reverted.** A stager-backlog
+pre-check is not a sound substitute for the combined bound: on a slow or
+congested path quinn's 1 MiB DATAGRAM buffer can sit above the window on its
+own, and the gate then admitted payloads the exact rule refuses, so the stager
+queued up to `cap/2` behind an already over-budget buffer instead of shedding
+the newest payload — the policy the window exists to enforce. The shipped code
+checks the combined occupancy on every payload again; the drain-side reductions
+below (§22.2) remain.
 
 ### 22.2 Client: the drain's lock count, and the empty-burst drain
 
 `drain_staged_inner` took the stager lock to clone the gate, again to test
 emptiness, again to claim, and a fourth time afterwards to decide the retry
 wakeup, plus one state-lock `datagram_send_buffer_space()` probe per claimed
-batch. It now takes **one** hold to clone the gate and learn the queue state,
-returns immediately when empty, probes the send buffer **once per drain**, and
-claims one hold per batch. The post-drain wakeup uses `try_lock` (a lost race
-means a drainer is active, so notifying is right either way) instead of a
+batch. It now takes **one** hold for the gate and **one** for the emptiness
+check (the gate is acquired *before* the queue is judged empty, so a completed
+drain stays the barrier direct sends rely on — §23), probes the send buffer
+**before each claimed batch** (a single probe per drain made a buffer that fills
+mid-drain drop the next claimed frame instead of leaving it queued — §23), and
+claims with one hold per batch. The post-drain wakeup uses `try_lock` (a lost
+race means a drainer is active, so notifying is right either way) instead of a
 blocking acquisition on an association task.
 
 On the association side, the burst-end drain is skipped when this burst staged
@@ -2433,8 +2438,9 @@ inherit the bulk pairing's 10 ms ACK delay.
 - **W3 hold wakeup.** `SharedEgress` now keeps one `Notify` per binding and
   raises it on every publish, and the association selects on it while it holds
   payloads. The 100 ms tick remains only as a backstop for a missed race. This
-  closes the window where a one-shot payload held across a cold start or a
-  redial waited up to a tick after egress returned.
+  closes the window for an **idle** waiter; a publish that races an in-flight
+  burst is not covered (`notify_waiters` stores no permit), so the burst end now
+  flushes the hold itself (§23).
 - **`push_batch` is O(n).** The old loop `remove(0)`-ed each accepted item,
   shifting the tail per item (measured ~1.5 µs for 64 items under the stager
   mutex). It now computes the accepted prefix in one pass and moves it with one
@@ -2508,6 +2514,9 @@ driver) and the frames a burst stages are queued before the driver polls, so
 the packer sees them. What remains is one cross-thread readiness wake per
 burst — the main runtime's I/O driver observes the relay socket and wakes the
 slot task — which is cheaper than the cross-core mutex hand-off it replaces.
+The placement is fixed by the **binding**, not by the live handle: if egress
+fails over to a sibling slot the loop stays where it is and that flow's sends
+cross cores again (throughput only, no semantic change — §23).
 
 Verification: the e2e suites already exercise this (the real client binary
 runs the sharded topology, and `rev3_e2e` round-trips SOCKS UDP associations
@@ -2535,3 +2544,132 @@ the loop.
 - **Keeping emptied per-session queues** to save one malloc/free per payload:
   the retained `HashMap` entry is not covered by the stager's admission charge,
   and it would grow with every session a connection ever saw.
+
+## 23. Review of the two performance commits, and the fixes it produced (2026-11-03)
+
+An independent review of `81b370b..26deda8` (the lock-tax batch and the
+association-migration batch) traced each changed path through its callers and
+the tokio/quinn sources. It confirmed most of the design and found one contract
+regression, two ordering/drop defects and a set of accounting/test gaps. This
+section records what was wrong, what was changed, and what remains by decision.
+
+### 23.1 The queue window's cheap gate was unsound (reverted)
+
+`admit_uplink`/`admit_standalone` skipped quinn's occupancy probe whenever the
+stager backlog alone was under half the window. That is not a substitute for
+the combined bound: on a slow or congested path the 1 MiB DATAGRAM send buffer
+sits above the window by itself, and the exact rule correctly refuses there.
+The cheap gate instead admitted up to `cap/2` more payloads, which the drain
+then queued behind an already over-budget buffer — the "queue rather than shed"
+policy the window exists to prevent — and it made the `over_cap` counter
+under-report. Both admissions now take the exact combined check on every
+payload again; the §22.1 text above is corrected accordingly. The per-payload
+connection-state lock is back; the drain-side reductions (§22.2) are not
+affected.
+
+### 23.2 An empty queue is no longer judged outside the drain gate
+
+The earlier `drain_staged_inner` returned "empty" before acquiring the drain
+gate. Callers use a completed drain as a barrier before a direct send (the
+server's rebind `OPEN|SRC` and large replies, the client's standalone
+payloads), while a drainer holds the gate between claiming a session's frames
+and sending them. With the early return, a direct frame could overtake frames
+that were already claimed but not yet on the wire — a per-session FIFO break
+invisible to the queue's emptiness check (multi-threaded topologies only: the
+client's pre-migration bursts and failover, the server's shared runtime). The
+gate is now acquired before the emptiness decision; the empty case costs one
+gate plus one stager hold.
+
+### 23.3 The send-buffer probe is per claimed batch again
+
+`drain_staged_inner` probed `datagram_send_buffer_space()` once per drain. If
+the buffer filled mid-drain, the next claim was encoded anyway and
+`send_packed_frames` dropped the refused frame's payloads (up to
+`R2_PACK_BATCH_ITEMS` = 64) and requeued only the tail; the old per-iteration
+probe returned `Blocked` before that claim, leaving everything queued for the
+retry task. The probe is back at the top of each claim iteration (one
+connection-state lock per batch, not per payload), so a full buffer leaves the
+queue untouched.
+
+### 23.4 The synthetic readiness clear is gone
+
+Clearing tokio's readable bit after `recvmmsg` returned 0
+(`try_io(READABLE, || Err(WouldBlock))`) races a reply that arrives before the
+`try_io` samples the event: the sample then carries the *new* tick,
+`clear_readiness` clears it, and the datagram waits for the next arrival. It is
+reachable when the session reader shares its runtime with a concurrent driver
+(`MYQUIC2_SHARD_RUNTIME=0`), and it is reachable on the default sharded
+topology too when `recvmmsg` fails with something other than `EAGAIN`:
+`BurstRecv::recv` maps every error to `0`, so `EINTR` looked like "empty". The
+clear was removed; the next `recv_from` pays one `EAGAIN` on the idle
+transition and clears readiness the way tokio expects.
+
+### 23.5 The migrated task is aborted with its caller, and cancellation is not silent
+
+`JoinHandle` drop only detaches. Aborting the outer future released the hub
+reservation and the SOCKS admission permit while the detached steady state kept
+the relay socket and its payloads, so the caps could be over-admitted and the
+entry left alive and deaf. The outer task now holds an `AssocAbort` guard that
+aborts the spawned task on drop. A cancelled task (the slot runtime is gone) is
+reported as an error unless the process is shutting down (`SHUTTING_DOWN`), and
+a panic is re-raised with `resume_unwind` so the cause is not flattened into a
+generic per-association line. A dead slot runtime can still drop the session
+without `finish_assoc` running; it is now visible instead of reported as
+success.
+
+### 23.6 Accounting and hold-release gaps
+
+- `StageBatch::flush_single` returned `Terminal` without booking the
+  `EGRESS_DEAD` payload the queued path books for `Unsupported`/
+  `ConnectionLost`. It now books one.
+- The W3 hold flush relied on a `Notify`, which has no permit: a publish that
+  landed while the association was mid-burst was lost, and the held one-shot
+  payload waited for the 100 ms backstop. `relay_burst` now flushes the hold at
+  the burst end (when it is non-empty), which is the first point guaranteed to
+  observe a handle that appeared mid-burst; idle waiters keep the notify.
+- Transient `sendto` failures behind the readiness gate (`ENOBUFS`/`ENOMEM`/
+  `EINTR`) were booked as hard `failed` drops. They are queued to the retry pool
+  again, which is what the readiness-only path always did; routing verdicts
+  stay immediate so `udp_try_send_or_return`'s caller can try the next address.
+
+### 23.7 Smaller fixes
+
+- `R2Stager::drain_gate()` no longer escapes into the public API: the direct-send
+  decision (queue empty, gate free, item accepted, encode, send) is one library
+  helper, `try_send_direct`, returning a `DirectSend` verdict for the caller to
+  book.
+- `priority_pin_cores_for(pool, app_workers, cores)` is pure, so both pinning
+  shapes are tested on any host; the tests now pin the 16-core (priority),
+  8-core/4-worker (partial) and oversubscribed (nothing pinned) cases.
+- The migration test waits for its blocking task to actually start (a flag, not
+  a fixed sleep), counts the assertions it makes inside the blocked window, and
+  joins the slot runtime through a drop guard.
+- The idle tick's first deadline is carried across the move (one jitter draw),
+  and the pre-migration timer is released before waiting on the moved task.
+- The deferred `Open` item's missing `set_reply_src`/`note_ctx_sent` learning is
+  pre-existing (the queued drain skips it too) and is left as a documented gap.
+
+### 23.8 Verification
+
+`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test --all-targets` clean: **772 passed, 0 failed, 1 ignored** (lib 384,
+client 209, server 163 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9), plus the
+release-mode `mqp::` (126) and `udp::` (92) suites. One earlier `--all-targets`
+run reported a single `forward_e2e` failure (6/7) that did not reproduce in 6
+full-file runs or 12 targeted runs of the two timing-sensitive tests; the
+harness discovers ports by bind-drop (TOCTOU), and a subagent was running
+`cargo test` concurrently at the time, so it is attributed to harness port
+contention rather than to these changes. No benchmark was run: the fixes are
+correctness/contract repairs, not throughput changes.
+
+### 23.9 What the review confirmed sound
+
+`push_batch`'s one-pass prefix computation (immutable bounds, exact mirror of
+`push`, tail order preserved), the direct-send accounting (`Sent`/`TooLarge`/
+`Blocked` exactly-once, full/zero-capacity stager falling through to the same
+drop policy), the address-only session socket constructor, cross-runtime polling
+of the relay/control sockets (tokio's registration keeps the creating driver;
+wakers cross runtimes), the thread-local state re-homing on migration (receive
+buffer, egress memo, burst scratch), the association index bounds and
+`udp_split=false` collapse, the verbatim extraction of the loop bodies and the
+teardown order, and the config window plumbing/memory arithmetic.

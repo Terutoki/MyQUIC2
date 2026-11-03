@@ -253,6 +253,29 @@ fn try_send_to_raw(
     Err(std::io::ErrorKind::WouldBlock.into())
 }
 
+/// Whether a `sendto` failure is transient enough for the delayed retry pool.
+///
+/// The raw fallback sees the real kernel verdict behind a tokio readiness miss.
+/// A full socket buffer (`ENOBUFS`), a temporary memory shortage (`ENOMEM`) and
+/// an interrupted syscall (`EINTR`) are all transient: the retry worker's
+/// `send_to().await` re-attempts for up to `UDP_RETRY_TIMEOUT`, and treating
+/// them as hard errors here would drop datagrams that the old readiness-only
+/// path always queued. Routing verdicts (`ENETUNREACH`, `EHOSTUNREACH`,
+/// `EMSGSIZE`) stay immediate so `udp_try_send_or_return`'s caller can try the
+/// next address of a record set.
+fn send_error_is_transient(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        use nix::libc;
+        return code == libc::ENOBUFS || code == libc::ENOMEM;
+    }
+    false
+}
+
 /// Best-effort non-blocking UDP send for shared loops (one datagram reader per
 /// connection, one relay per association).
 ///
@@ -290,50 +313,55 @@ pub fn udp_try_send_or_return(
     match sock.try_send_to(&payload, dst) {
         Ok(_) => {
             udp_write::sent();
-            Ok(())
+            return Ok(());
         }
+        // The cached-readiness miss and real backpressure look identical to
+        // tokio; the raw syscall tells them apart before the payload is copied
+        // and handed to the retry pool.
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // The cached-readiness miss and the full-buffer case look identical
-            // to tokio; the raw syscall tells them apart before the payload is
-            // copied and handed to the retry pool.
             match try_send_to_raw(sock, dst, &payload) {
                 Ok(_) => {
                     udp_write::sent();
                     return Ok(());
                 }
-                Err(raw) if raw.kind() == std::io::ErrorKind::WouldBlock => {}
+                // Transient verdict: queue it (below), exactly like the old
+                // readiness-only path did.
+                Err(raw) if send_error_is_transient(&raw) => {}
                 Err(raw) => {
                     let n = udp_write::failed();
                     warn_udp_write(UdpWriteDrop::SendFailed, n, || raw.to_string());
                     return Err((raw.kind(), payload));
                 }
             }
-            let req = UdpRetry {
-                sock: sock.clone(),
-                dst,
-                payload,
-            };
-            // Counted *after* the queue accepts it. `retried` means "handed to
-            // the shard's detached retry worker", and the old order counted the
-            // hand-off before knowing whether it happened, so a datagram dropped
-            // on a full shard was booked as both retried and dropped — one
-            // datagram, two mutually exclusive outcomes.
-            if udp_retry_submit(&dst, req) {
-                udp_write::retried();
-            } else {
-                let n = udp_write::dropped_no_permit();
-                warn_udp_write(UdpWriteDrop::Budget, n, || {
-                    format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
-                });
-            }
-            Ok(())
         }
+        // A syscall-level transient verdict (`EINTR`/`ENOBUFS`/`ENOMEM`): the
+        // kernel was really asked and refused, so do not retry inline; queue it.
+        Err(e) if send_error_is_transient(&e) => {}
         Err(e) => {
             let n = udp_write::failed();
             warn_udp_write(UdpWriteDrop::SendFailed, n, || e.to_string());
-            Err((e.kind(), payload))
+            return Err((e.kind(), payload));
         }
     }
+    let req = UdpRetry {
+        sock: sock.clone(),
+        dst,
+        payload,
+    };
+    // Counted *after* the queue accepts it. `retried` means "handed to the
+    // shard's detached retry worker", and the old order counted the hand-off
+    // before knowing whether it happened, so a datagram dropped on a full shard
+    // was booked as both retried and dropped — one datagram, two mutually
+    // exclusive outcomes.
+    if udp_retry_submit(&dst, req) {
+        udp_write::retried();
+    } else {
+        let n = udp_write::dropped_no_permit();
+        warn_udp_write(UdpWriteDrop::Budget, n, || {
+            format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
+        });
+    }
+    Ok(())
 }
 
 /// Borrowed fast path for replies built into a reused scratch buffer.
@@ -341,50 +369,52 @@ pub fn udp_try_send_or_return(
 /// `udp_try_send` needs an owned `Bytes` because the WouldBlock retry queue
 /// owns the payload, which forced the reply path to `freeze()` its scratch
 /// buffer (one allocation) on every datagram. The fast path only borrows the
-/// slice for the syscall; only WouldBlock copies into an owned `Bytes` for
-/// the queue, so steady-state replies allocate nothing and the scratch buffer
-/// is reused across packets.
+/// slice for the syscall; only a transient verdict copies into an owned `Bytes`
+/// for the queue, so steady-state replies allocate nothing and the scratch
+/// buffer is reused across packets.
 pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: &[u8]) {
     match sock.try_send_to(payload, dst) {
-        Ok(_) => udp_write::sent(),
+        Ok(_) => {
+            udp_write::sent();
+            return;
+        }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // Same split as `udp_try_send_or_return`: only a real kernel
-            // `WouldBlock` pays the owned copy and the retry-pool hand-off.
             match try_send_to_raw(sock, dst, payload) {
                 Ok(_) => {
                     udp_write::sent();
                     return;
                 }
-                Err(raw) if raw.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(raw) if send_error_is_transient(&raw) => {}
                 Err(raw) => {
                     let n = udp_write::failed();
                     warn_udp_write(UdpWriteDrop::SendFailed, n, || raw.to_string());
                     return;
                 }
             }
-            // The copy is paid before the queue decision; it only happens on
-            // `WouldBlock`, which is already the exceptional path, and buying it
-            // back would mean a capacity pre-check whose answer `try_send` can
-            // invalidate anyway.
-            let req = UdpRetry {
-                sock: sock.clone(),
-                dst,
-                payload: Bytes::copy_from_slice(payload),
-            };
-            // See `udp_try_send`: counted only once the queue owns it.
-            if udp_retry_submit(&dst, req) {
-                udp_write::retried();
-            } else {
-                let n = udp_write::dropped_no_permit();
-                warn_udp_write(UdpWriteDrop::Budget, n, || {
-                    format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
-                });
-            }
         }
+        Err(e) if send_error_is_transient(&e) => {}
         Err(e) => {
             let n = udp_write::failed();
             warn_udp_write(UdpWriteDrop::SendFailed, n, || e.to_string());
+            return;
         }
+    }
+    // The copy is paid only for a transient verdict, which is already the
+    // exceptional path; buying it back would mean a capacity pre-check whose
+    // answer `try_send` can invalidate anyway.
+    let req = UdpRetry {
+        sock: sock.clone(),
+        dst,
+        payload: Bytes::copy_from_slice(payload),
+    };
+    // See `udp_try_send`: counted only once the queue owns it.
+    if udp_retry_submit(&dst, req) {
+        udp_write::retried();
+    } else {
+        let n = udp_write::dropped_no_permit();
+        warn_udp_write(UdpWriteDrop::Budget, n, || {
+            format!("retry shard queue full ({UDP_RETRY_DEPTH} deep)")
+        });
     }
 }
 

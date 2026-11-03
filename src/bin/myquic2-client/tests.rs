@@ -4657,6 +4657,24 @@ async fn udp_associate_serves_its_first_datagram_without_a_startup_sleep() {
 /// another thread — the exact shape `spawn_slot_shard` builds — and pins the
 /// two properties migration could break: the first datagram is still served
 /// *before* the move, and the loop keeps reading the relay socket *after* it.
+/// Stops and joins the test's slot runtime even when an assertion panics, so a
+/// failing run cannot leave a parked runtime thread behind.
+struct SlotRuntimeThread {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SlotRuntimeThread {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
     // A slot runtime on its own thread, as `spawn_slot_shard` builds it.
@@ -4675,6 +4693,10 @@ async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
         });
     });
     let handle = handle_rx.recv().expect("slot runtime handle");
+    let slot = SlotRuntimeThread {
+        stop: Some(stop_tx),
+        join: Some(slot_thread),
+    };
 
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -4737,16 +4759,29 @@ async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
     // there, the second datagram cannot be read until the block ends; if it
     // stayed inline on this runtime, it is read immediately. That difference is
     // what makes this test discriminate migration from the old topology rather
-    // than merely exercising a loop.
-    slot_handle.spawn(async {
+    // than merely exercising a loop. The flag proves the block is *running*
+    // before the datagram is sent, instead of trusting a fixed sleep.
+    let blocker_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocker_flag = blocker_started.clone();
+    slot_handle.spawn(async move {
+        blocker_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(2_000));
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !blocker_started.load(std::sync::atomic::Ordering::Relaxed) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot runtime never started the blocking task"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 
     let stamp_before = entry.last.load(std::sync::atomic::Ordering::Relaxed);
     app.send_to(&frame, relay).await.unwrap();
     let blocked_until = std::time::Instant::now() + Duration::from_millis(500);
+    let mut checks = 0usize;
     while std::time::Instant::now() < blocked_until {
+        checks += 1;
         assert_eq!(
             entry.last.load(std::sync::atomic::Ordering::Relaxed),
             stamp_before,
@@ -4754,6 +4789,12 @@ async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // A starved test runtime could skip the loop body entirely and make the
+    // assertion above vacuous.
+    assert!(
+        checks >= 10,
+        "the blocked window was starved: only {checks} checks ran"
+    );
 
     // The block ends; the queued steady state reads the datagram and advances
     // the stamp.
@@ -4770,9 +4811,19 @@ async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
         "the steady state must still be running after the move"
     );
 
+    // Abort the outer task. Its abort-on-drop guard must abort the steady
+    // state too: the entry's liveness bit drops with it, which is what keeps
+    // the hub reservation and the SOCKS permit from outliving the task.
     task.abort();
-    let _ = stop_tx.send(());
-    slot_thread.join().expect("slot thread joins");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while entry.is_alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "aborting the caller must abort the moved steady state"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(slot);
 }
 
 /// The per-slot transport preset split: only the dedicated bulk UDP shards
@@ -5071,43 +5122,32 @@ async fn deferred_batch_flush_recovers_a_dead_egress_verdict() {
 /// association rides.
 #[test]
 fn slot_pinning_prioritizes_the_interactive_pair() {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Machine width is injected: on a runner with more cores than slots the
+    // no-pinning branch would otherwise be unreachable.
+    let cores = 16;
     let pool = ConnPool::new(4, vec![], true, true, 2);
     // The shipped split: the main runtime keeps half the machine, so the pinned
-    // slots may claim `usable = ceil(cores / 2)` cores at most.
+    // slots may claim `usable = cores - app_workers` cores at most.
     let app_workers = cores / 2;
-    let usable = cores.saturating_sub(app_workers).max(1);
-    let pin_cores = priority_pin_cores(&pool, app_workers);
+    let usable = cores - app_workers;
+    let pin_cores = priority_pin_cores_for(&pool, app_workers, cores);
     assert_eq!(pin_cores.len(), pool.slots_total());
-    if pool.slots_total() > cores {
-        // A pool wider than the machine is not partly pinned: pinning one slot
-        // of eight would leave the rest sharing a core with the app workers.
-        assert!(
-            pin_cores.iter().all(Option::is_none),
-            "an oversubscribed pool pins nothing"
-        );
-        return;
-    }
     // Rank 0 is always pinned (there is at least one core).
     assert_eq!(
         pin_cores[0],
         Some(0),
         "the interactive TCP slot is the top priority"
     );
-    if usable >= 2 {
-        assert_eq!(
-            pin_cores[pool.udp_global_slot(0)],
-            Some(1),
-            "the interactive UDP slot is the second priority"
-        );
-    }
-    if usable >= 3 {
-        assert_eq!(
-            pin_cores[1],
-            Some(2),
-            "the remaining TCP slots follow the interactive pair"
-        );
-    }
+    assert_eq!(
+        pin_cores[pool.udp_global_slot(0)],
+        Some(1),
+        "the interactive UDP slot is the second priority"
+    );
+    assert_eq!(
+        pin_cores[1],
+        Some(2),
+        "the remaining TCP slots follow the interactive pair"
+    );
     // Every pinned rank is a real core, and past the usable count slots float.
     let mut ranks: Vec<usize> = pin_cores.iter().flatten().copied().collect();
     ranks.sort_unstable();
@@ -5116,8 +5156,6 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
         (0..usable.min(pool.slots_total())).collect::<Vec<_>>(),
         "pins are a bijection onto the first `min(usable, slots)` ranks"
     );
-    // A pool wider than the usable cores leaves the lowest-priority tail
-    // floating: the number of pinned slots is exactly the usable core count.
     assert_eq!(
         pin_cores.iter().flatten().count(),
         usable.min(pool.slots_total()),
@@ -5142,34 +5180,43 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
         2,
         data_stale_threshold_ms(5, 40),
     );
-    let wide_pins = priority_pin_cores(&wide, app_workers);
+    let wide_pins = priority_pin_cores_for(&wide, app_workers, cores);
     assert_eq!(wide_pins.len(), wide.slots_total());
-    if wide.slots_total() > cores {
-        assert!(wide_pins.iter().all(Option::is_none), "no partial pinning");
-        return;
-    }
     assert_eq!(wide_pins[0], Some(0), "interactive TCP slot first");
-    if usable >= 2 {
-        assert_eq!(
-            wide_pins[wide.udp_global_slot(0)],
-            Some(1),
-            "first interactive UDP shard is rank 1"
+    assert_eq!(
+        wide_pins[wide.udp_global_slot(0)],
+        Some(1),
+        "first interactive UDP shard is rank 1"
+    );
+    assert_eq!(
+        wide_pins[wide.udp_global_slot(1)],
+        Some(2),
+        "second interactive UDP shard outranks every bulk slot"
+    );
+    assert_eq!(
+        wide_pins[1],
+        Some(3),
+        "the remaining TCP slots follow the whole interactive class"
+    );
+
+    // A pool wider than the machine pins nothing, at any small width: the
+    // 2-core router (OpenWrt) and a 4-core host both stay scheduler-balanced.
+    for small in [1usize, 2, 3, 4] {
+        let none = priority_pin_cores_for(&pool, small / 2, small);
+        assert!(
+            none.iter().all(Option::is_none),
+            "{small}-core host with {} slots must pin nothing",
+            pool.slots_total()
         );
     }
-    if usable >= 3 {
-        assert_eq!(
-            wide_pins[wide.udp_global_slot(1)],
-            Some(2),
-            "second interactive UDP shard outranks every bulk slot"
-        );
-    }
-    if usable >= 4 {
-        assert_eq!(
-            wide_pins[1],
-            Some(3),
-            "the remaining TCP slots follow the whole interactive class"
-        );
-    }
+    // A pool that fits the machine but exceeds `usable` pins exactly `usable`
+    // and leaves the tail floating (the pre-existing priority rule).
+    let eight = priority_pin_cores_for(&pool, 4, 8);
+    assert_eq!(
+        eight.iter().flatten().count(),
+        4,
+        "8 slots on 8 cores with 4 app workers pin exactly the 4 usable cores"
+    );
 }
 
 /// A fresh session's first datagram must reach the kernel, not the retry pool.

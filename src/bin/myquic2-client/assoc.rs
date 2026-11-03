@@ -679,10 +679,30 @@ fn relay_burst(
     // there is nothing of ours to push, and any connection-queue leftover
     // belongs to a drain that reported `Blocked`/`TooLarge` and already woke
     // the per-connection retry task.
-    if let Some(b) = *ctx.bind
-        && ctx.uplink.has_staged_batch()
-    {
-        drain_assoc_stage(ctx.egress_shared, ctx.pool, b, Some(&mut *ctx.uplink));
+    if let Some(b) = *ctx.bind {
+        if ctx.uplink.has_staged_batch() {
+            drain_assoc_stage(ctx.egress_shared, ctx.pool, b, Some(&mut *ctx.uplink));
+        }
+        if ctx.uplink.has_pending() {
+            // W3: a held payload that was created *during* this burst cannot
+            // rely on the publish notification — `notify_waiters` has no permit
+            // for a waiter that was not yet registered when the publish landed,
+            // so it would wait for the select's 100 ms backstop. The burst end
+            // is the first point guaranteed to observe a handle that appeared
+            // mid-burst; try it here, and drain whatever the flush staged.
+            let _ = flush_pending_uplink(
+                ctx.egress_shared,
+                ctx.pool,
+                ctx.sess,
+                b,
+                ctx.uplink,
+                ctx.frag,
+                coarse_millis(),
+            );
+            if ctx.uplink.has_staged_batch() {
+                drain_assoc_stage(ctx.egress_shared, ctx.pool, b, Some(&mut *ctx.uplink));
+            }
+        }
     }
     record_drain_batch(drained);
     AppDgram::Continue
@@ -816,6 +836,9 @@ struct AssocSession {
     bind: Option<UdpBind>,
     published_app: Option<SocketAddr>,
     activity_stamp: u64,
+    /// First deadline of the 30 s idle tick, drawn before the move so the
+    /// reap schedule does not restart here.
+    idle_first_tick: tokio::time::Instant,
     /// Marks the hub entry dead (and drops the relay socket) when the steady
     /// state ends, including when a runtime shutdown drops this future.
     _alive: AliveGuard,
@@ -840,6 +863,7 @@ async fn run_assoc(session: AssocSession) -> Result<()> {
         mut bind,
         mut published_app,
         mut activity_stamp,
+        idle_first_tick,
         _alive,
     } = session;
     // The receive-buffer pool is thread-local, so the steady state takes its
@@ -848,14 +872,10 @@ async fn run_assoc(session: AssocSession) -> Result<()> {
     let mut buf = assoc_recv_buf();
     // Timers are created here, on the runtime that will poll them (the slot in
     // the sharded topology), so no tick goes through another runtime's timer
-    // wheel. The jitter phase is baked into the first deadline, never slept
-    // off before serving the relay socket; `interval_at` keeps the
-    // desynchronized 30 s schedule and starts immediately.
-    let phase_ms = jitter_ms();
-    let mut idle_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_millis(phase_ms),
-        Duration::from_secs(ASSOC_IDLE_TICK_SECS),
-    );
+    // wheel. The 30 s schedule keeps the phase drawn before the move (a second
+    // jitter draw would shift the idle-reap deadline by up to one tick).
+    let mut idle_tick =
+        tokio::time::interval_at(idle_first_tick, Duration::from_secs(ASSOC_IDLE_TICK_SECS));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // W3 queue-until-publish flush timer. The branch is armed only while the
     // association holds payloads (`uplink.has_pending()` guard), so a healthy
@@ -1010,10 +1030,9 @@ pub(crate) async fn udp_associate_inner(
     // a DNS query, a STUN binding, a game handshake: the most latency-sensitive
     // one — sat unread for up to ~200 ms.
     let phase_ms = jitter_ms();
-    let mut idle_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_millis(phase_ms),
-        Duration::from_secs(ASSOC_IDLE_TICK_SECS),
-    );
+    let idle_first_tick = tokio::time::Instant::now() + Duration::from_millis(phase_ms);
+    let mut idle_tick =
+        tokio::time::interval_at(idle_first_tick, Duration::from_secs(ASSOC_IDLE_TICK_SECS));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let head = loop {
         tokio::select! {
@@ -1037,6 +1056,10 @@ pub(crate) async fn udp_associate_inner(
             }
         }
     };
+    // This interval was registered on the pre-migration runtime; release it
+    // before waiting on the moved task so it does not pin a timer entry there
+    // for the association's whole life.
+    drop(idle_tick);
     let first = {
         let mut ctx = AppDgramCtx {
             sess,
@@ -1082,20 +1105,55 @@ pub(crate) async fn udp_associate_inner(
         bind,
         published_app,
         activity_stamp,
+        idle_first_tick,
         _alive,
     };
     match target {
-        Some(handle) => match handle.spawn(run_assoc(session)).await {
-            Ok(result) => result?,
-            // The slot runtime is shutting down and dropped the task. The
-            // session's own drops (`AliveGuard`, relay, uplink) still ran, and
-            // the pre-sharding shape dropped these tasks just as silently.
-            Err(e) if e.is_cancelled() => {}
-            Err(e) => return Err(anyhow::anyhow!("udp association task: {e}")),
-        },
+        Some(handle) => {
+            let task = handle.spawn(run_assoc(session));
+            // The caller's future owns the hub reservation and the SOCKS
+            // admission permit; see `AssocAbort`.
+            let abort = AssocAbort(task.abort_handle());
+            let result = task.await;
+            drop(abort);
+            match result {
+                Ok(result) => result?,
+                // The slot runtime is gone (shutdown, or a fatal endpoint
+                // error) and dropped the session, so `finish_assoc` never ran.
+                // Silent success would hide that; only a real shutdown may end
+                // an association this way.
+                Err(e) if e.is_cancelled() => {
+                    if !crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                        anyhow::bail!(
+                            "udp association task was cancelled: the egress slot runtime is gone"
+                        );
+                    }
+                }
+                // Preserve the panic payload and site for the caller's log.
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => return Err(anyhow::anyhow!("udp association task: {e}")),
+            }
+        }
         None => run_assoc(session).await?,
     }
     Ok(())
+}
+
+/// Aborts a spawned association when the future awaiting it is dropped.
+///
+/// Before the steady state moved to the egress slot's runtime, the whole
+/// association lived in the caller's future, so dropping that future tore it
+/// down. A `JoinHandle` drop only *detaches* the task: the hub reservation and
+/// the SOCKS admission permit would be released while the task still held the
+/// relay socket and its payloads. Aborting on drop restores the coupling; the
+/// task's own drops (`AliveGuard`, relay, uplink, receive buffer) then run on
+/// its runtime.
+struct AssocAbort(tokio::task::AbortHandle);
+
+impl Drop for AssocAbort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// One in-progress BATCH run of the association's opportunistic N-pack.

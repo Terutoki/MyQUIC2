@@ -129,6 +129,27 @@ pub struct R2DrainOutcome {
     pub failed: Option<DatagramSend>,
 }
 
+/// Outcome of [`try_send_direct`].
+///
+/// Separate from [`R2DrainOutcome`] because the caller has to book the verdict
+/// itself: the queue's send phase normally owns that accounting, but a direct
+/// frame never enters the queue.
+#[derive(Debug)]
+pub enum DirectSend {
+    /// The frame is on the wire.
+    Sent,
+    /// The encoded frame no longer fits the live path budget; the caller books
+    /// it as a size drop (and re-arms its budget probe).
+    TooLarge,
+    /// The connection cannot carry DATAGRAMs, or is gone. The caller books one
+    /// `EGRESS_DEAD` payload and ends the session.
+    Terminal(DatagramSend),
+    /// The fast path does not apply (queue not empty, a drain in flight, the
+    /// stager cannot accept the item, or the send buffer is full). The item is
+    /// handed back for the normal queued path.
+    NotNow(R2StageItem),
+}
+
 /// One encoded DATAGRAM of a test-shape `next_frame` probe.
 #[cfg(test)]
 struct EncodedFrame {
@@ -357,20 +378,6 @@ impl R2Stager {
     #[must_use]
     pub fn wire(&self) -> Wire {
         self.wire
-    }
-
-    /// The drain gate, for a caller that sends a frame outside the queue and
-    /// must not overtake an in-flight drain.
-    ///
-    /// A direct send can skip the queue only when the queue is empty **and** no
-    /// drainer holds this gate (a drainer may already have claimed items and
-    /// not sent them yet, which the queue's emptiness cannot show). Cloning the
-    /// `Arc` is what the drain itself does; the guard is taken after the stager
-    /// lock is released, so the two mutexes are never nested in the opposite
-    /// order.
-    #[must_use]
-    pub fn drain_gate(&self) -> std::sync::Arc<parking_lot::Mutex<()>> {
-        self.drain_gate.clone()
     }
 
     /// Apply the negotiated `CAPS.max_train_items` (clamped to the codec bound;
@@ -1437,6 +1444,58 @@ fn stage_lock<'a>(
     }
 }
 
+/// Encode and send one item **outside** the queue, when that is safe.
+///
+/// The queue exists to pack several payloads into one DATAGRAM and to hold a
+/// backlog behind a full send buffer. A lone payload with an empty queue gets
+/// neither, and routing it through the stager costs an owned copy, a queue
+/// round trip and several lock acquisitions for a frame that is byte-identical
+/// to a direct send. This is the fast path for that shape.
+///
+/// It is only taken when the whole queue is empty **and** the stager's drain
+/// gate is free: a drainer holds the gate between claiming a session's items
+/// and putting them on the wire, so sending while it does would let this frame
+/// overtake already-claimed frames of the same session. `accepts` keeps the
+/// queued path's bound policy: a stager that cannot take the item would *drop*
+/// it there, and the direct path must not turn that policy drop into a send.
+///
+/// The gate guard lives only for this call (encode + hand-off, no await), and
+/// the stager lock is released before it is taken, so the two mutexes are never
+/// nested in the opposite order.
+pub fn try_send_direct(
+    stage: &parking_lot::Mutex<R2Stager>,
+    conn: &Connection,
+    item: R2StageItem,
+    limit: usize,
+) -> DirectSend {
+    let (gate, empty, accepts, wire) = {
+        let st = stage.lock();
+        (
+            st.drain_gate.clone(),
+            st.is_empty(),
+            st.accepts(item.payload.len()),
+            st.wire(),
+        )
+    };
+    if !empty || !accepts {
+        return DirectSend::NotNow(item);
+    }
+    let Some(_gate) = gate.try_lock() else {
+        return DirectSend::NotNow(item);
+    };
+    let Some(body) = encode_standalone_item_for(wire, &item, limit) else {
+        return DirectSend::TooLarge;
+    };
+    match try_send_datagram(conn, body) {
+        // Backpressure is not loss: hand the item back so the caller queues it
+        // exactly like the normal path.
+        DatagramSend::Blocked => DirectSend::NotNow(item),
+        DatagramSend::Sent => DirectSend::Sent,
+        DatagramSend::TooLarge => DirectSend::TooLarge,
+        other => DirectSend::Terminal(other),
+    }
+}
+
 /// Shared drain body; `None` means a `try_only` attempt gave up with no work
 /// done (and must therefore not be reported as a completed drain).
 fn drain_staged_inner(
@@ -1453,29 +1512,25 @@ fn drain_staged_inner(
     // race on the same stager. Both used to claim under the stager lock but
     // send outside it, so the second claim could overtake the first send.
     //
-    // The gate and the queue state come from **one** hold: the drain runs at
-    // every association burst end, and an idle or already-drained queue is the
-    // common case, so that case must cost one stager lock and no quinn probe
-    // rather than the three-lock walk it used to.
-    let (drain_gate, empty) = {
-        let st = stage_lock(stage, try_only)?;
-        (st.drain_gate.clone(), st.is_empty())
-    };
-    if empty {
-        return Some(total);
-    }
+    // The gate is taken **before** the queue is judged empty, and that order is
+    // load-bearing. Callers use a completed drain as a barrier before sending a
+    // frame directly (the server's rebind `OPEN|SRC` and large replies, the
+    // client's standalone payloads), while a drainer holds the gate between
+    // claiming a session's frames and putting them on the wire. Concluding
+    // "empty" outside the gate would let such a direct frame overtake frames
+    // that are already claimed but not yet sent — a per-session FIFO break that
+    // the queue's emptiness cannot show. The empty case therefore costs the
+    // gate plus one short stager hold, and nothing else.
+    let drain_gate = stage_lock(stage, try_only)?.drain_gate.clone();
     let _drain_guard = if try_only {
         drain_gate.try_lock()?
     } else {
         drain_gate.lock()
     };
-    // One backpressure probe per drain, not per claimed batch. The send phase
-    // already stops at the first failed frame, so a buffer that fills mid-drain
-    // costs exactly the one frame it always did; probing again between claims
-    // bought nothing but a connection-state lock on the drain path (the driver
-    // holds that same mutex across its transmit batch).
-    if conn.datagram_send_buffer_space() == 0 {
-        total.failed = Some(DatagramSend::Blocked);
+    // A `try_only` attempt that loses the stager here has done no work, so the
+    // `?` reports `Busy` (the holder is the drainer this call lost to).
+    let empty = stage_lock(stage, try_only)?.is_empty();
+    if empty {
         return Some(total);
     }
     let mut handled = 0usize;
@@ -1483,6 +1538,16 @@ fn drain_staged_inner(
     // A `try_only` attempt that never did must report `Busy`, not `Drained`.
     let mut progress = false;
     loop {
+        // Backpressure before the claim, once per batch. `send_packed_frames`
+        // drops the payloads of the frame whose send is refused and requeues
+        // only the tail, so a claim made after the send buffer filled would
+        // lose that frame (up to `R2_PACK_BATCH_ITEMS` payloads) instead of
+        // leaving it queued for the retry task. Probing only once per drain
+        // looked cheaper but traded those payloads for one state-lock take.
+        if conn.datagram_send_buffer_space() == 0 {
+            total.failed = Some(DatagramSend::Blocked);
+            break;
+        }
         // One hold per batch: learn emptiness and claim together. Every
         // `claim_one_frame` call removes at least one item, so `handled` is
         // also the loop's progress bound (including items dropped as too

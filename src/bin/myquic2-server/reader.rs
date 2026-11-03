@@ -4,7 +4,7 @@ use myquic2::mqp::r2;
 use myquic2::mqp::r2_flow::{FlowBinding, FlowRegistry, FlowState, SessionFlows, SourceMatch};
 use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::r2_frag::R2FragFlow;
-use myquic2::udp::r2_stage::encode_standalone_item_for;
+use myquic2::udp::r2_stage::{DirectSend, encode_standalone_item_for, try_send_direct};
 use myquic2::udp::{
     R2Fragmenter, R2StageItem, R2StageKind, R2Stager, book_too_large, drain_staged,
 };
@@ -92,21 +92,6 @@ pub(crate) fn too_large_probe_due(last_probe_ms: u64, now_ms: u64) -> bool {
 #[cfg(test)]
 pub(crate) fn sess_buf_pool_len() -> usize {
     SESS_BUF_POOL.with(|p| p.borrow().len())
-}
-
-/// Drop the socket's cached readable readiness without issuing a recv syscall.
-///
-/// [`recv_burst`] reads through `recvmmsg` on the raw descriptor, so it never
-/// tells tokio's reactor that the socket has no more data. Tokio's readiness
-/// therefore stays set, and the next `recv_from` on this socket issues a
-/// `recvfrom` that can only return `EAGAIN` — one wasted syscall per idle
-/// transition (for the request/response shape: every reply). `try_io` with a
-/// closure that returns `WouldBlock` is tokio's own way to clear that bit; it
-/// runs no syscall because the closure never touches the descriptor.
-fn clear_recv_readiness(sock: &tokio::net::UdpSocket) {
-    let _ = sock.try_io(tokio::io::Interest::READABLE, || {
-        Err::<usize, std::io::Error>(std::io::ErrorKind::WouldBlock.into())
-    });
 }
 
 /// Wire length of the `atyp | addr | port` header a packed frame carries for
@@ -705,56 +690,43 @@ impl StageBatch {
     /// is momentarily full (the item is then re-queued so nothing is dropped
     /// that the queue could have held). `Some(verdict)` means the item left the
     /// batch — sent, dropped as too large, or the connection is gone.
+    ///
+    /// The fast-path decision, the drain gate and the item's capacity policy
+    /// live in [`try_send_direct`]; this function only books the verdict,
+    /// exactly as the queued path's send phase would.
     fn flush_single(
         &mut self,
         c2: &quinn::Connection,
         limit: &mut usize,
         last_too_large_probe_ms: &mut u64,
     ) -> Option<StageDrain> {
-        // One stager hold: the gate, emptiness, capacity and the wire revision
-        // must be read together (the wire is fixed for a connection, but the
-        // gate is not). The gate is acquired after the stager lock is dropped.
-        //
-        // `accepts` keeps the queued path's *drop* semantics: a stager that
-        // cannot take the item (full, or configured with no capacity at all)
-        // drops it with `BUFFER_FULL` accounting, and the direct path must not
-        // turn that policy drop into a send.
-        let (gate, empty, accepts, wire) = {
-            let st = self.stage.lock();
-            let len = self.pending.first().map_or(0, |item| item.payload.len());
-            (st.drain_gate(), st.is_empty(), st.accepts(len), st.wire())
-        };
-        if !empty || !accepts {
-            return None;
-        }
-        let _gate = gate.try_lock()?;
         // The batch is task-local, so the length cannot change between the
         // guard in `flush` and here; `pop` still keeps the code honest if a
         // future caller stages from two places.
         let item = self.pending.pop()?;
-        let Some(body) = encode_standalone_item_for(wire, &item, *limit) else {
-            // The queued path's `encode_claimed` drops and books it the same
-            // way; doing it here keeps the accounting identical.
-            book_too_large(1);
-            reprobe_large(c2, limit, last_too_large_probe_ms);
-            return Some(StageDrain::TooLarge);
-        };
-        match try_send_datagram(c2, body) {
-            DatagramSend::Sent => {
-                udp_stats::payload(item.payload.len());
+        let len = item.payload.len();
+        match try_send_direct(&self.stage, c2, item, *limit) {
+            DirectSend::Sent => {
+                udp_stats::payload(len);
                 Some(StageDrain::Ok)
             }
-            DatagramSend::Blocked => {
-                // Backpressure, not loss: hand it back to the queue below.
-                self.pending.push(item);
-                None
-            }
-            DatagramSend::TooLarge => {
+            DirectSend::TooLarge => {
                 book_too_large(1);
                 reprobe_large(c2, limit, last_too_large_probe_ms);
                 Some(StageDrain::TooLarge)
             }
-            DatagramSend::Unsupported | DatagramSend::ConnectionLost => Some(StageDrain::Terminal),
+            DirectSend::Terminal(_) => {
+                // The queued path books one `EGRESS_DEAD` per payload before
+                // dropping it (`send_packed_frames`); a direct frame must not
+                // vanish from that accounting just because it skipped the
+                // queue.
+                let _ = dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                Some(StageDrain::Terminal)
+            }
+            DirectSend::NotNow(item) => {
+                self.pending.push(item);
+                None
+            }
         }
     }
 
@@ -1911,13 +1883,15 @@ pub(crate) async fn sess_reader_task(
                     break;
                 }
                 match recv_burst(&rs, LAST_HOP_DRAIN - drained) {
-                    Some(0) => {
-                        // The burst syscall does not go through tokio's
-                        // readiness accounting; clear the stale bit so the next
-                        // `recv_from` parks instead of paying an `EAGAIN`.
-                        clear_recv_readiness(&rs);
-                        break;
-                    }
+                    // Leave the readable bit set: `recv_burst` reads through a
+                    // raw `recvmmsg`, so it never goes through tokio's readiness
+                    // accounting, and clearing the bit ourselves races a newer
+                    // event (a reply arriving between the `recvmmsg` and a
+                    // synthetic clear can be erased on a multi-thread runtime,
+                    // and `recv_burst` reports a non-`WouldBlock` error as
+                    // `0`). The next `recv_from` costs one `EAGAIN` on the
+                    // idle transition and clears the bit the way tokio expects.
+                    Some(0) => break,
                     Some(k) => {
                         burst_n = k;
                         burst_i = 1;

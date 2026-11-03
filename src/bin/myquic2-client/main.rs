@@ -81,6 +81,17 @@ fn report_fd_budget() {
     }
 }
 
+/// Set once the process is shutting down.
+///
+/// A UDP association's steady state runs as a task on its egress slot's
+/// runtime; when that runtime is torn down before the process exits, the
+/// awaiting task sees a cancelled `JoinError`. That is the normal shutdown
+/// shape, not an association fault, so the error is suppressed only while this
+/// flag is set (and reported otherwise: a cancelled task means the session's
+/// teardown never ran).
+pub(crate) static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -565,6 +576,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
             },
             _ = &mut shutdown => {
                 info!("shutdown signal received: closing endpoints so conns drop and peers can reconnect");
+                SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
                 // Sharded slots own their endpoints: the flag wakes each
                 // shard, which closes its endpoint and drains it under its own
                 // bounded deadline (see `spawn_slot_shard`).
@@ -713,6 +725,14 @@ const SLOT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// floors at one), which matches the no-op `pin_to_core` there.
 fn priority_pin_cores(pool: &ConnPool, app_workers: usize) -> Vec<Option<usize>> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    priority_pin_cores_for(pool, app_workers, cores)
+}
+
+/// [`priority_pin_cores`] with the machine width injected, so both pinning
+/// shapes are testable on any host (a CI runner with more cores than slots
+/// never reaches the no-pinning branch otherwise).
+fn priority_pin_cores_for(pool: &ConnPool, app_workers: usize, cores: usize) -> Vec<Option<usize>> {
+    let cores = cores.max(1);
     let usable = cores.saturating_sub(app_workers).max(1);
     let slots = pool.slots_total();
     // A pool wider than the machine must not be partly pinned. Pinning is only
@@ -722,7 +742,9 @@ fn priority_pin_cores(pool: &ConnPool, app_workers: usize) -> Vec<Option<usize>>
     // alone while everything that matters competes for one core, which is
     // worse than letting the scheduler balance all of them. The slot count is
     // the operator's to lower (`conn_count`/`udp_*_conns`); until then, no
-    // pinning is the honest shape.
+    // pinning is the honest shape. The cutoff is the machine width, not
+    // `usable`: a pool that fits the machine may still pin only `usable` slots
+    // and leave the tail floating (the pre-existing priority rule).
     if slots > cores {
         return vec![None; slots];
     }
