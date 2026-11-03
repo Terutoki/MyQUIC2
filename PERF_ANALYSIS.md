@@ -2341,3 +2341,141 @@ rather than silent, and a flow that keeps filling the window does see reduced
 throughput. Second, P3-9 itself is untouched: the interactive class still shares
 one connection, and this change bounds the damage of that sharing rather than
 removing it.
+
+## 22. Fifteenth Batch: the per-datagram lock tax, the first packet of a session, and the lone reply (2026-11-03, post-81b370b)
+
+A fresh code-level audit ranked the remaining costs by call frequency. The
+top items were not "one more memcpy" but the fixed number of lock acquisitions
+one small datagram pays, the two-runtime split on the client, and the session
+setup path. This batch takes the ones that need no protocol or admission policy
+change.
+
+### 22.1 Client: the admission probe no longer takes the connection-state lock
+
+`ConnRev2::admit_uplink` ran per small payload and always called
+`datagram_send_buffer_space()`, which is a **connection-state `std::sync::Mutex`**
+take in quinn — the same mutex `ConnectionDriver::poll` holds across
+`process_conn_events` and up to `MAX_TRANSMIT_DATAGRAMS = 20` socket sends. A
+probe racing a busy driver can park a work-stealing worker for tens of
+microseconds, once per payload, on the connection whose purpose is latency.
+
+The cheap gate is now the stager's own backlog (a `parking_lot` hold the
+caller is about to take anyway): while `staged + batched + len <= cap / 2`, the
+payload is admitted without touching quinn. The exact probe runs only when its
+answer can change the verdict. The time bound is no looser: with quinn empty the
+whole queue is now bounded at half the window (plus one payload); with quinn
+full the exact check refuses as before, so the stager half stays under `cap/2`.
+
+### 22.2 Client: the drain's lock count, and the empty-burst drain
+
+`drain_staged_inner` took the stager lock to clone the gate, again to test
+emptiness, again to claim, and a fourth time afterwards to decide the retry
+wakeup, plus one state-lock `datagram_send_buffer_space()` probe per claimed
+batch. It now takes **one** hold to clone the gate and learn the queue state,
+returns immediately when empty, probes the send buffer **once per drain**, and
+claims one hold per batch. The post-drain wakeup uses `try_lock` (a lost race
+means a drainer is active, so notifying is right either way) instead of a
+blocking acquisition on an association task.
+
+On the association side, the burst-end drain is skipped when this burst staged
+nothing (`UplinkFlows::has_staged_batch`). A connection-queue leftover can only
+come from a drain that reported `Blocked`/`TooLarge`, and that drain already
+woke the per-connection retry task — the unconditional call was a gate, two
+stager locks and a state probe spent on a no-op for every burst, including the
+one-payload request/response shape.
+
+### 22.3 Server: a lone small reply goes straight to the wire
+
+Every reply ≤ `BATCH_SMALL_MAX` was pushed to the connection stager (owned
+`Bytes` copy, `push_batch`, drain: gate + stager + state probe, claim, encode
+copy) even when it was the only reply in its burst — two allocations, two
+copies and three or four lock acquisitions for a frame that is byte-identical to
+a direct send. `StageBatch::flush` now takes a fast path when exactly one reply
+is pending, the connection queue is empty **and** the drain gate is free, and
+encodes with the same `encode_standalone_item_for` the claim phase uses. The
+gate requirement is what rules out overtaking a claim that is already in flight;
+`R2Stager::accepts` keeps the queued path's drop semantics when the stager
+cannot take the item (full, or zero-capacity), so a policy drop never becomes a
+send. `Blocked` puts the item back and falls through to the queue.
+
+### 22.4 Server: session creation and the first send
+
+Session sockets are now created through `udp_socket_dual_small_addr` instead of
+formatting and re-parsing `"[::]:0"` per session.
+
+The first send on a fresh session socket is the more interesting half. tokio's
+`try_send_to` returns `WouldBlock` **without issuing the syscall** while the
+fd's cached writable readiness is empty, and a socket registered microseconds
+ago is exactly that — so the first datagram of every association was handed to
+the sharded retry pool (an allocation, an mpsc hand-off, a worker wake and a
+scheduler round trip). `udp_try_send_or_return`/`udp_try_send_slice` now try
+`try_send_to_raw` (socket2 `SockRef::send_to`) before queueing: only a real
+kernel `WouldBlock` reaches the retry pool, and a real hard error is now
+reported to the caller instead of being retried as if it were backpressure.
+
+The session reader also clears tokio's readable readiness after `recvmmsg`
+returns 0 (that raw syscall never goes through tokio's accounting), so the next
+`recv_from` parks instead of issuing an `EAGAIN` — one fewer syscall per
+request/response wakeup.
+
+### 22.5 Flow-control windows in the shipped configs
+
+`4/8/4 MB` caps a single flow at `4 MB / 140 ms ≈ 228 Mb/s` before BBR is
+consulted, against the documented 300 Mb/s target. The shipped
+`config-client.toml` / `config-server.toml` now set the 8/16/8 MB preset
+(the crate default stays memory-first; the config is what these deployments
+use). It costs ~12 MB more per admitted connection, charged against
+`max_peer_memory_mb`. ACK frequency stays at 2/5 ms so interactive flows do not
+inherit the bulk pairing's 10 ms ACK delay.
+
+### 22.6 Smaller items in the same batch
+
+- **W3 hold wakeup.** `SharedEgress` now keeps one `Notify` per binding and
+  raises it on every publish, and the association selects on it while it holds
+  payloads. The 100 ms tick remains only as a backstop for a missed race. This
+  closes the window where a one-shot payload held across a cold start or a
+  redial waited up to a tick after egress returned.
+- **`push_batch` is O(n).** The old loop `remove(0)`-ed each accepted item,
+  shifting the tail per item (measured ~1.5 µs for 64 items under the stager
+  mutex). It now computes the accepted prefix in one pass and moves it with one
+  `drain`.
+- **`stage_batch_bytes` is counted, not summed.** The admission check no longer
+  walks the burst batch once per payload.
+- **Pinning.** A pool wider than the machine is no longer partly pinned: with 8
+  slots on a 2-core router the old plan pinned one slot and left seven sharing
+  the other core with the app workers.
+
+### 22.7 Verification
+
+`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test --all-targets` all clean: **771 passed, 0 failed, 1 ignored**
+(lib 384, client 208, server 163 + 1 ignored, `forward_e2e` 7, `rev3_e2e` 9).
+New tests: `a_fresh_sockets_first_send_bypasses_tokios_readiness_gate` (the raw
+path sends and does not count `retried`) and
+`publishing_an_egress_handle_wakes_the_held_association` (the Notify trigger);
+`rev2_stage_queue_full_drops_and_counts` pins that the lone-reply fast path
+still falls back to the drop path when the stager cannot accept the item.
+
+### 22.8 Deliberately not changed
+
+- **The client's app-side tasks still run on the main runtime** while the QUIC
+  driver runs on a pinned slot thread. Moving the association task to the slot
+  runtime is blocked on *when* the egress class is decided: `pool.udp_class`
+  needs the first payload's destination port **and size**, so the slot (and
+  therefore the runtime) is not known at spawn. Doing it properly needs either
+  (a) a design decision to pick the class earlier (port/config based, losing
+  the first-payload size heuristic), or (b) a per-slot app-socket loop with its
+  own reactor, which is a new subsystem rather than a fix. The per-packet
+  *cost* of the split is reduced by §22.1/§22.2 (no per-payload state lock, one
+  drain probe), but the cross-core wake and the packing effect remain.
+- **The server fast table's capacity.** 568 slots against a documented ~1000
+  sessions per connection is a real slow-path rate, but the fix is a
+  memory/admission tradeoff (a 4096-slot table is ~360 KiB per connection).
+  `fast_table: hits=/misses=` in the 60 s line is the measurement to size it
+  from.
+- **Forward-listener batching.** Per-datagram staging there is one stager lock
+  per datagram; batching it needs the admission-eviction path to flush the
+  evicted peer's batch first, or a `Drop` accounting path for it.
+- **Keeping emptied per-session queues** to save one malloc/free per payload:
+  the retained `HashMap` entry is not covered by the stager's admission charge,
+  and it would grow with every session a connection ever saw.

@@ -816,7 +816,18 @@ pub(crate) async fn udp_associate_inner(
                 // stager with one lock hold and drain it now. Large payloads
                 // already flushed and drained inside `send_uplink` before
                 // going out directly.
-                if let Some(b) = bind {
+                //
+                // Only when this burst actually staged something: with the
+                // batch empty there is nothing of ours to push, and any
+                // connection-queue leftover belongs to a drain that reported
+                // `Blocked`/`TooLarge` and already woke the per-connection
+                // retry task — so the old unconditional call was a gate, two
+                // stager locks and a quinn state probe bought for a no-op on
+                // every burst (including the one-payload request/response
+                // shape).
+                if let Some(b) = bind
+                    && uplink.has_staged_batch()
+                {
                     drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
                 }
                 record_drain_batch(drained);
@@ -877,7 +888,30 @@ pub(crate) async fn udp_associate_inner(
             // association whose app is waiting for a reply sends no next burst).
             // Armed only while the hold is non-empty: the steady association
             // never wakes for this branch.
+            //
+            // The `tick` is the backstop; the `wait_publish` arm below is the
+            // low-latency trigger, so a one-shot payload held across a cold
+            // start or a redial leaves as soon as a handle exists instead of
+            // waiting up to the 100 ms cadence.
             _ = pending_flush.tick(), if uplink.has_pending() => {
+                if let Some(b) = bind {
+                    let _ = flush_pending_uplink(
+                        &egress_shared,
+                        &pool,
+                        sess,
+                        b,
+                        &mut uplink,
+                        &mut frag,
+                        coarse_millis(),
+                    );
+                    drain_assoc_stage(&egress_shared, &pool, b, Some(&mut uplink));
+                }
+            }
+            // W3 low-latency trigger: a fresh egress handle was published for
+            // this binding, so release the hold now. Same body as the tick; the
+            // guard keeps a healthy association from registering the future at
+            // all.
+            _ = egress_shared.wait_publish(bind), if uplink.has_pending() => {
                 if let Some(b) = bind {
                     let _ = flush_pending_uplink(
                         &egress_shared,

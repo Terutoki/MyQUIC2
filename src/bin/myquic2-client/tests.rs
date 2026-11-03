@@ -4952,6 +4952,15 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
     let usable = cores.saturating_sub(app_workers).max(1);
     let pin_cores = priority_pin_cores(&pool, app_workers);
     assert_eq!(pin_cores.len(), pool.slots_total());
+    if pool.slots_total() > cores {
+        // A pool wider than the machine is not partly pinned: pinning one slot
+        // of eight would leave the rest sharing a core with the app workers.
+        assert!(
+            pin_cores.iter().all(Option::is_none),
+            "an oversubscribed pool pins nothing"
+        );
+        return;
+    }
     // Rank 0 is always pinned (there is at least one core).
     assert_eq!(
         pin_cores[0],
@@ -5008,6 +5017,10 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
     );
     let wide_pins = priority_pin_cores(&wide, app_workers);
     assert_eq!(wide_pins.len(), wide.slots_total());
+    if wide.slots_total() > cores {
+        assert!(wide_pins.iter().all(Option::is_none), "no partial pinning");
+        return;
+    }
     assert_eq!(wide_pins[0], Some(0), "interactive TCP slot first");
     if usable >= 2 {
         assert_eq!(
@@ -5030,6 +5043,69 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
             "the remaining TCP slots follow the whole interactive class"
         );
     }
+}
+
+/// A fresh session's first datagram must reach the kernel, not the retry pool.
+///
+/// tokio's `try_send_to` refuses to issue the syscall while a just-registered
+/// socket has no cached writable readiness, and reports that as an ordinary
+/// `WouldBlock`; the two look identical from the outside. `udp_try_send` now
+/// tries the raw descriptor first on that verdict, which is the difference
+/// between "the kernel accepted it" and "the payload pays an allocation, an
+/// mpsc hand-off and a scheduler round trip". Pinned because every UDP session
+/// creates its socket and sends on it immediately: without the raw path this
+/// assertion fails for every created session, not just under load.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fresh_sockets_first_send_bypasses_tokios_readiness_gate() {
+    let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("sink socket");
+    let sink_addr = sink.local_addr().expect("sink addr");
+    sink.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("sink timeout");
+    let raw = std::net::UdpSocket::bind("127.0.0.1:0").expect("source socket");
+    raw.set_nonblocking(true).expect("source nonblocking");
+    let sock = Arc::new(tokio::net::UdpSocket::from_std(raw).expect("register source"));
+
+    let before = udp_write::snapshot();
+    udp_try_send(&sock, sink_addr, bytes::Bytes::from_static(b"hello"));
+    let d = udp_write::snapshot().since(&before);
+    assert_eq!(d.sent, 1, "the first send must reach the kernel");
+    assert_eq!(
+        d.retried, 0,
+        "the cached-readiness miss must not divert the first send to the retry pool"
+    );
+    let mut buf = [0u8; 16];
+    let (n, _) = sink.recv_from(&mut buf).expect("sink receives");
+    assert_eq!(&buf[..n], b"hello", "the datagram must be on the wire");
+}
+
+/// The W3 hold wakeup: publishing a handle for a binding wakes the associations
+/// waiting on it, so a payload held across a cold start or a redial leaves as
+/// soon as egress exists instead of waiting out the 100 ms tick.
+#[tokio::test]
+async fn publishing_an_egress_handle_wakes_the_held_association() {
+    let egress = Arc::new(SharedEgress::default());
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    let waiter = tokio::spawn({
+        let egress = egress.clone();
+        async move {
+            egress.wait_publish(Some(bind)).await;
+            true
+        }
+    });
+    // Let the task register before the publish lands.
+    tokio::task::yield_now().await;
+    egress.notify_published(bind);
+    let woke = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the publish must wake the waiter")
+        .expect("waiter joins");
+    assert!(woke);
+    // A publish with no waiter is a no-op, not a panicking notify.
+    egress.notify_published(bind);
 }
 
 // ---- Memory-retention fixes: egress dead-handle release, UDP-assoc cap ----

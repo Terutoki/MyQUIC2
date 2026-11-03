@@ -7,7 +7,7 @@ use myquic2::*;
 use quinn::Runtime;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
     time::Duration,

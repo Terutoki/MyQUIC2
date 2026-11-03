@@ -85,14 +85,17 @@ auth_token = ""
 # the budget above the fixed term or lower MYQUIC2_SESS_SOCKET_BUF /
 # MYQUIC2_RELAY_SOCKET_BUF / quic_endpoints first.
 # max_peer_memory_mb = 8192
-# Default 4/8/4 MB matches code defaults; must mirror the client (download
-# capped by receiver, upload by sender, so change both sides together).
-# Omit all five to use defaults; the 2/4/2 MB low-memory preset (~114 Mb/s,
-# 8.25 MiB per connection) suits RAM-tight hosts, and 8/16/8 MB gives 300 Mb/s
-# peak at ~4x loaded latency.
-# stream_receive_window_mb = 4
-# receive_window_mb = 8
-# send_window_mb = 4
+# Flow-control windows, shipped as the 8/16/8 MB preset (300 Mb/s @140 ms) and
+# must mirror the client: the download direction is capped by the receiver's
+# window, the upload by the sender's, so change both sides together. This is
+# ~12 MB more per admitted connection than the crate's 4/8/4 default, and it is
+# charged against max_peer_memory_mb above. The 2/4/2 MB low-memory preset
+# (~114 Mb/s, 8.25 MiB per connection) suits RAM-tight hosts.
+stream_receive_window_mb = 8
+receive_window_mb = 16
+send_window_mb = 8
+# ACK frequency stays at the interactive preset (threshold 2 / 5 ms); the bulk
+# class already uses 8/10 (transport/build.rs) on its dedicated connections.
 # ack_threshold = 2
 # max_ack_delay_ms = 5
 # RTT seed in ms for the first PTO / initial pacing (default 190). Set it to

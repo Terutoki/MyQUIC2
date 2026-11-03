@@ -330,6 +330,19 @@ impl R2Stager {
         self.queued_bytes
     }
 
+    /// Whether one more `len`-byte item could be queued right now.
+    ///
+    /// A direct send outside the queue is only equivalent to the queued path
+    /// when the queue could have taken the item: with a full (or
+    /// zero-capacity) stager the queued path *drops* it with `BUFFER_FULL`
+    /// accounting, and skipping the queue would silently turn a policy drop
+    /// into a send. Same two bounds [`Self::push`] enforces.
+    #[must_use]
+    pub fn accepts(&self, len: usize) -> bool {
+        self.queued_items < self.max_items
+            && self.queued_bytes.saturating_add(len) <= self.max_bytes
+    }
+
     /// Set the wire revision this stager encodes for.
     ///
     /// Called by the connection state constructor (a stager is created before
@@ -344,6 +357,20 @@ impl R2Stager {
     #[must_use]
     pub fn wire(&self) -> Wire {
         self.wire
+    }
+
+    /// The drain gate, for a caller that sends a frame outside the queue and
+    /// must not overtake an in-flight drain.
+    ///
+    /// A direct send can skip the queue only when the queue is empty **and** no
+    /// drainer holds this gate (a drainer may already have claimed items and
+    /// not sent them yet, which the queue's emptiness cannot show). Cloning the
+    /// `Arc` is what the drain itself does; the guard is taken after the stager
+    /// lock is released, so the two mutexes are never nested in the opposite
+    /// order.
+    #[must_use]
+    pub fn drain_gate(&self) -> std::sync::Arc<parking_lot::Mutex<()>> {
+        self.drain_gate.clone()
     }
 
     /// Apply the negotiated `CAPS.max_train_items` (clamped to the codec bound;
@@ -584,19 +611,38 @@ impl R2Stager {
         if items.is_empty() {
             return Ok(self.queued_items);
         }
-        // Consume from the front and keep the caller's allocation: taking the
-        // Vec would leave it at capacity 0, so the next burst would allocate
-        // again just to hand the items over. The shift is over at most one
-        // burst (`LAST_HOP_DRAIN`), and the items are pointer-sized moves.
         let total = items.len();
-        for accepted in 0..total {
-            let item = items.remove(0);
-            if let Err(back) = self.push(item) {
-                items.insert(0, back);
-                return Err(accepted);
+        // How much of the batch fits, in one pass. `push` refuses from the
+        // first item that would cross either bound and both bounds only grow,
+        // so the accepted prefix is exactly this prefix. The old loop removed
+        // `items[0]` per accepted item, shifting the whole tail every time —
+        // O(items^2) memmove under the stager mutex (measured ~1.5 us for a
+        // 64-item burst). The batch then moves with one `drain`.
+        let mut accepted = 0usize;
+        let mut bytes = self.queued_bytes;
+        for item in items.iter() {
+            if self.queued_items + accepted >= self.max_items
+                || bytes.saturating_add(item.payload.len()) > self.max_bytes
+            {
+                break;
             }
+            bytes += item.payload.len();
+            accepted += 1;
         }
-        Ok(self.queued_items)
+        for item in items.drain(..accepted) {
+            // Cannot fail: the pre-pass applies the same monotone bounds
+            // `push` checks, and nothing else mutates the queue under this
+            // lock. A silent `Err` here would lose a payload, so debug builds
+            // assert it.
+            let pushed = self.push(item);
+            debug_assert!(pushed.is_ok(), "push_batch pre-pass and push disagree");
+            let _ = pushed;
+        }
+        if accepted == total {
+            Ok(self.queued_items)
+        } else {
+            Err(accepted)
+        }
     }
 
     /// Drop everything, returning how many items the caller must account for
@@ -1406,46 +1452,59 @@ fn drain_staged_inner(
     // two drainers (an association burst-end and the connection retry task)
     // race on the same stager. Both used to claim under the stager lock but
     // send outside it, so the second claim could overtake the first send.
-    let drain_gate = stage_lock(stage, try_only)?.drain_gate.clone();
+    //
+    // The gate and the queue state come from **one** hold: the drain runs at
+    // every association burst end, and an idle or already-drained queue is the
+    // common case, so that case must cost one stager lock and no quinn probe
+    // rather than the three-lock walk it used to.
+    let (drain_gate, empty) = {
+        let st = stage_lock(stage, try_only)?;
+        (st.drain_gate.clone(), st.is_empty())
+    };
+    if empty {
+        return Some(total);
+    }
     let _drain_guard = if try_only {
         drain_gate.try_lock()?
     } else {
         drain_gate.lock()
     };
+    // One backpressure probe per drain, not per claimed batch. The send phase
+    // already stops at the first failed frame, so a buffer that fills mid-drain
+    // costs exactly the one frame it always did; probing again between claims
+    // bought nothing but a connection-state lock on the drain path (the driver
+    // holds that same mutex across its transmit batch).
+    if conn.datagram_send_buffer_space() == 0 {
+        total.failed = Some(DatagramSend::Blocked);
+        return Some(total);
+    }
     let mut handled = 0usize;
     // Whether this attempt got past the gate and actually touched the queue.
     // A `try_only` attempt that never did must report `Busy`, not `Drained`.
     let mut progress = false;
     loop {
-        let empty = match stage_lock(stage, try_only) {
-            Some(st) => st.is_empty(),
-            None => return if progress { Some(total) } else { None },
-        };
-        if empty {
-            break;
-        }
-        if conn.datagram_send_buffer_space() == 0 {
-            total.failed = Some(DatagramSend::Blocked);
-            break;
-        }
-        let more = {
+        // One hold per batch: learn emptiness and claim together. Every
+        // `claim_one_frame` call removes at least one item, so `handled` is
+        // also the loop's progress bound (including items dropped as too
+        // large, which never enter `q`).
+        let (more, claimed) = {
             let mut st = match stage_lock(stage, try_only) {
                 Some(st) => st,
                 None => return if progress { Some(total) } else { None },
             };
             if st.is_empty() {
-                false
+                (false, false)
             } else {
                 let before = st.len();
                 let more = st.claim_batch(limit, R2_PACK_BATCH_FRAMES, R2_PACK_BATCH_ITEMS, &mut q);
-                // Every `claim_one_frame` call removes at least one item, so
-                // this is also the loop's progress bound (including items
-                // dropped as too large, which never enter `q`).
                 handled = handled.saturating_add(before.saturating_sub(st.len()));
                 progress = true;
-                more
+                (more, true)
             }
         };
+        if !claimed {
+            break;
+        }
         // The lock is released: allocate/copy the DATAGRAM bodies now.
         encode_claimed(&mut q, limit);
         if q.frames.is_empty() {

@@ -218,18 +218,53 @@ fn retry_shard_for(dst: &SocketAddr) -> &'static RetryShard {
     &retry_shards()[h % UDP_RETRY_SHARDS]
 }
 
+/// One `sendto` straight on the descriptor, bypassing tokio's readiness gate.
+///
+/// tokio's `try_send_to` returns `WouldBlock` **without issuing the syscall**
+/// when the socket's cached writable readiness is empty, and it reports nothing
+/// that distinguishes that case from a genuinely full kernel buffer. A socket
+/// registered microseconds ago — every fresh UDP session — is exactly the first
+/// case, so the first datagram of every association used to be handed to the
+/// sharded retry pool: an extra `Bytes` allocation, an mpsc hand-off, a worker
+/// wake and a scheduler round trip for a datagram the kernel would have taken
+/// immediately. The raw syscall separates the two: `WouldBlock` here means real
+/// backpressure (queue it), anything else is a verdict the caller should see,
+/// and success means the datagram is on the wire.
+///
+/// On targets without a borrowed descriptor there is no portable raw path, so
+/// the helper reports `WouldBlock` and the caller keeps the old queue-always
+/// behaviour.
+#[cfg(unix)]
+fn try_send_to_raw(
+    sock: &tokio::net::UdpSocket,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<usize> {
+    let dst = socket2::SockAddr::from(dst);
+    socket2::SockRef::from(sock).send_to(payload, &dst)
+}
+
+#[cfg(not(unix))]
+fn try_send_to_raw(
+    _sock: &tokio::net::UdpSocket,
+    _dst: SocketAddr,
+    _payload: &[u8],
+) -> std::io::Result<usize> {
+    Err(std::io::ErrorKind::WouldBlock.into())
+}
+
 /// Best-effort non-blocking UDP send for shared loops (one datagram reader per
 /// connection, one relay per association).
 ///
 /// `try_send_to` alone is not enough: tokio returns `WouldBlock` without even
 /// attempting the syscall while a freshly registered socket has no cached
 /// writable readiness, which would silently drop the first packet of every new
-/// session. A genuinely full socket buffer is real backpressure too. In both
-/// cases the packet is queued to a sharded global retry pool (one worker task
-/// per shard, selected by destination ip+port) so the caller never stalls, no
-/// task is spawned per retried packet (the worker polls each retry as a future
-/// in a bounded set), and one slow destination cannot head-of-line-block every
-/// other session behind a single queue; a full shard drops (UDP semantics).
+/// session. [`try_send_to_raw`] is tried first on that verdict, so only a real
+/// kernel `WouldBlock` reaches the retry pool (one worker task per shard,
+/// selected by destination ip+port) — the caller never stalls, no task is
+/// spawned per retried packet (the worker polls each retry as a future in a
+/// bounded set), one slow destination cannot head-of-line-block every other
+/// session behind a single queue, and a full shard drops (UDP semantics).
 pub fn udp_try_send(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, payload: Bytes) {
     // The error kind is dropped here: this path has exactly one destination, so
     // there is nothing to fall back to. `udp_try_send_or_return` exists for the
@@ -258,6 +293,21 @@ pub fn udp_try_send_or_return(
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // The cached-readiness miss and the full-buffer case look identical
+            // to tokio; the raw syscall tells them apart before the payload is
+            // copied and handed to the retry pool.
+            match try_send_to_raw(sock, dst, &payload) {
+                Ok(_) => {
+                    udp_write::sent();
+                    return Ok(());
+                }
+                Err(raw) if raw.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(raw) => {
+                    let n = udp_write::failed();
+                    warn_udp_write(UdpWriteDrop::SendFailed, n, || raw.to_string());
+                    return Err((raw.kind(), payload));
+                }
+            }
             let req = UdpRetry {
                 sock: sock.clone(),
                 dst,
@@ -298,6 +348,20 @@ pub fn udp_try_send_slice(sock: &Arc<tokio::net::UdpSocket>, dst: SocketAddr, pa
     match sock.try_send_to(payload, dst) {
         Ok(_) => udp_write::sent(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // Same split as `udp_try_send_or_return`: only a real kernel
+            // `WouldBlock` pays the owned copy and the retry-pool hand-off.
+            match try_send_to_raw(sock, dst, payload) {
+                Ok(_) => {
+                    udp_write::sent();
+                    return;
+                }
+                Err(raw) if raw.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(raw) => {
+                    let n = udp_write::failed();
+                    warn_udp_write(UdpWriteDrop::SendFailed, n, || raw.to_string());
+                    return;
+                }
+            }
             // The copy is paid before the queue decision; it only happens on
             // `WouldBlock`, which is already the exceptional path, and buying it
             // back would mean a capacity pre-check whose answer `try_send` can

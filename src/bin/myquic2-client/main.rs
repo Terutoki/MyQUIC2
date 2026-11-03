@@ -714,7 +714,19 @@ const SLOT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 fn priority_pin_cores(pool: &ConnPool, app_workers: usize) -> Vec<Option<usize>> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let usable = cores.saturating_sub(app_workers).max(1);
-    let mut order: Vec<usize> = Vec::with_capacity(pool.slots_total());
+    let slots = pool.slots_total();
+    // A pool wider than the machine must not be partly pinned. Pinning is only
+    // a win when every slot can own a core; with 8 slots on a 2-core router
+    // (the OpenWrt target), the old plan pinned slot 0 to core 0 and left the
+    // other seven sharing core 1 with the app worker — the pinned slot runs
+    // alone while everything that matters competes for one core, which is
+    // worse than letting the scheduler balance all of them. The slot count is
+    // the operator's to lower (`conn_count`/`udp_*_conns`); until then, no
+    // pinning is the honest shape.
+    if slots > cores {
+        return vec![None; slots];
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(slots);
     order.push(0);
     if pool.udp_split {
         order.extend(

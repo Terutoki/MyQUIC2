@@ -388,9 +388,21 @@ impl ConnRev2 {
     /// neighbour that fills it can also cost an interactive flow a payload.
     /// That is the shared-queue trade P3-9 describes, bounded in time.
     ///
-    /// Cost per call is two relaxed loads, the stager probe, and one
-    /// `datagram_send_buffer_space()` read — which takes the connection state
-    /// lock. It runs once per UDP payload, never per encoded frame.
+    /// Cost per call is the stager probe (a short `parking_lot` hold) and, only
+    /// near the budget, one `datagram_send_buffer_space()` read — which takes
+    /// the connection state lock. It runs once per UDP payload, never per
+    /// encoded frame.
+    ///
+    /// The state lock is the expensive half: quinn's driver holds that same
+    /// mutex across `process_conn_events` and up to `MAX_TRANSMIT_DATAGRAMS`
+    /// socket sends, so a probe racing a busy driver parks this producer for
+    /// tens of microseconds — once per payload, on the connection whose whole
+    /// purpose is latency. The stager backlog is this process's own term and is
+    /// readable under a lock the caller takes anyway moments later, so it gates
+    /// the probe: while half the window is free, admitting one payload cannot
+    /// push the stager half of the FIFO past the budget, and quinn's buffer is
+    /// bounded by its size and drained by its driver. The exact probe runs only
+    /// where its answer can change the verdict.
     ///
     /// `true` when the window is disabled or no rate has been sampled yet.
     #[must_use]
@@ -403,12 +415,21 @@ impl ConnRev2 {
         let Some(cap) = self.queue_window_cap(conn) else {
             return true;
         };
+        let staged = self.stager.lock().queued_bytes();
+        if staged
+            .saturating_add(batched)
+            .saturating_add(len)
+            .saturating_mul(2)
+            <= cap
+        {
+            return true;
+        }
         fits_queue_window(
             cap,
             self.dg_send_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             conn.datagram_send_buffer_space(),
-            self.stager.lock().queued_bytes(),
+            staged,
             batched,
             len,
         )
@@ -434,12 +455,19 @@ impl ConnRev2 {
         let Some(cap) = self.queue_window_cap(conn) else {
             return true;
         };
+        let staged = self.stager.lock().queued_bytes();
+        // Same cheap-first rule as [`Self::admit_uplink`]. A payload larger
+        // than the whole window never passes the cheap gate, which is right:
+        // that is exactly the case the exact rule below exists for.
+        if staged.saturating_add(len).saturating_mul(2) <= cap {
+            return true;
+        }
         fits_standalone_window(
             cap,
             self.dg_send_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             conn.datagram_send_buffer_space(),
-            self.stager.lock().queued_bytes(),
+            staged,
             len,
         )
     }
@@ -684,7 +712,15 @@ impl ConnRev2 {
         // The drain is the only writer; once it releases the lock, a non-empty
         // queue means the send buffer is full or the budget ran out. Wake the
         // per-connection retry task instead of waiting for the next app packet.
-        if !self.stager.lock().is_empty() {
+        //
+        // `try_lock` on purpose: this runs on an association task, and a
+        // blocking acquisition here would serialise the association behind the
+        // drainer it is trying to notify. A lost race means somebody else is
+        // inside the queue right now, so notifying is the safe answer either
+        // way; the retry task tolerates an empty queue (one drain that finds
+        // nothing).
+        let has_backlog = self.stager.try_lock().is_none_or(|st| !st.is_empty());
+        if has_backlog {
             self.stage_retry.notify_one();
         }
         outcome
@@ -1152,6 +1188,15 @@ pub(crate) struct UplinkFlows {
     /// the items, so per-session FIFO is unchanged. The buffer is bounded by
     /// [`r2::R2_MAX_TRAIN_ITEMS`] (one train's worth) in `stage_or_count`.
     stage_batch: Vec<R2StageItem>,
+    /// Payload bytes held in [`Self::stage_batch`], maintained in step with
+    /// every push, flush and drop.
+    ///
+    /// The queue-window admission runs once per payload and used to sum the
+    /// batch (`iter().map(..).sum()`) on every one of them. The batch is at most
+    /// one train long, so the sum was small — but it is a second traversal of a
+    /// `Vec` on the path whose whole point is one payload's latency, and the
+    /// counter is one add on push and one store on flush.
+    stage_batch_bytes: usize,
 }
 
 impl UplinkFlows {
@@ -1179,6 +1224,7 @@ impl UplinkFlows {
             pending: UplinkPending::default(),
             stage_batching,
             stage_batch: Vec::new(),
+            stage_batch_bytes: 0,
         }
     }
 
@@ -1226,12 +1272,22 @@ impl UplinkFlows {
 
     /// Bytes held in [`Self::stage_batch`], for the queue-window admission.
     ///
-    /// Summed rather than counted: the batch is one train's worth
-    /// ([`r2::R2_MAX_TRAIN_ITEMS`]) of small payloads, so the sum is cheaper
-    /// than keeping a parallel counter in step with every push, flush and
-    /// dropped batch.
+    /// A maintained counter, not a sum: the admission check runs once per
+    /// payload, and a second traversal of the batch there was pure overhead on
+    /// the per-datagram path. Every mutation of the batch (push, flush, drop)
+    /// updates it.
     fn stage_batch_bytes(&self) -> usize {
-        self.stage_batch.iter().map(|item| item.payload.len()).sum()
+        self.stage_batch_bytes
+    }
+
+    /// Whether this association holds small payloads that a burst-end drain
+    /// still has to push. When it does not, [`drain_assoc_stage`] can skip the
+    /// whole gate/stager round trip: nothing of ours is waiting, and whatever
+    /// another association staged has its own burst-end drain (or the
+    /// connection retry task) to send it.
+    #[must_use]
+    pub(crate) fn has_staged_batch(&self) -> bool {
+        !self.stage_batch.is_empty()
     }
 
     /// Push this burst's staged items into the connection stager with one lock
@@ -1275,6 +1331,9 @@ impl UplinkFlows {
         for attempt in 0..2 {
             match rev2.push_stage_batch(&mut self.stage_batch) {
                 Ok(queued) => {
+                    // The batch moved into the connection stager; the admission
+                    // counter's `staged` term now covers it.
+                    self.stage_batch_bytes = 0;
                     // Same opportunistic drain as the single-push path: one
                     // train's worth of cross-session items is where the
                     // queue is worth a send even if this burst is over.
@@ -1309,6 +1368,7 @@ impl UplinkFlows {
             }
             total = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
         }
+        self.stage_batch_bytes = 0;
         warn_stage_full(total, first);
         PayloadSend {
             frames: drained.frames,
@@ -1325,6 +1385,7 @@ impl UplinkFlows {
     fn drop_stage_batch(&mut self) {
         let dropped = self.stage_batch.len();
         self.stage_batch.clear();
+        self.stage_batch_bytes = 0;
         for _ in 0..dropped {
             dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
         }
@@ -1864,6 +1925,7 @@ fn stage_or_count(
     if !rev2.admit_uplink(conn, item.payload.len(), up.stage_batch_bytes()) {
         return over_queue_window(rev2);
     }
+    up.stage_batch_bytes = up.stage_batch_bytes.saturating_add(item.payload.len());
     up.stage_batch.push(item);
     // One train's worth is the bound the single-push path used to fire its
     // opportunistic drain at. A receive burst is smaller than this, so the

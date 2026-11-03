@@ -108,6 +108,23 @@ pub(crate) struct SharedEgress {
     /// one lock per oversized datagram for the whole memo window: at most one
     /// re-read per interval, the rest keep the last known budget.
     pub(crate) budget_probed_ms: [std::sync::atomic::AtomicU64; MAX_UDP_SLOTS],
+    /// Wakeup for the W3 hold: one `Notify` per binding, raised on every
+    /// publish of a fresh handle.
+    ///
+    /// An association whose one-shot payload was held because egress was
+    /// momentarily unavailable has three flush triggers: its next app datagram,
+    /// a 100 ms tick, and (now) this notification. The tick alone meant a DNS
+    /// query held during a cold start or a redial could sit for up to 100 ms
+    /// after the connection returned — the tick bounds the tail, it is not a
+    /// good latency bound. Notifying on publish makes the common case "as soon
+    /// as the handle exists"; the tick stays as a backstop for a missed race
+    /// (a waiter that was not yet registered when the publish landed).
+    ///
+    /// `notify_waiters` on purpose: every association of the binding may be
+    /// holding payloads, and a wakeup is worth nothing to a task that registers
+    /// after it. The association that performed the refresh flushes on its own
+    /// send path, so losing that notification costs nothing either.
+    pub(crate) published: [tokio::sync::Notify; MAX_UDP_SLOTS],
 }
 
 impl Default for SharedEgress {
@@ -118,6 +135,7 @@ impl Default for SharedEgress {
             refreshing: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
             generation: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             budget_probed_ms: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            published: std::array::from_fn(|_| tokio::sync::Notify::new()),
         }
     }
 }
@@ -393,6 +411,7 @@ impl SharedEgress {
                 rev2: c.rev2.clone(),
             })));
             self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.notify_published(bind);
             return Some(EgressHandle {
                 conn: c.conn.clone(),
                 limit: m,
@@ -441,6 +460,7 @@ impl SharedEgress {
                             })));
                             self.generation[bind.index]
                                 .fetch_add(1, std::sync::atomic::Ordering::Release);
+                            self.notify_published(bind);
                             return Some(EgressHandle {
                                 conn: (**c).clone(),
                                 limit: m,
@@ -491,6 +511,32 @@ impl SharedEgress {
                 self.cached[i].store(None);
                 self.generation[i].fetch_add(1, std::sync::atomic::Ordering::Release);
             }
+        }
+    }
+
+    /// Wake every association of `bind` that is holding payloads for a handle
+    /// that did not exist yet (W3).
+    ///
+    /// Called after each publish in [`Self::refresh_global`]. The association
+    /// that won the refresh does not need it (its own send path flushes the
+    /// hold before it sends), but every other association bound to the same
+    /// slot does — and without it their held one-shot payloads would wait for
+    /// the next datagram or the [`super::rev2::PENDING_FLUSH_TICK`] backstop.
+    pub(crate) fn notify_published(&self, bind: UdpBind) {
+        self.published[bind.index].notify_waiters();
+    }
+
+    /// Wait for a fresh handle to be published for `bind` (W3 trigger).
+    ///
+    /// The association selects on this only while it actually holds payloads,
+    /// so a healthy association never creates or polls the future. `None`
+    /// (no binding yet) can never coincide with a non-empty hold — the hold is
+    /// only filled after the first send resolved a binding — so the branch
+    /// parks forever in that case rather than guessing a slot.
+    pub(crate) async fn wait_publish(&self, bind: Option<UdpBind>) {
+        match bind {
+            Some(b) => self.published[b.index].notified().await,
+            None => std::future::pending().await,
         }
     }
 
