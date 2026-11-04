@@ -131,6 +131,17 @@ pub(crate) const CTL_QUEUE: usize = 64;
 /// game tick, and the timer only runs while the stager is non-empty.
 const STAGE_RETRY_DELAY: Duration = Duration::from_millis(2);
 
+/// Immediate re-tries of a `Busy` drain before the retry task sleeps.
+///
+/// A `Busy` verdict means another thread holds the stager mutex or the drain
+/// gate for a few instructions — a forward listener's burst push, or a
+/// cross-thread failover producer. Sleeping [`STAGE_RETRY_DELAY`] for that
+/// would turn a microsecond of contention into two milliseconds of added
+/// latency on exactly the notify-driven path this task exists for, so it
+/// yields and re-probes a few times first. Past the bound the holder is a real
+/// drainer making progress, and sleeping is the right answer.
+const STAGE_BUSY_SPINS: u32 = 4;
+
 /// How long a target the server rejected (`CTL FLOW_REJECT`) is sent `INLINE`
 /// before the uplink retries an `OPEN`.
 ///
@@ -761,15 +772,24 @@ impl ConnRev2 {
                     _ = rev2.stage_retry.notified() => {}
                 }
                 loop {
-                    let Some(limit) = conn.max_datagram_size() else {
-                        // None means the peer never negotiated DATAGRAM, so no
-                        // retry can ever send. Account the queued payloads as
-                        // egress death instead of leaving them for teardown.
-                        let _ = rev2.clear_stage();
-                        return;
+                    let mut busy_spins = 0u32;
+                    let attempt = loop {
+                        let Some(limit) = conn.max_datagram_size() else {
+                            // None means the peer never negotiated DATAGRAM, so no
+                            // retry can ever send. Account the queued payloads as
+                            // egress death instead of leaving them for teardown.
+                            let _ = rev2.clear_stage();
+                            return;
+                        };
+                        let limit = rev2.frame_limit(limit);
+                        let attempt = rev2.try_drain_stage(&conn, limit);
+                        if attempt.is_busy() && busy_spins < STAGE_BUSY_SPINS {
+                            busy_spins += 1;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        break attempt;
                     };
-                    let limit = rev2.frame_limit(limit);
-                    let attempt = rev2.try_drain_stage(&conn, limit);
                     if !attempt.is_busy() {
                         counters::stage_retry();
                     }
@@ -792,6 +812,19 @@ impl ConnRev2 {
     #[must_use]
     pub(crate) fn stage_len(&self) -> usize {
         self.stager.lock().len()
+    }
+
+    /// Wake this connection's stager-retry task.
+    ///
+    /// A producer that has pushed frames but must not drain them on its own
+    /// thread calls this: the retry task runs on the slot runtime, next to the
+    /// endpoint driver, so the encode and the `send_datagram` calls (and the
+    /// connection-state mutex they take) stay on the driver's thread. The
+    /// notify is harmless when a drain is already in flight — `Notify` stores
+    /// a permit for the next wait — and a connection without the task (unit
+    /// fixtures) simply keeps the permit.
+    pub(crate) fn request_drain(&self) {
+        self.stage_retry.notify_one();
     }
 
     /// Drop the connection's queued payloads at teardown, accounting each as an
@@ -1155,21 +1188,14 @@ pub(crate) struct UplinkFlows {
     /// Payloads held while no egress connection exists, bounded and flushed in
     /// order once a fresh handle appears (W3: queue-until-publish).
     pending: UplinkPending,
-    /// Whether small payloads are batched until the caller's burst boundary.
-    ///
-    /// SOCKS associations own a receive burst and flush at its end, so they
-    /// batch. The UDP-forward listeners stage per datagram and only retain the
-    /// egress bindings for the burst, not the per-peer uplink handles, so they
-    /// keep the per-datagram push (see [`UplinkFlows::new_unbatched`]).
-    stage_batching: bool,
     /// Small payloads staged during the current receive burst, not yet handed
     /// to the connection stager.
     ///
     /// The stager is shared by every association of a connection, so pushing
     /// each payload as it is produced made the same mutex the per-datagram
-    /// serialisation point. The association already processes up to
+    /// serialisation point. The caller already processes up to
     /// `LAST_HOP_DRAIN` datagrams per burst, so it keeps them here and pushes
-    /// them once with [`ConnRev2::push_stage_batch`] before the burst's drain.
+    /// them once with [`ConnRev2::push_stage_batch`] at the burst boundary.
     /// Order is the push order, which is the order [`send_uplink`] produced
     /// the items, so per-session FIFO is unchanged. The buffer is bounded by
     /// [`r2::R2_MAX_TRAIN_ITEMS`] (one train's worth) in `stage_or_count`.
@@ -1189,26 +1215,17 @@ impl UplinkFlows {
     /// `closed` is the association's signal from its hub entry
     /// ([`AssocEntry::closed`]); tests that do not exercise `SESS_CLOSE` pass a
     /// fresh [`CloseSignal`].
+    ///
+    /// Small payloads are batched until the caller's burst boundary; the SOCKS
+    /// association and the UDP-forward listeners both flush at that boundary
+    /// (`drain_assoc_stage` / `flush_assoc_stage`).
     pub(crate) fn new(closed: Arc<CloseSignal>) -> Self {
-        Self::new_with_batching(closed, true)
-    }
-
-    /// [`Self::new`] for a caller that cannot flush at a burst boundary: every
-    /// small payload is pushed to the shared stager immediately, exactly like
-    /// the pre-batch path. The UDP-forward listeners use this because their
-    /// burst loop retains bindings, not per-peer uplinks.
-    pub(crate) fn new_unbatched(closed: Arc<CloseSignal>) -> Self {
-        Self::new_with_batching(closed, false)
-    }
-
-    fn new_with_batching(closed: Arc<CloseSignal>, stage_batching: bool) -> Self {
         Self {
             flows: SessionFlows::new(),
             epoch: 0,
             closed,
             last: None,
             pending: UplinkPending::default(),
-            stage_batching,
             stage_batch: Vec::new(),
             stage_batch_bytes: 0,
         }
@@ -1460,6 +1477,22 @@ impl UplinkFlows {
             book_hold_loss(n, "association exit");
         }
         n
+    }
+}
+
+/// Book a burst batch that never reached the connection stager.
+///
+/// The normal paths flush at every burst boundary (`drain_assoc_stage` /
+/// `flush_assoc_stage`), so this is a safety net for owners that disappear
+/// mid-burst — a UDP forward peer evicted by an admission limit between two
+/// datagrams of the same burst is the live case. The items were never handed
+/// to the stager, so nothing else can account them; `EGRESS_DEAD` is the same
+/// category the stager uses when the connection dies with a queue.
+impl Drop for UplinkFlows {
+    fn drop(&mut self) {
+        if !self.stage_batch.is_empty() {
+            self.drop_stage_batch();
+        }
     }
 }
 
@@ -1915,10 +1948,9 @@ fn stage_or_count(
     up.stage_batch.push(item);
     // One train's worth is the bound the single-push path used to fire its
     // opportunistic drain at. A receive burst is smaller than this, so the
-    // normal flush point is the association's burst boundary; a caller that
-    // stages outside a burst still cannot grow the buffer without bound. A
-    // caller without a burst boundary flushes every item instead.
-    if !up.stage_batching || up.stage_batch.len() >= r2::R2_MAX_TRAIN_ITEMS {
+    // normal flush point is the caller's burst boundary; a caller that stages
+    // outside a burst still cannot grow the buffer without bound.
+    if up.stage_batch.len() >= r2::R2_MAX_TRAIN_ITEMS {
         return up.flush_stage(rev2, conn, limit);
     }
     PayloadSend {
@@ -2376,6 +2408,50 @@ fn flush_assoc_batch(
             frames: 0,
             failed: None,
         },
+    }
+}
+
+/// Push this caller's burst batch into the connection stager and wake the
+/// connection's retry task, **without** draining here.
+///
+/// The UDP forward listeners run on the main runtime, while the connection's
+/// driver owns a pinned slot runtime. Draining from the listener would carry
+/// the encode, the `send_datagram` calls and quinn's connection-state mutex
+/// across cores on every burst; notifying the retry task moves that work onto
+/// the driver's thread. The batch is still pushed here, so the stager can pack
+/// it with other sessions' frames into one `TRAIN`.
+///
+/// A missing egress handle leaves the batch in `up` for the next burst (its
+/// bytes keep counting toward admission); a failed push is accounted exactly
+/// like [`drain_assoc_stage`]'s flush. When the connection later dies, the
+/// stager books whatever was queued, and `UplinkFlows`'s `Drop` books a batch
+/// that never reached it.
+pub(crate) fn flush_assoc_stage(
+    egress: &SharedEgress,
+    pool: &ConnPool,
+    bind: UdpBind,
+    up: &mut UplinkFlows,
+) {
+    let now = coarse_millis();
+    let flushed = egress.with_fresh(bind, now, |c, limit, rev2| {
+        let limit = rev2.frame_limit(limit);
+        let sent = up.flush_stage(rev2, c, limit);
+        rev2.request_drain();
+        sent
+    });
+    if let Some(sent) = flushed {
+        recover_send_outcome(egress, bind, sent);
+        return;
+    }
+    // Generation read before the cached read, the same contract the
+    // per-datagram miss path documents.
+    let generation = egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+    if let Some(h) = egress.acquire(pool, bind, now) {
+        egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+        let limit = h.rev2.frame_limit(h.limit);
+        let sent = up.flush_stage(&h.rev2, &h.conn, limit);
+        h.rev2.request_drain();
+        recover_send_outcome(egress, bind, sent);
     }
 }
 

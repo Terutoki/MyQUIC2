@@ -4826,6 +4826,58 @@ async fn udp_association_keeps_serving_after_it_moves_to_its_slot_runtime() {
     drop(slot);
 }
 
+/// The TCP relay pump follows its slot's runtime: while the slot thread is
+/// parked before its runtime polls, the pump cannot run; once the thread runs,
+/// it completes. An inline pump would set the flag immediately on the caller's
+/// runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_pump_runs_on_the_slot_runtime() {
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let slot_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("slot runtime");
+        handle_tx
+            .send(rt.handle().clone())
+            .expect("hand over handle");
+        // Hold the thread before its runtime ever polls: a task spawned onto
+        // this handle cannot run until the `block_on` below.
+        gate_rx.recv().expect("release the slot thread");
+        rt.block_on(async {
+            let _ = stop_rx.await;
+        });
+    });
+    let _slot = SlotRuntimeThread {
+        stop: Some(stop_tx),
+        join: Some(slot_thread),
+    };
+    let handle = handle_rx.recv().expect("slot runtime handle");
+
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_in_pump = ran.clone();
+    let pump = crate::run_tcp_pump(Some(handle), async move {
+        ran_in_pump.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok::<(u64, u64), anyhow::Error>((7, 9))
+    });
+    let task = tokio::spawn(pump);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::Relaxed),
+        "the pump ran on the caller's runtime while the slot thread was parked"
+    );
+    gate_tx.send(()).expect("release the slot thread");
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("the pump must run once the slot runtime is live")
+        .expect("join")
+        .expect("pump");
+    assert_eq!(result, (7, 9));
+    assert!(ran.load(std::sync::atomic::Ordering::Relaxed));
+}
+
 /// The per-slot transport preset split: only the dedicated bulk UDP shards
 /// may dial with the coarse bulk preset. TCP slots and the interactive UDP
 /// class keep the tuned low-latency preset — the old wiring gave *both* UDP
@@ -8476,6 +8528,10 @@ async fn udp_forward_demuxes_peers_and_delivers_raw_replies() {
     let sess_b = fwd.peer_sess(b).expect("peer b session");
     assert_ne!(sess_a, sess_b, "peers must not share a session");
     assert_eq!(hub.len.load(std::sync::atomic::Ordering::Relaxed), 2);
+    // The listener batches per peer and flushes at its burst boundary; the
+    // tests drive that boundary explicitly, then drain the connection stager.
+    fwd.flush_peer(a);
+    fwd.flush_peer(b);
     drain_assoc_stage(&egress, &pool, ba, None);
     drain_assoc_stage(&egress, &pool, bb, None);
 
@@ -8798,7 +8854,10 @@ async fn udp_forward_idle_sweep_sends_sess_close() {
     let t0 = mono_millis();
     let bind_used = fwd.handle_datagram(peer, b"q", t0).expect("a binding");
     let sess = fwd.peer_sess(peer).expect("the peer session");
-    // Flush the OPEN first so the next datagram is unambiguous.
+    // Flush the OPEN first so the next datagram is unambiguous: the listener
+    // batches per peer and the burst boundary is what pushes it into the
+    // connection stager.
+    fwd.flush_peer(peer);
     drain_assoc_stage(&egress, &pool, bind_used, None);
     let _open = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
         .await

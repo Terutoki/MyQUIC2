@@ -252,15 +252,19 @@ pub(crate) async fn handle_socks(
         recv.stop(0x04u32.into()).ok();
         return Err(e);
     }
-    match copy_tcp_quic_acked(
+    // The pump follows the connection's slot runtime (see
+    // `crate::run_tcp_pump`): its QUIC writes then share a thread with the
+    // slot's endpoint driver instead of taking that driver's connection-state
+    // mutex across cores for every 16 KiB chunk. Without a slot runtime the
+    // pump runs inline, unchanged.
+    let pump = copy_tcp_quic_acked(
         s,
         send,
         recv,
         Duration::from_secs(300),
         TCP_DIAL_ACK_TIMEOUT,
-    )
-    .await
-    {
+    );
+    match crate::run_tcp_pump(slot.runtime(), pump).await {
         Ok((up, down)) => {
             tracing::debug!("tcp {target:?} clean fin: {up}B up/{down}B down");
         }

@@ -305,7 +305,7 @@ impl UdpForwarder {
                 hub: self.hub.clone(),
                 _fwd_permit: fwd_permit,
                 entry,
-                uplink: UplinkFlows::new_unbatched(closed),
+                uplink: UplinkFlows::new(closed),
                 frag: R2Fragmenter::new(),
                 bind: None,
             },
@@ -370,9 +370,19 @@ impl UdpForwarder {
         let Some((src, idle)) = victim else {
             return false;
         };
-        let Some(peer) = self.peers.remove(&src) else {
+        let Some(mut peer) = self.peers.remove(&src) else {
             return false;
         };
+        // Eviction can land between two datagrams of the same burst, before
+        // the boundary flush: drain whatever this peer already staged
+        // *synchronously* before the `SESS_CLOSE`, so the data frame cannot be
+        // overtaken by the close (the notify-driven drain used on the steady
+        // path would put the two on different wires). Eviction is rare — one
+        // peer idle for at least `EVICT_MIN_IDLE_MS` — so the cross-thread
+        // drain here is not on any hot path.
+        if let Some(bind) = peer.bind {
+            drain_assoc_stage(&self.egress, &self.pool, bind, Some(&mut peer.uplink));
+        }
         send_sess_close(
             &self.egress,
             &self.pool,
@@ -491,10 +501,12 @@ impl UdpForwarder {
             Duration::from_secs(ASSOC_IDLE_TICK_SECS),
         );
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Egress bindings touched by the current burst; the connection stager is
-        // drained once per distinct binding at the burst end so small payloads
-        // from several peers still share one TRAIN.
-        let mut touched: Vec<UdpBind> = Vec::with_capacity(MAX_UDP_SLOTS);
+        // Egress bindings touched by the current burst, paired with the peer
+        // that used them: each peer's burst batch is flushed once at the burst
+        // end, and the connection's own drain task sends it on the slot
+        // runtime (see `flush_assoc_stage`). One entry per peer, so a burst
+        // can name at most `LAST_HOP_DRAIN` peers.
+        let mut touched: Vec<(SocketAddr, UdpBind)> = Vec::with_capacity(LAST_HOP_DRAIN);
         // Consecutive transient receive errors since the last good datagram.
         // An ICMP error is consumed by the syscall that reports it, so the
         // socket is live on the next call: the listener must retry immediately
@@ -594,10 +606,14 @@ impl UdpForwarder {
                             },
                         }
                     }
-                    // Connection-scoped dashboard: all sessions' small payloads
-                    // staged on these bindings go out together.
-                    for b in touched.drain(..) {
-                        drain_assoc_stage(&self.egress, &self.pool, b, None);
+                    // Burst boundary: push every touched peer's batch into its
+                    // connection's stager (one lock per peer, not one per
+                    // payload) and let that connection's retry task drain it on
+                    // the slot runtime, where the driver lives. Draining here
+                    // instead would carry the encode and the QUIC sends across
+                    // cores on every burst.
+                    for (peer, _bind) in touched.drain(..) {
+                        self.flush_peer(peer);
                     }
                     record_drain_batch(drained);
                 }
@@ -620,7 +636,7 @@ impl UdpForwarder {
         src: SocketAddr,
         payload: &[u8],
         now: u64,
-        touched: &mut Vec<UdpBind>,
+        touched: &mut Vec<(SocketAddr, UdpBind)>,
     ) {
         if payload.len() >= ASSOC_RECV_BUF_LEN {
             let dropped = dgram_drops::bump(&dgram_drops::TOO_LARGE);
@@ -638,10 +654,28 @@ impl UdpForwarder {
             return;
         }
         if let Some(b) = self.handle_datagram(src, payload, now)
-            && !touched.contains(&b)
+            && !touched.iter().any(|(s, _)| *s == src)
         {
-            touched.push(b);
+            touched.push((src, b));
         }
+    }
+
+    /// Flush one peer's burst batch into its connection stager and wake the
+    /// connection's retry task.
+    ///
+    /// The listener owns the batch because it owns the [`UplinkFlows`]; the
+    /// connection's retry task owns the drain because it runs on the slot
+    /// runtime next to the endpoint driver. Called once per touched peer at a
+    /// burst boundary, and by tests as the seam between `handle_datagram` and
+    /// their explicit `drain_assoc_stage`.
+    pub(crate) fn flush_peer(&mut self, src: SocketAddr) {
+        let Some(peer) = self.peers.get_mut(&src) else {
+            return;
+        };
+        let Some(bind) = peer.bind else {
+            return;
+        };
+        flush_assoc_stage(&self.egress, &self.pool, bind, &mut peer.uplink);
     }
 }
 

@@ -92,6 +92,72 @@ fn report_fd_budget() {
 pub(crate) static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Aborts a spawned relay pump when the awaiting caller is dropped.
+///
+/// The pump owns the application socket and both QUIC stream halves. Before it
+/// moved to the slot runtime, dropping the SOCKS/forward task dropped them with
+/// it; a bare `JoinHandle` only detaches, so a detached pump would keep the
+/// flow (and its permits) alive past its ingress task. The abort restores the
+/// coupling, and the pump's own drops then close the socket and reset/stop the
+/// stream. A completed task ignores the abort.
+struct PumpAbort(tokio::task::AbortHandle);
+
+impl Drop for PumpAbort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Run one TCP relay pump, on the egress slot's runtime when the sharded
+/// topology provides one.
+///
+/// The pump is the only part of a TCP flow that touches the QUIC connection:
+/// `write_chunk` and `read_chunks` take quinn's per-connection state mutex,
+/// which the slot's endpoint driver also holds while it polls and transmits.
+/// Running the pump on the multi-threaded main runtime (where the SOCKS/TCP
+/// ingress lives) makes every 16 KiB chunk a cross-core hand-off to that mutex;
+/// running it on the slot's current-thread runtime puts both sides on one
+/// thread, the same placement a UDP association's steady state already uses
+/// (see `assoc::udp_associate_inner` and PERF_ANALYSIS §22.8).
+///
+/// The app socket was registered by the main runtime's I/O driver. Tokio
+/// delivers its readiness to a task on any live runtime — the main runtime
+/// lives for the process — which is the same contract the UDP relay socket
+/// relies on. With no slot runtime (the shared-runtime topology and unit
+/// tests) the pump runs inline, exactly as before.
+///
+/// `JoinError` handling mirrors the UDP migration: a cancelled task is a
+/// shutdown only while [`SHUTTING_DOWN`] is set (otherwise the slot runtime
+/// died under a live flow, which must be reported), and a panic is resumed on
+/// the caller so its message and site survive.
+pub(crate) async fn run_tcp_pump<F>(
+    runtime: Option<tokio::runtime::Handle>,
+    pump: F,
+) -> Result<(u64, u64)>
+where
+    F: std::future::Future<Output = Result<(u64, u64)>> + Send + 'static,
+{
+    let Some(runtime) = runtime else {
+        return pump.await;
+    };
+    let task = runtime.spawn(pump);
+    let abort = PumpAbort(task.abort_handle());
+    let result = task.await;
+    drop(abort);
+    match result {
+        Ok(result) => result,
+        Err(e) if e.is_cancelled() => {
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                Ok((0, 0))
+            } else {
+                anyhow::bail!("tcp relay task was cancelled: the egress slot runtime is gone")
+            }
+        }
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(anyhow::anyhow!("tcp relay task: {e}")),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(

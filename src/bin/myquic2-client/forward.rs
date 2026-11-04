@@ -232,14 +232,18 @@ pub(crate) async fn relay_tcp_forward(
     egress: Arc<SharedEgress>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let (send, recv) = match open_forward_stream(&target, &pool, &egress, timeout).await {
+    let (slot_idx, send, recv) = match open_forward_stream(&target, &pool, &egress, timeout).await {
         Ok(v) => v,
         Err(e) => {
             abort_tcp(&sock);
             return Err(e);
         }
     };
-    match copy_tcp_quic_acked(sock, send, recv, FORWARD_TCP_IDLE, TCP_DIAL_ACK_TIMEOUT).await {
+    // Same placement rule as the SOCKS pump: the relay runs on the egress
+    // slot's runtime so its QUIC writes do not cross cores to the driver's
+    // connection-state mutex (see `crate::run_tcp_pump`).
+    let pump = copy_tcp_quic_acked(sock, send, recv, FORWARD_TCP_IDLE, TCP_DIAL_ACK_TIMEOUT);
+    match crate::run_tcp_pump(pool.slot(slot_idx).runtime(), pump).await {
         Ok((up, down)) => {
             tracing::debug!("tcp_forward {target:?} clean fin: {up}B up/{down}B down");
             Ok(())
@@ -262,6 +266,9 @@ pub(crate) async fn relay_tcp_forward(
 
 /// Open one QUIC bidi stream and write the MQP target header on it.
 ///
+/// Returns the slot the stream was opened on as well, so the caller can run the
+/// relay pump on that slot's runtime (the connection's driver thread).
+///
 /// Mirrors the CONNECT half of `socks::handle_socks`, including the dead-slot
 /// self-heal: an `open_bi` failure on a connection with a `close_reason` is the
 /// one path that can notice a death before the reconnect loop's watchdog, so
@@ -271,7 +278,7 @@ async fn open_forward_stream(
     pool: &ConnPool,
     egress: &SharedEgress,
     timeout: Duration,
-) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
+) -> anyhow::Result<(usize, quinn::SendStream, quinn::RecvStream)> {
     let slot_idx = pool.pick_tcp_index(target);
     let slot = pool.slot(slot_idx);
     let zero_rtt = slot.zero_rtt_state();
@@ -296,7 +303,7 @@ async fn open_forward_stream(
     )
     .await
     {
-        Ok(pair) => Ok(pair),
+        Ok((send, recv)) => Ok((slot_idx, send, recv)),
         Err(e) => {
             // The dead-slot self-heal: an open failure on a connection with a
             // `close_reason` is the one path that can notice a death before the
