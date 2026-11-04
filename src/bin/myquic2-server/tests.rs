@@ -7598,6 +7598,51 @@ async fn reply_source_memo_rescans_after_the_flow_snapshot_is_replaced() {
     server_conn.close(0u32.into(), b"done");
 }
 
+/// The memo must keep a *working set* of reply sources, not just the last one.
+///
+/// A session that alternates between targets — DNS fanout, CDN rotation, a game
+/// session with per-server flows — missed a one-entry memo on every reply and
+/// paid the full `match_source` scan each time (measured at 164 ns for 64
+/// flows). Both sources here land in different memo slots, so the assertion
+/// does not depend on the hash.
+#[tokio::test]
+async fn reply_source_memo_keeps_a_working_set_of_sources() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let a: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let mut b: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+    while crate::reader::reply_memo_slot(b) == crate::reader::reply_memo_slot(a) {
+        b.set_port(b.port() + 1);
+    }
+    let (ss, _flows, _binding_a) = rev2_reply_fixture(TargetAddr::Ip(a), Vec::new());
+    let _binding_b = insert_r2_binding(&ss, 7, 2, TargetAddr::Ip(b), Vec::new());
+    remember_dst(&ss, 7, a);
+    remember_dst(&ss, 7, b);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server_conn.clone(), stage, None);
+
+    // First round: one scan per distinct source.
+    assert!(matches!(h.reply(b"a1", a), ReplyDisposition::Continue));
+    assert_eq!(h.r2.match_scans, 1);
+    assert!(matches!(h.reply(b"b1", b), ReplyDisposition::Continue));
+    assert_eq!(h.r2.match_scans, 2);
+    // Two same-session steady items pack into one TRAIN, so the frame count is
+    // not asserted here; the scan counter is the whole point of this test.
+    assert_eq!(h.drain(), StageDrain::Ok);
+
+    // Second round: both verdicts are still memoized, so the alternation costs
+    // no further scans. A one-entry memo would rescan on every reply here.
+    assert!(matches!(h.reply(b"a2", a), ReplyDisposition::Continue));
+    assert!(matches!(h.reply(b"b2", b), ReplyDisposition::Continue));
+    assert_eq!(
+        h.r2.match_scans, 2,
+        "both sources must stay memoized across the alternation"
+    );
+    assert_eq!(h.drain(), StageDrain::Ok);
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
 /// The memo must not survive a reverse-table change or serve a closed binding:
 /// an install (new snapshot) and a `Closed` mark both invalidate it, so the
 /// verdict always comes from the current table.

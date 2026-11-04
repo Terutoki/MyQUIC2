@@ -218,7 +218,33 @@ pub(crate) fn reply_stage_v3(
 /// the binding is published, and `mark_open`/`mark_closed` are covered by the
 /// snapshot-pointer and `Closed` checks. A miss falls through to the full scan,
 /// which re-records the memo, so the entry never outlives a stale verdict.
-struct ReplySourceMemo(Option<ReplySourceMemoEntry>);
+///
+/// **Direct-mapped, not one entry.** A single entry only covers the
+/// single-target flow. A session that talks to several targets at once — a
+/// 32-resolver DNS fanout, CDN rotation, a game session with per-server flows —
+/// alternates reply sources, so a one-entry memo missed on *every* reply and
+/// paid the full [`SessionFlows::match_source`] scan (up to
+/// [`R2_MAX_FLOWS_PER_SESSION`](myquic2::mqp::r2_flow::R2_MAX_FLOWS_PER_SESSION)
+/// entries, each with an `ArcSwapOption` load for `reply_src` and, for domain
+/// flows, another for `resolved`). Eight slots cover that working set at
+/// ~450 B per reader, and each slot keeps the exact same validation, so a
+/// collision only costs a rescan.
+struct ReplySourceMemo {
+    slots: [Option<ReplySourceMemoEntry>; REPLY_SOURCE_MEMO_SLOTS],
+}
+
+/// Slots in [`ReplySourceMemo`]. Power of two so the index is a mask; eight is
+/// the smallest size that covers a typical multi-target working set without
+/// turning the array into a per-reader memory line of its own.
+const REPLY_SOURCE_MEMO_SLOTS: usize = 8;
+
+impl Default for ReplySourceMemo {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+}
 
 struct ReplySourceMemoEntry {
     /// The reply source this verdict was recorded for (the memo key).
@@ -237,12 +263,36 @@ struct ReplySourceMemoEntry {
 }
 
 impl ReplySourceMemo {
-    const EMPTY: Self = Self(None);
+    /// Direct-mapped index for `src`.
+    ///
+    /// The fan-out shapes differ either in the port (one host, many ports) or
+    /// in the low IP octets (many resolvers), so both are mixed in before the
+    /// mask. A collision only evicts the other source's slot; the entry's own
+    /// validation still decides, so a collision is never a wrong verdict.
+    fn slot_of(src: SocketAddr) -> usize {
+        let ip = match src.ip() {
+            std::net::IpAddr::V4(v4) => u32::from(v4),
+            // Fold the IPv6 halves: a resolver set is usually contiguous in the
+            // low 32 bits, which the fold keeps distinguishable.
+            std::net::IpAddr::V6(v6) => {
+                let o = v6.octets();
+                u32::from_ne_bytes([
+                    o[0] ^ o[4] ^ o[8] ^ o[12],
+                    o[1] ^ o[5] ^ o[9] ^ o[13],
+                    o[2] ^ o[6] ^ o[10] ^ o[14],
+                    o[3] ^ o[7] ^ o[11] ^ o[15],
+                ])
+            }
+        };
+        let mut h = (ip as usize) ^ usize::from(src.port()).wrapping_mul(0x9E37);
+        h ^= h >> 16;
+        h & (REPLY_SOURCE_MEMO_SLOTS - 1)
+    }
 
     /// The memoized verdict for `src`, or `None` when the memo is invalid for
     /// the current snapshot/binding state (the caller then runs the scan).
     fn lookup(&self, snapshot: &Arc<SessionFlows>, src: SocketAddr) -> Option<SourceMatch> {
-        let entry = self.0.as_ref()?;
+        let entry = self.slots[Self::slot_of(src)].as_ref()?;
         if entry.src != src
             || !Arc::ptr_eq(snapshot, &entry.snapshot)
             || entry.binding.state() == FlowState::Closed
@@ -266,7 +316,7 @@ impl ReplySourceMemo {
             SourceMatch::Exact(b) => (b, true),
             SourceMatch::Rebind(b) => (b, false),
         };
-        self.0 = Some(ReplySourceMemoEntry {
+        self.slots[Self::slot_of(src)] = Some(ReplySourceMemoEntry {
             src,
             snapshot,
             binding: Arc::clone(binding),
@@ -277,8 +327,15 @@ impl ReplySourceMemo {
     }
 }
 
+/// Memo slot for `src` (test probe: a test that wants two sources to coexist
+/// must not depend on the hash).
+#[cfg(test)]
+pub(crate) fn reply_memo_slot(src: SocketAddr) -> usize {
+    ReplySourceMemo::slot_of(src)
+}
+
 /// Per-session rev2 reply state: the reverse table used to classify a reply
-/// source, plus the one-entry memo in front of its scan.
+/// source, plus the direct-mapped memo in front of its scan.
 ///
 /// Phase 1 kept a per-session small-frame staging area here; Phase 2 moved all
 /// small-reply staging to the connection-scoped [`R2Stager`] so replies from
@@ -356,7 +413,7 @@ impl R2ReplyState {
             flows_cache,
             conn,
             wire,
-            memo: ReplySourceMemo::EMPTY,
+            memo: ReplySourceMemo::default(),
             ctx_sent: std::collections::HashMap::new(),
             ctx_epoch: 0,
             #[cfg(test)]
@@ -1494,7 +1551,10 @@ pub(crate) fn handle_session_reply(
         }
         allow_snap
             .as_ref()
-            .is_some_and(|r| !r.is_empty() && r.contains(&src))
+            // `contains` already returns false for an empty ring, so the old
+            // `!r.is_empty() &&` was a second 16-slot scan that could never
+            // change the result.
+            .is_some_and(|r| r.contains(&src))
     };
     // A destination can fall out of the 16-entry recent ring while its flow is
     // still live (a 32-resolver DNS fanout is exactly that shape). The flow

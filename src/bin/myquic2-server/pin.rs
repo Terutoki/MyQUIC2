@@ -35,9 +35,23 @@ pub(crate) struct RecentAddrs {
 pub(crate) const RECENT_DST_CAP: usize = 16;
 
 impl RecentAddrs {
+    /// Membership test with a one-slot fast path.
+    ///
+    /// The steady request/response flow talks to a single target, and that is
+    /// the slot written last, so the common reply validates with one comparison
+    /// instead of walking all [`RECENT_DST_CAP`] slots. `push` does not advance
+    /// `pos` for a duplicate, so `pos - 1` always names the most recently
+    /// written slot.
+    fn contains_ip(&self, ip: IpAddr) -> bool {
+        if self.pos != 0 && self.slots[(self.pos - 1) % RECENT_DST_CAP] == Some(ip) {
+            return true;
+        }
+        self.slots.contains(&Some(ip))
+    }
+
     pub(crate) fn push(&mut self, dst: SocketAddr) {
         let ip = unmap(dst.ip());
-        if self.slots.contains(&Some(ip)) {
+        if self.contains_ip(ip) {
             return;
         }
         self.slots[self.pos % RECENT_DST_CAP] = Some(ip);
@@ -45,9 +59,13 @@ impl RecentAddrs {
     }
 
     pub(crate) fn contains(&self, src: &SocketAddr) -> bool {
-        self.slots.contains(&Some(unmap(src.ip())))
+        self.contains_ip(unmap(src.ip()))
     }
 
+    /// Whether nothing has been recorded yet. Test probe only: the reply path
+    /// no longer asks (an empty ring cannot contain a source, so `contains`
+    /// already answers false and the extra scan was dead work).
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.iter().all(|s| s.is_none())
     }
