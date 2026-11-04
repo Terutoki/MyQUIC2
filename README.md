@@ -3,7 +3,7 @@
 <h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-724_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-778_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -418,7 +418,7 @@ The stager is covered in detail in §9. The important property here is that the 
 
 ### 7. Downlink: server to client, domain targets and rebinding
 
-The server's reply path starts at a session socket and a `recvmmsg` burst. `SessionFlows::match_source` classifies the reply source in **one pass** over the session's bindings:
+The server's reply path starts at a session socket and a `recvmmsg` burst. A small direct-mapped memo in front of the classification serves the repeated source of a steady flow **and** the working set of a multi-target session (DNS fanout, CDN rotation, per-server game flows), so the full scan runs only on a new source or a changed binding. `SessionFlows::match_source` classifies the source in **one pass** over the session's bindings:
 
 | Match | Result | Wire |
 |---|---|---|
@@ -584,7 +584,7 @@ MQP-3 is a passenger, not a replacement. The transport choices that matter most:
 - **Receive isolation.** Each pool slot owns its endpoint, socket and runtime; the server uses `SO_REUSEPORT` with one endpoint per usable core, capped at 8. There is no shared receive lock between slots.
 - **No incoming streams on the client.** The client advertises `max_concurrent_bidi_streams = 0` and `max_concurrent_uni_streams = 0`. It opens every stream it uses (one bidi stream per SOCKS TCP relay, one uni stream for the auth token) and the server never opens one, so an advertised slot would only let the peer pin quinn receive-assembler state (up to 1,024 gap spans per stream) on a side that never accepts a stream. A peer that opens one anyway is violating our transport parameters, and quinn closes the connection before buffering any stream data.
 - **Pre-auth stream credit on the server.** The server's handshake advertises only 4 bidi + 2 uni streams; the unauthenticated peer must not be able to park a receive assembler per advertised stream while it stalls the token exchange (the full 8,192-stream credit would allow hundreds of MiB on one connection). `MAX_STREAMS` is increase-only, so the accept loop raises bidi to 8,192 as soon as authentication succeeds — one client may still legitimately place every admitted TCP flow on one connection. The post-auth parked-stream bound is charged process-wide; the pre-auth one is charged per connection.
-- **Runtime topology.** The client pins one current-thread runtime per pool slot (7 at the shipped defaults) and sizes the multi-threaded main runtime to the cores those pinned threads leave over, so saturation cannot put `cores + slots` runnable threads on `cores` CPUs. An association starts on the main runtime (the SOCKS handshake and the first datagram), and its steady state then moves onto the runtime of the slot that owns its egress binding — so the recv, the encode, quinn's connection-state lock and the driver poll all run on one thread instead of crossing cores per datagram. A later egress failover to a sibling slot keeps the loop where it is, so that flow's frames cross cores again; that costs throughput on the flow, not correctness. A TCP relay (SOCKS `CONNECT` or `[[tcp_forward]]`) follows the same rule once its stream is open: the pump runs on the egress slot's runtime, so `write_chunk`/`read_chunks` take the slot driver's connection-state mutex on its own thread instead of across cores. A `[[udp_forward]]` listener stays on the main runtime because one listener serves peers on several slots; it pushes a per-burst batch and wakes the connection's retry task, which drains on the slot runtime. `MYQUIC2_SHARD_RUNTIME=0` restores the single shared runtime (full worker width) and keeps every association and pump inline.
+- **Runtime topology.** The client pins one current-thread runtime per pool slot (7 at the shipped defaults) and sizes the multi-threaded main runtime to the cores those pinned threads leave over, so saturation cannot put `cores + slots` runnable threads on `cores` CPUs. An association starts on the main runtime (the SOCKS handshake and the first datagram), and its steady state then moves onto the runtime of the slot that owns its egress binding — so the recv, the encode, quinn's connection-state lock and the driver poll all run on one thread instead of crossing cores per datagram. A later egress failover to a sibling slot keeps the loop where it is, so that flow's frames cross cores again; that costs throughput on the flow, not correctness. A TCP relay (SOCKS `CONNECT` or `[[tcp_forward]]`) follows the same rule once its stream is open: the pump runs on the egress slot's runtime, so `write_chunk`/`read_chunks` take the slot driver's connection-state mutex on its own thread instead of across cores. A `[[udp_forward]]` listener stays on the main runtime because one listener serves peers on several slots; it pushes a per-burst batch and wakes the connection's retry task, which drains on the slot runtime. A payload held while no egress handle exists is released by a process-wide publish wakeup with a 100 ms backstop, so a one-shot request (a DNS query, a single echo) is not stranded until its peer happens to send again. `MYQUIC2_SHARD_RUNTIME=0` restores the single shared runtime (full worker width) and keeps every association and pump inline.
 - **Session sockets.** Each UDP association gets one 64 KiB socket and one reader. `recvmmsg` and `sendmmsg` batch up to 32 datagrams; the per-session fair share prevents one association from monopolizing the exit.
 - **TCP path.** TCP rides a QUIC bidirectional stream: optimistic SOCKS5 success, borrowed QUIC halves, vectored writes, 300 s idle timeout, 250 ms happy-eyeballs delay, and `RST`/`STOP_SENDING` (`0x04`) on failure.
 - **Liveness.** Keepalive is only the NAT refresh cadence (5 s default); the QUIC idle timeout is decoupled (`idle_timeout_secs`, default 60 s, floor `max(3 × keepalive, 15 s)`), the client watchdog is `2/3 × idle` (40 s), and the selection-time stale gate is 22 s. Reconnect backoff is 200 ms to 5 s. A dead path is detected below the QUIC idle timeout so the next request does not wait for it; raise `idle_timeout_secs` (e.g. 90) to tolerate longer handovers, at the cost of slower true-failure detection.
@@ -629,7 +629,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **769 tests** on macOS (lib 384 + client 206 + server 163 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **778 tests** on macOS (lib 384 + client 213 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1226,7 +1226,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **769 tests** on the macOS dev box (lib 384 + client 206 + server 163 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **778 tests** on the macOS dev box (lib 384 + client 213 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -2208,7 +2208,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>769 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>778 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB
