@@ -286,6 +286,25 @@ impl ReplySourceMemo {
 /// read-only lookup handle and the reply-source memo.
 pub(crate) struct R2ReplyState {
     pub(crate) flows: Arc<arc_swap::ArcSwap<SessionFlows>>,
+    /// Cached view of [`Self::flows`] for the per-reply classification.
+    ///
+    /// `classify_reply_source` needs the *current* snapshot on every reply, and
+    /// the memo validates its verdict with `Arc::ptr_eq` against it. Taking it
+    /// with `ArcSwap::load_full` paid an `Arc` refcount increment + decrement on
+    /// the snapshot's shared control block per reply (arc-swap documents ~50 ns
+    /// uncontended, 80–100 ns with concurrent `load_full` on the same value);
+    /// the reply path runs on the shard thread while the ingress side may
+    /// publish a new snapshot, so that control block is cross-core.
+    ///
+    /// `Cache` revalidates with one relaxed atomic pointer load (arc-swap's own
+    /// `revalidate`), and only falls back to `load_full` when the snapshot
+    /// actually changed. On the steady echo flow it never changes, so the
+    /// per-reply cost drops to a read-mostly load with no shared refcount RMW.
+    ///
+    /// Correctness is unchanged: a replaced snapshot changes the pointer, so the
+    /// next reply reloads it and the memo's `Arc::ptr_eq` check fails as before
+    /// (a stale cache can never serve a verdict from an older table).
+    flows_cache: arc_swap::cache::Cache<Arc<arc_swap::ArcSwap<SessionFlows>>, Arc<SessionFlows>>,
     /// The connection state when this reader belongs to a live connection: the
     /// full-cone path allocates a server-owned wire id from it and installs the
     /// binding in the connection registry. `None` only for fixtures.
@@ -329,8 +348,12 @@ impl R2ReplyState {
         // The reply/output encoders follow the connection's revision; a fixture
         // without a connection is the shipped rev2 default.
         let wire = conn.as_ref().map_or(Wire::Rev2, |c| c.wire());
+        // Seeded once here; `classify_reply_source` revalidates it with a single
+        // relaxed load per reply (see the field doc).
+        let flows_cache = arc_swap::cache::Cache::new(Arc::clone(&flows));
         Self {
             flows,
+            flows_cache,
             conn,
             wire,
             memo: ReplySourceMemo::EMPTY,
@@ -414,12 +437,14 @@ impl R2ReplyState {
     /// scan it usually avoids is the largest single CPU cost on the reply path
     /// (see [`ReplySourceMemo`]).
     fn classify_reply_source(&mut self, src: SocketAddr) -> Option<SourceMatch> {
-        // One snapshot load per reply either way: the memo compares against it
-        // and the scan iterates it. `load_full` (rather than `load`) is what
-        // lets the memo keep the snapshot alive, so the pointer comparison that
-        // validates it cannot alias a later allocation.
-        let snapshot = self.flows.load_full();
-        if let Some(matched) = self.memo.lookup(&snapshot, src) {
+        // One snapshot view per reply either way: the memo compares against it
+        // and the scan iterates it. `flows_cache` revalidates with a single
+        // relaxed pointer load and only pays `load_full` when the table was
+        // actually replaced; the memo keeps its own `Arc` alive, so the pointer
+        // comparison that validates the verdict cannot alias a later
+        // allocation.
+        let snapshot = self.flows_cache.load();
+        if let Some(matched) = self.memo.lookup(snapshot, src) {
             return Some(matched);
         }
         #[cfg(test)]
@@ -432,7 +457,9 @@ impl R2ReplyState {
             }
         });
         if let Some(matched) = matched.as_ref() {
-            self.memo.record(src, snapshot, matched);
+            // Only a scan (never a memo hit) clones the `Arc`: the memo has to
+            // own the snapshot it validated against.
+            self.memo.record(src, Arc::clone(snapshot), matched);
         }
         matched
     }

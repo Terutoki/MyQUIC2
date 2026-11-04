@@ -7537,6 +7537,67 @@ async fn reply_source_memo_invalidates_on_rebind_and_flow_ack() {
     server_conn.close(0u32.into(), b"done");
 }
 
+/// The cached flow snapshot must revalidate when the reverse table is replaced:
+/// a verdict memoized against the old snapshot must never be served after it.
+///
+/// `classify_reply_source` reads the snapshot through `arc_swap::cache::Cache`
+/// (one relaxed pointer load on a memo hit instead of `load_full`'s `Arc`
+/// refcount round-trip). This pins the correctness half of that trade: a
+/// replaced snapshot changes the pointer, the memo's `Arc::ptr_eq` check fails,
+/// and the reply rescans instead of routing against a table that no longer
+/// exists.
+#[tokio::test]
+async fn reply_source_memo_rescans_after_the_flow_snapshot_is_replaced() {
+    let (client_conn, server_conn) = stream_test_pair().await;
+    let target: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+    let (ss, r2_flows, _binding) = rev2_reply_fixture(TargetAddr::Ip(target), Vec::new());
+    remember_dst(&ss, 7, target);
+    let stage = Arc::new(parking_lot::Mutex::new(R2Stager::new()));
+    let mut h = R2ReplyHarness::new(7, &ss, server_conn.clone(), stage, None);
+
+    // The target names the source, so the first reply classifies as `Exact` and
+    // the memo records that verdict against this snapshot.
+    assert!(matches!(
+        h.reply(b"first", target),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(h.r2.match_scans, 1);
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let _ = r2_read_frame(&client_conn).await;
+
+    // Same source, same snapshot: the memo answers without a scan.
+    assert!(matches!(
+        h.reply(b"second", target),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(
+        h.r2.match_scans, 1,
+        "a repeated source must be answered by the memo"
+    );
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let _ = r2_read_frame(&client_conn).await;
+
+    // Replace the reverse table. The cached pointer changes, so the memoized
+    // verdict is stale and must not be served.
+    r2_flows.store(Arc::new(SessionFlows::new()));
+    assert!(matches!(
+        h.reply(b"third", target),
+        ReplyDisposition::Continue
+    ));
+    assert_eq!(
+        h.r2.match_scans, 2,
+        "a replaced snapshot must invalidate the memo"
+    );
+    assert_eq!(h.drain(), StageDrain::Ok);
+    let frame = r2_read_frame(&client_conn).await;
+    let data = r2::decode_data(&frame).expect("an unbound source must fall back to INLINE");
+    assert!(data.id.is_none(), "the new snapshot holds no binding");
+    assert_eq!(data.addr, Some(TargetAddrRef::Ip(target)));
+
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
 /// The memo must not survive a reverse-table change or serve a closed binding:
 /// an install (new snapshot) and a `Closed` mark both invalidate it, so the
 /// verdict always comes from the current table.
