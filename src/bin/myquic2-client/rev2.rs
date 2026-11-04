@@ -2455,6 +2455,58 @@ pub(crate) fn flush_assoc_stage(
     }
 }
 
+/// Try to drain a connection's stager **without parking on its drain gate**.
+///
+/// Teardown needs the stager empty before [`send_sess_close`]: that function
+/// calls `drop_session` on the stager, so any frames that were pushed but not
+/// yet sent would be discarded. The old `drain_assoc_stage` used the blocking
+/// `drain_stage`, which on a UDP-forward listener (main runtime) can park a
+/// worker behind the slot-runtime retry task that owns the gate.
+///
+/// Returns `true` only when the queue was proven empty. On `false` the caller
+/// must **skip** the close: a lost `SESS_CLOSE` is harmless (the server's idle
+/// sweep is the backstop), while a close sent too early would lose payloads.
+/// The connection's retry task was already notified by `flush_assoc_stage` and
+/// will finish the drain on the driver's thread.
+pub(crate) fn try_drain_connection_stage(
+    egress: &SharedEgress,
+    pool: &ConnPool,
+    bind: UdpBind,
+) -> bool {
+    let now = coarse_millis();
+    let attempt = egress.with_fresh(bind, now, |c, limit, rev2| {
+        let limit = rev2.frame_limit(limit);
+        try_drain_spins(rev2, c, limit)
+    });
+    if let Some(drained) = attempt {
+        return drained;
+    }
+    // Generation read before the cached read, the same contract the
+    // per-datagram miss path documents.
+    let generation = egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
+    let Some(h) = egress.acquire(pool, bind, now) else {
+        return false;
+    };
+    egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+    let limit = h.rev2.frame_limit(h.limit);
+    try_drain_spins(&h.rev2, &h.conn, limit)
+}
+
+/// A `Busy` verdict means another thread holds the stager or the drain gate
+/// for a few instructions. Bound the spin so a teardown never waits on a real
+/// drainer; the retry task owns the remaining work.
+fn try_drain_spins(rev2: &ConnRev2, conn: &quinn::Connection, limit: usize) -> bool {
+    for _ in 0..STAGE_BUSY_SPINS {
+        let attempt = rev2.try_drain_stage(conn, limit);
+        if attempt.is_busy() {
+            std::thread::yield_now();
+            continue;
+        }
+        return attempt.is_complete() && rev2.stage_known_empty();
+    }
+    false
+}
+
 /// Client-local MQP-3 rev2 counters.
 ///
 /// Deliberately in the client binary rather than the shared `udp_stats`

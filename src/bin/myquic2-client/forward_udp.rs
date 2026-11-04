@@ -67,6 +67,7 @@ pub(crate) fn spawn_udp_forward(
         egress,
         forward_budget,
         last_evict_scan_ms: 0,
+        deferred: false,
         peers: HashMap::default(),
     };
     Ok(tokio::spawn(async move { fwd.run(shutdown).await }))
@@ -122,6 +123,18 @@ pub(crate) struct UdpForwarder {
     /// cannot turn every O(1) refusal into a whole-table walk. `0` lets the
     /// first refusal scan (the mono epoch starts near zero).
     last_evict_scan_ms: u64,
+    /// At least one peer is holding payloads that a burst-boundary flush could
+    /// not send: either the W3 `UplinkPending` hold (no egress handle at the
+    /// time) or a `stage_batch` whose `flush_assoc_stage` found no handle.
+    ///
+    /// A UDP forward listener is one task for peers on several egress bindings,
+    /// so unlike a SOCKS association it cannot select on one binding's
+    /// `published` Notify. This flag gates (a) a process-wide publish wakeup and
+    /// (b) a 100 ms backstop tick; both call [`Self::flush_deferred`]. Without
+    /// them a one-shot request (DNS, STUN, a single echo) held across a cold
+    /// start or redial had no further datagram to trigger the hold's flush and
+    /// simply expired at `PENDING_TTL_MS`.
+    deferred: bool,
     peers: HashMap<SocketAddr, PeerSession, foldhash::fast::RandomState>,
 }
 
@@ -174,6 +187,7 @@ impl UdpForwarder {
             egress,
             forward_budget,
             last_evict_scan_ms: 0,
+            deferred: false,
             peers: HashMap::default(),
         }
     }
@@ -181,6 +195,16 @@ impl UdpForwarder {
     #[cfg(test)]
     pub(crate) fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_deferred_for_test(&self) -> bool {
+        self.deferred
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_deferred_for_test(&mut self) {
+        self.flush_deferred();
     }
 
     #[cfg(test)]
@@ -209,7 +233,7 @@ impl UdpForwarder {
         // Fast path: the peer exists. Borrow the disjoint fields directly so a
         // hit never re-borrows `self` after the lookup.
         if let Some(peer) = self.peers.get_mut(&src) {
-            return send_peer_payload(
+            let bind = send_peer_payload(
                 &self.pool,
                 &self.egress,
                 &self.target.as_ref(),
@@ -217,6 +241,14 @@ impl UdpForwarder {
                 now,
                 peer,
             );
+            // A held payload is the *only* state here that can outlive this
+            // burst with no wakeup of its own. Record it now: the peer may
+            // never send again (a one-shot echo request), so a burst-boundary
+            // check alone would miss it.
+            if peer.uplink.has_pending() {
+                self.deferred = true;
+            }
+            return bind;
         }
         if let Err(refusal) = self.create_peer(src, now) {
             // Accounting lives here, not in `create_peer`, so the admission
@@ -226,14 +258,18 @@ impl UdpForwarder {
             return None;
         }
         let peer = self.peers.get_mut(&src)?;
-        send_peer_payload(
+        let bind = send_peer_payload(
             &self.pool,
             &self.egress,
             &self.target.as_ref(),
             payload,
             now,
             peer,
-        )
+        );
+        if peer.uplink.has_pending() {
+            self.deferred = true;
+        }
+        bind
     }
 
     /// Admit a new peer source, with one eviction attempt when a limit refuses
@@ -374,22 +410,10 @@ impl UdpForwarder {
             return false;
         };
         // Eviction can land between two datagrams of the same burst, before
-        // the boundary flush: drain whatever this peer already staged
-        // *synchronously* before the `SESS_CLOSE`, so the data frame cannot be
-        // overtaken by the close (the notify-driven drain used on the steady
-        // path would put the two on different wires). Eviction is rare — one
-        // peer idle for at least `EVICT_MIN_IDLE_MS` — so the cross-thread
-        // drain here is not on any hot path.
-        if let Some(bind) = peer.bind {
-            drain_assoc_stage(&self.egress, &self.pool, bind, Some(&mut peer.uplink));
-        }
-        send_sess_close(
-            &self.egress,
-            &self.pool,
-            peer.bind,
-            peer.sess,
-            peer.uplink.epoch,
-        );
+        // the boundary flush, so this peer may still hold un-pushed payloads.
+        // [`Self::retire_peer`] pushes them and proves the stager empty before
+        // the close, without blocking the main runtime on the slot's drain gate.
+        self.retire_peer(&mut peer);
         tracing::debug!(
             "udp_forward {} peer {src}: session {} evicted after {idle} ms idle to admit a new source",
             display_target(&self.target),
@@ -450,14 +474,10 @@ impl UdpForwarder {
             }
         }
         for src in reap {
-            if let Some(peer) = self.peers.remove(&src) {
-                send_sess_close(
-                    &self.egress,
-                    &self.pool,
-                    peer.bind,
-                    peer.sess,
-                    peer.uplink.epoch,
-                );
+            if let Some(mut peer) = self.peers.remove(&src) {
+                // Same ordering as admission eviction: a close must not drop
+                // frames this peer still has queued (see `retire_peer`).
+                self.retire_peer(&mut peer);
                 tracing::debug!(
                     "udp_forward {} peer {src}: session {} idle reaped",
                     display_target(&self.target),
@@ -470,14 +490,11 @@ impl UdpForwarder {
     /// Close every session (process shutdown): best-effort `SESS_CLOSE`, then
     /// release the hub slots by dropping the map.
     pub(crate) fn shutdown_all(&mut self) {
-        for (src, peer) in std::mem::take(&mut self.peers) {
-            send_sess_close(
-                &self.egress,
-                &self.pool,
-                peer.bind,
-                peer.sess,
-                peer.uplink.epoch,
-            );
+        for (src, mut peer) in std::mem::take(&mut self.peers) {
+            // Flush the outstanding burst batches before the closes, for the
+            // same reason as `retire_peer`: `send_sess_close` drops a session's
+            // still-queued stager items.
+            self.retire_peer(&mut peer);
             tracing::debug!(
                 "udp_forward {} peer {src}: session {} closed on shutdown",
                 display_target(&self.target),
@@ -501,6 +518,16 @@ impl UdpForwarder {
             Duration::from_secs(ASSOC_IDLE_TICK_SECS),
         );
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Backstop for payloads held while no egress handle existed (W3).
+        // A listener serves peers on several bindings, so it waits on the
+        // process-wide publish Notify rather than one binding's slot; this
+        // 100 ms tick covers the wakeup that lands before the waiter registers.
+        // Both arms are gated on `deferred`, so a healthy listener pays nothing.
+        let mut deferred_flush = tokio::time::interval(PENDING_FLUSH_TICK);
+        deferred_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Local Arc: the select future must not borrow `self`, whose flush arm
+        // below needs `&mut self` (the same shape `listener` uses above).
+        let publish_wake = self.egress.clone();
         // Egress bindings touched by the current burst, paired with the peer
         // that used them: each peer's burst batch is flushed once at the burst
         // end, and the connection's own drain task sends it on the slot
@@ -517,6 +544,10 @@ impl UdpForwarder {
         // spin a worker with no timeslice for other tasks.
         let mut consecutive_recv_errors: u32 = 0;
         loop {
+            // Read the flag before the select: the arm bodies mutate `self`, so
+            // the guards must not hold a borrow of it. A flag raised inside one
+            // arm simply enables the deferred arms on the next iteration.
+            let has_deferred = self.deferred;
             tokio::select! {
                 r = listener.recv_from(&mut buf) => {
                     let (n, src) = match r {
@@ -620,6 +651,12 @@ impl UdpForwarder {
                 _ = idle_tick.tick() => {
                     self.sweep_idle(mono_millis());
                 }
+                _ = publish_wake.wait_any_publish(), if has_deferred => {
+                    self.flush_deferred();
+                }
+                _ = deferred_flush.tick(), if has_deferred => {
+                    self.flush_deferred();
+                }
                 _ = shutdown.changed() => break,
             }
         }
@@ -660,14 +697,19 @@ impl UdpForwarder {
         }
     }
 
-    /// Flush one peer's burst batch into its connection stager and wake the
-    /// connection's retry task.
+    /// Flush one peer's held payloads and burst batch into its connection
+    /// stager and wake the connection's retry task.
     ///
     /// The listener owns the batch because it owns the [`UplinkFlows`]; the
     /// connection's retry task owns the drain because it runs on the slot
     /// runtime next to the endpoint driver. Called once per touched peer at a
     /// burst boundary, and by tests as the seam between `handle_datagram` and
     /// their explicit `drain_assoc_stage`.
+    ///
+    /// Held (W3) payloads come first: they are older than this burst, so
+    /// `flush_pending_uplink` preserves the session's FIFO before the newer
+    /// `stage_batch` is pushed. Anything still unsent afterwards marks the
+    /// listener deferred so [`Self::flush_deferred`] retries it.
     pub(crate) fn flush_peer(&mut self, src: SocketAddr) {
         let Some(peer) = self.peers.get_mut(&src) else {
             return;
@@ -675,7 +717,114 @@ impl UdpForwarder {
         let Some(bind) = peer.bind else {
             return;
         };
+        if peer.uplink.has_pending() {
+            flush_pending_uplink(
+                &self.egress,
+                &self.pool,
+                peer.sess,
+                bind,
+                &mut peer.uplink,
+                &mut peer.frag,
+                coarse_millis(),
+            );
+        }
         flush_assoc_stage(&self.egress, &self.pool, bind, &mut peer.uplink);
+        if peer.uplink.has_pending() || peer.uplink.has_staged_batch() {
+            self.deferred = true;
+        }
+    }
+
+    /// Retry every peer whose payloads are still waiting on an egress handle.
+    ///
+    /// This is the UDP-forward equivalent of the three W3 flush triggers a
+    /// SOCKS association has (next datagram, publish notify, 100 ms tick).
+    /// A listener has no per-peer task and no next datagram for a one-shot
+    /// request, so without it a payload held during a cold start or redial
+    /// expired at `PENDING_TTL_MS` with no reply. Both `UplinkPending` (no
+    /// handle when the payload arrived) and a `stage_batch` that
+    /// `flush_assoc_stage` could not push (handle died before the burst
+    /// boundary) are retried here.
+    ///
+    /// Only runs while [`Self::deferred`] is set, so the steady-state echo
+    /// path never walks the peer table. A held item is bookkept by
+    /// `UplinkPending::expire` once its TTL passes; `flush_assoc_stage`
+    /// accounts a batch it drops on a generation change.
+    fn flush_deferred(&mut self) {
+        if !self.deferred {
+            return;
+        }
+        let now = coarse_millis();
+        let mut still = false;
+        for peer in self.peers.values_mut() {
+            let Some(bind) = peer.bind else {
+                continue;
+            };
+            if peer.uplink.has_pending() {
+                flush_pending_uplink(
+                    &self.egress,
+                    &self.pool,
+                    peer.sess,
+                    bind,
+                    &mut peer.uplink,
+                    &mut peer.frag,
+                    now,
+                );
+            }
+            if peer.uplink.has_staged_batch() {
+                flush_assoc_stage(&self.egress, &self.pool, bind, &mut peer.uplink);
+            }
+            if peer.uplink.has_pending() || peer.uplink.has_staged_batch() {
+                still = true;
+            }
+        }
+        self.deferred = still;
+    }
+
+    /// Retire one peer on *every* teardown path (admission eviction, idle
+    /// sweep, shutdown): get its frames onto the wire, then tell the server to
+    /// drop the session.
+    ///
+    /// [`send_sess_close`] calls `drop_session` on the connection stager, so a
+    /// close sent while this peer's frames are still queued would discard them.
+    /// The old eviction path drained synchronously with `drain_assoc_stage`,
+    /// which takes the **blocking** drain gate from the main runtime while the
+    /// slot-runtime retry task may own it; the idle sweep and shutdown sent the
+    /// close with no drain at all. One helper now gives all three the same
+    /// ordering, using a bounded non-blocking drain instead of a blocking one.
+    ///
+    /// When the drain cannot prove the queue empty, the close is deliberately
+    /// skipped: the server's 180 s idle sweep is a safe backstop, and the retry
+    /// task (already notified by `flush_assoc_stage`) still sends the data.
+    fn retire_peer(&mut self, peer: &mut PeerSession) {
+        let Some(bind) = peer.bind else {
+            // No egress binding was ever resolved, so no frames of this peer
+            // can be in a stager.
+            send_sess_close(&self.egress, &self.pool, None, peer.sess, peer.uplink.epoch);
+            return;
+        };
+        if peer.uplink.has_pending() {
+            flush_pending_uplink(
+                &self.egress,
+                &self.pool,
+                peer.sess,
+                bind,
+                &mut peer.uplink,
+                &mut peer.frag,
+                coarse_millis(),
+            );
+        }
+        if peer.uplink.has_staged_batch() {
+            flush_assoc_stage(&self.egress, &self.pool, bind, &mut peer.uplink);
+        }
+        if try_drain_connection_stage(&self.egress, &self.pool, bind) {
+            send_sess_close(
+                &self.egress,
+                &self.pool,
+                peer.bind,
+                peer.sess,
+                peer.uplink.epoch,
+            );
+        }
     }
 }
 

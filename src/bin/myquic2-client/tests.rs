@@ -8487,6 +8487,172 @@ fn publish_test_egress(
     })));
 }
 
+/// A one-shot UDP echo request that arrives while no egress connection exists
+/// must still be delivered once a handle is published. The forward listener is
+/// one task for every peer, so it has no per-peer waiter and a one-shot request
+/// has no "next datagram" to trigger the W3 hold's flush. Before the deferred
+/// flush existed this payload expired at `PENDING_TTL_MS` with no reply.
+#[tokio::test]
+async fn udp_forward_one_shot_held_payload_flushes_when_egress_returns() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let rev2 = rev2_state();
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+
+    let hub = Arc::new(UdpHub::new());
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        MAX_UDP_ASSOCS,
+        pool.clone(),
+        hub,
+        egress.clone(),
+    );
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let src = peer.local_addr().unwrap();
+
+    // (1) No published handle: the payload is *held*, and the listener arms
+    // the deferred flush (this is the state that used to have no wakeup).
+    fwd.handle_datagram(src, b"one-shot echo", mono_millis());
+    assert!(
+        fwd.has_deferred_for_test(),
+        "a held one-shot payload must arm the deferred flush"
+    );
+    let sess = fwd.peer_sess(src).expect("peer session");
+
+    // (2) A fresh egress handle appears (cold start / redial completes).
+    publish_test_egress(&egress, &pool, bind, &client_conn, rev2);
+
+    // (3) The publish wakeup (or its 100 ms backstop) releases the hold and
+    // pushes the batch into the connection stager.
+    fwd.flush_deferred_for_test();
+    assert!(
+        !fwd.has_deferred_for_test(),
+        "the hold must clear once a handle exists"
+    );
+    // The retry task is not spawned in this fixture; drive its drain.
+    drain_assoc_stage(&egress, &pool, bind, None);
+
+    // (4) The server receives the echo request the old path silently lost.
+    let d = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+        .await
+        .expect("the held echo request must be sent")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("decode DATA");
+    assert_eq!(f.sess, Some(sess));
+    assert_eq!(f.payload, b"one-shot echo");
+}
+
+/// A burst batch whose `flush_assoc_stage` finds no egress handle at the burst
+/// boundary must be retried once a handle returns, instead of sitting in the
+/// peer's `stage_batch` until the peer is reaped.
+#[tokio::test]
+async fn udp_forward_stranded_burst_batch_is_retried() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let rev2 = rev2_state();
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    publish_test_egress(&egress, &pool, bind, &client_conn, rev2.clone());
+
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        MAX_UDP_ASSOCS,
+        pool.clone(),
+        Arc::new(UdpHub::new()),
+        egress.clone(),
+    );
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let src = peer.local_addr().unwrap();
+
+    // (1) A normal datagram leaves a small payload in the peer's burst batch.
+    fwd.handle_datagram(src, b"stranded echo", mono_millis());
+
+    // (2) The handle disappears between the payload and the burst boundary
+    // (a reconnect publishing under the listener). The same `rev2` is
+    // republished below, so the batch's epoch stays valid.
+    egress.cached[bind.index].store(None);
+    egress
+        .generation
+        .get(bind.index)
+        .unwrap()
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    egress.memo_clear(bind);
+
+    // (3) The boundary flush cannot push the batch, so it arms the deferred
+    // flush instead of silently losing it.
+    fwd.flush_peer(src);
+    assert!(
+        fwd.has_deferred_for_test(),
+        "an unpushed burst batch must arm the deferred flush"
+    );
+    let sess = fwd.peer_sess(src).expect("peer session");
+
+    // (4) The connection comes back; the publish wakeup / backstop retries it.
+    publish_test_egress(&egress, &pool, bind, &client_conn, rev2);
+    fwd.flush_deferred_for_test();
+    assert!(!fwd.has_deferred_for_test());
+    drain_assoc_stage(&egress, &pool, bind, None);
+
+    let d = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+        .await
+        .expect("the stranded echo request must be sent")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("decode DATA");
+    assert_eq!(f.sess, Some(sess));
+    assert_eq!(f.payload, b"stranded echo");
+}
+
+/// The idle sweep must not let `SESS_CLOSE` overtake (and discard) a peer's
+/// still-queued burst batch: `send_sess_close` drops that session's stager
+/// items, so every teardown path has to drain them first.
+#[tokio::test]
+async fn udp_forward_idle_sweep_flushes_queued_data_before_close() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let pool = ConnPool::new(2, Vec::new(), true, true, 1);
+    let egress = Arc::new(SharedEgress::default());
+    let bind = pool.udp_bind_shard(EgressClass::Interactive, 0);
+    publish_test_egress(&egress, &pool, bind, &client_conn, rev2_state());
+
+    let listener =
+        Arc::new(tokio::net::UdpSocket::from_std(udp_socket_dual("[::]:0").unwrap()).unwrap());
+    let target: TargetAddr = TargetAddr::Ip("198.51.100.9:53".parse().unwrap());
+    let mut fwd = crate::forward_udp::UdpForwarder::for_test(
+        listener,
+        target,
+        MAX_UDP_ASSOCS,
+        pool,
+        Arc::new(UdpHub::new()),
+        egress,
+    );
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let src = peer.local_addr().unwrap();
+
+    // One datagram, and deliberately *no* `flush_peer`: the burst boundary is
+    // interrupted before the batch reaches the connection stager.
+    fwd.handle_datagram(src, b"sweep echo", mono_millis());
+    assert_eq!(fwd.peer_count(), 1);
+
+    // Force the idle sweep to retire the peer with data still queued.
+    fwd.sweep_idle(mono_millis() + ASSOC_IDLE_MS + 1_000);
+    assert_eq!(fwd.peer_count(), 0, "the peer must be reaped");
+
+    let d = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+        .await
+        .expect("the queued echo request must be sent before the close")
+        .unwrap();
+    let f = r2::decode_data(&d).expect("decode DATA");
+    assert_eq!(f.payload, b"sweep echo");
+}
+
 /// Two peers on one forward listener get two independent sessions; the server
 /// sees the configured target on each `OPEN`, and an inbound reply for one
 /// session reaches only that peer, as a bare payload.

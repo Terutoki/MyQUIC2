@@ -125,6 +125,17 @@ pub(crate) struct SharedEgress {
     /// after it. The association that performed the refresh flushes on its own
     /// send path, so losing that notification costs nothing either.
     pub(crate) published: [tokio::sync::Notify; MAX_UDP_SLOTS],
+    /// Process-wide companion to [`Self::published`] for tasks that serve
+    /// sessions on *several* bindings at once. A `[[udp_forward]]` listener is
+    /// one task for peers spread over every UDP slot, so it cannot wait on one
+    /// binding's `published` slot; it waits on this one and then re-checks all
+    /// of its peers. Raised by every [`Self::notify_published`].
+    ///
+    /// `notify_waiters` (no stored permit) is deliberate: the listener also
+    /// has a 100 ms backstop tick, so a publish that lands before it registers
+    /// its waiter costs at most one tick, exactly like the SOCKS association's
+    /// W3 contract.
+    published_any: tokio::sync::Notify,
 }
 
 impl Default for SharedEgress {
@@ -136,6 +147,7 @@ impl Default for SharedEgress {
             generation: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             budget_probed_ms: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             published: std::array::from_fn(|_| tokio::sync::Notify::new()),
+            published_any: tokio::sync::Notify::new(),
         }
     }
 }
@@ -524,6 +536,16 @@ impl SharedEgress {
     /// the next datagram or the [`super::rev2::PENDING_FLUSH_TICK`] backstop.
     pub(crate) fn notify_published(&self, bind: UdpBind) {
         self.published[bind.index].notify_waiters();
+        self.published_any.notify_waiters();
+    }
+
+    /// Wait for a fresh handle on any binding (multi-binding W3 trigger).
+    ///
+    /// Used by the UDP-forward listeners, whose deferred payloads may belong
+    /// to peers on different egress bindings. The caller re-checks its peers
+    /// after the wakeup; a lost wakeup is covered by its backstop tick.
+    pub(crate) async fn wait_any_publish(&self) {
+        self.published_any.notified().await;
     }
 
     /// Wait for a fresh handle to be published for `bind` (W3 trigger).
