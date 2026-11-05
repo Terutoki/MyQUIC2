@@ -856,7 +856,7 @@ pub(crate) async fn forward_server_dgram(
             let spawned = std::time::Instant::now();
             tokio::spawn(async move {
                 let _permit = permit;
-                let unusable = deliver_resolved_server_dgram(
+                let outcome = deliver_resolved_server_dgram(
                     &task_ss,
                     &cd,
                     conn_id,
@@ -870,7 +870,7 @@ pub(crate) async fn forward_server_dgram(
                 )
                 .await;
                 waiter_took(spawned.elapsed());
-                if unusable.is_none() {
+                if !matches!(outcome, DeliveryOutcome::Unusable(_)) {
                     // The answer landed: send the datagrams that arrived while it
                     // was in flight. They go through the same delivery path, so
                     // the session, the destination memo and the reply allowlist
@@ -878,7 +878,7 @@ pub(crate) async fn forward_server_dgram(
                     // a packet the application had to retransmit.
                     let parked = task_ss.dns_gate.take_parked(s, &host, p, generation);
                     for payload in parked {
-                        let outcome = deliver_resolved_server_dgram(
+                        let delivered = deliver_resolved_server_dgram(
                             &task_ss,
                             &cd,
                             conn_id,
@@ -891,11 +891,12 @@ pub(crate) async fn forward_server_dgram(
                             None,
                         )
                         .await;
-                        // Only a datagram that actually left is delivered: the
-                        // `Some` outcome (filtered / refused) already booked a
-                        // `REFUSED` drop inside, and counting it twice would
-                        // report a delivery that did not happen.
-                        if outcome.is_none() {
+                        // Only a payload that actually reached the socket is a
+                        // delivery: `Unusable` already booked a `REFUSED` inside,
+                        // and `NotDelivered` (a cancelled waiter, a resource
+                        // refusal, or every candidate refusing the send) is a
+                        // loss the same code booked under its own counter.
+                        if matches!(delivered, DeliveryOutcome::Delivered) {
                             myquic2::dns::stats::parked_delivered();
                         }
                     }
@@ -904,9 +905,14 @@ pub(crate) async fn forward_server_dgram(
                 // every later datagram for this target would be dropped as
                 // in-flight until the backstop expires. The waiter guard drops
                 // after this, removing its cancellation registry entry.
-                task_ss
-                    .dns_gate
-                    .finish(s, &host, p, generation, unusable, coarse_millis());
+                task_ss.dns_gate.finish(
+                    s,
+                    &host,
+                    p,
+                    generation,
+                    outcome.unusable(),
+                    coarse_millis(),
+                );
                 drop(waiter);
             });
             // The resolution happens in the spawned task above (it awaits), so
@@ -920,14 +926,48 @@ pub(crate) async fn forward_server_dgram(
     }
 }
 
+/// What one gated resolver delivery actually did.
+///
+/// The previous `Option<Duration>` conflated "the payload left" with "nothing
+/// was delivered for a reason that is not about the name" — both were `None` —
+/// so the parked-datagram accounting counted a session-creation refusal or a
+/// cancelled waiter as a delivery. The three states are the distinction the
+/// caller needs anyway: only [`Unusable`](Self::Unusable) may be cached as a
+/// verdict by [`DnsGate::finish`], and only [`Delivered`](Self::Delivered) is a
+/// delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// The payload was handed to the socket.
+    Delivered,
+    /// The name yielded no usable address (every record filtered, or the lookup
+    /// failed). The gate may refuse this target for the carried window.
+    Unusable(Duration),
+    /// Nothing was delivered and the name is not to blame: the waiter was
+    /// cancelled (the association closed), session creation was refused, or
+    /// every candidate address rejected the send. Each of those already booked
+    /// its own counter, so this outcome adds none.
+    NotDelivered,
+}
+
+impl DeliveryOutcome {
+    /// The verdict window [`DnsGate::finish`] should hold for this outcome.
+    fn unusable(self) -> Option<Duration> {
+        match self {
+            Self::Unusable(ttl) => Some(ttl),
+            Self::Delivered | Self::NotDelivered => None,
+        }
+    }
+}
+
 /// Deliver one datagram from a gated resolver waiter.
 ///
-/// Returns `Some(ttl)` when the name itself yielded no usable address (every
-/// record filtered, or the lookup failed): the outcome [`DnsGate`] caches for
-/// that long. The TTL is the failure's own class for a DNS refusal, and
+/// [`DeliveryOutcome::Unusable`] means the name itself yielded no usable address
+/// (every record filtered, or the lookup failed): the window [`DnsGate`] caches
+/// for that outcome. The TTL is the failure's own class for a DNS refusal, and
 /// [`filtered_ttl_ms`] when the resolver answered but the policy filtered every
-/// record. A resource refusal from `get_or_create_sess` is not a DNS verdict and
-/// returns `None`, so it never suppresses the next datagram's retry.
+/// record. A resource refusal from `get_or_create_sess` and a cancelled waiter
+/// are [`DeliveryOutcome::NotDelivered`] — not a DNS verdict, so neither
+/// suppresses the next datagram's retry.
 ///
 /// The answer can hold several addresses, and the first one is not always the
 /// reachable one: on a network that advertises AAAA without a working IPv6 route
@@ -948,12 +988,12 @@ pub(crate) async fn deliver_resolved_server_dgram(
     allow_private: bool,
     r2: Option<&Arc<R2ConnState>>,
     waiter: Option<&DnsWaiter>,
-) -> Option<Duration> {
+) -> DeliveryOutcome {
     let addrs = match resolve_all_cached(host, port).await {
         Ok(v) => v,
         Err(e) => {
             dgram_drops::bump(&dgram_drops::REFUSED);
-            return Some(e.retry_ttl());
+            return DeliveryOutcome::Unusable(e.retry_ttl());
         }
     };
     // The DNS *entry* may be older than `DNS_CACHE_TTL_MS`: `resolve_all_cached`
@@ -979,7 +1019,7 @@ pub(crate) async fn deliver_resolved_server_dgram(
         // may hold it for the answer's own remaining life instead of a flat
         // window that re-spawned this doomed resolution every few seconds.
         dgram_drops::bump(&dgram_drops::REFUSED);
-        return Some(Duration::from_millis(filtered_ttl_ms(host, port)));
+        return DeliveryOutcome::Unusable(Duration::from_millis(filtered_ttl_ms(host, port)));
     };
     // The client may have closed the association while the DNS lookup was in
     // flight. Check the close before paying socket()/permit and again through
@@ -988,7 +1028,7 @@ pub(crate) async fn deliver_resolved_server_dgram(
     // waiter returns "not a DNS verdict" so the gate does not cache anything
     // for the next datagram.
     if waiter.is_some_and(DnsWaiter::is_cancelled) {
-        return None;
+        return DeliveryOutcome::NotDelivered;
     }
     let sock = match get_or_create_sess_guarded(
         ss,
@@ -1001,7 +1041,7 @@ pub(crate) async fn deliver_resolved_server_dgram(
     )
     .await
     {
-        Some(v) => Some(v),
+        Some(v) => v,
         // `get_or_create_sess_guarded` already bumps the specific budget
         // counter for every resource refusal (FAIR_SHARE / SESSION_FULL /
         // SESS_CREATE_FAILED); the only silent None is the no-DATAGRAM path,
@@ -1014,54 +1054,53 @@ pub(crate) async fn deliver_resolved_server_dgram(
             if cd.max_datagram_size().is_none() {
                 dgram_drops::bump(&dgram_drops::SESS_CREATE_FAILED);
             }
-            None
+            return DeliveryOutcome::NotDelivered;
         }
     };
-    if let Some(sock) = sock {
-        if waiter.is_some_and(DnsWaiter::is_cancelled) {
-            return None;
+    if waiter.is_some_and(DnsWaiter::is_cancelled) {
+        return DeliveryOutcome::NotDelivered;
+    }
+    let mut payload = payload;
+    let mut sent_to = None;
+    for (i, cand) in allowed.iter().copied().enumerate() {
+        // The first candidate is always tried: a routing verdict is a hint
+        // with a ten-second memory, not a fact, and giving up on the only
+        // remaining address would turn "unreachable just now" into "never
+        // tried again".
+        if i > 0 && is_unreachable(cand) {
+            continue;
         }
-        let mut payload = payload;
-        let mut sent_to = None;
-        for (i, cand) in allowed.iter().copied().enumerate() {
-            // The first candidate is always tried: a routing verdict is a hint
-            // with a ten-second memory, not a fact, and giving up on the only
-            // remaining address would turn "unreachable just now" into "never
-            // tried again".
-            if i > 0 && is_unreachable(cand) {
-                continue;
+        match udp_try_send_or_return(&sock, map_for_dual(cand), payload) {
+            Ok(()) => {
+                sent_to = Some(cand);
+                break;
             }
-            match udp_try_send_or_return(&sock, map_for_dual(cand), payload) {
-                Ok(()) => {
-                    sent_to = Some(cand);
-                    break;
+            Err((kind, back)) => {
+                payload = back;
+                if is_routing_error(kind) {
+                    mark_unreachable(cand);
+                    continue;
                 }
-                Err((kind, back)) => {
-                    payload = back;
-                    if is_routing_error(kind) {
-                        mark_unreachable(cand);
-                        continue;
-                    }
-                    // Anything else is a socket-level problem that would hit
-                    // every address equally: the loss is already booked by
-                    // `udp_try_send_or_return`, so stop rather than multiply it.
-                    break;
-                }
-            }
-        }
-        if let Some(sent) = sent_to {
-            // Only an address a datagram actually went to may enter the reply
-            // allowlist: `remember_dst` widens what the reverse table accepts,
-            // and every candidate failing is a datagram that was never sent.
-            remember_dst(ss, s, sent);
-            if sent != preferred {
-                // The preferred address could not be reached and a later one worked.
-                // Store it where the next datagram looks: the preference list
-                // has proven wrong for this host, so the session memo — and the
-                // pin armed from it — must not keep choosing the dead address.
-                sess_dest_store(ss, s, host, port, sent, remaining_ms);
+                // Anything else is a socket-level problem that would hit
+                // every address equally: the loss is already booked by
+                // `udp_try_send_or_return`, so stop rather than multiply it.
+                break;
             }
         }
     }
-    None
+    // No candidate accepted the payload (a routing error per address, or a
+    // socket-level failure): nothing left, so this is not a delivery — and no
+    // address may enter the reply allowlist for a datagram that was never sent.
+    let Some(sent) = sent_to else {
+        return DeliveryOutcome::NotDelivered;
+    };
+    remember_dst(ss, s, sent);
+    if sent != preferred {
+        // The preferred address could not be reached and a later one worked.
+        // Store it where the next datagram looks: the preference list has proven
+        // wrong for this host, so the session memo — and the pin armed from it —
+        // must not keep choosing the dead address.
+        sess_dest_store(ss, s, host, port, sent, remaining_ms);
+    }
+    DeliveryOutcome::Delivered
 }

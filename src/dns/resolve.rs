@@ -492,8 +492,11 @@ pub const RESOLVER_CONFIG_POLL: Duration = Duration::from_secs(5);
 /// One generation of the process-wide upstream resolver.
 struct ResolverGen {
     /// `Err` is the do-not-use-hickory signal for the `getaddrinfo` fallback;
-    /// the reason is logged when the generation is built.
-    resolver: Result<std::sync::Arc<hickory_resolver::TokioResolver>, String>,
+    /// the reason is logged when the generation is built. `Arc<str>`, not
+    /// `String`: `upstream_resolver` hands it out on *every* lookup of a process
+    /// running on the fallback, and that path should not allocate to report why
+    /// it is being used.
+    resolver: Result<std::sync::Arc<hickory_resolver::TokioResolver>, std::sync::Arc<str>>,
     /// Nameserver addresses and search list this generation was built from, in
     /// a form that compares cheaply. Empty when the platform configuration
     /// could not be read at all.
@@ -506,7 +509,7 @@ impl ResolverGen {
             "hickory resolver init failed ({reason}); dns lookups fall back to getaddrinfo"
         );
         Self {
-            resolver: Err(reason),
+            resolver: Err(std::sync::Arc::from(reason)),
             fingerprint,
         }
     }
@@ -704,11 +707,12 @@ pub fn spawn_resolver_watch() {
 /// [`DNS_RECORD_TTL_MAX`] — the store's own ceiling. The clamp can therefore
 /// never shorten a life the store would honour, and the store's `time_to_live`
 /// (`DNS_RECORD_TTL_MAX + DNS_STALE_WINDOW`) is the only eviction bound.
-fn upstream_resolver() -> Result<std::sync::Arc<hickory_resolver::TokioResolver>, String> {
+fn upstream_resolver()
+-> Result<std::sync::Arc<hickory_resolver::TokioResolver>, std::sync::Arc<str>> {
     let generation = resolver_gen().load();
     match &generation.resolver {
         Ok(resolver) => Ok(std::sync::Arc::clone(resolver)),
-        Err(reason) => Err(reason.clone()),
+        Err(reason) => Err(std::sync::Arc::clone(reason)),
     }
 }
 
@@ -1022,14 +1026,15 @@ pub async fn resolve_all_cached(
                     let now = Instant::now();
                     // The cache's invariant: every stored set is ordered with
                     // the configured preferred family first (the resolver's own
-                    // order within a family is kept by the stable sort), so a
-                    // hit for another port hands back the same order a fresh
-                    // resolution would. The retained set is then capped: a DNS
-                    // answer can carry thousands of A/AAAA records (a truncated
-                    // UDP answer is retried over TCP), and the cache is bounded
-                    // in entries, not bytes (`store::DNS_CACHE_MAX_ADDRS`).
-                    // Every consumer uses at most 16 addresses, so the cap
-                    // bounds memory without changing which address leads.
+                    // order within a family is preserved), so a hit for another
+                    // port hands back the same order a fresh resolution would.
+                    // The retained set is then capped per family: a DNS answer
+                    // can carry thousands of A/AAAA records (a truncated UDP
+                    // answer is retried over TCP), and the cache is bounded in
+                    // entries, not bytes (`store::DNS_CACHE_MAX_ADDRS`). The cap
+                    // must not cost a family its last address — see
+                    // `prepare_cache_ips` — and it never changes which address
+                    // leads.
                     let ips = prepare_cache_ips(ips);
                     let ips: Arc<[IpAddr]> = Arc::from(ips);
                     // The entry's freshness deadline is the answer's own TTL,
@@ -1092,15 +1097,37 @@ pub async fn resolve_all_cached(
 ///
 /// The order is part of the cache's contract: every stored set is ordered with
 /// the configured preferred family first (the resolver's own order within a
-/// family is kept by the stable sort), so a hit for another port hands back the
-/// same order a fresh resolution would. The cap bounds the cache's bytes — it
-/// is capacity-bounded in entries only — while keeping the head of that order,
-/// which is the only part any consumer reads first.
-fn prepare_cache_ips(mut ips: Vec<IpAddr>) -> Vec<IpAddr> {
+/// family is preserved), so a hit for another port hands back the same order a
+/// fresh resolution would. The cap bounds the cache's bytes — it is
+/// capacity-bounded in entries only.
+///
+/// The cap is applied **per family**, not to the flat prefix. A flat cut of the
+/// preferred-family-first order drops the *whole* other family as soon as the
+/// answer carries [`DNS_CACHE_MAX_ADDRS`] records of one family, and every
+/// consumer's dual-stack fallback rests on the other family surviving:
+/// `resolve_server_addrs` hands the client's dial loop
+/// `DIAL_ADDR_CANDIDATES` addresses (a v6-only list cannot fall back when the
+/// network advertises AAAA without a route), and the server's TCP
+/// happy-eyeballs interleaves families precisely so one cannot starve the
+/// other. Each family therefore keeps at most half the budget, and the family
+/// that cannot fill its half hands the remainder to the other — so a
+/// single-family answer still retains the full cap.
+///
+/// The partition is also one linear pass with no sort: the answer is
+/// attacker-sized (a truncated UDP answer is retried over TCP, where a DNS
+/// message is `u16`-length-prefixed), so the previous `sort_by_key` over the
+/// whole set was O(n log n) on a peer-controlled `n`.
+fn prepare_cache_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
     let pref = ip_preference();
-    ips.sort_by_key(|ip| pref.sort_key_ip(*ip));
-    ips.truncate(DNS_CACHE_MAX_ADDRS);
-    ips
+    let (mut preferred, mut other): (Vec<IpAddr>, Vec<IpAddr>) =
+        ips.into_iter().partition(|ip| pref.sort_key_ip(*ip) == 0);
+    // `other` gets the room `preferred` leaves after taking at most half;
+    // `preferred` then takes whatever `other` did not need.
+    let half = DNS_CACHE_MAX_ADDRS / 2;
+    other.truncate(DNS_CACHE_MAX_ADDRS.saturating_sub(preferred.len().min(half)));
+    preferred.truncate(DNS_CACHE_MAX_ADDRS - other.len());
+    preferred.extend(other);
+    preferred
 }
 
 /// Attach the caller's port to a cached, port-free address set and warm this
@@ -1177,11 +1204,42 @@ const DNS_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 /// attempt reserves its own slot until `DNS_LOOKUP_TIMEOUT + cooldown`, and the
 /// claim's `Drop` rewrites that to `now + DNS_REFRESH_COOLDOWN`, so a crashed or
 /// cancelled task cannot wedge a name forever.
-fn refresh_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<Arc<str>, Instant>> {
-    static REGISTRY: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<Arc<str>, Instant>>,
-    > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+///
+/// The registry is keyed by name, so it has to bound itself: it is swept when it
+/// reaches [`sweep_at`](Self::sweep_at), which doubles after each sweep. That
+/// keeps the amortized cost of a claim O(1) and the resident size at roughly
+/// twice the live set — the names actually being refreshed right now — plus the
+/// [`DNS_REFRESH_SWEEP_MIN`] floor. Sweeping only at `DNS_CACHE_MAX` (the
+/// previous shape) meant a process that had once seen that many distinct stale
+/// names kept the map, and one `Arc<str>` per name, for its whole lifetime.
+struct RefreshRegistry {
+    entries: std::collections::HashMap<Arc<str>, Instant>,
+    /// Entry count at which the next sweep runs; see the type docs. Clamped to
+    /// `DNS_CACHE_MAX` so the sweep can never be scheduled past the hard cap
+    /// below — a saturated registry would otherwise stop sweeping and, with it,
+    /// stop admitting any new refresh.
+    sweep_at: usize,
+}
+
+/// Floor for [`RefreshRegistry::sweep_at`]: a quiet relay must not sweep its
+/// registry on every claim.
+const DNS_REFRESH_SWEEP_MIN: usize = 256;
+
+/// The sweep must be scheduled strictly below the hard cap, or a saturated
+/// registry would stop sweeping — and, with it, stop admitting any refresh. A
+/// compile error rather than a `clamp` panic on a path that only runs under
+/// load.
+const _: () = assert!(DNS_REFRESH_SWEEP_MIN < DNS_CACHE_MAX);
+
+fn refresh_registry() -> &'static parking_lot::Mutex<RefreshRegistry> {
+    static REGISTRY: std::sync::OnceLock<parking_lot::Mutex<RefreshRegistry>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        parking_lot::Mutex::new(RefreshRegistry {
+            entries: std::collections::HashMap::new(),
+            sweep_at: DNS_REFRESH_SWEEP_MIN,
+        })
+    })
 }
 
 /// Drop-guard for one name's refresh slot; leaves the cooldown running when the
@@ -1191,7 +1249,7 @@ struct RefreshClaim(Arc<str>);
 impl Drop for RefreshClaim {
     fn drop(&mut self) {
         let until = Instant::now() + DNS_REFRESH_COOLDOWN;
-        if let Some(slot) = refresh_registry().lock().get_mut(&*self.0) {
+        if let Some(slot) = refresh_registry().lock().entries.get_mut(&*self.0) {
             *slot = (*slot).min(until);
         }
     }
@@ -1201,20 +1259,30 @@ impl Drop for RefreshClaim {
 /// down.
 fn claim_refresh(host_key: &str, now: Instant) -> Option<RefreshClaim> {
     let mut registry = refresh_registry().lock();
-    if registry.get(host_key).is_some_and(|until| *until > now) {
+    if registry
+        .entries
+        .get(host_key)
+        .is_some_and(|until| *until > now)
+    {
         return None;
     }
-    // The registry is keyed by name, so a long-lived process that sees many
-    // failing names could grow it without bound. Prune on the way in, and give
-    // up rather than exceed the cache's own entry budget.
-    if registry.len() >= DNS_CACHE_MAX {
-        registry.retain(|_, until| *until > now);
+    // Sweep on the way in (see [`RefreshRegistry`]). The hard cap stays: a
+    // registry that cannot free enough is not allowed to outgrow the cache's own
+    // entry budget, and a name that cannot be claimed is simply not refreshed —
+    // the stale entry keeps serving until its next hit.
+    if registry.entries.len() >= registry.sweep_at {
+        registry.entries.retain(|_, until| *until > now);
+        registry.sweep_at = registry
+            .entries
+            .len()
+            .saturating_mul(2)
+            .clamp(DNS_REFRESH_SWEEP_MIN, DNS_CACHE_MAX);
     }
-    if registry.len() >= DNS_CACHE_MAX {
+    if registry.entries.len() >= DNS_CACHE_MAX {
         return None;
     }
     let key: Arc<str> = Arc::from(host_key);
-    registry.insert(
+    registry.entries.insert(
         Arc::clone(&key),
         now + DNS_LOOKUP_TIMEOUT + DNS_REFRESH_COOLDOWN,
     );
@@ -1467,6 +1535,42 @@ pub async fn resolve_server_addr(s: &str) -> Result<SocketAddr> {
     Ok(addrs.remove(0))
 }
 
+/// At most `max` dial candidates from a resolved set: preferred family first,
+/// with the two families **interleaved** so one cannot fill the list alone.
+///
+/// A flat `take(max)` of the preference-ordered set is what this used to hand
+/// the dial loop, and with the default IPv6 preference a name carrying three or
+/// more AAAA records produced three IPv6 candidates and no IPv4 one — on a
+/// network that advertises AAAA without a working route every attempt failed
+/// against an answer that did contain a usable A record. The server's TCP
+/// happy-eyeballs list (`bin/myquic2-server/tcp.rs`) alternates for the same
+/// reason, and this is the client's counterpart.
+fn dial_candidates(addrs: &[SocketAddr], max: usize) -> Vec<SocketAddr> {
+    dial_candidates_for(ip_preference(), addrs, max)
+}
+
+/// [`dial_candidates`] with an explicit preference, so both family orders are
+/// unit-testable without mutating the process-wide [`IP_PREFERENCE`] (a test
+/// that did would race every other test's reading of it).
+fn dial_candidates_for(pref: IpPreference, addrs: &[SocketAddr], max: usize) -> Vec<SocketAddr> {
+    let max = max.max(1);
+    let mut out = Vec::with_capacity(max.min(addrs.len()));
+    let mut v4 = addrs.iter().filter(|a| a.is_ipv4());
+    let mut v6 = addrs.iter().filter(|a| !a.is_ipv4());
+    let mut want_v4 = pref == IpPreference::Ipv4;
+    while out.len() < max {
+        let next = if want_v4 {
+            v4.next().or_else(|| v6.next())
+        } else {
+            v6.next().or_else(|| v4.next())
+        };
+        let Some(addr) = next else { break };
+        out.push(*addr);
+        want_v4 = !want_v4;
+    }
+    out
+}
+
 /// Every address of a configured `host:port` endpoint, in preference order
 /// ([`ip_preference`] first), capped at `max`. An IP literal is one address and
 /// never touches the resolver.
@@ -1480,7 +1584,9 @@ pub async fn resolve_server_addr(s: &str) -> Result<SocketAddr> {
 ///
 /// The list is what lets a dial fall through to the next address when the most
 /// preferred one is a dead end (the classic: AAAA present in the answer, IPv6
-/// unroutable on the network).
+/// unroutable on the network). The families are interleaved for that reason —
+/// see [`dial_candidates`] — so "the most preferred address" is still first, but
+/// the other family is reachable inside the same `max`.
 pub async fn resolve_server_addrs(s: &str, max: usize) -> Result<Vec<SocketAddr>> {
     if let Ok(a) = s.parse::<SocketAddr>() {
         return Ok(vec![a]);
@@ -1490,12 +1596,7 @@ pub async fn resolve_server_addrs(s: &str, max: usize) -> Result<Vec<SocketAddr>
         .context("bad server_addr, want host:port")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let port: u16 = port.parse().context("bad server port")?;
-    let addrs: Vec<SocketAddr> = resolve_all_cached(host, port)
-        .await?
-        .iter()
-        .copied()
-        .take(max.max(1))
-        .collect();
+    let addrs = dial_candidates(&resolve_all_cached(host, port).await?, max);
     if addrs.is_empty() {
         anyhow::bail!("dns empty");
     }
@@ -1524,13 +1625,16 @@ pub async fn resolve_server_addrs_fresh(s: &str, max: usize) -> Result<Vec<Socke
     let port: u16 = port.parse().context("bad server port")?;
     let host_key = dns_host_key_owned(host);
     let _ = positives().remove(host_key.as_str()).await;
-    let _ = negatives().remove(host_key.as_str()).await;
-    let addrs: Vec<SocketAddr> = resolve_all_cached(host, port)
-        .await?
-        .iter()
-        .copied()
-        .take(max.max(1))
-        .collect();
+    // A removed verdict must also be invalidated in every thread's negative
+    // memo, or a worker that memoized the refusal keeps answering
+    // `CachedLookup::Negative` for the rest of `DNS_NEG_TTL` — the name is no
+    // longer refused anywhere in the store, only in that memo. Same contract as
+    // the other three removal sites (`resolve_all_cached`, `refresh_positive`,
+    // `withdraw_refusal_if_answered`); see `memo::NEG_EPOCH`.
+    if negatives().remove(host_key.as_str()).await.is_some() {
+        bump_neg_epoch();
+    }
+    let addrs = dial_candidates(&resolve_all_cached(host, port).await?, max);
     if addrs.is_empty() {
         anyhow::bail!("dns empty");
     }
@@ -1842,6 +1946,9 @@ mod tests {
     /// failing server.
     #[test]
     fn a_failed_refresh_is_cooled_down_per_name() {
+        // The registry is process-global and the sweep test below clears cooled
+        // entries, so the two must not interleave.
+        let _serial = super::DNS_CACHE_TEST_LOCK.blocking_lock();
         let host = "cooldown-refresh.example.test";
         let t0 = Instant::now();
         let claim = claim_refresh(host, t0).expect("the first attempt is free");
@@ -1873,6 +1980,37 @@ mod tests {
             .is_some(),
             "the name must become refreshable again once the cooldown ends"
         );
+    }
+
+    /// The registry must give its memory back. It is keyed by name, and a relay
+    /// that has once seen many distinct stale names used to keep the map — and
+    /// one `Arc<str>` per name — for its whole lifetime, because the only sweep
+    /// ran at `DNS_CACHE_MAX`.
+    #[test]
+    fn the_refresh_registry_sweeps_once_its_entries_have_cooled() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.blocking_lock();
+        let base = Instant::now();
+        // Claim several floors' worth of distinct names, each one far enough
+        // ahead that every entry before it has cooled down. Without a sweep the
+        // registry would end up holding all of them; with one it holds only the
+        // names still inside their cooldown, i.e. at most one floor's worth.
+        // The claims are kept alive: dropping one would re-arm its cooldown.
+        let total = DNS_REFRESH_SWEEP_MIN * 4;
+        let mut claims = Vec::new();
+        for i in 0..total {
+            let name = format!("sweep-{i}.example.test");
+            let now = base + Duration::from_secs(20 * (i as u64 + 1));
+            claims.push(claim_refresh(&name, now).expect("a cooled-down name is claimable"));
+        }
+        let len = refresh_registry().lock().entries.len();
+        // `+8` of slack for a concurrent refresh another test may have started
+        // between this test's last sweep and this read.
+        assert!(
+            len <= DNS_REFRESH_SWEEP_MIN + 8,
+            "the registry must not grow with the number of names it has seen: \
+             {total} claims left {len} entries"
+        );
+        drop(claims);
     }
 
     /// The generation key must move when the platform configuration moves — and
@@ -2036,6 +2174,51 @@ mod tests {
         // Idempotent: nothing left to withdraw, nothing rewritten wrongly.
         withdraw_refusal_if_answered(&host_key, &memo_key, port).await;
         assert_eq!(lookup_cached_fast(host, port), CachedLookup::Addr(addr));
+    }
+
+    /// Dropping a verdict from the store is only half the invalidation: the
+    /// per-thread negative memo has to be told as well, or the worker that
+    /// recorded the refusal keeps answering `Negative` for the rest of
+    /// `DNS_NEG_TTL` while the store holds nothing.
+    ///
+    /// [`resolve_server_addrs_fresh`] is the one removal site that is not a
+    /// "this name resolves now" event — the reconnect loop calls it because the
+    /// cached *answer* is the suspect — so it was the one site that forgot the
+    /// epoch bump.
+    #[tokio::test]
+    async fn a_forced_refresh_invalidates_the_negative_memo() {
+        let _serial = super::DNS_CACHE_TEST_LOCK.lock().await;
+        // `localhost` is the only name that resolves without a network query and
+        // without being an IP literal (the literal form takes the early return
+        // in `resolve_server_addrs_fresh` and never touches the caches).
+        let (host, port) = ("localhost", 19_772u16);
+        dns_neg_cache_seed(host, port).await;
+        assert_eq!(lookup_cached_fast(host, port), CachedLookup::Negative);
+        let epoch_before = neg_epoch();
+
+        let resolved = resolve_server_addrs_fresh(&format!("{host}:{port}"), 3).await;
+
+        // The removal and the bump happen before the lookup, so they hold even
+        // where the name itself cannot be resolved.
+        assert!(
+            neg_epoch() > epoch_before,
+            "removing a verdict must invalidate every thread's negative memo"
+        );
+        assert!(
+            negatives().get(host).await.is_none(),
+            "the verdict must be gone from the store"
+        );
+        if let Ok(addrs) = resolved {
+            assert!(
+                !addrs.is_empty(),
+                "a successful refresh returns the new candidate list"
+            );
+            assert_eq!(
+                lookup_cached_fast(host, port),
+                CachedLookup::Addr(addrs[0]),
+                "the packet path must follow the store, not its stale memo"
+            );
+        }
     }
 
     /// A stale entry is **served**, and the repair happens beside the caller:
@@ -2343,13 +2526,78 @@ mod tests {
         drop(release_tx);
     }
 
+    /// The dial list is the client's only fallback path: an answer dominated by
+    /// one family must still offer the other inside the small `max` the dial
+    /// loop asks for. A flat prefix of the preference order did not, which is
+    /// how a v6-rich endpoint ended up with three IPv6 candidates and no IPv4
+    /// one on a network whose IPv6 route was dead.
+    #[test]
+    fn dial_candidates_interleave_families_within_the_cap() {
+        let v6: Vec<SocketAddr> = (1..=16u16)
+            .map(|i| {
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)),
+                    443,
+                )
+            })
+            .collect();
+        let v4: Vec<SocketAddr> = (1..=16u8)
+            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)), 443))
+            .collect();
+        let set: Vec<SocketAddr> = [v6.clone(), v4.clone()].concat();
+
+        // Three candidates (the client's `DIAL_ADDR_CANDIDATES`): the preferred
+        // family leads, the other one is still in the list.
+        let three = dial_candidates_for(IpPreference::Ipv6, &set, 3);
+        assert_eq!(three, vec![v6[0], v4[0], v6[1]]);
+        assert!(
+            three.iter().any(|a| a.is_ipv4()) && three.iter().any(|a| a.is_ipv6()),
+            "a three-slot dial list must carry both families: {three:?}"
+        );
+        // The v4-first preference mirrors it.
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv4, &set, 3),
+            vec![v4[0], v6[0], v4[1]]
+        );
+        // One slot is still the single most preferred address.
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv6, &set, 1),
+            vec![v6[0]]
+        );
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv4, &set, 1),
+            vec![v4[0]]
+        );
+        // A single-family answer fills the list from that family.
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv6, &v4, 3),
+            vec![v4[0], v4[1], v4[2]]
+        );
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv4, &v6, 3),
+            vec![v6[0], v6[1], v6[2]]
+        );
+        // Asking for more than the set holds returns the set, interleaved.
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv6, &set, 99).len(),
+            set.len()
+        );
+        // `max == 0` still means "one address", never an empty dial list.
+        assert_eq!(
+            dial_candidates_for(IpPreference::Ipv6, &set, 0),
+            vec![v6[0]]
+        );
+    }
+
     /// The cache is `DNS_CACHE_MAX` *entries*; a positive entry's value is
     /// attacker-sized unless it is capped. A hostile authoritative server can
     /// return thousands of A/AAAA records (truncated UDP → TCP retry), so the
-    /// retained set must be the capped, preferred-family-first prefix — never
-    /// the whole answer.
+    /// retained set must be capped — but the cap is **per family**, because a
+    /// flat prefix of the preferred-family-first order drops the whole other
+    /// family once one family fills the budget, and that is the dual-stack
+    /// fallback the client's dial list and the server's happy-eyeballs rely on.
     #[test]
-    fn cache_prefix_keeps_preferred_family_and_caps_the_retained_set() {
+    fn cache_prefix_caps_each_family_and_keeps_the_other_one_reachable() {
         let v6: Vec<IpAddr> = (1..=40u16)
             .map(|i| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
             .collect();
@@ -2363,11 +2611,39 @@ mod tests {
             "a {}-record answer must be capped at {DNS_CACHE_MAX_ADDRS}",
             v4.len() + v6.len()
         );
-        assert!(
-            out.iter().all(IpAddr::is_ipv6),
-            "the default preference keeps the IPv6 prefix ahead of IPv4"
+        let (v6_out, v4_out): (Vec<IpAddr>, Vec<IpAddr>) =
+            out.iter().copied().partition(IpAddr::is_ipv6);
+        assert_eq!(
+            v6_out.len(),
+            DNS_CACHE_MAX_ADDRS / 2,
+            "each family keeps half the budget when both are present"
         );
-        assert_eq!(&out[..], &v6[..DNS_CACHE_MAX_ADDRS]);
+        assert_eq!(
+            v4_out.len(),
+            DNS_CACHE_MAX_ADDRS / 2,
+            "the non-preferred family must survive the cap: a v6-only list has \
+             no fallback on a network whose AAAA records are unroutable"
+        );
+        assert_eq!(
+            &out[..],
+            [&v6[..v6_out.len()], &v4[..v4_out.len()]].concat(),
+            "the preferred family still leads, and each family keeps the \
+             resolver's own order"
+        );
+        // A single-family answer still gets the whole budget (the other family
+        // hands its unused half over), in either direction.
+        let v6_only = prepare_cache_ips(v6.clone());
+        assert_eq!(&v6_only[..], &v6[..DNS_CACHE_MAX_ADDRS]);
+        let v4_only = prepare_cache_ips(v4.clone());
+        assert_eq!(&v4_only[..], &v4[..DNS_CACHE_MAX_ADDRS]);
+        // A short family gives its room to the long one.
+        let skewed = prepare_cache_ips([v4[..2].to_vec(), v6.clone()].concat());
+        assert_eq!(skewed.len(), DNS_CACHE_MAX_ADDRS);
+        assert_eq!(
+            skewed.iter().filter(|ip| ip.is_ipv4()).count(),
+            2,
+            "every record of the short family is kept"
+        );
         // And a small answer keeps every record, in the same order.
         let small = prepare_cache_ips(vec![v6[0], v4[0]]);
         assert_eq!(&small[..], &[v6[0], v4[0]]);

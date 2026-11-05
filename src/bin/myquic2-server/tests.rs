@@ -8834,9 +8834,11 @@ async fn cancelled_generic_dns_waiter_does_not_create_a_session() {
         Some(&waiter),
     )
     .await;
-    assert!(
-        delivered.is_none(),
-        "a cancelled waiter reports no DNS verdict (nothing to cache)"
+    assert_eq!(
+        delivered,
+        DeliveryOutcome::NotDelivered,
+        "a cancelled waiter reports no DNS verdict (nothing to cache) and no \
+         delivery (nothing left)"
     );
     assert_eq!(
         ss.len(),
@@ -8892,8 +8894,9 @@ async fn generic_dns_slow_path_clamps_the_session_memo_to_the_entry_life() {
         None,
     )
     .await;
-    assert!(
-        delivered.is_none(),
+    assert_eq!(
+        delivered,
+        DeliveryOutcome::Delivered,
         "a delivered datagram is not a DNS verdict"
     );
     let mut buf = [0u8; 64];

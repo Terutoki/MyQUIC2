@@ -165,17 +165,21 @@ pub(crate) const DNS_NEG_MAX: usize = 4096;
 /// the whole answer would let a peer that controls a domain pin hundreds of MiB
 /// inside a 10,240-entry cache — far outside the DNS admission term
 /// (`config::tuning::dns_inflight_memory_bytes`, which prices resolver waiters,
-/// not cache values). The cached set is therefore the first
-/// [`DNS_CACHE_MAX_ADDRS`] records in the caller's order; the init path has
-/// already sorted the answer preferred-family-first, so the order semantics
-/// every consumer sees are unchanged.
+/// not cache values). The cached set is therefore capped at
+/// [`DNS_CACHE_MAX_ADDRS`] records **per address family**: the init path has
+/// already ordered the answer preferred-family-first, and the cap is applied to
+/// each family rather than to the flat prefix, because a flat cut drops the
+/// whole other family once one family fills the budget — which is exactly the
+/// dual-stack fallback every consumer relies on (see `resolve::prepare_cache_ips`).
 ///
 /// 32 is far more than any consumer uses: a rev2 flow retains at most
 /// `R2_MAX_RESOLVED_ADDRS` (16), the server's TCP happy-eyeballs list at most 8,
 /// and every UDP datagram uses the first address. A name that legitimately
 /// answers with more records still gets enough of them for dual-stack and
-/// multi-homed rotation; the dropped tail only bounds memory, never a lookup's
-/// ability to find *a* usable address for a real service.
+/// multi-homed rotation — at least half the budget is reserved for the
+/// non-preferred family whenever the answer carries one — and the dropped tail
+/// only bounds memory, never a lookup's ability to find *a* usable address for
+/// a real service.
 pub(crate) const DNS_CACHE_MAX_ADDRS: usize = 32;
 /// Wall-clock budget for a single upstream DNS lookup. Client-side dial
 /// timeouts are sized to cover this plus the TCP connect budget.
