@@ -194,6 +194,182 @@ fn parse_notsent_lowat(v: Option<&str>) -> usize {
     }
 }
 
+/// `MYQUIC2_SOCKET_PRIORITY`: `SO_PRIORITY` for the client's latency-sensitive
+/// egress sockets. Unset uses [`SOCKET_PRIORITY_DEFAULT`]; `0` disables the
+/// knob.
+const ENV_SOCKET_PRIORITY: &str = "MYQUIC2_SOCKET_PRIORITY";
+
+/// Default `SO_PRIORITY` for the latency-sensitive egress class.
+///
+/// 6 is the highest value an unprivileged process may set (the kernel requires
+/// `CAP_NET_ADMIN` above it), and it is the value Linux's `prio` qdisc places
+/// in the highest band and mac80211 maps to the Wi-Fi **voice** access
+/// category. The interactive class is exactly the DNS/STUN/game/RPC traffic
+/// whose packets are small and whose queueing delay is the user-visible
+/// latency; bulk slots stay at the kernel default (0), so with a `prio` qdisc
+/// or a WMM access point the small packets win the local scheduling decision
+/// without touching the wire format.
+///
+/// `SO_PRIORITY` is deliberately used instead of `IP_TOS`/DSCP: quinn-udp
+/// writes a per-packet `IP_TOS`/`IPV6_TCLASS` cmsg carrying only the ECN
+/// codepoint, which would overwrite a socket-level DSCP on every ECN-marked
+/// packet. `SO_PRIORITY` is not touched by that cmsg.
+pub const SOCKET_PRIORITY_DEFAULT: u32 = 6;
+
+/// Upper clamp for [`ENV_SOCKET_PRIORITY`]: 6 is the unprivileged ceiling, and
+/// a larger value would just make `setsockopt` fail (or, with
+/// `CAP_NET_ADMIN`, let a typo jump the queue above the host's own control
+/// traffic).
+pub const SOCKET_PRIORITY_MAX: u32 = 6;
+
+/// Effective `SO_PRIORITY` for latency-sensitive egress, parsed once per
+/// process. Unset or malformed uses [`SOCKET_PRIORITY_DEFAULT`]; an explicit
+/// `0` disables the knob. Values above [`SOCKET_PRIORITY_MAX`] are clamped.
+#[must_use]
+pub fn socket_priority() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| parse_socket_priority(std::env::var(ENV_SOCKET_PRIORITY).ok().as_deref()))
+}
+
+fn parse_socket_priority(v: Option<&str>) -> u32 {
+    match v.and_then(|s| s.trim().parse::<u32>().ok()) {
+        None => SOCKET_PRIORITY_DEFAULT,
+        Some(n) => n.min(SOCKET_PRIORITY_MAX),
+    }
+}
+
+/// Give one egress UDP socket the local scheduling priority of its class.
+///
+/// Apply after the socket exists and before it carries traffic; only the
+/// latency-sensitive slots are raised, so bulk sockets keep the kernel default
+/// and the two classes do not silently share the priority band. Best-effort:
+/// a kernel or container that rejects the option logs once and leaves the
+/// socket working at default priority. A no-op off Linux.
+pub fn tune_udp_priority(sock: &std::net::UdpSocket, latency_sensitive: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        if !latency_sensitive {
+            return;
+        }
+        let prio = socket_priority();
+        if prio == 0 {
+            return;
+        }
+        match socket2::SockRef::from(sock).set_priority(prio) {
+            Ok(()) => debug_once(
+                "socket-priority",
+                &format!(
+                    "SO_PRIORITY={prio} armed on the latency-sensitive egress class \
+                     (0 disables via {ENV_SOCKET_PRIORITY})"
+                ),
+            ),
+            Err(e) => debug_once(
+                "socket-priority",
+                &format!("SO_PRIORITY({prio}) not armed ({e}); egress stays at the default"),
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (sock, latency_sensitive);
+}
+
+/// `MYQUIC2_TCP_FASTOPEN_CONNECT=1` opts into `TCP_FASTOPEN_CONNECT` on
+/// single-candidate target dials.
+const ENV_TFO_CONNECT: &str = "MYQUIC2_TCP_FASTOPEN_CONNECT";
+
+/// SYN retries for a TFO-connected target. `TCP_FASTOPEN_CONNECT` makes
+/// `connect()` return before the handshake, so the kernel's SYN budget — not
+/// the caller's dial timeout — is what bounds a target that never answers.
+/// Three retries is the 1 + 2 + 4 s SYN backoff (~7 s), far below the stock
+/// six-retry minute, so the socket does not camp in the relay.
+///
+/// Deliberately not `TCP_USER_TIMEOUT`: the socket outlives the handshake, and
+/// a short user timeout would abort a healthy long-lived relay during an
+/// ordinary multi-second path stall. A dead target fails in the SYN phase,
+/// which is the only phase this option is meant to bound.
+#[cfg(target_os = "linux")]
+const TFO_SYN_RETRIES: i32 = 3;
+
+/// Whether the operator opted into TCP Fast Open on target dials.
+///
+/// Off by default because the mechanism changes *when* a connect error is
+/// observable: `connect()` returns before the handshake, so a dead target
+/// looks connected until the first write (or the SYN/user timeout) reports the
+/// failure. The SOCKS success reply is already optimistic, but an operator
+/// should choose that trade explicitly.
+#[must_use]
+pub fn tcp_fastopen_connect_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_on_flag(std::env::var(ENV_TFO_CONNECT).ok().as_deref()))
+}
+
+fn parse_on_flag(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+/// Connect one TCP target, using `TCP_FASTOPEN_CONNECT` when the operator
+/// opted in and the kernel supports it.
+///
+/// `TCP_FASTOPEN_CONNECT` lets `connect()` return before the SYN is sent; the
+/// kernel then puts the first write into the SYN itself, saving one full RTT
+/// whenever the target has a cached TFO cookie. A kernel or network that does
+/// not support TFO just falls back to the normal handshake, so the only
+/// failure mode is the deferred error detection documented on
+/// [`tcp_fastopen_connect_enabled`].
+///
+/// The single-candidate dial path is the only caller: the happy-eyeballs race
+/// needs `connect()` to mean "this candidate completed the handshake", or the
+/// first candidate would always win before any SYN left the host.
+#[cfg(target_os = "linux")]
+pub async fn tcp_connect(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    if !tcp_fastopen_connect_enabled() {
+        return tokio::net::TcpStream::connect(addr).await;
+    }
+    match fastopen_connect(addr).await {
+        Ok(stream) => Ok(stream),
+        Err(e) => {
+            debug_once(
+                "tfo-connect",
+                &format!(
+                    "TCP_FASTOPEN_CONNECT to {addr} failed ({e}); retrying with a normal connect"
+                ),
+            );
+            tokio::net::TcpStream::connect(addr).await
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn fastopen_connect(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    use nix::libc::{IPPROTO_TCP, TCP_FASTOPEN_CONNECT, TCP_SYNCNT};
+    use tokio::net::TcpSocket;
+
+    let sock = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    sock.set_nodelay(true)?;
+    let fd = sock.as_raw_fd();
+    // Required: without it the connect is an ordinary blocking handshake and
+    // the fallback below is pointless.
+    set_raw_int(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1)?;
+    // Best-effort bound for the deferred handshake; a kernel that rejects it
+    // still gets the TFO benefit, just with its default SYN budget.
+    let _ = set_raw_int(fd, IPPROTO_TCP, TCP_SYNCNT, TFO_SYN_RETRIES);
+    sock.connect(addr).await
+}
+
+/// Non-Linux: `TCP_FASTOPEN_CONNECT` is Linux-specific, so this is the plain
+/// connect the caller would otherwise use.
+#[cfg(not(target_os = "linux"))]
+pub async fn tcp_connect(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    tokio::net::TcpStream::connect(addr).await
+}
+
 /// Apply the busy-poll posture to one UDP socket (every socket this crate
 /// creates goes through here: QUIC endpoints, relay sockets, session sockets).
 ///
@@ -442,13 +618,15 @@ fn get_raw_int(
 /// every socket, so the full message must not repeat per connection.
 fn once(kind: &str) -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static SEEN: [(&str, AtomicBool); 6] = [
+    static SEEN: [(&str, AtomicBool); 8] = [
         ("busy-poll", AtomicBool::new(false)),
         ("busy-poll-armed", AtomicBool::new(false)),
         ("busy-poll-prefer", AtomicBool::new(false)),
         ("defer-accept", AtomicBool::new(false)),
         ("fastopen", AtomicBool::new(false)),
         ("notsent-lowat", AtomicBool::new(false)),
+        ("socket-priority", AtomicBool::new(false)),
+        ("tfo-connect", AtomicBool::new(false)),
     ];
     SEEN.iter()
         .find(|(k, _)| *k == kind)
@@ -471,6 +649,133 @@ fn warn_once(kind: &str, msg: &str) {
 fn debug_once(kind: &str, msg: &str) {
     if once(kind) {
         tracing::debug!("linux tuning: {msg}");
+    }
+}
+
+// ---------------- inotify (Linux) ----------------
+
+/// Minimal inotify wrapper for the DNS resolver watcher.
+///
+/// The watcher only needs "something under the platform DNS configuration
+/// changed"; it re-reads the fingerprint and rebuilds the resolver, so event
+/// payloads are deliberately ignored and only the wakeup matters. The fd is
+/// nonblocking and registered with the async reactor, so the watch adds no
+/// thread and no poll tick of its own.
+#[cfg(target_os = "linux")]
+pub(crate) mod inotify {
+    use nix::libc;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use tokio::io::unix::AsyncFd;
+
+    /// Events that can change the parsed resolver configuration or the hosts
+    /// table. `IN_ATTRIB` covers chmod/ownership changes that a fingerprint
+    /// based on mtime+size would otherwise miss; the move/delete pair covers
+    /// the atomic-replace idiom every resolv.conf manager uses.
+    const MASK: u32 = libc::IN_MODIFY
+        | libc::IN_ATTRIB
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_MOVED_TO
+        | libc::IN_MOVED_FROM
+        | libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF;
+
+    /// One inotify instance watching a set of paths.
+    pub(crate) struct Watch {
+        fd: AsyncFd<OwnedFd>,
+    }
+
+    impl Watch {
+        /// Arm a watch on every path that exists. A path that cannot be
+        /// watched is skipped (a missing `/etc/resolv.conf` is a valid system
+        /// state); an instance with no armed path is an error so the caller
+        /// falls back to polling instead of waiting forever.
+        pub(crate) fn new(paths: &[std::path::PathBuf]) -> io::Result<Self> {
+            let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `inotify_init1` returned a fresh owned descriptor and
+            // nothing else in this process has seen it.
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            // SAFETY: `owned` is uniquely owned here and is not closed or
+            // replaced while `AsyncFd` holds it.
+            let fd = unsafe { AsyncFd::register(owned) }.map_err(io::Error::from)?;
+            let mut armed = 0usize;
+            for path in paths {
+                let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+                    continue;
+                };
+                // SAFETY: `fd` is a live inotify descriptor and `c_path` is a
+                // NUL-terminated path that outlives the call.
+                let wd = unsafe {
+                    libc::inotify_add_watch(fd.get_ref().as_raw_fd(), c_path.as_ptr(), MASK)
+                };
+                if wd >= 0 {
+                    armed += 1;
+                } else {
+                    tracing::debug!(
+                        "inotify watch {} not armed ({})",
+                        path.display(),
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+            if armed == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no DNS configuration path could be watched",
+                ));
+            }
+            Ok(Self { fd })
+        }
+
+        /// Wait for the next change event, draining the queue so one burst of
+        /// writes produces one wakeup.
+        pub(crate) async fn changed(&self) -> io::Result<()> {
+            loop {
+                let mut ready = self.fd.readable().await?;
+                match ready.try_io(|inner| drain(inner.get_ref().as_raw_fd())) {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(e)) => return Err(e),
+                    // Spurious readiness: the queue was already drained by a
+                    // concurrent wake. The guard cleared the readiness bit.
+                    Err(_would_block) => continue,
+                }
+            }
+        }
+    }
+
+    /// Read every queued event. Returns `WouldBlock` when the queue was empty,
+    /// which is what tells [`AsyncFd`] to clear readiness and park again.
+    fn drain(fd: RawFd) -> io::Result<()> {
+        let mut buf = [0u8; 4096];
+        let mut got = false;
+        loop {
+            // SAFETY: `fd` is a live inotify descriptor and `buf` is a valid
+            // writable slice of the length passed; read only writes into it.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                got = true;
+                continue;
+            }
+            if n == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::WouldBlock => break,
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(e),
+            }
+        }
+        if got {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
     }
 }
 
@@ -640,5 +945,129 @@ mod tests {
         assert!(snd >= want, "SO_SNDBUF read back {snd} < requested {want}");
         assert!(rcv >= want, "SO_RCVBUF read back {rcv} < requested {want}");
         drop(client);
+    }
+
+    /// `MYQUIC2_SOCKET_PRIORITY`: unset/malformed keep the class default, `0`
+    /// disables the knob, and an out-of-range value is clamped to the highest
+    /// priority an unprivileged process may set.
+    #[test]
+    fn socket_priority_defaults_clamps_and_zero_disables() {
+        assert_eq!(parse_socket_priority(None), SOCKET_PRIORITY_DEFAULT);
+        assert_eq!(
+            parse_socket_priority(Some("banana")),
+            SOCKET_PRIORITY_DEFAULT
+        );
+        assert_eq!(parse_socket_priority(Some("")), SOCKET_PRIORITY_DEFAULT);
+        assert_eq!(parse_socket_priority(Some("0")), 0);
+        assert_eq!(parse_socket_priority(Some(" 3 ")), 3);
+        assert_eq!(parse_socket_priority(Some("99")), SOCKET_PRIORITY_MAX);
+    }
+
+    /// `MYQUIC2_TCP_FASTOPEN_CONNECT`: only the documented on spellings enable
+    /// it; an unset or malformed value keeps the safe default (off).
+    #[test]
+    fn tfo_connect_flag_is_explicitly_opt_in() {
+        assert!(!parse_on_flag(None));
+        assert!(!parse_on_flag(Some("")));
+        assert!(!parse_on_flag(Some("banana")));
+        assert!(!parse_on_flag(Some("0")));
+        for on in ["1", "true", "TRUE", " on ", "yes"] {
+            assert!(parse_on_flag(Some(on)), "{on:?} must enable TFO connect");
+        }
+    }
+
+    /// The latency-sensitive class must read back the configured priority and
+    /// a bulk socket must stay at the kernel default. Linux-gated; runs in CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tune_udp_priority_raises_only_the_latency_sensitive_class() {
+        let want = socket_priority();
+        let sock = crate::udp_socket_dual("127.0.0.1:0").unwrap();
+        tune_udp_priority(&sock, false);
+        assert_eq!(
+            socket2::SockRef::from(&sock).priority().unwrap(),
+            0,
+            "a bulk egress socket must stay at the kernel default"
+        );
+        tune_udp_priority(&sock, true);
+        assert_eq!(
+            socket2::SockRef::from(&sock).priority().unwrap(),
+            want,
+            "the interactive class must read back the effective priority"
+        );
+    }
+
+    /// `TCP_FASTOPEN_CONNECT` must still complete a real loopback handshake
+    /// and deliver the first write; the listener does not have to arm TFO —
+    /// the kernel falls back to the normal handshake when the peer does not
+    /// accept the data in the SYN. Linux-gated; runs in CI.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tfo_connect_delivers_the_first_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Skip on a kernel that does not know the option (the feature is
+        // best-effort by contract); do not skip on a failure *after* the
+        // option was accepted, which is what the rest of this test pins.
+        let probe = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        if set_raw_int(
+            probe.as_raw_fd(),
+            nix::libc::IPPROTO_TCP,
+            nix::libc::TCP_FASTOPEN_CONNECT,
+            1,
+        )
+        .is_err()
+        {
+            return;
+        }
+        drop(probe);
+        let li = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = li.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = fastopen_connect(addr).await.unwrap();
+            stream.write_all(b"tfo").await.unwrap();
+            stream
+        });
+        let (mut server, _) = li.accept().await.unwrap();
+        let mut got = [0u8; 3];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.read_exact(&mut got),
+        )
+        .await
+        .expect("the first write must reach the listener")
+        .unwrap();
+        assert_eq!(&got, b"tfo");
+        let _stream = client.await.unwrap();
+    }
+
+    /// The resolver watcher's wakeup mechanism: a write to a watched file must
+    /// surface as one `changed()` completion. Linux-gated; uses a private temp
+    /// directory so no system file is touched.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inotify_watch_reports_a_config_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "myquic2-inotify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("resolv.conf");
+        std::fs::write(&file, "nameserver 192.0.2.1\n").unwrap();
+        let watch = inotify::Watch::new(&[dir.clone(), file.clone()]).unwrap();
+        std::fs::write(&file, "nameserver 192.0.2.2\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), watch.changed())
+            .await
+            .expect("a watched write must produce an event")
+            .expect("inotify watch");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

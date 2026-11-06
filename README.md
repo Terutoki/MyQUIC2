@@ -3,7 +3,7 @@
 <h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-778_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-786_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -629,7 +629,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **778 tests** on macOS (lib 384 + client 213 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **786 tests** on macOS (lib 389 + client 216 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1155,6 +1155,14 @@ Measured 2026-10-29 on two hosts, same 128 B shape, 8 associations through the s
 - **There is no sender feedback.** DATAGRAM has no flow control, so past the pipe the sender keeps sending and the excess is dropped silently somewhere in the chain. The client stage counts its own drops (`stage_full`, and 2.3 % of pushes at 160k); the receive side below it does not.
 - **The 8 × 1,000 pps acceptance test sits 5× / 17× below these knees.** Loopback with the harness itself saturating is not a WAN capacity spec; method, per-queue attribution and the code reading are in [`PERF_ANALYSIS.md`](PERF_ANALYSIS.md) §13.
 
+### Linux edge controls
+
+The small-packet class was already isolated in QUIC — the interactive TCP slot and the interactive UDP shards own separate connections, congestion windows, DATAGRAM buffers and server readers. Three Linux-only controls extend the same policy to the host and to connection setup, all without a wire change:
+
+- **Local scheduling priority.** The client raises `SO_PRIORITY` to **6** on the interactive TCP slot and every interactive UDP shard; bulk TCP and bulk UDP stay at the kernel default (0). With a `prio` qdisc the small-packet class gets the highest band; on Wi-Fi, mac80211 maps priority 6 to the voice access category. DNS is in that class by default — port 53 is one of the shipped `interactive_ports` — so DNS-over-UDP and DNS-over-TCP both ride the promoted sockets. The default `fq_codel` ignores `SO_PRIORITY`, so the setting is free where it does not apply and effective where the operator configured a priority qdisc. `MYQUIC2_SOCKET_PRIORITY=0` disables it. DSCP is deliberately not used: quinn-udp writes a per-packet `IP_TOS`/`IPV6_TCLASS` cmsg for ECN that would overwrite a socket-level DSCP on every ECN-marked packet.
+- **DNS configuration events.** On Linux the resolver watcher arms an inotify watch on `/etc/resolv.conf`, `/etc/hosts`, `/etc`, and the `resolv.conf` symlink target and its directory. A DHCP renewal, VPN transition or `resolvconf` rewrite rebuilds the resolver at the event instead of waiting out the 5 s poll; the poll remains the backstop for a missed event (and is the only mechanism on macOS).
+- **TCP Fast Open on target dials.** `MYQUIC2_TCP_FASTOPEN_CONNECT=1` enables `TCP_FASTOPEN_CONNECT` on the server's **single-candidate** target dials (IP-literal targets, which are the dominant case). The first write then rides the SYN and saves one RTT when the target has a cached TFO cookie. It is opt-in because `connect()` returns before the handshake: a dead target looks connected until the first write (bounded by a three-retry SYN budget), so the normal happy-eyeballs race keeps blocking-connect semantics and never uses it.
+
 ## 🛡️ Security
 
 The security model assumes an untrusted peer and a hostile network. TLS 1.3 authenticates and encrypts the tunnel; MQP's job is narrower but critical: a compressed id must not become an authorization bypass, a rebind must not become an open relay, and a malformed frame must not become a memory or CPU primitive. The defaults are deliberately restrictive — full-cone off, private targets off, token required, and every peer-fillable structure bounded.
@@ -1221,13 +1229,13 @@ The client and server must run the **same revision**. Certificates are generated
 - **UDP scheduling:** `udp_split`, `udp_interactive_conns` (interactive shards, default 2), `udp_egress_conns` (bulk shards, default 2), `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
 - **Interactive routing:** `interactive_ports` pins TCP flows to slot 0 and puts matching UDP destinations on the interactive egress class. Default: SSH 22, DNS 53, NTP 123, RDP 3389, STUN/TURN 3478–3481, VNC 5900.
 - **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Per-listener caps (`max_conns` / `max_sessions`) sit under process-wide forward budgets (`max_forward_conns` / `max_forward_sessions`, both defaulting to 3/4 of the shared SOCKS limit) so forwarding cannot deny the SOCKS endpoint. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
-- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL` (busy-poll budget for every UDP socket, default 50 µs; `0` disables it. It trades idle CPU for wakeup latency, so set `0` if a core sits at 100% while idle), `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`.
+- **Environment knobs:** `MYQUIC2_SESS_SOCKET_BUF`, `MYQUIC2_RELAY_SOCKET_BUF`, `MYQUIC2_BUSY_POLL` (busy-poll budget for every UDP socket, default 50 µs; `0` disables it. It trades idle CPU for wakeup latency, so set `0` if a core sits at 100% while idle), `MYQUIC2_TCP_NOTSET_LOWAT`, `MYQUIC2_SHARD_RUNTIME`, `MYQUIC2_SOCKET_PRIORITY` (Linux: `SO_PRIORITY` for the client's latency-sensitive egress class, default 6 = the unprivileged ceiling; bulk slots stay at 0; `0` disables it), `MYQUIC2_TCP_FASTOPEN_CONNECT` (Linux: opt-in `TCP_FASTOPEN_CONNECT` on single-candidate target dials; off by default because the connect returns before the handshake).
 
 The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **778 tests** on the macOS dev box (lib 384 + client 213 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **786 tests** on the macOS dev box (lib 389 + client 216 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -2122,6 +2130,8 @@ flowchart LR
     class O ok
 ```
 
+On Linux the resolver generation above is also rebuilt on **inotify** events for the configuration files, so a network transition does not wait for the 5 s poll; see [Linux edge controls](#linux-edge-controls).
+
 ### 🚀 Scheduling & transport
 
 #### Cross-session fairness
@@ -2209,7 +2219,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>778 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>786 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB

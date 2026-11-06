@@ -4923,6 +4923,47 @@ fn only_the_dedicated_bulk_udp_shards_use_the_bulk_preset() {
     }
 }
 
+/// The local-priority class is narrower than the transport-preset split: the
+/// interactive TCP slot and every interactive UDP shard are latency-sensitive,
+/// while bulk TCP and bulk UDP stay at the kernel's default priority. With
+/// `udp_split` off the shared UDP slot carries both classes and must not be
+/// promoted.
+#[test]
+fn only_the_latency_sensitive_slots_get_local_priority() {
+    let split = ConnPool::new(4, vec![], true, true, MAX_UDP_EGRESS_CONNS);
+    assert!(slot_is_latency_sensitive(&split, 0), "interactive TCP slot");
+    for i in 1..split.tcp_slots() {
+        assert!(
+            !slot_is_latency_sensitive(&split, i),
+            "bulk TCP slot {i} must stay at default priority"
+        );
+    }
+    for i in 0..split.interactive_shards {
+        assert!(
+            slot_is_latency_sensitive(&split, split.udp_global_slot(i)),
+            "interactive UDP shard {i}"
+        );
+    }
+    for i in 0..MAX_UDP_EGRESS_CONNS {
+        assert!(
+            !slot_is_latency_sensitive(&split, split.udp_global_slot(1 + i)),
+            "bulk UDP shard {i} must stay at default priority"
+        );
+    }
+
+    let shared = ConnPool::new(4, vec![], true, false, 1);
+    assert!(
+        slot_is_latency_sensitive(&shared, 0),
+        "the interactive TCP slot keeps its priority with udp_split off"
+    );
+    for i in 1..shared.slots_total() {
+        assert!(
+            !slot_is_latency_sensitive(&shared, i),
+            "the shared UDP slot carries bulk traffic and must not be promoted"
+        );
+    }
+}
+
 /// P0-2 regression: the deferred N-pack flush must never park its payloads
 /// back for a later loop iteration. The pre-fix code re-stored them on a stale
 /// memo, so they waited for the next app datagram — unbounded when the app

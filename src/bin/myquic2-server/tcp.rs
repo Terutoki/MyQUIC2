@@ -335,7 +335,13 @@ pub(crate) async fn dial_happy_eyeballs(
     }
     match n {
         0 => None,
-        1 => tokio::time::timeout(DIAL_BUDGET, connect_attempt(accept[0]))
+        // The single-candidate path is the only one allowed to use
+        // `TCP_FASTOPEN_CONNECT`: `connect()` returning before the handshake
+        // is exactly what the race below must not see (it would declare the
+        // first candidate the winner before any SYN left the host), but here
+        // there is no race to corrupt and the first write can ride the SYN.
+        // The helper is a plain connect unless the operator opted in.
+        1 => tokio::time::timeout(DIAL_BUDGET, connect_attempt(accept[0], true))
             .await
             .ok()
             .flatten(),
@@ -348,8 +354,15 @@ pub(crate) async fn dial_happy_eyeballs(
 
 /// One connection attempt. Any failure is just "not this candidate": the dial
 /// only needs a winner, and the caller's reset code does not depend on why.
-async fn connect_attempt(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
-    tokio::net::TcpStream::connect(addr).await.ok()
+///
+/// `allow_tfo` is true only for the single-candidate path; the racing path
+/// must keep the blocking-connect semantics described above.
+async fn connect_attempt(addr: SocketAddr, allow_tfo: bool) -> Option<tokio::net::TcpStream> {
+    if allow_tfo {
+        myquic2::linux::tcp_connect(addr).await.ok()
+    } else {
+        tokio::net::TcpStream::connect(addr).await.ok()
+    }
 }
 
 /// Race the candidates in the order the caller produced them, one new attempt
@@ -374,7 +387,7 @@ async fn race_dial(cands: &[SocketAddr]) -> Option<tokio::net::TcpStream> {
     let mut attempts: tokio::task::JoinSet<Option<tokio::net::TcpStream>> =
         tokio::task::JoinSet::new();
     let mut next = 0;
-    attempts.spawn(connect_attempt(cands[0]));
+    attempts.spawn(connect_attempt(cands[0], false));
     next += 1;
     loop {
         tokio::select! {
@@ -394,7 +407,7 @@ async fn race_dial(cands: &[SocketAddr]) -> Option<tokio::net::TcpStream> {
             return None;
         }
         if next < cands.len() {
-            attempts.spawn(connect_attempt(cands[next]));
+            attempts.spawn(connect_attempt(cands[next], false));
             next += 1;
         }
     }

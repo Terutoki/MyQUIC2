@@ -303,6 +303,12 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         sendmmsg_available(),
         recvmmsg_available()
     );
+    #[cfg(target_os = "linux")]
+    info!(
+        "egress priority: SO_PRIORITY={} on the latency-sensitive slots (interactive TCP + \
+         interactive UDP shards); 0 disables it (MYQUIC2_SOCKET_PRIORITY)",
+        myquic2::linux::socket_priority()
+    );
     let alpn = c.alpn_bytes();
     info!(
         "application wire: rev{} (ALPN {})",
@@ -456,6 +462,12 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         let pin_cores = priority_pin_cores(&pool, main_workers);
         for (i, &pin_core) in pin_cores.iter().enumerate() {
             let sock = udp_socket_dual("[::]:0")?;
+            // Local scheduling priority follows the *class* of the slot, not
+            // its transport preset: the interactive TCP slot and the
+            // interactive UDP shards carry DNS/game/RPC-sized packets, while
+            // bulk TCP and bulk UDP are throughput classes. See
+            // `slot_is_latency_sensitive` and `linux::tune_udp_priority`.
+            myquic2::linux::tune_udp_priority(&sock, slot_is_latency_sensitive(&pool, i));
             // Per-slot transport preset (see `slot_uses_bulk_preset`): only
             // the dedicated bulk UDP class connection gets the coarse bulk
             // preset; the TCP pool and the interactive UDP class keep the
@@ -510,8 +522,9 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     } else {
         let rt = Arc::new(quinn::TokioRuntime);
         let mut eps: Vec<quinn::Endpoint> = Vec::with_capacity(pool.slots_total());
-        for _ in 0..pool.slots_total() {
+        for i in 0..pool.slots_total() {
             let sock = udp_socket_dual("[::]:0")?;
+            myquic2::linux::tune_udp_priority(&sock, slot_is_latency_sensitive(&pool, i));
             eps.push(quinn::Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::default(),
                 None,

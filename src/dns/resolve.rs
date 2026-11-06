@@ -485,8 +485,14 @@ fn configure_resolver_options(opts: &mut hickory_resolver::config::ResolverOpts)
 /// names pointed at dead nameservers for half a minute (serve-stale only hides
 /// that for names already answered); 5 s costs a negligible fraction of one
 /// worker's CPU and bounds the window to the first retry an application would
-/// make anyway. Platform change notifications would be better still, but they
-/// need a dependency per platform for a window this small.
+/// make anyway.
+///
+/// On Linux an inotify watch on `/etc/resolv.conf`, `/etc/hosts` and their
+/// directories wakes the same loop immediately, so a DHCP renewal or a VPN
+/// transition rebuilds the resolver at the event instead of at the next tick.
+/// This interval remains the backstop for a missed event (an atomic replace
+/// whose new inode the watch did not follow), and it is the only mechanism on
+/// macOS.
 pub const RESOLVER_CONFIG_POLL: Duration = Duration::from_secs(5);
 
 /// One generation of the process-wide upstream resolver.
@@ -632,6 +638,54 @@ fn resolver_gen() -> &'static arc_swap::ArcSwap<ResolverGen> {
     GEN.get_or_init(|| arc_swap::ArcSwap::from_pointee(build_resolver_gen()))
 }
 
+/// Paths whose change can alter the resolver generation or its hosts table.
+///
+/// `/etc/resolv.conf` is frequently a symlink into `/run` (systemd-resolved,
+/// NetworkManager, resolvconf); watching only the link would miss an in-place
+/// rewrite of the target, which is the normal update path, so the target and
+/// its parent are watched as well. A missing path is fine: the watcher arms
+/// whatever exists and the poll remains the backstop.
+#[cfg(target_os = "linux")]
+fn resolver_watch_paths() -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let mut paths = vec![
+        PathBuf::from("/etc/resolv.conf"),
+        PathBuf::from("/etc/hosts"),
+        PathBuf::from("/etc"),
+    ];
+    if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            Path::new("/etc").join(target)
+        };
+        if let Some(parent) = target.parent() {
+            paths.push(parent.to_path_buf());
+        }
+        paths.push(target);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The Linux inotify fast path for [`spawn_resolver_watch`].
+#[cfg(target_os = "linux")]
+struct ResolverWatch(crate::linux::inotify::Watch);
+
+#[cfg(target_os = "linux")]
+impl ResolverWatch {
+    fn arm() -> std::io::Result<Self> {
+        Ok(Self(crate::linux::inotify::Watch::new(
+            &resolver_watch_paths(),
+        )?))
+    }
+
+    async fn changed(&self) -> std::io::Result<()> {
+        self.0.changed().await
+    }
+}
+
 /// Warm the resolver and keep following the platform's DNS configuration.
 ///
 /// Idempotent; the binaries call it once at startup. The first build runs in a
@@ -654,7 +708,52 @@ pub fn spawn_resolver_watch() {
         {
             tracing::debug!("dns resolver warm-up task failed ({e})");
         }
+        // Linux: wake on the configuration file's own events instead of
+        // waiting out the poll. A missed event (an atomic replace whose new
+        // inode no watch followed) still lands on the backstop tick below.
+        #[cfg(target_os = "linux")]
+        let mut watch = match ResolverWatch::arm() {
+            Ok(w) => {
+                tracing::info!(
+                    "dns resolver watch: inotify armed on /etc/resolv.conf, /etc/hosts and their \
+                     directories ({} s poll backstop)",
+                    RESOLVER_CONFIG_POLL.as_secs()
+                );
+                Some(w)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "dns resolver watch: inotify unavailable ({e}); polling every {} s",
+                    RESOLVER_CONFIG_POLL.as_secs()
+                );
+                None
+            }
+        };
         loop {
+            #[cfg(target_os = "linux")]
+            {
+                let mut disable_watch = false;
+                if let Some(w) = watch.as_ref() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(RESOLVER_CONFIG_POLL) => {}
+                        result = w.changed() => {
+                            if let Err(e) = result {
+                                tracing::debug!(
+                                    "dns resolver watch: inotify read failed ({e}); \
+                                     falling back to polling"
+                                );
+                                disable_watch = true;
+                            }
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(RESOLVER_CONFIG_POLL).await;
+                }
+                if disable_watch {
+                    watch = None;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             tokio::time::sleep(RESOLVER_CONFIG_POLL).await;
             let fresh = tokio::task::spawn_blocking(|| {
                 hickory_resolver::system_conf::read_system_conf()

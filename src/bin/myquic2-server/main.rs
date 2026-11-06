@@ -128,6 +128,13 @@ async fn main() -> Result<()> {
         sendmmsg_available(),
         recvmmsg_available()
     );
+    #[cfg(target_os = "linux")]
+    if myquic2::linux::tcp_fastopen_connect_enabled() {
+        info!(
+            "tcp target dials: TCP_FASTOPEN_CONNECT armed for single-candidate dials \
+             (the first write rides the SYN; racing dials keep blocking-connect semantics)"
+        );
+    }
     let listen: SocketAddr = c.listen.parse().context("bad listen")?;
     // File-descriptor budget before the first socket: the designed caps need
     // one fd per session socket plus one per relayed TCP flow, which is an

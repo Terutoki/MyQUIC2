@@ -2742,3 +2742,196 @@ clean; `cargo test --lib` 387, `--bin myquic2-server` 165 (+1 ignored),
 change is a mechanism fix (the admission rate is now bounded by arrivals, not by
 the 100 ms scan interval), and the existing e2e churn test exercises 40 one-shot
 peers below the cap, not the saturated valve.
+
+## 25. Seventeenth Batch: the Linux edge — class priority, event-driven DNS, and opt-in TFO (2026-11-06, post-3862325)
+
+Scope: Linux-only scheduling, DNS-reactivity and connection-establishment
+features around the existing data plane. **No wire change.** The frame path is
+still rev3, byte for byte; none of the three items needs a protocol revision,
+and the compatibility waiver was not a reason to spend one.
+
+### 25.1 What was left after the packet path
+
+Twenty-four batches have pushed the per-datagram path to a syscall-and-copy
+floor: quinn-udp already batches sends with GSO and receives with GRO/`recvmmsg`;
+the last hop already batches 32 frames with `sendmmsg`/`recvmmsg`; the client
+already splits the interactive and bulk classes into separate QUIC connections,
+congestion windows, DATAGRAM buffers and pinned runtimes; and the server already
+uses `SO_REUSEPORT`, `SO_BUSY_POLL`, `TCP_NODELAY`, `TCP_NOTSENT_LOWAT` and
+explicit socket buffers. The remaining Linux levers are therefore not more
+per-packet code. They are:
+
+1. **local scheduling** — tell the host's qdisc/WMM which packets are small and
+   latency-sensitive (the client's class split existed only inside QUIC);
+2. **configuration reactivity** — stop polling the platform DNS configuration
+   when the kernel can say exactly when it changed;
+3. **connection establishment** — remove the target-side TCP RTT where the
+   operator accepts TFO's deferred error semantics;
+4. **kernel bypass** — eBPF/`io_uring`/`AF_XDP`, deliberately not taken here
+   (§25.6).
+
+### 25.2 The class split stopped at the QUIC boundary
+
+The client already gives the latency-sensitive population its own egress:
+TCP slot 0 (`interactive_ports`) and the interactive UDP shards are separate
+QUIC connections, so a bulk flow cannot queue behind their cwnd or DATAGRAM
+buffer, and the server's per-connection reader is separate too. What the kernel
+saw, however, was every pool socket at the same default priority: the separation
+existed only above the UDP socket.
+
+`slot_is_latency_sensitive` (client `pool.rs`) is deliberately narrower than the
+existing `slot_uses_bulk_preset` predicate. The preset split treats every TCP
+slot as "tuned" because ACK cadence is a transport concern; the priority split
+treats only **TCP slot 0** and the **interactive UDP shards** as
+latency-sensitive. With `udp_split = false` the one shared UDP slot carries both
+classes and is not promoted at all. DNS is in the promoted class by default:
+port 53 is in the shipped `interactive_ports`, and the client's first-payload
+size heuristic puts the UDP side there even without the port list.
+
+`linux::tune_udp_priority` then sets `SO_PRIORITY` on exactly those sockets:
+**6** by default (`SOCKET_PRIORITY_DEFAULT`), the highest value an unprivileged
+process may set, which `prio` qdisc puts in the highest band and mac80211 maps
+to the Wi-Fi voice access category. Bulk slots are left at 0. The knob is
+clamped to 0–6; `MYQUIC2_SOCKET_PRIORITY=0` disables it. Failure is best-effort
+and logged once, like every other Linux option in that module.
+
+DSCP was considered and rejected for the QUIC sockets: quinn-udp emits a
+per-packet `IP_TOS`/`IPV6_TCLASS` cmsg carrying only the ECN codepoint
+(`quinn-udp/src/unix.rs`), which overwrites a socket-level DSCP on every
+ECN-marked packet. `SO_PRIORITY` is untouched by that cmsg. Getting both would
+require a quinn-udp fork, not a local option.
+
+The honest limit: the kernel's default `fq_codel` ignores `skb->priority`, so
+the setting changes nothing on a stock wired host unless the operator installs a
+`prio` qdisc; on Wi-Fi it selects the WMM access category without any
+configuration. The alternative — marking all interactive traffic EF in the IP
+header — is both unreliable through quinn and a network-policy decision that
+belongs to the operator, not the proxy.
+
+### 25.3 The resolver was polled, although Linux can report the change
+
+`spawn_resolver_watch` rebuilds the resolver generation when the platform
+configuration's fingerprint changes. The 5 s poll was the documented compromise:
+a VPN coming up or a DHCP renewal could leave cold names pointed at dead
+nameservers for up to one interval, and the code comment already named inotify as
+the better mechanism ("they need a dependency per platform").
+
+No dependency was needed: `linux::inotify` wraps `inotify_init1` +
+`inotify_add_watch` through the `nix::libc` re-export already used for the other
+raw options, registers the descriptor with `tokio::io::unix::AsyncFd`, and
+exposes one `changed()` future. The watcher arms:
+
+* `/etc/resolv.conf` and `/etc/hosts`;
+* `/etc` itself, for the atomic-replace idiom (`mv resolv.conf.new
+  resolv.conf`) and a symlink swap;
+* the `resolv.conf` symlink target and its parent, because systemd-resolved,
+  NetworkManager and resolvconf all point the link into `/run` and rewrite the
+  target in place.
+
+Event payloads are ignored on purpose: any event means "re-read the
+fingerprint", and the existing comparison decides whether a rebuild is needed.
+A path that cannot be watched is skipped; an instance with no armed path is an
+error and the loop keeps the 5 s poll. A read error also falls back to polling
+for the rest of the process. The poll is never removed — it is the backstop for
+an event the watch could not see (a new inode the old watch did not follow), and
+it is the only mechanism on macOS.
+
+Effect: after a network transition, the first cold lookup that would have waited
+for the tick instead rebuilds the resolver at the event. The five-second window
+was small but it sat exactly on the reconnect path (the client re-resolves its
+own server endpoint), so it was paid at the worst time.
+
+### 25.4 TFO was armed on the listener, not on the dial
+
+The client's SOCKS/forward listeners already set `TCP_FASTOPEN`
+(`tune_tcp_listener`), but the server's target dials were plain
+`TcpStream::connect`. `MYQUIC2_TCP_FASTOPEN_CONNECT=1` now opts into
+`TCP_FASTOPEN_CONNECT` on the **single-candidate** dial path: the kernel returns
+from `connect()` before the SYN, and the first write is carried in the SYN,
+saving one RTT when the target has a cached TFO cookie.
+
+Two limits are structural, not tuning:
+
+* **Only single-candidate dials.** The happy-eyeballs race needs `connect()` to
+  mean "this candidate completed the handshake"; with TFO the first candidate
+  would "win" before any SYN left the host. The racing path keeps a plain
+  connect.
+* **Deferred error detection.** A dead target now looks connected until the
+  first write or the SYN budget reports the failure. `TCP_SYNCNT` is set to 3
+  so a blackholed target fails in the SYN phase after the 1 + 2 + 4 s SYN
+  backoff (~7 s) instead of camping for the stock six-retry minute. `TCP_USER_TIMEOUT` is
+  deliberately **not** set: the socket outlives the handshake, and a 4 s user
+  timeout would abort a healthy long-lived relay during an ordinary path stall.
+
+The option is off by default because that trade is the operator's to make, and
+an unsupported kernel or a rejected option falls back to the ordinary connect
+before any traffic is sent. The first connection to a target still pays the
+normal handshake; the saving is on the repeat connections that have a cookie.
+
+### 25.5 Tests
+
+* `linux.rs`: `socket_priority_defaults_clamps_and_zero_disables`,
+  `tfo_connect_flag_is_explicitly_opt_in` (portable), plus Linux-gated
+  `tune_udp_priority_raises_only_the_latency_sensitive_class` (reads the option
+  back), `tfo_connect_delivers_the_first_write` (a real loopback handshake with
+  the first write in the SYN) and `inotify_watch_reports_a_config_write` (a
+  private temp directory, no system file touched).
+* `myquic2-client/tests.rs`:
+  `only_the_latency_sensitive_slots_get_local_priority` pins the predicate
+  against the split and shared pool shapes — interactive TCP + interactive UDP
+  promoted, bulk TCP/UDP default, shared UDP not promoted.
+
+### 25.6 Examined and deliberately not changed
+
+* **eBPF `SO_ATTACH_REUSEPORT_EBPF` CPU steering.** A program returning
+  `bpf_get_smp_processor_id() % n` could keep each packet on the CPU that owns
+  its endpoint's runtime, avoiding the cross-core wakeup the reuseport hash
+  ignores. The socket-array index is not exposed to userspace, so the mapping
+  from "CPU i" to "the endpoint pinned to core i" depends on group insertion
+  order; a wrong mapping sends a connection's packets to an endpoint whose CID
+  table does not know it, which is a correctness failure, not a slow path. It
+  also needs `CAP_BPF`/`CAP_NET_ADMIN`, and the measured server cost is already
+  0.42 core at 120k pps. Not worth the failure mode without a measurement that
+  isolates wakeup latency.
+* **`io_uring` / `AF_XDP`.** Both replace quinn-udp's socket and reactor
+  integration, not a local option: a custom `AsyncUdpSocket` with completion
+  queues, or an XDP redirect path with a userspace ring. The per-datagram cost
+  is already ~3.5 µs round trip on Linux; the risk is a transport rewrite for a
+  gain the current ceiling (receive queues, no sender feedback) would hide.
+* **`SO_TXTIME` + ETF qdisc.** Kernel pacing would need a per-packet
+  `SCM_TXTIME` cmsg that quinn-udp does not emit, plus an operator-installed
+  ETF qdisc. Same fork problem as DSCP.
+* **`TCP_QUICKACK`.** Not sticky: it must be re-armed after every read, so it
+  becomes one `setsockopt` per small read to save a delayed ACK that does not
+  sit on the proxy's forwarding path (the app's data is already in userspace
+  when the ACK is delayed).
+* **`mlockall`.** `MCL_FUTURE` makes ordinary allocations fail once the
+  memlock limit is reached, so a page-fault-latency knob can become an
+  out-of-memory failure mode; `MCL_CURRENT` at startup locks almost nothing in
+  a process that allocates its buffers later. Not a safe default.
+* **A wire revision.** The three wins above are host-side. The one remaining
+  latency item that would need the wire is the client-side address hint that
+  overlaps a domain target's DNS lookup with the handshake; it still trades
+  split-horizon/VPN correctness for one RTT and was not part of this batch.
+
+### 25.7 Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --all-targets -- -D warnings`
+clean on macOS and on `aarch64-unknown-linux-musl`;
+`cargo +stable check --target aarch64-unknown-linux-musl --all-targets` clean;
+`cargo test --all-targets` **786 passed / 0 failed** (lib 389, client 216,
+server 165 with 1 ignored benchmark, `forward_e2e` 7, `rev3_e2e` 9). The same
+tree in the Linux CI container (`rustc 1.99.0`, aarch64 Linux): lib **397**
+(12 `linux::tests`, including the three new mechanism tests), client 216,
+server 165 (+1 ignored), `forward_e2e` 7 and `rev3_e2e` 9 — all green.
+
+### 25.8 What this does not establish
+
+No benchmark was run. The `SO_PRIORITY` effect depends on a `prio` qdisc, a WMM
+access point or another priority-aware path; on the default `fq_codel` it is a
+no-op, and this batch does not claim a p99 improvement from it. The inotify path
+removes a bounded staleness window, not steady-state lookup time. TFO saves a
+round trip only when the target supports it and a cookie is cached, and it is
+off by default; the Linux-gated tests prove the mechanism (the option reads back,
+the first write reaches a loopback listener, an inotify event wakes the watch),
+not a deployment's RTT.

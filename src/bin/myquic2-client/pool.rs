@@ -1111,6 +1111,26 @@ pub(crate) fn slot_uses_bulk_preset(pool: &ConnPool, i: usize) -> bool {
     !pool.udp_split || i > pool.tcp_slots
 }
 
+/// Whether pool slot `i` carries the latency-sensitive egress class and should
+/// therefore be raised above the kernel's default local scheduling priority.
+///
+/// That is slot 0 of the TCP pool (`interactive_ports`: SSH, RDP, DNS-over-TCP)
+/// and every **interactive** UDP shard. The other TCP slots and the bulk UDP
+/// shards are throughput classes and stay at priority 0. With `udp_split` off,
+/// the one shared UDP slot carries both classes and is left alone: marking it
+/// would promote a bulk flow that happens to share the socket.
+///
+/// This is deliberately a *narrower* predicate than
+/// [`slot_uses_bulk_preset`], which treats every TCP slot as tuned: transport
+/// presets are about ACK cadence and buffer depth, while the socket priority is
+/// the local qdisc/WMM verdict on the flow's latency budget.
+pub(crate) fn slot_is_latency_sensitive(pool: &ConnPool, i: usize) -> bool {
+    if i < pool.tcp_slots {
+        return i == 0;
+    }
+    pool.udp_split && i < pool.tcp_slots + pool.interactive_shards
+}
+
 /// Number of pool slots [`ConnPool::new_with_bulk_ports`] would build for a
 /// config with these clamped values, without allocating the slots.
 ///
