@@ -33,12 +33,15 @@ gso = true
 # NAT/firewall refresh cadence. This is not the liveness window; keep it short
 # enough for the path's UDP mapping (5 s is safe on common 30-120 s NATs).
 keep_alive_secs = 5
-# Liveness window, decoupled from keepalive. Default 60 s: the client's silence
-# watchdog is 2/3 of it (40 s) and its stale gate is 22 s. 15 restores the old
-# fast behavior (~10 s watchdog); 90 widens the no-drop window to ~60 s. Values
-# below 3 × keep_alive_secs are raised to that floor. Both sides advertise an
-# idle timeout and QUIC uses the minimum, so keep this equal on both sides.
-idle_timeout_secs = 60
+# Liveness window, decoupled from keepalive. Shipped as 15 s, the floor for a
+# 5 s keepalive (3 × keep_alive_secs): the client's silence watchdog is 2/3 of
+# it (~10 s) and its stale gate is (keepalive + watchdog) / 2 (~7 s), so a
+# blackholed path stops taking new flows in ~7 s and is force-closed in ~10 s
+# instead of 22 s / 40 s. 60 was the old default and is the conservative choice
+# on a lossy link; 90 widens the no-drop window to ~60 s. Values below
+# 3 × keep_alive_secs are raised to that floor. Both sides advertise an idle
+# timeout and QUIC uses the minimum, so keep this equal on both sides.
+idle_timeout_secs = 15
 allow_private = true
 # Full-cone NAT semantics for the UDP relay (default false). When true, every
 # UDP association's relay socket forwards replies from ANY source, not just the
@@ -98,17 +101,23 @@ send_window_mb = 8
 # class already uses 8/10 (transport/build.rs) on its dedicated connections.
 # ack_threshold = 2
 # max_ack_delay_ms = 5
-# RTT seed in ms for the first PTO / initial pacing (default 190). Set it to
-# the link RTT, e.g. 140 on a 140 ms link; steady state re-measures.
-# initial_rtt_ms = 140
-# Path MTU (max UDP payload) every new connection starts from, bytes, default
-# 1200 = the QUIC floor (clamped 1200..=1472; lower values are raised to 1200,
-# since QUIC forbids smaller packets). PMTU discovery is opportunistic, so at
-# the default a busy connection sends 18-23% more packets and fragments UDP
-# payloads above 1150 B. On a known path raise it — 1360 is 1388/1408 wire
-# bytes after the IP+UDP headers, safe on WireGuard-1420 and similar tunnel
-# paths; a known 1500-byte Ethernet path can use 1400/1472. Mirror the client.
-# initial_mtu = 1400
+# RTT seed in ms for the first PTO / initial pacing (crate default 190). Shipped
+# as 140 because this build targets a ~140 ms WAN link: the seed sets the first
+# PTO to ~435 ms instead of ~575 ms, and it only lives until the first measured
+# sample. Lower it on a shorter link (clamped 1..=3000). Mirror the client.
+initial_rtt_ms = 140
+# Path MTU (max UDP payload) every new connection starts from, bytes (clamped
+# 1200..=1472; lower values are raised to 1200, since QUIC forbids smaller
+# packets). Shipped as 1360: 1388/1408 wire bytes after the IPv4/IPv6 + UDP
+# headers, so it is safe on WireGuard-1420, PPPoE-1492 and a 1500-byte Ethernet
+# path. This matters because quinn's PMTU discovery is opportunistic — probes
+# are only emitted from a transmit poll that builds no payload packet, so a busy
+# connection can sit at its start value indefinitely. At the 1200 floor that is
+# ~19% more packets, and quinn's DATAGRAM budget is mtu - 38 (1162 B), so every
+# UDP payload above 1150 B splits into two MQP fragments. A known 1500-byte
+# Ethernet path can use 1400 or 1472. Mirror the client; a too-high value costs
+# a loss burst until quinn's black-hole detector drops back to 1200.
+initial_mtu = 1360
 # ALPN (optional; omit/empty = the default `h3` masquerade for BOTH wire
 # revisions). Must match the client; a custom label is used verbatim. Distinct
 # labels are the opt-in way to get a TLS-level fail-fast gate across revisions
