@@ -16,6 +16,7 @@
 //! `dispatcher.rs`).
 use super::*;
 use myquic2::udp::R2Fragmenter;
+use std::collections::VecDeque;
 
 /// Spawn a UDP forward listener on `spec.listen`, relaying each peer's
 /// datagrams to `spec.target`.
@@ -36,9 +37,9 @@ use myquic2::udp::R2Fragmenter;
 ///    residual (at most 1/4 by default) can ever be taken from SOCKS.
 ///
 /// When a level refuses a *new source*, the listener first tries to evict its
-/// own oldest peer that has been idle for [`EVICT_MIN_IDLE_MS`] — a churn
-/// workload (DNS-style ephemeral source ports) could otherwise hold the session
-/// cap until the 180 s idle reap and refuse every new peer in the meantime.
+/// own oldest idle peer (admission order) — a churn workload (DNS-style
+/// ephemeral source ports) could otherwise hold the session cap until the 180 s
+/// idle reap and refuse every new peer in the meantime.
 pub(crate) fn spawn_udp_forward(
     spec: UdpForwardSpec,
     pool: ConnPool,
@@ -69,6 +70,7 @@ pub(crate) fn spawn_udp_forward(
         last_evict_scan_ms: 0,
         deferred: false,
         peers: HashMap::default(),
+        evict_order: VecDeque::new(),
     };
     Ok(tokio::spawn(async move { fwd.run(shutdown).await }))
 }
@@ -136,6 +138,20 @@ pub(crate) struct UdpForwarder {
     /// simply expired at `PENDING_TTL_MS`.
     deferred: bool,
     peers: HashMap<SocketAddr, PeerSession, foldhash::fast::RandomState>,
+    /// Insertion order of the peers this listener has admitted, for the
+    /// admission-eviction valve.
+    ///
+    /// A productive eviction must be O(1): the table is normally full of
+    /// DNS-style ephemeral sources (one new `IP:port` per exchange), so the
+    /// valve runs once per refused newcomer, and a whole-table scan there would
+    /// cost O(peers) per admitted packet. Entries are removed lazily — a peer
+    /// the idle sweep or shutdown already dropped is skipped when the queue
+    /// reaches it — and a peer that is not yet past [`EVICT_MIN_IDLE_MS`] is
+    /// moved to the back, so an old but active session cannot pin the head.
+    /// Bounded by the live peer count: `sweep_idle` compacts it and a scan drops
+    /// stale entries as it meets them, so a listener that never fills its table
+    /// cannot accumulate one entry per lifetime admission.
+    evict_order: VecDeque<SocketAddr>,
 }
 
 impl UdpForwarder {
@@ -189,6 +205,7 @@ impl UdpForwarder {
             last_evict_scan_ms: 0,
             deferred: false,
             peers: HashMap::default(),
+            evict_order: VecDeque::new(),
         }
     }
 
@@ -277,14 +294,15 @@ impl UdpForwarder {
     ///
     /// Order matters: a listener-cap or forward-budget refusal must spend no
     /// shared permit, and the hub probe comes last. A refusal is retried once
-    /// after displacing this listener's oldest peer that has been idle for at
-    /// least [`EVICT_MIN_IDLE_MS`] — that is what keeps an ephemeral-source
-    /// workload from dead-ending on the session cap until the 180 s idle reap.
-    /// The eviction scan itself is throttled to one per
-    /// [`EVICT_SCAN_INTERVAL_MS`] ([`Self::evict_one_idle`]): a throttled scan
-    /// is simply a refusal, so the retry runs only after a real eviction. The
-    /// *retry's* verdict is reported when eviction ran, because after freeing
-    /// one peer a different level may be the binding constraint.
+    /// after displacing this listener's oldest idle peer — that is what keeps an
+    /// ephemeral-source workload from dead-ending on the session cap until the
+    /// 180 s idle reap. [`Self::evict_one_idle`] walks an insertion-order queue
+    /// rather than the whole table, so a productive eviction is O(1); the
+    /// [`EVICT_SCAN_INTERVAL_MS`] throttle only bounds scans that find nobody
+    /// evictable. A throttled scan is simply a refusal, so the retry runs only
+    /// after a real eviction. The *retry's* verdict is reported when eviction
+    /// ran, because after freeing one peer a different level may be the binding
+    /// constraint.
     fn create_peer(&mut self, src: SocketAddr, now: u64) -> Result<(), PeerRefusal> {
         match self.try_admit_peer(src) {
             Ok(()) => Ok(()),
@@ -346,6 +364,9 @@ impl UdpForwarder {
                 bind: None,
             },
         );
+        // The valve's queue mirrors admission order; a later idle sweep that
+        // removes this peer leaves a stale entry the next scan skips.
+        self.evict_order.push_back(src);
         tracing::debug!(
             "udp_forward {} peer {src}: session {sess} opened",
             display_target(&self.target)
@@ -373,10 +394,21 @@ impl UdpForwarder {
     /// server to drop the session now (best effort, exactly like the idle
     /// sweep).
     ///
-    /// Returns `true` when a peer was removed. The scan itself is throttled:
-    /// a call inside [`EVICT_SCAN_INTERVAL_MS`] of the previous scan returns
-    /// `false` without touching the table, which the caller treats as an
-    /// ordinary refusal (no retry).
+    /// Returns `true` when a peer was removed.
+    ///
+    /// The scan walks [`Self::evict_order`] instead of the whole table: one
+    /// candidate is popped, and either evicted (O(1) for the caller's retry) or
+    /// moved to the back when it is still too fresh. A full rotation — every
+    /// candidate active — costs the same O(peers) the old scan did and is what
+    /// the [`EVICT_SCAN_INTERVAL_MS`] throttle bounds.
+    ///
+    /// A **productive** scan re-arms the throttle (its stamp is backdated by one
+    /// interval). That is the DNS-churn case: the table is full of one-shot
+    /// sources past the floor, so each refused newcomer must be able to displace
+    /// one immediately instead of waiting out the 100 ms window (which capped
+    /// admission at 10 new sources/s). The throttle still applies as soon as a
+    /// scan finds nobody evictable, so a spoofed-source flood against fresh
+    /// peers cannot turn every refusal into a table walk.
     fn evict_one_idle(&mut self, now: u64) -> bool {
         // Throttle *before* any per-peer work: this is the difference between a
         // cheap refusal and the eviction feature becoming its own DoS vector
@@ -385,8 +417,18 @@ impl UdpForwarder {
             return false;
         }
         self.last_evict_scan_ms = now;
-        let mut victim: Option<(SocketAddr, u64)> = None;
-        for (src, peer) in &self.peers {
+        // One rotation per call: every candidate is examined at most once, and
+        // the queue's order survives for the next scan.
+        let mut remaining = self.evict_order.len();
+        while remaining > 0 {
+            remaining -= 1;
+            let Some(src) = self.evict_order.pop_front() else {
+                break;
+            };
+            // Stale: the idle sweep (or shutdown) already removed this peer.
+            let Some(peer) = self.peers.get(&src) else {
+                continue;
+            };
             // Same fold the idle sweep uses: consume a pending `replied` flag
             // (that is activity the 30 s tick has not folded into `last` yet,
             // because the reply path deliberately takes no clock), stamping
@@ -396,30 +438,35 @@ impl UdpForwarder {
             // until the next idle tick even when it has been reply-idle for far
             // longer than the floor.
             if !peer.entry.idle_since_tick(now, EVICT_MIN_IDLE_MS) {
+                // Still in use: it keeps its place behind every candidate this
+                // scan has not reached yet.
+                self.evict_order.push_back(src);
                 continue;
             }
             let idle = peer.entry.idle_ms(now);
-            if victim.is_none_or(|(_, oldest)| idle > oldest) {
-                victim = Some((*src, idle));
-            }
+            let Some(mut peer) = self.peers.remove(&src) else {
+                continue;
+            };
+            // Eviction can land between two datagrams of the same burst, before
+            // the boundary flush, so this peer may still hold un-pushed
+            // payloads. [`Self::retire_peer`] pushes them and proves the stager
+            // empty before the close, without blocking the main runtime on the
+            // slot's drain gate.
+            self.retire_peer(&mut peer);
+            tracing::debug!(
+                "udp_forward {} peer {src}: session {} evicted after {idle} ms idle to admit a new source",
+                display_target(&self.target),
+                peer.sess
+            );
+            // A productive scan must not wait out the interval: the next
+            // refused source is another churn newcomer, not a flood. Backdating
+            // the stamp by exactly one interval (rather than zeroing it) keeps
+            // the check valid even in the first 100 ms of process life, when
+            // `now` itself is smaller than the interval.
+            self.last_evict_scan_ms = now.saturating_sub(EVICT_SCAN_INTERVAL_MS);
+            return true;
         }
-        let Some((src, idle)) = victim else {
-            return false;
-        };
-        let Some(mut peer) = self.peers.remove(&src) else {
-            return false;
-        };
-        // Eviction can land between two datagrams of the same burst, before
-        // the boundary flush, so this peer may still hold un-pushed payloads.
-        // [`Self::retire_peer`] pushes them and proves the stager empty before
-        // the close, without blocking the main runtime on the slot's drain gate.
-        self.retire_peer(&mut peer);
-        tracing::debug!(
-            "udp_forward {} peer {src}: session {} evicted after {idle} ms idle to admit a new source",
-            display_target(&self.target),
-            peer.sess
-        );
-        true
+        false
     }
 
     /// Count and rate-limit-log one refused new peer, naming the limit that
@@ -485,11 +532,17 @@ impl UdpForwarder {
                 );
             }
         }
+        // Drop the valve's entries for every peer that is gone (this reap's
+        // victims and any earlier stale entry). Without this the queue would
+        // grow by one entry per admitted source for a listener that never fills
+        // its table, because the reap — not the valve — is what removes them.
+        self.evict_order.retain(|src| self.peers.contains_key(src));
     }
 
     /// Close every session (process shutdown): best-effort `SESS_CLOSE`, then
     /// release the hub slots by dropping the map.
     pub(crate) fn shutdown_all(&mut self) {
+        self.evict_order.clear();
         for (src, mut peer) in std::mem::take(&mut self.peers) {
             // Flush the outstanding burst batches before the closes, for the
             // same reason as `retire_peer`: `send_sess_close` drops a session's
@@ -889,19 +942,24 @@ pub(crate) const EVICT_MIN_IDLE_MS: u64 = 5_000;
 /// Minimum spacing between admission-eviction scans, measured on the caller's
 /// `now` epoch.
 ///
-/// The scan is O(peers), so it must not run per refused datagram: a
-/// spoofed-source flood that keeps the table full of **fresh** (< 5 s idle,
-/// therefore non-evictable) peers would otherwise walk every entry on each
-/// refusal and saturate the listener task, stalling all its other peers — a DoS
-/// regression the eviction feature itself would introduce over the previous
-/// O(1) refusal. 100 ms bounds the extra work to at most 10 scans/s per
-/// listener (≈30 k `idle_ms` loads/s at the default 3024-peer cap). In
-/// production `now` is the coarse clock (`coarse_millis`, refreshed on a 1 s
-/// tick), so the practical rate is at most one scan per tick; precise/time-
-/// injected callers get the stated 100 ms floor. A legitimate new peer that
-/// meets a table of genuinely idle peers is still admitted by the first scan
-/// after the interval: throttling only *delays* a scan, and a peer cannot
-/// become evictable before [`EVICT_MIN_IDLE_MS`] anyway (50× this interval).
+/// A scan that finds nobody evictable walks [`UdpForwarder::evict_order`], so it
+/// must not run per refused datagram: a spoofed-source flood that keeps the
+/// table full of **fresh** (< 5 s idle, therefore non-evictable) peers would
+/// otherwise walk every entry on each refusal and saturate the listener task,
+/// stalling all its other peers — a DoS regression the eviction feature itself
+/// would introduce over the previous O(1) refusal. 100 ms bounds that work to at
+/// most 10 fruitless scans/s per listener (≈30 k `idle_ms` loads/s at the
+/// default 3024-peer cap). In production `now` is the coarse clock
+/// (`coarse_millis`, refreshed on a 1 s tick), so the practical rate is at most
+/// one fruitless scan per tick; precise/time-injected callers get the stated
+/// 100 ms floor.
+///
+/// A **productive** scan does not wait out this interval: it re-arms the window
+/// (see [`UdpForwarder::evict_one_idle`]), so a DNS-style ephemeral-source
+/// workload — where the table stays full of peers past the floor — is admitted
+/// at the rate newcomers arrive instead of at 10/s. Throttling only delays a
+/// *fruitless* scan, and a peer cannot become evictable before
+/// [`EVICT_MIN_IDLE_MS`] anyway (50× this interval).
 pub(crate) const EVICT_SCAN_INTERVAL_MS: u64 = 100;
 
 /// Whether a `recv_from` error on a UDP forward listener is a **transient
@@ -1175,8 +1233,90 @@ mod tests {
         assert_eq!(fwd.create_peer(b, after), Ok(()));
         assert!(fwd.peer_sess(full).is_none());
         assert!(fwd.peer_sess(b).is_some());
-        assert_eq!(fwd.last_evict_scan_ms, after);
+        assert_eq!(
+            fwd.last_evict_scan_ms,
+            after.saturating_sub(EVICT_SCAN_INTERVAL_MS),
+            "a productive scan re-arms the throttle for the next churn newcomer"
+        );
         assert_eq!(fwd.hub.len.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// DNS-style churn: every exchange arrives from a new `IP:port`, so once the
+    /// table is full of peers past the eviction floor every newcomer must
+    /// displace one immediately. The pre-fix valve admitted exactly one per
+    /// [`EVICT_SCAN_INTERVAL_MS`] (10/s) because each eviction paid a whole-table
+    /// scan; the insertion-order queue makes a productive eviction O(1) and
+    /// re-arms the throttle, so admission keeps up with the churn.
+    #[tokio::test]
+    async fn a_full_listener_admits_a_churn_of_ephemeral_sources() {
+        const CAP: usize = 10;
+        let mut fwd = test_forwarder(MAX_UDP_ASSOCS, CAP);
+        let t0 = mono_millis();
+        // A full table of sessions that have all been silent past the floor —
+        // the steady state of a DNS listener under source-port churn.
+        let old: Vec<SocketAddr> = (0..CAP as u16).map(|i| peer_src(30_000 + i)).collect();
+        for src in &old {
+            assert_eq!(fwd.create_peer(*src, t0), Ok(()));
+        }
+
+        // Eight newcomers arrive back to back, well inside one scan interval.
+        // Each displaces one of the old peers (the queue is in admission
+        // order), so the valve must not stall them at one per interval.
+        let start = t0 + EVICT_MIN_IDLE_MS + 1;
+        for i in 0..8u16 {
+            let src = peer_src(30_100 + i);
+            assert_eq!(
+                fwd.create_peer(src, start + u64::from(i)),
+                Ok(()),
+                "churn source {i} must be admitted by displacing an idle peer"
+            );
+            assert_eq!(fwd.peer_count(), CAP, "the listener stays at its cap");
+        }
+        assert!(
+            old[..8].iter().all(|src| fwd.peer_sess(*src).is_none()),
+            "the oldest idle peers were displaced by the churn"
+        );
+        assert!(
+            old[8..].iter().all(|src| fwd.peer_sess(*src).is_some()),
+            "the peers the churn did not need are still there"
+        );
+        // Every displaced session returned both shared slots.
+        assert_eq!(fwd.hub.len.load(std::sync::atomic::Ordering::Relaxed), CAP);
+        assert_eq!(fwd.forward_budget.available_permits(), MAX_UDP_ASSOCS - CAP);
+    }
+
+    /// An old but *active* peer at the head of the queue must not pin it: the
+    /// scan moves it to the back and keeps looking, so the idle peer behind it
+    /// is still found. This is the guard that lets the valve stay O(1) without
+    /// ever evicting a session whose replies are still arriving.
+    #[tokio::test]
+    async fn eviction_rotation_skips_an_active_peer_and_finds_the_idle_one() {
+        let mut fwd = test_forwarder(MAX_UDP_ASSOCS, 2);
+        let t0 = mono_millis();
+        let (active, idle, newcomer) = (peer_src(30_041), peer_src(30_042), peer_src(30_043));
+        assert_eq!(fwd.create_peer(active, t0), Ok(()));
+        assert_eq!(fwd.create_peer(idle, t0), Ok(()));
+
+        // `active` has reply activity the idle tick has not folded yet: the
+        // scan folds it into `last = now` and must leave the session alone.
+        let now = t0 + EVICT_MIN_IDLE_MS + 1;
+        fwd.peers
+            .get(&active)
+            .unwrap()
+            .entry
+            .replied
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fwd.create_peer(newcomer, now), Ok(()));
+        assert!(
+            fwd.peer_sess(active).is_some(),
+            "a peer with pending reply activity is never displaced"
+        );
+        assert!(
+            fwd.peer_sess(idle).is_none(),
+            "the scan rotates past the active head and evicts the idle peer"
+        );
+        assert!(fwd.peer_sess(newcomer).is_some());
+        assert_eq!(fwd.peer_count(), 2);
     }
 
     /// The widened transient taxonomy: ICMP/resource errors keep the listener

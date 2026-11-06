@@ -2673,3 +2673,72 @@ wakers cross runtimes), the thread-local state re-homing on migration (receive
 buffer, egress memo, burst scratch), the association index bounds and
 `udp_split=false` collapse, the verbatim extraction of the loop bodies and the
 teardown order, and the config window plumbing/memory arithmetic.
+
+## 24. Sixteenth Batch: DNS-style churn admitted ten sources a second (2026-11-06, post-aa5424b)
+
+Scope: the client's `[[udp_forward]]` listener (`bin/myquic2-client/forward_udp.rs`).
+No wire, protocol or admission-policy change.
+
+### 24.1 The finding
+
+A `[[udp_forward]]` listener keeps one session per source `IP:port`, and DNS
+clients are the shape that stresses it: a stub resolver (or a forwarder on a
+busy network) opens a fresh ephemeral port per exchange, so every query is a
+new peer. The listener's cap defaults to the process-wide forward budget
+(≈3024 at the shipped `max_udp_assocs`), and peers are only reaped after
+`ASSOC_IDLE_MS` = 180 s, so the table fills within seconds at a few hundred
+queries/s.
+
+The admission valve was supposed to handle exactly this: a refused new source
+may displace this listener's oldest peer that has been idle for
+`EVICT_MIN_IDLE_MS` = 5 s. But `evict_one_idle` found that victim with a
+whole-table scan (up to 3024 entries, each an `idle_since_tick` with its atomic
+loads), and the scan was throttled to one per `EVICT_SCAN_INTERVAL_MS` = 100 ms
+to keep a spoofed-source flood from turning every refusal into a table walk.
+The two rules compose badly: **once the table is full, the listener admits at
+most one new source per 100 ms (10/s)**, no matter how many peers are already
+dead. Everything above that is dropped as `REFUSED` — ordinary UDP loss, but a
+cliff that makes a DNS forwarder unusable under its normal source-port churn.
+
+### 24.2 The fix: an insertion-order valve, O(1) per admitted source
+
+`UdpForwarder` now keeps `evict_order: VecDeque<SocketAddr>`, the admission
+order of its peers, and `evict_one_idle` walks that instead of the table:
+
+* pop the head; a peer the idle sweep already removed is a stale entry and is
+  dropped; a peer that has not been idle for the floor is **moved to the back**,
+  so a long-lived active session cannot pin the head; the first idle peer is
+  evicted with the same `retire_peer` ordering as before;
+* a **productive** scan backdates `last_evict_scan_ms` by one interval, so the
+  next churn newcomer may evict immediately instead of waiting out the window.
+  The throttle still bounds *fruitless* scans (a flood against fresh peers), and
+  a peer cannot become evictable before the 5 s floor anyway;
+* `sweep_idle` compacts the queue to the live set, so a listener that never
+  fills its table cannot accumulate stale entries — the queue stays bounded by
+  the peer count, not by lifetime admissions.
+
+The cost of a productive eviction is one pop plus the eviction itself, instead
+of an O(peers) scan; a full rotation (every candidate still active) costs the
+old scan and remains throttled. Semantics are unchanged: only peers idle past
+the floor are displaced, pending reply activity is folded before the verdict,
+and the displaced peer still returns its hub slot and forward-budget permit
+through `PeerSession::drop`.
+
+### 24.3 Tests and verification
+
+* `a_full_listener_admits_a_churn_of_ephemeral_sources` — a cap-2 listener with
+  both slots past the floor admits **8 back-to-back newcomers** (each displacing
+  one), where the old valve admitted exactly one per interval.
+* `eviction_rotation_skips_an_active_peer_and_finds_the_idle_one` — the head
+  peer has unfolded reply activity; the scan rotates past it and evicts the idle
+  peer behind it.
+* `eviction_scan_is_throttled_against_a_refusal_flood` — unchanged in intent,
+  now also pins the productive re-arm (`last_evict_scan_ms` backdated, not
+  `now`).
+
+`cargo fmt --all --check` clean; `cargo clippy --all-targets -- -D warnings`
+clean; `cargo test --lib` 387, `--bin myquic2-server` 165 (+1 ignored),
+`--bin myquic2-client` 215, `--test forward_e2e` 7. No benchmark was run: the
+change is a mechanism fix (the admission rate is now bounded by arrivals, not by
+the 100 ms scan interval), and the existing e2e churn test exercises 40 one-shot
+peers below the cap, not the saturated valve.
