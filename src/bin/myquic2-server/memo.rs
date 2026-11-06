@@ -49,16 +49,35 @@ pub(crate) struct SessMemo {
     pub(crate) recent_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// 256 direct-mapped slots: session ids hash uniformly (odd multiplier is a
-/// bijection mod power-of-two), so 32 interleaved sessions already thrashed the
-/// old 32-slot table back to the table lock on every packet. This memo is a
-/// separate cache from the fast session table in `accept.rs` (which is now
-/// larger than 256 slots after the inline pin was removed): a memo miss costs
-/// the slow path one shard read, and `arm_fast` deliberately keeps the fast
-/// slot on a miss, so the two sizes no longer need to track each other. Past
-/// 256 entries still just miss through to the table — a miss is never a
-/// mis-serve, the key compare guarantees that.
-pub(crate) const SESS_MEMO_SLOTS: usize = 256;
+/// Direct-mapped slots, sized to cover the fast session table's working set.
+///
+/// Session ids hash uniformly (the odd multiplier is a bijection mod
+/// power-of-two), so 32 interleaved sessions already thrashed the original
+/// 32-slot table back to the table lock on every packet.
+///
+/// This memo is the second-level cache behind `accept.rs::FastTable`: a
+/// fast-table hit never consults it, but a fast-table *miss* is exactly the
+/// case where the memo decides whether the slow path takes the session table's
+/// shard lock at all. The fast table is ~568 slots and the shipped client packs
+/// more live sessions onto one connection than either cache holds, so the old
+/// 256-slot memo was *smaller* than the cache in front of it — an inverted
+/// hierarchy in which an L1 miss almost always missed L2 as well and paid the
+/// shard read in `get_or_create_sess`. 2048 keeps the 2x headroom over the fast
+/// table that the id mixing requires (two ids one table step apart must not
+/// collide here) and costs `size_of::<SessMemo>() * 2048` (~96 KiB) per worker
+/// thread, which is small next to the per-connection charge.
+///
+/// A miss is never a mis-serve — the `(conn, sess)` key compare guarantees that
+/// — and `arm_fast` deliberately keeps the fast slot on a memo miss, so the two
+/// caches cannot fight over an entry.
+pub(crate) const SESS_MEMO_SLOTS: usize = 2048;
+
+/// The index is `% SESS_MEMO_SLOTS`, which the compiler folds into a mask only
+/// for a power of two.
+const _: () = assert!(SESS_MEMO_SLOTS.is_power_of_two());
+/// The memo is thread-local, so every worker thread pays it in full: a field
+/// added to `SessMemo` must not silently multiply the per-thread cost.
+const _: () = assert!(std::mem::size_of::<SessMemo>() * SESS_MEMO_SLOTS <= 128 * 1024);
 
 thread_local! {
     static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =

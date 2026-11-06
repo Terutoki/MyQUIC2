@@ -1086,7 +1086,7 @@ async fn a_full_set_evicts_its_quietest_session() {
 
 /// A memo eviction must not drop a live session's fast slot.
 ///
-/// The session memo is a 256-entry direct-mapped cache, so ids a multiple of
+/// The session memo is a 2048-entry direct-mapped cache, so ids a multiple of
 /// `SESS_MEMO_SLOTS` apart always share a row (the index mixes the id with an
 /// odd multiplier). The shipped client pools thousands of associations onto a
 /// handful of QUIC connections, so arm-time memo misses are the normal case
@@ -1244,10 +1244,11 @@ async fn sparse_session_ids_both_hit_and_a_full_table_never_grows() {
         overflow.push((s, sock));
     }
     for (s, _) in &overflow {
-        // Refresh the memo row immediately before the arm. The fast table is
-        // now larger than the 256-entry memo, so a batch of 406 inserts would
-        // evict the early rows before their arms ran; production arms each
-        // session right after `get_or_create_sess`/`sess_memo_put`.
+        // Refresh the memo row immediately before the arm, matching production
+        // (which arms each session right after `get_or_create_sess` /
+        // `sess_memo_put`). The memo now covers the fast table, so a batch of
+        // 406 inserts no longer evicts the early rows, but the refresh keeps
+        // this fixture insensitive to the two sizes.
         let (sock, last, abort, epoch) = {
             let sh = ss.shard(*s);
             let r = sh.read();

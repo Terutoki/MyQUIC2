@@ -357,6 +357,12 @@ const FAST_TABLE_ARRAY_BYTES: usize = 128 * (432 + 12);
 pub(crate) const FAST_SESS_SLOTS: usize =
     FAST_TABLE_ARRAY_BYTES / (std::mem::size_of::<FastSess>() + 12);
 const _: () = assert!(FAST_SESS_SLOTS >= 128);
+/// The session memo (`memo::SESS_MEMO_SLOTS`) is the second-level cache behind
+/// this table: a fast-table hit never consults it, but a fast-table *miss* is
+/// decided there. A memo smaller than this table would make every L1 miss pay
+/// the session table's shard read as well, so the 2x headroom the id mixing
+/// needs is a compile-time invariant rather than a comment.
+const _: () = assert!(SESS_MEMO_SLOTS >= 2 * FAST_SESS_SLOTS);
 
 /// Set-associative groups in [`FastTable`]. Session ids are monotonic and
 /// never reused, so the low bits are a cheap set selector: eight sets of 71
@@ -806,9 +812,9 @@ fn try_stage_inner(
 /// the first free one, else the quietest), so a probe always finds it. A
 /// `Stale` memo probe clears the session's slot: the row named this session and
 /// its reader is gone, so the slot can only describe a session that no longer
-/// exists. A `Miss` leaves the slot alone — the memo is a 256-entry
-/// direct-mapped cache, the shipped client keeps more live sessions than that
-/// per QUIC connection, and the slot checks its own liveness
+/// exists. A `Miss` leaves the slot alone — the memo is a 2048-entry
+/// direct-mapped cache, a busy connection can still exceed that after churn,
+/// and the slot checks its own liveness
 /// (`is_live_for` + `sock.upgrade`) before it is used, so dropping it on a memo
 /// eviction only threw away a correct fast-path entry.
 ///
@@ -857,12 +863,12 @@ pub(crate) fn arm_fast(fast: &mut FastTable, conn_id: usize, s: u32) {
             fast.clear(s);
         }
         // A miss means this thread's memo lost `(conn_id, s)`, not that the
-        // session died: the memo is 256 direct-mapped entries and the shipped
+        // session died: the memo is 2048 direct-mapped entries and the shipped
         // client keeps more live sessions than that per connection, so rows are
-        // evicted by their hash neighbours all the time. Keep the slot — it
-        // carries its own liveness check, and clearing it here made every memo
-        // eviction a fast-path miss (the table looked useless above ~256
-        // sessions per connection).
+        // still evicted by their hash neighbours. Keep the slot — it carries its
+        // own liveness check, and clearing it here made every memo eviction a
+        // fast-path miss (the table looked useless above ~256 sessions per
+        // connection before the memo was enlarged).
         SessHit::Miss => {}
     }
 }
