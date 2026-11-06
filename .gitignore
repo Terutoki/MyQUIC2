@@ -7,6 +7,7 @@ dist/openwrt-x86_64/myquic2-server-*
 
 # AI agent workspace (local only, not part of the deliverable)
 .omo/
+.workbuddy-ai/
 
 # machine-generated identity: server regenerates on first run,
 # client must receive server-cert.pem out-of-band. NEVER commit keys.
