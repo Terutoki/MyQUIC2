@@ -3,7 +3,7 @@
 <h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-786_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-790_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -514,7 +514,7 @@ Backpressure is handled at the sender, not by unbounded queues:
 
 The stager drops the **newest** item when its bound is reached, never the oldest: dropping old data would break per-session FIFO and silently reorder the stream. Every drop is counted by reason, so a full queue is visible rather than silent.
 
-The client also bounds queue **time**, not just bytes. On the tuned (interactive and TCP) preset a payload is admitted only while the bytes already waiting — the connection's stager plus the unsent part of quinn's DATAGRAM send buffer — stay below ten milliseconds of the path's own rate (`cwnd / srtt × 10 ms`, clamped to 8 KiB..256 KiB and re-sampled every 250 ms). The check is the **combined** figure on every payload, quinn's occupancy included: the stager backlog alone cannot stand in for it (on a slow path the 1 MiB send buffer exceeds the window by itself, and admitting there would queue behind an over-budget buffer instead of shedding the newest payload), so this costs one connection-state lock per admitted payload. `cwnd / srtt` is an upper bound on the rate (about twice it on the BBR preset, so the real bound sits nearer twenty milliseconds), and the window is one shared queue, so a neighbour that fills it can cost this flow a packet as well. Past the budget the newest payload is dropped and counted as `over_cap` instead of being queued: 256 KiB is a second of delay on a 2 Mbps uplink and two milliseconds on a LAN, and a datagram that has waited a second is not worth sending. The bulk preset keeps the deep buffer, because there throughput rather than delay is the point.
+The client also bounds queue **time**, not just bytes. On the tuned (interactive and TCP) preset a payload is admitted only while the bytes already waiting — the connection's stager plus the unsent part of quinn's DATAGRAM send buffer — stay below ten milliseconds of the path's own rate (`cwnd / srtt × 10 ms`, clamped to 8 KiB..256 KiB and re-sampled every 250 ms). The check is the **combined** figure on every payload, quinn's occupancy included: the stager backlog alone cannot stand in for it (on a slow path the 1 MiB send buffer exceeds the window by itself, and admitting there would queue behind an over-budget buffer instead of shedding the newest payload). The exact figure still decides every payload, but it is no longer read per payload: the client caches the last exact `datagram_send_buffer_space()` reading and the bytes admitted since, admits without the connection-state lock while that conservative bound already fits, and takes the exact probe (which re-samples) only when it does not. A cached refusal is therefore always re-checked exactly, so the set of admitted payloads is unchanged — the cache changes the lock count, not the policy. `cwnd / srtt` is an upper bound on the rate (about twice it on the BBR preset, so the real bound sits nearer twenty milliseconds), and the window is one shared queue, so a neighbour that fills it can cost this flow a packet as well. Past the budget the newest payload is dropped and counted as `over_cap` instead of being queued: 256 KiB is a second of delay on a 2 Mbps uplink and two milliseconds on a LAN, and a datagram that has waited a second is not worth sending. The bulk preset keeps the deep buffer, because there throughput rather than delay is the point.
 
 ### 12. Resource bounds and admission
 
@@ -629,7 +629,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **786 tests** on macOS (lib 389 + client 216 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **790 tests** on macOS (lib 389 + client 220 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1235,7 +1235,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **786 tests** on the macOS dev box (lib 389 + client 216 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **790 tests** on the macOS dev box (lib 389 + client 220 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -2219,7 +2219,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>786 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>790 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB

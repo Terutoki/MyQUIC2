@@ -90,6 +90,131 @@ pub(crate) const UDP_QUEUE_FLOOR_BYTES: usize = 8 * 1024;
 /// RTTs.
 const QUEUE_SAMPLE_MS: u64 = 250;
 
+/// Optimistic admission cache for quinn's DATAGRAM send-buffer space.
+///
+/// `Connection::datagram_send_buffer_space()` takes the connection-state mutex,
+/// and the driver holds that same mutex across `process_conn_events` and up to
+/// `MAX_TRANSMIT_DATAGRAMS` socket sends. On the sharded topology producer and
+/// driver share one thread, so the probe is merely a lock tax; with
+/// `MYQUIC2_SHARD_RUNTIME=0` it can park a worker for tens of microseconds —
+/// once per payload, on the path whose purpose is latency.
+///
+/// The cache keeps the last exact reading and subtracts every byte admitted
+/// since. Admitted bytes are >= bytes actually handed to quinn, and the driver
+/// only ever *adds* space between samples, so [`Self::space`] is a **lower
+/// bound** on the true space — equivalently, the derived occupancy is an upper
+/// bound on the real one.
+///
+/// That direction is what makes the cache safe: a cached *fits* is therefore
+/// also true of the exact reading, and a cached *does not fit* falls through to
+/// an exact probe before the policy drop. Admission decisions are identical to
+/// the unconditional-probe rule; only the number of probes changes — skipped
+/// while the answer is unambiguous, taken as before while the queue is near or
+/// over budget. A backlog makes the estimate more conservative (bytes still in
+/// the stager are counted both there and in `since`), which costs probes, not
+/// payloads.
+///
+/// Two limits on that statement. The bound is exact only against the state at
+/// which the loaded word was produced: a relaxed load may return an older word
+/// than another thread's latest admission, so on the shared runtime an
+/// unobserved concurrent admission can still overshoot — exactly the
+/// check-then-act window the unconditional probe already had, not a new one.
+/// On the sharded default every admission runs on the connection's own thread,
+/// so the loaded word is always current and the bound is literal.
+///
+/// This is deliberately *not* the reverted "backlog-only" gate (§23.1): that
+/// skipped the occupancy term entirely on a slow path whose quinn buffer sat
+/// above the window. Here the occupancy term is a real recent sample of the
+/// same quantity; only its age is bounded.
+#[derive(Debug, Default)]
+struct SpaceCache {
+    /// `(hint << 32) | since`.
+    ///
+    /// One packed word rather than two atomics: a reader must never pair a
+    /// fresh hint with a stale `since` — that is the one combination that
+    /// could over-admit — and two relaxed stores to separate locations may
+    /// become visible in either order on a weak-memory target. Packing makes
+    /// the pair a single atomic load. The capacity is at most a few MiB
+    /// (1 MiB tuned / 2 MiB bulk), so 32 bits is ample for each half.
+    packed: std::sync::atomic::AtomicU64,
+}
+
+/// Low half of [`SpaceCache::packed`]: payload bytes admitted since the hint.
+const SINCE_MASK: u64 = u32::MAX as u64;
+
+impl SpaceCache {
+    /// Conservative estimate of the buffer space currently available.
+    ///
+    /// Never larger than the true space (see the type's note), so it can only
+    /// make the window stricter.
+    #[inline]
+    fn space(&self) -> usize {
+        let v = self.packed.load(std::sync::atomic::Ordering::Relaxed);
+        let hint = (v >> 32) as usize;
+        let since = (v & SINCE_MASK) as usize;
+        hint.saturating_sub(since)
+    }
+
+    /// Account one payload that admission just accepted.
+    #[inline]
+    fn note_admitted(&self, len: usize) {
+        // Saturating at the half-word keeps the offset from carrying into the
+        // hint. The counter can only reach that bound if the hint itself were
+        // 4 GiB, which the transport never configures.
+        let len = (len as u64).min(SINCE_MASK);
+        let mut v = self.packed.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let since = (v & SINCE_MASK).saturating_add(len).min(SINCE_MASK);
+            let new = (v & !SINCE_MASK) | since;
+            match self.packed.compare_exchange_weak(
+                v,
+                new,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(cur) => v = cur,
+            }
+        }
+    }
+
+    /// The word to pass back to [`Self::resample`] with a probe taken after it.
+    #[inline]
+    fn observe(&self) -> u64 {
+        self.packed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish a fresh exact reading, unless a concurrent admission landed
+    /// while the probe was in flight.
+    ///
+    /// A plain store would reset the offset to zero and erase that admission's
+    /// accounting — the one way this cache could over-admit. The CAS makes the
+    /// publish conditional on nothing having changed since [`Self::observe`];
+    /// on a lost race the old (stale, conservative) sample stays and the next
+    /// payload probes again. On the sharded topology every admission runs on
+    /// the connection's own thread, so this CAS never loses.
+    #[inline]
+    fn resample(&self, observed: u64, space: usize) {
+        debug_assert!(
+            space <= u32::MAX as usize,
+            "DATAGRAM send buffer exceeds 4 GiB"
+        );
+        let hint = (space as u64).min(u64::from(u32::MAX));
+        let _ = self.packed.compare_exchange(
+            observed,
+            hint << 32,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Forget the sample (a new dial reconfigures the transport).
+    #[inline]
+    fn clear(&self) {
+        self.packed.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Retry cadence for `CTL HELLO` until `CAPS` arrives.
 pub(crate) const HELLO_RETRY: Duration = Duration::from_millis(200);
 /// Slow `HELLO` retry cadence once the fast window below has elapsed.
@@ -273,6 +398,10 @@ pub(crate) struct ConnRev2 {
     /// ([`myquic2::transport::datagram_send_buffer_bytes`]); it turns
     /// `datagram_send_buffer_space()` into an occupancy figure.
     dg_send_bytes: std::sync::atomic::AtomicUsize,
+    /// Conservative cache of the latest exact send-buffer space reading, so
+    /// the steady admission path does not take the connection state lock for
+    /// every payload (see [`SpaceCache`]).
+    dg_space: SpaceCache,
     /// Last sampled byte budget (`cwnd / srtt × window`, clamped). `0` means
     /// "not sampled yet", which admits everything rather than stalling a
     /// connection that has no rate estimate.
@@ -362,6 +491,7 @@ impl ConnRev2 {
             dg_send_bytes: std::sync::atomic::AtomicUsize::new(
                 myquic2::transport::datagram_send_buffer_bytes(false),
             ),
+            dg_space: SpaceCache::default(),
             queue_cap_bytes: std::sync::atomic::AtomicUsize::new(0),
             queue_sampled_ms: std::sync::atomic::AtomicU64::new(0),
         })
@@ -381,6 +511,7 @@ impl ConnRev2 {
             .store(dg_send_bytes, std::sync::atomic::Ordering::Relaxed);
         self.queue_cap_bytes
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.dg_space.clear();
     }
 
     /// Whether one more `len`-byte payload fits this connection's uplink queue
@@ -399,7 +530,8 @@ impl ConnRev2 {
     /// neighbour that fills it can also cost an interactive flow a payload.
     /// That is the shared-queue trade P3-9 describes, bounded in time.
     ///
-    /// Cost per call is the stager probe (a short `parking_lot` hold) and one
+    /// Cost per call is the stager probe (a short `parking_lot` hold) and, only
+    /// when the cached estimate would refuse, one
     /// `datagram_send_buffer_space()` read — which takes the connection state
     /// lock. It runs once per UDP payload, never per encoded frame.
     ///
@@ -410,9 +542,15 @@ impl ConnRev2 {
     /// window; that is not a sound substitution. The invariant is the *combined*
     /// occupancy (stager + quinn's unsent DATAGRAM bytes), and a slow path keeps
     /// quinn's 1 MiB buffer above the window on its own — exactly the state the
-    /// window exists to shed. Admitting there queues payloads behind an
-    /// already-over-budget buffer instead of dropping the newest, which is the
-    /// policy the window promises and the reason the probe is unconditional.
+    /// window exists to shed.
+    ///
+    /// The probe is therefore still the source of truth, but it is no longer
+    /// paid per payload: [`SpaceCache`] keeps the last exact reading and only
+    /// the bytes admitted since, a lower bound on the true space. A payload the
+    /// estimate admits is admitted with no lock (a conservative *fits* is also
+    /// true exactly); one it refuses falls through to the exact probe — which
+    /// also re-samples — before any policy drop. The admitted set is therefore
+    /// unchanged; only the lock count is.
     ///
     /// `true` when the window is disabled or no rate has been sampled yet.
     #[must_use]
@@ -425,15 +563,23 @@ impl ConnRev2 {
         let Some(cap) = self.queue_window_cap(conn) else {
             return true;
         };
-        fits_queue_window(
-            cap,
-            self.dg_send_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            conn.datagram_send_buffer_space(),
-            self.stager.lock().queued_bytes(),
-            batched,
-            len,
-        )
+        let capacity = self
+            .dg_send_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let staged = self.stager.lock().queued_bytes();
+        if fits_queue_window(cap, capacity, self.dg_space.space(), staged, batched, len) {
+            self.dg_space.note_admitted(len);
+            return true;
+        }
+        let observed = self.dg_space.observe();
+        let space = conn.datagram_send_buffer_space();
+        self.dg_space.resample(observed, space);
+        if fits_queue_window(cap, capacity, space, staged, batched, len) {
+            self.dg_space.note_admitted(len);
+            true
+        } else {
+            false
+        }
     }
 
     /// Queue-window admission for a payload sent through the standalone path.
@@ -458,15 +604,24 @@ impl ConnRev2 {
         };
         // The combined bound, exactly as `admit_uplink`: the stager backlog
         // alone cannot stand in for quinn's occupancy (see that function's
-        // note on why the probe is unconditional).
-        fits_standalone_window(
-            cap,
-            self.dg_send_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            conn.datagram_send_buffer_space(),
-            self.stager.lock().queued_bytes(),
-            len,
-        )
+        // note on the cached estimate and its conservatism).
+        let capacity = self
+            .dg_send_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let staged = self.stager.lock().queued_bytes();
+        if fits_standalone_window(cap, capacity, self.dg_space.space(), staged, len) {
+            self.dg_space.note_admitted(len);
+            return true;
+        }
+        let observed = self.dg_space.observe();
+        let space = conn.datagram_send_buffer_space();
+        self.dg_space.resample(observed, space);
+        if fits_standalone_window(cap, capacity, space, staged, len) {
+            self.dg_space.note_admitted(len);
+            true
+        } else {
+            false
+        }
     }
 
     /// Current queue-window byte budget, or `None` while the cap is disabled
@@ -2925,6 +3080,77 @@ mod tests {
             queue_window_bytes(10_000_000, Duration::ZERO, UDP_QUEUE_WINDOW_MS),
             R2_STAGE_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn the_space_hint_can_only_understate_the_buffer() {
+        let cache = SpaceCache::default();
+        // Nothing sampled yet: the estimate is zero, so the first payload takes
+        // the exact probe rather than trusting a default.
+        assert_eq!(cache.space(), 0);
+        cache.resample(cache.observe(), 4096);
+        assert_eq!(cache.space(), 4096);
+        // Every admission only shrinks the estimate; the driver draining the
+        // buffer between samples is invisible here, which is what makes the
+        // value a lower bound on the true space (it can refuse, never overfill).
+        cache.note_admitted(1024);
+        assert_eq!(cache.space(), 3072);
+        cache.note_admitted(4096);
+        assert_eq!(cache.space(), 0, "saturating, never wrapping");
+        // A refresh restores the exact reading and resets the offset.
+        cache.resample(cache.observe(), 64 * 1024);
+        assert_eq!(cache.space(), 64 * 1024);
+        cache.clear();
+        assert_eq!(cache.space(), 0);
+    }
+
+    #[test]
+    fn the_hint_refusal_falls_through_to_the_exact_probe() {
+        // The two-step decision `admit_uplink` makes, with the arithmetic the
+        // probe replaces: a stale-low estimate refuses, the fresh reading
+        // admits, and only then is the payload counted as waiting.
+        let cache = SpaceCache::default();
+        let cap = 10_000;
+        let capacity = 1 << 20;
+        assert!(!fits_queue_window(cap, capacity, cache.space(), 0, 0, 1200));
+        cache.resample(cache.observe(), capacity); // the exact probe: buffer empty
+        assert!(fits_queue_window(cap, capacity, cache.space(), 0, 0, 1200));
+        cache.note_admitted(1200);
+        assert_eq!(cache.space(), capacity - 1200);
+    }
+
+    #[test]
+    fn a_concurrent_admission_is_not_erased_by_a_resample() {
+        let cache = SpaceCache::default();
+        cache.resample(cache.observe(), 4096);
+        // Thread B admits while thread A is inside the exact probe: A observed
+        // the word before B's update, so A's publish must lose the CAS rather
+        // than reset the offset and forget those bytes.
+        let observed = cache.observe();
+        cache.note_admitted(700);
+        cache.resample(observed, 3000);
+        assert_eq!(
+            cache.space(),
+            4096 - 700,
+            "the lost race keeps the old sample"
+        );
+        // With no concurrent writer the publish succeeds and re-baselines.
+        let observed = cache.observe();
+        cache.resample(observed, 3000);
+        assert_eq!(cache.space(), 3000);
+    }
+
+    #[test]
+    fn reconfiguring_the_window_forgets_the_space_hint() {
+        let r = ConnRev2::new();
+        r.configure_queue_window(UDP_QUEUE_WINDOW_MS, 1 << 20);
+        r.dg_space.resample(r.dg_space.observe(), 4096);
+        r.dg_space.note_admitted(1024);
+        assert_eq!(r.dg_space.space(), 3072);
+        // A re-dial reconfigures the transport; a hint measured against the
+        // old buffer must not survive into the new one.
+        r.configure_queue_window(UDP_QUEUE_WINDOW_MS, 2 << 20);
+        assert_eq!(r.dg_space.space(), 0);
     }
 
     #[test]

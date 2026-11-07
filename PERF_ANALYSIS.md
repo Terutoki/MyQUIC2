@@ -2935,3 +2935,166 @@ round trip only when the target supports it and a cookie is cached, and it is
 off by default; the Linux-gated tests prove the mechanism (the option reads back,
 the first write reaches a loopback listener, an inotify event wakes the watch),
 not a deployment's RTT.
+
+## 26. Eighteenth Batch: the admission probe leaves the payload path (2026-11-07, post-e6036d0)
+
+Scope: the batch-18 plan was four items. Reading them against the current tree
+closed three without a change (§26.4); the one real per-payload cost left in the
+client's uplink was the queue-window probe, and that is what this batch takes.
+**No wire change, no configuration change, no admission-policy change.**
+
+### 26.1 The cost
+
+`ConnRev2::admit_uplink` and `admit_standalone` ran on every small UDP payload
+of a tuned connection and both called `Connection::datagram_send_buffer_space()`
+— a take of quinn's connection-state mutex, the same mutex
+`ConnectionDriver::poll` holds across `process_conn_events` and up to
+`MAX_TRANSMIT_DATAGRAMS` socket sends (quinn 0.11.12 `connection.rs:508-514`).
+§21.1 named the fix and deferred it; §22.1's reverted cheap gate is why the
+probe had stayed unconditional.
+
+On the default sharded topology the producer and the driver share one OS thread,
+so the probe is a lock tax of a few tens of nanoseconds, not contention. With
+`MYQUIC2_SHARD_RUNTIME=0` — the documented fallback — the association runs on a
+work-stealing worker while the driver owns the connection, and the same probe can
+park that worker for the length of a driver pass. That asymmetry is the reason to
+take the lock off the per-payload path even though the default topology would
+not show it in a benchmark.
+
+### 26.2 The change: a conservative cached bound
+
+`SpaceCache` holds one packed `u64`, high half the last exact space reading,
+low half the payload bytes admitted since that reading. Admission uses the
+difference as the space term of the existing `fits_queue_window` /
+`fits_standalone_window` calls.
+
+The direction of the error is the whole design. Every admitted byte either is
+still in the stager, is in quinn's DATAGRAM buffer, or has already left; the
+driver only ever *adds* space between samples. So the cached estimate is an
+**upper bound** on the combined occupancy, and:
+
+* a cached *fits* is also true of the exact reading, so the fast path can admit
+  without the lock;
+* a cached *does not fit* falls through to the exact probe, which also re-samples.
+
+The admitted set is therefore identical to the unconditional-probe rule; only
+the probe count changes. A backlog makes the estimate more conservative (bytes
+still in the stager are counted both there and in the admitted-since half),
+which costs probes, never payloads: the double count can only push a decision
+into the exact path, and that path is the old rule.
+
+Probe rate on a healthy path is one per window of admitted bytes — at 12.8 MB/s
+(100k pps × 128 B) against a 10 KB window, about 1.3k probes/s instead of 100k.
+A genuinely full buffer still probes per payload, exactly as before; that is the
+overload regime where the old code refused anyway.
+
+Two atomics would have been wrong on a weak-memory target: a reader could pair a
+fresh `hint` with a stale `since`, the one combination that over-admits. The
+packed word makes the pair a single load; accounting is a saturating CAS on the
+low half so a carry cannot reach the hint.
+
+The publish is conditional for the same reason. The slow path reads the packed
+word, takes the exact probe, and CASes the fresh `(space, 0)` in only if the
+word is unchanged. A plain store would reset the offset and erase an admission
+that landed while the probe was in flight — the cache's one over-admitting
+path. A lost CAS keeps the old (stale, conservative) sample and the next
+payload probes again; on the sharded topology every admission runs on the
+connection's own thread, so the CAS never loses. The residual window is the one
+§21.1 already documents: an association that admitted but has not yet handed
+its payload to quinn is invisible to another association's probe, so concurrent
+associations can still overshoot by about one payload each. That window is
+unchanged; the CAS only stops the reset from widening it.
+
+### 26.3 Why the count stays at admission
+
+Counting hand-offs instead (increment when the drain passes frames to quinn)
+would remove the backlog double count, but it needs the counter threaded through
+`drain_staged`/`try_drain_staged` and every standalone send, and a site that
+forgot to count would under-count — the unsafe direction. Counting at admission
+over-counts, and §26.2's fall-through turns that into probes only. The plumbing
+was not worth it.
+
+### 26.4 Re-audited and closed without change
+
+* **Forward-listener batching** (§22.9). Already batched: `forward_udp.rs`
+  stages each payload into the peer's `UplinkFlows` batch without a lock and
+  flushes once per touched peer at the burst boundary (`flush_peer`), so the
+  stager is taken once per peer per burst. §22.9's "one stager lock per
+  datagram" no longer holds.
+* **Client uplink N-pack (F8)**. Superseded by rev3 staging:
+  `R2Stager::claim_one_frame` packs a run of steady items from any sessions into
+  one TRAIN (same-flow equal-length, same-flow, or dictionary), so the
+  small-payload path is already N-packed at the connection level. The old
+  2-pack direct path the F8 note described is gone.
+* **Fast-table capacity** (§22.9). Left at 568 slots. A miss costs the
+  thread-local memo probe (2048 slots) plus a 71-way arm scan and insert,
+  roughly 30–60 ns; at the note's 88 % miss rate and 120k pps that is
+  ~0.3–0.6 % of one core. A 4× table costs ~180 KiB per connection of admission
+  charge for that, so the trade is not made on arithmetic alone. `fast_table:
+  hits=… misses=…` in the 60 s line is the measurement that would justify it.
+
+### 26.5 What this does not establish
+
+No throughput benchmark is claimed; §26.8 is a before/after regression matrix,
+not a latency A/B. The change is behaviour-preserving by construction (the
+admitted set is unchanged), so it cannot show up as a throughput or p99 number;
+what it removes is one uncontended mutex acquisition per small payload in the
+default topology, and a possible park in the shared-runtime fallback. The
+remaining per-payload costs are the stager `parking_lot` hold, the same
+connection-state lock inside quinn's own `send_datagram`, and the copy — none of
+which this tree can remove without a quinn fork.
+
+### 26.6 What is left, in order
+
+1. **App-facing send grouping.** The stager rotates sessions, so a decoded burst
+   stages `(sock, dst)` in round-robin order and `flush_staged_sends` sees runs
+   of length 1 — the one shape `sendmmsg` cannot batch (§13.3). A *stable*
+   grouping by `(sock, dst)` at flush time would raise the run length without
+   touching fairness or per-flow order (different destination sockets cannot
+   observe each other's order). Needs a Linux A/B: `sendmmsg` call count,
+   pps, CPU.
+2. **Receiver-paced DATAGRAM flow control** (§13.5 item 1). The only lever that
+   changes the overload shape rather than the per-packet cost: today the client
+   offers more than the server's app side absorbs, the excess dies in a receive
+   queue, and the datagrams that arrive are the oldest. A pause/credit over the
+   rev3 control stream would bound the queue at the point it forms.
+3. **Kernel bypass (`io_uring`, AF_XDP)** only after a profile on the target
+   host shows the syscall share dominating; §25.6's objections stand until then.
+
+### 26.7 Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --all-targets -- -D warnings`
+clean; `cargo test --all-targets` **790 passed / 0 failed** (lib 389, client
+220, server 165 with 1 ignored benchmark, `forward_e2e` 7, `rev3_e2e` 9). Four
+new tests: `the_space_hint_can_only_understate_the_buffer` (the saturating
+arithmetic and the reset), `the_hint_refusal_falls_through_to_the_exact_probe`
+(the conservative-fits / exact-decides sequence),
+`a_concurrent_admission_is_not_erased_by_a_resample` (the lost-CAS direction),
+and `reconfiguring_the_window_forgets_the_space_hint` (a re-dial cannot inherit
+a sample taken against the previous buffer).
+
+### 26.8 Linux smoke matrix (container)
+
+`scripts/linux-bench-matrix.sh --quick --no-netem` on the repo's CI image
+(`localhost/myquic2-ci:1.99`, rustc 1.99.0, 5 vCPU), once on the pre-change tree
+and once on this one. The point is regression, not a latency A/B: the change
+cannot move a throughput number, and a 200-sample loopback cell on a shared VM
+cannot resolve a lock-count difference.
+
+| Cell | Before | After |
+| --- | --- | --- |
+| `udppaced` 128 B, 5k pps × 2 s | 10000/10000, 0.000 % | 10000/10000, 0.000 % |
+| `udpbidir` 128 B, 5k pps × 2 s | 10000/10000, 0.000 % | 10000/10000, 0.000 % |
+| `udpfanout` 8 flows | 2000/2000, 0.000 % | 2000/2000, 0.000 % |
+| `udpsweep` 8 B…8 KiB | ALL OK | ALL OK |
+| `udpdomain` (1000, burst 64) | 998/1000 | 997/1000 |
+| `udpmulti` 8 assoc (16000, burst 64) | 15944 (0.350 %) | 15953 (0.294 %) |
+| `lat` 64 B, 200 samples | p50 81 / p99 264 µs | p50 123 / p99 335 µs |
+
+The unpaced multi-association and domain cells lose a fraction of a percent in
+*both* builds — the quick matrix's burst shape, not this change — and the
+paced/duplex/fan-out/sweep cells are exact. The `lat` difference is inside this
+VM's run-to-run spread (the same cell is 111–123 µs p50 on the macOS host in
+`analysis/echo-path-lock-audit.md`), and no mechanism in the change adds work to
+a low-rate request/response flow: the first payload takes the same exact probe
+as before, and the rest replace a mutex acquisition with one atomic load.
