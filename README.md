@@ -3,7 +3,7 @@
 <h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-790_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-800_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -632,7 +632,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **790 tests** on macOS (lib 389 + client 220 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **800 tests** on macOS (lib 391 + client 228 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1238,9 +1238,9 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **790 tests** on the macOS dev box (lib 389 + client 220 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **800 tests** on the macOS dev box (lib 391 + client 228 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
-- **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
+- **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, source-carrying reply-source ACK and stale-ACK rejection, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
 - **Release-binary smoke:** `udppaced`, `udpbidir`, `udpsweep` 8 B–8 KiB, `udpfanout`, 8-association `udpmultipaced` — all **0.000 % loss**.
 
@@ -2222,7 +2222,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>790 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>800 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB
