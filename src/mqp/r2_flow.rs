@@ -267,19 +267,49 @@ impl FlowBinding {
     }
 
     /// Record the actual reply source of a downlink flow and clear its
-    /// confirmation: the binding frame that teaches the peer this source has
-    /// only been queued to quinn, not acknowledged. Re-sending the same source
-    /// (the idempotent retry path) re-arms the wait, which is harmless: the
-    /// next ACK confirms whichever retransmission reached the peer.
+    /// confirmation when the source **changes**: the binding frame that teaches
+    /// the peer the new source has only been queued to quinn, not acknowledged.
+    ///
+    /// Re-recording the same source (an idempotent retry, a `NEED_CONTEXT`
+    /// repair, a queued context sent again) leaves an existing confirmation
+    /// intact. Clearing it there would reopen the ack window for a source the
+    /// peer has already applied and make a repair cost an extra round trip.
     pub fn set_reply_src(&self, src: SocketAddr) {
+        if self.reply_src() == Some(src) {
+            return;
+        }
         self.reply_src.store(Some(Arc::new(src)));
         self.reply_src_acked.store(false, Ordering::Relaxed);
     }
 
     /// Record that the peer confirmed the `OPEN|SRC` binding frame (it decoded
     /// the source or rejected the flow).
+    ///
+    /// This is the source-less form, kept for fixtures and for the legacy
+    /// `FLOW_ACK` path. It cannot distinguish two rebinds of the same id, so the
+    /// data plane uses [`Self::confirm_reply_src`] instead.
     pub fn mark_reply_src_acked(&self) {
         self.reply_src_acked.store(true, Ordering::Relaxed);
+    }
+
+    /// Confirm that the peer applied **`src`** as this binding's reply source.
+    ///
+    /// Returns `true` only when `src` is the current source. A mismatch is a
+    /// stale ACK (or a reordered old `OPEN|SRC` on the receiver): it must not
+    /// confirm the current source, and it clears the ack instead, so the sender
+    /// repeats the current binding context and the receiver converges.
+    ///
+    /// The previous boolean-only contract could be closed by an ACK for the
+    /// *previous* source after a source change, which let the sender compress a
+    /// frame the receiver would label with the old source (ECHO review L1).
+    pub fn confirm_reply_src(&self, src: SocketAddr) -> bool {
+        if self.reply_src() == Some(src) {
+            self.reply_src_acked.store(true, Ordering::Relaxed);
+            true
+        } else {
+            self.reply_src_acked.store(false, Ordering::Relaxed);
+            false
+        }
     }
 
     /// Whether the peer has confirmed the learned reply source.

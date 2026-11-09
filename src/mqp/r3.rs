@@ -127,14 +127,17 @@
 //! stream opener writes [`CTL_STREAM_MARKER`] once (so the server can tell it
 //! apart from a TCP-flow stream, whose first byte is a valid address `atyp`),
 //! then frames messages as `type:u8 | len:u16le | body`, where `len` counts the
-//! body only (`len <= MAX_CTL_BODY`; every defined body is `<= 5` B, so a
-//! message is at most 8 B, well inside the 64 B message budget). The marker is
+//! body only (`len <= MAX_CTL_BODY`; every defined body is `<= 21` B, so a
+//! message is well inside the 64 B message budget). The marker is
 //! not part of any message and is not produced or consumed by
 //! [`encode_ctl_message`]/[`decode_ctl_message`].
 
 use bytes::Bytes;
+use std::net::SocketAddr;
 
-use super::addr::{AddrHeader, TargetAddrRef};
+use super::addr::{
+    AddrHeader, TargetAddrRef, get_ip_socket_addr, ip_socket_addr_len, put_ip_socket_addr,
+};
 use super::error::MqpError;
 
 // ---------------- frame classes and form flags ----------------
@@ -1477,6 +1480,8 @@ pub const CTL_STREAM_MARKER: u8 = 0xFF;
 pub const CTL_ASSOC_CLOSE: u8 = 0x01;
 /// `FLOW_CLOSE` (`both`): eager release of one flow.
 pub const CTL_FLOW_CLOSE: u8 = 0x02;
+/// `SRC_ACK` (`C->S`): confirm the reply source the peer taught on a rebind.
+pub const CTL_SRC_ACK: u8 = 0x03;
 /// `REJECT` (`S->C`): policy/table-full/DNS refusal of a flow.
 pub const CTL_REJECT: u8 = 0x81;
 /// `NEED_CONTEXT` (`both`): recovery hint; re-arm the binding for a flow.
@@ -1506,6 +1511,18 @@ pub enum CtlMessage {
         fid: u16,
         /// Opaque close reason.
         reason: u8,
+    },
+    /// `0x03`: confirm the `OPEN|SRC` for `fid` **and the source it taught**.
+    ///
+    /// Rev3 has no per-flow ACK plane; this message is the reliability the
+    /// source-confirmation needs. A plain id ACK cannot distinguish two rebinds
+    /// of the same flow, so a stale ACK could confirm a source the receiver
+    /// never applied (ECHO review L1).
+    SrcAck {
+        /// Flow whose source is being confirmed.
+        fid: u16,
+        /// The reply source the receiver applied.
+        addr: SocketAddr,
     },
     /// `0x81`: server refusal of a flow.
     Reject {
@@ -1537,6 +1554,7 @@ impl CtlMessage {
         match self {
             CtlMessage::AssocClose { .. } => CTL_ASSOC_CLOSE,
             CtlMessage::FlowClose { .. } => CTL_FLOW_CLOSE,
+            CtlMessage::SrcAck { .. } => CTL_SRC_ACK,
             CtlMessage::Reject { .. } => CTL_REJECT,
             CtlMessage::NeedContext { .. } => CTL_NEED_CONTEXT,
             CtlMessage::SessClose { .. } => CTL_SESS_CLOSE,
@@ -1550,6 +1568,7 @@ impl CtlMessage {
         match self {
             CtlMessage::AssocClose { .. } | CtlMessage::SessClose { .. } => 5,
             CtlMessage::FlowClose { .. } | CtlMessage::Reject { .. } => 3,
+            CtlMessage::SrcAck { addr, .. } => 2 + ip_socket_addr_len(*addr),
             CtlMessage::NeedContext { .. } => 2,
             CtlMessage::Goaway => 0,
         }
@@ -1579,6 +1598,7 @@ pub fn encode_ctl_message(m: CtlMessage) -> Option<Bytes> {
     let fid_in_range = match m {
         CtlMessage::FlowClose { fid, .. }
         | CtlMessage::Reject { fid, .. }
+        | CtlMessage::SrcAck { fid, .. }
         | CtlMessage::NeedContext { fid } => valid_fid(fid),
         _ => true,
     };
@@ -1597,6 +1617,10 @@ pub fn encode_ctl_message(m: CtlMessage) -> Option<Bytes> {
         CtlMessage::FlowClose { fid, reason } | CtlMessage::Reject { fid, reason } => {
             put_u16(&mut v, fid);
             v.push(reason);
+        }
+        CtlMessage::SrcAck { fid, addr } => {
+            put_u16(&mut v, fid);
+            put_ip_socket_addr(&mut v, addr);
         }
         CtlMessage::NeedContext { fid } => put_u16(&mut v, fid),
         CtlMessage::Goaway => {}
@@ -1634,6 +1658,22 @@ pub fn decode_ctl_message(b: &[u8]) -> Result<(CtlMessage, usize), MqpError> {
         CTL_FLOW_CLOSE => {
             let (fid, reason) = ctl_fid_reason(body)?;
             CtlMessage::FlowClose { fid, reason }
+        }
+        CTL_SRC_ACK => {
+            if body.len() < 2 {
+                return Err(MqpError::Malformed("bad r3 src ack body len"));
+            }
+            let mut off = 0usize;
+            let fid = u16::from_le_bytes([body[0], body[1]]);
+            if !valid_fid(fid) {
+                return Err(MqpError::Malformed("bad r3 src ack fid"));
+            }
+            off += 2;
+            let addr = get_ip_socket_addr(body, &mut off)?;
+            if off != body.len() {
+                return Err(MqpError::Malformed("r3 src ack trailing bytes"));
+            }
+            CtlMessage::SrcAck { fid, addr }
         }
         CTL_REJECT => {
             let (fid, reason) = ctl_fid_reason(body)?;
@@ -3307,5 +3347,17 @@ mod tests {
                 let _ = is_r3(s);
             }
         }
+    }
+    #[test]
+    fn src_ack_roundtrip_and_short_body_is_rejected() {
+        let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        let msg = CtlMessage::SrcAck { fid: 3, addr };
+        let b = encode_ctl_message(msg).expect("valid src ack");
+        let (got, n) = decode_ctl_message(&b).expect("roundtrip");
+        assert_eq!(got, msg);
+        assert_eq!(n, b.len());
+        // body len 0/1: the decoder must reject before `body[0..2]`.
+        assert!(decode_ctl_message(&[CTL_SRC_ACK, 0, 0]).is_err());
+        assert!(decode_ctl_message(&[CTL_SRC_ACK, 1, 0, 0x01]).is_err());
     }
 }

@@ -41,9 +41,10 @@ use myquic2::mqp::r3::CtlMessage;
 use myquic2::mqp::wire::{self, Wire};
 use myquic2::udp::r2_frag::R2FragFlow;
 use myquic2::udp::r2_stage::R2_STAGE_MAX_BYTES;
+use myquic2::udp::r2_stage::{DirectSend, try_send_direct};
 use myquic2::udp::{
-    R2DrainAttempt, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager, drain_staged,
-    try_drain_staged,
+    R2DrainAttempt, R2DrainOutcome, R2Fragmenter, R2StageItem, R2StageKind, R2Stager,
+    drain_session_staged, drain_staged, try_drain_staged,
 };
 use std::collections::VecDeque;
 
@@ -408,6 +409,11 @@ pub(crate) struct ConnRev2 {
     queue_cap_bytes: std::sync::atomic::AtomicUsize,
     /// `mono_millis()` of the last sample (see [`QUEUE_SAMPLE_MS`]).
     queue_sampled_ms: std::sync::atomic::AtomicU64,
+    /// Mirror of the stager's `queued_bytes`, published after each push/drain
+    /// so admission reads it without taking the stager mutex. A stale-high
+    /// value after a `drop_session`/`drop_flow` is conservative (it refuses or
+    /// probes, never over-admits); a drain refreshes it.
+    staged_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for ConnRev2 {
@@ -494,6 +500,7 @@ impl ConnRev2 {
             dg_space: SpaceCache::default(),
             queue_cap_bytes: std::sync::atomic::AtomicUsize::new(0),
             queue_sampled_ms: std::sync::atomic::AtomicU64::new(0),
+            staged_bytes: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -552,12 +559,17 @@ impl ConnRev2 {
     /// also re-samples — before any policy drop. The admitted set is therefore
     /// unchanged; only the lock count is.
     ///
+    /// `wire_len` is the encoded DATAGRAM body length (payload plus the exact
+    /// MQP frame header), not the raw payload: quinn's buffer charges the body,
+    /// so charging the payload alone let the window be overrun by every header
+    /// and by uncounted control frames (ECHO review L7).
+    ///
     /// `true` when the window is disabled or no rate has been sampled yet.
     #[must_use]
     pub(crate) fn admit_uplink(
         &self,
         conn: &quinn::Connection,
-        len: usize,
+        wire_len: usize,
         batched: usize,
     ) -> bool {
         let Some(cap) = self.queue_window_cap(conn) else {
@@ -566,16 +578,23 @@ impl ConnRev2 {
         let capacity = self
             .dg_send_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        let staged = self.stager.lock().queued_bytes();
-        if fits_queue_window(cap, capacity, self.dg_space.space(), staged, batched, len) {
-            self.dg_space.note_admitted(len);
+        let staged = self.staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if fits_queue_window(
+            cap,
+            capacity,
+            self.dg_space.space(),
+            staged,
+            batched,
+            wire_len,
+        ) {
+            self.dg_space.note_admitted(wire_len);
             return true;
         }
         let observed = self.dg_space.observe();
         let space = conn.datagram_send_buffer_space();
         self.dg_space.resample(observed, space);
-        if fits_queue_window(cap, capacity, space, staged, batched, len) {
-            self.dg_space.note_admitted(len);
+        if fits_queue_window(cap, capacity, space, staged, batched, wire_len) {
+            self.dg_space.note_admitted(wire_len);
             true
         } else {
             false
@@ -598,7 +617,7 @@ impl ConnRev2 {
     /// within the window and refused once a previous payload has pushed the
     /// queue over it.
     #[must_use]
-    pub(crate) fn admit_standalone(&self, conn: &quinn::Connection, len: usize) -> bool {
+    pub(crate) fn admit_standalone(&self, conn: &quinn::Connection, wire_len: usize) -> bool {
         let Some(cap) = self.queue_window_cap(conn) else {
             return true;
         };
@@ -608,20 +627,30 @@ impl ConnRev2 {
         let capacity = self
             .dg_send_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        let staged = self.stager.lock().queued_bytes();
-        if fits_standalone_window(cap, capacity, self.dg_space.space(), staged, len) {
-            self.dg_space.note_admitted(len);
+        let staged = self.staged_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if fits_standalone_window(cap, capacity, self.dg_space.space(), staged, wire_len) {
+            self.dg_space.note_admitted(wire_len);
             return true;
         }
         let observed = self.dg_space.observe();
         let space = conn.datagram_send_buffer_space();
         self.dg_space.resample(observed, space);
-        if fits_standalone_window(cap, capacity, space, staged, len) {
-            self.dg_space.note_admitted(len);
+        if fits_standalone_window(cap, capacity, space, staged, wire_len) {
+            self.dg_space.note_admitted(wire_len);
             true
         } else {
             false
         }
+    }
+
+    /// Charge one control DATAGRAM (`HELLO`, `FLOW_ACK_SRC`, `SESS_CLOSE`)
+    /// against the DATAGRAM buffer estimate.
+    ///
+    /// Control frames bypass the stager and were previously invisible to
+    /// `SpaceCache`; enough of them could make a cached "fits" false. Only a
+    /// successfully queued frame is charged (a refused one occupies nothing).
+    pub(crate) fn note_control_sent(&self, wire_len: usize) {
+        self.dg_space.note_admitted(wire_len);
     }
 
     /// Current queue-window byte budget, or `None` while the cap is disabled
@@ -823,7 +852,11 @@ impl ConnRev2 {
     /// whole burst through [`Self::push_stage_batch`].
     #[cfg(test)]
     pub(crate) fn push_stage(&self, item: R2StageItem) -> Result<usize, R2StageItem> {
-        self.stager.lock().push(item)
+        let mut st = self.stager.lock();
+        let result = st.push(item);
+        self.staged_bytes
+            .store(st.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
+        result
     }
 
     /// Queue a whole burst of small payloads with one lock hold.
@@ -836,11 +869,36 @@ impl ConnRev2 {
     /// counter call per item.
     pub(crate) fn push_stage_batch(&self, items: &mut Vec<R2StageItem>) -> Result<usize, usize> {
         let before = items.len();
-        let result = self.stager.lock().push_batch(items);
+        let result = {
+            let mut st = self.stager.lock();
+            let result = st.push_batch(items);
+            self.staged_bytes
+                .store(st.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
+            result
+        };
         for _ in 0..before - items.len() {
             counters::stage_push();
         }
         result
+    }
+
+    /// Drain only `session`'s queued items; other sessions keep their backlog.
+    ///
+    /// The large-standalone-payload ordering requirement is per session; the
+    /// connection-wide drain made one large datagram flush up to 1024 items
+    /// from unrelated associations (ECHO review L6).
+    pub(crate) fn drain_session_stage(
+        &self,
+        conn: &quinn::Connection,
+        limit: usize,
+        session: u32,
+    ) -> R2DrainOutcome {
+        let outcome = drain_session_staged(conn, &self.stager, session, limit);
+        if let Some(st) = self.stager.try_lock() {
+            self.staged_bytes
+                .store(st.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
+        }
+        outcome
     }
 
     /// Two-phase drain of the connection's queued payloads.
@@ -871,7 +929,14 @@ impl ConnRev2 {
         // inside the queue right now, so notifying is the safe answer either
         // way; the retry task tolerates an empty queue (one drain that finds
         // nothing).
-        let has_backlog = self.stager.try_lock().is_none_or(|st| !st.is_empty());
+        let has_backlog = match self.stager.try_lock() {
+            Some(st) => {
+                self.staged_bytes
+                    .store(st.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
+                !st.is_empty()
+            }
+            None => true,
+        };
         if has_backlog {
             self.stage_retry.notify_one();
         }
@@ -885,11 +950,18 @@ impl ConnRev2 {
     /// contention is reported as [`R2DrainAttempt::Busy`] and retried on the
     /// next cadence. Accounting is the same as [`Self::drain_stage`]'s.
     pub(crate) fn try_drain_stage(&self, conn: &quinn::Connection, limit: usize) -> R2DrainAttempt {
-        try_drain_staged(conn, &self.stager, limit, |at| {
+        let attempt = try_drain_staged(conn, &self.stager, limit, |at| {
             counters::stage_full();
             let n = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
             warn_stage_full(n, at);
-        })
+        });
+        if attempt.is_complete()
+            && let Some(st) = self.stager.try_lock()
+        {
+            self.staged_bytes
+                .store(st.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
+        }
+        attempt
     }
 
     /// Whether the stager is known to be empty, without blocking.
@@ -1100,10 +1172,12 @@ pub(crate) async fn handshake_with(
             wire_ver: r2::R2_WIRE_VER,
             flags: 0,
         });
+        let hello_len = hello.len();
         match try_send_datagram(conn, hello) {
             // The datagram queue is full (a fresh connection usually is not):
             // HELLO is idempotent, the next tick retries it.
-            DatagramSend::Sent | DatagramSend::Blocked | DatagramSend::TooLarge => {}
+            DatagramSend::Sent => rev2.note_control_sent(hello_len),
+            DatagramSend::Blocked | DatagramSend::TooLarge => {}
             DatagramSend::ConnectionLost | DatagramSend::Unsupported => {
                 counters::handshake_fail();
                 return false;
@@ -1156,6 +1230,7 @@ fn spawn_hello_retry(conn: quinn::Connection, rev2: Arc<ConnRev2>, slow_retry: D
             wire_ver: r2::R2_WIRE_VER,
             flags: 0,
         });
+        let hello_len = hello.len();
         loop {
             if rev2.is_ready() {
                 counters::handshake_ok();
@@ -1173,7 +1248,11 @@ fn spawn_hello_retry(conn: quinn::Connection, rev2: Arc<ConnRev2>, slow_retry: D
                 return;
             }
             match try_send_datagram(&conn, hello.clone()) {
-                DatagramSend::Sent | DatagramSend::Blocked | DatagramSend::TooLarge => {
+                DatagramSend::Sent => {
+                    rev2.note_control_sent(hello_len);
+                    counters::hello_tx();
+                }
+                DatagramSend::Blocked | DatagramSend::TooLarge => {
                     counters::hello_tx();
                 }
                 // No peer left to negotiate with; the reconnect loop owns the
@@ -1190,8 +1269,18 @@ fn spawn_hello_retry(conn: quinn::Connection, rev2: Arc<ConnRev2>, slow_retry: D
 /// Mirrors the server's helper: control frames are loss-tolerant by design
 /// (every opcode is idempotent and its sender retries or waits for the sweep),
 /// so the verdict is reported for counting and nothing is retried here.
-pub(crate) fn r2_send_ctl(conn: &quinn::Connection, ctl: &r2::Ctl) -> DatagramSend {
-    try_send_datagram(conn, r2::encode_ctl(ctl))
+pub(crate) fn r2_send_ctl(
+    rev2: &ConnRev2,
+    conn: &quinn::Connection,
+    ctl: &r2::Ctl,
+) -> DatagramSend {
+    let body = r2::encode_ctl(ctl);
+    let len = body.len();
+    let verdict = try_send_datagram(conn, body);
+    if verdict == DatagramSend::Sent {
+        rev2.note_control_sent(len);
+    }
+    verdict
 }
 
 /// Association-exit rev2 session teardown: release the session's
@@ -1278,7 +1367,10 @@ pub(crate) fn send_sess_close(
         }
         for _ in 0..3 {
             match try_send_datagram(conn, frame.clone()) {
-                DatagramSend::Sent => counters::sess_close_tx(),
+                DatagramSend::Sent => {
+                    rev2.note_control_sent(frame.len());
+                    counters::sess_close_tx();
+                }
                 DatagramSend::ConnectionLost
                 | DatagramSend::Unsupported
                 | DatagramSend::Blocked
@@ -1299,7 +1391,7 @@ pub(crate) fn send_sess_close(
     let now = coarse_millis();
     let generation = egress.generation[b.index].load(std::sync::atomic::Ordering::Acquire);
     if let Some(h) = egress.acquire(pool, b, now) {
-        egress.memo_store(b, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+        egress.memo_store(b, generation, &h.cache);
         send(&h.conn, &h.rev2);
     }
 }
@@ -1464,6 +1556,35 @@ impl UplinkFlows {
         conn: &quinn::Connection,
         limit: usize,
     ) -> PayloadSend {
+        self.flush_stage_inner(rev2, conn, limit, true)
+    }
+
+    /// Push the association batch into the connection stager **without**
+    /// draining it here.
+    ///
+    /// The `[[udp_forward]]` listener runs on the main runtime while the
+    /// connection's driver, retry task and other associations live on the
+    /// slot runtime; letting the push's opportunistic drain run there carries
+    /// the encode, the `send_datagram` calls and quinn's state mutex across
+    /// cores (ECHO review L3). On a full queue the batch is left in `up` for
+    /// the deferred retry, never dropped: the listener's next deferred tick
+    /// retries the push.
+    pub(crate) fn flush_stage_no_drain(
+        &mut self,
+        rev2: &ConnRev2,
+        conn: &quinn::Connection,
+        limit: usize,
+    ) -> PayloadSend {
+        self.flush_stage_inner(rev2, conn, limit, false)
+    }
+
+    fn flush_stage_inner(
+        &mut self,
+        rev2: &ConnRev2,
+        conn: &quinn::Connection,
+        limit: usize,
+        allow_drain: bool,
+    ) -> PayloadSend {
         if self.stage_batch.is_empty() {
             return PayloadSend {
                 frames: 0,
@@ -1495,7 +1616,7 @@ impl UplinkFlows {
                     // Same opportunistic drain as the single-push path: one
                     // train's worth of cross-session items is where the
                     // queue is worth a send even if this burst is over.
-                    if queued >= r2::R2_MAX_TRAIN_ITEMS {
+                    if allow_drain && queued >= r2::R2_MAX_TRAIN_ITEMS {
                         drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
                     }
                     return match drained.failed {
@@ -1511,6 +1632,17 @@ impl UplinkFlows {
                         },
                     };
                 }
+                // Push-only mode: never drain on the listener's thread. The
+                // unaccepted tail stays in `stage_batch`; `flush_peer` sees
+                // `has_staged_batch()` and arms the deferred retry.
+                Err(_) if !allow_drain => {
+                    counters::stage_full();
+                    self.stage_batch_bytes = self.stage_batch.iter().map(|i| i.payload.len()).sum();
+                    return PayloadSend {
+                        frames: drained.frames,
+                        failed: drained.failed.or(Some(DatagramSend::Blocked)),
+                    };
+                }
                 Err(_) if attempt == 0 => {
                     counters::stage_full();
                     drained = prefer_severe(drained, drain_conn_stage(rev2, conn, limit));
@@ -1520,18 +1652,83 @@ impl UplinkFlows {
         }
         let mut total = 0u64;
         let mut first = None;
+        // A terminal drain verdict tears the generation down, so these payloads
+        // were lost to a dead egress, not to buffer pressure; book them as such
+        // (ECHO review L11). A still-full live queue keeps BUFFER_FULL.
+        let dead = matches!(
+            drained.failed,
+            Some(DatagramSend::ConnectionLost | DatagramSend::Unsupported)
+        );
         for item in self.stage_batch.drain(..) {
             if first.is_none() {
                 first = Some(item.ids());
             }
-            total = dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+            total = if dead {
+                dgram_drops::bump(&dgram_drops::EGRESS_DEAD)
+            } else {
+                dgram_drops::bump(&dgram_drops::BUFFER_FULL)
+            };
         }
         self.stage_batch_bytes = 0;
-        warn_stage_full(total, first);
+        if !dead {
+            warn_stage_full(total, first);
+        }
         PayloadSend {
             frames: drained.frames,
             failed: drained.failed.or(Some(DatagramSend::Blocked)),
         }
+    }
+
+    /// Send a lone staged payload directly, skipping the stager push/drain.
+    ///
+    /// The one-datagram request/response shape pays the item's payload copy in
+    /// `send_uplink`, but the queue round trip (stager push + drain gate +
+    /// claim) is pure overhead when there is nothing to pack. `try_send_direct`
+    /// requires the connection queue empty and the gate free, so it cannot
+    /// overtake an earlier frame; a `NotNow` returns the item to the batch and
+    /// the caller falls through to the normal flush/drain.
+    pub(crate) fn flush_lone_direct(
+        &mut self,
+        rev2: &ConnRev2,
+        conn: &quinn::Connection,
+        limit: usize,
+    ) -> Option<PayloadSend> {
+        if self.epoch != rev2.epoch || self.stage_batch.len() != 1 {
+            return None;
+        }
+        let item = self.stage_batch.pop()?;
+        self.stage_batch_bytes = 0;
+        let len = item.payload.len();
+        match try_send_direct(&rev2.stager, conn, item, limit) {
+            DirectSend::Sent => {
+                udp_stats::payload(len);
+                Some(PayloadSend {
+                    frames: 1,
+                    failed: None,
+                })
+            }
+            DirectSend::TooLarge => Some(PayloadSend {
+                frames: 0,
+                failed: Some(DatagramSend::TooLarge),
+            }),
+            DirectSend::Terminal(verdict) => Some(PayloadSend {
+                frames: 0,
+                failed: Some(verdict),
+            }),
+            DirectSend::NotNow(item) => {
+                self.stage_batch_bytes = item.payload.len();
+                self.stage_batch.push(item);
+                None
+            }
+        }
+    }
+
+    /// Test-only: seed the association batch directly, without an egress
+    /// handle. Used to pin `flush_stage_no_drain`'s push-only contract.
+    #[cfg(test)]
+    pub(crate) fn test_stage_item(&mut self, item: R2StageItem) {
+        self.stage_batch_bytes += item.payload.len();
+        self.stage_batch.push(item);
     }
 
     /// Drop a batch that was built for a connection generation (or a session)
@@ -1893,7 +2090,7 @@ pub(crate) fn flush_pending_uplink(
                 egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
             match egress.acquire(pool, bind, now) {
                 Some(h) => {
-                    egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+                    egress.memo_store(bind, generation, &h.cache);
                     let limit = h.rev2.frame_limit(h.limit);
                     flush_pending_on(&h.conn, limit, sess, bind, &h.rev2, up, frag)
                 }
@@ -1958,7 +2155,7 @@ pub(crate) fn send_uplink(
     // still the right accounting (the app chose an impossible target).
     if addr.header().is_err() {
         let flushed = up.flush_stage(rev2, conn, limit);
-        let drained = drain_conn_stage(rev2, conn, limit);
+        let drained = map_drain_outcome(rev2.drain_session_stage(conn, limit, sess));
         return prefer_severe(prefer_severe(flushed, drained), bad_address_header());
     }
     let Some(binding) = ensure_binding(rev2, up, sess, addr) else {
@@ -1969,7 +2166,8 @@ pub(crate) fn send_uplink(
             // The window covers one-frame payloads too; without this check the
             // largest packets bypass it and can sit in the send buffer for a
             // path-rate fraction far above the intended ten milliseconds.
-            let sent = if rev2.admit_standalone(conn, payload.len()) {
+            let wire_len = uplink_wire_len(rev2.wire(), None, false, sess, addr, payload.len());
+            let sent = if rev2.admit_standalone(conn, wire_len) {
                 send_standalone(
                     conn,
                     limit,
@@ -2026,8 +2224,16 @@ pub(crate) fn send_uplink(
     // connection queue first so this standalone payload cannot overtake a
     // session's earlier small payloads.
     let flushed = up.flush_stage(rev2, conn, limit);
-    let drained = drain_conn_stage(rev2, conn, limit);
-    let sent = if rev2.admit_standalone(conn, payload.len()) {
+    let drained = map_drain_outcome(rev2.drain_session_stage(conn, limit, sess));
+    let wire_len = uplink_wire_len(
+        rev2.wire(),
+        Some(&binding),
+        context,
+        sess,
+        addr,
+        payload.len(),
+    );
+    let sent = if rev2.admit_standalone(conn, wire_len) {
         send_standalone(
             conn,
             limit,
@@ -2086,6 +2292,58 @@ pub(crate) fn uses_binding_context(
 /// [`PayloadSend`] (`frames: 1`, no failure) so the shared recovery path stays
 /// quiet; a flush verdict reached through the batch bound is propagated as
 /// before.
+/// Exact encoded length of `item` on `wire` (see [`ConnRev2::admit_uplink`]).
+fn item_wire_len(item: &R2StageItem, wire: Wire) -> usize {
+    let payload = item.payload.len();
+    match &item.kind {
+        R2StageKind::Steady { wire_id } => match wire {
+            Wire::Rev2 => r2::data_steady_len(*wire_id, payload),
+            Wire::Rev3 => myquic2::mqp::r3::data_steady_len(payload),
+        },
+        R2StageKind::Open { wire_id, addr, .. } => {
+            let addr_len = addr.as_ref().header().map_or(0, |h| h.len());
+            match wire {
+                Wire::Rev2 => r2::data_open_len(*wire_id, addr_len, payload),
+                Wire::Rev3 => myquic2::mqp::r3::data_open_len(addr_len, payload),
+            }
+        }
+        R2StageKind::Inline { addr, .. } => {
+            let addr_len = addr.as_ref().header().map_or(0, |h| h.len());
+            match wire {
+                Wire::Rev2 => r2::data_inline_len(addr_len, payload),
+                Wire::Rev3 => myquic2::mqp::r3::data_inline_len(addr_len, payload),
+            }
+        }
+    }
+}
+
+/// Exact encoded length of a standalone payload (the same forms as
+/// [`item_wire_len`]).
+fn uplink_wire_len(
+    wire: Wire,
+    binding: Option<&Arc<FlowBinding>>,
+    context: bool,
+    _sess: u32,
+    addr: &TargetAddrRef<'_>,
+    payload_len: usize,
+) -> usize {
+    let addr_len = addr.header().map_or(0, |h| h.len());
+    match (binding, context) {
+        (Some(binding), false) => match wire {
+            Wire::Rev2 => r2::data_steady_len(binding.wire_id, payload_len),
+            Wire::Rev3 => myquic2::mqp::r3::data_steady_len(payload_len),
+        },
+        (Some(binding), true) => match wire {
+            Wire::Rev2 => r2::data_open_len(binding.wire_id, addr_len, payload_len),
+            Wire::Rev3 => myquic2::mqp::r3::data_open_len(addr_len, payload_len),
+        },
+        (None, _) => match wire {
+            Wire::Rev2 => r2::data_inline_len(addr_len, payload_len),
+            Wire::Rev3 => myquic2::mqp::r3::data_inline_len(addr_len, payload_len),
+        },
+    }
+}
+
 fn stage_or_count(
     rev2: &ConnRev2,
     conn: &quinn::Connection,
@@ -2096,9 +2354,21 @@ fn stage_or_count(
     // The window is checked before the batch grows, so the payload that would
     // push the queue past ten milliseconds of path rate is the one refused. A
     // disabled window (`0`) short-circuits before any lock or `stats()` call.
-    if !rev2.admit_uplink(conn, item.payload.len(), up.stage_batch_bytes()) {
+    let wire_len = item_wire_len(&item, rev2.wire());
+    if !rev2.admit_uplink(conn, wire_len, up.stage_batch_bytes()) {
         return over_queue_window(rev2);
     }
+    stage_item_admitted(rev2, conn, limit, up, item)
+}
+
+/// Push one already-admitted item into the association batch.
+fn stage_item_admitted(
+    rev2: &ConnRev2,
+    conn: &quinn::Connection,
+    limit: usize,
+    up: &mut UplinkFlows,
+    item: R2StageItem,
+) -> PayloadSend {
     up.stage_batch_bytes = up.stage_batch_bytes.saturating_add(item.payload.len());
     up.stage_batch.push(item);
     // One train's worth is the bound the single-push path used to fire its
@@ -2528,6 +2798,11 @@ pub(crate) fn drain_assoc_stage(
     let now = coarse_millis();
     let drained = egress.with_fresh(bind, now, |c, limit, rev2| {
         let limit = rev2.frame_limit(limit);
+        if let Some(up) = up.as_deref_mut()
+            && let Some(sent) = up.flush_lone_direct(rev2, c, limit)
+        {
+            return sent;
+        }
         let flushed = flush_assoc_batch(&mut up, rev2, c, limit);
         prefer_severe(flushed, map_drain_outcome(rev2.drain_stage(c, limit)))
     });
@@ -2539,13 +2814,19 @@ pub(crate) fn drain_assoc_stage(
     // per-datagram miss path documents.
     let generation = egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
     if let Some(h) = egress.acquire(pool, bind, now) {
-        egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+        egress.memo_store(bind, generation, &h.cache);
         let limit = h.rev2.frame_limit(h.limit);
-        let flushed = flush_assoc_batch(&mut up, &h.rev2, &h.conn, limit);
-        let sent = prefer_severe(
-            flushed,
-            map_drain_outcome(h.rev2.drain_stage(&h.conn, limit)),
-        );
+        let sent = if let Some(up) = up.as_deref_mut()
+            && let Some(sent) = up.flush_lone_direct(&h.rev2, &h.conn, limit)
+        {
+            sent
+        } else {
+            let flushed = flush_assoc_batch(&mut up, &h.rev2, &h.conn, limit);
+            prefer_severe(
+                flushed,
+                map_drain_outcome(h.rev2.drain_stage(&h.conn, limit)),
+            )
+        };
         recover_send_outcome(egress, bind, sent);
     }
 }
@@ -2590,7 +2871,7 @@ pub(crate) fn flush_assoc_stage(
     let now = coarse_millis();
     let flushed = egress.with_fresh(bind, now, |c, limit, rev2| {
         let limit = rev2.frame_limit(limit);
-        let sent = up.flush_stage(rev2, c, limit);
+        let sent = up.flush_stage_no_drain(rev2, c, limit);
         rev2.request_drain();
         sent
     });
@@ -2602,9 +2883,9 @@ pub(crate) fn flush_assoc_stage(
     // per-datagram miss path documents.
     let generation = egress.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
     if let Some(h) = egress.acquire(pool, bind, now) {
-        egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+        egress.memo_store(bind, generation, &h.cache);
         let limit = h.rev2.frame_limit(h.limit);
-        let sent = up.flush_stage(&h.rev2, &h.conn, limit);
+        let sent = up.flush_stage_no_drain(&h.rev2, &h.conn, limit);
         h.rev2.request_drain();
         recover_send_outcome(egress, bind, sent);
     }
@@ -2642,7 +2923,7 @@ pub(crate) fn try_drain_connection_stage(
     let Some(h) = egress.acquire(pool, bind, now) else {
         return false;
     };
-    egress.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+    egress.memo_store(bind, generation, &h.cache);
     let limit = h.rev2.frame_limit(h.limit);
     try_drain_spins(&h.rev2, &h.conn, limit)
 }
@@ -3835,5 +4116,48 @@ mod tests {
         book_hold_loss(2, "test");
         assert!(dgram_drops::snapshot().since(&before_drops).no_egress >= 2);
         assert!(counters::since(&before_counters).egress_hold_stale >= 2);
+    }
+    #[test]
+    fn admission_charges_the_encoded_frame_not_just_the_payload() {
+        let payload = Bytes::from_static(b"abc");
+        let steady = R2StageItem {
+            session: 1,
+            kind: R2StageKind::Steady { wire_id: 5 },
+            payload: payload.clone(),
+        };
+        assert_eq!(
+            item_wire_len(&steady, Wire::Rev2),
+            r2::data_steady_len(5, 3),
+            "rev2 steady header is part of the buffer charge"
+        );
+        assert_eq!(
+            item_wire_len(&steady, Wire::Rev3),
+            myquic2::mqp::r3::data_steady_len(3)
+        );
+        let addr = TargetAddr::Ip("198.51.100.1:53".parse().unwrap());
+        let open = R2StageItem {
+            session: 1,
+            kind: R2StageKind::Open {
+                wire_id: 5,
+                sess: 1,
+                addr: addr.clone(),
+                src: false,
+            },
+            payload: payload.clone(),
+        };
+        let addr_len = addr.as_ref().header().unwrap().len();
+        assert_eq!(
+            item_wire_len(&open, Wire::Rev2),
+            r2::data_open_len(5, addr_len, 3)
+        );
+        assert_eq!(
+            uplink_wire_len(Wire::Rev2, None, false, 1, &addr.as_ref(), 3),
+            r2::data_inline_len(addr_len, 3)
+        );
+        let binding = FlowBinding::new_shared(5, 1, addr.clone());
+        assert_eq!(
+            uplink_wire_len(Wire::Rev2, Some(&binding), false, 1, &addr.as_ref(), 3),
+            r2::data_steady_len(5, 3)
+        );
     }
 }

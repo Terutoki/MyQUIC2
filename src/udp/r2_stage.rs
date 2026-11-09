@@ -958,7 +958,20 @@ impl R2Stager {
         if self.steady_order.back() == Some(&session) {
             return;
         }
-        let Some(pos) = self.steady_order.iter().position(|s| *s == session) else {
+        // The cursor is round-robin, so a session already deep in the ring is
+        // not going to be visited again immediately; moving it is not worth an
+        // O(steady-sessions) scan every frame (ECHO review L12). Bound the
+        // search to the first 32 entries: a session beyond that is left in
+        // place and served when the cursor reaches it, which preserves FIFO
+        // and fairness (the ring still advances) while making the common
+        // first-frame cost constant.
+        const STEADY_SCAN: usize = 32;
+        let Some(pos) = self
+            .steady_order
+            .iter()
+            .take(STEADY_SCAN)
+            .position(|s| *s == session)
+        else {
             return;
         };
         self.steady_order.rotate_left(pos + 1);
@@ -1147,6 +1160,126 @@ fn encode_train_run(
         }
     }
     wire::encode_train_dict(wire, flows, &items[..run.len()], limit)
+}
+
+impl R2Stager {
+    /// Remove and return every queued item of `session`, in FIFO order.
+    ///
+    /// Used by the large-payload pre-drain: it must flush **this** session's
+    /// earlier small payloads before a standalone frame overtakes them, but it
+    /// must not block on other sessions' backlog (ECHO review L6). The caller
+    /// owns the drain gate, so no other drainer can claim these items.
+    pub fn take_session_items(&mut self, session: u32) -> Vec<R2StageItem> {
+        let mut items = Vec::new();
+        while let Some(item) = self.pop_one(session) {
+            items.push(item);
+        }
+        items
+    }
+
+    /// Put `items` back at the **front** of their session queues, preserving
+    /// order. Returns how many could not be requeued because the bounded queue
+    /// filled again; each dropped item is booked as `BUFFER_FULL` here.
+    pub fn requeue_items_front(&mut self, items: Vec<R2StageItem>) -> usize {
+        let mut dropped = 0usize;
+        for item in items.into_iter().rev() {
+            if self.push_front(item).is_err() {
+                dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+}
+
+/// Drain **one session's** queued items, leaving every other session's queue
+/// untouched.
+///
+/// The large-standalone-payload path uses this instead of `drain_staged`: the
+/// ordering requirement is per session, and draining the connection-wide queue
+/// made one 60 KiB datagram encode and send up to 1024 items belonging to
+/// unrelated associations (ECHO review L6). The drain gate is held across
+/// claim/send/requeue exactly like `drain_staged_inner`, so it cannot race a
+/// normal drain; the stager lock itself is released during the sends.
+pub fn drain_session_staged(
+    conn: &Connection,
+    stage: &parking_lot::Mutex<R2Stager>,
+    session: u32,
+    limit: usize,
+) -> R2DrainOutcome {
+    let mut out = R2DrainOutcome::default();
+    let gate = match stage_lock(stage, false) {
+        Some(st) => st.drain_gate.clone(),
+        None => return out,
+    };
+    let _gate = gate.lock();
+    let wire = match stage_lock(stage, false) {
+        Some(st) => st.wire(),
+        None => return out,
+    };
+    let items = match stage_lock(stage, false) {
+        Some(mut st) => st.take_session_items(session),
+        None => return out,
+    };
+    if items.is_empty() {
+        return out;
+    }
+    let total = items.len();
+    for (idx, item) in items.iter().enumerate() {
+        let Some(body) = encode_standalone_item_for(wire, item, limit) else {
+            book_too_large(1);
+            out.items_dropped = out.items_dropped.saturating_add(1);
+            out.failed = Some(DatagramSend::TooLarge);
+            let rest = items[idx + 1..].to_vec();
+            if let Some(mut st) = stage_lock(stage, false) {
+                let _ = st.requeue_items_front(rest);
+            }
+            return out;
+        };
+        match try_send_datagram(conn, body) {
+            DatagramSend::Sent => {
+                out.frames = out.frames.saturating_add(1);
+                out.items_sent = out.items_sent.saturating_add(1);
+                udp_stats::payload(item.payload.len());
+            }
+            DatagramSend::Blocked => {
+                // Backpressure: nothing was sent; keep the whole tail for the
+                // next drain (the byte accounting stays in the stager).
+                out.failed = Some(DatagramSend::Blocked);
+                let rest = items[idx..].to_vec();
+                if let Some(mut st) = stage_lock(stage, false) {
+                    let _ = st.requeue_items_front(rest);
+                }
+                return out;
+            }
+            DatagramSend::TooLarge => {
+                // This frame cannot fit the live budget; drop it with the
+                // size class and keep the tail for a later drain.
+                book_too_large(1);
+                out.items_dropped = out.items_dropped.saturating_add(1);
+                out.failed = Some(DatagramSend::TooLarge);
+                let rest = items[idx + 1..].to_vec();
+                if let Some(mut st) = stage_lock(stage, false) {
+                    let _ = st.requeue_items_front(rest);
+                }
+                return out;
+            }
+            other => {
+                // The connection cannot carry these frames: requeueing them
+                // would only leave them for teardown. Book them as egress
+                // deaths now (the session-scoped twin of `send_packed_frames`).
+                for item in &items[idx..] {
+                    dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+                    let _ = item;
+                }
+                out.items_dropped = out.items_dropped.saturating_add((items.len() - idx) as u32);
+                out.failed = Some(other);
+                return out;
+            }
+        }
+    }
+    let _ = total;
+    out
 }
 
 /// Encode every claimed frame in `q`, outside the stager lock.
@@ -1493,6 +1626,77 @@ pub fn try_send_direct(
         DatagramSend::Sent => DirectSend::Sent,
         DatagramSend::TooLarge => DirectSend::TooLarge,
         other => DirectSend::Terminal(other),
+    }
+}
+
+/// Outcome of [`try_send_direct_borrowed`].
+#[derive(Debug)]
+pub enum DirectSendBorrowed {
+    /// Encoded and queued to quinn.
+    Sent,
+    /// The queue/gate/buffer was not free; the caller should take the normal
+    /// item + stager path.
+    NotNow,
+    /// The encoded frame does not fit the live budget.
+    TooLarge,
+    /// `Unsupported`/`ConnectionLost`.
+    Terminal(DatagramSend),
+}
+
+/// Encode and send one payload **without** materializing an [`R2StageItem`].
+///
+/// The lone-small-reply/request fast path: when the connection queue is empty
+/// and the drain gate is free, the DATAGRAM body can be built directly from the
+/// caller's borrowed payload. The existing [`try_send_direct`] takes an owned
+/// item and therefore cannot avoid the item's payload copy; this variant can,
+/// while keeping the same "queue empty + gate free + capacity policy" rule (see
+/// [`try_send_direct`] for why each is required).
+///
+/// Returns [`DirectSendBorrowed::NotNow`] with no side effects when the caller
+/// must fall back; the payload is untouched. A `TooLarge`/`Terminal` verdict is
+/// returned for the caller's accounting.
+pub fn try_send_direct_borrowed(
+    stage: &parking_lot::Mutex<R2Stager>,
+    conn: &Connection,
+    kind: &R2StageKind,
+    payload: &[u8],
+    limit: usize,
+) -> DirectSendBorrowed {
+    let (gate, empty, accepts, wire) = {
+        let st = stage.lock();
+        (
+            st.drain_gate.clone(),
+            st.is_empty(),
+            st.accepts(payload.len()),
+            st.wire(),
+        )
+    };
+    if !empty || !accepts {
+        return DirectSendBorrowed::NotNow;
+    }
+    let Some(_gate) = gate.try_lock() else {
+        return DirectSendBorrowed::NotNow;
+    };
+    let body = match kind {
+        R2StageKind::Steady { wire_id } => wire::encode_data_steady(wire, *wire_id, payload, limit),
+        R2StageKind::Open {
+            wire_id,
+            sess,
+            addr,
+            src,
+        } => wire::encode_data_open(wire, *wire_id, *sess, &addr.as_ref(), *src, payload, limit),
+        R2StageKind::Inline { sess, addr, src } => {
+            wire::encode_data_inline(wire, *sess, &addr.as_ref(), *src, payload, limit)
+        }
+    };
+    let Some(body) = body else {
+        return DirectSendBorrowed::TooLarge;
+    };
+    match try_send_datagram(conn, body) {
+        DatagramSend::Sent => DirectSendBorrowed::Sent,
+        DatagramSend::Blocked => DirectSendBorrowed::NotNow,
+        DatagramSend::TooLarge => DirectSendBorrowed::TooLarge,
+        other => DirectSendBorrowed::Terminal(other),
     }
 }
 

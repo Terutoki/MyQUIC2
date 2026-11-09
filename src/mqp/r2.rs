@@ -46,7 +46,10 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
-use super::addr::{AddrHeader, TargetAddr, TargetAddrRef};
+use super::addr::{
+    AddrHeader, TargetAddr, TargetAddrRef, get_ip_socket_addr, ip_socket_addr_len,
+    put_ip_socket_addr,
+};
 use super::error::MqpError;
 
 /// Wire version advertised by `CTL HELLO`/`CAPS`. The protocol name stays
@@ -83,6 +86,8 @@ pub const R2_TRAIN_FORM_DICT: u8 = 1;
 pub const R2_CTL_HELLO: u8 = 0x01;
 pub const R2_CTL_CAPS: u8 = 0x02;
 pub const R2_CTL_FLOW_ACK: u8 = 0x10;
+/// Source-carrying ACK: `FLOW_ACK` plus the reply source it confirms.
+pub const R2_CTL_FLOW_ACK_SRC: u8 = 0x13;
 pub const R2_CTL_FLOW_REJECT: u8 = 0x11;
 pub const R2_CTL_FLOW_CLOSE: u8 = 0x12;
 pub const R2_CTL_SESS_CLOSE: u8 = 0x20;
@@ -892,12 +897,33 @@ impl Default for Caps {
 /// (compression or resource release), never correctness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctl {
-    Hello { wire_ver: u16, flags: u16 },
+    Hello {
+        wire_ver: u16,
+        flags: u16,
+    },
     Caps(Caps),
-    FlowAck { id: u32, status: u8 },
-    FlowReject { id: u32, reason: u8 },
-    FlowClose { id: u32 },
-    SessClose { sess: u32, reason: u8 },
+    FlowAck {
+        id: u32,
+        status: u8,
+    },
+    /// Confirm the `OPEN|SRC` for `id` **and the source it taught**. An ack
+    /// without the source cannot distinguish two rebinds of the same id, which
+    /// is what made a stale ack confirm a newer source (see the ECHO review L1).
+    FlowAckSrc {
+        id: u32,
+        addr: SocketAddr,
+    },
+    FlowReject {
+        id: u32,
+        reason: u8,
+    },
+    FlowClose {
+        id: u32,
+    },
+    SessClose {
+        sess: u32,
+        reason: u8,
+    },
 }
 
 impl Ctl {
@@ -908,6 +934,7 @@ impl Ctl {
             Ctl::Hello { .. } => 8,
             Ctl::Caps(_) => 17,
             Ctl::FlowAck { id, .. } | Ctl::FlowReject { id, .. } => 3 + varint_len(*id),
+            Ctl::FlowAckSrc { id, addr } => 2 + varint_len(*id) + ip_socket_addr_len(*addr),
             Ctl::FlowClose { id } => 2 + varint_len(*id),
             Ctl::SessClose { .. } => 7,
         }
@@ -945,6 +972,11 @@ pub fn encode_ctl(ctl: &Ctl) -> Bytes {
             v.push(R2_CTL_FLOW_ACK);
             put_varint(&mut v, id);
             v.push(status);
+        }
+        Ctl::FlowAckSrc { id, addr } => {
+            v.push(R2_CTL_FLOW_ACK_SRC);
+            put_varint(&mut v, id);
+            put_ip_socket_addr(&mut v, addr);
         }
         Ctl::FlowReject { id, reason } => {
             v.push(R2_CTL_FLOW_REJECT);
@@ -1005,6 +1037,18 @@ pub fn decode_ctl(b: &[u8]) -> Result<Ctl, MqpError> {
                 return Err(MqpError::Malformed("r2 ack trailing bytes"));
             }
             Ok(Ctl::FlowAck { id, status })
+        }
+        R2_CTL_FLOW_ACK_SRC => {
+            let mut off = 2usize;
+            let id = get_varint(b, &mut off)?;
+            if !valid_wire_id(id) {
+                return Err(MqpError::Malformed("r2 src ack id 0"));
+            }
+            let addr = get_ip_socket_addr(b, &mut off)?;
+            if off != b.len() {
+                return Err(MqpError::Malformed("r2 src ack trailing bytes"));
+            }
+            Ok(Ctl::FlowAckSrc { id, addr })
         }
         R2_CTL_FLOW_REJECT => {
             let mut off = 2usize;
@@ -1427,5 +1471,16 @@ mod tests {
         assert_eq!(kind(&[0x10]), None);
         assert!(!is_r2(&[]));
         assert!(is_r2(&[0x00]));
+    }
+    #[test]
+    fn flow_ack_src_roundtrip_and_truncation() {
+        let addr: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        let ctl = Ctl::FlowAckSrc { id: 5, addr };
+        let b = encode_ctl(&ctl);
+        assert_eq!(b.len(), ctl.len());
+        assert_eq!(decode_ctl(&b).unwrap(), ctl);
+        // A body without the address is malformed, not a panic.
+        let short = [R2_CTL, R2_CTL_FLOW_ACK_SRC, 0x05];
+        assert!(decode_ctl(&short).is_err());
     }
 }

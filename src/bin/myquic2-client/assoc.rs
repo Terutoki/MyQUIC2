@@ -501,8 +501,7 @@ pub(crate) fn send_payload_uplink(
                 egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
             match egress_shared.acquire(pool, bind, now) {
                 Some(h) => {
-                    egress_shared
-                        .memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+                    egress_shared.memo_store(bind, generation, &h.cache);
                     send_uplink(
                         &h.conn, h.limit, sess, target, payload, bind, &h.rev2, uplink, frag,
                     )
@@ -1343,7 +1342,7 @@ pub(crate) fn flush_deferred_batch(
         egress_shared.generation[bind.index].load(std::sync::atomic::Ordering::Acquire);
     match egress_shared.acquire(pool, bind, now_flush) {
         Some(h) => {
-            egress_shared.memo_store(bind, generation, &h.conn, h.limit, h.stamp_ms, &h.rev2);
+            egress_shared.memo_store(bind, generation, &h.cache);
             recover_send_outcome(
                 egress_shared,
                 bind,

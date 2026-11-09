@@ -372,16 +372,16 @@ pub(crate) struct R2ReplyState {
     /// One-entry memo of the last `reply source -> binding` verdict (see
     /// [`ReplySourceMemo`]). Task-local, so it dies with the reply reader.
     memo: ReplySourceMemo,
-    /// rev3 only: per-flow count of context-carrying frames already sent, while
-    /// the flow is inside its K=2 no-ACK context window.
+    /// rev3 only: flows whose binding context the peer asked to re-arm
+    /// (`NEED_CONTEXT`). A repair forces one context-carrying reply; the entry
+    /// is removed when that reply is staged.
     ///
-    /// rev2 waits for the client's `FLOW_ACK` before a learned reply source is
-    /// trusted (`reply_src_acked`); rev3 has no ACK, so this reader emits the
-    /// context form for the first [`R3_CONTEXT_K`] replies and then marks the
-    /// source confirmed locally. The map only ever holds flows *inside* their
-    /// window (entries are removed when the window closes), plus the bounded
-    /// `NEED_CONTEXT` repair set, so it cannot grow with the flow count.
-    ctx_sent: std::collections::HashMap<u32, u8>,
+    /// The source itself is confirmed by the client's source-carrying ACK
+    /// (`CtlMessage::SrcAck` → [`FlowBinding::confirm_reply_src`]), not by a
+    /// local K-count. The set is bounded by `CTX_NEED_CAP` on the producer side
+    /// and is cleared/replaced by each observed repair epoch, so it cannot grow
+    /// with the flow count.
+    ctx_repairs: std::collections::HashSet<u32>,
     /// rev3 only: last observed connection repair epoch (see
     /// [`R2ConnState::take_need_context`]).
     ctx_epoch: u64,
@@ -390,12 +390,6 @@ pub(crate) struct R2ReplyState {
     #[cfg(test)]
     pub(crate) match_scans: u64,
 }
-
-/// rev3 no-ACK context redundancy: how many consecutive downlink frames carry
-/// the binding context (`SRC`/`OPEN_SRC`) before the flow compresses. Two
-/// covers one lost datagram; the reliable control stream's `NEED_CONTEXT` is the
-/// repair path beyond that.
-pub(crate) const R3_CONTEXT_K: u8 = 2;
 
 impl R2ReplyState {
     pub(crate) fn new(
@@ -414,7 +408,7 @@ impl R2ReplyState {
             conn,
             wire,
             memo: ReplySourceMemo::default(),
-            ctx_sent: std::collections::HashMap::new(),
+            ctx_repairs: std::collections::HashSet::new(),
             ctx_epoch: 0,
             #[cfg(test)]
             match_scans: 0,
@@ -445,46 +439,15 @@ impl R2ReplyState {
             return;
         };
         self.ctx_epoch = seen;
-        // A repair supersedes every in-flight K window: the peer's list is the
-        // authority for what it is missing, and a stale window can only cause
-        // redundant (harmless) context frames.
-        self.ctx_sent.clear();
-        for wire_id in ids {
-            self.ctx_sent.insert(wire_id, 0);
-        }
+        // The peer's list is the authority for what it is missing; replace the
+        // set so a flow whose context has since been re-sent cannot accumulate.
+        self.ctx_repairs.clear();
+        self.ctx_repairs.extend(ids);
     }
 
-    /// Whether this flow must send another context-carrying frame before
-    /// compressing (rev3 only).
-    fn context_due(&self, wire_id: u32) -> bool {
-        self.wire == Wire::Rev3
-            && self
-                .ctx_sent
-                .get(&wire_id)
-                .is_some_and(|sent| *sent < R3_CONTEXT_K)
-    }
-
-    /// Record one context-carrying downlink frame for `binding` (rev3 only).
-    ///
-    /// After [`R3_CONTEXT_K`] sends the learned source is locally confirmed
-    /// (`mark_reply_src_acked`), which is exactly what the client's `FLOW_ACK`
-    /// does on rev2; the no-ACK contract replaces the round trip with bounded
-    /// redundancy, and the `NEED_CONTEXT` stream message repairs a run of losses
-    /// beyond that.
-    fn note_ctx_sent(&mut self, binding: &Arc<FlowBinding>) {
-        if self.wire != Wire::Rev3 {
-            return;
-        }
-        let wire_id = binding.wire_id;
-        let sent = self.ctx_sent.entry(wire_id).or_insert(0);
-        *sent = sent.saturating_add(1);
-        if *sent >= R3_CONTEXT_K {
-            self.ctx_sent.remove(&wire_id);
-            // Local confirmation of the learned reply source. Harmless for
-            // flows whose target already names the source (it only affects the
-            // `match_source` acked gate, which those already satisfy).
-            binding.mark_reply_src_acked();
-        }
+    /// Consume one repair for `wire_id`: the next reply must carry the context.
+    fn take_repair(&mut self, wire_id: u32) -> bool {
+        self.wire == Wire::Rev3 && self.ctx_repairs.remove(&wire_id)
     }
 
     /// Classify one reply source: the memo first, the full reverse-table scan on
@@ -753,11 +716,11 @@ impl StageBatch {
         if self.push_pending().is_err() {
             verdict = drain_stage(c2, &self.stage, limit, last_too_large_probe_ms);
             if verdict == StageDrain::Terminal {
-                self.drop_pending();
+                self.drop_pending(true);
                 return StageDrain::Terminal;
             }
             if self.push_pending().is_err() {
-                self.drop_pending();
+                self.drop_pending(false);
             }
         }
         worse(
@@ -830,11 +793,18 @@ impl StageBatch {
         )
     }
 
-    fn drop_pending(&mut self) {
+    /// Drop the pre-stager batch. `terminal` selects the loss class: a dead
+    /// connection books `EGRESS_DEAD`; a still-full live queue books
+    /// `BUFFER_FULL` (and the stage-full counter).
+    fn drop_pending(&mut self, terminal: bool) {
         for item in self.pending.drain(..) {
             drop(item);
-            dgram_drops::bump(&dgram_drops::BUFFER_FULL);
-            r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+            if terminal {
+                dgram_drops::bump(&dgram_drops::EGRESS_DEAD);
+            } else {
+                dgram_drops::bump(&dgram_drops::BUFFER_FULL);
+                r2_stats::bump(&r2_stats::STAGE_FULL_DROPS);
+            }
         }
     }
 }
@@ -1089,7 +1059,6 @@ fn r2_send_large_reply(
                 let sent = try_send_datagram(c2, body);
                 let out = R2LargeReply::from_send(sent);
                 if out == R2LargeReply::Sent {
-                    binding.set_reply_src(src);
                     udp_stats::payload(n);
                     r2_stats::bump_open_src_sent(now_ms);
                 }
@@ -1107,10 +1076,8 @@ fn r2_send_large_reply(
                     payload,
                 );
                 if sent.complete() {
-                    // The whole binding frame set was queued: the client learns
-                    // the actual source when it reassembles, so the next reply
-                    // from it compresses.
-                    binding.set_reply_src(src);
+                    // The binding was learned before the send (see
+                    // `handle_session_reply`); the peer ACKs the source.
                     r2_stats::bump_open_src_sent(now_ms);
                 }
                 R2LargeReply::from_payload(&sent)
@@ -1600,24 +1567,45 @@ pub(crate) fn handle_session_reply(
     {
         r2_match = Some(SourceMatch::Rebind(binding));
     }
-    // rev3 no-ACK context policy. `match_source` classifies a learned reply
-    // source as `Exact` only once `reply_src_acked` is set; rev2 gets that from
-    // the client's `FLOW_ACK`, rev3 has no ACK at all. Instead:
-    // - pick up any client `NEED_CONTEXT` repairs first (bounded hint list);
-    // - while a flow is inside its K=2 context window, force the context form
-    //   even when the table says `Exact` — this is what carries the binding for
-    //   a server-owned flow whose target names the source (otherwise the table
-    //   short-circuits to `Exact` and the first reply would be steady);
-    // - [`R2ReplyState::note_ctx_sent`] confirms the source locally after the
-    //   K-th successful context frame, which is exactly the state the rev2 ACK
-    //   would have produced.
+    // rev3 context policy. `match_source` classifies a learned reply source as
+    // `Exact` only once the peer confirmed it; the confirmation is a
+    // source-carrying `SRC_ACK` on the reliable control stream (see
+    // `FlowBinding::confirm_reply_src`), so rev3 needs no local K-count and no
+    // per-reply ACK. `NEED_CONTEXT` remains the repair for a receiver that
+    // missed the binding context entirely: it forces exactly one context frame
+    // even when the table would otherwise return `Exact` (e.g. a server-owned
+    // flow whose target names its source).
     if r2.wire() == Wire::Rev3 {
         r2.sync_ctx_repairs();
-        if let Some(SourceMatch::Exact(binding)) = r2_match.as_ref()
-            && r2.context_due(binding.wire_id)
+        if let Some(binding) = match r2_match.as_ref() {
+            Some(SourceMatch::Exact(b)) | Some(SourceMatch::Rebind(b)) => Some(b),
+            None => None,
+        } && r2.take_repair(binding.wire_id)
+            && !matches!(r2_match, Some(SourceMatch::Rebind(_)))
         {
             r2_match = Some(SourceMatch::Rebind(Arc::clone(binding)));
         }
+    }
+    // A server-owned flow exists only because the server taught the client its
+    // id. `match_source` calls it `Exact` as soon as the target names the reply
+    // source, but that says nothing about the peer having received the initial
+    // `OPEN|SRC`/`OPEN_SRC`; compressing before the source ACK would send a
+    // steady frame for an id the client does not know. Keep the context form
+    // until the client confirms the source (rev2 `FLOW_ACK_SRC`, rev3 `SRC_ACK`).
+    if let Some(SourceMatch::Exact(binding)) = r2_match.as_ref()
+        && r2::wire_id_server_owned(binding.wire_id)
+        && !binding.reply_src_acked()
+    {
+        r2_match = Some(SourceMatch::Rebind(Arc::clone(binding)));
+    }
+    // Learn the source **before** the binding frame is queued/sent. A queued
+    // `OPEN|SRC` that the stager later sends (or drops) previously left
+    // `reply_src` unset, so the flow could never compress (PERF §23.7, K1). The
+    // binding is unacked until the peer's source-carrying ACK arrives, so a
+    // dropped frame only costs another context on the next reply; it can never
+    // make the sender compress a source the peer did not receive.
+    if let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref() {
+        binding.set_reply_src(src);
     }
     // ------------------------------------------------------------------
     // Small replies: one connection-scoped staging queue (Phase 2).
@@ -1673,12 +1661,8 @@ pub(crate) fn handle_session_reply(
             );
             let verdict = worse(flushed, verdict);
             if sent {
-                if let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref() {
-                    binding.set_reply_src(src);
-                    // rev3: count this context frame and confirm the source
-                    // locally after K=2 (the no-ACK replacement for FLOW_ACK).
-                    r2.note_ctx_sent(binding);
-                }
+                // The source was learned before the send; the peer's
+                // source-carrying ACK confirms it.
                 r2_stats::bump_open_src_sent(now);
             }
             verdict
@@ -1734,15 +1718,7 @@ pub(crate) fn handle_session_reply(
         large_reply_disposition(sent, c2, limit, last_too_large_probe_ms)
     };
     match disposition {
-        ReplyDisposition::Continue => {
-            // rev3 no-ACK: a fully queued context frame counts toward the K=2
-            // window (the fragmenter already learned the source above).
-            if sent == R2LargeReply::Sent
-                && let Some(SourceMatch::Rebind(binding)) = r2_match.as_ref()
-            {
-                r2.note_ctx_sent(binding);
-            }
-        }
+        ReplyDisposition::Continue => {}
         ReplyDisposition::BreakSession => return ReplyDisposition::BreakSession,
     }
     ReplyDisposition::Continue

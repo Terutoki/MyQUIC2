@@ -244,3 +244,76 @@ impl<'a> TargetAddrRef<'a> {
         }
     }
 }
+
+// ---------------- IP-only socket-address helpers (control-plane) ----------------
+//
+// A reply source is always IP-form (the server never echoes a domain), and the
+// control plane needs an exact, source-carrying confirmation. These helpers are
+// deliberately narrower than [`TargetAddrRef`]: no domain form, no validation
+// against unspecified/scoped addresses (a source that reached a socket is
+// concrete), and a fixed 7/19-byte encoding.
+
+/// Wire length of [`put_ip_socket_addr`]'s output: `atyp | ip | port`.
+#[must_use]
+pub fn ip_socket_addr_len(addr: SocketAddr) -> usize {
+    match addr {
+        SocketAddr::V4(_) => 1 + 4 + 2,
+        SocketAddr::V6(_) => 1 + 16 + 2,
+    }
+}
+
+/// Append an IP-form socket address (`atyp | ip | port`, big-endian port).
+pub fn put_ip_socket_addr(out: &mut Vec<u8>, addr: SocketAddr) {
+    match addr {
+        SocketAddr::V4(a) => {
+            out.push(0x01);
+            out.extend_from_slice(&a.ip().octets());
+            out.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            out.push(0x04);
+            out.extend_from_slice(&a.ip().octets());
+            out.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+}
+
+/// Decode one [`put_ip_socket_addr`] value and advance `off`.
+///
+/// A domain atyp is refused: a reply source on the wire is an address, never a
+/// name.
+pub fn get_ip_socket_addr(b: &[u8], off: &mut usize) -> Result<SocketAddr, MqpError> {
+    let atyp = *b.get(*off).ok_or(MqpError::Malformed("short src addr"))?;
+    *off += 1;
+    match atyp {
+        0x01 => {
+            let end = off
+                .checked_add(4 + 2)
+                .ok_or(MqpError::Malformed("src v4 overflow"))?;
+            let s = b
+                .get(*off..end)
+                .ok_or(MqpError::Malformed("short src v4"))?;
+            let ip = std::net::Ipv4Addr::new(s[0], s[1], s[2], s[3]);
+            let port = u16::from_be_bytes([s[4], s[5]]);
+            *off = end;
+            Ok(SocketAddr::new(IpAddr::V4(ip), port))
+        }
+        0x04 => {
+            let end = off
+                .checked_add(16 + 2)
+                .ok_or(MqpError::Malformed("src v6 overflow"))?;
+            let s = b
+                .get(*off..end)
+                .ok_or(MqpError::Malformed("short src v6"))?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&s[..16]);
+            let port = u16::from_be_bytes([s[16], s[17]]);
+            *off = end;
+            Ok(SocketAddr::new(
+                IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                port,
+            ))
+        }
+        _ => Err(MqpError::Malformed("bad src atyp")),
+    }
+}

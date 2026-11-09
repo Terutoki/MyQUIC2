@@ -98,7 +98,7 @@ rollback wire (see [the rev2 section](#-mqp-3-rev2-wire)).
 | First-frame context | `DATA_EXT` OPEN / SRC / OPEN_SRC / INLINE | `DATA` OPEN / INLINE / OPEN\|SRC |
 | Aggregation | `TRAIN` SAME / SAME_EQUAL / DICT | `TRAIN` same / dict |
 | Fragmentation | `FRAG` steady / OPEN / SRC / OPEN_SRC / INLINE, 8 KiB / 64 fragments | same bounds |
-| Per-flow acknowledgement | **none** — K=2 context frames + reliable `NEED_CONTEXT` | `CTL FLOW_ACK` / `FLOW_REJECT` |
+| Per-flow acknowledgement | install: **none** (K=2 uplink context + reliable `NEED_CONTEXT`); downlink source rebinds: reliable `SRC_ACK` | `CTL FLOW_ACK_SRC` (source) / `FLOW_ACK` (install) / `FLOW_REJECT` |
 | Control plane | one reliable QUIC stream, `type:u8 \| len:u16le \| body` framing | loss-tolerant `CTL` DATAGRAMs |
 | Capabilities | static contract (revision from config; no wire negotiation) | negotiated `HELLO`/`CAPS` |
 | 0-RTT | token + early OPEN/payloads in the first flight; server authenticates and forwards pre-handshake | same client policy, same server accept path |
@@ -138,8 +138,8 @@ FRAG          b0 = 11 | flags[3:0]     fid:u16 · frag_id:u32 · idx:u8 · total
   the same safety property through a different mechanism: its `DATA OPEN` is
   ACK-gated and keeps repeating until the binding is confirmed.
 - **One reliable control stream.** Closes and context repair travel as stream
-  messages — `ASSOC_CLOSE`, `FLOW_CLOSE`, `REJECT`, `NEED_CONTEXT`, `SESS_CLOSE`,
-  `GOAWAY` — framed as `type:u8 | len:u16le | body` (bounded body, hostile input
+  messages — `ASSOC_CLOSE`, `FLOW_CLOSE`, `REJECT`, `NEED_CONTEXT`, `SRC_ACK`,
+  `SESS_CLOSE`, `GOAWAY` — framed as `type:u8 | len:u16le | body` (bounded body, hostile input
   rejected before slicing). QUIC retransmits them; the DATAGRAM plane itself
   stays unreliable and unordered. The stream is opened **after the handshake
   verdict is known, never into 0-RTT**: a peer that rejects resumption resets
@@ -377,13 +377,16 @@ extended: 0x09 | flags:u8 | [wire_id if !INLINE] | frag_id:u32le |
                   max_flows_sess:u16 | max_train_items:u8 |
                   max_frame_bytes:u16 | max_reassembly:u16
 0x10 FLOW_ACK:    wire_id:varint | status:u8 (0 = open/confirmed)
+0x13 FLOW_ACK_SRC: wire_id:varint | atyp:u8 | addr | port:u16
+                  (confirms the OPEN|SRC for *this* reply source; a mismatch
+                   is a stale ack and clears the confirmation)
 0x11 FLOW_REJECT: wire_id:varint | reason:u8
                   (1 = policy, 2 = table full, 3 = DNS)
 0x12 FLOW_CLOSE:  wire_id:varint      (reserved; rev2 code never sends it)
 0x20 SESS_CLOSE:  sess:u32 | reason:u8
 ```
 
-Control frames ride DATAGRAMs, are idempotent, and may be lost. Their only jobs are to confirm a binding, refuse one, or reclaim state. Losing one delays compression or reclamation; it never corrupts or blackholes user payload. On rev2 the `HELLO`/`CAPS` exchange announces the wire version; rev3 has **no** DATAGRAM control plane at all — closes/context repair travel on one reliable stream, and the revision must be matched by configuration (ALPN defaults to `h3` for both revisions). A `FLOW_ACK` is never a delivery ACK.
+Control frames ride DATAGRAMs, are idempotent, and may be lost. Their jobs are to confirm a binding or its reply source, refuse one, or reclaim state. Losing one delays compression or reclamation; it never corrupts or blackholes user payload. On rev2 the `HELLO`/`CAPS` exchange announces the wire version; rev3 has **no** DATAGRAM control plane at all — closes/context repair travel on one reliable stream, and the revision must be matched by configuration (ALPN defaults to `h3` for both revisions). A `FLOW_ACK` is never a delivery ACK.
 
 `FLOW_CLOSE` (`0x12`) is defined but **not sent by the rev2 implementation**: a binding is retired by `SESS_CLOSE`, connection close or the idle sweep instead. Rev3 uses the reliable control stream for the equivalent (`FLOW_CLOSE`/`ASSOC_CLOSE`/`SESS_CLOSE` messages).
 
@@ -402,7 +405,7 @@ OPEN ── SESS_CLOSE / connection close / idle sweep ──▶ CLOSED   (rev2;
 - **Rebind.** A domain flow, an anycast reply, or a source-port change is handled by `OPEN|SRC` on the existing id. The client updates `reply_src` and the SOCKS5 reply header; the application sees no API change.
 - **Reject.** `policy`, `table_full` and `dns` are distinct reasons. The client falls back to `INLINE` for that target and may retry after a TTL; the payload is still delivered without a binding.
 - **Close.** `SESS_CLOSE` is sent three times on association exit (idempotent, best-effort). rev2 never sends `FLOW_CLOSE` (the opcode is reserved); a single binding is retired by its session close, the connection closing, or the idle sweep. rev3 sends `FLOW_CLOSE`/`ASSOC_CLOSE` as reliable control-stream messages. The server also sends `SESS_CLOSE` when *it* reaps a session without a client request (idle sweep, admission-pressure sweep, reply-reader exit), so a client binding never stays `Open` against a session the server no longer holds. The 180 s idle sweep is the backstop. Close purges the registry, the session's stager items and the in-flight reassembly partials; a late frame then finds no live binding.
-- **ACK is a rev2 optimization.** It unlocks the rev2 2 B steady path. It is not a reliability mechanism, and payload delivery is never acknowledged. Rev3 removes it entirely: full context on the first K=2 frames plus a reliable `NEED_CONTEXT` repair replaces the confirmation round trip.
+- **ACK is an optimization.** It unlocks the compressed steady path. It is not a reliability mechanism, and payload delivery is never acknowledged. Rev2 carries it on `FLOW_ACK`/`FLOW_ACK_SRC`; rev3 has no install ACK (K=2 context + reliable `NEED_CONTEXT`), and a downlink source rebind is confirmed by the source-carrying `SRC_ACK` on the reliable stream. The source is recorded before the context is queued, so a lost/queued context can only cost another binding frame.
 
 ### 6. Uplink: client to server
 
@@ -412,7 +415,7 @@ The uplink path starts at a SOCKS5 `UDP ASSOCIATE`. The association allocates a 
 2. **Choose the frame.** A confirmed flow that fits the live DATAGRAM budget uses steady `DATA`. Several small payloads use the stager and `TRAIN`. A payload above one frame uses `FRAG`. An opening flow uses `DATA OPEN`.
 3. **Stage or send.** Small payloads (at most 512 B) enter the connection-level stager. The stager drains at the end of a burst, before a large payload, when an association exits, and when the queue is full.
 4. **Forward at the exit.** The server dispatches on the first byte, resolves the target, applies the SSRF policy, creates or reuses a 64 KiB session socket, and sends with `sendmmsg` bursts of up to 32. The session is subject to the global 8192-session pool and the per-connection fair share.
-5. **Confirm (rev2) / skip (rev3).** On rev2 the server sends `FLOW_ACK` after a successful install; the client moves the binding from `Opening` to `Open` and starts compressing subsequent payloads. Rev3 has no per-flow ACK: the sender already carries full context on the first K=2 frames, and a receiver that misses it asks once with the reliable `NEED_CONTEXT` message, so the first payload is not gated on a confirmation round trip.
+5. **Confirm (rev2) / skip (rev3).** On rev2 the server sends `FLOW_ACK` after a successful install; the client moves the binding from `Opening` to `Open` and starts compressing subsequent payloads. Rev3 has no install ACK: the sender carries full context on the first K=2 frames, and a receiver that misses it asks once with `NEED_CONTEXT`, so the first payload is not gated on a confirmation round trip. A **reply-source** change is different: the receiver confirms the exact source it applied with `SRC_ACK` (rev3) or `FLOW_ACK_SRC` (rev2); until then the sender keeps the context form.
 
 The stager is covered in detail in §9. The important property here is that the sender never holds a lock across a QUIC send: packing moves item ownership under a short lock, the send happens outside it, and a failed send requeues only the unsent tail. A blocked send buffer is detected with `datagram_send_buffer_space()` before any encoding, so a full buffer costs a cheap check rather than a full-queue re-encode.
 

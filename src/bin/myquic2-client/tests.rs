@@ -2554,7 +2554,8 @@ async fn egress_memo_honours_generation_and_freshness() {
     })));
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     let generation = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, generation, &conn, 1200, now, &rev2_state());
+    let cache = e.cached[class.index].load_full().expect("cache published");
+    e.memo_store(class, generation, &cache);
     assert_eq!(e.with_fresh(class, now, |_, limit, _| limit), Some(1200));
     assert!(
         e.with_fresh(bulk, now, |_, _, _| ()).is_none(),
@@ -2577,7 +2578,8 @@ async fn egress_memo_honours_generation_and_freshness() {
     // A memo tagged before a later bump is not served even while its stamp
     // is still inside the window.
     let old_gen = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, old_gen, &conn, 1200, now, &rev2_state());
+    let cache = e.cached[class.index].load_full().expect("cache published");
+    e.memo_store(class, old_gen, &cache);
     assert!(e.with_fresh(class, now, |_, _, _| ()).is_some());
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     assert!(e.with_fresh(class, now, |_, _, _| ()).is_none());
@@ -2613,7 +2615,8 @@ async fn memo_hit_serves_a_dead_handle_and_the_send_reports_it() {
     })));
     e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     let generation = e.generation[class.index].load(std::sync::atomic::Ordering::Acquire);
-    e.memo_store(class, generation, &conn, 1200, now, &rev2_state());
+    let cache = e.cached[class.index].load_full().expect("cache published");
+    e.memo_store(class, generation, &cache);
     assert_eq!(
         e.with_fresh(class, now, |_, limit, _| limit),
         Some(1200),
@@ -2708,7 +2711,8 @@ async fn too_large_refreshes_the_budget_without_discarding_the_handle() {
     );
 
     // With no cached handle at all it must not resurrect one.
-    e.invalidate(class);
+    e.cached[class.index].store(None);
+    e.generation[class.index].fetch_add(1, std::sync::atomic::Ordering::Release);
     e.refresh_budget(class);
     assert!(
         e.cached[class.index].load().is_none(),
@@ -2752,7 +2756,8 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
     })));
     e.generation[class.index].fetch_add(1, Ordering::Release);
     let generation = e.generation[class.index].load(Ordering::Acquire);
-    e.memo_store(class, generation, &conn, live, now, &rev2_state());
+    let cache = e.cached[class.index].load_full().expect("cache published");
+    e.memo_store(class, generation, &cache);
     for _ in 0..16 {
         assert_eq!(e.with_fresh(class, now, |_, limit, _| limit), Some(live));
     }
@@ -2831,7 +2836,8 @@ async fn steady_n1_pays_zero_auxiliary_quinn_takes() {
     // handle — no invalidate, no re-acquire. Model that arm (doing nothing)
     // and assert the steady path is undisturbed.
     let gen_unsupported = e.generation[class.index].load(Ordering::Acquire);
-    e.memo_store(class, gen_unsupported, &conn, live, now, &rev2_state());
+    let cache = e.cached[class.index].load_full().expect("cache published");
+    e.memo_store(class, gen_unsupported, &cache);
     // ... production `Unsupported` arm runs here: bump EGRESS_DEAD only ...
     assert_eq!(
         e.generation[class.index].load(Ordering::Acquire),
@@ -3381,7 +3387,7 @@ async fn egress_stays_on_its_connection_while_it_lives() {
     let got = e
         .refresh_global(&pool, class, now)
         .expect("a live cached connection must be reused, not re-picked");
-    let (limit, stamp) = (got.limit, got.stamp_ms);
+    let (limit, stamp) = (got.limit, got.cache.stamp_ms);
     assert_eq!(
         got.conn.stable_id(),
         conn.stable_id(),
@@ -5223,7 +5229,15 @@ async fn send_verdict_recovery_is_counted_once_and_shared() {
 
     // `ConnectionLost`: one `EGRESS_DEAD` for the event — even when a single
     // BATCH verdict lost two staged payloads (`frames` is not consulted) —
-    // and the cached handle goes, so the next datagram re-acquires.
+    // and the cached handle goes, so the next datagram re-acquires. `invalidate`
+    // only clears a handle whose connection is actually closed (ECHO review
+    // L8), so close it before the verdict.
+    conn.close(0u32.into(), b"test");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while conn.close_reason().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "close must settle");
+        tokio::task::yield_now().await;
+    }
     egress.cached[bind.index].store(Some(Arc::new(cached())));
     let gen_before = egress.generation[bind.index].load(Ordering::Acquire);
     let before = dgram_drops::snapshot();
@@ -5305,14 +5319,15 @@ async fn deferred_batch_flush_recovers_a_dead_egress_verdict() {
     );
     let now = coarse_millis();
     let generation = egress.generation[bind.index].load(Ordering::Acquire);
-    egress.memo_store(bind, generation, &conn, 1200, now, &rev2_state());
-    egress.cached[bind.index].store(Some(Arc::new(EgressCache {
+    let cache = Arc::new(EgressCache {
         conn: conn.clone(),
         limit: 1200,
         stamp_ms: now,
         slot: 0,
         rev2: rev2_state(),
-    })));
+    });
+    egress.cached[bind.index].store(Some(Arc::clone(&cache)));
+    egress.memo_store(bind, generation, &cache);
     assert!(
         egress.with_fresh(bind, now, |_, _, _| ()).is_some(),
         "premise: the memo is fresh, so the flush takes the hit path"
@@ -5647,7 +5662,15 @@ async fn stale_egress_memo_releases_the_connection() {
         index: 0,
     };
     let now = mono_millis();
-    e.memo_store(bind, 0, &conn, 1200, now, &rev2_state());
+    let cache = Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: now,
+        slot: 0,
+        rev2: rev2_state(),
+    });
+    e.cached[bind.index].store(Some(Arc::clone(&cache)));
+    e.memo_store(bind, 0, &cache);
     assert!(!memo_is_empty(bind), "premise: the memo holds a handle");
 
     // Fresh hit: served, and the hit path must not clear the memo.
@@ -7798,10 +7821,7 @@ async fn sess_close_cleanup_runs_in_the_handshake_window() {
     egress.memo_store(
         bind,
         egress.generation[bind.index].load(std::sync::atomic::Ordering::Relaxed),
-        &h.conn,
-        h.limit,
-        h.stamp_ms,
-        &h.rev2,
+        &h.cache,
     );
 
     let wire_id = r2::make_wire_id(1, false).unwrap();
@@ -7980,11 +8000,11 @@ async fn dispatch_rev2_open_src_sends_flow_ack_idempotently() {
         .expect("the OPEN|SRC must be confirmed")
         .unwrap();
     match r2::decode_ctl(&d).expect("the confirmation must be a CTL frame") {
-        r2::Ctl::FlowAck { id, status } => {
+        r2::Ctl::FlowAckSrc { id, addr } => {
             assert_eq!(id, server_id);
-            assert_eq!(status, r2::R2_ACK_OPEN);
+            assert_eq!(addr, src);
         }
-        other => panic!("expected FLOW_ACK, got {other:?}"),
+        other => panic!("expected FLOW_ACK_SRC, got {other:?}"),
     }
     assert!(counters::since(&before).flow_ack_tx >= 1);
 
@@ -8008,7 +8028,7 @@ async fn dispatch_rev2_open_src_sends_flow_ack_idempotently() {
         .unwrap();
     assert!(matches!(
         r2::decode_ctl(&d).expect("second confirmation"),
-        r2::Ctl::FlowAck { id, status } if id == server_id && status == r2::R2_ACK_OPEN
+        r2::Ctl::FlowAckSrc { id, addr } if id == server_id && addr == src
     ));
     assert_eq!(
         rev2.registry.len(),
@@ -8052,7 +8072,7 @@ async fn dispatch_rev2_open_src_sends_flow_ack_idempotently() {
         .unwrap();
     assert!(matches!(
         r2::decode_ctl(&d).expect("rebind confirmation"),
-        r2::Ctl::FlowAck { id, status } if id == client_id && status == r2::R2_ACK_OPEN
+        r2::Ctl::FlowAckSrc { id, addr } if id == client_id && addr == src
     ));
 
     client_conn.close(0u32.into(), b"done");
@@ -10109,4 +10129,196 @@ async fn held_datagram_expiry_then_fresh_generation_delivers_the_next_payload() 
         client_conn.close(0u32.into(), b"done");
         server_conn.close(0u32.into(), b"done");
     }
+}
+
+/// A pump future that is cancelled must run the abnormal disposition before
+/// its owned streams drop: the peer sees `RESET(0x04)`, never a clean FIN
+/// (`SendStream::drop` alone would call `finish()`).
+#[tokio::test]
+async fn aborting_a_tcp_pump_resets_the_peer_stream() {
+    let (client_conn, server_conn, _client_ep, _server_ep) = real_connection_with_server().await;
+    let (send, recv) = client_conn.open_bi().await.unwrap();
+    let li = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = li.local_addr().unwrap();
+    let mut app = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (tcp, _) = li.accept().await.unwrap();
+    let pump = tokio::spawn(myquic2::tcp::copy_tcp_quic_idle(
+        tcp,
+        send,
+        recv,
+        Duration::from_secs(300),
+    ));
+    // The stream is opened on the wire by the first c2s write, so the app
+    // writes before the server-side accept.
+    app.write_all(b"before-abort").await.unwrap();
+    let (_ssend, mut srecv) = server_conn.accept_bi().await.unwrap();
+    let mut buf = [0u8; 32];
+    let n = tokio::time::timeout(Duration::from_secs(5), srecv.read(&mut buf))
+        .await
+        .expect("the pump must forward before the abort")
+        .unwrap()
+        .expect("the forwarded bytes must be a data read");
+    assert_eq!(&buf[..n], b"before-abort");
+    pump.abort();
+    let _ = pump.await;
+    let mut buf = [0u8; 32];
+    let err = tokio::time::timeout(Duration::from_secs(5), srecv.read(&mut buf))
+        .await
+        .expect("the peer read must resolve")
+        .unwrap_err();
+    match err {
+        quinn::ReadError::Reset(code) => assert_eq!(code, 4u32.into()),
+        other => panic!("expected RESET(0x04), got {other:?}"),
+    }
+    client_conn.close(0u32.into(), b"done");
+    server_conn.close(0u32.into(), b"done");
+}
+
+/// The forward listener's flush must push the batch and leave a backlog
+/// for the slot runtime's retry task: it must not take the connection-wide
+/// opportunistic drain on the main thread (ECHO review L3).
+#[tokio::test]
+async fn forward_flush_is_push_only_even_above_the_train_threshold() {
+    let (client_conn, _server_conn, _ce, _se) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
+    up.sync(&rev2);
+    let id = r2::make_wire_id(1, false).unwrap();
+    for _ in 0..64 {
+        rev2.push_stage(R2StageItem {
+            session: 1,
+            kind: R2StageKind::Steady { wire_id: id },
+            payload: bytes::Bytes::from_static(b"x"),
+        })
+        .expect("the stager has room for 64 items");
+    }
+    up.test_stage_item(R2StageItem {
+        session: 1,
+        kind: R2StageKind::Steady { wire_id: id },
+        payload: bytes::Bytes::from_static(b"y"),
+    });
+    let sent = up.flush_stage_no_drain(&rev2, &client_conn, 1200);
+    assert!(sent.failed.is_none(), "a successful push is not a failure");
+    assert_eq!(
+        rev2.stager.lock().len(),
+        65,
+        "push-only must leave the queue for the slot's retry task"
+    );
+    assert!(!up.has_staged_batch(), "the batch moved into the stager");
+}
+
+/// A single staged payload goes out directly, without a stager push or a
+/// drain: the connection queue stays empty and the frame reaches the peer.
+#[tokio::test]
+async fn lone_staged_payload_is_sent_directly() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let mut up = UplinkFlows::new(Arc::new(CloseSignal::new()));
+    up.sync(&rev2);
+    let id = r2::make_wire_id(1, false).unwrap();
+    up.test_stage_item(R2StageItem {
+        session: 1,
+        kind: R2StageKind::Steady { wire_id: id },
+        payload: bytes::Bytes::from_static(b"direct"),
+    });
+    let sent = up
+        .flush_lone_direct(&rev2, &client_conn, 1200)
+        .expect("the lone item must be sent directly");
+    assert!(sent.failed.is_none());
+    assert_eq!(rev2.stager.lock().len(), 0, "no queue round trip");
+    assert!(!up.has_staged_batch());
+    let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+        .await
+        .expect("the direct frame must reach the peer")
+        .unwrap();
+    let f = wire::decode_data(Wire::Rev2, &d).expect("a DATA frame");
+    assert_eq!(f.wire_id, Some(id));
+    assert_eq!(f.payload, b"direct");
+    assert_eq!(f.sess, None);
+}
+
+/// A large-payload pre-drain flushes only its own session's queue; another
+/// session's backlog stays queued (ECHO review L6).
+#[tokio::test]
+async fn session_drain_leaves_other_sessions_queued() {
+    let (client_conn, server_conn, _ce, _se) = real_connection_with_server().await;
+    let rev2 = rev2_state();
+    let id1 = r2::make_wire_id(1, false).unwrap();
+    let id2 = r2::make_wire_id(2, false).unwrap();
+    for payload in [&b"a1"[..], b"a2"] {
+        rev2.push_stage(R2StageItem {
+            session: 1,
+            kind: R2StageKind::Steady { wire_id: id1 },
+            payload: bytes::Bytes::copy_from_slice(payload),
+        })
+        .unwrap();
+    }
+    for payload in [&b"b1"[..], b"b2"] {
+        rev2.push_stage(R2StageItem {
+            session: 2,
+            kind: R2StageKind::Steady { wire_id: id2 },
+            payload: bytes::Bytes::copy_from_slice(payload),
+        })
+        .unwrap();
+    }
+    let out = rev2.drain_session_stage(&client_conn, 1200, 1);
+    assert_eq!(out.items_sent, 2);
+    assert!(out.failed.is_none());
+    assert_eq!(
+        rev2.stager.lock().len(),
+        2,
+        "the other session's queue must be untouched"
+    );
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let d = tokio::time::timeout(Duration::from_secs(5), server_conn.read_datagram())
+            .await
+            .expect("the session drain must send both items")
+            .unwrap();
+        let f = wire::decode_data(Wire::Rev2, &d).expect("steady DATA");
+        got.push(f.payload.to_vec());
+    }
+    assert_eq!(got, vec![b"a1".to_vec(), b"a2".to_vec()]);
+}
+
+/// `invalidate` must not wipe a live handle that a concurrent refresh has
+/// just published; it clears only the dead one (ECHO review L8).
+#[tokio::test]
+async fn invalidate_only_clears_a_closed_cached_handle() {
+    let (conn, _client, _server) = real_connection().await;
+    let e = SharedEgress::default();
+    let bind = UdpBind {
+        class: EgressClass::Interactive,
+        index: 0,
+    };
+    e.cached[0].store(Some(Arc::new(EgressCache {
+        conn: conn.clone(),
+        limit: 1200,
+        stamp_ms: mono_millis(),
+        slot: 0,
+        rev2: rev2_state(),
+    })));
+    e.invalidate(bind);
+    assert!(
+        e.cached[0].load().is_some(),
+        "a live handle must survive a stale ConnectionLost verdict"
+    );
+    assert_eq!(
+        e.generation[0].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "no generation bump without a clear"
+    );
+    conn.close(0u32.into(), b"test");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while conn.close_reason().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "close must settle");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    e.invalidate(bind);
+    assert!(e.cached[0].load().is_none(), "the dead handle is cleared");
+    assert_eq!(
+        e.generation[0].load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the clear bumps the generation once"
+    );
 }

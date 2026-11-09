@@ -18,15 +18,12 @@ pub(crate) const EGRESS_REFRESH_MS: u64 = 1000;
 /// binding that stops sending — see [`SharedEgress::forget_slot`].
 pub(crate) struct EgressMemo {
     pub(crate) generation: u64,
-    pub(crate) conn: quinn::Connection,
-    pub(crate) limit: usize,
-    pub(crate) stamp_ms: u64,
-    /// MQP-3 rev2 state paired with `conn`. Served from the memo so the
-    /// uplink hot path reaches the connection's flow registry without an
-    /// extra slot load; pairing it with the cached connection is what keeps a
-    /// frame from being encoded against one connection's ids and sent on
-    /// another's.
-    pub(crate) rev2: Arc<ConnRev2>,
+    /// Weak on purpose: the process-wide `cached` slot owns the handle. A memo
+    /// holding a strong `quinn::Connection` pinned a dead generation on every
+    /// thread that used the binding until that thread happened to send on it
+    /// again (ECHO review L9); `forget_slot` cannot reach another thread's
+    /// thread-local array. A failed upgrade is a normal miss.
+    pub(crate) cache: std::sync::Weak<EgressCache>,
 }
 
 /// Init shim for the thread-local memo array: `[None; N]` needs a const item
@@ -67,8 +64,10 @@ pub(crate) struct EgressCache {
 pub(crate) struct EgressHandle {
     pub(crate) conn: quinn::Connection,
     pub(crate) limit: usize,
-    pub(crate) stamp_ms: u64,
     pub(crate) rev2: Arc<ConnRev2>,
+    /// The published cache entry this handle came from, for `memo_store`'s
+    /// `Weak` (the memo must not be the owner).
+    pub(crate) cache: Arc<EgressCache>,
 }
 
 #[derive(Debug)]
@@ -202,9 +201,10 @@ impl SharedEgress {
             let mut memo = slots.borrow_mut();
             let entry = memo[bind.index].as_ref()?;
             if entry.generation == generation
-                && now_ms.saturating_sub(entry.stamp_ms) < EGRESS_REFRESH_MS
+                && let Some(cache) = entry.cache.upgrade()
+                && now_ms.saturating_sub(cache.stamp_ms) < EGRESS_REFRESH_MS
             {
-                return Some(f(&entry.conn, entry.limit, &entry.rev2));
+                return Some(f(&cache.conn, cache.limit, &cache.rev2));
             }
             // Stale (generation bump or expired refresh window): release this
             // thread's clone of the handle before returning None. The clone is
@@ -223,23 +223,11 @@ impl SharedEgress {
     /// generation, not per packet). `generation` is the generation observed before the
     /// acquire's cached read, so a mutation racing the acquire cannot leave a
     /// stale memo entry behind.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn memo_store(
-        &self,
-        bind: UdpBind,
-        generation: u64,
-        conn: &quinn::Connection,
-        limit: usize,
-        stamp_ms: u64,
-        rev2: &Arc<ConnRev2>,
-    ) {
+    pub(crate) fn memo_store(&self, bind: UdpBind, generation: u64, cache: &Arc<EgressCache>) {
         EGRESS_MEMO.with(|slots| {
             slots.borrow_mut()[bind.index] = Some(EgressMemo {
                 generation,
-                conn: conn.clone(),
-                limit,
-                stamp_ms,
-                rev2: rev2.clone(),
+                cache: Arc::downgrade(cache),
             });
         });
     }
@@ -297,8 +285,8 @@ impl SharedEgress {
                 return Some(EgressHandle {
                     conn: c.conn.clone(),
                     limit: c.limit,
-                    stamp_ms: c.stamp_ms,
                     rev2: c.rev2.clone(),
+                    cache: Arc::clone(c),
                 });
             }
         }
@@ -317,8 +305,8 @@ impl SharedEgress {
                 return Some(EgressHandle {
                     conn: c.conn.clone(),
                     limit: c.limit,
-                    stamp_ms: c.stamp_ms,
                     rev2: c.rev2.clone(),
+                    cache: Arc::clone(c),
                 });
             }
             self.invalidate(bind);
@@ -415,20 +403,21 @@ impl SharedEgress {
             && c.conn.close_reason().is_none()
             && let Some(m) = c.conn.max_datagram_size()
         {
-            cached.store(Some(Arc::new(EgressCache {
+            let entry = Arc::new(EgressCache {
                 conn: c.conn.clone(),
                 limit: m,
                 stamp_ms: now_ms,
                 slot: c.slot,
                 rev2: c.rev2.clone(),
-            })));
+            });
+            cached.store(Some(Arc::clone(&entry)));
             self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
             self.notify_published(bind);
             return Some(EgressHandle {
-                conn: c.conn.clone(),
-                limit: m,
-                stamp_ms: now_ms,
-                rev2: c.rev2.clone(),
+                conn: entry.conn.clone(),
+                limit: entry.limit,
+                rev2: entry.rev2.clone(),
+                cache: entry,
             });
         }
         drop(current);
@@ -463,21 +452,22 @@ impl SharedEgress {
                         Some(m) => {
                             // Lock-free publish: cannot lose, cannot park the
                             // executor, and always carries a real stamp.
-                            cached.store(Some(Arc::new(EgressCache {
+                            let entry = Arc::new(EgressCache {
                                 conn: (**c).clone(),
                                 limit: m,
                                 stamp_ms: now_ms,
                                 slot: i,
-                                rev2: rev2.clone(),
-                            })));
+                                rev2,
+                            });
+                            cached.store(Some(Arc::clone(&entry)));
                             self.generation[bind.index]
                                 .fetch_add(1, std::sync::atomic::Ordering::Release);
                             self.notify_published(bind);
                             return Some(EgressHandle {
-                                conn: (**c).clone(),
-                                limit: m,
-                                stamp_ms: now_ms,
-                                rev2,
+                                conn: entry.conn.clone(),
+                                limit: entry.limit,
+                                rev2: entry.rev2.clone(),
+                                cache: entry,
                             });
                         }
                         None => {
@@ -495,9 +485,29 @@ impl SharedEgress {
     }
 
     pub(crate) fn invalidate(&self, bind: UdpBind) {
-        self.cached[bind.index].store(None);
-        // The clear always lands, so the memo invalidation is never skipped.
-        self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
+        // A `ConnectionLost` verdict belongs to the handle the send used. By the
+        // time it is booked another thread may have refreshed the binding and
+        // published a live successor; a blind store would then throw a good
+        // handle away and force a needless refresh (and, under a reconnect
+        // storm, a W3 hold). Compare-and-clear only when the published handle is
+        // itself closed: that is the handle the verdict can legitimately refer
+        // to. If the close reason is not visible yet the next send fails again
+        // and retries the clear; correctness is unaffected.
+        let mut cleared = false;
+        self.cached[bind.index].rcu(|cur| {
+            if cur
+                .as_ref()
+                .is_some_and(|c| c.conn.close_reason().is_some())
+            {
+                cleared = true;
+                None
+            } else {
+                cur.clone()
+            }
+        });
+        if cleared {
+            self.generation[bind.index].fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Drop every cached handle that was published from pool slot `slot`.

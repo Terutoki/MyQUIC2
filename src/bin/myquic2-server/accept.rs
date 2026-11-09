@@ -2782,10 +2782,21 @@ pub(crate) fn r2_handle_ctl(
         // the flow permanently unaddressable). The client ACKs every
         // `OPEN|SRC` it decodes, so one ACK makes the source steady.
         Ctl::FlowAck { id, .. } => {
+            // Source-less ACK: it can only confirm the flow is known. It must
+            // not confirm a reply source — an ACK for the previous source can
+            // arrive after a rebind and would otherwise make the server compress
+            // with a source the peer never applied (ECHO review L1). The
+            // source-carrying `FlowAckSrc` below is the confirmation.
             if let Some(binding) = state.registry.get(id) {
                 binding.mark_open();
-                binding.mark_reply_src_acked();
-                r2_stats::bump(&r2_stats::FLOW_ACKS_RECV);
+            }
+        }
+        Ctl::FlowAckSrc { id, addr } => {
+            if let Some(binding) = state.registry.get(id) {
+                binding.mark_open();
+                if binding.confirm_reply_src(addr) {
+                    r2_stats::bump(&r2_stats::FLOW_ACKS_RECV);
+                }
             }
         }
         Ctl::FlowReject { id, .. } => {
@@ -2923,6 +2934,18 @@ pub(crate) fn handle_control_message(
             }
             r2_stats::bump(&r2_stats::NEED_CONTEXT_RECV);
             state.note_need_context(wire_id);
+        }
+        CtlMessage::SrcAck { fid, addr } => {
+            let Some(wire_id) = wire::wire_id_for_fid(fid) else {
+                r2_refuse(None);
+                return;
+            };
+            if let Some(binding) = state.registry.get(wire_id) {
+                binding.mark_open();
+                if binding.confirm_reply_src(addr) {
+                    r2_stats::bump(&r2_stats::FLOW_ACKS_RECV);
+                }
+            }
         }
         // Server→client message classes: never valid from a client.
         CtlMessage::Reject { .. } | CtlMessage::SessClose { .. } => r2_refuse(None),
@@ -3232,7 +3255,12 @@ async fn r2_forward_domain_open_bg(
         sess,
         id,
         TargetAddr::Domain(host, port),
-        usable,
+        // Consistency with the warm path: a flow authorizes the address its
+        // payloads were actually sent to, not every record the name resolved
+        // to. `usable` is the policy-filtered set; `dst` is the one sent to.
+        // (Record failover on a dead first address remains out of scope; see
+        // the ECHO review L10 note.)
+        vec![dst],
     ) {
         Ok(_) => {
             r2_stats::bump(&r2_stats::OPENS);
@@ -3398,11 +3426,11 @@ pub(crate) async fn r2_ingress_open(
                 fast.pin_cache(sess, &host, port, dst, life);
                 r2_stats::bump(&r2_stats::DNS_SYNC_OPENS);
                 // The one address the synchronous probe knows (the memo's first
-                // record) is the flow's validated reply-source set here: it is
-                // the address this payload was sent to, so its replies are
-                // authorized without a second lookup. A reply from a *different*
-                // record of the same name is the cold path's case (its full
-                // resolved set is installed there).
+                // record) is the flow's validated reply-source set: it is the
+                // address this payload was sent to, so its replies are
+                // authorized without a second lookup. The cold path now installs
+                // the same one-address set, so a reply from a *different* record
+                // of the same name is refused consistently on both paths.
                 Some(vec![dst])
             } else {
                 match state.begin_pending_open(sess, id, &target) {
@@ -3630,8 +3658,14 @@ async fn r2_ingress_train(
         std::array::from_fn(|_| (0, None));
     let mut slot_of: [u16; TRAIN_HASH_CAP] = [u16::MAX; TRAIN_HASH_CAP];
     let mut item_slot: [u16; TRAIN_MAX] = [0; TRAIN_MAX];
+    // Record each item's payload range in pass 1 instead of running the
+    // borrowing iterator a second time (ECHO review L13).
+    let mut item_off: [u32; TRAIN_MAX] = [0; TRAIN_MAX];
+    let mut item_len: [u32; TRAIN_MAX] = [0; TRAIN_MAX];
     let mut n_slots = 0usize;
-    for (i, (wire_id, _)) in train.items().enumerate() {
+    let mut n_items = 0usize;
+    let base = d.as_ptr() as usize;
+    for (i, (wire_id, item)) in train.items().enumerate() {
         debug_assert!(i < TRAIN_MAX, "the codec bounds the train item count");
         let mut h = (wire_id.wrapping_mul(0x9E37_79B1) as usize) & (TRAIN_HASH_CAP - 1);
         let slot = loop {
@@ -3649,12 +3683,20 @@ async fn r2_ingress_train(
             h = (h + 1) & (TRAIN_HASH_CAP - 1);
         };
         item_slot[i] = slot;
+        let off = item.as_ptr() as usize - base;
+        debug_assert!(off + item.len() <= d.len(), "train item inside the frame");
+        item_off[i] = off as u32;
+        item_len[i] = item.len() as u32;
+        n_items = i + 1;
     }
     state.registry.get_batch(&mut slots[..n_slots]);
-    for (slot_index, (wire_id, item)) in train.items().enumerate() {
+    for slot_index in 0..n_items {
+        let off = item_off[slot_index] as usize;
+        let len = item_len[slot_index] as usize;
+        let wire_id = slots[usize::from(item_slot[slot_index])].0;
         r2_stats::bump_train_item();
-        udp_stats::payload(item.len());
-        let payload = d.slice_ref(item);
+        udp_stats::payload(len);
+        let payload = d.slice(off..off + len);
         let binding = slots[usize::from(item_slot[slot_index])].1.as_ref();
         let _ = r2_forward_flow_resolved(
             fast,

@@ -61,7 +61,16 @@ pub(crate) struct SessMemo {
 /// shard lock at all. The fast table is ~568 slots and the shipped client packs
 /// more live sessions onto one connection than either cache holds, so the old
 /// 256-slot memo was *smaller* than the cache in front of it — an inverted
-/// hierarchy in which an L1 miss almost always missed L2 as well and paid the
+/// hierarchy in which an L1 miss almost always missed L2 as well and
+///
+/// **Shared across connections (ECHO review L14).** Unlike the per-connection
+/// fast table, this array is per *worker thread*: every connection whose
+/// datagram reader runs on the shard shares the same 2048 slots (`conn_id` is
+/// part of the key, so the sharing is safe, just less effective). The 2x
+/// headroom over `FAST_SESS_SLOTS` is therefore a per-connection **upper
+/// bound**, not a guarantee: with C connections on one shard the effective
+/// per-connection L2 is roughly 2048/C. A miss is always correct — it falls
+/// through to the table — so this is a sizing caveat, not a defect. paid the
 /// shard read in `get_or_create_sess`. 2048 keeps the 2x headroom over the fast
 /// table that the id mixing requires (two ids one table step apart must not
 /// collide here) and costs `size_of::<SessMemo>() * 2048` (~96 KiB) per worker

@@ -5626,6 +5626,24 @@ async fn unsolicited_reply_through_filter(reply_filter: ReplyFilter) -> Option<U
                 );
                 assert!(data.src, "the binding frame marks the source");
                 assert_eq!(data.addr, Some(TargetAddrRef::Ip(stranger_addr)));
+                // Confirm the source, as a real client does with
+                // `FLOW_ACK_SRC`; otherwise the unacked server-owned flow keeps
+                // sending the context form instead of compressing.
+                let acks_before = r2_count(&r2_stats::FLOW_ACKS_RECV);
+                client_conn
+                    .send_datagram(r2::encode_ctl(&r2::Ctl::FlowAckSrc {
+                        id,
+                        addr: stranger_addr,
+                    }))
+                    .unwrap();
+                let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while r2_count(&r2_stats::FLOW_ACKS_RECV) == acks_before {
+                    assert!(
+                        tokio::time::Instant::now() < ack_deadline,
+                        "the source ACK must be processed"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
                 // The client app can now answer on the same id: the server
                 // forwards the steady frame to the remote source.
                 client_conn
@@ -7078,21 +7096,18 @@ async fn rev2_domain_open_and_downlink_rebind() {
     );
     assert_eq!(data.payload, b"domain-first");
 
-    // LOGIC-3: the client confirms every `OPEN|SRC` it decodes with
-    // `CTL FLOW_ACK`; only then does the server classify the learned source as
-    // steady. Wait for the server to process the ACK before relying on it.
+    // The client confirms the `OPEN|SRC` with a source-carrying
+    // `CTL FLOW_ACK_SRC`; only then does the server classify the learned source
+    // as steady. Wait for the server to process the ACK before relying on it.
     let acks_before = r2_count(&r2_stats::FLOW_ACKS_RECV);
     client
-        .send_datagram(r2::encode_ctl(&r2::Ctl::FlowAck {
-            id,
-            status: r2::R2_ACK_OPEN,
-        }))
+        .send_datagram(r2::encode_ctl(&r2::Ctl::FlowAckSrc { id, addr: dst }))
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while r2_count(&r2_stats::FLOW_ACKS_RECV) == acks_before {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the client FLOW_ACK must be processed"
+            "the client FLOW_ACK_SRC must be processed"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -8630,6 +8645,11 @@ async fn rev2_full_cone_opens_server_owned_flow_and_compresses() {
         h.r2.flows.load().match_source(peer),
         Some(SourceMatch::Exact(_))
     ));
+    // A server-owned flow is `Exact` because its target names the source, but
+    // the client may still not have received the initial OPEN|SRC; the source
+    // ACK is what closes that gap.
+    assert!(!binding.reply_src_acked());
+    assert!(binding.confirm_reply_src(peer));
 
     // Second reply from the same source: the reverse table hits `reply_src` and
     // the payload compresses to steady DATA (no second OPEN).
@@ -8955,15 +8975,50 @@ async fn flow_ack_confirms_a_learned_reply_source() {
         Some(SourceMatch::Rebind(_))
     ));
 
+    // A source-less legacy ACK keeps the flow known but must not confirm a
+    // source: it cannot distinguish two rebinds of the same id.
     let acks_before = r2_count(&r2_stats::FLOW_ACKS_RECV);
-    let ack = r2::encode_ctl(&r2::Ctl::FlowAck {
+    let legacy = r2::encode_ctl(&r2::Ctl::FlowAck {
         id: binding.wire_id,
         status: r2::R2_ACK_OPEN,
+    });
+    r2_handle_ctl(
+        &ss,
+        &server_conn,
+        &state,
+        &mut R2Reassembler::new(),
+        &legacy,
+    );
+    assert!(
+        !binding.reply_src_acked(),
+        "a source-less FLOW_ACK must not confirm a reply source"
+    );
+    assert_eq!(r2_count(&r2_stats::FLOW_ACKS_RECV), acks_before);
+
+    // A source ACK for a different source is a stale/reordered confirmation:
+    // it must not confirm the current source and must clear the ack so the
+    // sender repeats the current context.
+    let other: SocketAddr = "198.51.100.9:5001".parse().unwrap();
+    let wrong = r2::encode_ctl(&r2::Ctl::FlowAckSrc {
+        id: binding.wire_id,
+        addr: other,
+    });
+    r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &wrong);
+    assert!(!binding.reply_src_acked());
+    assert!(matches!(
+        r2_flows.load().match_source(learned),
+        Some(SourceMatch::Rebind(_))
+    ));
+
+    // The source-carrying ACK for the learned source confirms it.
+    let ack = r2::encode_ctl(&r2::Ctl::FlowAckSrc {
+        id: binding.wire_id,
+        addr: learned,
     });
     r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &ack);
     assert!(
         binding.reply_src_acked(),
-        "FLOW_ACK must confirm the learned reply source"
+        "FLOW_ACK_SRC must confirm the source it carries"
     );
     assert_eq!(r2_count(&r2_stats::FLOW_ACKS_RECV), acks_before + 1);
     assert!(matches!(
@@ -8971,16 +9026,43 @@ async fn flow_ack_confirms_a_learned_reply_source() {
         Some(SourceMatch::Exact(_))
     ));
 
+    // A source change followed by a delayed ACK for the *old* source must not
+    // confirm the new one (the regression this change exists for).
+    binding.set_reply_src(other);
+    let stale = r2::encode_ctl(&r2::Ctl::FlowAckSrc {
+        id: binding.wire_id,
+        addr: learned,
+    });
+    r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &stale);
+    assert!(
+        !binding.reply_src_acked(),
+        "a stale ACK must not confirm the new source"
+    );
+    assert!(matches!(
+        r2_flows.load().match_source(other),
+        Some(SourceMatch::Rebind(_))
+    ));
+    let fresh = r2::encode_ctl(&r2::Ctl::FlowAckSrc {
+        id: binding.wire_id,
+        addr: other,
+    });
+    r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &fresh);
+    assert!(binding.reply_src_acked());
+    assert!(matches!(
+        r2_flows.load().match_source(other),
+        Some(SourceMatch::Exact(_))
+    ));
+
     // An ACK for an id this side never installed is a cheap no-op.
     let stray = r2::make_wire_id(99, false).unwrap();
-    let ack = r2::encode_ctl(&r2::Ctl::FlowAck {
+    let ack = r2::encode_ctl(&r2::Ctl::FlowAckSrc {
         id: stray,
-        status: r2::R2_ACK_OPEN,
+        addr: learned,
     });
     r2_handle_ctl(&ss, &server_conn, &state, &mut R2Reassembler::new(), &ack);
     assert_eq!(
         r2_count(&r2_stats::FLOW_ACKS_RECV),
-        acks_before + 1,
+        acks_before + 2,
         "an ACK for an unknown id confirms nothing"
     );
 
@@ -9616,7 +9698,7 @@ async fn rev3_stream_first_byte_dispatch_and_second_control_stream() {
 /// a learned reply source carry the `SRC` context form (session-less, no ACK
 /// gating), after which the flow compresses to steady frames.
 #[tokio::test]
-async fn rev3_downlink_k2_src_context_then_steady() {
+async fn rev3_downlink_src_context_until_source_ack() {
     let (client_conn, server_conn) = stream_test_pair().await;
     let target: SocketAddr = "198.51.100.9:4242".parse().unwrap();
     let learned: SocketAddr = "198.51.100.9:5000".parse().unwrap();
@@ -9640,10 +9722,10 @@ async fn rev3_downlink_k2_src_context_then_steady() {
     assert_eq!(binding.reply_src(), Some(learned));
     assert!(
         !binding.reply_src_acked(),
-        "rev3 does not wait for a client ACK; it counts K sends locally"
+        "rev3 waits for the reliable source-carrying ACK"
     );
 
-    // Reply 2: second (and last) context frame.
+    // Reply 2: still unacked, so it repeats the context form.
     assert!(matches!(
         h.reply(b"two", learned),
         ReplyDisposition::Continue
@@ -9654,11 +9736,15 @@ async fn rev3_downlink_k2_src_context_then_steady() {
     assert!(data.src);
     assert_eq!(data.payload, b"two");
     assert!(
-        binding.reply_src_acked(),
-        "after K=2 context frames the source is confirmed locally"
+        !binding.reply_src_acked(),
+        "without a source ACK the flow must keep teaching the source"
     );
 
-    // Reply 3: steady (the no-ACK policy replaces the FLOW_ACK round trip).
+    // The client applied the source and confirmed it on the reliable control
+    // stream (what `handle_control_message(CtlMessage::SrcAck)` does).
+    assert!(binding.confirm_reply_src(learned));
+
+    // Reply 3: steady.
     assert!(matches!(
         h.reply(b"three", learned),
         ReplyDisposition::Continue
@@ -9711,8 +9797,14 @@ async fn rev3_downlink_server_owned_open_src_then_steady() {
     assert_eq!(data.addr, Some(TargetAddrRef::Ip(peer)));
     assert_eq!(data.payload, b"hello-peer");
 
-    // K=2: the second reply repeats the context form even though the binding's
-    // target already names the source (target_names_src would say Exact).
+    // A server-owned flow's target names its source, so `match_source` already
+    // says Exact; the unacked gate is what keeps teaching the context until the
+    // client confirms it. The second reply is still `OPEN_SRC`.
+    let binding = conn
+        .registry
+        .get(wid)
+        .expect("the full-cone install published the binding");
+    assert!(!binding.reply_src_acked());
     assert!(matches!(
         h.reply(b"second", peer),
         ReplyDisposition::Continue
@@ -9722,6 +9814,9 @@ async fn rev3_downlink_server_owned_open_src_then_steady() {
     assert_eq!(data.wire_id, Some(wid));
     assert!(data.src);
     assert_eq!(data.payload, b"second");
+
+    // The client applies the source and confirms it.
+    assert!(binding.confirm_reply_src(peer));
 
     // Third reply compresses.
     assert!(matches!(
@@ -9788,7 +9883,7 @@ async fn rev3_downlink_large_and_fragmented_replies() {
 /// repair message bumps the connection's epoch and the reply reader re-sends K=2
 /// context frames for the flow before compressing again.
 #[tokio::test]
-async fn rev3_need_context_rearms_the_downlink_window() {
+async fn rev3_need_context_rearms_the_downlink_context() {
     let (client_conn, server_conn) = stream_test_pair().await;
     let peer: SocketAddr = "203.0.113.7:5353".parse().unwrap();
     let (ss, _flows, _other) = rev2_reply_fixture(
@@ -9800,14 +9895,17 @@ async fn rev3_need_context_rearms_the_downlink_window() {
     let mut h = R2ReplyHarness::new(7, &ss, server_conn.clone(), stage, Some(conn.clone()))
         .with_filter(ReplyFilter::FullCone);
 
-    // Open the flow and run out its initial K=2 window (first two replies are
-    // standalone OPEN_SRC frames; the third compresses after a drain).
+    // Open the flow: two context frames while the source is unconfirmed, then
+    // the client's source ACK lets it compress.
     assert!(matches!(h.reply(b"a", peer), ReplyDisposition::Continue));
     let frame = r2_read_frame(&client_conn).await;
     let _ = wire::decode_data(Wire::Rev3, &frame).expect("rev3 OPEN_SRC");
     assert!(matches!(h.reply(b"b", peer), ReplyDisposition::Continue));
     let frame = r2_read_frame(&client_conn).await;
-    let _ = wire::decode_data(Wire::Rev3, &frame).expect("rev3 OPEN_SRC");
+    let data = wire::decode_data(Wire::Rev3, &frame).expect("rev3 OPEN_SRC");
+    let wid = data.wire_id.unwrap();
+    let binding = conn.registry.get(wid).expect("full-cone binding");
+    assert!(binding.confirm_reply_src(peer));
     assert!(matches!(
         h.reply(b"steady", peer),
         ReplyDisposition::Continue
@@ -9816,7 +9914,6 @@ async fn rev3_need_context_rearms_the_downlink_window() {
     let frame = r2_read_frame(&client_conn).await;
     let data = wire::decode_data(Wire::Rev3, &frame).expect("steady rev3 DATA");
     assert!(!data.src);
-    let wid = data.wire_id.unwrap();
 
     // The peer says it missed the context for that flow.
     let fid = wire::fid_for(wid).expect("server fid");
@@ -9828,15 +9925,18 @@ async fn rev3_need_context_rearms_the_downlink_window() {
         "the repair hint must be queued for the reply readers"
     );
 
-    // The repaired reader sends context K=2 again before compressing.
-    for payload in [&b"repair-one"[..], b"repair-two"] {
-        assert!(matches!(h.reply(payload, peer), ReplyDisposition::Continue));
-        let frame = r2_read_frame(&client_conn).await;
-        let data = wire::decode_data(Wire::Rev3, &frame).expect("rev3 OPEN_SRC frame");
-        assert_eq!(data.wire_id, Some(wid));
-        assert!(data.src, "a repaired flow must re-send its binding context");
-        assert_eq!(data.payload, payload);
-    }
+    // A repaired reader re-sends exactly one context frame, then compresses:
+    // the source itself is already confirmed, so the repair must not reopen a
+    // two-reply window.
+    assert!(matches!(
+        h.reply(b"repair-one", peer),
+        ReplyDisposition::Continue
+    ));
+    let frame = r2_read_frame(&client_conn).await;
+    let data = wire::decode_data(Wire::Rev3, &frame).expect("rev3 OPEN_SRC frame");
+    assert_eq!(data.wire_id, Some(wid));
+    assert!(data.src, "a repaired flow must re-send its binding context");
+    assert_eq!(data.payload, b"repair-one");
     assert!(matches!(
         h.reply(b"after", peer),
         ReplyDisposition::Continue
@@ -9844,7 +9944,10 @@ async fn rev3_need_context_rearms_the_downlink_window() {
     assert_eq!(h.drain(), StageDrain::Ok);
     let frame = r2_read_frame(&client_conn).await;
     let data = wire::decode_data(Wire::Rev3, &frame).expect("steady rev3 DATA");
-    assert!(!data.src, "the repaired window closes after K sends");
+    assert!(
+        !data.src,
+        "the repaired window closes after one context frame"
+    );
     assert_eq!(data.payload, b"after");
 
     client_conn.close(0u32.into(), b"done");

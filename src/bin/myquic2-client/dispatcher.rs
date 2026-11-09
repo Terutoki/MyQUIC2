@@ -870,19 +870,31 @@ fn r2_lookup(
 /// receiver that never ACKs turns every downlink frame into a binding frame
 /// and leaves the source unconfirmed forever. `None` (unit tests without a live
 /// connection) simply skips the send.
-fn send_flow_ack(conn: Option<&quinn::Connection>, id: u32) {
-    let Some(conn) = conn else {
-        return;
-    };
-    match r2_send_ctl(
-        conn,
-        &r2::Ctl::FlowAck {
-            id,
-            status: r2::R2_ACK_OPEN,
-        },
-    ) {
-        DatagramSend::Sent => counters::flow_ack_tx(),
-        _ => counters::ctl_tx_fail(),
+fn send_flow_ack(rev2: &ConnRev2, conn: Option<&quinn::Connection>, id: u32, src: SocketAddr) {
+    match rev2.wire() {
+        Wire::Rev2 => {
+            let Some(conn) = conn else {
+                return;
+            };
+            // Only the source-carrying ACK: a source-less ACK can confirm the
+            // wrong rebind (ECHO review L1), so it is deliberately not sent.
+            // An old server ignores this opcode and simply keeps re-sending the
+            // binding context; data still flows, only compression is lost.
+            match r2_send_ctl(rev2, conn, &r2::Ctl::FlowAckSrc { id, addr: src }) {
+                DatagramSend::Sent => counters::flow_ack_tx(),
+                _ => counters::ctl_tx_fail(),
+            }
+        }
+        Wire::Rev3 => {
+            let Some(fid) = wire::fid_for(id) else {
+                return;
+            };
+            if rev2.send_ctl(CtlMessage::SrcAck { fid, addr: src }) {
+                counters::flow_ack_tx();
+            } else {
+                counters::ctl_tx_fail();
+            }
+        }
     }
 }
 
@@ -903,7 +915,7 @@ fn send_flow_reject(rev2: &ConnRev2, conn: Option<&quinn::Connection>, id: u32, 
             let Some(conn) = conn else {
                 return;
             };
-            match r2_send_ctl(conn, &r2::Ctl::FlowReject { id, reason }) {
+            match r2_send_ctl(rev2, conn, &r2::Ctl::FlowReject { id, reason }) {
                 DatagramSend::Sent => counters::flow_reject_tx(),
                 _ => counters::ctl_tx_fail(),
             }
@@ -1045,6 +1057,9 @@ pub(crate) fn handle_r2_ctl_at(
             }
             None => counters::rx_unknown_id(),
         },
+        // A source ACK is client→server only; receiving one here means the
+        // peer echoed the wrong direction. Count and ignore.
+        r2::Ctl::FlowAckSrc { .. } => counters::ctl_drop(),
         r2::Ctl::FlowReject { id, reason } => match rev2.registry.remove(id) {
             Some(binding) => {
                 // Known flow: only now is the per-id cleanup worth its scan.
@@ -1219,7 +1234,9 @@ pub(crate) fn handle_r3_ctl(
         CtlMessage::Goaway => counters::ctl_stream_drop(),
         // Server→client is REJECT/SESS_CLOSE/NEED_CONTEXT/GOAWAY; the rest are
         // client→server directions and are a protocol anomaly here.
-        CtlMessage::AssocClose { .. } => counters::ctl_stream_drop(),
+        CtlMessage::AssocClose { .. } | CtlMessage::SrcAck { .. } => {
+            counters::ctl_stream_drop();
+        }
     }
 }
 
@@ -1398,7 +1415,7 @@ fn dispatch_r2_data(
     {
         binding.set_reply_src(src);
         if wire == Wire::Rev2 {
-            send_flow_ack(conn, binding.wire_id);
+            send_flow_ack(rev2, conn, binding.wire_id, src);
         }
     }
     // Any compressed downlink proves the server installed this id: that is the
@@ -1471,8 +1488,16 @@ fn dispatch_r2_train(
         std::array::from_fn(|_| (0, None));
     let mut slot_of: [u16; TRAIN_HASH_CAP] = [u16::MAX; TRAIN_HASH_CAP];
     let mut item_slot: [u16; TRAIN_MAX] = [0; TRAIN_MAX];
+    // Payload offsets recorded in pass 1: the codec yields a borrowing
+    // iterator, and a second `t.items()` re-parsed every id/length (ECHO
+    // review L13). The frame owns `d` for the whole function, so an offset is
+    // stable; `d.slice` below is a refcount bump.
+    let mut item_off: [u32; TRAIN_MAX] = [0; TRAIN_MAX];
+    let mut item_len: [u32; TRAIN_MAX] = [0; TRAIN_MAX];
     let mut n_slots = 0usize;
-    for (i, (wire_id, _)) in t.items().enumerate() {
+    let mut n_items = 0usize;
+    let base = d.as_ptr() as usize;
+    for (i, (wire_id, payload)) in t.items().enumerate() {
         debug_assert!(i < TRAIN_MAX, "the codec bounds the train item count");
         let mut h = (wire_id.wrapping_mul(0x9E37_79B1) as usize) & (TRAIN_HASH_CAP - 1);
         let slot = loop {
@@ -1490,6 +1515,14 @@ fn dispatch_r2_train(
             h = (h + 1) & (TRAIN_HASH_CAP - 1);
         };
         item_slot[i] = slot;
+        let off = payload.as_ptr() as usize - base;
+        debug_assert!(
+            off + payload.len() <= d.len(),
+            "train item inside the frame"
+        );
+        item_off[i] = off as u32;
+        item_len[i] = payload.len() as u32;
+        n_items = i + 1;
     }
     // One read-lock hold for the whole frame.
     rev2.registry.get_batch(&mut slots[..n_slots]);
@@ -1515,7 +1548,8 @@ fn dispatch_r2_train(
     // session, the entry Arc (already upgraded by the lookup — kept alive so
     // the follower call needs nothing but a reference) and its app address.
     let mut last_pushed: Option<(u32, Arc<AssocEntry>, SocketAddr)> = None;
-    for (i, (_id, payload)) in t.items().enumerate() {
+    for i in 0..n_items {
+        let payload = &d[item_off[i] as usize..(item_off[i] + item_len[i]) as usize];
         let slot = usize::from(item_slot[i]);
         let (sess, dst) = match resolved[slot] {
             Resolved::Hit { sess, dst } => (sess, dst),
@@ -1663,9 +1697,7 @@ fn dispatch_r2_frag(
                 // frame; rev3 has no ACK plane (the server repeats the context
                 // for the first K replies itself).
                 binding.set_reply_src(src_addr);
-                if wire == Wire::Rev2 {
-                    send_flow_ack(conn, binding.wire_id);
-                }
+                send_flow_ack(rev2, conn, binding.wire_id, src_addr);
             }
             let Some(dst) = src_dst.or_else(|| r2_reply_dst(&binding)) else {
                 dgram_drops::bump(&dgram_drops::REFUSED);

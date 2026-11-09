@@ -250,384 +250,464 @@ where
     Ok(())
 }
 
-async fn copy_tcp_quic_inner(
-    mut tcp: tokio::net::TcpStream,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    idle: Duration,
-    ack: Option<Duration>,
-) -> Result<(u64, u64)> {
-    use futures_util::future::FutureExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // Liveness stamp shared by both directions, in the coarse millisecond epoch
-    // (see [`coarse_millis`]): the value is only ever compared against the 300 s
-    // idle deadline, so it does not need a clock read per chunk. Seeded with
-    // "now" rather than 0 because it is compared against that same epoch — a 0
-    // would read as "idle since process start", and the first idle tick of a
-    // long-running process would tear every flow down on the spot.
-    // Stack stamp, not `Arc`: both pump futures only borrow it (shared `&`),
-    // and they are driven to completion inside this function, so no heap
-    // allocation per flow.
-    let last_ms = AtomicU64::new(coarse_millis());
-    // Per-direction progress stamps, same epoch and throttle as `last_ms`. A
-    // shared stamp alone cannot see a stall in one direction while the other
-    // keeps flowing: the live direction refreshes it, so a half-dead stream
-    // (e.g. a bulk download with a wedged upload) never looks idle and the
-    // watchdog never fires. Each direction therefore stamps its own counter
-    // alongside the shared one, and the idle tick below fails a direction
-    // that made no progress for the whole window provided the shared stamp
-    // is expired too (AND gate): one live direction keeps a healthy
-    // half-idle flow alive, so only a stall on top of global silence kills.
-    let c2s_last = AtomicU64::new(coarse_millis());
-    let s2c_last = AtomicU64::new(coarse_millis());
-    // Borrowed halves: `tcp` itself stays owned here so the final disposition
-    // (graceful FIN on clean EOF, RST on any abnormal end) is decided in one
-    // place after both directions settle, instead of each direction racing to
-    // shut the socket down on its own.
-    let (mut tr, mut tw) = tcp.split();
-    // Per-direction completion flags, declared outside the pump scope so the
-    // error disposition below can tell a half that finished cleanly from one
-    // that was abandoned mid-flight.
-    let mut c2s_total: Option<u64> = None;
-    let mut s2c_total: Option<u64> = None;
-    // Scope the pump futures: everything borrowing `tcp`, `send` and `recv` ends
-    // at the block end, so the final disposition below owns all three outright.
-    // The futures deliberately *borrow* the two QUIC halves rather than taking
-    // them (no `move`): a dropped `quinn::SendStream` calls `finish()`, so a
-    // future that owned the send half would announce an abnormal end to the peer
-    // as a clean FIN — see the disposition, and `peer_sees_reset_not_fin`.
-    let outcome: Result<(u64, u64)> = {
-        let c2s = async {
-            // Double-buffer. `split_to(n).freeze()` promotes the remainder to
-            // a shared handle while quinn holds the frozen half in
-            // `unacked_segments`, so the next `reserve_copy_chunk` on the same
-            // buffer cannot reclaim in place and replaces it with a fresh,
-            // exactly one-chunk allocation (`COPY_CHUNK` unless the buffer
-            // still holds data).
-            // Rotating gives the ACK one full other-buffer cycle to drop the
-            // first frozen half before we need its capacity again; when the
-            // half is released within that window the reclaim is skipped, and
-            // when it is not the behaviour is the same as the old
-            // single-buffer path (allocate on reserve). Small writes
-            // (`write_all`) do not split, so they keep the current buffer and
-            // clear it.
-            let mut bufs = [copy_buf_acquire(), copy_buf_acquire()];
-            let mut cur = 0usize;
-            let mut total = 0u64;
-            let mut stamped = 0u64;
-            let mut stamped_dir = 0u64;
-            let mut eof = false;
-            loop {
-                reserve_copy_chunk(&mut bufs[cur]);
-                let mut n = match tr.read_buf(&mut bufs[cur]).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        let total_copy = total;
-                        release_copy_bufs(&mut bufs);
-                        return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                            "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
-                        ));
-                    }
-                };
-                // A request/response or gaming TCP flow often emits several
-                // small writes back-to-back. The first `read_buf` can return
-                // only the first segment, and paying one QUIC stream write (and
-                // one wake of the connection driver) per segment multiplies the
-                // per-packet cost. Poll again without waiting: `now_or_never`
-                // only consumes bytes that are already readable, so this adds
-                // no timer and no latency; it just folds the burst into one
-                // write. Stop at the chunk size to keep the buffer bounded.
-                while n < COPY_CHUNK {
-                    match tr.read_buf(&mut bufs[cur]).now_or_never() {
-                        Some(Ok(0)) => {
-                            eof = true;
-                            break;
+/// Owns one TCP/QUIC relay's three movable resources for the pump's lifetime.
+///
+/// The pump futures deliberately borrow the QUIC halves (a dropped
+/// `SendStream` calls `finish()`, announcing an abnormal end as a clean FIN).
+/// That means a future dropped mid-await would drop the owned halves and the
+/// TCP socket outside the final disposition: the peer would see a clean EOF on
+/// a truncated transfer. The guard closes that hole — its `Drop` runs the same
+/// RST/`reset`/`stop` disposition when the pump future is cancelled. The normal
+/// path sets `finished` and performs the disposition itself.
+struct PumpGuard {
+    tcp: Option<tokio::net::TcpStream>,
+    send: Option<quinn::SendStream>,
+    recv: Option<quinn::RecvStream>,
+    done_c2s: std::sync::atomic::AtomicBool,
+    done_s2c: std::sync::atomic::AtomicBool,
+    finished: bool,
+}
+
+impl PumpGuard {
+    fn new(tcp: tokio::net::TcpStream, send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self {
+            tcp: Some(tcp),
+            send: Some(send),
+            recv: Some(recv),
+            done_c2s: std::sync::atomic::AtomicBool::new(false),
+            done_s2c: std::sync::atomic::AtomicBool::new(false),
+            finished: false,
+        }
+    }
+
+    /// Run the duplex pump. The borrow block is closed before the final
+    /// disposition so the owned halves are reachable again; a cancellation
+    /// skips this block entirely and runs [`Drop`] instead.
+    async fn run(&mut self, idle: Duration, ack: Option<Duration>) -> Result<(u64, u64)> {
+        use futures_util::future::FutureExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let outcome: Result<(u64, u64)> = {
+            // Liveness stamp shared by both directions, in the coarse millisecond epoch
+            // (see [`coarse_millis`]): the value is only ever compared against the 300 s
+            // idle deadline, so it does not need a clock read per chunk. Seeded with
+            // "now" rather than 0 because it is compared against that same epoch — a 0
+            // would read as "idle since process start", and the first idle tick of a
+            // long-running process would tear every flow down on the spot.
+            // Stack stamp, not `Arc`: both pump futures only borrow it (shared `&`),
+            // and they are driven to completion inside this function, so no heap
+            // allocation per flow.
+            let last_ms = AtomicU64::new(coarse_millis());
+            // Per-direction progress stamps, same epoch and throttle as `last_ms`. A
+            // shared stamp alone cannot see a stall in one direction while the other
+            // keeps flowing: the live direction refreshes it, so a half-dead stream
+            // (e.g. a bulk download with a wedged upload) never looks idle and the
+            // watchdog never fires. Each direction therefore stamps its own counter
+            // alongside the shared one, and the idle tick below fails a direction
+            // that made no progress for the whole window provided the shared stamp
+            // is expired too (AND gate): one live direction keeps a healthy
+            // half-idle flow alive, so only a stall on top of global silence kills.
+            let c2s_last = AtomicU64::new(coarse_millis());
+            let s2c_last = AtomicU64::new(coarse_millis());
+            // The guard owns the three resources; the pump futures borrow them so a
+            // dropped future cannot drop `SendStream` (which would `finish()`), and a
+            // cancelled future is handled by `PumpGuard::drop`.
+            let done_c2s = &self.done_c2s;
+            let done_s2c = &self.done_s2c;
+            let tcp = self.tcp.as_mut().expect("pump guard owns the tcp socket");
+            let send = self.send.as_mut().expect("pump guard owns the send half");
+            let recv = self.recv.as_mut().expect("pump guard owns the recv half");
+            let (mut tr, mut tw) = tcp.split();
+            // Per-direction completion flags, declared outside the pump scope so the
+            // error disposition below can tell a half that finished cleanly from one
+            // that was abandoned mid-flight.
+            let mut c2s_total: Option<u64> = None;
+            let mut s2c_total: Option<u64> = None;
+            // Scope the pump futures: everything borrowing `tcp`, `send` and `recv` ends
+            // at the block end, so the final disposition below owns all three outright.
+            // The futures deliberately *borrow* the two QUIC halves rather than taking
+            // them (no `move`): a dropped `quinn::SendStream` calls `finish()`, so a
+            // future that owned the send half would announce an abnormal end to the peer
+            // as a clean FIN — see the disposition, and `peer_sees_reset_not_fin`.
+            let outcome: Result<(u64, u64)> = {
+                let c2s = async {
+                    // Double-buffer. `split_to(n).freeze()` promotes the remainder to
+                    // a shared handle while quinn holds the frozen half in
+                    // `unacked_segments`, so the next `reserve_copy_chunk` on the same
+                    // buffer cannot reclaim in place and replaces it with a fresh,
+                    // exactly one-chunk allocation (`COPY_CHUNK` unless the buffer
+                    // still holds data).
+                    // Rotating gives the ACK one full other-buffer cycle to drop the
+                    // first frozen half before we need its capacity again; when the
+                    // half is released within that window the reclaim is skipped, and
+                    // when it is not the behaviour is the same as the old
+                    // single-buffer path (allocate on reserve). Small writes
+                    // (`write_all`) do not split, so they keep the current buffer and
+                    // clear it.
+                    let mut bufs = [copy_buf_acquire(), copy_buf_acquire()];
+                    let mut cur = 0usize;
+                    let mut total = 0u64;
+                    let mut stamped = 0u64;
+                    let mut stamped_dir = 0u64;
+                    let mut eof = false;
+                    loop {
+                        reserve_copy_chunk(&mut bufs[cur]);
+                        let mut n = match tr.read_buf(&mut bufs[cur]).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(e) => {
+                                let total_copy = total;
+                                release_copy_bufs(&mut bufs);
+                                return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                    "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
+                                ));
+                            }
+                        };
+                        // A request/response or gaming TCP flow often emits several
+                        // small writes back-to-back. The first `read_buf` can return
+                        // only the first segment, and paying one QUIC stream write (and
+                        // one wake of the connection driver) per segment multiplies the
+                        // per-packet cost. Poll again without waiting: `now_or_never`
+                        // only consumes bytes that are already readable, so this adds
+                        // no timer and no latency; it just folds the burst into one
+                        // write. Stop at the chunk size to keep the buffer bounded.
+                        while n < COPY_CHUNK {
+                            match tr.read_buf(&mut bufs[cur]).now_or_never() {
+                                Some(Ok(0)) => {
+                                    eof = true;
+                                    break;
+                                }
+                                Some(Ok(k)) => n += k,
+                                Some(Err(e)) => {
+                                    let total_copy = total;
+                                    release_copy_bufs(&mut bufs);
+                                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                        "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
+                                    ));
+                                }
+                                None => break,
+                            }
                         }
-                        Some(Ok(k)) => n += k,
-                        Some(Err(e)) => {
+                        // Hand the filled buffer to quinn as an owned `Bytes` so a bulk
+                        // chunk crosses no memcpy boundary at all (quinn's `write_chunk`
+                        // moves it into `unacked_segments`); the remaining allocation is
+                        // the one quinn's `to_owned()` used to perform, minus the copy.
+                        let res = if n >= ZEROCOPY_MIN_WRITE {
+                            let frozen = bufs[cur].split_to(n).freeze();
+                            // Next read uses the other buffer; this one may be shared
+                            // with `frozen` until the ACK drops it.
+                            cur ^= 1;
+                            send.write_chunk(frozen).await
+                        } else {
+                            let r = send.write_all(&bufs[cur][..n]).await;
+                            if r.is_ok() {
+                                bufs[cur].clear();
+                            }
+                            r
+                        };
+                        if let Err(e) = res {
                             let total_copy = total;
                             release_copy_bufs(&mut bufs);
                             return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                                "tcp>quic tcp read failed after {total_copy}B up: {e:#}"
+                                "tcp>quic quic write failed after {total_copy}B up: {e:#}"
                             ));
                         }
-                        None => break,
+                        total += n as u64;
+                        // Stamp every chunk (throttled inside): gating on a chunk count
+                        // starves slow trickle uploads past the 300s idle reap while
+                        // downloads stamp every batch. Both the shared stamp and this
+                        // direction's own progress stamp move here (separate throttle
+                        // locals: one `touch_stamp` call consumes the observation, so a
+                        // second call with the same local would never store).
+                        let now = coarse_millis();
+                        touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
+                        touch_stamp(&c2s_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
+                        if eof {
+                            break;
+                        }
                     }
-                }
-                // Hand the filled buffer to quinn as an owned `Bytes` so a bulk
-                // chunk crosses no memcpy boundary at all (quinn's `write_chunk`
-                // moves it into `unacked_segments`); the remaining allocation is
-                // the one quinn's `to_owned()` used to perform, minus the copy.
-                let res = if n >= ZEROCOPY_MIN_WRITE {
-                    let frozen = bufs[cur].split_to(n).freeze();
-                    // Next read uses the other buffer; this one may be shared
-                    // with `frozen` until the ACK drops it.
-                    cur ^= 1;
-                    send.write_chunk(frozen).await
-                } else {
-                    let r = send.write_all(&bufs[cur][..n]).await;
-                    if r.is_ok() {
-                        bufs[cur].clear();
-                    }
-                    r
-                };
-                if let Err(e) = res {
-                    let total_copy = total;
+                    send.finish().ok();
                     release_copy_bufs(&mut bufs);
-                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                        "tcp>quic quic write failed after {total_copy}B up: {e:#}"
-                    ));
-                }
-                total += n as u64;
-                // Stamp every chunk (throttled inside): gating on a chunk count
-                // starves slow trickle uploads past the 300s idle reap while
-                // downloads stamp every batch. Both the shared stamp and this
-                // direction's own progress stamp move here (separate throttle
-                // locals: one `touch_stamp` call consumes the observation, so a
-                // second call with the same local would never store).
-                let now = coarse_millis();
-                touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
-                touch_stamp(&c2s_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
-                if eof {
-                    break;
-                }
-            }
-            send.finish().ok();
-            release_copy_bufs(&mut bufs);
-            Ok::<u64, anyhow::Error>(total)
-        };
-        let s2c = async {
-            let mut total = 0u64;
-            let mut stamped = 0u64;
-            let mut stamped_dir = 0u64;
-            // Optimistic SOCKS replies have already told the application the
-            // connection is up, so the MQP-2 dial ACK only gates the reply
-            // direction here. A failure means the remote dial failed (or the
-            // server never acked); tear the TCP flow down so the app fails fast.
-            if let Some(t) = ack {
-                let ok = matches!(
-                    tokio::time::timeout(t, read_mqp_ack(&mut recv)).await,
-                    Ok(Ok(()))
-                );
-                if !ok {
-                    // No FIN here: the final disposition aborts the TCP flow with
-                    // RST so the application retries instead of accepting an
-                    // empty reply as success.
-                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                        "remote dial failed or MQP ack timed out"
-                    ));
-                }
-            }
-            let mut batch: [Bytes; COPY_BATCH] = std::array::from_fn(|_| Bytes::new());
-            loop {
-                // Batched zero-copy receive: `read_chunks` drains up to
-                // `COPY_BATCH` assembler segments under one connection-lock
-                // acquisition, then a single vectored write pushes them to TCP.
-                // The old `read_chunk(MAX)+write_all` paid one lock + one syscall
-                // per ~1.4 KiB STREAM frame; batching amortizes both. The idle
-                // stamp is written once per batch, not per chunk.
-                let n = match recv.read_chunks(&mut batch).await {
-                    Ok(Some(n)) => n,
-                    Ok(None) => break,
-                    Err(e) => {
-                        // Classify for the log line: a peer reset (e.g. refused
-                        // dial) and a dead connection need different follow-ups.
-                        let kind = match &e {
-                            quinn::ReadError::Reset(code) => format!("peer reset {code:?}"),
-                            quinn::ReadError::ConnectionLost(_) => "connection lost".to_string(),
-                            _ => "quic read failed".to_string(),
-                        };
-                        return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                            "quic>tcp {kind} after {total}B down: {e:#}"
-                        ));
-                    }
+                    Ok::<u64, anyhow::Error>(total)
                 };
-                if n == 0 {
-                    continue;
-                }
-                // quinn writes only `batch[..n]`; every entry above it still holds
-                // the *previous* call's chunk, and those are slices of quinn
-                // receive buffers the assembler has already dropped from its own
-                // accounting (see `Assembler::read`). Leaving them there pins
-                // those allocations for the flow's lifetime — a burst-then-trickle
-                // flow (any bulk download that settles, a WebSocket, ssh) leaves up
-                // to `COPY_BATCH - 1` of them — so the tail is cleared explicitly
-                // instead of waiting for a later call to overwrite it.
-                for stale in batch[n..].iter_mut() {
-                    *stale = Bytes::new();
-                }
-                let mut batch_bytes = 0usize;
-                for b in batch.iter().take(n) {
-                    batch_bytes += b.len();
-                }
-                if batch_bytes == 0 {
-                    continue;
-                }
-                if let Err(e) = write_batch_vectored(&mut tw, &batch[..n]).await {
-                    return Err::<u64, anyhow::Error>(anyhow::anyhow!(
-                        "quic>tcp tcp write failed after {total}B down: {e:#}"
-                    ));
-                }
-                // The written slots are dead now: they are slices of quinn
-                // assembler chunks, and the next `read_chunks` only overwrites
-                // them if it returns at least as many. A flow that stops after
-                // one batch (HTTP keep-alive body done, ssh idle, a paused
-                // download) would otherwise pin them — up to ~8 chunks — until
-                // its next data event or the 300 s idle reap.
-                for written in batch[..n].iter_mut() {
-                    *written = Bytes::new();
-                }
-                total += batch_bytes as u64;
-                let now = coarse_millis();
-                touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
-                touch_stamp(&s2c_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
-            }
-            // QUIC-recv EOF: half-close the TCP write side now. Without
-            // this FIN the peer waits for EOF while our own c2s direction
-            // waits for the peer's FIN — a deadlock in which neither side
-            // ever finishes and every cleanly-closed flow lingers until the
-            // idle reap (or connection death), pinning its task, both
-            // sockets and the stream-task permit. The TCP read side stays
-            // open: c2s may still be forwarding, and its own EOF (after the
-            // peer reacts to this FIN) completes the other half
-            // symmetrically. A shutdown error means the peer is already
-            // gone; the transfer itself is complete, so it is ignored and
-            // the direction still reports Ok.
-            tw.shutdown().await.ok();
-            Ok::<u64, anyhow::Error>(total)
-        };
-        // Drive both directions manually instead of `join!`: when one direction
-        // fails, leaving the loop drops the other future immediately, which closes
-        // its TCP half and (see the disposition below) resets/stops its QUIC
-        // stream. `join!` left the other side blocked in `read()` until the 300 s
-        // idle deadline, so a dead QUIC connection could pin the target fd and
-        // buffers for minutes.
-        tokio::pin!(c2s);
-        tokio::pin!(s2c);
-        // Idle watchdog on a *fixed* cadence. The previous shape created a fresh
-        // `sleep(step)` on every loop iteration, and any progress in either
-        // direction re-entered the loop — so a busy stream registered and cancelled
-        // a timer per data chunk (thousands per second). One pinned sleep that is
-        // never re-created fixes the cadence: it is polled again after each transfer
-        // event, and only the elapsed-time comparison decides when the deadline has
-        // passed.
-        // The unbounded `copy_tcp_quic` path passes u32::MAX seconds as
-        // "no idle timeout": arming a 5s tick for it wakes every stream
-        // forever for a check that can never fire.
-        let idle_enabled = idle < Duration::from_secs(u32::MAX as u64 / 2);
-        let idle_step = Duration::from_secs(5).min(idle);
-        let idle_tick = tokio::time::sleep(idle_step);
-        tokio::pin!(idle_tick);
-        loop {
-            tokio::select! {
-                r = &mut c2s, if c2s_total.is_none() => match r {
-                    Ok(v) => c2s_total = Some(v),
-                    Err(e) => break Err(e),
-                },
-                r = &mut s2c, if s2c_total.is_none() => match r {
-                    Ok(v) => s2c_total = Some(v),
-                    Err(e) => break Err(e),
-                },
-                _ = &mut idle_tick, if idle_enabled => {
-                    let elapsed_ms = coarse_millis();
-                    let idle_ms = idle.as_millis() as u64;
-                    // Per-direction stall, AND-gated on the shared stamp below: a
-                    // direction that already reached clean EOF is exempt — its
-                    // stamp legitimately stops — and the `Err` runs the shared
-                    // reset/stop+RST disposition, so the peer learns the stall
-                    // as a reset.
-                    let c2s_stalled = c2s_total.is_none()
-                        && elapsed_ms.saturating_sub(c2s_last.load(Ordering::Relaxed))
-                            >= idle_ms;
-                    let s2c_stalled = s2c_total.is_none()
-                        && elapsed_ms.saturating_sub(s2c_last.load(Ordering::Relaxed))
-                            >= idle_ms;
-                    // AND-gated on the shared stamp: a direction that went quiet
-                    // on its own (e.g. c2s done sending while s2c downloads past
-                    // the window) is healthy, not a stall — the old shared-stamp
-                    // logic kept such flows alive. Kill only when some unfinished
-                    // direction is silent AND nothing flowed anywhere, keeping
-                    // the direction name for the log line.
-                    let shared_expired = elapsed_ms
-                        .saturating_sub(last_ms.load(Ordering::Relaxed))
-                        >= idle_ms;
-                    if (c2s_stalled || s2c_stalled) && shared_expired {
-                        let dir = if c2s_stalled && s2c_stalled {
-                            "both directions"
-                        } else if c2s_stalled {
-                            "c2s"
-                        } else {
-                            "s2c"
+                let s2c = async {
+                    let mut total = 0u64;
+                    let mut stamped = 0u64;
+                    let mut stamped_dir = 0u64;
+                    // Optimistic SOCKS replies have already told the application the
+                    // connection is up, so the MQP-2 dial ACK only gates the reply
+                    // direction here. A failure means the remote dial failed (or the
+                    // server never acked); tear the TCP flow down so the app fails fast.
+                    if let Some(t) = ack {
+                        let ok = matches!(
+                            tokio::time::timeout(t, read_mqp_ack(recv)).await,
+                            Ok(Ok(()))
+                        );
+                        if !ok {
+                            // No FIN here: the final disposition aborts the TCP flow with
+                            // RST so the application retries instead of accepting an
+                            // empty reply as success.
+                            return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                "remote dial failed or MQP ack timed out"
+                            ));
+                        }
+                    }
+                    let mut batch: [Bytes; COPY_BATCH] = std::array::from_fn(|_| Bytes::new());
+                    loop {
+                        // Batched zero-copy receive: `read_chunks` drains up to
+                        // `COPY_BATCH` assembler segments under one connection-lock
+                        // acquisition, then a single vectored write pushes them to TCP.
+                        // The old `read_chunk(MAX)+write_all` paid one lock + one syscall
+                        // per ~1.4 KiB STREAM frame; batching amortizes both. The idle
+                        // stamp is written once per batch, not per chunk.
+                        let n = match recv.read_chunks(&mut batch).await {
+                            Ok(Some(n)) => n,
+                            Ok(None) => break,
+                            Err(e) => {
+                                // Classify for the log line: a peer reset (e.g. refused
+                                // dial) and a dead connection need different follow-ups.
+                                let kind = match &e {
+                                    quinn::ReadError::Reset(code) => format!("peer reset {code:?}"),
+                                    quinn::ReadError::ConnectionLost(_) => {
+                                        "connection lost".to_string()
+                                    }
+                                    _ => "quic read failed".to_string(),
+                                };
+                                return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                    "quic>tcp {kind} after {total}B down: {e:#}"
+                                ));
+                            }
                         };
-                        break Err(anyhow::anyhow!(
-                            "tcp stream stall ({dir}) idle>{idle:?} after {}B up/{}B down",
-                            c2s_total.unwrap_or(0),
-                            s2c_total.unwrap_or(0),
-                        ));
+                        if n == 0 {
+                            continue;
+                        }
+                        // quinn writes only `batch[..n]`; every entry above it still holds
+                        // the *previous* call's chunk, and those are slices of quinn
+                        // receive buffers the assembler has already dropped from its own
+                        // accounting (see `Assembler::read`). Leaving them there pins
+                        // those allocations for the flow's lifetime — a burst-then-trickle
+                        // flow (any bulk download that settles, a WebSocket, ssh) leaves up
+                        // to `COPY_BATCH - 1` of them — so the tail is cleared explicitly
+                        // instead of waiting for a later call to overwrite it.
+                        for stale in batch[n..].iter_mut() {
+                            *stale = Bytes::new();
+                        }
+                        let mut batch_bytes = 0usize;
+                        for b in batch.iter().take(n) {
+                            batch_bytes += b.len();
+                        }
+                        if batch_bytes == 0 {
+                            continue;
+                        }
+                        if let Err(e) = write_batch_vectored(&mut tw, &batch[..n]).await {
+                            return Err::<u64, anyhow::Error>(anyhow::anyhow!(
+                                "quic>tcp tcp write failed after {total}B down: {e:#}"
+                            ));
+                        }
+                        // The written slots are dead now: they are slices of quinn
+                        // assembler chunks, and the next `read_chunks` only overwrites
+                        // them if it returns at least as many. A flow that stops after
+                        // one batch (HTTP keep-alive body done, ssh idle, a paused
+                        // download) would otherwise pin them — up to ~8 chunks — until
+                        // its next data event or the 300 s idle reap.
+                        for written in batch[..n].iter_mut() {
+                            *written = Bytes::new();
+                        }
+                        total += batch_bytes as u64;
+                        let now = coarse_millis();
+                        touch_stamp(&last_ms, &mut stamped, now, IDLE_STAMP_THROTTLE_MS);
+                        touch_stamp(&s2c_last, &mut stamped_dir, now, IDLE_STAMP_THROTTLE_MS);
                     }
-                    // Shared-only expiry (no unfinished direction silent, yet
-                    // nothing flowed anywhere): kept as the overall-idle arm so
-                    // this check is not dead code behind the gate above.
-                    if shared_expired {
-                        break Err(anyhow::anyhow!(
-                            "tcp stream idle>{idle:?} after {}B up/{}B down",
-                            c2s_total.unwrap_or(0),
-                            s2c_total.unwrap_or(0),
-                        ));
+                    // QUIC-recv EOF: half-close the TCP write side now. Without
+                    // this FIN the peer waits for EOF while our own c2s direction
+                    // waits for the peer's FIN — a deadlock in which neither side
+                    // ever finishes and every cleanly-closed flow lingers until the
+                    // idle reap (or connection death), pinning its task, both
+                    // sockets and the stream-task permit. The TCP read side stays
+                    // open: c2s may still be forwarding, and its own EOF (after the
+                    // peer reacts to this FIN) completes the other half
+                    // symmetrically. A shutdown error means the peer is already
+                    // gone; the transfer itself is complete, so it is ignored and
+                    // the direction still reports Ok.
+                    tw.shutdown().await.ok();
+                    Ok::<u64, anyhow::Error>(total)
+                };
+                // Drive both directions manually instead of `join!`: when one direction
+                // fails, leaving the loop drops the other future immediately, which closes
+                // its TCP half and (see the disposition below) resets/stops its QUIC
+                // stream. `join!` left the other side blocked in `read()` until the 300 s
+                // idle deadline, so a dead QUIC connection could pin the target fd and
+                // buffers for minutes.
+                tokio::pin!(c2s);
+                tokio::pin!(s2c);
+                // Idle watchdog on a *fixed* cadence. The previous shape created a fresh
+                // `sleep(step)` on every loop iteration, and any progress in either
+                // direction re-entered the loop — so a busy stream registered and cancelled
+                // a timer per data chunk (thousands per second). One pinned sleep that is
+                // never re-created fixes the cadence: it is polled again after each transfer
+                // event, and only the elapsed-time comparison decides when the deadline has
+                // passed.
+                // The unbounded `copy_tcp_quic` path passes u32::MAX seconds as
+                // "no idle timeout": arming a 5s tick for it wakes every stream
+                // forever for a check that can never fire.
+                let idle_enabled = idle < Duration::from_secs(u32::MAX as u64 / 2);
+                let idle_step = Duration::from_secs(5).min(idle);
+                let idle_tick = tokio::time::sleep(idle_step);
+                tokio::pin!(idle_tick);
+                loop {
+                    tokio::select! {
+                        r = &mut c2s, if c2s_total.is_none() => match r {
+                            Ok(v) => {
+                                c2s_total = Some(v);
+                                done_c2s.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                done_c2s.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break Err(e);
+                            }
+                        },
+                        r = &mut s2c, if s2c_total.is_none() => match r {
+                            Ok(v) => {
+                                s2c_total = Some(v);
+                                done_s2c.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                done_s2c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break Err(e);
+                            }
+                        },
+                        _ = &mut idle_tick, if idle_enabled => {
+                            let elapsed_ms = coarse_millis();
+                            let idle_ms = idle.as_millis() as u64;
+                            // Per-direction stall, AND-gated on the shared stamp below: a
+                            // direction that already reached clean EOF is exempt — its
+                            // stamp legitimately stops — and the `Err` runs the shared
+                            // reset/stop+RST disposition, so the peer learns the stall
+                            // as a reset.
+                            let c2s_stalled = c2s_total.is_none()
+                                && elapsed_ms.saturating_sub(c2s_last.load(Ordering::Relaxed))
+                                    >= idle_ms;
+                            let s2c_stalled = s2c_total.is_none()
+                                && elapsed_ms.saturating_sub(s2c_last.load(Ordering::Relaxed))
+                                    >= idle_ms;
+                            // AND-gated on the shared stamp: a direction that went quiet
+                            // on its own (e.g. c2s done sending while s2c downloads past
+                            // the window) is healthy, not a stall — the old shared-stamp
+                            // logic kept such flows alive. Kill only when some unfinished
+                            // direction is silent AND nothing flowed anywhere, keeping
+                            // the direction name for the log line.
+                            let shared_expired = elapsed_ms
+                                .saturating_sub(last_ms.load(Ordering::Relaxed))
+                                >= idle_ms;
+                            if (c2s_stalled || s2c_stalled) && shared_expired {
+                                let dir = if c2s_stalled && s2c_stalled {
+                                    "both directions"
+                                } else if c2s_stalled {
+                                    "c2s"
+                                } else {
+                                    "s2c"
+                                };
+                                break Err(anyhow::anyhow!(
+                                    "tcp stream stall ({dir}) idle>{idle:?} after {}B up/{}B down",
+                                    c2s_total.unwrap_or(0),
+                                    s2c_total.unwrap_or(0),
+                                ));
+                            }
+                            // Shared-only expiry (no unfinished direction silent, yet
+                            // nothing flowed anywhere): kept as the overall-idle arm so
+                            // this check is not dead code behind the gate above.
+                            if shared_expired {
+                                break Err(anyhow::anyhow!(
+                                    "tcp stream idle>{idle:?} after {}B up/{}B down",
+                                    c2s_total.unwrap_or(0),
+                                    s2c_total.unwrap_or(0),
+                                ));
+                            }
+                            // Re-arm towards the same fixed cadence rather than from "now":
+                            // a chunk arriving just before the deadline must not push the
+                            // check another full step into the future.
+                            idle_tick
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + idle_step);
+                        }
                     }
-                    // Re-arm towards the same fixed cadence rather than from "now":
-                    // a chunk arriving just before the deadline must not push the
-                    // check another full step into the future.
-                    idle_tick
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + idle_step);
+                    if let (Some(a), Some(b)) = (c2s_total, s2c_total) {
+                        break Ok((a, b));
+                    }
                 }
+            }; // pump futures (and their borrows of `tcp`, `send` and `recv`) end here
+            outcome
+        };
+        match outcome {
+            Ok((a, b)) => {
+                // Both halves reached clean EOF: graceful FIN close. Mark
+                // finished first: a cancellation during `shutdown().await`
+                // must not turn this clean end into an RST.
+                self.finished = true;
+                if let Some(tcp) = self.tcp.as_mut() {
+                    tcp.shutdown().await.ok();
+                }
+                Ok((a, b))
             }
-            if let (Some(a), Some(b)) = (c2s_total, s2c_total) {
-                break Ok((a, b));
+            Err(e) => {
+                // Same disposition as before the guard existed: RST for the
+                // TCP application, and reset/stop the QUIC halves that were
+                // abandoned mid-flight. A half that already reached clean EOF
+                // is left alone (its data was delivered).
+                if let Some(tcp) = self.tcp.take() {
+                    abort_tcp(tcp);
+                }
+                if !self.done_c2s.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(send) = self.send.as_mut()
+                {
+                    send.reset(0x04u32.into()).ok();
+                }
+                if !self.done_s2c.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(recv) = self.recv.as_mut()
+                {
+                    recv.stop(0x04u32.into()).ok();
+                }
+                self.finished = true;
+                Err(e)
             }
-        }
-    }; // pump futures (and their borrows of `tcp`, `send` and `recv`) end here
-    match outcome {
-        Ok((a, b)) => {
-            // Both halves reached clean EOF: graceful FIN close.
-            tcp.shutdown().await.ok();
-            Ok((a, b))
-        }
-        Err(e) => {
-            // Any abnormal end aborts with RST (see `abort_tcp`): a FIN here
-            // would pose as a complete transfer and silently corrupt downloads.
-            abort_tcp(tcp);
-            // ...and the *peer* has to learn the same thing, which is why the
-            // pump futures only borrow the QUIC halves. `Drop for
-            // quinn::SendStream` calls `finish()` — a graceful FIN — so an
-            // upload direction abandoned because the download failed (or because
-            // the idle watchdog fired) used to tell the peer "transfer
-            // complete". The peer's `read_chunks` then returns a clean
-            // `Ok(None)` instead of a reset, its own `abort_tcp` never runs, and
-            // the application on that side accepts a truncated transfer as a
-            // whole one: exactly the silent corruption `abort_tcp` exists to
-            // prevent, one hop further out. `recv.stop` is the mirror image for a
-            // download abandoned mid-flight — it makes the peer's `write_chunk`
-            // fail with `Stopped` instead of succeeding into a void.
-            //
-            // Both are gated on the direction's own completion flag, because a
-            // half that already reached clean EOF must *not* be reset: its data
-            // was delivered and the peer may already have acted on it, and a
-            // reset after FIN would retroactively mark a complete transfer as
-            // aborted. (`stop` on a fully-read stream is a protocol no-op, so
-            // skipping it costs nothing either.)
-            if c2s_total.is_none() {
-                send.reset(0x04u32.into()).ok();
-            }
-            if s2c_total.is_none() {
-                recv.stop(0x04u32.into()).ok();
-            }
-            Err(e)
         }
     }
+}
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Cancelled mid-pump: no final disposition ran. Apply it here before
+        // the owned fields drop (a plain drop would FIN the TCP socket and
+        // `finish()` the send half — a clean EOF on a truncated transfer).
+        if !self.done_c2s.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(send) = self.send.as_mut()
+        {
+            send.reset(0x04u32.into()).ok();
+        }
+        if !self.done_s2c.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(recv) = self.recv.as_mut()
+        {
+            recv.stop(0x04u32.into()).ok();
+        }
+        if let Some(tcp) = self.tcp.take() {
+            abort_tcp(tcp);
+        }
+    }
+}
+
+/// Internal entry: wrap the resources in a guard and run the pump.
+async fn copy_tcp_quic_inner(
+    tcp: tokio::net::TcpStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    idle: Duration,
+    ack: Option<Duration>,
+) -> Result<(u64, u64)> {
+    let mut guard = PumpGuard::new(tcp, send, recv);
+    guard.run(idle, ack).await
 }
 
 /// Abort a TCP socket with RST instead of FIN.

@@ -19,7 +19,8 @@ pub use r2_frag::{R2FragFlow, R2Fragmenter};
 pub use r2_reasm::{R2Assembled, R2Reassembler};
 pub use r2_stage::{
     PackedFrames, R2DrainAttempt, R2DrainOutcome, R2StageItem, R2StageKind, R2Stager,
-    book_too_large, drain_staged, encode_standalone_item, send_packed_frames, try_drain_staged,
+    book_too_large, drain_session_staged, drain_staged, encode_standalone_item, send_packed_frames,
+    try_drain_staged, try_send_direct_borrowed,
 };
 pub use reassembler::DgramReassembler;
 pub(crate) use reassembler::Partial;
