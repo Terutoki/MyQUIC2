@@ -1466,7 +1466,7 @@ flowchart LR
 
 #### Connection pool panorama
 
-_Seven QUIC connections by default; each slot is its own endpoint and runtime._
+_Eight QUIC connections by default (4 TCP + 2 interactive UDP + 2 bulk UDP); each slot is its own endpoint and runtime._
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontSize":"14px","lineColor":"#94a3b8","textColor":"#0f172a","edgeLabelBackground":"#f8fafc"}}}%%

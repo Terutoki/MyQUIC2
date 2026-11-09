@@ -61,7 +61,7 @@ as per `git diff`. Implementation results:
 | F11 | ✅ Fixed | `src/lib.rs` process-level socket buffer probe cache (subsequent sockets skip 4~6 getsockopt / failed BUFFFORCE) + `udp_socket_dual_small_addr`; `server/table.rs` table-level `live` count makes `note_empty_state` O(1) |
 | F12 | ✅ Fixed | `stats/udp_stats.rs` `fragmented()`/`unsolicited()` merged into thread-local 256 batching |
 | F13 | ⏸ deferred | Requires rewriting the `push_with_chunk` borrow/accounting structure, gain ~4ns/fragment + 30~45ns at completion, risk not worth it; left for a separate change |
-| F14 | ◐ Partial | Fixed: P3-2 reassembly tick guard, P3-3 pin hit skips SSRF re-check, P3-4 fragmenter clock lazification, P3-5 DNS warm-hit positive-then-negative + single allocation, P3-6 SocketAddr direct pass; Not done: P3-1 drop counting padded shard, P3-7 CONNECT timer merging, P3-8 dispatcher slice_ref, P3-9 interactive single-connection fragmentation (all low gain/cold path/design tradeoff) |
+| F14 | ◐ Partial | Fixed: P3-2 reassembly tick guard, P3-3 pin hit skips SSRF re-check, P3-4 fragmenter clock lazification, P3-5 DNS warm-hit positive-then-negative + single allocation, P3-6 SocketAddr direct pass; Not done: P3-1 drop counting padded shard, P3-7 CONNECT timer merging, P3-8 dispatcher slice_ref (all low gain/cold path/design tradeoff); P3-9 (interactive single-connection fragmentation) is resolved by A2's interactive sharding |
 
 > Constraint compliance: no configuration parameters/defaults changed (`src/config/**`, `Cargo.toml` zero changes), no dependencies added;
 > all are code logic, data structure, batching, and scheduling structure changes. Behavioral changes see §7.
@@ -433,9 +433,9 @@ during the same cache-hot access that stores the chunk in `push`, and move it di
 | P3-4 | `udp/fragmenter.rs:213` | One precise `mono_millis()` read per fragment payload, but it is only used after 2^32 id wraps; move the clock evaluation into the `last_wrap_ms != 0` branch |
 | P3-5 | `dns/resolve.rs:386-450` | warm-hit does negative then positive, two moka probes each time; the Ok branch does `Vec<SocketAddr>` + `Arc::from`, two allocations. Query positive first, with the port attached by the caller |
 | P3-6 | `client/assoc.rs:45-46` + `lib.rs:319` | Each association formats a `SocketAddr` into a String and parses it back; add a constructor entry in lib that takes `SocketAddr` |
-| P3-7 | `client/socks.rs:133,150,166,218,246-252,377` + `pool.rs:763-771,252-257` | ~7 independent timeout timers per TCP CONNECT; `holds_dead_handle` and `wait_conn` probe liveness twice on the same quinn state lock; non-interactive flows pay an extra `set_priority(0)` (quinn-proto 0.11 only stores the i32 and sends no frame) |
+| P3-7 | `client/socks.rs:133,150,166,218,246-252,377` + `pool.rs:362-367,489-516` | ~7 independent timeout timers per TCP CONNECT; `holds_dead_handle` and `wait_conn` probe liveness twice on the same quinn state lock; non-interactive flows pay an extra `set_priority(0)` (quinn-proto 0.11 only stores the i32 and sends no frame) |
 | P3-8 | `client/dispatcher.rs:220-243` | BATCH does one `d.slice_ref` per payload + one `entry.relay.clone()` per frame; can change to `StagedReply{frame,off,len}` holding just 1 frame + 1 socket Arc per frame |
-| P3-9 | `client/pool.rs:592-598`, `egress.rs:259-290` | The interactive UDP class is hard-bound to a single connection (one driver + one state lock carries all small-packet associations); bulk already has shard rotation, which could be generalized (design cap, not a defect) |
+| P3-9 | `client/pool.rs:966-1000`, `client/main.rs:409-418` | ✅ Resolved by A2: the interactive UDP class has its own `udp_interactive_conns` shards (`interactive_shards`, separate `udp_irr` cursor) and each shard has its own endpoint/driver, so the interactive population no longer funnels into one connection. What remains is the per-connection uplink FIFO (§21's time bound), not the single-connection cap. |
 
 ---
 
@@ -557,7 +557,7 @@ The following, after line-by-line verification + existing in-code measurements, 
 ### 7.4 Follow-up (deferred, per §0.5)
 
 F3 (thread topology), F8 (client N-pack), F10 (cross-runtime), F13 (reassembler probe fusion),
-P3-1/P3-7/P3-8/P3-9 — all need a Linux benchmark or have a gain/risk ratio unsuitable for this batch; design proposals were retained in the report.
+P3-1/P3-7/P3-8 — all need a Linux benchmark or have a gain/risk ratio unsuitable for this batch; design proposals were retained in the report. (P3-9 is resolved by A2's interactive sharding.)
 
 ## 8. Third Batch: Independent Audit of v0.2.3 (2026-10-28)
 

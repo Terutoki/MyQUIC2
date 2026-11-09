@@ -61,16 +61,29 @@ const FD_GUARD: usize = 256;
 /// Fds the documented caps can need at once: one accepted socket per SOCKS
 /// relay ([`MAX_SOCKS_CONNS`], shared with `[[tcp_forward]]`), one socket per
 /// UDP association ([`MAX_UDP_ASSOCS`], shared with `[[udp_forward]]` peers) and
-/// one QUIC endpoint per pool slot ([`MAX_POOL_CONNS`]).
-fn designed_fds() -> u64 {
-    (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + MAX_POOL_CONNS + FD_GUARD) as u64
+/// one QUIC endpoint per **pool slot** — the TCP pool plus the dedicated UDP
+/// range, which is wider than [`MAX_POOL_CONNS`] with `udp_split` on.
+fn designed_fds_for_slots(slots: usize) -> u64 {
+    (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + slots + FD_GUARD) as u64
+}
+
+/// [`designed_fds_for_slots`] for `c`'s resolved pool layout. The layout comes
+/// from [`planned_slot_count`], the same definition the pool is built from, so
+/// a wide UDP range cannot be under-budgeted here.
+fn designed_fds(c: &ClientConf) -> u64 {
+    designed_fds_for_slots(planned_slot_count(
+        c.conn_count(),
+        c.udp_split(),
+        c.udp_interactive_cnt(),
+        c.udp_egress_cnt(),
+    ))
 }
 
 /// Raise the soft `RLIMIT_NOFILE` toward [`designed_fds`] and report what is in
 /// force. See `myquic2::fdlimit` for why this is a startup step rather than a
 /// per-accept error path.
-fn report_fd_budget() {
-    let want = designed_fds();
+fn report_fd_budget(c: &ClientConf) {
+    let want = designed_fds(c);
     match myquic2::fdlimit::raise_nofile_limit(want) {
         Ok(lim) if lim.shortfall(want) == 0 => info!("{}", lim.describe(want)),
         Ok(lim) => warn!("{}", lim.describe(want)),
@@ -174,7 +187,7 @@ fn main() -> Result<()> {
     // association caps are one fd each, far above a stock unix soft limit, and
     // the accept loop treats `EMFILE` as transient — so without this line the
     // client silently serves a fraction of its documented capacity.
-    report_fd_budget();
+    report_fd_budget(&c);
     let main_workers = main_runtime_workers(&c);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(main_workers)

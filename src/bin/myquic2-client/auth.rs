@@ -578,10 +578,12 @@ pub(crate) async fn dial_once(
     // and widening the window in which the pool still advertises the previous,
     // dead connection. Every stage below now shares this instant.
     let deadline = t0 + budget;
-    // Every dial resets the slot's phase: a publication is always paired with
-    // the phase of the handshake that produced it (the connection loop publishes
-    // after this returns).
-    zero_rtt.mark_none();
+    // Every dial starts a new attempt and resets the slot's phase: a
+    // publication is always paired with the phase of the handshake that
+    // produced it (the connection loop publishes after this returns). The id is
+    // carried to every later write so a monitor from a superseded candidate can
+    // never overwrite the next attempt's phase.
+    let attempt = zero_rtt.begin_attempt();
     let connecting = ep.connect_with(cfg.clone(), server, name)?;
     // 0.11 API: `into_0rtt()` yields `(Connection, ZeroRttAccepted)`; the future
     // resolves when the handshake completes with true = early data kept,
@@ -593,7 +595,7 @@ pub(crate) async fn dial_once(
             // The token goes out NOW, on a 0-RTT uni stream opened while the
             // handshake is in flight. No later stage re-sends it synchronously:
             // the monitor below is the 1-RTT fallback.
-            zero_rtt.mark_pending();
+            zero_rtt.mark_pending(attempt);
             let token = auth_token.to_owned();
             let early_ok = if token.is_empty() {
                 true
@@ -611,11 +613,12 @@ pub(crate) async fn dial_once(
                     }
                 }
             };
-            zero_rtt.set_token_early(early_ok && !token.is_empty());
+            zero_rtt.set_token_early(attempt, early_ok && !token.is_empty());
             spawn_zero_rtt_monitor(
                 conn.clone(),
                 accepted_fut,
                 zero_rtt.clone(),
+                attempt,
                 token,
                 early_ok,
             );
@@ -684,13 +687,21 @@ fn spawn_zero_rtt_monitor(
     conn: quinn::Connection,
     accepted_fut: quinn::ZeroRttAccepted,
     zero_rtt: Arc<ZeroRttState>,
+    attempt: u64,
     token: String,
     early_ok: bool,
 ) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
         let accepted = accepted_fut.await;
-        zero_rtt.mark_settled(accepted);
+        // A verdict for a superseded attempt is dropped: the slot is on a newer
+        // dial, this connection will never be published, and writing its phase
+        // would corrupt the current attempt's 0-RTT decision (see
+        // `ZeroRttState`).
+        if !zero_rtt.mark_settled(attempt, accepted) {
+            tracing::debug!("0-RTT verdict for a superseded dial attempt; ignored");
+            return;
+        }
         if accepted {
             ZERO_RTT_ACCEPTED.fetch_add(1, Relaxed);
             tracing::debug!("QUIC resumption: 0-RTT accepted");

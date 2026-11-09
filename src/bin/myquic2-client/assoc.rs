@@ -540,7 +540,7 @@ pub(crate) fn send_payload_uplink(
                             bind.index,
                             uplink.pending_len(),
                             pool.udp_fail_closed(),
-                            pool.slot(pool.udp_global_slot(bind.index)).is_live(),
+                            pool.slot_ref(pool.udp_global_slot(bind.index)).is_live(),
                             egress_shared.refreshing[bind.index]
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         )
@@ -1088,7 +1088,7 @@ pub(crate) async fn udp_associate_inner(
     //
     // With no slot runtime (shared-runtime topology, unit tests) the loop runs
     // inline on the caller's runtime, which is the pre-existing shape.
-    let target = bind.and_then(|b| pool.slot(pool.udp_global_slot(b.index)).runtime());
+    let target = bind.and_then(|b| pool.slot_ref(pool.udp_global_slot(b.index)).runtime());
     // The pool is thread-local: hand the pre-migration buffer back to *this*
     // thread before the steady state takes its own from the runtime it lands on.
     assoc_recycle_buf(buf);

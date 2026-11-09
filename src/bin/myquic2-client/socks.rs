@@ -149,7 +149,7 @@ pub(crate) async fn handle_socks(
     });
 
     let slot_idx = pool.pick_tcp_index(&target);
-    let slot = pool.slot(slot_idx);
+    let slot = pool.slot_ref(slot_idx);
     // The slot's 0-RTT phase: on a resumed dial the connection may still be
     // handshaking here, so the open below can ride early data.
     let zero_rtt = slot.zero_rtt_state();
@@ -213,7 +213,7 @@ pub(crate) async fn handle_socks(
                 // until the loop's watchdog noticed, and a dead egress handle
                 // could outlive the redial. Whichever writer wins the clear
                 // owns the whole cleanup, so nothing is released twice.
-                retire_dead_slot(&slot, slot_idx, &egress_shared, &conn);
+                retire_dead_slot(slot, slot_idx, &egress_shared, &conn);
                 write_socks_reply(
                     &mut s,
                     fast_socks5::consts::SOCKS5_REPLY_HOST_UNREACHABLE,

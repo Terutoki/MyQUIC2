@@ -1235,7 +1235,7 @@ pub(crate) fn send_sess_close(
     let cached = bind.and_then(|b| egress.cached_handle(b));
     let fallback = match &cached {
         Some(_) => None,
-        None => bind.and_then(|b| pool.slot(pool.udp_global_slot(b.index)).rev2()),
+        None => bind.and_then(|b| pool.slot_ref(pool.udp_global_slot(b.index)).rev2()),
     };
     let reached = cached.as_ref().map(|(_, rev2)| rev2.clone()).or(fallback);
     if let Some(rev2) = &reached

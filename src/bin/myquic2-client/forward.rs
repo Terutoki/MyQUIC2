@@ -243,7 +243,7 @@ pub(crate) async fn relay_tcp_forward(
     // slot's runtime so its QUIC writes do not cross cores to the driver's
     // connection-state mutex (see `crate::run_tcp_pump`).
     let pump = copy_tcp_quic_acked(sock, send, recv, FORWARD_TCP_IDLE, TCP_DIAL_ACK_TIMEOUT);
-    match crate::run_tcp_pump(pool.slot(slot_idx).runtime(), pump).await {
+    match crate::run_tcp_pump(pool.slot_ref(slot_idx).runtime(), pump).await {
         Ok((up, down)) => {
             tracing::debug!("tcp_forward {target:?} clean fin: {up}B up/{down}B down");
             Ok(())
@@ -280,7 +280,7 @@ async fn open_forward_stream(
     timeout: Duration,
 ) -> anyhow::Result<(usize, quinn::SendStream, quinn::RecvStream)> {
     let slot_idx = pool.pick_tcp_index(target);
-    let slot = pool.slot(slot_idx);
+    let slot = pool.slot_ref(slot_idx);
     let zero_rtt = slot.zero_rtt_state();
     let mut gen_rx = slot.gen_rx.clone();
     let conn = slot.wait_conn(&mut gen_rx, timeout).await?;
@@ -310,7 +310,7 @@ async fn open_forward_stream(
             // reconnect loop's watchdog, so it must retire the slot's
             // generation exactly like the SOCKS path does.
             if conn.close_reason().is_some() {
-                retire_dead_slot(&slot, slot_idx, egress, &conn);
+                retire_dead_slot(slot, slot_idx, egress, &conn);
             }
             Err(e)
         }

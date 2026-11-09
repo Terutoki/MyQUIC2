@@ -15,12 +15,14 @@ pub(crate) const MAX_UDP_SLOTS: usize = MAX_UDP_INTERACTIVE_CONNS + MAX_UDP_EGRE
 /// immutable, so a reader that wins the load keeps a consistent handle for as
 /// long as it holds the guard.
 pub(crate) type SharedConn = Arc<ArcSwapOption<quinn::Connection>>;
-/// Bump the connection-generation counter. Split across two statements on
-/// purpose: the borrow's read guard must drop before `send_replace` takes
-/// the write lock, otherwise this self-deadlocks inside one statement.
+/// Bump the connection-generation counter.
+///
+/// `send_modify` takes the watch write lock once and mutates the value in
+/// place, so the increment is atomic across concurrent writers and there is no
+/// read guard to drop first (the old `send_replace(tx.borrow() + 1)` shape
+/// self-deadlocked by holding the read guard across the write lock).
 pub(crate) fn bump_gen(tx: &watch::Sender<u64>) {
-    let next = tx.borrow().wrapping_add(1);
-    tx.send_replace(next);
+    tx.send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 /// 0-RTT handshake phase of the connection a [`ConnSlot`] currently publishes.
@@ -31,7 +33,7 @@ pub(crate) fn bump_gen(tx: &watch::Sender<u64>) {
 /// still discard that early data (`ZeroRttAccepted` then resolves `false`), and
 /// quinn reports such a discard only later, as `ZeroRttRejected` errors from the
 /// 0-RTT streams/datagrams. This state is how the rest of the client learns
-/// which of the three windows the published connection is in:
+/// which of the four windows the published connection is in:
 ///
 /// - [`Self::NONE`] — the dial was a full handshake that was awaited to
 ///   completion; every stream is 1-RTT (the pre-0-RTT behaviour);
@@ -42,18 +44,27 @@ pub(crate) fn bump_gen(tx: &watch::Sender<u64>) {
 /// - [`Self::REJECTED`] — the peer discarded it: the early token is re-sent by
 ///   the dial's monitor and TCP opens must retry on a 1-RTT stream.
 ///
-/// It is per-generation state published with the connection (reset at the start
-/// of every dial), not a global: a reader that already holds an older
-/// `quinn::Connection` never consults a newer dial's phase in a way that could
-/// change behaviour, and the only consumer — the TCP open path's 0-RTT retry —
-/// re-validates through the connection it was handed.
+/// The phase is scoped to a **dial attempt**, not to the slot. Every dial starts
+/// with [`Self::begin_attempt`], which resets the phase and returns an attempt
+/// id; every later write (the dial's `mark_pending`/`set_token_early` and the
+/// detached monitor's `mark_settled`) must present that id. The phase, the
+/// early-token flag and the attempt id live in one atomic word and are updated
+/// by compare-and-swap, so a monitor whose attempt has been superseded — e.g. a
+/// candidate address that failed before publication while the reconnect loop
+/// moved on to the next candidate — cannot overwrite the next attempt's phase.
+///
+/// A reader that already holds an older `quinn::Connection` still reads
+/// whichever attempt is current; the phase only gates an optimisation
+/// (waiting/retrying on 0-RTT rejection), and the stream's own
+/// `ZeroRttRejected` error remains the authority.
 #[derive(Debug)]
 pub(crate) struct ZeroRttState {
-    phase: std::sync::atomic::AtomicU8,
-    /// Whether the early auth-token uni stream was written in the 0-RTT window.
-    /// When it was not, the dial's monitor re-sends the token on a 1-RTT stream
-    /// even if the early data was accepted.
-    token_early: std::sync::atomic::AtomicBool,
+    /// `attempt` (bits 3..) | `token_early` (bit 2) | `phase` (bits 0..=1).
+    ///
+    /// One word so the identity check and the update it guards commit
+    /// together: a compare-and-swap that still sees the caller's attempt is the
+    /// only way a write lands.
+    state: std::sync::atomic::AtomicU64,
 }
 
 impl ZeroRttState {
@@ -66,10 +77,55 @@ impl ZeroRttState {
     /// The peer discarded the early data; only 1-RTT streams work now.
     pub(crate) const REJECTED: u8 = 3;
 
+    const PHASE_MASK: u64 = 0b11;
+    const TOKEN_BIT: u64 = 1 << 2;
+    const ATTEMPT_SHIFT: u32 = 3;
+    /// 61 bits of attempt id; a wrap would take 2^61 dials and can be ignored.
+    const ATTEMPT_MASK: u64 = u64::MAX >> Self::ATTEMPT_SHIFT;
+
+    fn pack(attempt: u64, phase: u8, token_early: bool) -> u64 {
+        ((attempt & Self::ATTEMPT_MASK) << Self::ATTEMPT_SHIFT)
+            | (u64::from(phase) & Self::PHASE_MASK)
+            | if token_early { Self::TOKEN_BIT } else { 0 }
+    }
+
+    fn unpack(word: u64) -> (u64, u8, bool) {
+        (
+            word >> Self::ATTEMPT_SHIFT,
+            (word & Self::PHASE_MASK) as u8,
+            word & Self::TOKEN_BIT != 0,
+        )
+    }
+
+    /// Apply `f` only while `attempt` is still the current dial. The CAS makes
+    /// "still current" and "the write lands" one step: a concurrent
+    /// [`Self::begin_attempt`] either wins the word first (this call then sees a
+    /// different attempt and does nothing) or loses to it (this call's write is
+    /// overwritten by the new attempt's reset).
+    fn update(&self, attempt: u64, f: impl Fn(u8, bool) -> (u8, bool)) -> bool {
+        let mut cur = self.state.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let (current, phase, token_early) = Self::unpack(cur);
+            if current != attempt {
+                return false;
+            }
+            let (phase, token_early) = f(phase, token_early);
+            let next = Self::pack(current, phase, token_early);
+            match self.state.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            phase: std::sync::atomic::AtomicU8::new(Self::NONE),
-            token_early: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU64::new(Self::pack(0, Self::NONE, false)),
         })
     }
 
@@ -77,7 +133,7 @@ impl ZeroRttState {
     /// (waiting/retrying on 0-RTT rejection), never a correctness decision:
     /// the stream's own `ZeroRttRejected` error remains the authority.
     pub(crate) fn phase(&self) -> u8 {
-        self.phase.load(std::sync::atomic::Ordering::Relaxed)
+        Self::unpack(self.state.load(std::sync::atomic::Ordering::Relaxed)).1
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -93,48 +149,63 @@ impl ZeroRttState {
         self.phase() == Self::ACCEPTED
     }
 
-    /// The dial is a full handshake: no 0-RTT data was ever sent.
-    pub(crate) fn mark_none(&self) {
-        self.phase
-            .store(Self::NONE, std::sync::atomic::Ordering::Relaxed);
-        self.token_early
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+    /// Start a dial attempt: reset the phase and return the id every later
+    /// write for this attempt must present. Called at the top of every
+    /// `dial_once`, including each candidate of a multi-address dial.
+    pub(crate) fn begin_attempt(&self) -> u64 {
+        let mut cur = self.state.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let attempt = (cur >> Self::ATTEMPT_SHIFT).wrapping_add(1) & Self::ATTEMPT_MASK;
+            let next = Self::pack(attempt, Self::NONE, false);
+            match self.state.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return attempt,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
-    /// A resumed dial published a 0.5-RTT connection.
-    pub(crate) fn mark_pending(&self) {
-        self.phase
-            .store(Self::PENDING, std::sync::atomic::Ordering::Relaxed);
+    /// A resumed dial entered its 0.5-RTT window.
+    pub(crate) fn mark_pending(&self, attempt: u64) {
+        let _ = self.update(attempt, |_, token_early| (Self::PENDING, token_early));
     }
 
     /// The handshake completed: `accepted` is quinn's `ZeroRttAccepted` value.
-    pub(crate) fn mark_settled(&self, accepted: bool) {
-        self.phase.store(
-            if accepted {
-                Self::ACCEPTED
-            } else {
-                Self::REJECTED
-            },
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Returns whether the verdict was committed; `false` means this attempt
+    /// has been superseded (its connection will never be the slot's).
+    pub(crate) fn mark_settled(&self, attempt: u64, accepted: bool) -> bool {
+        self.update(attempt, move |_, token_early| {
+            (
+                if accepted {
+                    Self::ACCEPTED
+                } else {
+                    Self::REJECTED
+                },
+                token_early,
+            )
+        })
     }
 
-    pub(crate) fn set_token_early(&self, sent: bool) {
-        self.token_early
-            .store(sent, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn set_token_early(&self, attempt: u64, sent: bool) {
+        let _ = self.update(attempt, move |phase, _| (phase, sent));
     }
 
     #[cfg(test)]
     pub(crate) fn token_early(&self) -> bool {
-        self.token_early.load(std::sync::atomic::Ordering::Relaxed)
+        Self::unpack(self.state.load(std::sync::atomic::Ordering::Relaxed)).2
     }
 
     /// Wait (bounded by `deadline`) until the handshake phase is known.
     ///
-    /// Polled at [`ZERO_RTT_SETTLE_POLL`]: the only caller is the TCP open
-    /// retry after a `ZeroRttRejected` error, i.e. the handshake is already
-    /// complete and the monitor task is about to publish the phase; a single
-    /// 10 ms tick covers the scheduling gap without a wakeup channel on the
+    /// Polled at [`ZERO_RTT_SETTLE_POLL`]. The callers are the TCP open retry
+    /// after a `ZeroRttRejected` error and the rev3 control-stream task waiting
+    /// for a resumed dial to settle, so the handshake is already complete or
+    /// about to be; the monitor task publishes the phase, and a single 10 ms
+    /// tick covers the scheduling gap without adding a wakeup channel to the
     /// per-flow path.
     pub(crate) async fn wait_settled(&self, deadline: tokio::time::Instant) {
         while self.is_pending() {
@@ -667,6 +738,59 @@ impl EgressClass {
 /// its class's connection — so the worst case is never worse than before.
 pub(crate) const UDP_INTERACTIVE_MAX: usize = 512;
 
+/// Resolved pool shape for one config: the TCP slots plus the dedicated UDP
+/// egress range, every count clamped to the hard caps.
+///
+/// This is the **single** definition of the layout. [`ConnPool::new_with_bulk_ports`],
+/// [`planned_slot_count`] and the client's fd budget all derive from it, so a
+/// new clamp can never leave one of them describing a different pool (the
+/// scratch arrays in the routing and egress paths are sized from
+/// [`MAX_POOL_CONNS`] / [`MAX_UDP_SLOTS`] and depend on the same caps).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotLayout {
+    /// TCP slots (`0..tcp`): slot 0 interactive, the rest bulk.
+    pub(crate) tcp: usize,
+    /// Interactive UDP shards (UDP-range indices `0..interactive`).
+    pub(crate) interactive: usize,
+    /// Bulk UDP shards (UDP-range indices `interactive..interactive + bulk`).
+    pub(crate) bulk: usize,
+    /// Width of the UDP range: `interactive + bulk`, or 1 without the split.
+    pub(crate) udp: usize,
+    /// `tcp + udp`.
+    pub(crate) total: usize,
+}
+
+impl SlotLayout {
+    /// Resolve a layout from the config knobs, applying the same clamps the
+    /// pool has always applied: at least one TCP slot, at least one shard per
+    /// class when split, and nothing wider than the caps the scratch arrays
+    /// assume. `udp_split = false` collapses the range to one shared slot.
+    pub(crate) fn for_config(
+        conns: usize,
+        udp_split: bool,
+        udp_interactive: usize,
+        udp_bulk: usize,
+    ) -> Self {
+        let tcp = conns.clamp(1, MAX_POOL_CONNS);
+        let (interactive, bulk) = if udp_split {
+            (
+                udp_interactive.clamp(1, MAX_UDP_INTERACTIVE_CONNS),
+                udp_bulk.clamp(1, MAX_UDP_EGRESS_CONNS),
+            )
+        } else {
+            (1, 1)
+        };
+        let udp = if udp_split { interactive + bulk } else { 1 };
+        Self {
+            tcp,
+            interactive,
+            bulk,
+            udp,
+            total: tcp + udp,
+        }
+    }
+}
+
 /// The client's QUIC connection pool: `n` TCP slots indexed `0..n`, where
 /// `n = ClientConf::conn_count()` (4 by default, `quic_conns`), plus a
 /// **dedicated UDP egress range** past the TCP slots.
@@ -737,6 +861,9 @@ pub(crate) struct ConnPool {
     /// `interactive_shards..interactive_shards + bulk_shards`). 1 when
     /// `udp_split` is off.
     pub(crate) bulk_shards: usize,
+    /// Width of the UDP range ([`SlotLayout::udp`]): `interactive_shards +
+    /// bulk_shards` with the split on, 1 without it.
+    pub(crate) udp_slots: usize,
     /// When set, UDP only ever uses dedicated UDP slots *of its own class*: if
     /// every one of them is down the datagram is dropped (counted in
     /// `dgram_drops::NO_EGRESS`) instead of sharing a TCP connection's
@@ -814,23 +941,8 @@ impl ConnPool {
         udp_bulk_shards: usize,
         data_stale_ms: u64,
     ) -> Self {
-        let tcp = n.clamp(1, MAX_POOL_CONNS);
-        let interactive_shards = if udp_split {
-            udp_interactive_shards.clamp(1, MAX_UDP_INTERACTIVE_CONNS)
-        } else {
-            1
-        };
-        let bulk_shards = if udp_split {
-            udp_bulk_shards.clamp(1, MAX_UDP_EGRESS_CONNS)
-        } else {
-            1
-        };
-        let udp_slots = if udp_split {
-            interactive_shards + bulk_shards
-        } else {
-            1
-        };
-        let slots: Vec<ConnSlot> = (0..tcp + udp_slots).map(|_| ConnSlot::fresh()).collect();
+        let layout = SlotLayout::for_config(n, udp_split, udp_interactive_shards, udp_bulk_shards);
+        let slots: Vec<ConnSlot> = (0..layout.total).map(|_| ConnSlot::fresh()).collect();
         Self {
             slots: Arc::new(slots),
             rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -838,10 +950,11 @@ impl ConnPool {
             udp_irr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interactive_ports: Arc::new(interactive_ports.into_iter().collect()),
             bulk_ports: Arc::new(bulk_ports.into_iter().collect()),
-            tcp_slots: tcp,
+            tcp_slots: layout.tcp,
             udp_split,
-            interactive_shards,
-            bulk_shards,
+            interactive_shards: layout.interactive,
+            bulk_shards: layout.bulk,
+            udp_slots: layout.udp,
             udp_fail_closed,
             data_stale_ms,
         }
@@ -855,11 +968,7 @@ impl ConnPool {
     /// UDP-range width: the interactive shards plus the bulk ones with the
     /// split on, a single shared slot with it off.
     pub(crate) fn udp_slot_count(&self) -> usize {
-        if self.udp_split {
-            self.interactive_shards + self.bulk_shards
-        } else {
-            1
-        }
+        self.udp_slots
     }
 
     /// Interactive UDP shards (the class's UDP-range width).
@@ -960,14 +1069,22 @@ impl ConnPool {
         self.udp_fail_closed
     }
 
-    /// The slot at `i`. Slots are installed by `new` and never removed, so the
-    /// index is always in range; out-of-range would mean the pool was not
-    /// built by `new`.
-    pub(crate) fn slot(&self, i: usize) -> ConnSlot {
+    /// The slot at `i`, borrowed. Prefer this on the per-flow paths: `slot`
+    /// clones the six `Arc`s and the watch pair (~9 refcount operations) for a
+    /// value whose only shared state is those very `Arc`s.
+    pub(crate) fn slot_ref(&self, i: usize) -> &ConnSlot {
         self.slots
             .get(i)
-            .cloned()
             .expect("pool slots are installed at startup and never removed")
+    }
+
+    /// The slot at `i`, owned. Only for callers that need a `'static` value
+    /// (`tokio::spawn`) or that store it; everything else should use
+    /// [`ConnPool::slot_ref`]. Slots are installed by `new` and never removed,
+    /// so the index is always in range; out-of-range would mean the pool was
+    /// not built by `new`.
+    pub(crate) fn slot(&self, i: usize) -> ConnSlot {
+        self.slot_ref(i).clone()
     }
 
     pub(crate) fn target_port(t: &TargetAddr) -> u16 {
@@ -985,24 +1102,31 @@ impl ConnPool {
     /// loop's inbound-progress stamp are what routing reads, and `wait_conn`
     /// remains the authority that fails a flow fast.
     ///
-    /// Two failovers, each a single re-pick over the same class rules, so a
-    /// flow can never oscillate and an all-unusable pool keeps the preference
-    /// for the bounded `wait_conn` stall:
+    /// Two overlays, applied in order to the **candidate that will be
+    /// returned** so neither can undo the other. Each re-picks at most once over
+    /// the same class rules, so a flow can never oscillate and an all-unusable
+    /// pool keeps the preference for the bounded `wait_conn` stall:
     ///
     /// 1. **Dead handle (L2)**: `live` is only a hint, so a slot whose QUIC
     ///    connection died in the window before the conn loop clears the bit
-    ///    still reads true; `close_reason()` is the authority.
+    ///    still reads true; `close_reason()` is the authority. A dead candidate
+    ///    is excluded from both the liveness and the freshness set before the
+    ///    re-pick (a dead handle is unusable whatever its progress stamp says).
     /// 2. **Path health (L3)**: a *blackholed* connection has no close reason
     ///    and still reads live — NAT rebind, Wi-Fi handover, SIGKILLed peer —
     ///    so `close_reason()` cannot see it until the silence watchdog fires
     ///    (`2/3 x idle`, 40 s at the shipped defaults). Its published
     ///    inbound-progress stamp goes stale first (see
     ///    [`ConnSlot::is_data_stale`] and [`data_stale_threshold_ms`]), so a
-    ///    `live` preference whose progress is stale is re-picked over the
+    ///    `live` candidate whose progress is stale is re-picked over the
     ///    live-and-fresh set. This changes
     ///    *selection only*: the slot stays live, the watchdog stays the
     ///    authority that force-closes and redials, and nothing here can trigger
     ///    a reconnect.
+    ///
+    /// The dead-handle probe is repeated on the L3 result, because a sibling
+    /// can die inside its stamp window; the common path pays one probe and a
+    /// failover at most two.
     pub(crate) fn pick_tcp_index(&self, t: &TargetAddr) -> usize {
         self.pick_tcp_index_inner(t, coarse_millis())
     }
@@ -1045,36 +1169,64 @@ impl ConnPool {
         // instead of spreading over the live set. One relaxed RMW per flow is
         // the same cost the old bulk-only increment paid.
         let rr = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let preferred = select_slot(pinned, rr, &live[..n]);
-        // L2 stale-live failover: a slot whose QUIC connection died in the
+        let mut pick = select_slot(pinned, rr, &live[..n]);
+        // L2 dead-handle failover: a slot whose QUIC connection died in the
         // window before the conn loop clears the bit still reads true and
         // `select_slot` keeps preferring it. `wait_conn` would then sit on that
         // slot's generation until the reconnect timeout even with live bulk
-        // siblings available. Confirm the preference with `close_reason()` and,
+        // siblings available. Confirm the candidate with `close_reason()` and,
         // when it holds a dead handle, re-pick once with the same `rr` and that
         // slot overlaid dead — class rules unchanged, and an all-dead pool
-        // keeps the preference for the bounded stall.
-        if live[preferred]
+        // keeps the preference for the bounded stall. The candidate is dropped
+        // from `fresh` too: a dead handle is unusable whatever its stamp says,
+        // and the L3 overlay must not select it again.
+        let mut pick_checked = false;
+        if live[pick] {
+            pick_checked = true;
+            if self
+                .slots
+                .get(pick)
+                .is_some_and(ConnSlot::holds_dead_handle)
+            {
+                live[pick] = false;
+                fresh[pick] = false;
+                pick = select_slot(pinned, rr, &live[..n]);
+                pick_checked = false;
+            }
+        }
+        // L3 path-health gate: the candidate is live but its inbound progress
+        // has been frozen for the threshold — a blackholed path that
+        // `close_reason()` cannot see yet. Re-pick once over the live-and-fresh
+        // set with the same `rr` and class rules, excluding the candidate just
+        // rejected. When every live slot is stale (a whole-pool outage, or a
+        // stalled clock) keep the candidate: a stale sibling would stall just
+        // the same, and `wait_conn` bounds the wait. Nothing is written here —
+        // the watchdog remains the only authority that closes and redials a
+        // slot.
+        if live[pick] && !fresh[pick] && fresh[..n].iter().any(|&f| f) {
+            fresh[pick] = false;
+            pick = select_slot(pinned, rr, &fresh[..n]);
+            pick_checked = false;
+        }
+        // The L3 re-pick is stamp-checked only: its connection can have died
+        // after the last progress sample. Confirm the final candidate once
+        // (unless the L2 probe above already covered it) and, when it is dead,
+        // prefer any fresh sibling left. With none, keep it: every alternative
+        // is dead too, and `wait_conn`'s bounded stall plus the conn loop's
+        // retire are the authority.
+        if !pick_checked
+            && live[pick]
             && self
                 .slots
-                .get(preferred)
+                .get(pick)
                 .is_some_and(ConnSlot::holds_dead_handle)
         {
-            live[preferred] = false;
-            return select_slot(pinned, rr, &live[..n]);
+            fresh[pick] = false;
+            if fresh[..n].iter().any(|&f| f) {
+                pick = select_slot(pinned, rr, &fresh[..n]);
+            }
         }
-        // L3 path-health gate: the preference is live but its inbound progress
-        // has been frozen for the threshold — a blackholed path that
-        // `close_reason()` cannot see yet. Re-pick once over the
-        // live-and-fresh set with the same `rr` and class rules. When every
-        // live slot is stale (a whole-pool outage, or a stalled clock) keep the
-        // preference: a stale sibling would stall just the same, and
-        // `wait_conn` bounds the wait. Nothing is written here — the watchdog
-        // remains the only authority that closes and redials a slot.
-        if live[preferred] && !fresh[preferred] && fresh[..n].iter().any(|&f| f) {
-            return select_slot(pinned, rr, &fresh[..n]);
-        }
-        preferred
+        pick
     }
 
     /// Pick the slot for a new TCP flow. Returning flows stick to their slot
@@ -1148,23 +1300,7 @@ pub(crate) fn planned_slot_count(
     udp_interactive: usize,
     udp_egress: usize,
 ) -> usize {
-    let tcp = conns.clamp(1, MAX_POOL_CONNS);
-    let interactive_shards = if udp_split {
-        udp_interactive.clamp(1, MAX_UDP_INTERACTIVE_CONNS)
-    } else {
-        1
-    };
-    let bulk_shards = if udp_split {
-        udp_egress.clamp(1, MAX_UDP_EGRESS_CONNS)
-    } else {
-        1
-    };
-    let udp_slots = if udp_split {
-        interactive_shards + bulk_shards
-    } else {
-        1
-    };
-    tcp + udp_slots
+    SlotLayout::for_config(conns, udp_split, udp_interactive, udp_egress).total
 }
 
 #[cfg(test)]
@@ -1194,10 +1330,30 @@ mod planned_slot_count_tests {
                 egress,
                 1,
             );
+            let layout = SlotLayout::for_config(conns, split, interactive, egress);
             assert_eq!(
                 planned_slot_count(conns, split, interactive, egress),
                 pool.slots_total(),
                 "config ({conns:?}, split={split}, interactive={interactive:?}, egress={egress:?})"
+            );
+            // The layout is the single definition: the built pool and the
+            // planned count must both be its fields, not a second arithmetic.
+            assert_eq!(
+                (
+                    layout.tcp,
+                    layout.interactive,
+                    layout.bulk,
+                    layout.udp,
+                    layout.total
+                ),
+                (
+                    pool.tcp_slots(),
+                    pool.interactive_shards(),
+                    pool.bulk_shards,
+                    pool.udp_slot_count(),
+                    pool.slots_total()
+                ),
+                "layout ({conns:?}, split={split}, interactive={interactive:?}, egress={egress:?})"
             );
         }
     }

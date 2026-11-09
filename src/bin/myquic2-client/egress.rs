@@ -515,12 +515,19 @@ impl SharedEgress {
     /// its next datagram.
     pub(crate) fn forget_slot(&self, slot: usize) {
         for i in 0..MAX_UDP_SLOTS {
-            if self.cached[i]
-                .load()
-                .as_ref()
-                .is_some_and(|e| e.slot == slot)
-            {
-                self.cached[i].store(None);
+            // Compare-and-clear, not check-then-store: a concurrent
+            // `refresh_global` for this binding can publish a handle from a
+            // *different, live* pool slot between a load and a blind store, and
+            // the blind store would throw that fresh publish away. The last run
+            // of the `rcu` closure is the committed one (the same pattern as
+            // `ConnSlot::clear_if_and_mark_dead`).
+            let mut cleared = false;
+            self.cached[i].rcu(|cur| {
+                let hit = cur.as_ref().is_some_and(|e| e.slot == slot);
+                cleared = hit;
+                if hit { None } else { cur.clone() }
+            });
+            if cleared {
                 self.generation[i].fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }

@@ -34,6 +34,11 @@ explicitly and marks everything that should not be optimized without a profile.
 | T1 | Test gaps: threshold invariant only proven for the default idle; no 0-RTT attempt-race test; no gate-composition test; no `forget_slot` race test | test gap | info |
 | D1 | Docs drift: README says 7 default connections (8); PERF_ANALYSIS P3-9 claims interactive UDP is single-connection (it is sharded) | docs | info |
 
+> **Resolution (2026-11-09).** L1, L2, M1, L3, L4, L5, P1, T1 and D1 are
+> fixed in this tree (see *Resolution* at the end of the document). P2, P3 and
+> P4 are performance observations that this report recommends not changing
+> without a profile; they remain tracked notes, not defects.
+
 Nothing found rises to "wrong routing in steady state", "lost datagram", or
 "lost TCP flow" in the normal case. L1 and M1 are rare-race defects with
 user-visible symptoms (a failed flow; a held/dropped datagram) but no steady
@@ -615,3 +620,22 @@ Worth recording so these are not re-litigated:
 Validation for the L1 fix: `cargo test -p myquic2 --bin myquic2-client` (the
 0-RTT suite in `tests_0rtt.rs` plus the new state-machine case), then the
 existing dual-stack/restart E2E if one exercises a failed first candidate.
+
+---
+
+## Resolution (2026-11-09)
+
+| # | Resolution |
+|---|---|
+| L1 | `ZeroRttState` is now attempt-scoped: `begin_attempt` returns an id, the phase/token/attempt live in one `AtomicU64`, and `mark_pending`/`set_token_early`/`mark_settled` are compare-and-swap updates that only commit while the caller's attempt is current. `dial_once` threads the id into the monitor, and a superseded monitor drops its verdict (and its token replay) instead of overwriting the next dial's phase. Regression test: `zero_rtt_phase_is_scoped_to_the_current_dial_attempt`. |
+| L2 | `pick_tcp_index_inner` applies both overlays to the candidate that will be returned: the dead candidate is cleared from `live` *and* `fresh` before the L2 re-pick, the L3 re-pick excludes the rejected candidate, and the L3 result is probed once more for a dead handle (the common path still pays one probe, a failover at most two). Regression test: `dead_preference_fails_over_to_a_fresh_sibling_not_a_stale_one`. |
+| M1 | `SharedEgress::forget_slot` is a compare-and-clear (`rcu` over the cached entry, generation bumped only when the clear committed), so a concurrent refresh's fresh publish cannot be wiped by a stale load. The existing `forget_slot_releases_only_that_slots_handles` covers the scoping. |
+| L3 | `bump_gen` uses `watch::Sender::send_modify`, one lock and an atomic increment (no lost update, no read-guard-across-write-lock). |
+| L4 | `designed_fds` derives the endpoint term from `planned_slot_count(c.conn_count(), c.udp_split(), c.udp_interactive_cnt(), c.udp_egress_cnt())`; `fd_budget_covers_the_relay_and_association_pools` now pins the default (8 slots) and the widest (32) layouts. |
+| L5 | `SlotLayout::for_config` is the single layout definition used by `ConnPool::new_with_bulk_ports`, `planned_slot_count` and (through it) the fd budget and worker sizing; the pool stores the resolved `udp_slots` instead of recomputing it. `planned_slots_match_the_built_pool` also asserts every layout field against the built pool. |
+| P1 | `ConnPool::slot_ref` returns `&ConnSlot`; the per-flow paths (SOCKS, forward TCP/UDP, `send_sess_close`) use it, while `slot()` (owned clone) remains for `tokio::spawn` and the tests. |
+| P2 | Intentionally unchanged: removing the second probe needs either a generation/stable-id hint threaded from `pick_tcp_index` into `wait_conn` or a per-generation `conn.closed()` watcher publishing an atomic dead bit. Both change the liveness contract for a one-mutex-per-flow saving; the report recommends a profile first. Still tracked as PERF_ANALYSIS P3-7. |
+| P3 | Intentionally unchanged: the shared `rr` cursor is required for pinned fallback spreading, and its contention is below the accept path's noise. |
+| P4 | Intentionally unchanged: the confirmation probe on each waiter is the dead-handle guarantee `wait_conn` exists for; a "trust the bump" shortcut would reopen the dead-handle race. |
+| T1 | Added: the explicit-`idle_timeout_secs` range in `data_stale_threshold_sits_between_healthy_idle_and_watchdog` (keepalives 1/2/3/4/5/6/10/60/300 x every accepted idle), the 0-RTT attempt test, and the L2 composition test; the fd test now covers the default and widest layouts. A `forget_slot`-vs-publish race test would need an injection hook and is not included. |
+| D1 | README default is "eight" (4 TCP + 2 interactive + 2 bulk); PERF_ANALYSIS P3-9 is marked resolved by A2 with current references, P3-7's `pool.rs` references point at the current `holds_dead_handle`/`wait_conn` lines, and the F14 status list no longer claims P3-9 is open. Narrative sections of PERF_ANALYSIS are left as the historical record of the batches that wrote them. |

@@ -724,6 +724,52 @@ async fn stale_true_preference_repicks_to_a_live_bulk_sibling() {
     );
 }
 
+/// Composition of the two failover overlays: when the dead-handle re-pick lands
+/// on a slot whose progress is stale, the L3 gate must apply to *that* result
+/// (not only to the original preference), or the flow is handed a blackholed
+/// path while a live-and-fresh sibling exists.
+///
+/// Shape: slot 1 holds a closed handle (L2), but its successor slot 2 is
+/// blackholed (L3), and slot 0 is live and fresh. The only acceptable pick is
+/// slot 0 — the documented bulk-to-interactive fallback when no bulk slot is
+/// usable.
+#[tokio::test]
+async fn dead_preference_fails_over_to_a_fresh_sibling_not_a_stale_one() {
+    let pool = ConnPool::new(4, vec![], true, true, 1);
+    let (dead, _client, _server) = real_connection().await;
+    dead.close(0u32.into(), b"dead");
+    pool.slot(1).publish(&dead);
+    for i in 0..pool.tcp_slots() {
+        pool.slot(i)
+            .live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let now = 1_000_000u64;
+    for i in [0usize, 1] {
+        pool.slot(i)
+            .last_rx_ms
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+    let stale = now - pool.data_stale_ms - 1;
+    for i in [2usize, 3] {
+        pool.slot(i)
+            .last_rx_ms
+            .store(stale, std::sync::atomic::Ordering::Relaxed);
+    }
+    let bulk = TargetAddr::Ip("203.0.113.7:443".parse().unwrap());
+    pool.rr.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pool.pick_tcp_index_at(&bulk, now),
+        0,
+        "the L2 re-pick's successor is stale, so the L3 gate must relocate to \
+         the fresh interactive slot"
+    );
+    assert!(
+        pool.slot(1).is_live(),
+        "selection never writes the liveness bit (the conn loop owns that)"
+    );
+}
+
 /// Path-health gate, healthy case: a live slot whose inbound-progress stamp is
 /// fresh is the *normal* state of an idle healthy connection (keepalives keep
 /// `udp_rx.datagrams` moving at least every keepalive interval, and the
@@ -985,6 +1031,64 @@ fn slot_data_staleness_semantics() {
     );
 }
 
+/// The 0-RTT phase belongs to a dial attempt, not to the slot. A candidate that
+/// fails before publication leaves a detached monitor behind; when the next
+/// candidate dials, that monitor's verdict must be dropped instead of
+/// overwriting the current attempt's phase (which used to make a pending
+/// connection look `REJECTED`: duplicate header opens, failed flows and a
+/// premature control stream).
+#[test]
+fn zero_rtt_phase_is_scoped_to_the_current_dial_attempt() {
+    let state = ZeroRttState::new();
+    let first = state.begin_attempt();
+    state.mark_pending(first);
+    assert_eq!(state.phase(), ZeroRttState::PENDING);
+
+    // The first candidate failed; the reconnect loop starts the next one while
+    // the first attempt's monitor is still waiting for its handshake verdict.
+    let second = state.begin_attempt();
+    state.mark_pending(second);
+    assert!(
+        !state.mark_settled(first, false),
+        "a superseded attempt must not commit its verdict"
+    );
+    assert_eq!(
+        state.phase(),
+        ZeroRttState::PENDING,
+        "the current attempt stays pending through the stale monitor"
+    );
+    assert!(state.mark_settled(second, true));
+    assert_eq!(state.phase(), ZeroRttState::ACCEPTED);
+
+    // The early-token flag is attempt-scoped too: a late write from the old
+    // attempt must not change the current one's replay decision.
+    state.set_token_early(first, true);
+    assert!(
+        !state.token_early(),
+        "a retired attempt cannot set the flag"
+    );
+    state.set_token_early(second, true);
+    assert!(state.token_early());
+    state.set_token_early(first, false);
+    assert!(
+        state.token_early(),
+        "a retired attempt cannot clear the current attempt's flag"
+    );
+
+    // A following full-handshake attempt resets both, and the previous
+    // attempt's verdict can no longer land.
+    let _third = state.begin_attempt();
+    assert_eq!(state.phase(), ZeroRttState::NONE);
+    assert!(
+        !state.token_early(),
+        "a new attempt clears the early-token flag"
+    );
+    assert!(!state.mark_settled(second, false));
+    assert_eq!(state.phase(), ZeroRttState::NONE);
+    assert!(!state.mark_settled(first, false));
+    assert_eq!(state.phase(), ZeroRttState::NONE);
+}
+
 /// The selection threshold must sit strictly between "a healthy idle
 /// connection is never rejected" and "the gate can win before the watchdog
 /// closes the slot" for every legal keepalive — the invariant the whole gate
@@ -1012,6 +1116,35 @@ fn data_stale_threshold_sits_between_healthy_idle_and_watchdog() {
             threshold < watchdog_ms,
             "keepalive={keepalive}: threshold {threshold} >= watchdog {watchdog_ms}"
         );
+    }
+    // The same invariant for an explicit `idle_timeout_secs`: production
+    // accepts any value in `max(3 x keepalive, IDLE_TIMEOUT_MIN_SECS)..=
+    // IDLE_TIMEOUT_MAX_SECS`, and the pool only sees the resolved value. The
+    // tightest cases are the short-idle corners; the whole accepted range is
+    // covered for the representative keepalives below.
+    for keepalive in [1u64, 2, 3, 4, 5, 6, 10, 60, KEEP_ALIVE_MAX_SECS] {
+        let floor = (keepalive * 3).max(IDLE_TIMEOUT_MIN_SECS);
+        for idle in floor..=IDLE_TIMEOUT_MAX_SECS {
+            let resolved = resolve_idle_timeout_secs(keepalive, Some(idle));
+            assert_eq!(
+                resolved, idle,
+                "idle {idle}s must be inside the accepted range for keepalive {keepalive}s"
+            );
+            let watchdog = watchdog_silence_secs(resolved);
+            let threshold = data_stale_threshold_ms(keepalive, watchdog);
+            let healthy_idle_worst_ms = (keepalive + WATCHDOG_POLL.as_secs()) * 1_000;
+            assert!(
+                threshold > healthy_idle_worst_ms,
+                "keepalive={keepalive} idle={idle}: threshold {threshold} <= \
+                 healthy-idle age {healthy_idle_worst_ms}"
+            );
+            assert!(
+                threshold < watchdog * 1_000,
+                "keepalive={keepalive} idle={idle}: threshold {threshold} >= \
+                 watchdog {}",
+                watchdog * 1_000
+            );
+        }
     }
     // Out-of-range inputs use the same clamp as the transport, without warning.
     let watchdog_one = watchdog_silence_secs(resolve_idle_timeout_secs(1, None));
@@ -8158,15 +8291,36 @@ fn main_runtime_worker_count_only_subtracts_real_pinning() {
 #[test]
 fn fd_budget_covers_the_relay_and_association_pools() {
     let floor = (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS) as u64;
-    assert!(
-        designed_fds() >= floor,
-        "designed_fds() {} < relay+association floor {floor}",
-        designed_fds()
+    // One endpoint per pool slot: with the default split that is 4 TCP +
+    // 2 interactive UDP + 2 bulk = 8, not the 4 TCP slots `MAX_POOL_CONNS`
+    // alone used to imply.
+    let default_slots = planned_slot_count(
+        crate::DEFAULT_QUIC_CONNS,
+        true,
+        crate::DEFAULT_UDP_INTERACTIVE_CONNS,
+        crate::DEFAULT_UDP_EGRESS_CONNS,
     );
+    assert_eq!(default_slots, 8);
+    let want = designed_fds_for_slots(default_slots);
+    assert!(want >= floor, "designed_fds {want} < floor {floor}");
     assert_eq!(
-        designed_fds(),
-        (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + MAX_POOL_CONNS + FD_GUARD) as u64,
+        want,
+        (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + 8 + FD_GUARD) as u64,
         "the endpoint term and guard band stay part of the derivation"
+    );
+    // The widest pool the caps allow spends one endpoint per slot, so the term
+    // must grow with the dedicated UDP range instead of pinning at
+    // `MAX_POOL_CONNS`.
+    let widest = planned_slot_count(
+        MAX_POOL_CONNS,
+        true,
+        MAX_UDP_INTERACTIVE_CONNS,
+        MAX_UDP_EGRESS_CONNS,
+    );
+    assert_eq!(widest, MAX_POOL_CONNS + MAX_UDP_SLOTS);
+    assert_eq!(
+        designed_fds_for_slots(widest),
+        (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + MAX_POOL_CONNS + MAX_UDP_SLOTS + FD_GUARD) as u64
     );
 }
 
