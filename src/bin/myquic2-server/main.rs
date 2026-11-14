@@ -190,12 +190,12 @@ async fn main() -> Result<()> {
     scfg.transport_config(build_transport_tuned(congestion, keep_alive_secs, tuning));
     // QUIC ingress: `quic_endpoints` endpoints, each bound to `listen` with
     // its own receive loop — on Linux they share the port as a `SO_REUSEPORT`
-    // group and the kernel spreads connections across it (the default there;
-    // see `default_quic_endpoints` for the platform rule). The first
-    // per-packet cost on the server was single-threaded — one endpoint driver
-    // did every receive syscall, version check and CID lookup for the whole
-    // process — and the group is what moves it off one core; the kernel pins
-    // each connection to one member by its 4-tuple (see
+    // group and the kernel spreads connections across it when the operator
+    // explicitly requests more than one endpoint. The first per-packet cost on
+    // the server was single-threaded — one endpoint driver did every receive
+    // syscall, version check and CID lookup for the whole process — and the
+    // group is what moves it off one core; the kernel pins each connection to
+    // one member by its 4-tuple (see
     // `udp_socket_dual_reuseport` for the NAT-rebind and same-host-group
     // caveats). A single-endpoint deployment keeps the strict singleton
     // socket, no REUSEPORT at all.
@@ -221,6 +221,13 @@ async fn main() -> Result<()> {
             "quic_endpoints={ep_count} on a platform that delivers a REUSEPORT group to a \
              single member: the extra endpoints add sockets and idle driver tasks, not \
              ingress parallelism"
+        );
+    }
+    if ep_count > 1 && cfg!(target_os = "linux") {
+        warn!(
+            "quic_endpoints={ep_count} enables Linux SO_REUSEPORT 4-tuple affinity: a client \
+             NAT rebind can land on an endpoint with a different CID table and time out. \
+             Use quic_endpoints=1 when QUIC connection migration must survive rebinding"
         );
     }
     info!(

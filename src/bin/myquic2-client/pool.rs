@@ -1360,8 +1360,8 @@ mod planned_slot_count_tests {
 
     #[test]
     fn shipped_defaults_build_eight_slots() {
-        // 4 TCP + 2 interactive UDP shards + 2 bulk shards = 8 pinned runtimes
-        // at the shipped defaults; the main runtime is sized against this
+        // 4 TCP + 2 interactive UDP shards + 2 bulk shards = 8 pool slots at
+        // the shipped defaults; the runtime topology is sized against this
         // number.
         assert_eq!(
             planned_slot_count(

@@ -154,17 +154,14 @@ pub struct ServerConf {
     /// `SO_REUSEPORT`) to run, and with them the number of accept loops, CID
     /// tables and receive queues serving this address.
     ///
-    /// Unset means [`default_quic_endpoints`]: every usable core on Linux,
-    /// where the kernel spreads a REUSEPORT group by connection 4-tuple, so
-    /// the first per-packet cost — one driver doing every `recv` syscall,
-    /// version check and CID lookup for the process before any connection
-    /// task runs — scales with the cores. On a platform that delivers the
-    /// whole group to a single member (macOS; the default there is 1) extra
-    /// endpoints buy nothing, and the server logs that when they are
-    /// requested anyway. 1 restores the strict singleton socket (no REUSEPORT
-    /// is set at all). Clamped to `1..=MAX_QUIC_ENDPOINTS`; forced to 1 (with
-    /// a warning) on platforms without REUSEPORT, where the second bind would
-    /// fail.
+    /// Unset means one endpoint, which preserves QUIC connection migration
+    /// across client NAT rebinds. A value above 1 opts into a group whose
+    /// members share the port by 4-tuple; the first per-packet receive work can
+    /// then scale with the cores, but a rebind can move the connection to a
+    /// member whose CID table does not know it. On macOS a REUSEPORT group also
+    /// does not spread, so extra endpoints only add sockets. Clamped to
+    /// `1..=MAX_QUIC_ENDPOINTS`; forced to 1 (with a warning) on platforms
+    /// without REUSEPORT, where the second bind would fail.
     ///
     /// The trade-offs are REUSEPORT's, and are worth knowing before raising
     /// this: the kernel pins a connection to one member by its 4-tuple, so a

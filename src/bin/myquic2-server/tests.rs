@@ -953,7 +953,7 @@ fn domain_pin_side_cache_is_keyed_and_cleared_with_the_slot() {
 /// is also why the arm scan no longer has to look for dead entries (two
 /// atomics per slot) and now only reads the tag and stamp arrays.
 ///
-/// The table is eight sets of [`FAST_GROUP_SLOTS`] ways: an arm in a full set
+/// The table is 32 sets of [`FAST_GROUP_SLOTS`] ways: an arm in a full set
 /// evicts that set's quietest entry, and an arm in another set must leave it
 /// alone.
 #[tokio::test]
@@ -969,7 +969,7 @@ async fn a_full_set_evicts_its_quietest_session() {
     // `quiet` and `newcomer` share a set, so the newcomer can only evict it
     // from that set — and the outsider below must not touch it from another.
     let quiet = 5u32;
-    let newcomer = 13u32;
+    let newcomer = quiet + FAST_TABLE_GROUPS as u32;
     let outsider = 9_000u32;
     let quiet_set = quiet as usize & (FAST_TABLE_GROUPS - 1);
     let mut fresh: Vec<u32> = Vec::with_capacity(FAST_SESS_SLOTS - 1);
@@ -3723,6 +3723,17 @@ fn a_routing_failure_condemns_only_that_address() {
             && !forward::is_routing_error(std::io::ErrorKind::PermissionDenied),
         "only the unreachable family may condemn an address"
     );
+}
+
+/// The first record is only a preference. Once another candidate accepts the
+/// payload, it becomes the flow's first steady-path address.
+#[test]
+fn a_reachable_secondary_record_is_prioritized_for_the_flow() {
+    let preferred: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+    let fallback: SocketAddr = "192.0.2.44:443".parse().unwrap();
+    let mut resolved = vec![preferred, fallback];
+    prioritize_resolved_addr(&mut resolved, fallback);
+    assert_eq!(resolved, [fallback, preferred]);
 }
 
 /// A routing verdict must reach the cache lookups, not only the send: a

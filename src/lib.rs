@@ -186,7 +186,8 @@ pub fn udp_socket_dual(bind: &str) -> Result<std::net::UdpSocket> {
 /// (a NAT rebind) is re-hashed to another member whose CID table does not know
 /// it and cannot follow it, and any process on the host that also sets
 /// REUSEPORT could join the group. Both are why the connection-owning side
-/// keeps this opt-in: bind it only when the endpoint count is > 1.
+/// keeps this opt-in: [`default_quic_endpoints`] returns 1, and a group is
+/// created only when the operator explicitly sets `quic_endpoints > 1`.
 ///
 /// Returns `EADDRINUSE` on a second bind when REUSEPORT is unavailable; call
 /// [`reuse_port_ingress_supported`] first.
@@ -3584,9 +3585,10 @@ mod tests {
         assert!(toml::from_str::<ServerConf>(&format!("{server}quic_endpoint = 2\n")).is_err());
     }
 
-    /// `quic_endpoints` defaults per [`default_quic_endpoints`] (cores on
-    /// Linux, 1 elsewhere — see the fn for the measured reason), and an
-    /// explicit value clamps into `1..=MAX_QUIC_ENDPOINTS`.
+    /// `quic_endpoints` defaults to one endpoint because a REUSEPORT group
+    /// cannot follow a NAT rebind across its independent CID tables. An
+    /// explicit value opts into the group and clamps into
+    /// `1..=MAX_QUIC_ENDPOINTS`.
     #[test]
     fn server_quic_endpoints_defaults_and_clamps() {
         let server = "listen = '[::]:8443'\ncert_file = 'c'\nkey_file = 'k'\nserver_name = 's'\n";
@@ -3597,6 +3599,7 @@ mod tests {
             default_quic_endpoints(),
             "unset means the platform's default rule"
         );
+        assert_eq!(default_quic_endpoints(), 1);
         assert!(
             conf("").endpoint_count() <= MAX_QUIC_ENDPOINTS,
             "the default may never exceed the socket-group cap"
@@ -3636,11 +3639,10 @@ mod tests {
     /// REUSEPORT group ingress: two sockets bind the *same* address, every
     /// datagram lands on exactly one member, and the platform's spread
     /// behavior is pinned as measured — Linux hashes by connection 4-tuple
-    /// (the property the multi-endpoint server relies on), while macOS hands
-    /// the whole group to one member (most recently bound), which is why
-    /// [`default_quic_endpoints`] is 1 there. A kernel that changed either way
-    /// would make this test state loudly instead of the default quietly going
-    /// wrong.
+    /// (the property the opt-in multi-endpoint server relies on), while macOS
+    /// hands the whole group to one member (most recently bound). A kernel
+    /// that changed either way would make this test state loudly instead of an
+    /// explicit operator setting quietly going wrong.
     #[cfg(all(
         unix,
         not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
@@ -3699,9 +3701,8 @@ mod tests {
         {
             // Measured on macOS: the whole group's traffic goes to one member
             // (the most recently bound socket), with no spreading at all.
-            // `default_quic_endpoints` returning 1 on this platform is based
-            // on exactly this; if a future macOS starts spreading, this
-            // assertion tells us the default can be raised again.
+            // The safe default remains one on macOS as well as Linux; this
+            // assertion documents why a group is not useful here.
             assert!(
                 a_hits == 0 || b_hits == 0,
                 "macOS is not expected to spread a REUSEPORT group (a={a_hits}, b={b_hits})"
@@ -3865,8 +3866,8 @@ mod tests {
         // by the admission bound rather than per connection.
         assert_eq!(
             d * 4096 / (1024 * 1024),
-            105984,
-            "4096 x 25.875 MiB is the 103.5 GiB worst case for the default windows"
+            106560,
+            "4096 x 26.016 MiB is the 104.1 GiB worst case for the default windows"
         );
         let pool = session_pool_memory_bytes(8192);
         // Linux stores/reports SO_{R,CVBUF}/SO_SNDBUF at 2x the requested

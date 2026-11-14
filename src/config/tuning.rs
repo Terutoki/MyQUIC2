@@ -23,16 +23,12 @@ use crate::udp::{BURST_SLOT, LAST_HOP_DRAIN};
 /// small fixed maps next to them. A conservative single term keeps the
 /// admission bound from depending on binary-private types.
 ///
-/// The fast session table (`FAST_SESS_SLOTS` in `myquic2-server/accept.rs`) is
-/// sized from the same array budget the old 128 × 432 B table used. Each
-/// `FastSess` is now 128 B — the inline `ConnPin` moved to the bounded
-/// `DOMAIN_PIN_SLOTS` side cache because its only reader is the INLINE/legacy
-/// path — so the same ~55.4 KiB carries ~405 slots. The side cache adds
-/// 48 × ~304 B ≈ 14 KiB. With the 16 KiB pre-HELLO buffer and the surrounding
-/// maps, 96 KiB remains a round, conservative charge; the slot count is
-/// derived from `size_of::<FastSess>()` in `accept.rs`, so the arithmetic
-/// cannot drift silently.
-pub const R2_INGRESS_FIXED_BYTES: u64 = 96 * 1024;
+/// The fast session table (`FAST_SESS_SLOTS` in `myquic2-server/accept.rs`)
+/// carries 2,048 entries, covering the documented ~2,000-session working set
+/// on one connection. At 88 B per `FastSess` plus the split tag/age arrays and
+/// the bounded domain-pin cache, the table is about 214 KiB. A 240 KiB term
+/// leaves room for the surrounding maps and keeps the arithmetic conservative.
+pub const R2_INGRESS_FIXED_BYTES: u64 = 240 * 1024;
 
 /// Per-flow allocation slack on top of `size_of::<FlowBinding>()`: the `Arc`
 /// header (16 B), the target's domain name up to the 255-byte wire limit, and
@@ -257,40 +253,24 @@ pub const DEFAULT_FORWARD_CONNS: usize = MAX_SOCKS_CONNS - MAX_SOCKS_CONNS / 4;
 /// is how the server's packet ingress — one `recv`-loop task and one CID
 /// lookup per datagram before this — uses more than one core; platforms that
 /// do not spread default to a single endpoint, so see
-/// [`default_quic_endpoints`] for the real rule. The cap bounds the kernel
+/// [`default_quic_endpoints`] for the safe default. The cap bounds the kernel
 /// receive-buffer footprint (`cap × rmem_max`) and the per-endpoint driver
 /// wakeups an overloaded host pays; past it the extra parallelism is better
-/// spent on per-connection tasks. Sized to half the client's TCP pool cap
-/// (`MAX_POOL_CONNS`, 16): on Linux the default is already one
-/// endpoint per usable core, so the cap only binds on hosts with more than
-/// 8 cores (and bounds what an explicit `quic_endpoints` may request).
+/// spent on per-connection tasks.
 pub const MAX_QUIC_ENDPOINTS: usize = 8;
 
 /// Default [`ServerConf::quic_endpoints`] when the key is unset.
 ///
-/// Linux spreads a `SO_REUSEPORT` group across its members by connection
-/// 4-tuple, so one endpoint per usable core is the useful default there —
-/// bounded by [`MAX_QUIC_ENDPOINTS`], and derived from
-/// `available_parallelism` so a cgroup's CPU limit is respected rather than
-/// the host's core count.
-///
-/// Everywhere else the default is 1, because every other platform we can
-/// measure does not spread at all: macOS (verified on this codebase, see the
-/// `udp_reuseport_group_*` tests) delivers the whole group's traffic to a
-/// single member — the most recently bound one — so extra members there are
-/// sockets and idle driver tasks, not ingress parallelism. An explicit
-/// `quic_endpoints > 1` is still honored on those platforms (the server warns
-/// that it buys nothing) rather than silently ignored, because the
-/// measurement is a property of the kernel, not of this binary.
+/// A `SO_REUSEPORT` ingress group is opt-in. Linux hashes a datagram by its
+/// connection 4-tuple, so a client NAT rebind can move the connection to an
+/// endpoint whose independent quinn CID table does not know it. That turns a
+/// QUIC migration event into a blackhole until the connection timeout. A
+/// single endpoint keeps migration working and is therefore the safe default;
+/// operators who accept the 4-tuple affinity trade can request more endpoints
+/// explicitly. On macOS a group does not spread at all, which is another
+/// reason not to make it the default.
 pub fn default_quic_endpoints() -> usize {
-    if cfg!(target_os = "linux") {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, MAX_QUIC_ENDPOINTS)
-    } else {
-        1
-    }
+    1
 }
 
 /// Default RTT seed in ms for the loss-detection estimator before the first
@@ -687,16 +667,23 @@ pub fn dns_inflight_memory_bytes() -> u64 {
 /// there must update this constant.
 const SERVER_SESS_BUF_POOL_DEPTH: usize = 8;
 
+/// Upper bound for the server's per-thread `SessMemo` table. It now has 4,096
+/// slots so the second-level session cache remains at least twice the size of
+/// the 2,048-slot per-connection fast table seen above.
+const SERVER_SESS_MEMO_MAX_BYTES: u64 = 256 * 1024;
+
 /// Worst-case per-thread scratch memory the server's datagram paths allocate.
 ///
-/// Two thread-locals live on every server worker thread that runs an ingress
-/// or dispatcher path, and neither is released while the thread lives:
+/// Three thread-locals live on every server worker thread that runs an ingress
+/// or dispatcher path, and none is released while the thread lives:
 ///
 /// - the `recvmmsg` burst scratch ([`LAST_HOP_DRAIN`] slots of [`BURST_SLOT`]
 ///   bytes each) — a peer filling every slot drives it to the full size;
 /// - the session read-buffer pool (`SERVER_SESS_BUF_POOL_DEPTH` buffers of
 ///   `UDP_RECV_MAX + UDP_RECV_SLACK` bytes), which a peer fills by keeping that
 ///   many session readers idle-but-live on one thread.
+/// - the second-level `SessMemo` table, whose fixed slot count is mirrored by
+///   [`SERVER_SESS_MEMO_MAX_BYTES`] because the type is binary-private.
 ///
 /// `threads` is the number of OS worker threads running those paths (the
 /// server's shard runtimes), not the number of tasks; charged once as a
@@ -707,7 +694,7 @@ pub fn worker_scratch_bytes(threads: usize) -> u64 {
     let burst = (LAST_HOP_DRAIN * BURST_SLOT) as u64;
     let sess_pool =
         (SERVER_SESS_BUF_POOL_DEPTH * (crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK)) as u64;
-    (threads as u64).saturating_mul(burst + sess_pool)
+    (threads as u64).saturating_mul(burst + sess_pool + SERVER_SESS_MEMO_MAX_BYTES)
 }
 
 /// quinn-proto 0.11's per-stream reassembly cap: `src/connection/assembler.rs`
@@ -846,24 +833,22 @@ mod tests {
         );
     }
 
-    /// Worker scratch is linear in the thread count and must include both
-    /// thread-locals: the burst scratch and the session read-buffer pool.
+    /// Worker scratch is linear in the thread count and includes the burst
+    /// scratch, the session read-buffer pool, and the fixed `SessMemo` table.
     #[test]
-    fn worker_scratch_is_linear_in_threads_and_covers_both_thread_locals() {
+    fn worker_scratch_is_linear_in_threads_and_covers_all_fixed_thread_locals() {
         let burst = (LAST_HOP_DRAIN * BURST_SLOT) as u64;
         let pool =
             (SERVER_SESS_BUF_POOL_DEPTH * (crate::UDP_RECV_MAX + crate::UDP_RECV_SLACK)) as u64;
+        let fixed = burst + pool + SERVER_SESS_MEMO_MAX_BYTES;
         assert_eq!(
             BURST_SLOT,
             crate::UDP_RECV_MAX + crate::SOCKS_UDP_HDR_MAX + crate::UDP_RECV_SLACK
         );
         assert_eq!(worker_scratch_bytes(0), 0);
-        assert_eq!(worker_scratch_bytes(1), burst + pool);
+        assert_eq!(worker_scratch_bytes(1), fixed);
         for threads in 1..8 {
-            assert_eq!(
-                worker_scratch_bytes(threads),
-                threads as u64 * (burst + pool)
-            );
+            assert_eq!(worker_scratch_bytes(threads), threads as u64 * fixed);
         }
         assert!(
             worker_scratch_bytes(1) > 256 * 1024,
@@ -977,21 +962,17 @@ mod tests {
         );
     }
 
-    /// PERF-4: the rev2 ingress term grew for the fast session table (each slot
-    /// carries an inline `ConnPin`); it must stay a round, conservative 96 KiB
-    /// rather than drifting back to the 32 KiB figure that covered 16 slots.
+    /// The rev2 ingress term must cover the 2,048-slot fast session table and
+    /// its domain-pin side cache.
     #[test]
     fn r2_ingress_term_covers_the_fast_table() {
-        assert_eq!(R2_INGRESS_FIXED_BYTES, 96 * 1024);
-        // 128 slots. The payload entry is 440 B today (an inline `ConnPin` is
-        // 304 B of it) and the probe arrays add a 4 B tag plus an 8 B stamp per
-        // slot, so charge the whole slot; the 16 KiB pre-HELLO buffer and the
-        // surrounding maps ride along inside the same term.
-        let slots = 128u64;
-        let per_slot = 452;
+        assert_eq!(R2_INGRESS_FIXED_BYTES, 240 * 1024);
+        let slots = 2048u64;
+        let per_slot = 100;
+        let domain_pins = 48u64 * 308;
         assert!(
-            R2_INGRESS_FIXED_BYTES >= 16 * 1024 + slots * per_slot,
-            "term must cover the pre-HELLO buffer and the fast table"
+            R2_INGRESS_FIXED_BYTES >= slots * per_slot + domain_pins,
+            "term must cover the fast table and its domain pins"
         );
     }
 

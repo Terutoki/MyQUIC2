@@ -58,39 +58,43 @@ pub(crate) struct SessMemo {
 /// This memo is the second-level cache behind `accept.rs::FastTable`: a
 /// fast-table hit never consults it, but a fast-table *miss* is exactly the
 /// case where the memo decides whether the slow path takes the session table's
-/// shard lock at all. The fast table is ~568 slots and the shipped client packs
-/// more live sessions onto one connection than either cache holds, so the old
-/// 256-slot memo was *smaller* than the cache in front of it — an inverted
-/// hierarchy in which an L1 miss almost always missed L2 as well and
+/// shard lock at all. The fast table now covers the documented ~2,000-session
+/// working set; keeping at least twice as many memo slots avoids an inverted
+/// hierarchy in which an L1 miss usually misses L2 as well.
 ///
 /// **Shared across connections (ECHO review L14).** Unlike the per-connection
 /// fast table, this array is per *worker thread*: every connection whose
-/// datagram reader runs on the shard shares the same 2048 slots (`conn_id` is
+/// datagram reader runs on the shard shares the same 4096 slots (`conn_id` is
 /// part of the key, so the sharing is safe, just less effective). The 2x
 /// headroom over `FAST_SESS_SLOTS` is therefore a per-connection **upper
 /// bound**, not a guarantee: with C connections on one shard the effective
-/// per-connection L2 is roughly 2048/C. A miss is always correct — it falls
-/// through to the table — so this is a sizing caveat, not a defect. paid the
-/// shard read in `get_or_create_sess`. 2048 keeps the 2x headroom over the fast
-/// table that the id mixing requires (two ids one table step apart must not
-/// collide here) and costs `size_of::<SessMemo>() * 2048` (~96 KiB) per worker
-/// thread, which is small next to the per-connection charge.
+/// per-connection L2 is roughly 4096/C. A miss is always correct — it falls
+/// through to the table — so this is a sizing caveat, not a defect. For one
+/// connection on a shard, 4096 slots keep the 2x headroom over the fast table
+/// that the id mixing requires (two ids one table step apart must not collide
+/// here) and cost `size_of::<SessMemo>() * 4096` (~192 KiB) per worker thread,
+/// which is charged with the datagram worker scratch.
 ///
 /// A miss is never a mis-serve — the `(conn, sess)` key compare guarantees that
 /// — and `arm_fast` deliberately keeps the fast slot on a memo miss, so the two
 /// caches cannot fight over an entry.
-pub(crate) const SESS_MEMO_SLOTS: usize = 2048;
+pub(crate) const SESS_MEMO_SLOTS: usize = 4096;
 
 /// The index is `% SESS_MEMO_SLOTS`, which the compiler folds into a mask only
 /// for a power of two.
 const _: () = assert!(SESS_MEMO_SLOTS.is_power_of_two());
 /// The memo is thread-local, so every worker thread pays it in full: a field
 /// added to `SessMemo` must not silently multiply the per-thread cost.
-const _: () = assert!(std::mem::size_of::<SessMemo>() * SESS_MEMO_SLOTS <= 128 * 1024);
+const _: () = assert!(std::mem::size_of::<SessMemo>() * SESS_MEMO_SLOTS <= 256 * 1024);
 
 thread_local! {
-    static SESS_MEMO: std::cell::RefCell<[Option<SessMemo>; SESS_MEMO_SLOTS]> =
-        std::cell::RefCell::new(std::array::from_fn(|_| None));
+    static SESS_MEMO: std::cell::RefCell<Box<[Option<SessMemo>]>> =
+        std::cell::RefCell::new(
+            std::iter::repeat_with(|| None)
+                .take(SESS_MEMO_SLOTS)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
 }
 
 pub(crate) fn sess_memo_idx(conn: usize, sess: u32) -> usize {

@@ -340,23 +340,13 @@ impl FastSess {
 
 /// Per-connection fast-path slots.
 ///
-/// See the note at the declaration site in [`handle_conn`] for why this is a
-/// table and not the single `(session, dst)` pair it used to be; the sizing
-/// argument is there too. The shipped client packs up to ~2000 live sessions
-/// per connection, so the table is a working set charged to admission by
-/// `R2_INGRESS_FIXED_BYTES`, not a router.
-///
-/// The slot count is computed from the same array budget the previous
-/// `128 × 432 B` table used. Removing the inline `ConnPin` (its only reader was
-/// the INLINE/legacy `resolve_fast`, never the steady/TRAIN path) shrank
-/// `FastSess`, and spending that saving on more slots attacks the measured
-/// ~88% slow-path rate directly without increasing the per-connection
-/// admission charge. The `+ 12` is the split table's per-slot tag (4 B) and
-/// age (8 B).
-const FAST_TABLE_ARRAY_BYTES: usize = 128 * (432 + 12);
-pub(crate) const FAST_SESS_SLOTS: usize =
-    FAST_TABLE_ARRAY_BYTES / (std::mem::size_of::<FastSess>() + 12);
-const _: () = assert!(FAST_SESS_SLOTS >= 128);
+/// The shipped client can place roughly 2,000 live associations on one
+/// connection. A smaller working set evicted on essentially every arm once
+/// that active set exceeded the table, sending each miss through the session
+/// table and an ungrouped target send. Size the table for the documented
+/// working set and charge it through `R2_INGRESS_FIXED_BYTES`.
+pub(crate) const FAST_SESS_SLOTS: usize = 2048;
+const _: () = assert!(FAST_SESS_SLOTS >= 2048);
 /// The session memo (`memo::SESS_MEMO_SLOTS`) is the second-level cache behind
 /// this table: a fast-table hit never consults it, but a fast-table *miss* is
 /// decided there. A memo smaller than this table would make every L1 miss pay
@@ -365,14 +355,14 @@ const _: () = assert!(FAST_SESS_SLOTS >= 128);
 const _: () = assert!(SESS_MEMO_SLOTS >= 2 * FAST_SESS_SLOTS);
 
 /// Set-associative groups in [`FastTable`]. Session ids are monotonic and
-/// never reused, so the low bits are a cheap set selector: eight sets of 71
-/// ways keep the probe and arm scans to one 71-entry group instead of the
-/// full 568-slot array, while still bounding each group to an exact LRU.
+/// never reused, so the low bits are a cheap set selector: 32 sets of 64 ways
+/// keep the probe and arm scans to one 64-entry group instead of the full
+/// 2,048-slot array, while still bounding each group to an exact LRU.
 ///
 /// Groups are not a replacement for capacity: a hot set can evict sooner than
 /// a globally-LRU table would, and the `fast_table` counters expose whether
 /// that matters. They are a pure scan reduction with no extra memory.
-pub(crate) const FAST_TABLE_GROUPS: usize = 8;
+pub(crate) const FAST_TABLE_GROUPS: usize = 32;
 pub(crate) const FAST_GROUP_SLOTS: usize = FAST_SESS_SLOTS / FAST_TABLE_GROUPS;
 const _: () = assert!(FAST_TABLE_GROUPS.is_power_of_two());
 const _: () = assert!(FAST_SESS_SLOTS.is_multiple_of(FAST_TABLE_GROUPS));
@@ -383,8 +373,8 @@ const _: () = assert!(FAST_SESS_SLOTS.is_multiple_of(FAST_TABLE_GROUPS));
 const fn group_start(s: u32) -> usize {
     (s as usize & (FAST_TABLE_GROUPS - 1)) * FAST_GROUP_SLOTS
 }
-// A field added to `FastSess` costs working-set slots one-for-one; 88 B is the
-// size that buys ~568 slots from the fixed array budget.
+// The tag and age arrays add 12 B per slot; keep the hot entry within the
+// admission arithmetic documented in `config::tuning`.
 const _: () = assert!(std::mem::size_of::<FastSess>() <= 88);
 
 /// Full-name domain pins kept beside the fast slots.
@@ -392,14 +382,14 @@ const _: () = assert!(std::mem::size_of::<FastSess>() <= 88);
 /// The hot slot no longer carries a 255-byte pin, but the INLINE/legacy
 /// `resolve_fast` path still needs a lock-free hit for repeated domain
 /// frames. This side cache keeps the old pin shape for a bounded working set:
-/// 48 entries × ~304 B ≈ 14 KiB, which fits the 96 KiB admission charge
-/// together with the ~55.4 KiB slot arrays and the 16 KiB pre-HELLO reserve.
+/// 48 entries × ~304 B ≈ 14 KiB, which fits alongside the ~200 KiB slot
+/// arrays inside the 240 KiB admission charge.
 /// IP targets never enter it.
 pub(crate) const DOMAIN_PIN_SLOTS: usize = 48;
 const _: () = assert!(
     FAST_SESS_SLOTS * (std::mem::size_of::<FastSess>() + 12)
         + DOMAIN_PIN_SLOTS * (std::mem::size_of::<ConnPin>() + 4)
-        <= 80 * 1024
+        <= 224 * 1024
 );
 
 /// The connection's fast-path table: session id to steady-state entry.
@@ -420,19 +410,19 @@ pub(crate) struct FastTable {
     /// Session ids come from a monotonic, never-reused counter
     /// (`hub.rs::alloc_sess`) and `get_or_create_sess` refuses id 0, so 0 is a
     /// free sentinel.
-    tags: [u32; FAST_SESS_SLOTS],
+    tags: Box<[u32]>,
     /// Liveness stamp per slot: the session's `last` when it was armed,
     /// advanced on a hit. The eviction order once the table is full. A reaped
     /// session stops advancing, so its entry ages out on its own instead of
     /// needing a liveness probe of its own.
-    ages: [u64; FAST_SESS_SLOTS],
+    ages: Box<[u64]>,
     /// The entries. Only ever reached through `tags`, by index.
-    slots: [Option<FastSess>; FAST_SESS_SLOTS],
+    slots: Box<[Option<FastSess>]>,
     /// Session id per domain-pin slot, or [`EMPTY_TAG`] while free.
-    pin_tags: [u32; DOMAIN_PIN_SLOTS],
+    pin_tags: Box<[u32]>,
     /// Full-name domain pins for the INLINE/legacy `resolve_fast` path.
     /// Bounded and separate from the hot slots so IP targets never grow it.
-    pins: [Option<ConnPin>; DOMAIN_PIN_SLOTS],
+    pins: Box<[Option<ConnPin>]>,
     /// Last hit's `(session, slot)`.
     ///
     /// Every item of one v3 frame carries the same `sess`, so a frame that
@@ -456,13 +446,19 @@ const EMPTY_TAG: u32 = 0;
 const FAST_STATS_EVERY: u64 = 8192;
 
 impl FastTable {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            tags: [EMPTY_TAG; FAST_SESS_SLOTS],
-            ages: [0; FAST_SESS_SLOTS],
-            slots: [const { None }; FAST_SESS_SLOTS],
-            pin_tags: [EMPTY_TAG; DOMAIN_PIN_SLOTS],
-            pins: [const { None }; DOMAIN_PIN_SLOTS],
+            tags: vec![EMPTY_TAG; FAST_SESS_SLOTS].into_boxed_slice(),
+            ages: vec![0; FAST_SESS_SLOTS].into_boxed_slice(),
+            slots: std::iter::repeat_with(|| None)
+                .take(FAST_SESS_SLOTS)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            pin_tags: vec![EMPTY_TAG; DOMAIN_PIN_SLOTS].into_boxed_slice(),
+            pins: std::iter::repeat_with(|| None)
+                .take(DOMAIN_PIN_SLOTS)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             probe_cache: None,
             hits: 0,
             misses: 0,
@@ -471,7 +467,7 @@ impl FastTable {
 
     /// The slot describing `s`, or `None`.
     ///
-    /// Scans **one 71-entry set**, not the full 568-slot array, and uses no
+    /// Scans **one 64-entry set**, not the full 2,048-slot array, and uses no
     /// chains. The previous linear-probing version stopped at the first hole,
     /// which made an entry unreachable after an eviction — a miss, so safe —
     /// but also *unevictable*: its stamp is shared with the live session and
@@ -494,7 +490,7 @@ impl FastTable {
     /// [`Self::probe`] with a one-entry cache for the current frame's session.
     ///
     /// A v3 DATAGRAM can stage many items for the same `sess`; the probe scans
-    /// one 71-entry set, so caching the last hit turns one scan per frame into
+    /// one 64-entry set, so caching the last hit turns one scan per frame into
     /// at most one. The tag is re-checked so an eviction between items (or a
     /// stale cache after `insert`) cannot turn into a wrong slot.
     ///
@@ -3093,6 +3089,13 @@ pub(crate) fn policy_resolved(addrs: &[SocketAddr], allow_private: bool) -> Vec<
     usable
 }
 
+/// Put the address that accepted a datagram first in the validated set.
+pub(crate) fn prioritize_resolved_addr(resolved: &mut [SocketAddr], sent: SocketAddr) {
+    if let Some(pos) = resolved.iter().position(|candidate| *candidate == sent) {
+        resolved.swap(0, pos);
+    }
+}
+
 /// Resolve and forward a domain-target `DATA OPEN` **off the datagram loop**.
 ///
 /// This is the **cold-cache slow path**: the caller already consulted the
@@ -3184,7 +3187,7 @@ async fn r2_forward_domain_open_bg(
     if pending.is_cancelled() {
         return;
     }
-    let dst = usable[0];
+    let preferred = usable[0];
     // Pass the DNS entry's *remaining* life, not the fresh-resolution constant:
     // `resolve_all_cached` may have served a host-keyed cache hit (other ports
     // share the entry) that is already close to expiry, and the session
@@ -3200,7 +3203,7 @@ async fn r2_forward_domain_open_bg(
         &cd,
         conn_id,
         sess,
-        Some((host.as_str(), port, dst, remaining_ms)),
+        Some((host.as_str(), port, preferred, remaining_ms)),
         Some(&state),
         Some(pending.cancelled_flag()),
     )
@@ -3233,12 +3236,24 @@ async fn r2_forward_domain_open_bg(
     if pending.is_cancelled() {
         return;
     }
-    remember_dst(&ss, sess, dst);
+    let mut resolved = usable;
+    let sent = match forward::send_to_reachable_candidate(&sock, &resolved, payload) {
+        Ok(dst) => dst,
+        Err(_) => {
+            r2_refuse(Some(&r2_stats::DNS_OPEN_DROPS));
+            r2_reject(&state, &cd, id, r2::R2_REJECT_DNS);
+            return;
+        }
+    };
+    prioritize_resolved_addr(&mut resolved, sent);
+    remember_dst(&ss, sess, sent);
+    if sent != preferred {
+        sess_dest_store(&ss, sess, &host, port, sent, remaining_ms);
+    }
     // No `arm_fast` here: the fast table is owned by the datagram loop. The
     // next datagram for this session takes the slow path once, finds the dest
     // memo written above, and arms it there — one slow-path hit, never a
     // reason to keep the DNS wait on the reader.
-    udp_try_send(&sock, map_for_dual(dst), payload);
     // Duplicate OPENs that arrived while the lookup was in flight carried new
     // payloads (the client repeats OPEN per payload, it does not retransmit the
     // same one). Forward them now, in arrival order, before the install/ACK.
@@ -3247,7 +3262,16 @@ async fn r2_forward_domain_open_bg(
             r2_stats::bump(&r2_stats::DNS_OPEN_DROPS);
             continue;
         }
-        udp_try_send(&sock, map_for_dual(dst), queued);
+        match forward::send_to_reachable_candidate(&sock, &resolved, queued) {
+            Ok(dst) => {
+                prioritize_resolved_addr(&mut resolved, dst);
+                remember_dst(&ss, sess, dst);
+                if dst != preferred {
+                    sess_dest_store(&ss, sess, &host, port, dst, remaining_ms);
+                }
+            }
+            Err(_) => r2_stats::bump(&r2_stats::DNS_OPEN_DROPS),
+        }
     }
     match r2_install(
         &state,
@@ -3255,12 +3279,10 @@ async fn r2_forward_domain_open_bg(
         sess,
         id,
         TargetAddr::Domain(host, port),
-        // Consistency with the warm path: a flow authorizes the address its
-        // payloads were actually sent to, not every record the name resolved
-        // to. `usable` is the policy-filtered set; `dst` is the one sent to.
-        // (Record failover on a dead first address remains out of scope; see
-        // the ECHO review L10 note.)
-        vec![dst],
+        // The reachable address that accepted the first payload is moved to
+        // the front, while the remaining validated records stay available for
+        // reply authorization.
+        resolved,
     ) {
         Ok(_) => {
             r2_stats::bump(&r2_stats::OPENS);
@@ -3416,8 +3438,17 @@ pub(crate) async fn r2_ingress_open(
                         return;
                     }
                 };
+                if let Err((kind, back)) = udp_try_send_or_return(&sock, map_for_dual(dst), payload)
+                {
+                    if is_routing_error(kind) {
+                        mark_unreachable(dst);
+                    }
+                    drop(back);
+                    r2_refuse(Some(&r2_stats::DNS_OPEN_DROPS));
+                    r2_reject(state, cd, id, r2::R2_REJECT_DNS);
+                    return;
+                }
                 remember_dst(ss, sess, dst);
-                udp_try_send(&sock, map_for_dual(dst), payload);
                 // Arm the connection fast table from the answer just used, so
                 // this session's later steady frames hit the fast path. (The
                 // spawned slow path deliberately leaves arming to the datagram
@@ -3425,12 +3456,9 @@ pub(crate) async fn r2_ingress_open(
                 arm_fast(fast, conn_id, sess);
                 fast.pin_cache(sess, &host, port, dst, life);
                 r2_stats::bump(&r2_stats::DNS_SYNC_OPENS);
-                // The one address the synchronous probe knows (the memo's first
-                // record) is the flow's validated reply-source set: it is the
-                // address this payload was sent to, so its replies are
-                // authorized without a second lookup. The cold path now installs
-                // the same one-address set, so a reply from a *different* record
-                // of the same name is refused consistently on both paths.
+                // The synchronous probe has only the memo's first address.
+                // If it is unreachable, the next duplicate OPEN takes the cold
+                // path, which walks and installs the full validated set.
                 Some(vec![dst])
             } else {
                 match state.begin_pending_open(sess, id, &target) {
@@ -4313,19 +4341,12 @@ async fn handle_conn_inner(
         // syscall amplification of one `sendto` per datagram against one
         // `sendmmsg` per 32.
         //
-        // Sizing: `FAST_SESS_SLOTS` is computed to fit the same ~55.4 KiB
-        // array budget the old 128 × 432 B table used, next to a 4 B tag and an
-        // 8 B stamp in the probe arrays. Removing the inline pin and then the
-        // per-slot SSRF verdict shrank `FastSess` to 88 B, so the budget now
-        // carries ~570 slots (4.4× the old 128). The shipped client packs up to
-        // ~2000 live sessions onto one connection,
-        // i.e. once the table is full *every* arm evicts; the larger working set
-        // is a direct cut to that rate, and admission still charges the table
-        // through `R2_INGRESS_FIXED_BYTES`. The remaining gap to
-        // `LOCAL_SESS_MAX` is structural: covering it with slots would cost
-        // ~1.8 MiB per connection, so a miss must stay cheap (an arm now scans
-        // only the tag and stamp arrays) rather than be made impossible by
-        // table size.
+        // Sizing: 2,048 slots cover the documented ~2,000-live-session working
+        // set on one connection. Every slot costs one 88 B payload entry plus
+        // a 4 B tag and 8 B age, about 200 KiB per connection, which
+        // `R2_INGRESS_FIXED_BYTES` charges to admission. The table remains a
+        // bounded cache rather than a 4,096-session router; a miss is safe and
+        // falls through to the session memo/table.
         //
         // **Probed, not direct-mapped.** Session ids come from the client's
         // monotonic counter and are never reused, so the live ids on a
@@ -4345,10 +4366,8 @@ async fn handle_conn_inner(
         // before it stages anything, and a miss only means "run the slow path,
         // which re-arms".
         //
-        // The slot count is computed from a fixed per-connection array budget
-        // (`FAST_SESS_SLOTS` above), so it cannot silently grow the admission
-        // charge as `FastSess` changes; see `R2_INGRESS_FIXED_BYTES` in
-        // `config::tuning`.
+        // `FAST_SESS_SLOTS` and the layout assertions above are tied directly
+        // to the admission charge in `config::tuning`.
         let mut fast = FastTable::new();
         // Target sends staged for the current drain burst, flushed grouped per
         // `(sock, dst)` run by `flush_staged_sends` (one `sendmmsg` per 32 on

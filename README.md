@@ -3,7 +3,7 @@
 <h1>MyQUIC2</h1>
 
 [![Release](https://img.shields.io/badge/Release-v0.2.3-16a34a?style=flat-square)](https://github.com/Terutoki/MyQUIC2/releases/latest)
-[![Tests](https://img.shields.io/badge/Tests-800_passing-16a34a?style=flat-square)](#-verification)
+[![Tests](https://img.shields.io/badge/Tests-801_passing-16a34a?style=flat-square)](#-verification)
 [![CI](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/Terutoki/MyQUIC2/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-dea584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![QUIC](https://img.shields.io/badge/QUIC-TLS_1.3-38bdf8?style=flat-square)](https://datatracker.ietf.org/doc/html/rfc9000)
@@ -56,7 +56,7 @@ The client is a pool of independent QUIC endpoints. The server is admission-firs
 
 ## 🧭 Architecture
 
-MyQUIC2 is split along the only boundary that matters for latency: **per-connection state lives with the connection, and the data plane never shares a receive path**. On the client, every pool slot owns its own QUIC endpoint, UDP socket and pinned runtime; TCP and UDP egress can be isolated by class, and the thread-local egress memo turns a steady flow into a handful of atomic loads. On the server, `SO_REUSEPORT` endpoints accept in parallel, the token gate and memory admission run before per-connection allocation, and each UDP association gets one 64 KiB session socket and one reader task.
+MyQUIC2 is split along the only boundary that matters for latency: **per-connection state lives with the connection, and the data plane never shares a receive path**. On the client, every pool slot owns its own QUIC endpoint and UDP socket; dedicated runtimes are used when the core plan can keep them pinned without starving the app pool, otherwise the slots share one multi-thread runtime. TCP and UDP egress can be isolated by class, and the thread-local egress memo turns a steady flow into a handful of atomic loads. On the server, the token gate and memory admission run before per-connection allocation, each UDP association gets one 64 KiB session socket and one reader task, and operators may opt into a `SO_REUSEPORT` ingress group.
 
 | Layer | Responsibility | Key design choice |
 |---|---|---|
@@ -65,14 +65,14 @@ MyQUIC2 is split along the only boundary that matters for latency: **per-connect
 | **Forward listeners** | Raw TCP/UDP to configured fixed destinations (`[[tcp_forward]]` / `[[udp_forward]]`) | Same pool, tunnel and server; one session per UDP peer; IPv4, IPv6 and dual-stack listeners; fail-fast startup validation |
 | **Shared codec** | MQP-3 rev3 + rev2 frames (config-selected), flow tables, fragmentation, stager, reassembly | One implementation used by both binaries and by the tests; the revision is a connection property, never sniffed per frame |
 | **Transport** | QUIC / TLS 1.3, BBR + ECN, PMTU, GSO/GRO | No custom congestion control and no custom crypto; QUIC does the hard part |
-| **Server ingress** | `SO_REUSEPORT` endpoints, token gate, connection and memory admission | Admission before per-connection allocation; one endpoint per core, at most 8 |
+| **Server ingress** | Token gate, connection and memory admission; optional `SO_REUSEPORT` endpoints | Admission before per-connection allocation; one endpoint by default so QUIC migration survives NAT rebinds |
 | **Forwarding** | DNS, SSRF policy, TCP happy-eyeballs, UDP `sendmmsg` / `recvmmsg` | Resolve and authorize at the exit, never at the client |
 | **Observability** | Counters, periodic reporter, drop warnings | Every frame kind and every drop reason is observable without a packet capture |
 
-- **Pool-first client.** Every pool slot owns a QUIC endpoint, a UDP socket and a pinned runtime. TCP and UDP egress are isolated; the thread-local egress memo is lock-free, and the UDP hub caps the process at 4032 associations.
+- **Pool-first client.** Every pool slot owns a QUIC endpoint and a UDP socket; on sufficiently wide Linux hosts each slot also gets a pinned runtime, while smaller hosts use one shared runtime. TCP and UDP egress are isolated, the thread-local egress memo is lock-free, and the UDP hub caps the process at 4032 associations.
 - **One wire, two transports.** TCP rides a QUIC stream; UDP rides MQP-3 DATAGRAMs (rev3 by default, rev2 selectable). Shared pieces: TLS 1.3, BBR, PMTU discovery, GSO/GRO.
 - **Two ingress modes.** SOCKS5 and the fixed-destination forward listeners share the pool, the egress classes, the admission budgets and the server; a deployment can use either or both. See [TCP/UDP forwarding](#-tcpudp-forwarding).
-- **Admission-first server.** `SO_REUSEPORT` ingress endpoints, token auth, memory/connection admission, one 64 KiB session socket per association.
+- **Admission-first server.** Token auth, memory/connection admission, one 64 KiB session socket per association, and opt-in `SO_REUSEPORT` ingress parallelism.
 
 ## 📡 MQP-3 rev3 wire (default)
 
@@ -525,7 +525,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 
 | Resource | Bound | Enforcement |
 |---|---|---|
-| Fast session table | ~568 slots + 48-entry domain-pin side cache | server ingress |
+| Fast session table | 2,048 slots + 48-entry domain-pin side cache | server ingress |
 | Flow registry | 4096 live flows per connection | send: `INLINE` fallback; receive: `FLOW_REJECT(table_full)` |
 | Flows per session | 64 | same fallback/reject path |
 | Resolved addresses | 16 per flow | DNS result truncation |
@@ -547,7 +547,7 @@ Every peer-fillable structure is bounded, and the bounds are part of the protoco
 | File descriptors | 24,840 server / 12,496 client (designed capacity + 256 guard) | startup check against `RLIMIT_NOFILE`, rate-limited `EMFILE` warn at runtime |
 | Per-connection admission | 25,875 KiB (27,131,904 B) | checked before state allocation |
 
-The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 96 KiB of fixed ingress state (the ~568-slot fast session table plus the bounded 48-entry domain-pin side cache, without inline pins in the hot slot, plus maps; the charge conservatively keeps the 16 KiB pre-HELLO allowance after Phase 0 removed the buffer), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (72 streams × 1,024 gap spans × 96 B = 6.75 MiB; the server advertises 64 bidi + 8 uni streams until the token is verified, then raises bidi to 8,192). The total is 25.875 MiB. At the full 4,096 connections that is **103.5 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
+The admission charge is a **ceiling**, not a reservation. It assumes the worst case: 14 MiB of QUIC transport buffers (8 MiB receive + 4 MiB send + two 1 MiB DATAGRAM buffers), two 256 KiB reassemblers, a 256 KiB stager plus 1,024 × 96 B × 8 slots (1 MiB), 240 KiB of fixed ingress state (the 2,048-slot fast session table plus the bounded 48-entry domain-pin side cache and maps), 4,096 × 904 B of flow-registry capacity (3.53 MiB), and the quinn receive assemblers for the handshake's pre-auth stream credit (72 streams × 1,024 gap spans × 96 B = 6.75 MiB; the server advertises 64 bidi + 8 uni streams until the token is verified, then raises bidi to 8,192). The total is about 26.0 MiB. At the full 4,096 connections that is **104.1 GiB** of worst-case peer-fillable state, which is why `max_peer_memory_mb` exists and why the default is a hard ceiling rather than a promise that every connection will use it.
 
 A second, **process-wide fixed term** is subtracted from the budget once before the remainder is divided into connections. It covers state a peer can drive regardless of the connection count:
 
@@ -584,10 +584,10 @@ MQP-3 is a passenger, not a replacement. The transport choices that matter most:
 - **PMTU.** The path starts at 1,200 B and probes 1,336, 1,404, 1,438 and 1,472 B. A probe failure falls back without losing the connection; the stager repacks to the smaller budget.
 - **Congestion control.** BBR with ECN, not a custom controller. MQP has no window, no slow start and no retransmission timer of its own.
 - **GSO/GRO.** The server uses UDP segmentation and coalescing offload where the platform supports it; the client does the same per pool slot.
-- **Receive isolation.** Each pool slot owns its endpoint, socket and runtime; the server uses `SO_REUSEPORT` with one endpoint per usable core, capped at 8. There is no shared receive lock between slots.
+- **Receive isolation.** Each client pool slot owns its endpoint and socket; dedicated runtimes are selected only when every slot can be pinned while preserving at least half the machine for app workers. The server defaults to one QUIC endpoint and supports up to eight through explicit `SO_REUSEPORT` opt-in.
 - **No incoming streams on the client.** The client advertises `max_concurrent_bidi_streams = 0` and `max_concurrent_uni_streams = 0`. It opens every stream it uses (one bidi stream per SOCKS TCP relay, one uni stream for the auth token) and the server never opens one, so an advertised slot would only let the peer pin quinn receive-assembler state (up to 1,024 gap spans per stream) on a side that never accepts a stream. A peer that opens one anyway is violating our transport parameters, and quinn closes the connection before buffering any stream data.
 - **Pre-auth stream credit on the server.** The server's handshake advertises only 4 bidi + 2 uni streams; the unauthenticated peer must not be able to park a receive assembler per advertised stream while it stalls the token exchange (the full 8,192-stream credit would allow hundreds of MiB on one connection). `MAX_STREAMS` is increase-only, so the accept loop raises bidi to 8,192 as soon as authentication succeeds — one client may still legitimately place every admitted TCP flow on one connection. The post-auth parked-stream bound is charged process-wide; the pre-auth one is charged per connection.
-- **Runtime topology.** The client pins one current-thread runtime per pool slot (7 at the shipped defaults) and sizes the multi-threaded main runtime to the cores those pinned threads leave over, so saturation cannot put `cores + slots` runnable threads on `cores` CPUs. An association starts on the main runtime (the SOCKS handshake and the first datagram), and its steady state then moves onto the runtime of the slot that owns its egress binding — so the recv, the encode, quinn's connection-state lock and the driver poll all run on one thread instead of crossing cores per datagram. A later egress failover to a sibling slot keeps the loop where it is, so that flow's frames cross cores again; that costs throughput on the flow, not correctness. A TCP relay (SOCKS `CONNECT` or `[[tcp_forward]]`) follows the same rule once its stream is open: the pump runs on the egress slot's runtime, so `write_chunk`/`read_chunks` take the slot driver's connection-state mutex on its own thread instead of across cores. A `[[udp_forward]]` listener stays on the main runtime because one listener serves peers on several slots; it pushes a per-burst batch and wakes the connection's retry task, which drains on the slot runtime. A payload held while no egress handle exists is released by a process-wide publish wakeup with a 100 ms backstop, so a one-shot request (a DNS query, a single echo) is not stranded until its peer happens to send again. `MYQUIC2_SHARD_RUNTIME=0` restores the single shared runtime (full worker width) and keeps every association and pump inline.
+- **Runtime topology.** On Linux, the client uses one pinned current-thread runtime per pool slot only when every slot can own a core and the app runtime still keeps at least half the machine. Small hosts automatically use one shared multi-thread runtime instead of placing `cores + slots` runnable runtime threads on `cores` CPUs. An association starts on the main runtime (the SOCKS handshake and the first datagram), and when dedicated slot runtimes are active its steady state moves onto the runtime of the slot that owns its egress binding — so the recv, the encode, quinn's connection-state lock and the driver poll all run on one thread instead of crossing cores per datagram. A later egress failover to a sibling slot keeps the loop where it is, so that flow's frames cross cores again; that costs throughput on the flow, not correctness. A TCP relay (SOCKS `CONNECT` or `[[tcp_forward]]`) follows the same rule once its stream is open. A `[[udp_forward]]` listener stays on the main runtime because one listener serves peers on several slots; it pushes a per-burst batch and wakes the connection's retry task, which drains on the slot runtime. A payload held while no egress handle exists is released by a process-wide publish wakeup with a 100 ms backstop. `MYQUIC2_SHARD_RUNTIME=0` forces the shared-runtime topology.
 - **Session sockets.** Each UDP association gets one 64 KiB socket and one reader. `recvmmsg` and `sendmmsg` batch up to 32 datagrams; the per-session fair share prevents one association from monopolizing the exit.
 - **TCP path.** TCP rides a QUIC bidirectional stream: optimistic SOCKS5 success, borrowed QUIC halves, vectored writes, 300 s idle timeout, 250 ms happy-eyeballs delay, and `RST`/`STOP_SENDING` (`0x04`) on failure.
 - **Liveness.** Keepalive is only the NAT refresh cadence (5 s default); the QUIC idle timeout is decoupled (`idle_timeout_secs`, default 60 s, floor `max(3 × keepalive, 15 s)`), the client watchdog is `2/3 × idle` (40 s), and the selection-time stale gate is 22 s. Reconnect backoff is 200 ms to 5 s. A dead path is detected below the QUIC idle timeout so the next request does not wait for it; raise `idle_timeout_secs` (e.g. 90) to tolerate longer handovers, at the cost of slower true-failure detection.
@@ -632,7 +632,7 @@ The counters are intentionally granular: bytes and frames by kind, `TRAIN` items
 
 ### 17. Verification snapshot
 
-The current tree has **800 tests** on macOS (lib 391 + client 228 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
+The current tree has **801 tests** on macOS (lib 391 + client 228 + server 166 + 16 process-level E2E: 7 forwarding + 9 wire-revision); the Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests. `cargo fmt --check`, strict Clippy and the full test suite are clean.
 
 The data-plane evidence is deliberately end-to-end:
 
@@ -1228,7 +1228,7 @@ The client and server must run the **same revision**. Certificates are generated
 ## ⚙️ Configuration
 
 - **Wire:** `wire_rev` (`2` = rev2 rollback, `3` = rev3 default; unset = build default) — both binaries must agree. Both revisions default to the same `h3` ALPN label, so a mismatched pair is not rejected at the handshake; deploy matched binaries, or pin distinct `alpn` labels on both sides for a TLS-level skew gate. See [MQP-3 rev3](#-mqp-3-rev3-wire-default).
-- **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (server ingress parallelism), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
+- **Wire and memory:** `initial_mtu` (default 1200 = QUIC floor, clamp 1200–1472), `quic_endpoints` (opt-in REUSEPORT ingress parallelism; default 1 preserves NAT-rebind migration), `max_peer_memory_mb` (admission cap), `udp_full_cone` (server opt-in).
 - **UDP scheduling:** `udp_split`, `udp_interactive_conns` (interactive shards, default 2), `udp_egress_conns` (bulk shards, default 2), `max_udp_assocs`, `interactive_ports`, `udp_bulk_ports`, `udp_fail_closed`.
 - **Interactive routing:** `interactive_ports` pins TCP flows to slot 0 and puts matching UDP destinations on the interactive egress class. Default: SSH 22, DNS 53, NTP 123, RDP 3389, STUN/TURN 3478–3481, VNC 5900.
 - **Forwarding (client):** `[[tcp_forward]]` / `[[udp_forward]]` — raw TCP/UDP listeners relaying to a fixed destination, with IPv4, IPv6 and dual-stack on both sides and no server change. Per-listener caps (`max_conns` / `max_sessions`) sit under process-wide forward budgets (`max_forward_conns` / `max_forward_sessions`, both defaulting to 3/4 of the shared SOCKS limit) so forwarding cannot deny the SOCKS endpoint. Full guide: [TCP/UDP forwarding](#-tcpudp-forwarding).
@@ -1238,7 +1238,7 @@ The sample configs are the reference; comments explain defaults and trade-offs.
 
 ## ✅ Verification
 
-- **800 tests** on the macOS dev box (lib 391 + client 228 + server 165 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
+- **801 tests** on the macOS dev box (lib 391 + client 228 + server 166 + 16 process-level E2E: 7 forwarding + 9 wire-revision).
 - The Linux CI-equivalent environment additionally runs the `cfg(target_os = "linux")`-gated tests.
 - **Coverage of the contract:** rev3 codec golden vectors and malformed-input matrices, rev2/rev3 codec round-trips and truncation, the first-byte matrix against legacy decoders, id allocation and idempotent install, same-flow / equal-length / dictionary `TRAIN`, `FRAG`/reassembly bounds, stager fairness and drop accounting, no-ACK context/`NEED_CONTEXT` repair, the reliable control plane, source-carrying reply-source ACK and stale-ACK rejection, admission math, SSRF and reply-source policy, max-0-RTT pre-handshake auth/forwarding and rejection repair, and both ingress modes (TCP relay/half-close, UDP per-peer session demux and raw replies, startup validation, private-target refusal) driven through the real binaries by 16 process-level E2E tests.
 - **GitHub CI:** rustfmt, Clippy `-D warnings`, Test, musl build and glibc build all green.
@@ -1290,7 +1290,7 @@ flowchart LR
     end
     subgraph EXIT["🛰️  Exit side"]
         direction TB
-        ING["🚪 QUIC ingress<br/>:8443 · SO_REUSEPORT<br/>1 endpoint / core · ≤ 8"]
+        ING["🚪 QUIC ingress<br/>:8443 · 1 endpoint default<br/>SO_REUSEPORT opt-in ≤ 8"]
         AUTH["🔑 token gate<br/>5 s / 5 s / 10 s"]
         ROUTE["🧭 dispatch<br/>TCP dial-out · UDP sessions"]
         TARGETS["🎯 Targets<br/>TCP / UDP"]
@@ -2011,7 +2011,7 @@ flowchart TB
     accDescr: Admission happens before per-connection allocation; the session then resolves and gates the target before UDP egress allocates a session socket.
     subgraph G1["🚪  Ingress · admission before work"]
         direction LR
-        L["[::]:8443<br/>SO_REUSEPORT<br/>1 endpoint / core · ≤ 8"]
+        L["[::]:8443<br/>1 endpoint default<br/>SO_REUSEPORT opt-in ≤ 8"]
         A["accept_loop × N<br/>own socket · CID table · driver"]
         G{"conn limit?<br/>4096 token · 256 bare"}
         H["🤝 handshake<br/>PRE_AUTH 5 s · HANDSHAKE 10 s"]
@@ -2222,7 +2222,7 @@ flowchart LR
         direction TB
         C(["📝 push / PR"]) --> F["🎨 rustfmt"]
         F --> L["🧹 clippy -D warnings"]
-        L --> T["🧪 cargo test<br/>800 tests · macOS + Linux cfg-gated"]
+        L --> T["🧪 cargo test<br/>801 tests · macOS + Linux cfg-gated"]
     end
     subgraph BUILD["📦 builds"]
         direction TB

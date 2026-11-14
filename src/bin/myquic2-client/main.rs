@@ -9,7 +9,10 @@ use quinn::Runtime;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize},
+    },
     time::Duration,
 };
 use tokio::{
@@ -67,16 +70,28 @@ fn designed_fds_for_slots(slots: usize) -> u64 {
     (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + slots + FD_GUARD) as u64
 }
 
+/// Fd capacity for the resolved pool plus configured forward listeners.
+fn designed_fds_with_listeners(slots: usize, tcp_listeners: usize, udp_listeners: usize) -> u64 {
+    let max_listeners = myquic2::config::client_conf::MAX_FORWARD_LISTENERS;
+    designed_fds_for_slots(slots)
+        .saturating_add(tcp_listeners.min(max_listeners) as u64)
+        .saturating_add(udp_listeners.min(max_listeners) as u64)
+}
+
 /// [`designed_fds_for_slots`] for `c`'s resolved pool layout. The layout comes
 /// from [`planned_slot_count`], the same definition the pool is built from, so
 /// a wide UDP range cannot be under-budgeted here.
 fn designed_fds(c: &ClientConf) -> u64 {
-    designed_fds_for_slots(planned_slot_count(
-        c.conn_count(),
-        c.udp_split(),
-        c.udp_interactive_cnt(),
-        c.udp_egress_cnt(),
-    ))
+    designed_fds_with_listeners(
+        planned_slot_count(
+            c.conn_count(),
+            c.udp_split(),
+            c.udp_interactive_cnt(),
+            c.udp_egress_cnt(),
+        ),
+        c.tcp_forward.len(),
+        c.udp_forward.len(),
+    )
 }
 
 /// Raise the soft `RLIMIT_NOFILE` toward [`designed_fds`] and report what is in
@@ -188,49 +203,48 @@ fn main() -> Result<()> {
     // the accept loop treats `EMFILE` as transient — so without this line the
     // client silently serves a fraction of its documented capacity.
     report_fd_budget(&c);
-    let main_workers = main_runtime_workers(&c);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(main_workers)
-        .enable_all()
-        .build()
-        .context("build client main runtime")?;
-    rt.block_on(client_main(c, main_workers))
+    let topology = client_runtime_topology(&c);
+    if shard_runtime_enabled() && !topology.slot_runtimes {
+        warn!(
+            "sharded slot runtimes would oversubscribe {} core(s) with {} pool slot(s); \
+             using the shared multi-thread runtime and all {} worker(s)",
+            topology.cores, topology.slots, topology.main_workers
+        );
+    }
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(topology.main_workers).enable_all();
+    // When Linux dedicates one core per slot, bind each app worker to the
+    // complement. Without this the worker-count arithmetic merely reserves
+    // cores on paper; the scheduler may place workers on the same cores as the
+    // pinned slot runtimes.
+    if topology.slot_runtimes && topology.pinned_slots != 0 {
+        let next_worker = Arc::new(AtomicUsize::new(0));
+        let pin_offset = topology.pinned_slots;
+        builder.on_thread_start(move || {
+            let rank = next_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            myquic2::linux::pin_to_core(pin_offset + rank);
+        });
+    }
+    let rt = builder.build().context("build client main runtime")?;
+    rt.block_on(client_main(c, &topology))
 }
 
-/// Worker count for the process's multi-threaded main runtime.
-///
-/// The sharded topology (`MYQUIC2_SHARD_RUNTIME`, on by default) runs one
-/// current-thread runtime — and therefore one OS thread — per pool slot: 8 at
-/// the shipped defaults (4 TCP + 2 interactive UDP + 2 bulk shards). The main
-/// runtime is where every SOCKS accept, TCP relay pump and UDP association
-/// task runs.
-///
-/// Only **pinned** slot threads own a core (`linux::pin_to_core` is implemented
-/// only on Linux), so only there may the app-side pool give anything up. But
-/// "one core per slot" is not a reservation the app-side pool can afford to
-/// honour in full: it is the pool that moves user payload (accepts, relay
-/// pumps, every association), while a slot thread mostly parks on its endpoint
-/// and wakes for QUIC crypto. At the shipped 8 slots an 8-core host kept 8
-/// cores for those parked threads and ran every SOCKS/TCP/UDP task on a single
-/// worker; a 4-core host did the same while pinning more slots than it has
-/// cores — the worst shape exactly where capacity is scarce.
-///
-/// The reservation is therefore capped at **half the machine**:
-/// `workers >= ceil(cores / 2)` everywhere, and a wide machine keeps the old
-/// one-core-per-slot shape (16 cores: 8 slots pinned, 8 workers). The floor of
-/// one worker is kept because the runtime must exist. [`priority_pin_cores`]
-/// pins only the cores this rule leaves unpinned, so the split is real rather
-/// than arithmetic: a pinned slot never shares a core with the app-side pool.
-///
-/// Off Linux `pin_to_core` is a no-op, so the slot threads are ordinary threads
-/// the scheduler timeshares with everything else and the full default width is
-/// kept — at the shipped 8 slots an 8-core macOS host ran every SOCKS/TCP/UDP
-/// task on a single worker when the subtraction was applied there
-/// (LOGIC/PERF-3 regression). `main_runtime_workers_for` is the pure rule so
-/// both platform behaviours stay testable on one host.
-fn main_runtime_workers(c: &ClientConf) -> usize {
+/// Coherent client runtime plan. Dedicated slot runtimes are used only when
+/// every slot can be pinned and the remaining cores still leave the app runtime
+/// at least half the machine. Otherwise the shared runtime avoids putting
+/// `cores + slots` runnable runtime threads on `cores` CPUs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientRuntimeTopology {
+    cores: usize,
+    slots: usize,
+    main_workers: usize,
+    slot_runtimes: bool,
+    pinned_slots: usize,
+}
+
+fn client_runtime_topology(c: &ClientConf) -> ClientRuntimeTopology {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    main_runtime_workers_for(
+    client_runtime_topology_for(
         cores,
         shard_runtime_enabled(),
         planned_slot_count(
@@ -243,24 +257,48 @@ fn main_runtime_workers(c: &ClientConf) -> usize {
     )
 }
 
-/// Pure sizing rule behind [`main_runtime_workers`].
-///
-/// `pins_slots` is whether `linux::pin_to_core` really places each sharded slot
-/// thread on its own core (true only on Linux). Parameters instead of `cfg!`
-/// inside the body so a unit test can pin both platform behaviours without a
-/// second target.
-fn main_runtime_workers_for(cores: usize, sharded: bool, slots: usize, pins_slots: bool) -> usize {
+/// Pure topology rule behind [`client_runtime_topology`].
+fn client_runtime_topology_for(
+    cores: usize,
+    sharded: bool,
+    slots: usize,
+    pins_slots: bool,
+) -> ClientRuntimeTopology {
     let cores = cores.max(1);
-    if !sharded || !pins_slots {
-        return cores;
+    if !sharded {
+        return ClientRuntimeTopology {
+            cores,
+            slots,
+            main_workers: cores,
+            slot_runtimes: false,
+            pinned_slots: 0,
+        };
     }
-    // A pinned slot may claim a core, but never more than half the machine:
-    // the app-side workers are the side that moves payload, so they keep at
-    // least `ceil(cores / 2)` of it (see the doc above).
-    cores.saturating_sub(slots.min(cores / 2)).max(1)
+    if !pins_slots {
+        return ClientRuntimeTopology {
+            cores,
+            slots,
+            main_workers: cores,
+            slot_runtimes: true,
+            pinned_slots: 0,
+        };
+    }
+    let dedicate_each_slot = slots != 0 && slots <= cores / 2;
+    ClientRuntimeTopology {
+        cores,
+        slots,
+        main_workers: if dedicate_each_slot {
+            cores - slots
+        } else {
+            cores
+        },
+        slot_runtimes: dedicate_each_slot,
+        pinned_slots: if dedicate_each_slot { slots } else { 0 },
+    }
 }
 
-async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
+async fn client_main(c: ClientConf, topology: &ClientRuntimeTopology) -> Result<()> {
+    let main_workers = topology.main_workers;
     // Build the upstream resolver now, off the runtime, and keep watching the
     // platform configuration: the client re-resolves its own server endpoint on
     // every reconnect, so a resolver that was never initialised (or that still
@@ -464,7 +502,7 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
     // on one core instead of migrating between work-stealing workers. Shared
     // (the pre-sharding topology): every slot runs on the multi-thread
     // runtime and work-stealing may migrate those tasks.
-    let (eps, shard_joins) = if shard_runtime_enabled() {
+    let (eps, shard_joins) = if topology.slot_runtimes {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let mut joins = Vec::with_capacity(pool.slots_total());
         // Core assignment by priority, not by slot index: see
@@ -473,6 +511,10 @@ async fn client_main(c: ClientConf, main_workers: usize) -> Result<()> {
         // slots, and so only the cores `main_workers` did not claim are
         // pinned.
         let pin_cores = priority_pin_cores(&pool, main_workers);
+        debug_assert!(
+            topology.pinned_slots == 0 || pin_cores.iter().flatten().count() == pool.slots_total(),
+            "a pinned dedicated-runtime topology must pin every slot"
+        );
         for (i, &pin_core) in pin_cores.iter().enumerate() {
             let sock = udp_socket_dual("[::]:0")?;
             // Local scheduling priority follows the *class* of the slot, not

@@ -5357,23 +5357,16 @@ async fn deferred_batch_flush_recovers_a_dead_egress_verdict() {
 
 /// The sharded topology pins cores by *priority*, not by slot index: TCP slot
 /// 0 (interactive) gets the lowest core, then the dedicated interactive UDP
-/// slot, then the remaining TCP slots, then the bulk shards. The old
-/// `idx < cores` shape left the interactive UDP slot unpinned on hosts with
-/// fewer cores than TCP slots + 1 — exactly the slot every small-datagram
-/// association rides.
+/// slot, then the remaining TCP slots, then the bulk shards. It is entered
+/// only when every slot can be pinned and the app runtime keeps at least half
+/// the machine.
 #[test]
 fn slot_pinning_prioritizes_the_interactive_pair() {
-    // Machine width is injected: on a runner with more cores than slots the
-    // no-pinning branch would otherwise be unreachable.
     let cores = 16;
     let pool = ConnPool::new(4, vec![], true, true, 2);
-    // The shipped split: the main runtime keeps half the machine, so the pinned
-    // slots may claim `usable = cores - app_workers` cores at most.
     let app_workers = cores / 2;
-    let usable = cores - app_workers;
     let pin_cores = priority_pin_cores_for(&pool, app_workers, cores);
     assert_eq!(pin_cores.len(), pool.slots_total());
-    // Rank 0 is always pinned (there is at least one core).
     assert_eq!(
         pin_cores[0],
         Some(0),
@@ -5389,20 +5382,18 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
         Some(2),
         "the remaining TCP slots follow the interactive pair"
     );
-    // Every pinned rank is a real core, and past the usable count slots float.
     let mut ranks: Vec<usize> = pin_cores.iter().flatten().copied().collect();
     ranks.sort_unstable();
     assert_eq!(
         ranks,
-        (0..usable.min(pool.slots_total())).collect::<Vec<_>>(),
-        "pins are a bijection onto the first `min(usable, slots)` ranks"
+        (0..pool.slots_total()).collect::<Vec<_>>(),
+        "the dedicated topology pins every slot exactly once"
     );
     assert_eq!(
         pin_cores.iter().flatten().count(),
-        usable.min(pool.slots_total()),
-        "exactly `min(usable, slots)` slots are pinned"
+        pool.slots_total(),
+        "no slot runtime is left floating"
     );
-    // And pinning never eats a core the app-side pool was sized for.
     assert!(
         cores.saturating_sub(pin_cores.iter().flatten().count()) >= app_workers,
         "pinned slots must leave the {app_workers} app-side workers their cores"
@@ -5440,8 +5431,9 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
         "the remaining TCP slots follow the whole interactive class"
     );
 
-    // A pool wider than the machine pins nothing, at any small width: the
-    // 2-core router (OpenWrt) and a 4-core host both stay scheduler-balanced.
+    // The lower-level helper still refuses an over-wide pool. The client
+    // topology never calls it in that case because it selects the shared
+    // runtime instead.
     for small in [1usize, 2, 3, 4] {
         let none = priority_pin_cores_for(&pool, small / 2, small);
         assert!(
@@ -5450,14 +5442,6 @@ fn slot_pinning_prioritizes_the_interactive_pair() {
             pool.slots_total()
         );
     }
-    // A pool that fits the machine but exceeds `usable` pins exactly `usable`
-    // and leaves the tail floating (the pre-existing priority rule).
-    let eight = priority_pin_cores_for(&pool, 4, 8);
-    assert_eq!(
-        eight.iter().flatten().count(),
-        4,
-        "8 slots on 8 cores with 4 app workers pin exactly the 4 usable cores"
-    );
 }
 
 /// A fresh session's first datagram must reach the kernel, not the retry pool.
@@ -8259,46 +8243,48 @@ fn app_ip_pin_is_family_tolerant() {
     assert!(!app_ip_matches(l4, pub4));
 }
 
-/// PERF-3: the main runtime only loses workers to the sharded slot runtimes
-/// where those slots are really pinned (Linux), and even there it never drops
-/// below half the machine — the shipped 8 slots on an 8-core host must not leave
-/// every SOCKS/TCP/UDP task on one worker.
+/// Slot runtimes and the app runtime are one scheduling plan. If every slot
+/// cannot be pinned while keeping at least half the machine for the app pool,
+/// the client uses the shared runtime rather than oversubscribing the host.
 #[test]
-fn main_runtime_worker_count_only_subtracts_real_pinning() {
-    // Linux: 8 pinned slots on 8 cores may claim at most half the machine, so
-    // the app-side pool keeps the other half (the old rule left exactly one).
-    assert_eq!(main_runtime_workers_for(8, true, 8, true), 4);
-    // A wide machine keeps the one-core-per-slot shape: 16 - 8 = 8.
-    assert_eq!(main_runtime_workers_for(16, true, 8, true), 8);
-    // 4 cores: 8 slots may only claim 2, leaving 2 workers.
-    assert_eq!(main_runtime_workers_for(4, true, 8, true), 2);
-    // Degenerate core counts still yield a usable runtime.
-    assert_eq!(main_runtime_workers_for(1, true, 8, true), 1);
-    assert_eq!(main_runtime_workers_for(2, true, 8, true), 1);
-    assert_eq!(main_runtime_workers_for(0, true, 8, true), 1);
-    // Off Linux pinning is a no-op: the slot threads reserve no core, so the
-    // full default width is kept (this was the one-worker regression).
-    assert_eq!(main_runtime_workers_for(8, true, 8, false), 8);
-    assert_eq!(main_runtime_workers_for(4, true, 8, false), 4);
-    // Shared-runtime topology: no pinned slot threads at all.
-    assert_eq!(main_runtime_workers_for(8, false, 8, true), 8);
-    assert_eq!(main_runtime_workers_for(0, false, 8, false), 1);
-    // Invariant over the whole matrix: pinned slots never take more than half
-    // the machine, so the pool that moves payload keeps at least the other
-    // half (rounded up) whatever the pool width is.
+fn client_runtime_topology_never_oversubscribes_pinned_slots() {
+    let small = client_runtime_topology_for(4, true, 8, true);
+    assert_eq!(small.main_workers, 4);
+    assert!(!small.slot_runtimes);
+    assert_eq!(small.pinned_slots, 0);
+
+    let equal = client_runtime_topology_for(8, true, 8, true);
+    assert_eq!(equal.main_workers, 8);
+    assert!(!equal.slot_runtimes);
+
+    let wide = client_runtime_topology_for(16, true, 8, true);
+    assert_eq!(wide.main_workers, 8);
+    assert!(wide.slot_runtimes);
+    assert_eq!(wide.pinned_slots, 8);
+
+    let no_pins = client_runtime_topology_for(8, true, 8, false);
+    assert_eq!(no_pins.main_workers, 8);
+    assert!(no_pins.slot_runtimes);
+
+    let shared = client_runtime_topology_for(16, false, 8, true);
+    assert_eq!(shared.main_workers, 16);
+    assert!(!shared.slot_runtimes);
+
     for cores in 1..=64usize {
         for slots in [1, 4, 8, 9, 16] {
-            let workers = main_runtime_workers_for(cores, true, slots, true);
-            assert!(workers >= 1, "cores={cores} slots={slots}");
-            assert_eq!(
-                workers,
-                cores.saturating_sub(slots.min(cores / 2)).max(1),
-                "cores={cores} slots={slots}"
-            );
-            assert!(
-                workers >= cores.div_ceil(2),
-                "cores={cores} slots={slots} left only {workers} workers"
-            );
+            let plan = client_runtime_topology_for(cores, true, slots, true);
+            assert!(plan.main_workers >= 1, "cores={cores} slots={slots}");
+            if plan.slot_runtimes {
+                assert_eq!(plan.pinned_slots, slots);
+                assert_eq!(plan.main_workers + plan.pinned_slots, cores);
+                assert!(
+                    plan.main_workers >= cores.div_ceil(2),
+                    "cores={cores} slots={slots} left too little app capacity"
+                );
+            } else {
+                assert_eq!(plan.main_workers, cores);
+                assert_eq!(plan.pinned_slots, 0);
+            }
         }
     }
 }
@@ -8321,12 +8307,12 @@ fn fd_budget_covers_the_relay_and_association_pools() {
         crate::DEFAULT_UDP_EGRESS_CONNS,
     );
     assert_eq!(default_slots, 8);
-    let want = designed_fds_for_slots(default_slots);
+    let want = designed_fds_with_listeners(default_slots, 7, 11);
     assert!(want >= floor, "designed_fds {want} < floor {floor}");
     assert_eq!(
         want,
-        (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + 8 + FD_GUARD) as u64,
-        "the endpoint term and guard band stay part of the derivation"
+        (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + 8 + FD_GUARD + 7 + 11) as u64,
+        "the endpoint, forward-listener and guard terms stay in the derivation"
     );
     // The widest pool the caps allow spends one endpoint per slot, so the term
     // must grow with the dedicated UDP range instead of pinning at
@@ -8341,6 +8327,19 @@ fn fd_budget_covers_the_relay_and_association_pools() {
     assert_eq!(
         designed_fds_for_slots(widest),
         (MAX_SOCKS_CONNS + MAX_UDP_ASSOCS + MAX_POOL_CONNS + MAX_UDP_SLOTS + FD_GUARD) as u64
+    );
+    assert_eq!(
+        designed_fds_with_listeners(
+            default_slots,
+            myquic2::config::client_conf::MAX_FORWARD_LISTENERS,
+            myquic2::config::client_conf::MAX_FORWARD_LISTENERS
+        ),
+        (MAX_SOCKS_CONNS
+            + MAX_UDP_ASSOCS
+            + default_slots
+            + FD_GUARD
+            + 2 * myquic2::config::client_conf::MAX_FORWARD_LISTENERS) as u64,
+        "every configured TCP/UDP forward listener owns one fd"
     );
 }
 

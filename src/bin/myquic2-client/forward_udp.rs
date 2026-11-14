@@ -49,7 +49,7 @@ pub(crate) fn spawn_udp_forward(
     forward_budget: Arc<tokio::sync::Semaphore>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let listen = spec.listen;
-    let raw = udp_socket_dual(&listen.to_string())
+    let raw = udp_socket_dual_small_addr(listen)
         .with_context(|| format!("forward UDP listener {listen}"))?;
     let listener = Arc::new(tokio::net::UdpSocket::from_std(raw)?);
     if !listen_is_loopback(listen) {

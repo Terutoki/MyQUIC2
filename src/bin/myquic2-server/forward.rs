@@ -959,6 +959,37 @@ impl DeliveryOutcome {
     }
 }
 
+/// Send one payload to the first candidate the local kernel accepts.
+///
+/// A routing verdict is remembered and the next candidate is tried. The first
+/// candidate is always attempted, even if it is already remembered as
+/// unreachable, so the memo remains a hint rather than a permanent verdict.
+pub(crate) fn send_to_reachable_candidate(
+    sock: &Arc<tokio::net::UdpSocket>,
+    candidates: &[SocketAddr],
+    mut payload: Bytes,
+) -> std::result::Result<SocketAddr, (std::io::ErrorKind, Bytes)> {
+    let mut last_kind = std::io::ErrorKind::AddrNotAvailable;
+    for (i, cand) in candidates.iter().copied().enumerate() {
+        if i > 0 && is_unreachable(cand) {
+            continue;
+        }
+        match udp_try_send_or_return(sock, map_for_dual(cand), payload) {
+            Ok(()) => return Ok(cand),
+            Err((kind, back)) => {
+                payload = back;
+                if is_routing_error(kind) {
+                    mark_unreachable(cand);
+                    last_kind = kind;
+                    continue;
+                }
+                return Err((kind, payload));
+            }
+        }
+    }
+    Err((last_kind, payload))
+}
+
 /// Deliver one datagram from a gated resolver waiter.
 ///
 /// [`DeliveryOutcome::Unusable`] means the name itself yielded no usable address
@@ -1060,38 +1091,9 @@ pub(crate) async fn deliver_resolved_server_dgram(
     if waiter.is_some_and(DnsWaiter::is_cancelled) {
         return DeliveryOutcome::NotDelivered;
     }
-    let mut payload = payload;
-    let mut sent_to = None;
-    for (i, cand) in allowed.iter().copied().enumerate() {
-        // The first candidate is always tried: a routing verdict is a hint
-        // with a ten-second memory, not a fact, and giving up on the only
-        // remaining address would turn "unreachable just now" into "never
-        // tried again".
-        if i > 0 && is_unreachable(cand) {
-            continue;
-        }
-        match udp_try_send_or_return(&sock, map_for_dual(cand), payload) {
-            Ok(()) => {
-                sent_to = Some(cand);
-                break;
-            }
-            Err((kind, back)) => {
-                payload = back;
-                if is_routing_error(kind) {
-                    mark_unreachable(cand);
-                    continue;
-                }
-                // Anything else is a socket-level problem that would hit
-                // every address equally: the loss is already booked by
-                // `udp_try_send_or_return`, so stop rather than multiply it.
-                break;
-            }
-        }
-    }
-    // No candidate accepted the payload (a routing error per address, or a
-    // socket-level failure): nothing left, so this is not a delivery — and no
-    // address may enter the reply allowlist for a datagram that was never sent.
-    let Some(sent) = sent_to else {
+    let Ok(sent) = send_to_reachable_candidate(&sock, &allowed, payload) else {
+        // No candidate accepted the payload, so no address may enter the reply
+        // allowlist and this is not a delivery.
         return DeliveryOutcome::NotDelivered;
     };
     remember_dst(ss, s, sent);
